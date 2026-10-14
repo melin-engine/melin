@@ -149,6 +149,9 @@ pub use melin_transport_core::replication::{ReplicaCursors, ReplicationMetrics, 
 pub(crate) use dpdk::add_replication_listener;
 #[cfg(feature = "dpdk")]
 pub use dpdk::{DpdkReplicationDriver, run_receiver_dpdk};
+// Ungated, beside the node's other DPDK replication configuration: plain
+// logic over the steering plan, tested on every host.
+pub use crate::dpdk_replication_args::ReplicaDialPorts;
 pub use tcp_receiver::{ReceiverResult, run_receiver};
 pub use tcp_sender::{ReplicationListener, Sender, run_sender};
 

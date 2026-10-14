@@ -244,7 +244,7 @@ veth_test!(
 /// kernel speaks for a crashed process.
 #[test]
 fn a_replica_cut_off_is_dropped_and_its_primary_halts() {
-    a_replica_cut_off_is_dropped(PrimaryReplication::Shared);
+    a_replica_cut_off_is_dropped(NodeReplication::Shared);
 }
 
 /// [`a_replica_cut_off_is_dropped_and_its_primary_halts`], the primary's
@@ -252,10 +252,10 @@ fn a_replica_cut_off_is_dropped_and_its_primary_halts() {
 /// silent replica, and the primary halts all the same.
 #[test]
 fn a_replica_cut_off_from_a_primary_replication_nic_is_dropped_and_its_primary_halts() {
-    a_replica_cut_off_is_dropped(PrimaryReplication::OwnNic);
+    a_replica_cut_off_is_dropped(NodeReplication::OwnNic);
 }
 
-fn a_replica_cut_off_is_dropped(primary: PrimaryReplication) {
+fn a_replica_cut_off_is_dropped(primary: NodeReplication) {
     let _serial = serialise();
     let cluster = Cluster::with_primary(primary);
     let primary_health = Cluster::health(0);
@@ -294,12 +294,13 @@ fn a_replica_cut_off_is_dropped(primary: PrimaryReplication) {
 /// joined. Its two NICs each carry their own traffic, which its per-queue
 /// counts show.
 ///
-/// The replicas run in shared mode (a replica on a NIC of its own is not
-/// run yet), dialing the primary's replication NIC from their client NICs.
+/// The replicas run in shared mode, dialing the primary's replication NIC
+/// from their client NICs (replicas on NICs of their own are
+/// `replicas_on_a_replication_nic_follow_a_primary_on_one_and_take_over`'s).
 #[test]
 fn a_primary_replication_nic_serves_two_replicas_under_its_ack_policy() {
     let _serial = serialise();
-    let cluster = Cluster::with_primary(PrimaryReplication::OwnNic);
+    let cluster = Cluster::with_primary(NodeReplication::OwnNic);
     let primary_health = Cluster::health(0);
 
     // Two fsynced copies before an ack: the primary's and a replica's,
@@ -356,9 +357,14 @@ fn a_primary_replication_nic_serves_two_replicas_under_its_ack_policy() {
 
 /// Both replica slots have acked the primary's whole history.
 fn assert_replicas_current(primary_health: SocketAddr, when: &str) {
+    assert_replica_slots_current(primary_health, &["0", "1"], when);
+}
+
+/// Replica slots `slots` have acked the primary's whole history.
+fn assert_replica_slots_current(primary_health: SocketAddr, slots: &[&str], when: &str) {
     let head = gauge(primary_health, "melin_journal_sequence")
         .unwrap_or_else(|| panic!("{when}: the primary's sequence"));
-    for slot in ["0", "1"] {
+    for slot in slots {
         wait_for_gauge(
             primary_health,
             &format!("melin_replica_acked_sequence{{slot=\"{slot}\"}}"),
@@ -366,6 +372,131 @@ fn assert_replicas_current(primary_health: SocketAddr, when: &str) {
             STARTUP_LIMIT,
         );
     }
+}
+
+/// Replicas whose replication runs on NICs of their own follow a primary
+/// on one too, under an ack policy that needs a replica's fsync, and one
+/// takes over when it goes, promoted by the operator's `PROMOTE`:
+///
+/// - the promoted node serves clients on its client NIC, which it left
+///   unpolled as a replica, with every write acked before the failover;
+/// - its ack policy holds across it: with no replica attached, a write is
+///   refused, not acked on its own disk alone;
+/// - the other replica, pointed at the promoted node's replication NIC,
+///   rejoins it there and catches up, and writes are acked again;
+/// - the promoted node's replication poll thread serves that replica on
+///   the replication NIC its receiver ran on (one transport dropped and
+///   another built on the same queue), and its client poll thread its
+///   clients: its per-queue counts show one queue per NIC, each having
+///   moved packets both ways.
+#[test]
+fn replicas_on_a_replication_nic_follow_a_primary_on_one_and_take_over() {
+    replicas_on_a_replication_nic_take_over(NodeReplication::OwnNic);
+}
+
+/// [`replicas_on_a_replication_nic_follow_a_primary_on_one_and_take_over`],
+/// in a mixed cluster: the primary replicates on its client NIC, and its
+/// replicas dial its ordinary replication address from their replication
+/// NICs.
+#[test]
+fn replicas_on_a_replication_nic_follow_a_shared_primary_and_take_over() {
+    replicas_on_a_replication_nic_take_over(NodeReplication::Shared);
+}
+
+fn replicas_on_a_replication_nic_take_over(primary: NodeReplication) {
+    let _serial = serialise();
+    // Two fsynced copies before an ack, on every node: the primary's and a
+    // replica's, and once promoted, the promoted node's and a replica's.
+    let cluster =
+        Cluster::with(primary, NodeReplication::OwnNic).with_ack_policy(AckPolicy::TwoDisks);
+    let primary_health = Cluster::health(0);
+
+    let primary = cluster.start_primary();
+    let first = cluster.start_replica(1, "first");
+    let second = cluster.start_replica(2, "second");
+    wait_for_gauge(primary_health, "melin_replicas_connected", 2, STARTUP_LIMIT);
+    let mut conn = served_within(primary.addr(), STARTUP_LIMIT, "with both replicas attached");
+    let mut total = 1;
+    for _ in 0..8 {
+        total = acked_total(&mut conn, "with both replicas attached");
+    }
+    assert_eq!(total, 9, "every increment acked, in order");
+    assert_replicas_current(primary_health, "before the failover");
+    drop(conn);
+
+    // The primary goes; its replicas see their links reset.
+    primary.stop();
+
+    // The operator promotes the first replica.
+    assert_eq!(admin_command(Cluster::admin(1), "PROMOTE"), "OK");
+    let promoted_health = Cluster::health(1);
+
+    // It serves on its client NIC. With no replica attached, a write is
+    // refused: two disks are not there to hold it.
+    let deadline = Instant::now() + STARTUP_LIMIT;
+    let mut conn = Connection::connect_by(first.addr(), &writer_key(), deadline)
+        .unwrap_or_else(|e| panic!("the promoted node serves no client: {e}"));
+    let refused = conn
+        .request_one(&increment_request(1))
+        .expect("the promoted node answers a write");
+    assert_eq!(
+        refused.first(),
+        Some(&KIND_RESP_REJECTED),
+        "with no replica attached, a write under two-disks must be refused"
+    );
+
+    // The second replica, pointed at the promoted node's replication
+    // address, rejoins there; writes are acked again, on top of every one
+    // acked before the failover and none of the refused one.
+    second.stop();
+    let second = cluster.start_replica_of(2, "second", cluster.replica_addrs(1).replication());
+    wait_for_gauge(
+        promoted_health,
+        "melin_replicas_connected",
+        1,
+        STARTUP_LIMIT,
+    );
+    assert_eq!(
+        acked_total(&mut conn, "with the second replica rejoined"),
+        total + 1,
+        "the promoted node holds every write acked before the failover"
+    );
+    assert_replica_slots_current(promoted_health, &["0"], "after the rejoin");
+
+    for family in [
+        "melin_dpdk_queue_rx_packets_total",
+        "melin_dpdk_queue_tx_packets_total",
+    ] {
+        let queues = samples(promoted_health, family);
+        assert_eq!(queues.len(), 2, "{family}: one queue per NIC: {queues:?}");
+        for (labels, packets) in &queues {
+            assert!(labels.ends_with(",queue=\"0\"}"), "{family}{labels}");
+            assert!(*packets > 0, "{family}{labels} moved nothing");
+        }
+    }
+
+    // The promoted node stops cleanly, its replication poll thread joined.
+    drop(conn);
+    first.stop();
+    second.stop();
+}
+
+/// An increment on `conn` is acked; returns the counter's total it
+/// carries.
+fn acked_total(conn: &mut Connection, when: &str) -> u64 {
+    let reply = conn
+        .request_one(&increment_request(1))
+        .unwrap_or_else(|e| panic!("{when}: the request was not answered: {e}"));
+    assert_eq!(
+        reply.first(),
+        Some(&KIND_RESP_ACK),
+        "{when}: increment acked"
+    );
+    let total = reply
+        .get(1..9)
+        .and_then(|bytes| bytes.try_into().ok())
+        .unwrap_or_else(|| panic!("{when}: an ack carries the total: {reply:02x?}"));
+    u64::from_le_bytes(total)
 }
 
 /// A primary asked to run replication on a queue of its own needs a NIC
@@ -384,6 +515,45 @@ fn a_primary_in_queue_mode_on_one_queue_pair_refuses_to_start_cleanly() {
         .start_primary_with(config)
         .join()
         .expect_err("a primary in queue mode on one queue pair");
+    assert_too_few_queue_pairs(&err);
+
+    let primary = cluster.start_primary();
+    drop(connect_for_challenge(primary.addr()));
+    primary.stop();
+}
+
+/// A replica in queue mode, which every role now runs, refuses to start on
+/// the runner's one queue pair as a primary does, with the same error,
+/// rather than run its replication on the client queue; and leaves its slot
+/// clean: a replica started there next attaches to the primary.
+#[test]
+fn a_replica_in_queue_mode_on_one_queue_pair_refuses_to_start_cleanly() {
+    let _serial = serialise();
+    let cluster = Cluster::new();
+    let primary = cluster.start_primary();
+
+    let mut config = cluster.config(1, "replica");
+    config.replica_of = Some(cluster.primary_addrs().replication());
+    config.dpdk_replication.queue = true;
+    let err = Cluster::start(&cluster.replica_addrs(1), config)
+        .join()
+        .expect_err("a replica in queue mode on one queue pair");
+    assert_too_few_queue_pairs(&err);
+
+    let replica = cluster.start_replica(1, "replica");
+    wait_for_gauge(
+        Cluster::health(0),
+        "melin_replicas_connected",
+        1,
+        STARTUP_LIMIT,
+    );
+    replica.stop();
+    primary.stop();
+}
+
+/// `err` is a node's refusal to bring queue mode up on a port with one
+/// queue pair, naming the port.
+fn assert_too_few_queue_pairs(err: &str) {
     let (port, rest) = err
         .strip_prefix("port ")
         .and_then(|rest| rest.split_once(' '))
@@ -393,10 +563,6 @@ fn a_primary_in_queue_mode_on_one_queue_pair_refuses_to_start_cleanly() {
         rest.starts_with("configure: 2 queue pairs are needed, and the NIC offers 1"),
         "{err}"
     );
-
-    let primary = cluster.start_primary();
-    drop(connect_for_challenge(primary.addr()));
-    primary.stop();
 }
 
 /// A primary whose replication NIC's transport cannot listen for replicas
@@ -406,7 +572,7 @@ fn a_primary_in_queue_mode_on_one_queue_pair_refuses_to_start_cleanly() {
 #[test]
 fn a_primary_whose_replication_nic_cannot_listen_refuses_to_start() {
     let _serial = serialise();
-    let cluster = Cluster::with_primary(PrimaryReplication::OwnNic);
+    let cluster = Cluster::with_primary(NodeReplication::OwnNic);
     let addrs = cluster.primary_addrs();
     let config = ServerConfig {
         replication_bind: Some(SocketAddr::new(addrs.replication().ip(), 0)),
@@ -430,7 +596,7 @@ fn a_primary_whose_replication_nic_cannot_listen_refuses_to_start() {
 #[test]
 fn a_boot_failing_after_the_replication_poll_thread_stops_it() {
     let _serial = serialise();
-    let cluster = Cluster::with_primary(PrimaryReplication::OwnNic);
+    let cluster = Cluster::with_primary(NodeReplication::OwnNic);
     let taken = std::net::TcpListener::bind(Cluster::health(0)).expect("take the health port");
     let err = cluster
         .start_primary()
@@ -479,7 +645,7 @@ fn assert_no_stage_left_running(context: &str) {
 #[test]
 fn a_standalone_node_with_a_replication_nic_serves_its_clients() {
     let _serial = serialise();
-    let cluster = Cluster::with_primary(PrimaryReplication::OwnNic);
+    let cluster = Cluster::with_primary(NodeReplication::OwnNic);
     let config = ServerConfig {
         standalone: true,
         ..cluster.config(0, "standalone")
@@ -518,6 +684,38 @@ fn a_replica_refuses_clients_until_promoted() {
             "a replica's client port must refuse, not time out: {e}"
         ),
         Ok(_) => panic!("a replica accepted a client's connection"),
+    }
+
+    replica.stop();
+    primary.stop();
+}
+
+/// A DPDK replica whose replication runs on a NIC of its own does not read
+/// its client NIC until promoted, so a client's connection is neither
+/// accepted nor refused: it goes unanswered, as on a kernel-TCP replica
+/// (docs/replication.md says so).
+#[test]
+fn a_replica_on_a_replication_nic_leaves_clients_unanswered_until_promoted() {
+    let _serial = serialise();
+    let cluster = Cluster::with(NodeReplication::Shared, NodeReplication::OwnNic);
+
+    let primary = cluster.start_primary();
+    let replica = cluster.start_replica(1, "replica");
+    wait_for_gauge(
+        Cluster::health(0),
+        "melin_replicas_connected",
+        1,
+        STARTUP_LIMIT,
+    );
+
+    match TcpStream::connect_timeout(&replica.addr(), SILENCE) {
+        Ok(_) => panic!("a replica accepted a client's connection"),
+        // No answer: the SYN times out, or, with no ARP answered either,
+        // the kernel gives up on the address.
+        Err(e) => assert!(
+            is_timeout(&e) || e.kind() == io::ErrorKind::HostUnreachable,
+            "a replica that reads no client NIC must leave a connection unanswered: {e}"
+        ),
     }
 
     replica.stop();
@@ -631,17 +829,17 @@ fn a_stalled_join_costs_the_other_replica_nothing() {
 /// completes intact.)
 #[test]
 fn large_joins_complete_a_tick_at_a_time() {
-    large_joins_complete(PrimaryReplication::Shared);
+    large_joins_complete(NodeReplication::Shared);
 }
 
 /// [`large_joins_complete_a_tick_at_a_time`], the primary's replication on
 /// a NIC of its own: the joins run on its replication poll thread.
 #[test]
 fn large_joins_from_a_primary_replication_nic_complete_a_tick_at_a_time() {
-    large_joins_complete(PrimaryReplication::OwnNic);
+    large_joins_complete(NodeReplication::OwnNic);
 }
 
-fn large_joins_complete(primary: PrimaryReplication) {
+fn large_joins_complete(primary: NodeReplication) {
     let _serial = serialise();
     let cluster = Cluster::with_primary(primary);
     let primary_health = Cluster::health(0);
@@ -1314,24 +1512,19 @@ impl Drop for StalledFile {
 
 /// An increment on `conn` is acked.
 fn assert_acked(conn: &mut Connection, when: &str) {
-    let reply = conn
-        .request_one(&increment_request(1))
-        .unwrap_or_else(|e| panic!("{when}: the request was not answered: {e}"));
-    assert_eq!(
-        reply.first(),
-        Some(&KIND_RESP_ACK),
-        "{when}: increment acked"
-    );
+    acked_total(conn, when);
 }
 
-/// Where a cluster's primary runs its replication.
+/// Where a node of a cluster runs its replication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PrimaryReplication {
+enum NodeReplication {
     /// On its client NIC and poll thread, as by default.
     Shared,
-    /// On a NIC of its own (port mode), polled by its replication poll
-    /// thread: the slot's replication seat. Its replicas, in shared mode,
-    /// dial it there from their client NICs.
+    /// On a NIC of its own (port mode), the slot's replication seat: a
+    /// primary's polled by its replication poll thread, which its replicas
+    /// dial; a replica's carrying its link to its primary, which it dials
+    /// from there, and polled by its replication poll thread once it is
+    /// promoted.
     OwnNic,
 }
 
@@ -1340,24 +1533,34 @@ enum PrimaryReplication {
 struct Cluster {
     dir: tempfile::TempDir,
     authorized_keys: std::path::PathBuf,
-    primary: PrimaryReplication,
+    primary: NodeReplication,
+    replicas: NodeReplication,
+    /// Every node's, from [`Self::config`]: a replica's is the one it
+    /// serves under once promoted.
+    ack_policy: AckPolicy,
 }
 
 impl Cluster {
-    /// A cluster whose primary replicates in shared mode.
+    /// A cluster whose nodes replicate in shared mode.
     fn new() -> Self {
-        Self::with_primary(PrimaryReplication::Shared)
+        Self::with_primary(NodeReplication::Shared)
     }
 
-    /// The keys: the primary's and three replicas', and the test's writer.
-    fn with_primary(primary: PrimaryReplication) -> Self {
+    /// A cluster whose primary replicates as `primary` says, and its
+    /// replicas in shared mode.
+    fn with_primary(primary: NodeReplication) -> Self {
+        Self::with(primary, NodeReplication::Shared)
+    }
+
+    /// The keys: the primary's and three replicas', the test's writer and
+    /// its operator.
+    fn with(primary: NodeReplication, replicas: NodeReplication) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let authorized_keys = dir.path().join("authorized_keys");
-        let mut lines = vec![key::authorized_keys_line(
-            "writer",
-            &writer_key().verifying_key(),
-            "veth-test",
-        )];
+        let mut lines = vec![
+            key::authorized_keys_line("writer", &writer_key().verifying_key(), "veth-test"),
+            key::authorized_keys_line("operator", &operator_key().verifying_key(), "veth-test"),
+        ];
         for slot in 0..3 {
             lines.push(key::authorized_keys_line(
                 "replication",
@@ -1370,7 +1573,14 @@ impl Cluster {
             dir,
             authorized_keys,
             primary,
+            replicas,
+            ack_policy: AckPolicy::Disk,
         }
+    }
+
+    /// The cluster with every node under `ack_policy`.
+    fn with_ack_policy(self, ack_policy: AckPolicy) -> Self {
+        Cluster { ack_policy, ..self }
     }
 
     fn node_key(slot: usize) -> SigningKey {
@@ -1384,21 +1594,31 @@ impl Cluster {
         SocketAddr::from(([127, 0, 0, 1], 9_101 + slot as u16))
     }
 
-    fn addrs(slot: usize) -> melin_test_node::Addrs {
-        melin_test_node::addrs(slot, || {
-            unreachable!("on DPDK the slot gives the addresses")
-        })
+    /// A node's admin endpoint, on the namespace's loopback as the health
+    /// endpoint is.
+    fn admin(slot: usize) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 9_201 + slot as u16))
     }
 
-    /// The primary's addresses, on slot 0: its replication address on its
-    /// replication NIC when it has one.
-    fn primary_addrs(&self) -> melin_test_node::Addrs {
-        match self.primary {
-            PrimaryReplication::Shared => Self::addrs(0),
-            PrimaryReplication::OwnNic => melin_test_node::addrs_with_replication_nic(0, || {
-                unreachable!("on DPDK the slot gives the addresses")
-            }),
+    /// Slot `slot`'s addresses for a node replicating as `replication`
+    /// says: its replication address on its replication NIC when it has
+    /// one.
+    fn addrs(slot: usize, replication: NodeReplication) -> melin_test_node::Addrs {
+        let on_dpdk = || unreachable!("on DPDK the slot gives the addresses");
+        match replication {
+            NodeReplication::Shared => melin_test_node::addrs(slot, on_dpdk),
+            NodeReplication::OwnNic => melin_test_node::addrs_with_replication_nic(slot, on_dpdk),
         }
+    }
+
+    /// The primary's addresses, on slot 0.
+    fn primary_addrs(&self) -> melin_test_node::Addrs {
+        Self::addrs(0, self.primary)
+    }
+
+    /// A replica's addresses, on `slot`.
+    fn replica_addrs(&self, slot: usize) -> melin_test_node::Addrs {
+        Self::addrs(slot, self.replicas)
     }
 
     /// The configuration every node shares; journal `{name}.journal`.
@@ -1408,11 +1628,12 @@ impl Cluster {
         ServerConfig {
             journal: self.dir.path().join(format!("{name}.journal")),
             authorized_keys: self.authorized_keys.clone(),
-            ack_policy: AckPolicy::Disk,
+            ack_policy: self.ack_policy,
             cores: PipelineCores::unpinned(),
             tick_interval_ms: 0,
             snapshot_interval_ms: 0,
             health_bind: Some(Self::health(slot)),
+            admin_bind: Some(Self::admin(slot)),
             replication_key: Some(key_path),
             ..melin_test_node::config()
         }
@@ -1433,9 +1654,23 @@ impl Cluster {
 
     /// A replica of the primary, on `slot`, journal `{name}.journal`.
     fn start_replica(&self, slot: usize, name: &str) -> melin_test_node::Node {
+        self.start_replica_of(slot, name, self.primary_addrs().replication())
+    }
+
+    /// A replica of the node whose replication address is `primary`, on
+    /// `slot`, journal `{name}.journal`. Listening, as a deployed replica
+    /// does, for replicas of its own should it be promoted.
+    fn start_replica_of(
+        &self,
+        slot: usize,
+        name: &str,
+        primary: SocketAddr,
+    ) -> melin_test_node::Node {
+        let addrs = self.replica_addrs(slot);
         let mut config = self.config(slot, name);
-        config.replica_of = Some(self.primary_addrs().replication());
-        Self::start(&Self::addrs(slot), config)
+        config.replica_of = Some(primary);
+        config.replication_bind = Some(addrs.replication());
+        Self::start(&addrs, config)
     }
 
     fn start(addrs: &melin_test_node::Addrs, config: ServerConfig) -> melin_test_node::Node {
@@ -1462,6 +1697,34 @@ fn writer_key() -> SigningKey {
 /// Listed nowhere.
 fn unknown_key() -> SigningKey {
     SigningKey::from_bytes(&[0xB2; 32])
+}
+
+/// Listed in a cluster's `authorized_keys` as an operator: what the admin
+/// endpoint takes.
+fn operator_key() -> SigningKey {
+    SigningKey::from_bytes(&[0xD4; 32])
+}
+
+/// Send `command` to the admin endpoint at `admin`, as the operator, and
+/// return its one-line reply. The admin endpoint is up from the node's
+/// boot, so this retries only until it is.
+fn admin_command(admin: SocketAddr, command: &str) -> String {
+    // The admin listener authenticates like the client one, then speaks
+    // text lines: the client crate does the handshake and hands over the
+    // socket.
+    let mut stream = Connection::connect_by(admin, &operator_key(), Instant::now() + STARTUP_LIMIT)
+        .unwrap_or_else(|e| panic!("the operator is admitted by the admin endpoint {admin}: {e}"))
+        .into_stream();
+    stream
+        .set_read_timeout(Some(STARTUP_LIMIT))
+        .expect("set the admin socket's read timeout");
+    stream
+        .write_all(format!("{command}\n").as_bytes())
+        .expect("send the admin command");
+    let mut reply = String::new();
+    io::BufRead::read_line(&mut io::BufReader::new(stream), &mut reply)
+        .expect("read the admin reply");
+    reply.trim_end().to_owned()
 }
 
 /// Connect a bare socket to `node` and read its challenge, retrying until

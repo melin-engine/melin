@@ -8,6 +8,11 @@
 //! mode it does not run: the client poll thread drives replication on its
 //! own transport, as it always has.
 //!
+//! On a replica in those modes the same queue (the seat) carries the
+//! receiver's link to its primary, on a transport the receiver's thread
+//! builds; a promoted replica drops that one and spawns this thread, which
+//! builds its own there, as at a primary's boot.
+//!
 //! The thread builds its own transport, on the thread that polls it (a
 //! transport never crosses threads), listens on the replication port, and
 //! drives the [`DpdkReplicationDriver`] the primary built for it: poll,
@@ -137,18 +142,33 @@ where
     })
 }
 
+impl ReplicationNicSeat {
+    /// A transport on the seat, listening on nothing, and announced where
+    /// its NIC is its own: what a replica's receiver dials its primary on,
+    /// and what the replication poll thread adds its listener to. Built on
+    /// the thread that polls it, as every transport is.
+    ///
+    /// A seat takes one transport at a time: a promoted replica drops its
+    /// receiver's before the replication poll thread builds its own on the
+    /// same queue.
+    pub(crate) fn unlistening_transport(&self) -> Result<DpdkTransport, String> {
+        let mut transport = DpdkTransport::on_nic_unlistening(&self.group, &self.nic, self.queue)
+            .map_err(|e| format!("the replication transport: {e}"))?;
+        if self.announce {
+            // As the client NIC's first queue does at boot: the switch
+            // learns this NIC's MAC before a peer dials it or answers it.
+            transport.send_gratuitous_arp();
+        }
+        Ok(transport)
+    }
+}
+
 /// The thread's transport: built on `seat`, listening for replicas on
 /// `listen_port` with the primary's replication buffers, and announced
 /// where its NIC is its own.
 fn bring_up(seat: &ReplicationNicSeat, listen_port: u16) -> Result<DpdkTransport, String> {
-    let mut transport = DpdkTransport::on_nic_unlistening(&seat.group, &seat.nic, seat.queue)
-        .map_err(|e| format!("the replication transport: {e}"))?;
+    let mut transport = seat.unlistening_transport()?;
     crate::replication::add_replication_listener(&mut transport, listen_port)?;
-    if seat.announce {
-        // As the client NIC's first queue does at boot: the switch learns
-        // this NIC's MAC before a replica dials it.
-        transport.send_gratuitous_arp();
-    }
     Ok(transport)
 }
 

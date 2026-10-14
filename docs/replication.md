@@ -283,8 +283,10 @@ A node started with `--replica-of <primary_addr>` runs as a replica:
   gate can evaluate any policy without separate ack streams.
 - Does not serve clients. On kernel TCP a client's connection is left
   unanswered (and is served if the replica is promoted while it waits);
-  on DPDK it is refused. Either way the client retries, or goes to the
-  primary.
+  on DPDK it is refused, unless the replica's replication runs on a queue
+  or a NIC of its own, where its client NIC is not read until promotion
+  and the connection is left unanswered. Either way the client retries,
+  or goes to the primary.
 
 If the primary disconnects or evicts the replica, the receiver
 reconnects with exponential backoff (1 s → 30 s cap), keeping the state

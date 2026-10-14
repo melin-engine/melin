@@ -2316,10 +2316,6 @@ where
 {
     check_keys_match_decoder(&*decoder, &authorized_keys)?;
     let dpdk_config = dpdk_config_from(&config)?;
-    crate::dpdk_replication_args::check_replication_nic_implemented(
-        &dpdk_config.replication,
-        config.replica_of.is_some(),
-    )?;
 
     run_dpdk_impl::<A>(
         config,
@@ -2434,8 +2430,8 @@ where
 
     // --- Replica mode (DPDK) ---
     // If --replica-of is set, run the DPDK replication receiver instead
-    // of the primary path. The receiver uses one queue pair for the
-    // outbound connection to the primary.
+    // of the primary path, on the queue pair replication runs on (see
+    // below) for the outbound connection to the primary.
     if let Some(primary_addr) = config.replica_of {
         info!(primary = %primary_addr, "starting in replica mode (DPDK)");
         // As on the kernel-TCP path: a replica never journals genesis,
@@ -2547,16 +2543,41 @@ where
         // No local rotation triggers on the replica side — rotation is
         // primary-driven (see the kernel-TCP receiver path).
 
-        // Queue 0's transport carries the replica's link to its primary
-        // and, should this node be promoted, everything it serves after:
-        // a promoted replica is a DPDK primary on this same transport (see
-        // the promotion arm below). It listens on nothing while the node
-        // is a replica — a replica serves nothing inbound, and the stack
-        // refuses a connection attempt — and gains its listeners at
-        // promotion.
-        let mut transport =
+        // Both of a node's transports come up at boot, each in the role it
+        // keeps once promoted, so that a promotion swaps no queue:
+        //
+        // - Queue 0's, the client transport, listening on nothing while
+        //   the node is a replica (it serves nothing inbound, and the stack
+        //   refuses a connection attempt), gains the client listener at
+        //   promotion and becomes the client poll thread's.
+        // - Where replication runs: in shared mode that same transport,
+        //   which then carries the receiver's link to the primary too; in
+        //   queue and port modes the replication seat's (the client NIC's
+        //   queue 1, or the replication NIC), whose transport carries the
+        //   receiver alone and is dropped at promotion, the replication
+        //   poll thread building its own there as at a primary's boot.
+        //
+        // In queue and port modes nothing polls the client transport until
+        // promotion: what reaches its queue waits in the RX ring, and once
+        // the ring is full the NIC drops the rest. That holds no mbuf the
+        // ring does not hold anyway, and nothing the replica needs arrives
+        // only there: the primary's MAC is seeded, not resolved (the
+        // `--dpdk-peer-mac`, or `--dpdk-replication-peer-mac` in port
+        // mode), and a DPDK primary learns the replica's from its frames.
+        // A kernel-TCP primary ARPs for it instead, which in queue mode
+        // lands on the unpolled queue 0: it needs a static neighbour entry.
+        // See docs/internal/dpdk-replication-split-2026-10.md for that and
+        // for what a client and a router then see.
+        let mut client_transport =
             melin_dpdk::DpdkTransport::from_shared_unlistening(shared, &dpdk_config, 0)?;
-        transport.send_gratuitous_arp();
+        client_transport.send_gratuitous_arp();
+        let replication_seat = crate::dpdk_repl_poll::ReplicationNicSeat::of(&nics, &dpdk_config)?;
+        let mut seat_transport = replication_seat
+            .as_ref()
+            .map(crate::dpdk_repl_poll::ReplicationNicSeat::unlistening_transport)
+            .transpose()?;
+        // Validated with the configuration: its plan exists.
+        let dial_ports = crate::replication::ReplicaDialPorts::for_node(&dpdk_config)?;
 
         let primary_ipv4 = match primary_addr.ip() {
             std::net::IpAddr::V4(ip) => ip,
@@ -2566,7 +2587,8 @@ where
         };
 
         match crate::replication::run_receiver_dpdk::<A>(
-            &mut transport,
+            seat_transport.as_mut().unwrap_or(&mut client_transport),
+            dial_ports,
             primary_ipv4,
             primary_addr.port(),
             &signing_key,
@@ -2586,11 +2608,17 @@ where
             None => return Ok(()),
             Some((mut app, writer)) => {
                 // Promotion! Transition to primary mode, on DPDK: the node
-                // serves on the transport it ran on, as a promoted
-                // kernel-TCP replica does. The receiver tore its pipeline
-                // down and handed over its application and journal writer;
-                // every link it opened is reset.
+                // serves clients on its client transport, and in shared
+                // mode its replicas too, the transport the receiver ran
+                // on, as a promoted kernel-TCP replica does. The receiver
+                // tore its pipeline down and handed over its application
+                // and journal writer; every link it opened is reset.
                 info!("replica promoted (DPDK) — transitioning to primary");
+                // In queue and port modes, the receiver's transport goes
+                // now, giving back every mbuf it holds, before the
+                // replication poll thread builds its own on the seat's
+                // queue: one transport per queue at a time.
+                drop(seat_transport);
                 // See the kernel-TCP promotion path.
                 check_promotable(&writer)?;
                 // Release --health-bind before run_as_primary_dpdk rebinds it.
@@ -2620,13 +2648,15 @@ where
                 // What `DpdkTransport::from_shared` gives a primary at
                 // boot: the client listener, with the client buffers. The
                 // replication listener is added with the primary's other
-                // replication wiring, as at boot.
-                transport
+                // replication wiring, as at boot: to this transport in
+                // shared mode, to the replication poll thread's otherwise.
+                client_transport
                     .add_listener(dpdk_config.listen_port)
                     .map_err(|e| format!("add the client listener on promotion: {e}"))?;
                 // As at boot: the switch may have aged out this port's MAC
-                // while the node only dialled out.
-                transport.send_gratuitous_arp();
+                // while the node only dialled out, or, in queue and port
+                // modes, sent nothing from it at all.
+                client_transport.send_gratuitous_arp();
 
                 // The raft guard drops — stopping the driver and joining
                 // the (already exited) promotion thread — after this
@@ -2634,11 +2664,11 @@ where
                 return run_as_primary_dpdk::<A>(
                     app,
                     writer,
-                    transport,
-                    // A replica runs shared mode only (see
-                    // `check_replication_nic_implemented`): replication
-                    // stays on the transport it ran on.
-                    None,
+                    client_transport,
+                    // Where replication runs, as at a primary's boot: on
+                    // the client transport in shared mode, on the seat's
+                    // queue, by the replication poll thread, otherwise.
+                    replication_seat,
                     &dpdk_config,
                     &config,
                     startup.on_primary,
@@ -2794,8 +2824,11 @@ where
 /// thread until shutdown.
 ///
 /// `transport` is queue 0's, listening on the client port: built at boot
-/// by a primary, or the transport a promoted replica ran on, with its
-/// client listener added. The replication listener is added here: to
+/// by a primary, or a promoted replica's client transport (the one its
+/// receiver ran on in shared mode), with its client listener added, and
+/// `replication_seat` the replica's own, as at boot: a promoted replica
+/// runs replication where a primary booted on its configuration would.
+/// The replication listener is added here: to
 /// `transport` when `replication_seat` is `None` (shared mode), the client
 /// poll thread then driving replication too; otherwise to the transport
 /// the replication poll thread builds on `replication_seat` (queue and
@@ -5531,74 +5564,55 @@ mod dpdk_config_tests {
         assert!(err.starts_with("invalid --dpdk-peer-mac: "), "{err}");
     }
 
-    /// A DPDK replica given a replication mode not implemented yet for a
-    /// replica refuses to start, through the public entry point, rather
-    /// than run it as shared. The refusal comes before EAL init, so no NIC
-    /// or hugepage is needed; the wording is pinned with the check itself.
-    #[cfg(feature = "dpdk")]
+    /// A DPDK replica runs every replication mode: its flags map onto the
+    /// mode, as a primary's do, with nothing refused for the role, and in
+    /// queue mode its dials skip the client port, which the NIC steers to
+    /// the client queue. (A replica running in port mode, and promoted, is
+    /// the netns suites'; queue mode end to end is the rig's.)
     #[test]
-    fn a_dpdk_replica_refuses_a_replication_mode_not_implemented_for_it() {
-        use std::sync::Arc;
-        use std::sync::atomic::AtomicBool;
-
-        use counter_server::{Counter, RequestDecoder, ResponseEncoder};
-
-        use crate::StartupEvents;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let authorized_keys = dir.path().join("authorized_keys");
-        std::fs::write(&authorized_keys, "").expect("write authorized_keys");
-        for (flags, mode) in [
-            (
-                &[
-                    "--dpdk-replication-queue",
+    fn a_dpdk_replica_runs_every_replication_mode() {
+        let replica = |flags: &[&str]| {
+            let cfg = ServerConfig::try_parse_from(
+                [
+                    "melin-server",
+                    "--dpdk-ports=0",
+                    "--bind=10.0.0.1:40001",
+                    "--replica-of=10.0.0.9:9877",
                     "--replication-bind=10.0.0.1:9877",
-                ][..],
-                "on a queue of its own",
-            ),
-            (
-                &[
-                    "--dpdk-replication-ports=1",
-                    "--dpdk-replication-ip=10.0.0.2",
-                ][..],
-                "on a NIC of its own",
-            ),
-        ] {
-            let cfg = ServerConfig {
-                journal: dir.path().join("counter.journal"),
-                authorized_keys: authorized_keys.clone(),
-                no_mlock: true,
-                ..ServerConfig::try_parse_from(
-                    [
-                        "melin-server",
-                        "--dpdk-ports=0",
-                        "--replica-of=10.0.0.9:9877",
-                    ]
-                    .into_iter()
-                    .chain(flags.iter().copied()),
-                )
-                .expect("the flags parse")
-            };
-            let err = super::run_with_shutdown::<Counter>(
-                cfg,
-                StartupEvents::none(),
-                (),
-                RequestDecoder,
-                ResponseEncoder,
-                None,
-                // Already set: on a host where the EAL could come up, a
-                // node that wrongly got past the check stops at once and
-                // fails the test, rather than hangs it.
-                Arc::new(AtomicBool::new(true)),
+                ]
+                .into_iter()
+                .chain(flags.iter().copied()),
             )
-            .expect_err("refused before EAL init")
-            .to_string();
-            assert!(
-                err.starts_with(&format!(
-                    "DPDK replication {mode} is not implemented yet on a replica"
-                )),
-                "{err}"
-            );
-        }
+            .expect("the flags parse");
+            dpdk_config_from(&cfg).expect("a replica's configuration")
+        };
+        let dial_from = |config: &melin_dpdk::DpdkConfig| {
+            let mut ports = crate::replication::ReplicaDialPorts::for_node(config)
+                .expect("a replica's dial ports");
+            [ports.take(), ports.take()]
+        };
+
+        let queue = replica(&["--dpdk-replication-queue"]);
+        assert_eq!(
+            queue.replication,
+            ReplicationNic::Queue(ReplicationPorts {
+                listen: Some(9877),
+                primary: Some(9877),
+            })
+        );
+        assert_eq!(dial_from(&queue), [Some(40_000), Some(40_002)]);
+
+        let port = replica(&[
+            "--dpdk-replication-ports=1",
+            "--dpdk-replication-ip=10.0.0.2",
+            "--dpdk-replication-peer-mac=02:99:00:00:00:0c",
+        ]);
+        let ReplicationNic::Port(nic) = &port.replication else {
+            panic!("port mode");
+        };
+        // The NIC the replica dials its primary from, with its MAC.
+        assert_eq!(nic.ip_addr, Ipv4Addr::new(10, 0, 0, 2));
+        assert_eq!(nic.peer_mac, Some([0x02, 0x99, 0, 0, 0, 0x0c]));
+        assert_eq!(dial_from(&port), [Some(40_000), Some(40_001)]);
     }
 }

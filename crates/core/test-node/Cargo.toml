@@ -65,6 +65,14 @@ name = "nic_groups_shared"
 path = "tests/nic_groups_shared.rs"
 required-features = ["dpdk"]
 
+# A transport dropped with connections open, its mbufs given back, and a
+# new one built on its queue, under the netns runner (see the file). Only
+# with `dpdk`, as above.
+[[test]]
+name = "transport_rebuild"
+path = "tests/transport_rebuild.rs"
+required-features = ["dpdk"]
+
 # A replication NIC that fails to come up after the client NIC has, under
 # the netns runner (see the file). Only with `dpdk`, as above.
 [[test]]

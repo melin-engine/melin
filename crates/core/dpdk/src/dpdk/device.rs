@@ -109,6 +109,32 @@ pub struct DpdkDevice {
 // SAFETY: DpdkDevice is only used from the single DPDK poll thread.
 unsafe impl Send for DpdkDevice {}
 
+/// Gives back the mbufs the device holds itself: frames queued for a TX
+/// burst the NIC has not taken yet, and frames received into a port's
+/// staging buffer and not yet handed to the stack (the `Device::receive`
+/// path's). Without it a device dropped while its queue lives on (a
+/// transport rebuilt on the same queue) would leak them from the pool.
+/// Frames already in the NIC's rings are the queue's, not the device's:
+/// the PMD frees a sent one at a later TX burst on the queue, whoever
+/// makes it, and a received one is taken by the queue's next poll.
+impl Drop for DpdkDevice {
+    fn drop(&mut self) {
+        for mbuf in self.tx_batch.drain(..) {
+            // SAFETY: an mbuf in `tx_batch` is owned by the device until
+            // a TX burst takes it, which none will now.
+            unsafe { ffi::dpdk_pktmbuf_free(mbuf) };
+        }
+        for port in &mut self.rx_ports {
+            for &mbuf in &port.rx_buf[port.rx_cursor..port.rx_count] {
+                // SAFETY: the entries from the cursor to the count were
+                // received and not yet handed out in an RX token.
+                unsafe { ffi::dpdk_pktmbuf_free(mbuf) };
+            }
+            port.rx_cursor = port.rx_count;
+        }
+    }
+}
+
 impl DpdkDevice {
     /// Create a new device backed by one or more DPDK ports.
     ///

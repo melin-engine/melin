@@ -77,8 +77,10 @@ pub use args::{DpdkArgs, DpdkArgsError, parse_mac_flag};
 // Ungated for the same reason as `peer_liveness`: the client NIC handle's
 // clock, local ports, dial wait and stream I/O are TCP-stack logic, tested
 // over an in-memory wire. The handle itself is in the gated `dpdk` module.
+// The local ports are public: a node's replica dials along a range of them
+// too.
 mod nic;
-pub use nic::dial_addr;
+pub use nic::{LocalPorts, dial_addr};
 #[cfg(test)]
 mod test_wire;
 

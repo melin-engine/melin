@@ -257,6 +257,27 @@ fn cluster_summary(nodes: &[NodeSetup]) -> String {
 #[test]
 #[serial]
 fn acked_events_survive_primary_death_under_ram_policy() {
+    acked_events_survive_primary_death(false);
+}
+
+/// [`acked_events_survive_primary_death_under_ram_policy`] with every
+/// node's replication on a NIC of its own (port mode), which exists on DPDK
+/// only: the replicas follow the primary from their replication NICs, and
+/// the winner of the election, promoted by raft rather than by the
+/// operator, serves its clients on its client NIC, which it left unpolled
+/// while a replica, and listens for replicas on its replication NIC, its
+/// replication poll thread having built a fresh transport on the NIC its
+/// receiver ran on.
+#[cfg(feature = "dpdk")]
+#[test]
+#[serial]
+fn acked_events_survive_primary_death_with_replication_on_nics_of_their_own() {
+    acked_events_survive_primary_death(true);
+}
+
+/// The test above, its nodes' replication on NICs of their own when
+/// `replication_nic` is set.
+fn acked_events_survive_primary_death(replication_nic: bool) {
     // Opt-in diagnostics: with RUST_LOG set, capture the nodes' tracing
     // output (all three run in this process) so a failing run records
     // the control-plane election dialogue, not just the panic-time
@@ -275,7 +296,11 @@ fn acked_events_survive_primary_death_under_ram_policy() {
     let nodes: Vec<NodeSetup> = (0..3)
         .map(|i| NodeSetup {
             key: SigningKey::from_bytes(&[0x61 + i as u8; 32]),
-            addrs: melin_test_node::addrs(i, || free_addr(PORT_BASE)),
+            addrs: if replication_nic {
+                melin_test_node::addrs_with_replication_nic(i, || free_addr(PORT_BASE))
+            } else {
+                melin_test_node::addrs(i, || free_addr(PORT_BASE))
+            },
             raft_addr: free_addr(PORT_BASE),
             health_addr: free_addr(PORT_BASE),
             admin_addr: free_addr(PORT_BASE),
@@ -350,11 +375,14 @@ fn acked_events_survive_primary_death_under_ram_policy() {
         start(0, config)
     };
 
-    // --- Replicas (nodes 1, 2). ---
+    // --- Replicas (nodes 1, 2), each with a replication bind of its own,
+    // as a failover-ready node is configured: the one that wins the
+    // election replicates from there once promoted. ---
     let replicas: Vec<_> = (1..3)
         .map(|i| {
             let mut config = make_config(i);
             config.replica_of = Some(replication_addr);
+            config.replication_bind = Some(nodes[i].addrs.replication());
             start(i, config)
         })
         .collect();
@@ -441,6 +469,20 @@ fn acked_events_survive_primary_death_under_ram_policy() {
         !serves_clients(nodes[loser].addrs.client(), Duration::from_secs(2)),
         "the losing replica must not serve clients"
     );
+    // The winner listens for replicas at its replication bind: on DPDK in
+    // port mode, its replication poll thread has built a fresh transport
+    // on the NIC its receiver ran on. A refused connection (a reset from
+    // a stack with no listener there) means it has not.
+    let replication = nodes[winner].addrs.replication();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while TcpStream::connect_timeout(&replication, Duration::from_millis(300)).is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "the promoted node never listened for replicas at {replication}\n{}",
+            cluster_summary(&nodes)
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
 
     // --- Phase 5: the documented post-failover workflow. The promoted
     // node still runs `ram`, whose gate is structurally
