@@ -840,6 +840,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "humantime"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15cdd26707701c53297e2fa6afb323d55fbc1d0810c3aec078ae3ef0424c3c15"
+
+[[package]]
 name = "iana-time-zone"
 version = "0.1.65"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -988,6 +994,24 @@ dependencies = [
  "libc",
  "tempfile",
  "tracing",
+]
+
+[[package]]
+name = "melin-bench"
+version = "0.19.0"
+dependencies = [
+ "clap",
+ "hdrhistogram",
+ "humantime",
+ "melin-app",
+ "melin-client",
+ "melin-dpdk",
+ "melin-example-echo",
+ "melin-example-notary",
+ "melin-journal",
+ "melin-server-runtime",
+ "melin-test-node",
+ "tempfile",
 ]
 
 [[package]]
