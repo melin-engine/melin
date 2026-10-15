@@ -205,8 +205,38 @@ BIN_PATTERN='[m]elin-bench/bin/'
 DPDK_RAN=0
 DEGRADED_RUNS=()
 
+# `sample_metrics <file> <pattern>`: in the background, the primary's
+# /metrics lines matching `pattern` (an extended regex), every second
+# until stop_samplers, into `file`, each scrape after a `# sample` line.
+# Scraped from the bench host over the private network: a shell loop
+# forking curl on the primary would share core 0 with its network
+# interrupts.
+SAMPLERS=()
+sample_metrics() {
+    rssh "$BENCH" "while :; do echo '# sample'; curl -s --max-time 1 http://${SERVER_VLAN}:${HEALTH_PORT}/metrics | grep -E '$2'; sleep 1; done" > "$1" 2>/dev/null &
+    SAMPLERS+=("$!")
+}
+
+# Stop every sampler sample_metrics started. Each is a subshell running
+# rssh, whose ssh outlives it unless stopped first: left running, it would
+# keep appending to its file for the rest of the suite. Defined ahead of
+# `cleanup`, which calls it, since the suite can exit before reaching
+# any run.
+stop_samplers() {
+    local sampler
+    for sampler in "${SAMPLERS[@]}"; do
+        pkill -P "$sampler" 2>/dev/null || true
+        kill "$sampler" 2>/dev/null || true
+        wait "$sampler" 2>/dev/null || true
+    done
+    SAMPLERS=()
+}
+
 cleanup() {
     local host
+    # A run interrupted mid-way leaves its sampler running: its ssh, not
+    # the subshell `jobs -p` lists below, is what keeps the remote loop.
+    stop_samplers
     for host in "${HOSTS[@]}"; do
         # Best-effort: a host may be unreachable or already clean.
         rssh "$host" "${SUDO} pkill -INT -f '${BIN_PATTERN}'" 2>/dev/null || true
@@ -720,19 +750,15 @@ run_workload() {
     echo ""
     echo "--- ${name}: ${clients} × ${window} for ${duration} ---"
 
-    # The primary's health, sampled every second for the run's length,
-    # from the bench host over the private network: a shell loop forking
-    # curl on the primary would share core 0 with its network interrupts.
+    # The primary's health, sampled every second for the run's length.
     local samples="${RESULTS_DIR}/${name}.health"
-    rssh "$BENCH" "while :; do echo '# sample'; curl -s --max-time 1 http://${SERVER_VLAN}:${HEALTH_PORT}/metrics | grep -E '^melin_replica(s_connected|_catching_up|_evictions_total)'; sleep 1; done" > "$samples" 2>/dev/null &
-    local sampler=$!
+    sample_metrics "$samples" '^melin_replica(s_connected|_catching_up|_evictions_total)'
 
     local rc=0
     rssh "$BENCH" "${SUDO} rm -f ${BENCH_JSON}"
     rssh "$BENCH" "${SUDO} $(bench_command "$transport" "$clients" "$window" "$duration")" \
         | tee "${RESULTS_DIR}/${name}.txt" || rc=$?
-    kill "$sampler" 2>/dev/null || true
-    wait "$sampler" 2>/dev/null || true
+    stop_samplers
 
     if (( rc != 0 )) || ! rscp "${BENCH}:${BENCH_JSON}" "${RESULTS_DIR}/${name}.json" 2>/dev/null; then
         echo "  FAILED: the load generator exited ${rc}"
