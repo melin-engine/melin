@@ -7,6 +7,12 @@ authorized_keys
 *.key
 *.pub
 .claude/scheduled_tasks.lock
+.claude/settings.local.json
+
+# Contributor notes that are not for the public repository (session logs,
+# raw bench runs and the hosts behind them). Never force-add anything from
+# here, and never link to it from a committed file.
+/docs/internal/private/
 
 # QEMU VM images for DPDK virtio testing.
 scripts/dpdk/.cache/
