@@ -304,7 +304,8 @@ impl<H: BorrowMut<NicHandle>> StreamConnection<DpdkStream<H>> {
     ///   deadline, whose message names the MAC the SYN was addressed to as
     ///   the first thing to check (a wrong one is silent);
     ///   [`io::ErrorKind::ConnectionRefused`] for a reset (nothing listens
-    ///   there, or a DPDK node was in another client's handshake);
+    ///   there, or a DPDK node had more handshakes under way on the port
+    ///   than its backlog takes);
     ///   [`io::ErrorKind::InvalidInput`] for a zero `socket_buffer`;
     ///   [`io::ErrorKind::AddrInUse`] for a handle with no room for
     ///   another stream.

@@ -57,14 +57,13 @@ static NEXT_HANDLE_TAG: AtomicU64 = AtomicU64::new(0);
 /// # One dial at a time
 ///
 /// [`Self::dial`] returns once the connection is established or has
-/// failed, so the dials of one handle are sequential. That is the node's
-/// constraint, not the client's: a DPDK node keeps one listening socket
-/// per port and replaces it only once the connection it accepted is
-/// established, and its stack answers a SYN that matches no listener with
-/// an RST. A second dial in flight during another's handshake would
-/// therefore be refused outright, where a kernel node would queue it in
-/// its backlog. The constraint lifts when the node keeps a backlog of
-/// listeners.
+/// failed, so the dials of one handle are sequential. A DPDK node takes
+/// a few handshakes at once on a port, one per socket of the port's
+/// backlog of listening sockets, and its stack answers a SYN that finds
+/// none of them listening with an RST, where a kernel node would queue
+/// it. Sequential dials keep a handle from refusing itself; clients that
+/// dial one node at once, more of them than its backlog, can still be
+/// refused, and retry.
 ///
 /// # Streams
 ///
@@ -285,8 +284,8 @@ impl NicHandle {
     ///   names the MAC the SYN was addressed to as the first thing to
     ///   check: a wrong one is silent.
     /// - [`io::ErrorKind::ConnectionRefused`]: the peer answered with a
-    ///   reset (nothing listens there, or a DPDK node was in another
-    ///   client's handshake).
+    ///   reset (nothing listens there, or a DPDK node had more handshakes
+    ///   under way on the port than its backlog takes).
     /// - [`io::ErrorKind::InvalidInput`]: a zero `socket_buffer`, or an
     ///   address the stack cannot dial.
     /// - [`io::ErrorKind::AddrInUse`]: the handle holds as many streams as

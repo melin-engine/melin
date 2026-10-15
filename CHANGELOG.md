@@ -108,9 +108,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   - `dial` takes a deadline and the caller's clock, gives every socket a
     fresh local port, and tells a refusal (`ConnectionRefused`) from a
     timeout (`TimedOut`, naming the MAC the SYN went to as the first
-    thing to check). Dials are sequential: a DPDK node refuses a SYN that
-    arrives during another client's handshake, so `dial` returns only once
-    its connection is established or has failed.
+    thing to check). Dials are sequential: a DPDK node takes only a few
+    handshakes at once on a port and refuses a SYN beyond them, so `dial`
+    returns only once its connection is established or has failed.
   - `stream(&id)` lends the stream a `StreamId` names as a `NicStream`
     view, for one call: a non-blocking `send` with a `can_send` room
     query, an in-place `send_in_place` that lends the transmit buffer's
@@ -401,6 +401,23 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   poll thread. The batch is now offered again until it is sent, and the
   ring's reader makes reading past an unconsumed batch impossible (see
   Changed).
+- **A DPDK node no longer refuses a client that connects right behind
+  another.** Each port had one listening socket, replaced only once its
+  connection was established, and the stack answers a SYN that finds no
+  socket listening with a reset: a SYN that arrived during another
+  connection's handshake, or in the same poll as its last ACK, was
+  refused, so clients dialing in turn were refused intermittently and
+  clients reconnecting together after a failover more often. Each port
+  now keeps a backlog of listening sockets and replaces each one as it
+  is accepted, so it takes several handshakes at once, as a kernel's
+  listen backlog does; only a burst beyond it is refused. A handshake
+  whose peer vanished after its SYN now times out and frees its socket
+  for the next client, rather than holding it until a restart. A full socket
+  set now shrinks the backlog instead of accepting a connection on a
+  slot beyond the node's per-connection tables, which could panic its
+  poll thread, and a connection its peer closed or reset in the poll
+  that completed its handshake no longer leaves its port without a
+  listener for good. The divergence entry is closed.
 - **A DPDK node frees a client's slot when the client closes.** The
   client's FIN left the node's socket half-closed, which its stack still
   counts as active, so the connection and its slot were held until the
