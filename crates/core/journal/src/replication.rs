@@ -2,13 +2,13 @@
 //! from the journal stage to one or more replication sender threads.
 //!
 //! Uses the generic disruptor ring for sequencing and backpressure, with a
-//! side array of pre-allocated 128 KiB byte buffers indexed by `seq & mask`.
-//! The journal stage copies batch bytes into the buffer, then publishes the
-//! metadata slot. Consumers read the metadata and reference the buffer
-//! directly (zero-copy read).
+//! side array of pre-allocated byte buffers, one [`CHUNK_SIZE`] chunk per
+//! slot, indexed by `seq & mask`. The journal stage copies batch bytes into
+//! the buffer, then publishes the metadata slot. Consumers read the
+//! metadata and reference the buffer directly (zero-copy read).
 //!
 //! This design avoids heap allocation on the journal thread. The only cost
-//! is a memcpy into the pre-allocated buffer (~80 KiB per batch).
+//! is one copy of each batch into its slot's buffer.
 
 use std::cell::UnsafeCell;
 use std::sync::Arc;
