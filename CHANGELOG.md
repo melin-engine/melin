@@ -216,8 +216,8 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   request in flight), for the echo and notary examples or the Exchange
   Core. It builds every binary on the machine running it, for the bench
   hosts' CPU and against a sysroot taken from them, and copies them
-  over; each run starts from fresh journals, and a replica evicted,
-  missing or catching up during it fails the suite.
+  over; each run starts from fresh journals, keeps every node's log, and
+  a replica evicted, missing or catching up during it fails the suite.
   `scripts/bench/server-setup.sh` and `server-deploy.sh` prepare the
   hosts; `scripts/bench/test-containers.sh` rehearses the whole suite
   against podman containers. The load generator is the new `melin-bench` tool

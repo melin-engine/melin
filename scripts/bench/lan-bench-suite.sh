@@ -48,6 +48,8 @@
 #   SINGLE_DURATION       measured phase of a single run (default 30s)
 #   WARMUP_DURATION       load before the measured phase (default 5s)
 #   COOLDOWN_DURATION     load after it, untimed (default 5s)
+#   SETTLE_SECS           seconds between both replicas live and the load
+#                         starting (default 0)
 #   ACK_POLICY            the cluster's ack policy (default disk+ram)
 #   BENCH_CORE            core the load generator's loop is pinned to
 #                         (default 7)
@@ -61,6 +63,10 @@
 #   TARGET_CPU            the CPU to build for, instead of asking the hosts
 #   SYSROOT               a sysroot to build against, instead of the cached
 #                         one taken from the server host
+#   PREBUILT_BIN_DIR      a local directory whose binaries replace the
+#                         suite's builds of the same name (e.g.
+#                         melin-ec-server, melin-ec-bench): an A/B against
+#                         a build made elsewhere
 #   JOURNAL_DIR           where the nodes journal (default /mnt/journal)
 #   RESULTS_DIR           default bench-results/lan-<app>-<timestamp>
 #   RUST_LOG              the nodes' log filter (default info)
@@ -442,6 +448,22 @@ if [[ "$NEED_DPDK" == 1 ]]; then
     fi
 fi
 
+# A binary in PREBUILT_BIN_DIR replaces this suite's build of the same
+# name. One that matches nothing is refused: a misspelt name would
+# otherwise run the suite's own build while claiming the prebuilt one.
+if [[ -n "${PREBUILT_BIN_DIR:-}" ]]; then
+    for bin in "${PREBUILT_BIN_DIR}"/*; do
+        [[ -f "$bin" ]] || continue
+        name=$(basename "$bin")
+        if [[ ! -e "${OUT_DIR}/${name}" ]]; then
+            echo "error: ${bin} replaces nothing this run builds ($(ls "$OUT_DIR" | tr '\n' ' '))" >&2
+            exit 1
+        fi
+        cp "$bin" "${OUT_DIR}/${name}"
+        echo "  using the prebuilt ${name} from ${PREBUILT_BIN_DIR}"
+    done
+fi
+
 # ---------------------------------------------------------------------------
 # Deploy: binaries, keys, authorized_keys
 # ---------------------------------------------------------------------------
@@ -657,7 +679,11 @@ start_cluster() {
     # On a fresh journal the primary serves clients only once a replica is
     # live, so this waits for the replicas too.
     wait_for_log "$SERVER" "$primary_ready" 120 || return 1
-    wait_for_replicas 2
+    wait_for_replicas 2 || return 1
+    if (( ${SETTLE_SECS:-0} > 0 )); then
+        echo "  settling ${SETTLE_SECS}s before the load"
+        sleep "$SETTLE_SECS"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -694,9 +720,11 @@ run_workload() {
     echo ""
     echo "--- ${name}: ${clients} × ${window} for ${duration} ---"
 
-    # The primary's health, sampled every second for the run's length.
+    # The primary's health, sampled every second for the run's length,
+    # from the bench host over the private network: a shell loop forking
+    # curl on the primary would share core 0 with its network interrupts.
     local samples="${RESULTS_DIR}/${name}.health"
-    rssh "$SERVER" "while :; do echo '# sample'; curl -s --max-time 1 http://${SERVER_VLAN}:${HEALTH_PORT}/metrics | grep -E '^melin_replica(s_connected|_catching_up|_evictions_total)'; sleep 1; done" > "$samples" 2>/dev/null &
+    rssh "$BENCH" "while :; do echo '# sample'; curl -s --max-time 1 http://${SERVER_VLAN}:${HEALTH_PORT}/metrics | grep -E '^melin_replica(s_connected|_catching_up|_evictions_total)'; sleep 1; done" > "$samples" 2>/dev/null &
     local sampler=$!
 
     local rc=0
@@ -720,6 +748,16 @@ run_workload() {
     fi
 }
 
+# Every node's log for run `name`, before the next run's launch truncates
+# it: a replica's is the only record of why it fell behind. Best-effort:
+# a host that cannot be reached loses its log, not the suite.
+save_node_logs() {
+    local name="$1"
+    rssh "$SERVER" "cat ${NODE_LOG}" > "${RESULTS_DIR}/${name}.primary.log" 2>/dev/null || true
+    rssh "$REPLICA" "cat ${NODE_LOG}" > "${RESULTS_DIR}/${name}.replica1.log" 2>/dev/null || true
+    rssh "$REPLICA2" "cat ${NODE_LOG}" > "${RESULTS_DIR}/${name}.replica2.log" 2>/dev/null || true
+}
+
 # ---------------------------------------------------------------------------
 # The runs
 # ---------------------------------------------------------------------------
@@ -728,13 +766,13 @@ for transport in "${RUN_TRANSPORTS[@]}"; do
         # A fresh cluster per run: each run starts from an empty journal.
         if ! start_cluster "$transport"; then
             DEGRADED_RUNS+=("${transport}-${workload}: the cluster did not start")
-            rssh "$SERVER" "cat ${NODE_LOG}" > "${RESULTS_DIR}/${transport}-${workload}.primary.log" 2>/dev/null || true
             stop_nodes "${HOSTS[@]}"
+            save_node_logs "${transport}-${workload}"
             continue
         fi
         run_workload "$transport" "$workload"
         stop_nodes "${HOSTS[@]}"
-        rssh "$SERVER" "cat ${NODE_LOG}" > "${RESULTS_DIR}/${transport}-${workload}.primary.log" 2>/dev/null || true
+        save_node_logs "${transport}-${workload}"
     done
 done
 

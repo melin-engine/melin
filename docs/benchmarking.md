@@ -80,6 +80,20 @@ measures, then keeps the load on through a cool-down so that the last
 measured replies arrive under the same load as the first. On the DPDK
 transport it runs on DPDK too.
 
+The load starts once both replicas are connected and none is catching
+up. A replica that has only just caught up can still be busy with what
+it received, and full load arriving within a second or two of that can
+evict it; at the default replication ring size it then cannot rejoin
+under that load, and the run is degraded. `SETTLE_SECS` waits that many
+seconds between the replicas going live and the load starting: 5 is
+enough on current hardware. The default, 0, starts the load straight
+away, which is what a cluster taking traffic as soon as its replicas are
+live would face.
+
+`PREBUILT_BIN_DIR` names a local directory whose binaries replace the
+suite's own builds of the same name, to compare a build made elsewhere
+against the suite's.
+
 ## Rehearsing without hosts
 
 `scripts/bench/test-containers.sh [echo|notary|ec]` runs the suite end to
@@ -98,8 +112,9 @@ Each run leaves, in `bench-results/lan-<app>-<timestamp>/`:
   shape every application's load generator writes;
 - `<transport>-<workload>.txt`: the load generator's console output;
 - `<transport>-<workload>.health`: the primary's replica metrics,
-  sampled every second;
-- `<transport>-<workload>.primary.log`: the primary's log.
+  sampled every second from the load-generating host;
+- `<transport>-<workload>.primary.log`, `.replica1.log` and
+  `.replica2.log`: each node's log.
 
 A latency is a full round trip as the client sees it, from the request
 leaving the client to its reply arriving. A run whose replicas were
