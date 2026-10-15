@@ -1,5 +1,9 @@
-# The LAN suite's logic that needs no host: sourced by lan-bench-suite.sh
-# and by test-lan-bench-suite.sh, which runs it against fixtures.
+# The LAN suite's logic that needs no host: sourced by lan-bench-suite.sh,
+# by its podman rehearsal test-containers.sh, by test-dpdk-setup.sh, and
+# by test-lan-bench-suite.sh, which runs it against fixtures.
+# dpdk-setup.sh does not source it (it ships to hosts standalone): its
+# ipv4_to_int is mirrored here as ipv4_as_int, and test-dpdk-setup.sh
+# checks the two agree.
 
 # `conf_value <conf text> <key>`: a value of /etc/melin-dpdk.conf, its
 # surrounding double quotes stripped (multi-word values are quoted).
@@ -8,10 +12,12 @@ conf_value() {
 }
 
 # `dpdk_conf_mode <conf text>`: how a host's NIC runs DPDK, as its
-# /etc/melin-dpdk.conf says: `mlx5`, `l3` or `sriov`. A conf that names
-# no mode, or no conf at all (empty text), is SR-IOV: the suite runs
-# dpdk-setup.sh unattended on a host without one, and SR-IOV on a bond is
-# the only setup that succeeds that way (mlx5 needs DPDK_IP).
+# /etc/melin-dpdk.conf says: `mlx5`, `l3` or `sriov` (dpdk-setup.sh's),
+# or `af_packet` (the container rig's, test-containers.sh, on its
+# containers' veths). A conf that names no mode, or no conf at all (empty
+# text), is SR-IOV: the suite runs dpdk-setup.sh unattended on a host
+# without one, and SR-IOV on a bond is the only setup that succeeds that
+# way (mlx5 needs DPDK_IP).
 dpdk_conf_mode() {
     local mode
     mode=$(conf_value "$1" DPDK_MODE)
@@ -68,14 +74,24 @@ dpdk_replication_modes() {
 # source for both.
 DPDK_REPLICATION_READY="DPDK replication sender started"
 
+# Why af_packet cannot run queue mode: refuse_queue_mode's reason for an
+# af_packet host and test-containers.sh's for its DPDK=1 rig, one wording.
+AF_PACKET_NO_QUEUE_MODE="which has one queue and no rte_flow to steer replication to a queue of its own; queue mode needs mlx5"
+
 # `refuse_queue_mode <host> <conf text>`: whether `host` can run DPDK
 # replication on a queue of its own, which needs the NIC to steer
-# replication to it (mlx5); IAVF, an SR-IOV VF's driver, cannot. Says why
-# on stderr and fails for a host that cannot, judged by its
-# /etc/melin-dpdk.conf (empty text: it has none).
+# replication to it (mlx5); IAVF, an SR-IOV VF's driver, cannot, nor can
+# af_packet, which has one queue and no rte_flow. Says why on stderr and
+# fails for a host that cannot, judged by its /etc/melin-dpdk.conf (empty
+# text: it has none).
 refuse_queue_mode() {
-    local host="$1" conf="$2"
-    [[ "$(dpdk_conf_mode "$conf")" != sriov ]] && return 0
+    local host="$1" conf="$2" mode
+    mode=$(dpdk_conf_mode "$conf")
+    if [[ "$mode" == af_packet ]]; then
+        echo "error: DPDK_REPLICATION=queue: ${host} runs DPDK on af_packet (DPDK_MODE=af_packet in /etc/melin-dpdk.conf), ${AF_PACKET_NO_QUEUE_MODE}" >&2
+        return 1
+    fi
+    [[ "$mode" != sriov ]] && return 0
     if [[ -z "$conf" ]]; then
         echo "error: DPDK_REPLICATION=queue: ${host} has no /etc/melin-dpdk.conf, and the suite's unattended setup cannot configure queue mode (it sets up SR-IOV on a bond, whose VFs cannot steer replication to a queue of its own, and mlx5 needs DPDK_IP); run scripts/dpdk/dpdk-setup.sh with DPDK_IP there first" >&2
     else
@@ -84,40 +100,78 @@ refuse_queue_mode() {
     return 1
 }
 
-# The /etc/melin-dpdk.conf keys of a replication NIC, which dpdk-setup.sh
-# writes when given one (DPDK_REPL_NIC and DPDK_REPL_IP, mlx5 only): its
-# DPDK port id, address, MAC and PCI address.
-DPDK_REPL_CONF_KEYS=(DPDK_REPL_PORT DPDK_REPL_IP DPDK_REPL_MAC DPDK_REPL_PCI)
+# The /etc/melin-dpdk.conf keys of a replication NIC: its DPDK port id,
+# address and MAC, and one of DPDK_REPL_DEVICE_KEYS naming its device.
+# dpdk-setup.sh writes them when given one (DPDK_REPL_NIC and
+# DPDK_REPL_IP, mlx5 only), and the container rig (test-containers.sh)
+# on its node containers.
+DPDK_REPL_CONF_KEYS=(DPDK_REPL_PORT DPDK_REPL_IP DPDK_REPL_MAC)
+# How a replication NIC's device is named, one or the other: a PCI
+# address (a real port, dpdk-setup.sh's), which DPDK_EAL_ARGS allows with
+# `-a <pci>`, or a virtual device's name (af_packet, the container
+# rig's), which DPDK_EAL_ARGS creates with `--vdev=<name>[,<args>]`.
+DPDK_REPL_DEVICE_KEYS=(DPDK_REPL_PCI DPDK_REPL_VDEV)
 
 # `refuse_port_mode <host> <conf text>`: whether `host` can run DPDK
 # replication on a NIC of its own, which needs one: every
 # DPDK_REPL_CONF_KEYS key in its /etc/melin-dpdk.conf (empty text: it has
-# none), and DPDK_EAL_ARGS allowing the replication NIC's device beside
-# the client NIC's (the node's one EAL brings up both). Says why on
-# stderr and fails for a host that cannot. The rest (another port and
-# address than the client NIC's, in its subnet) the node checks itself,
-# before it touches a NIC, and its log says so.
+# none) and one DPDK_REPL_DEVICE_KEYS key, and DPDK_EAL_ARGS bringing up
+# the replication NIC's device beside the client NIC's (the node's one
+# EAL brings up both). A conf naming neither device is reported missing
+# DPDK_REPL_PCI, as a real host's is. Says why on stderr and fails for a
+# host that cannot, with the remedy for the kind of host it is: an
+# af_packet one (DPDK_MODE=af_packet, or a virtual device named) has its
+# conf written by the container rig, any other by dpdk-setup.sh. The rest
+# (another port and address than the client NIC's, in its subnet) the
+# node checks itself, before it touches a NIC, and its log says so.
 refuse_port_mode() {
-    local host="$1" conf="$2" key missing=() pci
+    local host="$1" conf="$2" key value named=() missing=() device_key device
     local setup="run scripts/dpdk/dpdk-setup.sh with DPDK_IP, DPDK_REPL_NIC and DPDK_REPL_IP there (a second mlx5 port, see docs/benchmarking.md)"
     if [[ -z "$conf" ]]; then
         echo "error: DPDK_REPLICATION=port: ${host} has no /etc/melin-dpdk.conf, so no NIC of replication's own; ${setup}" >&2
         return 1
     fi
-    for key in "${DPDK_REPL_CONF_KEYS[@]}"; do
+    device_key="${DPDK_REPL_DEVICE_KEYS[0]}"
+    for key in "${DPDK_REPL_DEVICE_KEYS[@]}"; do
+        value=$(conf_value "$conf" "$key")
+        [[ -n "$value" ]] && named+=("${key}=${value}") && device_key="$key"
+    done
+    if (( ${#named[@]} > 1 )); then
+        local joined
+        joined=$(printf ', %s' "${named[@]}")
+        echo "error: DPDK_REPLICATION=port: ${host}'s /etc/melin-dpdk.conf names the replication NIC's device twice (${joined:2}); keep the one DPDK_EAL_ARGS brings up" >&2
+        return 1
+    fi
+    if [[ "$device_key" == DPDK_REPL_VDEV || "$(conf_value "$conf" DPDK_MODE)" == af_packet ]]; then
+        setup="an af_packet conf is the container rig's (DPDK=1 scripts/bench/test-containers.sh), which gives each node container a replication NIC on melin-bench-repl (see docs/benchmarking.md)"
+    fi
+    for key in "${DPDK_REPL_CONF_KEYS[@]}" "$device_key"; do
         [[ -z "$(conf_value "$conf" "$key")" ]] && missing+=("$key")
     done
     if (( ${#missing[@]} > 0 )); then
         echo "error: DPDK_REPLICATION=port: ${host}'s /etc/melin-dpdk.conf has no ${missing[*]}, so no NIC of replication's own; ${setup}" >&2
         return 1
     fi
-    pci=$(conf_value "$conf" DPDK_REPL_PCI)
-    # Allowed bare or with devargs (`-a <pci>,<key>=<value>`).
+    device=$(conf_value "$conf" "$device_key")
     local eal=" $(conf_value "$conf" DPDK_EAL_ARGS) "
-    if [[ "$eal" != *" -a ${pci} "* && "$eal" != *" -a ${pci},"* ]]; then
-        echo "error: DPDK_REPLICATION=port: ${host}'s /etc/melin-dpdk.conf has DPDK_EAL_ARGS not allowing the replication NIC's device (-a ${pci}); ${setup}" >&2
-        return 1
-    fi
+    case "$device_key" in
+        DPDK_REPL_VDEV)
+            # Created bare or with devargs, in either of EAL's spellings
+            # (`--vdev=<name>[,...]`, `--vdev <name>[,...]`).
+            if [[ "$eal" != *" --vdev=${device} "* && "$eal" != *" --vdev=${device},"* \
+                && "$eal" != *" --vdev ${device} "* && "$eal" != *" --vdev ${device},"* ]]; then
+                echo "error: DPDK_REPLICATION=port: ${host}'s /etc/melin-dpdk.conf has DPDK_EAL_ARGS not creating the replication NIC's device (--vdev=${device}); add it there beside the client NIC's" >&2
+                return 1
+            fi
+            ;;
+        DPDK_REPL_PCI)
+            # Allowed bare or with devargs (`-a <pci>,<key>=<value>`).
+            if [[ "$eal" != *" -a ${device} "* && "$eal" != *" -a ${device},"* ]]; then
+                echo "error: DPDK_REPLICATION=port: ${host}'s /etc/melin-dpdk.conf has DPDK_EAL_ARGS not allowing the replication NIC's device (-a ${device}); ${setup}" >&2
+                return 1
+            fi
+            ;;
+    esac
 }
 
 # `replication_flags <DPDK replication mode> <replication ports>
@@ -302,18 +356,25 @@ judge_steering() {
 # each run from the primary's /stats-dump
 # ---------------------------------------------------------------------------
 
-# `trace_setting <TRACE>`: 1 when the suite runs traced servers (`1`), 0
-# when it does not (unset, empty or `0`). On anything else, says why on
-# stderr and fails, rather than reading a typo as either.
-trace_setting() {
-    case "${1:-}" in
+# `switch_setting <name> <value>`: an on/off setting's value, 1 when on
+# (`1`), 0 when off (unset, empty or `0`). On anything else, says why on
+# stderr, naming the setting, and fails, rather than reading a typo as
+# either.
+switch_setting() {
+    case "${2:-}" in
         "" | 0) echo 0 ;;
         1) echo 1 ;;
         *)
-            echo "error: TRACE must be 1, or 0 or unset (got '${1}')" >&2
+            echo "error: ${1} must be 1, or 0 or unset (got '${2}')" >&2
             return 1
             ;;
     esac
+}
+
+# `trace_setting <TRACE>`: 1 when the suite runs traced servers, 0 when
+# it does not (switch_setting's).
+trace_setting() {
+    switch_setting TRACE "${1:-}"
 }
 
 # The cargo feature a server is traced with: the runtime's per-stage
@@ -446,4 +507,231 @@ trace_summary() {
                     printf "%-28s (no DPDK poll loop among its %d stages)\n", run, stages[run]
             }
         }' "$@"
+}
+
+# ---------------------------------------------------------------------------
+# DPDK=1 in the container rig (test-containers.sh): the suite's DPDK
+# passes on af_packet, over the containers' veths, configured by the rig
+# itself rather than by dpdk-setup.sh
+# ---------------------------------------------------------------------------
+
+# `ipv4_as_int <a.b.c.d>`: the address as an integer. On anything else,
+# an octet with a leading zero included (the node parses addresses as
+# Rust's Ipv4Addr does, which refuses one), says why on stderr and fails.
+# A copy of scripts/dpdk/dpdk-setup.sh's ipv4_to_int, but for the error
+# message: that script is shipped to a host alone and is a root
+# provisioner, not a library either side can source. Named apart so that
+# test-dpdk-setup.sh, which sources both, tests the shipping one; it also
+# checks that the two agree.
+ipv4_as_int() {
+    local o='(0|[1-9][0-9]{0,2})'
+    if [[ ! "$1" =~ ^$o\.$o\.$o\.$o$ ]]; then
+        echo "error: '$1' is not an IPv4 address" >&2
+        return 1
+    fi
+    local octet value=0
+    for octet in "${BASH_REMATCH[@]:1}"; do
+        if (( octet > 255 )); then
+            echo "error: '$1' is not an IPv4 address" >&2
+            return 1
+        fi
+        value=$(( (value << 8) | octet ))
+    done
+    echo "$value"
+}
+
+# `int_to_ipv4 <integer>`: ipv4_as_int's inverse.
+int_to_ipv4() {
+    echo "$(( ($1 >> 24) & 255 )).$(( ($1 >> 16) & 255 )).$(( ($1 >> 8) & 255 )).$(( $1 & 255 ))"
+}
+
+# `cidr_range <a.b.c.d/len>`: the first and last addresses of the subnet,
+# as integers, space-separated (host bits in the address given are
+# ignored). On anything else, says why on stderr and fails.
+cidr_range() {
+    local ip="${1%/*}" len="${1##*/}" value size
+    if [[ "$1" != */* || ! "$len" =~ ^[0-9]{1,2}$ ]] || (( 10#$len > 32 )); then
+        echo "error: '$1' is not an IPv4 subnet (a.b.c.d/len)" >&2
+        return 1
+    fi
+    value=$(ipv4_as_int "$ip") || return 1
+    size=$(( 1 << (32 - 10#$len) ))
+    value=$(( value - value % size ))
+    echo "$value $(( value + size - 1 ))"
+}
+
+# `cidrs_overlap <a.b.c.d/len> <a.b.c.d/len>`: whether the two subnets
+# share an address (exit status). Both must be well formed (cidr_range).
+cidrs_overlap() {
+    local a b
+    a=$(cidr_range "$1") || return 1
+    b=$(cidr_range "$2") || return 1
+    read -ra a <<< "$a"
+    read -ra b <<< "$b"
+    (( a[0] <= b[1] && b[0] <= a[1] ))
+}
+
+# Where the rig's two networks are carved from: podman's own pool for
+# networks it creates (its default `default_subnet_pools` base), so that
+# they sit where any podman network would, a /24 each.
+REHEARSAL_POOL=10.89
+# The prefix length every DPDK NIC of the rehearsal is given: the pool's,
+# a /16 holding both of the rig's /24s. The node takes its replication
+# NIC's address to be in the client NIC's subnet (it gives the replication
+# NIC the client NIC's prefix length), and the two NICs are on the two
+# networks, so the client NIC's subnet must span both. Wider than either
+# network, which costs nothing: a DPDK NIC resolves only the peers it
+# talks to, each on its own network.
+REHEARSAL_DPDK_PREFIX_LEN=16
+
+# `rehearsal_subnets <subnet>...`: the rig's two networks (the clients'
+# and replication's), two /24s of REHEARSAL_POOL.0.0/16 overlapping none
+# of the subnets given (every existing podman network's; IPv6 ones are
+# skipped), as `<clients' subnet> <replication's subnet>`. Taken from the
+# top of the pool down, as podman allocates from the bottom up. On a pool
+# with no two free, or a subnet that is not one, says why on stderr and
+# fails.
+rehearsal_subnets() {
+    local existing=() subnet third candidate taken
+    for subnet in "$@"; do
+        [[ "$subnet" == *:* ]] && continue
+        cidr_range "$subnet" >/dev/null || return 1
+        existing+=("$subnet")
+    done
+    for (( third = 254; third >= 0; third -= 2 )); do
+        taken=
+        for candidate in "${REHEARSAL_POOL}.${third}.0/24" "${REHEARSAL_POOL}.$((third + 1)).0/24"; do
+            for subnet in "${existing[@]}"; do
+                cidrs_overlap "$candidate" "$subnet" && taken=1
+            done
+        done
+        if [[ -z "$taken" ]]; then
+            echo "${REHEARSAL_POOL}.${third}.0/24 ${REHEARSAL_POOL}.$((third + 1)).0/24"
+            return 0
+        fi
+    done
+    echo "error: no two free /24s in ${REHEARSAL_POOL}.0.0/16 for the rehearsal's networks (podman's networks hold ${existing[*]}); remove some with podman network rm" >&2
+    return 1
+}
+
+# `podman_subnets <JSON>`: the subnets of `podman network inspect`'s
+# networks (its JSON, one array of every network), space-separated, IPv6
+# ones included. Says why on stderr and fails on JSON it cannot read.
+podman_subnets() {
+    python3 -I -c '
+import json, sys
+try:
+    networks = json.load(sys.stdin)
+    print(" ".join(s["subnet"] for n in networks for s in (n.get("subnets") or [])))
+except (ValueError, TypeError, KeyError, AttributeError):
+    sys.exit("error: cannot read the subnets of the podman networks (podman network inspect gave no list of networks with subnets)")
+' <<< "$1"
+}
+
+# `lower_half <a.b.c.d/len>`: the subnet's lower half, as a subnet: the
+# addresses podman is told to allocate from (`--ip-range`), leaving the
+# upper half to high_free_addresses.
+lower_half() {
+    local range
+    range=$(cidr_range "$1") || return 1
+    echo "$(int_to_ipv4 "${range%% *}")/$(( 10#${1##*/} + 1 ))"
+}
+
+# `high_free_addresses <subnet> <count> [<taken address>...]`: the
+# `count` highest host addresses of the subnet (its broadcast address
+# excluded) that are not taken, highest first, space-separated: the
+# addresses DPDK takes beside the kernel's, which podman assigned from
+# the subnet's lower half. Fails, saying why on stderr, when the subnet
+# has too few.
+high_free_addresses() {
+    local subnet="$1" count="$2" range address candidate found=()
+    shift 2
+    range=$(cidr_range "$subnet") || return 1
+    read -ra range <<< "$range"
+    local taken=" $* "
+    address=$(( range[1] - 1 ))
+    while (( address > range[0] && ${#found[@]} < count )); do
+        candidate=$(int_to_ipv4 "$address")
+        [[ "$taken" != *" ${candidate} "* ]] && found+=("$candidate")
+        address=$(( address - 1 ))
+    done
+    if (( ${#found[@]} < count )); then
+        echo "error: ${subnet} has fewer than ${count} free addresses" >&2
+        return 1
+    fi
+    echo "${found[*]}"
+}
+
+# The af_packet devices of the rehearsal's DPDK NICs: the client NIC's on
+# every container, the replication NIC's beside it on a node's. EAL
+# numbers virtual devices' ports in the order DPDK_EAL_ARGS creates them,
+# the client NIC's first: port 0, and the replication NIC's port 1.
+REHEARSAL_CLIENT_VDEV=net_af_packet0
+REHEARSAL_REPL_VDEV=net_af_packet1
+# The memory, in MiB, each DPDK process takes without hugepages: what the
+# netns test runner gives a process holding several nodes' mbuf pools
+# (crates/core/test-node's layout), so ample for one node's two. Reserved
+# rather than touched: a process uses what its pools fill.
+REHEARSAL_DPDK_MEMORY_MB=512
+
+# `af_packet_conf <cpus> <iface> <ip> <mac> [<repl iface> <repl ip>
+# <repl mac>]`: the /etc/melin-dpdk.conf the rig writes on a container,
+# its DPDK on af_packet: the client NIC on `iface` (the kernel's
+# interface, whose MAC DPDK shares, and beside whose address it takes
+# `ip`), and on a node the replication NIC on `repl iface`, likewise.
+# `cpus` is the container's CPU list (Cpus_allowed_list's form, `0-3,6`):
+# EAL pins its main thread to its main lcore's CPUs, and every thread the
+# process starts after inherits them, so the one lcore is given all of
+# them rather than one core shared by every thread of every container.
+# The EAL arguments are the netns test runner's (no hugepages, no PCI
+# scan), without `--in-memory`, which EAL refuses beside `--no-huge`: the
+# runtime directory it would keep in memory is the container's own, and
+# the suite clears it between runs. On arguments it cannot use, says why
+# on stderr and fails.
+af_packet_conf() {
+    local cpus="$1" iface="$2" ip="$3" mac="$4" repl_iface="${5:-}" repl_ip="${6:-}" repl_mac="${7:-}"
+    if [[ ! "$cpus" =~ ^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$ ]]; then
+        echo "error: '${cpus}' is not a CPU list (as Cpus_allowed_list gives one: 0-3,6)" >&2
+        return 1
+    fi
+    if [[ -z "$iface" || -z "$ip" || -z "$mac" ]]; then
+        echo "error: the client NIC needs an interface, an address and a MAC" >&2
+        return 1
+    fi
+    if [[ -n "${repl_iface}${repl_ip}${repl_mac}" && ( -z "$repl_iface" || -z "$repl_ip" || -z "$repl_mac" ) ]]; then
+        echo "error: the replication NIC needs an interface, an address and a MAC, or none of them" >&2
+        return 1
+    fi
+    local eal="--no-huge -m ${REHEARSAL_DPDK_MEMORY_MB} --no-pci --lcores=0@(${cpus}) --vdev=${REHEARSAL_CLIENT_VDEV},iface=${iface}"
+    [[ -n "$repl_iface" ]] && eal+=" --vdev=${REHEARSAL_REPL_VDEV},iface=${repl_iface}"
+    cat <<EOF
+DPDK_IP=${ip}
+DPDK_PREFIX=${REHEARSAL_DPDK_PREFIX_LEN}
+DPDK_PORT=0
+DPDK_MODE=af_packet
+DPDK_NIC=${iface}
+DPDK_MAC=${mac}
+DPDK_EAL_ARGS="${eal}"
+EOF
+    [[ -z "$repl_iface" ]] && return 0
+    cat <<EOF
+DPDK_REPL_NIC=${repl_iface}
+DPDK_REPL_VDEV=${REHEARSAL_REPL_VDEV}
+DPDK_REPL_IP=${repl_ip}
+DPDK_REPL_MAC=${repl_mac}
+DPDK_REPL_PORT=1
+EOF
+}
+
+# CAP_NET_RAW's bit in a capability set: af_packet's sockets need it.
+CAP_NET_RAW=13
+# CAP_NET_ADMIN's: af_packet's promiscuous switch needs it, and starting
+# a port flips it (test-containers.sh says why that is fatal).
+CAP_NET_ADMIN=12
+
+# `has_capability <capability set> <bit>`: whether the set (hexadecimal,
+# as /proc/<pid>/status's CapEff gives it) holds the capability (exit
+# status).
+has_capability() {
+    [[ "$1" =~ ^[0-9a-fA-F]{1,16}$ ]] && (( (16#$1 >> $2) & 1 ))
 }

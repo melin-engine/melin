@@ -216,5 +216,32 @@ check "and finds the replication NIC allowed, so takes the host for port mode" "
     "$(status refuse_port_mode root@h1 "$CONF")"
 
 echo ""
+echo "=== lib.sh's copy, and the container rig's confs ==="
+# lib.sh's ipv4_as_int is a copy of ipv4_to_int (dpdk-setup.sh is shipped
+# alone): the two must take and refuse the same addresses.
+for addr in 10.0.0.20 0.0.0.0 255.255.255.255 10.0.0.08 010.0.0.1 10.0.0.256 10.0.1 10.0.0.1/24 ""; do
+    # Its value and exit status (lib.sh's alone says why on stderr).
+    check "lib.sh's copy agrees on '${addr}'" "$(ipv4_to_int "$addr"; echo "rc $?")" \
+        "$(ipv4_as_int "$addr" 2>/dev/null; echo "rc $?")"
+done
+# The node's port-mode rules on the confs the rig writes on a node
+# container, its networks and addresses chosen as the rig chooses them
+# (the default route is the client NIC's interface there, eth0).
+rig_conf_check() {
+    local subnets clients repl ip repl_ip conf
+    subnets=$(rehearsal_subnets "$@") || return 1
+    read -r clients repl <<< "$subnets"
+    ip=$(high_free_addresses "$clients" 1) || return 1
+    repl_ip=$(high_free_addresses "$repl" 1) || return 1
+    conf=$(af_packet_conf 0-3 eth0 "$ip" 0a:58:0a:59:fe:02 eth1 "$repl_ip" 0a:58:0a:59:ff:02) || return 1
+    check_repl_nic_args "$(conf_value "$conf" DPDK_NIC)" \
+        "$(conf_value "$conf" DPDK_IP)/$(conf_value "$conf" DPDK_PREFIX)" eth0 \
+        "$(conf_value "$conf" DPDK_REPL_NIC)" "$(conf_value "$conf" DPDK_REPL_IP)"
+}
+check "a node container's conf meets the node's replication NIC rules" "0 " "$(status rig_conf_check)"
+check "and so does it with the networks moved down the pool" "0 " \
+    "$(status rig_conf_check 10.89.255.0/24 10.89.248.0/22)"
+
+echo ""
 echo "=== ${PASSED} passed, ${FAILED} failed ==="
 [[ "$FAILED" -eq 0 ]]

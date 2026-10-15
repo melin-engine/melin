@@ -181,7 +181,8 @@ refuse_repl_nic_outside_mlx5() {
 # anything else, an octet with a leading zero included: the node parses
 # its addresses as Rust's Ipv4Addr does, which refuses one, so an
 # address accepted here and written to the config must be one it starts
-# with.
+# with. scripts/bench/lib.sh has a copy (ipv4_as_int), which
+# test-dpdk-setup.sh checks agrees with this one.
 ipv4_to_int() {
     local o='(0|[1-9][0-9]{0,2})'
     [[ "$1" =~ ^$o\.$o\.$o\.$o$ ]] || return 1
