@@ -456,7 +456,13 @@ fn a_replica_that_takes_entries_but_persists_none_is_reported() {
     let mut replica = RawReplica::join(primary_addrs.replication(), &keys.scripted, FRAME_LIMIT);
     wait_for_gauge(health, "melin_replicas_connected", 1);
 
-    // A steady stream of entries for the replica to read.
+    // A steady stream of entries for the replica to read, paced: the
+    // warning needs entries pending past `PERSIST_STALL_BOUND`, not
+    // throughput. Flat out, a `disk` ack lets the client write faster than
+    // this thread reads the replica's stream, the primary's replication
+    // ring fills behind it, and the replica is evicted for that before the
+    // bound is reached.
+    const WRITE_PACE: Duration = Duration::from_millis(1);
     let stop = Arc::new(AtomicBool::new(false));
     let writer = {
         let stop = Arc::clone(&stop);
@@ -474,6 +480,7 @@ fn a_replica_that_takes_entries_but_persists_none_is_reported() {
                     .request_one(&increment_request(1))
                     .expect("a reply to the write");
                 assert_eq!(reply[0], KIND_RESP_ACK, "the write is acked");
+                std::thread::sleep(WRITE_PACE);
             }
         })
     };
