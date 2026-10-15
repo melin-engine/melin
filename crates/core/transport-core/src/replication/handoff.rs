@@ -36,7 +36,7 @@ use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use melin_journal::replication::{Batch, ReplicationConsumer};
+use melin_journal::replication::{ReplicationBatch, ReplicationConsumer};
 
 use super::catchup::{ChunkFate, HANDOFF_BRIDGE_TIMEOUT, RingChunk};
 use super::sent::SentHighWater;
@@ -282,7 +282,7 @@ impl LiveHandoff {
 /// covered-chunk arm commit. `Err` rather than a panic on an empty ring
 /// all the same, as a bug here must cost the replica its link, not the
 /// node its poll thread.
-fn held(consumer: &mut ReplicationConsumer) -> io::Result<Batch<'_>> {
+fn held(consumer: &mut ReplicationConsumer) -> io::Result<ReplicationBatch<'_>> {
     consumer
         .peek()
         .ok_or_else(|| io::Error::other("catch-up handoff: the held ring chunk is gone"))

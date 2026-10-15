@@ -255,11 +255,12 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 - **`melin_journal::replication::ReplicationConsumer` reads by
   `peek`.** `try_read`, `pending` and `commit` are replaced by `peek`,
-  which lends the next batch as a `Batch` without consuming it, and
-  `Batch::commit`, which consumes it. A batch dropped uncommitted is
-  peeked again, and no second batch can be peeked while one is held: the
-  borrow checker refuses it, where `try_read` read past an uncommitted
-  batch in release builds. Source-breaking for every reader of the ring:
+  which lends the next batch as a `ReplicationBatch` without consuming
+  it, and `ReplicationBatch::commit`, which consumes it. A batch dropped
+  uncommitted is peeked again, and no second batch can be peeked while
+  one is held: the borrow checker refuses it, where `try_read` read past
+  an uncommitted batch in release builds. Source-breaking for every
+  reader of the ring:
   `let Some(batch) = consumer.peek()`, then `batch.meta()`,
   `batch.data()` and `batch.commit()`.
 

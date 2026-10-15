@@ -750,10 +750,10 @@ pending state in `go_idle`.
 
 **Status: fixed**, by going further than the direction: the misuse no
 longer compiles. `ReplicationConsumer::peek` lends the next batch as a
-`Batch` without consuming it, and only `Batch::commit` consumes it; a
-batch dropped uncommitted is peeked again, and a second batch cannot be
-peeked while one is held (the borrow checker refuses it, pinned by a
-`compile_fail` doctest). The consumer keeps no pending state, so `go_idle`
+`ReplicationBatch` without consuming it, and only
+`ReplicationBatch::commit` consumes it; a batch dropped uncommitted is
+peeked again, and a second batch cannot be peeked while one is held (the
+borrow checker refuses it, pinned by a `compile_fail` doctest). The consumer keeps no pending state, so `go_idle`
 has none to clear. Every reader of the ring (both senders, both
 catch-up→live drains, the idle drain) goes through it.
 

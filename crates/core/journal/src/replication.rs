@@ -243,14 +243,15 @@ impl ReplicationProducer {
 
 /// Consumer end of the replication ring. One per replica sender thread.
 ///
-/// Reads are peeks: [`Self::peek`] lends the next batch as a [`Batch`]
-/// without consuming it, and only [`Batch::commit`] consumes it and
-/// releases its slot to the producer. A batch that is not committed (the
-/// replica's socket has no room for it, say) is simply dropped, and the
-/// next `peek` lends the same batch again: no batch can be read past
-/// without being committed, and none committed without being read. The
-/// borrow checker holds the rest: a [`Batch`] borrows the consumer, so no
-/// second batch can be peeked while one is held.
+/// Reads are peeks: [`Self::peek`] lends the next batch as a
+/// [`ReplicationBatch`] without consuming it, and only
+/// [`ReplicationBatch::commit`] consumes it and releases its slot to the
+/// producer. A batch that is not committed (the replica's socket has no
+/// room for it, say) is simply dropped, and the next `peek` lends the same
+/// batch again: no batch can be read past without being committed, and
+/// none committed without being read. The borrow checker holds the rest: a
+/// [`ReplicationBatch`] borrows the consumer, so no second batch can be
+/// peeked while one is held.
 pub struct ReplicationConsumer {
     inner: melin_pipeline::ring::Consumer<ReplicationMeta>,
     buffers: Arc<SharedBuffers>,
@@ -292,13 +293,13 @@ pub struct ReplicationConsumer {
 /// drop(next);
 /// ```
 #[must_use = "a batch is consumed only by `commit`; dropped, it is peeked again"]
-pub struct Batch<'a> {
+pub struct ReplicationBatch<'a> {
     inner: &'a mut melin_pipeline::ring::Consumer<ReplicationMeta>,
     meta: ReplicationMeta,
     data: &'a [u8],
 }
 
-impl Batch<'_> {
+impl ReplicationBatch<'_> {
     /// The batch's length and last journal sequence.
     pub fn meta(&self) -> ReplicationMeta {
         self.meta
@@ -320,20 +321,20 @@ impl Batch<'_> {
 impl ReplicationConsumer {
     /// The next batch, without consuming it: the same batch on every call
     /// until it is committed. `None` when the ring holds nothing unread.
-    pub fn peek(&mut self) -> Option<Batch<'_>> {
+    pub fn peek(&mut self) -> Option<ReplicationBatch<'_>> {
         let (first, _) = self.inner.peek_batch(1);
         let meta = *first.first()?;
         let idx = (self.inner.next_read() & self.buffers.mask) as usize;
         // SAFETY: `peek_batch` returned the slot at `next_read`, so the
         // producer has published it, and it cannot claim the slot again
         // until this consumer's progress passes it, which only
-        // `Batch::commit` does. The bytes are lent for the batch's
+        // `ReplicationBatch::commit` does. The bytes are lent for the batch's
         // lifetime, which ends at that commit at the latest.
         let data = unsafe {
             let chunk = &*self.buffers.chunks[idx].get();
             &chunk[..meta.len as usize]
         };
-        Some(Batch {
+        Some(ReplicationBatch {
             inner: &mut self.inner,
             meta,
             data,
