@@ -352,6 +352,19 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   a `-trace` suffix and the summary's header says so. The echo and notary
   examples gain a `latency-trace` feature, forwarding to the runtime's.
   See [docs/benchmarking.md](docs/benchmarking.md#traced-runs).
+- **The LAN suite's container rehearsal runs its DPDK passes.**
+  `DPDK=1 scripts/bench/test-containers.sh` runs the suite on DPDK's
+  af_packet driver over the containers' interfaces, in `shared` and
+  `port` modes by default (`DPDK_REPLICATION`; `queue` mode is refused
+  up front, as af_packet cannot steer), traced too with `TRACE=1`. It
+  writes each container's `/etc/melin-dpdk.conf` itself and attaches a
+  second podman network, `melin-bench-repl`, to the node containers for
+  their replication NICs; both networks get subnets of its choosing in
+  one `/16`. The suite now refuses queue mode on an af_packet host, and
+  takes a replication NIC named by a virtual device (`DPDK_REPL_VDEV`,
+  created by a `--vdev` EAL argument) as well as by PCI address
+  (`DPDK_REPL_PCI`). Without `DPDK=1` the rehearsal is unchanged. See
+  [docs/benchmarking.md](docs/benchmarking.md#rehearsing-without-hosts).
 - **`scripts/dpdk/dpdk-setup.sh` sets up a second mlx5 port for
   replication.** Given `DPDK_REPL_NIC` and `DPDK_REPL_IP` (or
   `--repl-nic` and `--repl-ip`), it refuses a port carrying the default

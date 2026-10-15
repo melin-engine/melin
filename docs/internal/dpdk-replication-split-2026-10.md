@@ -39,9 +39,20 @@ Owed on the rig (mlx5 hosts), each one hardware-only:
 6. **An unpolled queue on mlx5:** a full queue 0 drops per queue
    (`rx_out_of_buffer`) and never pauses the port, so a replica's queue
    1 keeps flowing under a client flood to its address.
-7. **The suite's DPDK passes** (its podman rehearsal runs kernel TCP
-   only): every mode, a traced pass, and `dpdk-setup.sh`'s second-port
-   path, including the port ids it derives.
+7. **The suite's DPDK passes on mlx5:** queue mode, every mode on the
+   rig's NICs (its confs, as `dpdk-setup.sh` writes them, a PCI address
+   per device), a traced queue pass, and `dpdk-setup.sh`'s second-port
+   path, including the port ids it derives. The podman rehearsal
+   (`DPDK=1 test-containers.sh`, on af_packet) covers the rest of the
+   suite's DPDK path: the DPDK build and deployment, the shared and port
+   passes (clusters, load generator on DPDK, health and port-mode
+   steering verdicts) and, with `TRACE=1`, their dumps with both poll
+   loops in port mode. Its first run is owed too (on a machine with
+   podman, not the rig), and should show `dpdk-shared-*` and
+   `dpdk-port-*` runs with health `ok`, the port runs' steering `ok`
+   (port 0 clients, port 1 replication), and under `TRACE=1` the trace
+   table with the client poll line for every run and the repl poll line
+   for the port runs.
 
 The one-line goal: **on DPDK, a primary's replication runs on a core, a
 queue and a TCP stack of its own, chosen by a flag, so that one ephemeral
@@ -504,11 +515,26 @@ unchanged after every step.
    compared are the primary's. The summary ends with both loops'
    work-iteration percentiles per run (`trace_summary`); the results
    directory takes a `-trace` suffix and the summary's header says
-   `TRACED`. Untested until the rig: a traced DPDK pass; the podman
-   rehearsal (`TRACE=1 test-containers.sh`) covers the kernel path.
-   The suite does not provision AWS ENIs; port mode there is for hosts
-   with a second mlx5 port. Untested until the rig: the DPDK passes
-   themselves (the podman rehearsal runs kernel TCP only) and
+   `TRACED`. The podman rehearsal (`TRACE=1 test-containers.sh`) covers
+   the kernel path. The suite does not provision AWS ENIs; port mode
+   there is for hosts with a second mlx5 port. `DPDK=1
+   test-containers.sh` then rehearses the shared and port passes, traced
+   or not, on af_packet: the rig writes each container's
+   `/etc/melin-dpdk.conf` (`DPDK_MODE=af_packet`, refused for queue mode
+   as SR-IOV is, and the replication NIC named by `DPDK_REPL_VDEV`, an
+   af_packet device the EAL arguments must create, where a real host's
+   is `DPDK_REPL_PCI`, which they must allow; `refuse_port_mode` takes
+   either) on networks it creates: two `/24`s of podman's pool in one
+   `/16`, the NICs given prefix length 16 so that the replication NIC
+   is in the client NIC's subnet. Its EAL arguments are the netns
+   runner's, but for `--lcores=0@(<the container's CPUs>)` in place of
+   one core, as EAL pins the main thread, and every thread the node
+   starts after it, to the main lcore's CPUs. The containers need
+   `CAP_NET_ADMIN` as well as `CAP_NET_RAW`, which the netns runner
+   never shows, having every capability in its user namespace: a port's
+   start replays the promiscuous setting, and af_packet's disable (an
+   `SIOCSIFFLAGS`) failing is fatal to it in DPDK 22.11. Untested until
+   the rig: queue mode in the suite, the DPDK passes on mlx5, and
    `dpdk-setup.sh`'s hardware path, including the port ids it derives.
 8. **Docs.** The modes, flags and the `repl-poll` core in the operator
    docs (`deployment.md`, `replication.md`); `dpdk-replication.md`; the

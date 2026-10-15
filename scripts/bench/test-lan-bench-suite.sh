@@ -6,7 +6,9 @@
 # node log line the suite waits for, and TRACE=1: the setting, the
 # servers' trace feature, and the verdict on and summary of a traced
 # primary's /stats-dump, with the stage names and format it reads checked
-# against the node's source.
+# against the node's source; and the container rig's DPDK=1 helpers (its
+# networks, DPDK's addresses on them, and the af_packet confs it writes,
+# read back as the suite reads a host's).
 # The rest of the suite drives hosts and is exercised by running it.
 #
 # Usage: ./scripts/bench/test-lan-bench-suite.sh
@@ -107,6 +109,7 @@ check "an mlx5 host" "mlx5" "$(dpdk_conf_mode "DPDK_IP=10.0.0.1
 DPDK_MODE=mlx5")"
 check "an L3 bifurcated host" "l3" "$(dpdk_conf_mode "DPDK_MODE=l3")"
 check "an SR-IOV host" "sriov" "$(dpdk_conf_mode "DPDK_MODE=sriov")"
+check "a container of the rig's, on af_packet" "af_packet" "$(dpdk_conf_mode "DPDK_MODE=af_packet")"
 check "a conf naming no mode is SR-IOV" "sriov" "$(dpdk_conf_mode "$CONF")"
 check "no conf at all is SR-IOV, the only setup the suite runs unattended" "sriov" "$(dpdk_conf_mode "")"
 
@@ -147,6 +150,9 @@ check "an SR-IOV host is refused, by name" \
 check "a host without a conf is refused, by name" \
     "1 error: DPDK_REPLICATION=queue: root@h2 has no /etc/melin-dpdk.conf, and the suite's unattended setup cannot configure queue mode (it sets up SR-IOV on a bond, whose VFs cannot steer replication to a queue of its own, and mlx5 needs DPDK_IP); run scripts/dpdk/dpdk-setup.sh with DPDK_IP there first" \
     "$(status refuse_queue_mode root@h2 "")"
+check "an af_packet host is refused, by name" \
+    "1 error: DPDK_REPLICATION=queue: root@h3 runs DPDK on af_packet (DPDK_MODE=af_packet in /etc/melin-dpdk.conf), which has one queue and no rte_flow to steer replication to a queue of its own; queue mode needs mlx5" \
+    "$(status refuse_queue_mode root@h3 "DPDK_MODE=af_packet")"
 
 echo ""
 echo "=== refuse_port_mode ==="
@@ -165,6 +171,8 @@ DPDK_REPL_IP=10.0.0.20
 DPDK_REPL_MAC=0c:42:a1:00:00:00
 DPDK_REPL_PORT=0'
 PORT_SETUP="run scripts/dpdk/dpdk-setup.sh with DPDK_IP, DPDK_REPL_NIC and DPDK_REPL_IP there (a second mlx5 port, see docs/benchmarking.md)"
+# An af_packet host's remedy: its conf is the container rig's.
+RIG_PORT_SETUP="an af_packet conf is the container rig's (DPDK=1 scripts/bench/test-containers.sh), which gives each node container a replication NIC on melin-bench-repl (see docs/benchmarking.md)"
 check "a host with a replication NIC runs port mode" "0 " "$(status refuse_port_mode root@h1 "$PORT_CONF")"
 check "a host with one NIC is refused, by name" \
     "1 error: DPDK_REPLICATION=port: root@h1's /etc/melin-dpdk.conf has no DPDK_REPL_PORT DPDK_REPL_IP DPDK_REPL_MAC DPDK_REPL_PCI, so no NIC of replication's own; ${PORT_SETUP}" \
@@ -184,6 +192,56 @@ check "a device allowed with devargs is allowed" "0 " \
 check "a device allowed is matched whole, not by prefix" \
     "1 error: DPDK_REPLICATION=port: root@h1's /etc/melin-dpdk.conf has DPDK_EAL_ARGS not allowing the replication NIC's device (-a 0000:c1:00.0); ${PORT_SETUP}" \
     "$(status refuse_port_mode root@h1 "$(sed 's/-a 0000:c1:00.0 /-a 0000:c1:00.00 /' <<< "$PORT_CONF")")"
+# A replication NIC on a virtual device, as the container rig names one:
+# by its name, created by a `--vdev` EAL argument.
+VDEV_CONF='DPDK_IP=10.89.254.254
+DPDK_PREFIX=16
+DPDK_PORT=0
+DPDK_MODE=af_packet
+DPDK_MAC=02:00:00:00:00:01
+DPDK_EAL_ARGS="--no-huge --vdev=net_af_packet0,iface=eth0 --vdev=net_af_packet1,iface=eth1"
+DPDK_REPL_VDEV=net_af_packet1
+DPDK_REPL_IP=10.89.255.254
+DPDK_REPL_MAC=02:00:00:00:00:02
+DPDK_REPL_PORT=1'
+check "a host with a replication NIC on a virtual device runs port mode" "0 " \
+    "$(status refuse_port_mode root@h1 "$VDEV_CONF")"
+check "a virtual device created bare is allowed" "0 " \
+    "$(status refuse_port_mode root@h1 "$(sed 's/--vdev=net_af_packet1,iface=eth1/--vdev=net_af_packet1/' <<< "$VDEV_CONF")")"
+check "a virtual device created before the client NIC's is allowed" "0 " \
+    "$(status refuse_port_mode root@h1 "$(sed 's/--vdev=net_af_packet0,iface=eth0 --vdev=net_af_packet1,iface=eth1/--vdev=net_af_packet1,iface=eth1 --vdev=net_af_packet0,iface=eth0/' <<< "$VDEV_CONF")")"
+check "a virtual device created in EAL's spaced form is allowed" "0 " \
+    "$(status refuse_port_mode root@h1 "$(sed 's/--vdev=net_af_packet1,/--vdev net_af_packet1,/' <<< "$VDEV_CONF")")"
+check "a virtual device created bare in the spaced form is allowed" "0 " \
+    "$(status refuse_port_mode root@h1 "$(sed 's/--vdev=net_af_packet1,iface=eth1/--vdev net_af_packet1/' <<< "$VDEV_CONF")")"
+check "a host whose EAL does not create the replication NIC's virtual device is refused" \
+    "1 error: DPDK_REPLICATION=port: root@h1's /etc/melin-dpdk.conf has DPDK_EAL_ARGS not creating the replication NIC's device (--vdev=net_af_packet1); add it there beside the client NIC's" \
+    "$(status refuse_port_mode root@h1 "$(sed 's/ --vdev=net_af_packet1,iface=eth1//' <<< "$VDEV_CONF")")"
+check "a virtual device is matched whole, not by prefix" \
+    "1 error: DPDK_REPLICATION=port: root@h1's /etc/melin-dpdk.conf has DPDK_EAL_ARGS not creating the replication NIC's device (--vdev=net_af_packet1); add it there beside the client NIC's" \
+    "$(status refuse_port_mode root@h1 "$(sed 's/--vdev=net_af_packet1,/--vdev=net_af_packet10,/' <<< "$VDEV_CONF")")"
+check "a virtual device is not an allowed PCI device's name" \
+    "1 error: DPDK_REPLICATION=port: root@h1's /etc/melin-dpdk.conf has DPDK_EAL_ARGS not creating the replication NIC's device (--vdev=net_af_packet1); add it there beside the client NIC's" \
+    "$(status refuse_port_mode root@h1 "$(sed 's/--vdev=net_af_packet1,iface=eth1/-a net_af_packet1/' <<< "$VDEV_CONF")")"
+check "a virtual-device host missing one key is refused, naming it, with the rig's remedy" \
+    "1 error: DPDK_REPLICATION=port: root@h1's /etc/melin-dpdk.conf has no DPDK_REPL_IP, so no NIC of replication's own; ${RIG_PORT_SETUP}" \
+    "$(status refuse_port_mode root@h1 "$(grep -v '^DPDK_REPL_IP=' <<< "$VDEV_CONF")")"
+check "a virtual device names an af_packet host whatever its DPDK_MODE says" \
+    "1 error: DPDK_REPLICATION=port: root@h1's /etc/melin-dpdk.conf has no DPDK_REPL_IP, so no NIC of replication's own; ${RIG_PORT_SETUP}" \
+    "$(status refuse_port_mode root@h1 "$(grep -v '^DPDK_REPL_IP=\|^DPDK_MODE=' <<< "$VDEV_CONF")")"
+check "a replication NIC named by neither device key is missing a PCI address, as a real host's is" \
+    "1 error: DPDK_REPLICATION=port: root@h1's /etc/melin-dpdk.conf has no DPDK_REPL_PCI, so no NIC of replication's own; ${RIG_PORT_SETUP}" \
+    "$(status refuse_port_mode root@h1 "$(grep -v '^DPDK_REPL_VDEV=' <<< "$VDEV_CONF")")"
+check "a host named by neither device key and not af_packet gets dpdk-setup.sh's remedy" \
+    "1 error: DPDK_REPLICATION=port: root@h1's /etc/melin-dpdk.conf has no DPDK_REPL_PCI, so no NIC of replication's own; ${PORT_SETUP}" \
+    "$(status refuse_port_mode root@h1 "$(grep -v '^DPDK_REPL_VDEV=\|^DPDK_MODE=' <<< "$VDEV_CONF")")"
+check "a replication NIC named both ways is refused" \
+    "1 error: DPDK_REPLICATION=port: root@h1's /etc/melin-dpdk.conf names the replication NIC's device twice (DPDK_REPL_PCI=0000:c1:00.0, DPDK_REPL_VDEV=net_af_packet1); keep the one DPDK_EAL_ARGS brings up" \
+    "$(status refuse_port_mode root@h1 "${VDEV_CONF}
+DPDK_REPL_PCI=0000:c1:00.0")"
+check "a PCI host is judged by its PCI address, whatever its EAL creates" \
+    "1 error: DPDK_REPLICATION=port: root@h1's /etc/melin-dpdk.conf has DPDK_EAL_ARGS not allowing the replication NIC's device (-a 0000:c1:00.0); ${PORT_SETUP}" \
+    "$(status refuse_port_mode root@h1 "$(sed 's/ -a 0000:c1:00.0/ --vdev=0000:c1:00.0/' <<< "$PORT_CONF")")"
 
 echo ""
 echo "=== replication_flags ==="
@@ -370,6 +428,11 @@ check "0 is untraced" "0 0" "$(status trace_setting 0)"
 check "1 is traced" "0 1" "$(status trace_setting 1)"
 check "anything else is refused, not read as either" \
     "1 error: TRACE must be 1, or 0 or unset (got 'yes')" "$(status trace_setting yes)"
+# The same rule for the container rig's DPDK=1, named as such.
+check "another switch, unset, is off" "0 0" "$(status switch_setting DPDK "")"
+check "another switch, 1, is on" "0 1" "$(status switch_setting DPDK 1)"
+check "another switch's refusal names it" \
+    "1 error: DPDK must be 1, or 0 or unset (got 'true')" "$(status switch_setting DPDK true)"
 
 echo ""
 echo "=== with_trace_feature ==="
@@ -513,6 +576,143 @@ check "the dump's line format is the endpoint's" "1" \
 for marker in '"# latency-trace disabled"' '"# no samples"' '"# truncated\t{}"'; do
     check "the endpoint writes ${marker}" "1" "$(grep -cF "writeln!(c, ${marker}" "$HEALTH_RS")"
 done
+
+echo ""
+echo "=== DPDK=1 in the container rig: addresses ==="
+check "an address as an integer" "0 167772161" "$(status ipv4_as_int 10.0.0.1)"
+check "an octet of zero" "0 167772160" "$(status ipv4_as_int 10.0.0.0)"
+check "a leading zero is refused, as the node refuses it" "1 error: '10.0.0.08' is not an IPv4 address" \
+    "$(status ipv4_as_int 10.0.0.08)"
+check "an octet past 255 is refused" "1 error: '10.0.0.256' is not an IPv4 address" "$(status ipv4_as_int 10.0.0.256)"
+check "three octets are refused" "1 error: '10.0.0' is not an IPv4 address" "$(status ipv4_as_int 10.0.0)"
+check "an integer as an address" "10.89.255.254" "$(int_to_ipv4 "$(ipv4_as_int 10.89.255.254)")"
+check "the ends of the address space" "0.0.0.0 255.255.255.255" "$(int_to_ipv4 0) $(int_to_ipv4 4294967295)"
+check "a subnet's first and last addresses" "0 10.89.254.0 10.89.254.255" \
+    "$(range=$(cidr_range 10.89.254.0/24) && echo "0 $(int_to_ipv4 "${range% *}") $(int_to_ipv4 "${range#* }")")"
+check "a subnet's host bits are ignored" "$(cidr_range 10.88.0.0/16)" "$(cidr_range 10.88.7.9/16)"
+check "a /32 is one address" "$(ipv4_as_int 10.0.0.1) $(ipv4_as_int 10.0.0.1)" "$(cidr_range 10.0.0.1/32)"
+check "a /0 is every address" "0 4294967295" "$(cidr_range 0.0.0.0/0)"
+check "a prefix past 32 is refused" "1 error: '10.0.0.0/33' is not an IPv4 subnet (a.b.c.d/len)" \
+    "$(status cidr_range 10.0.0.0/33)"
+check "an address alone is not a subnet" "1 error: '10.0.0.0' is not an IPv4 subnet (a.b.c.d/len)" \
+    "$(status cidr_range 10.0.0.0)"
+check "a /16 holds its /24s" "0 " "$(status cidrs_overlap 10.89.0.0/16 10.89.254.0/24)"
+check "and they it" "0 " "$(status cidrs_overlap 10.89.254.0/24 10.89.0.0/16)"
+check "neighbouring /24s do not overlap" "1 " "$(status cidrs_overlap 10.89.254.0/24 10.89.255.0/24)"
+check "a subnet with a malformed address overlaps nothing" "1 error: 'x' is not an IPv4 address" \
+    "$(status cidrs_overlap x/24 10.89.0.0/16)"
+check "a malformed second subnet overlaps nothing" "1 error: '10.89.0.0/x' is not an IPv4 subnet (a.b.c.d/len)" \
+    "$(status cidrs_overlap 10.89.0.0/24 10.89.0.0/x)"
+
+echo ""
+echo "=== DPDK=1 in the container rig: the networks ==="
+check "with no other network, the top of podman's pool" "0 10.89.254.0/24 10.89.255.0/24" \
+    "$(status rehearsal_subnets)"
+check "podman's own networks below are left alone" "0 10.89.254.0/24 10.89.255.0/24" \
+    "$(status rehearsal_subnets 10.88.0.0/16 10.89.0.0/24 10.89.1.0/24 fd00::/64)"
+check "a network on either /24 moves both down a pair" "0 10.89.252.0/24 10.89.253.0/24" \
+    "$(status rehearsal_subnets 10.89.255.0/24)"
+check "a wider network over the top moves them below it" "0 10.89.246.0/24 10.89.247.0/24" \
+    "$(status rehearsal_subnets 10.89.248.0/21)"
+check "a pool that is all taken is refused, naming what holds it" \
+    "1 error: no two free /24s in 10.89.0.0/16 for the rehearsal's networks (podman's networks hold 10.88.0.0/16 10.89.0.0/16); remove some with podman network rm" \
+    "$(status rehearsal_subnets 10.88.0.0/16 10.89.0.0/16)"
+check "a subnet that is not one is refused" "1 error: 'garbage' is not an IPv4 subnet (a.b.c.d/len)" \
+    "$(status rehearsal_subnets 10.88.0.0/16 garbage)"
+# The node takes the replication NIC's address to be in the client NIC's
+# subnet: the prefix length the rig gives both must span both networks.
+read -r CLIENTS_SUBNET REPL_SUBNET <<< "$(rehearsal_subnets 10.89.255.0/24)"
+check "the DPDK prefix length spans both networks" "0 0 " \
+    "$(status cidrs_overlap "${REHEARSAL_POOL}.0.0/${REHEARSAL_DPDK_PREFIX_LEN}" "$CLIENTS_SUBNET")$(status cidrs_overlap "${REHEARSAL_POOL}.0.0/${REHEARSAL_DPDK_PREFIX_LEN}" "$REPL_SUBNET")"
+# What `podman network inspect` prints of a network, in the form netavark
+# networks take (several subnets, IPv6 among them, or none).
+PODMAN_NETWORKS='[{"name":"podman","driver":"bridge","subnets":[{"subnet":"10.88.0.0/16","gateway":"10.88.0.1"}]},
+{"name":"dual","subnets":[{"subnet":"10.89.0.0/24","gateway":"10.89.0.1"},{"subnet":"fd00::/64"}]},
+{"name":"bare","driver":"macvlan"}]'
+check "every network's subnets" "0 10.88.0.0/16 10.89.0.0/24 fd00::/64" "$(status podman_subnets "$PODMAN_NETWORKS")"
+check "no network has no subnet" "0 " "$(status podman_subnets "[]")"
+check "output that is not podman's JSON is refused" \
+    "1 error: cannot read the subnets of the podman networks (podman network inspect gave no list of networks with subnets)" \
+    "$(status podman_subnets '["10.88.0.0/16"]')"
+check "no output is refused" \
+    "1 error: cannot read the subnets of the podman networks (podman network inspect gave no list of networks with subnets)" \
+    "$(status podman_subnets "")"
+check "the lower half podman allocates from" "10.89.254.0/25" "$(lower_half 10.89.254.0/24)"
+check "the addresses DPDK takes, from the top, broadcast excluded" "0 10.89.254.254 10.89.254.253 10.89.254.252" \
+    "$(status high_free_addresses 10.89.254.0/24 3 10.89.254.2 10.89.254.3)"
+check "an address podman gave is skipped" "0 10.89.254.254 10.89.254.252" \
+    "$(status high_free_addresses 10.89.254.0/24 2 10.89.254.253)"
+check "an address is skipped whole, not by prefix" "0 10.89.254.254" \
+    "$(status high_free_addresses 10.89.254.0/24 1 10.89.254.25)"
+check "a subnet with too few free addresses is refused" "1 error: 10.0.0.0/30 has fewer than 2 free addresses" \
+    "$(status high_free_addresses 10.0.0.0/30 2 10.0.0.1)"
+check "the network address is never taken" "0 10.0.0.2 10.0.0.1" "$(status high_free_addresses 10.0.0.0/30 2)"
+
+echo ""
+echo "=== DPDK=1 in the container rig: /etc/melin-dpdk.conf ==="
+RIG_CLIENT_CONF=$(af_packet_conf 0-7 eth0 10.89.254.253 0a:58:0a:59:fe:03)
+RIG_NODE_CONF=$(af_packet_conf 0-3,6 eth0 10.89.254.254 0a:58:0a:59:fe:02 eth1 10.89.255.254 0a:58:0a:59:ff:02)
+check "the load generator's container: one NIC" \
+    'DPDK_IP=10.89.254.253
+DPDK_PREFIX=16
+DPDK_PORT=0
+DPDK_MODE=af_packet
+DPDK_NIC=eth0
+DPDK_MAC=0a:58:0a:59:fe:03
+DPDK_EAL_ARGS="--no-huge -m 512 --no-pci --lcores=0@(0-7) --vdev=net_af_packet0,iface=eth0"' \
+    "$RIG_CLIENT_CONF"
+check "a node's container: the replication NIC beside it, port 1" \
+    'DPDK_IP=10.89.254.254
+DPDK_PREFIX=16
+DPDK_PORT=0
+DPDK_MODE=af_packet
+DPDK_NIC=eth0
+DPDK_MAC=0a:58:0a:59:fe:02
+DPDK_EAL_ARGS="--no-huge -m 512 --no-pci --lcores=0@(0-3,6) --vdev=net_af_packet0,iface=eth0 --vdev=net_af_packet1,iface=eth1"
+DPDK_REPL_NIC=eth1
+DPDK_REPL_VDEV=net_af_packet1
+DPDK_REPL_IP=10.89.255.254
+DPDK_REPL_MAC=0a:58:0a:59:ff:02
+DPDK_REPL_PORT=1' \
+    "$RIG_NODE_CONF"
+check "a CPU list that is not one is refused" \
+    "1 error: '0-3;6' is not a CPU list (as Cpus_allowed_list gives one: 0-3,6)" \
+    "$(status af_packet_conf '0-3;6' eth0 10.89.254.254 0a:58:0a:59:fe:02)"
+check "no CPU list is refused" \
+    "1 error: '' is not a CPU list (as Cpus_allowed_list gives one: 0-3,6)" \
+    "$(status af_packet_conf '' eth0 10.89.254.254 0a:58:0a:59:fe:02)"
+check "a client NIC without its MAC is refused" \
+    "1 error: the client NIC needs an interface, an address and a MAC" \
+    "$(status af_packet_conf 0 eth0 10.89.254.254 "")"
+check "a replication NIC without its MAC is refused" \
+    "1 error: the replication NIC needs an interface, an address and a MAC, or none of them" \
+    "$(status af_packet_conf 0 eth0 10.89.254.254 0a:58:0a:59:fe:02 eth1 10.89.255.254)"
+# The suite reads the rig's confs as it reads a real host's.
+check "the suite reads a rig's conf as af_packet" "af_packet" "$(dpdk_conf_mode "$RIG_NODE_CONF")"
+check "the suite runs port mode on a node container" "0 " "$(status refuse_port_mode melin-bench-server "$RIG_NODE_CONF")"
+check "the suite refuses port mode on the load generator's, which has no replication NIC" \
+    "1 error: DPDK_REPLICATION=port: melin-bench-client's /etc/melin-dpdk.conf has no DPDK_REPL_PORT DPDK_REPL_IP DPDK_REPL_MAC DPDK_REPL_PCI, so no NIC of replication's own; ${RIG_PORT_SETUP}" \
+    "$(status refuse_port_mode melin-bench-client "$RIG_CLIENT_CONF")"
+check "the suite refuses queue mode on a rig's conf" "1" \
+    "$(status refuse_queue_mode melin-bench-server "$RIG_NODE_CONF" | cut -d' ' -f1)"
+check "the suite takes the EAL arguments whole" \
+    "--no-huge -m 512 --no-pci --lcores=0@(0-3,6) --vdev=net_af_packet0,iface=eth0 --vdev=net_af_packet1,iface=eth1" \
+    "$(conf_value "$RIG_NODE_CONF" DPDK_EAL_ARGS)"
+# The node's port-mode rules on the rig's confs (the replication NIC's
+# address in the client NIC's subnet, and not its) are dpdk-setup.sh's
+# check_repl_nic_args, which scripts/dpdk/test-dpdk-setup.sh runs on them.
+# The memory is the netns test runner's, which runs DPDK on af_packet the
+# same way (crates/core/test-node's EAL arguments).
+check "each DPDK process's memory is the test runner's" "1" \
+    "$(grep -cF "[\"--no-huge\", \"-m\", \"${REHEARSAL_DPDK_MEMORY_MB}\", \"--no-pci\"" "${SCRIPT_DIR}/../../crates/core/test-node/src/layout.rs")"
+check "a capability set holding CAP_NET_RAW" "0 " "$(status has_capability 00000000800425fb "$CAP_NET_RAW")"
+check "podman's default set, without it" "1 " "$(status has_capability 00000000800405fb "$CAP_NET_RAW")"
+check "every capability" "0 " "$(status has_capability 000001ffffffffff "$CAP_NET_RAW")"
+check "a set that is not hexadecimal holds nothing" "1 " "$(status has_capability "" "$CAP_NET_RAW")"
+check "a set holding CAP_NET_RAW and CAP_NET_ADMIN, as the rig's containers get" "0 0 " \
+    "$(status has_capability 00000000800435fb "$CAP_NET_RAW")$(status has_capability 00000000800435fb "$CAP_NET_ADMIN")"
+check "podman's default set lacks CAP_NET_ADMIN" "1 " "$(status has_capability 00000000800405fb "$CAP_NET_ADMIN")"
+check "CAP_NET_RAW alone is not CAP_NET_ADMIN" "1 " "$(status has_capability 00000000800425fb "$CAP_NET_ADMIN")"
 
 
 echo ""

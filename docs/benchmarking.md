@@ -85,8 +85,9 @@ build:
   of its own (`--dpdk-replication-queue` on the primary and the
   replicas), the NIC steering replication to it. It needs a Mellanox
   (mlx5) NIC on the primary and both replicas: an SR-IOV virtual
-  function cannot steer, and the suite refuses to start when a node's
-  `/etc/melin-dpdk.conf` says SR-IOV, or when a node has none (the setup
+  function cannot steer, nor can af_packet (the container rehearsal's),
+  and the suite refuses to start when a node's `/etc/melin-dpdk.conf`
+  says either, or when a node has none (the setup
   the suite runs on its own can only configure SR-IOV, and an mlx5 NIC
   needs its address given: run `scripts/dpdk/dpdk-setup.sh` with
   `DPDK_IP` on it first), naming the host. The primary's
@@ -145,9 +146,38 @@ kernel TCP, with short phases: the sysroot, the build, the deployment,
 the cluster's start and the health verdict all run as they would on
 bench hosts. The containers use your machine's architecture, so on an
 ARM machine the build is for ARM rather than x86_64. The figures it
-prints measure nothing, and it does not exercise DPDK. Suite settings
-pass through: `TRACE=1` rehearses a traced suite (the traced build, the
-dumps and their verdict) on kernel TCP.
+prints measure nothing. Suite settings pass through: `TRACE=1` rehearses
+a traced suite (the traced build, the dumps and their verdict).
+
+`DPDK=1` rehearses the suite's DPDK passes instead, on DPDK's af_packet
+driver over the containers' own network interfaces: no NIC, no
+hugepages and no root needed. It runs `TRANSPORTS=dpdk` (or what you
+set, e.g. `kernel,dpdk`) with `DPDK_REPLICATION=shared,port` (or what
+you set), so the DPDK build, its deployment, a DPDK cluster in `shared`
+mode and in `port` mode (replication on a second network attached to the
+three node containers), the load generator on DPDK, the health verdict
+and, in `port` mode, the steering verdict all run as on bench hosts;
+with `TRACE=1`, so do the poll loops' dumps, both loops in `port` mode.
+The rehearsal writes each container's `/etc/melin-dpdk.conf` itself
+(`DPDK_MODE=af_packet`, the replication NIC named by its af_packet
+device rather than a PCI address), so `dpdk-setup.sh` is not run.
+
+It needs podman networks of its own: two `/24`s of one `/16`, carved
+from the top of podman's `10.89.0.0/16` pool clear of every existing
+network. DPDK takes addresses from the top of each, beside the
+container's own, which podman allocates from the bottom half, and its
+NICs are given a `/16` prefix length so that a node's replication NIC
+lies in its client NIC's subnet, as the node requires. The containers
+get `CAP_NET_RAW` and `CAP_NET_ADMIN`, which af_packet needs to open
+its sockets and to start its ports (both confined to the container's
+own network), and IPv4 forwarding off.
+Each DPDK process reserves 512 MiB of ordinary memory, of which it uses
+what its packet pools fill.
+
+What it cannot exercise: `queue` mode, which needs a NIC that steers
+(af_packet has one queue and no flow rules; the rehearsal refuses it up
+front, as the suite refuses it on such a host), mlx5 and SR-IOV
+themselves, hugepages, `dpdk-setup.sh`, and any figure worth reading.
 
 ## Results
 

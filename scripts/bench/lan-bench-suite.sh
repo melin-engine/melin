@@ -22,13 +22,16 @@
 # each mode is a pass of the dpdk transport of its own, from one build):
 #   shared  on the client queue and its poll thread (no flag, the default)
 #   queue   on a second queue of the client NIC, steered to it by the NIC
-#           (--dpdk-replication-queue): mlx5 only, refused on SR-IOV hosts;
-#           the primary's per-queue packet counters are judged too
+#           (--dpdk-replication-queue): mlx5 only, refused on SR-IOV and
+#           af_packet hosts; the primary's per-queue packet counters are
+#           judged too
 #   port    on a second NIC (--dpdk-replication-ports, -ip, -peer-mac):
 #           every node host needs one in /etc/melin-dpdk.conf (the
 #           DPDK_REPL_* keys dpdk-setup.sh writes given DPDK_REPL_NIC and
-#           DPDK_REPL_IP), refused up front by name otherwise; the
-#           primary's per-port packet counters are judged too
+#           DPDK_REPL_IP, its device a PCI address; or test-containers.sh
+#           does, its device an af_packet vdev), refused up front by name
+#           otherwise; the primary's per-port packet counters are judged
+#           too
 #
 # `all` is every mode, so it needs both on every node host.
 #
@@ -952,7 +955,8 @@ done
 
 # SR-IOV leaves the VFs bound to vfio-pci and the hugepages taken; a
 # kernel transport after it needs the hosts rebooted. mlx5 shares its
-# port with the kernel and leaves nothing behind.
+# port with the kernel and leaves nothing behind, as does af_packet (the
+# container rig's: a socket on the kernel's interface, no hugepages).
 if [[ "$DPDK_RAN" == 1 && "${SERVER_DPDK_MODE:-}" == sriov && "${SKIP_REBOOT:-0}" != 1 ]]; then
     echo ""
     echo "=== Rebooting the hosts (SR-IOV DPDK ran; SKIP_REBOOT=1 to skip) ==="
