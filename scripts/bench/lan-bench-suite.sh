@@ -383,7 +383,11 @@ cross_build() {
         export "CARGO_TARGET_${TARGET_ENV_UPPER}_LINKER=clang"
         export "CC_${TARGET_ENV}=clang"
         export "AR_${TARGET_ENV}=${ar}"
-        export "CFLAGS_${TARGET_ENV}=--sysroot=${SYSROOT}"
+        # `-fuse-ld=lld` for build scripts that link C themselves, as
+        # jemalloc's configure does: clang would otherwise link with this
+        # machine's ld, which may not know the target. Unused on a
+        # compile-only step, hence the warning silenced beside it.
+        export "CFLAGS_${TARGET_ENV}=--sysroot=${SYSROOT} -fuse-ld=lld -Wno-unused-command-line-argument"
         export "BINDGEN_EXTRA_CLANG_ARGS_${TARGET_ENV}=--sysroot=${SYSROOT}"
         export PKG_CONFIG_ALLOW_CROSS=1
         export PKG_CONFIG_SYSROOT_DIR="$SYSROOT"
