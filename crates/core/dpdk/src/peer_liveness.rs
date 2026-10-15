@@ -23,15 +23,18 @@
 //! like `mac` and `rx_checksum`, over an in-memory wire and a virtual
 //! clock.
 
-// Without `dpdk-sys` nothing but the tests calls into this module.
-#![cfg_attr(not(feature = "dpdk-sys"), allow(dead_code))]
-
 use std::time::Duration;
 
-use smoltcp::iface::{Interface, SocketHandle, SocketSet};
-use smoltcp::phy::Device;
-use smoltcp::socket::tcp;
-use smoltcp::time::Instant;
+// What acts on the TCP stack is compiled for the transport, its only
+// caller, and for the tests; the rule itself, `PeerLiveness`, is plain data
+// a binary can name in any build.
+#[cfg(any(test, feature = "dpdk-sys"))]
+use smoltcp::{
+    iface::{Interface, SocketHandle, SocketSet},
+    phy::Device,
+    socket::tcp,
+    time::Instant,
+};
 
 /// When a link's peer counts as gone: the socket probes an idle link every
 /// `probe_interval` and resets the connection once the peer has sent
@@ -103,6 +106,7 @@ impl PeerLiveness {
     /// Arm the rule on a socket. Done once the connection is established:
     /// set on a listening socket, the timeout would also cover a half-open
     /// handshake and close the listener itself, which nothing replaces.
+    #[cfg(any(test, feature = "dpdk-sys"))]
     pub(crate) fn apply(&self, socket: &mut tcp::Socket<'_>) {
         socket.set_keep_alive(Some(self.probe_interval.into()));
         socket.set_timeout(Some(self.timeout.into()));
@@ -116,6 +120,7 @@ impl PeerLiveness {
 /// the FIN has been read (smoltcp keeps a connection readable while
 /// unread data remains). A peer that has sent its FIN can send nothing
 /// more, so a session needing both directions is over.
+#[cfg(any(test, feature = "dpdk-sys"))]
 pub(crate) fn link_up(socket: &tcp::Socket<'_>) -> bool {
     socket.may_send() && socket.may_recv()
 }
@@ -129,6 +134,7 @@ pub(crate) fn link_up(socket: &tcp::Socket<'_>) -> bool {
 /// unsent, and the peer would learn nothing until its own deadline.
 /// Best effort: a frame the device cannot take now is not retried, and
 /// the peer's deadline covers that.
+#[cfg(any(test, feature = "dpdk-sys"))]
 pub(crate) fn abort_announced<D: Device + ?Sized>(
     iface: &mut Interface,
     device: &mut D,
@@ -159,6 +165,7 @@ pub(crate) fn abort_announced<D: Device + ?Sized>(
 /// The interface indexes established connections by four-tuple and cannot
 /// see a removal from the set, so the socket is also forgotten there: a
 /// stale entry would hold a slot of the index for the life of the process.
+#[cfg(any(test, feature = "dpdk-sys"))]
 pub(crate) fn reset_announced<D: Device + ?Sized>(
     iface: &mut Interface,
     device: &mut D,
@@ -185,6 +192,7 @@ pub(crate) fn reset_announced<D: Device + ?Sized>(
 /// clock's reading when the clock is made, so the values keep the
 /// magnitude the stack has always seen, and moves with
 /// [`std::time::Instant`] from then on.
+#[cfg(any(test, feature = "dpdk-sys"))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StackClock {
     origin: std::time::Instant,
@@ -193,6 +201,7 @@ pub(crate) struct StackClock {
     base_millis: i64,
 }
 
+#[cfg(any(test, feature = "dpdk-sys"))]
 impl StackClock {
     /// A clock reading the wall clock's milliseconds now.
     pub(crate) fn start() -> Self {

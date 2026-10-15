@@ -98,6 +98,26 @@ pub trait ByteStream {
     }
 }
 
+/// A stream lent as `&mut` is the stream: so a caller holding its streams
+/// in a collection lends one per call, as a NIC handle lends its views.
+impl<S: ByteStream + ?Sized> ByteStream for &mut S {
+    fn send(&mut self, data: &[u8]) -> io::Result<usize> {
+        (**self).send(data)
+    }
+
+    fn service(&mut self, now_ns: u64) {
+        (**self).service(now_ns);
+    }
+
+    fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        (**self).recv(buf)
+    }
+
+    fn send_in_place(&mut self, fill: impl FnOnce(&mut [u8]) -> usize) -> io::Result<usize> {
+        (**self).send_in_place(fill)
+    }
+}
+
 /// Whether a non-blocking socket call failed only because it would have
 /// waited.
 fn would_block(e: &io::Error) -> bool {

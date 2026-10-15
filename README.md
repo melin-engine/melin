@@ -44,7 +44,7 @@ Every figure is a full round trip as the client sees it: the request leaves the 
 | Kernel TCP | 25K/s | 38 µs | 62 µs | 73 µs | 104 µs |
 | DPDK kernel bypass | 48K/s | 20 µs | 45 µs | 47 µs | 49 µs |
 
-The benchmark harness and tuning guidance ship with [the Melin Exchange Core](https://github.com/melin-engine/exchange-core).
+The harness that runs these, and the host tuning they assume, are in this repository: [Benchmarking across a LAN](docs/benchmarking.md). It drives the Exchange Core, or the echo and notary examples here.
 
 ## Building an application on Melin
 

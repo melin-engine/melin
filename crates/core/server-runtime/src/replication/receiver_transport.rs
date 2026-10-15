@@ -155,6 +155,8 @@ pub(super) trait ControlFrameSource {
 /// How often [`run_serviced`] services the link while the work runs:
 /// well within a TCP stack's retransmission and probe timers, and
 /// sleeping in between so a helper sharing the core still gets to run.
+/// Compiled where [`run_serviced`] is.
+#[cfg(any(test, feature = "dpdk"))]
 const SERVICED_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
 
 /// [`ControlFrameSource::serviced`] for a transport whose stack runs on
@@ -165,7 +167,7 @@ const SERVICED_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_mi
 ///
 /// If the helper cannot be spawned the work runs here, unserviced, with
 /// a warning: no worse than before the link was serviced at all.
-#[cfg_attr(not(feature = "dpdk"), allow(dead_code))]
+#[cfg(any(test, feature = "dpdk"))]
 pub(super) fn run_serviced<R: Send>(
     work: impl FnOnce() -> R + Send,
     mut service: impl FnMut(),

@@ -4,11 +4,6 @@
 //! Compiled for the `dpdk` feature, and for the unit tests on every
 //! build: parsing is plain code, and checking it should not need libdpdk.
 
-// Without `dpdk`, only the unit tests use this module, and not all of it
-// (the environment lookup, the ports): what they leave unused is used by
-// the DPDK launcher, which is not compiled.
-#![cfg_attr(not(feature = "dpdk"), allow(dead_code))]
-
 use std::net::Ipv4Addr;
 
 /// The DPDK interfaces, one per node slot, space-separated.
@@ -41,9 +36,12 @@ pub const CLIENT_VDEV: &str = "net_af_packet_client";
 
 /// The client port of every DPDK node. Fixed rather than picked: each
 /// node owns its IP outright, in namespaces no other test shares, so
-/// nothing else can be on it.
+/// nothing else can be on it. The DPDK launcher's alone, like
+/// [`Layout::from_env`]: the unit tests parse a layout of their own.
+#[cfg(feature = "dpdk")]
 pub const NODE_PORT: u16 = 9876;
 /// The replication port of every DPDK node, fixed for the same reason.
+#[cfg(feature = "dpdk")]
 pub const REPLICATION_PORT: u16 = 9877;
 
 /// One veth seat on the runner's network, a node slot or the DPDK
@@ -77,6 +75,7 @@ pub struct Layout {
 impl Layout {
     /// The layout from this process's environment, or an error saying how
     /// to run under the runner.
+    #[cfg(feature = "dpdk")]
     pub fn from_env() -> Result<Layout, String> {
         Layout::parse(|name| match std::env::var(name) {
             Ok(value) => Ok(Some(value)),

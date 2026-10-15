@@ -4,9 +4,6 @@
 //! Plain logic with no libdpdk dependency, so it is tested on every host,
 //! like `mac` and `rx_checksum`. `DpdkShared::init` is its only caller.
 
-// Without `dpdk-sys` nothing but the tests calls into this module.
-#![cfg_attr(not(feature = "dpdk-sys"), allow(dead_code))]
-
 /// The mbuf pool's name when the node owns EAL: the name it has always
 /// had, so the one-node-per-process deployment is unchanged.
 const OWN_EAL_POOL: &str = "pktmbuf_pool";

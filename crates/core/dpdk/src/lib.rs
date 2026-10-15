@@ -43,11 +43,14 @@ pub use mac::{
 // stack is decided from offload flags and frame bytes alone, so the
 // policy is tested on any host, with or without libdpdk.
 pub mod rx_checksum;
-// Ungated for the same reason: what a node does differently on a
-// process-wide EAL is decided from its configuration alone.
+// What a node does differently on a process-wide EAL is decided from its
+// configuration alone, so it is tested on any host; only the gated
+// transport calls it, so it is compiled for that and for the tests.
+#[cfg(any(test, feature = "dpdk-sys"))]
 mod eal_sharing;
-// Ungated for the same reason: when a long-lived link's peer counts as
-// gone is TCP-stack logic, tested over an in-memory wire.
+// Ungated for the same reason as `rx_checksum`: when a long-lived link's
+// peer counts as gone is TCP-stack logic, tested over an in-memory wire.
+// What in it acts on a socket is compiled for the transport and the tests.
 pub mod peer_liveness;
 pub use peer_liveness::PeerLiveness;
 // Ungated for the same reason: the ARP frames a transport sends and
@@ -63,10 +66,15 @@ pub use config::{DpdkConfig, NicConfig, SocketBuffers};
 mod args;
 #[cfg(feature = "clap")]
 pub use args::{DpdkArgs, DpdkArgsError};
-// Ungated for the same reason as `peer_liveness`: the client NIC handle's
-// clock, local ports, dial wait and stream I/O are TCP-stack logic, tested
-// over an in-memory wire. The handle itself is in the gated `dpdk` module.
+// The client NIC handle's clock, local ports, dial wait and stream I/O are
+// TCP-stack logic, tested over an in-memory wire on any host; the handle
+// itself is in the gated `dpdk` module, and is their only caller, so they
+// are compiled for it and for the tests. So is `dial_addr`, whose callers
+// all dial over a NIC.
+#[cfg(any(test, feature = "dpdk-sys"))]
 mod nic;
+#[cfg(feature = "dpdk-sys")]
+pub use nic::dial_addr;
 #[cfg(test)]
 mod test_wire;
 

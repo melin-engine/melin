@@ -172,10 +172,8 @@ fn run(cli: Cli) -> Result<(), Failure> {
 
 #[cfg(feature = "dpdk")]
 fn connect_dpdk(cli: &Cli, clock: &TscClock) -> Result<dpdk::DpdkTcp, String> {
-    let server = match cli.server {
-        SocketAddr::V4(v4) => v4,
-        SocketAddr::V6(_) => return Err("the DPDK transport is IPv4 only".into()),
-    };
+    let server = melin_dpdk::dial_addr(cli.server)
+        .map_err(|why| format!("--server {}: {why}", cli.server))?;
     dpdk::DpdkTcp::connect(&cli.dpdk, server, clock)
 }
 

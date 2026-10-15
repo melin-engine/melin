@@ -1,0 +1,57 @@
+[package]
+name = "melin-bench"
+version.workspace = true
+edition = "2024"
+rust-version.workspace = true
+license.workspace = true
+description = "A closed-loop load generator for the Melin example applications, over kernel TCP or DPDK."
+# A tool for the LAN suite (`scripts/bench/`), not a library anyone links.
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "melin-bench"
+path = "src/main.rs"
+
+[dependencies]
+# The polled connection: one per client, all driven from one loop over
+# whichever stream carries them. The DPDK NIC handle with the `dpdk`
+# feature.
+melin-client = { workspace = true }
+# Core pinning for the loop's thread.
+melin-app = { workspace = true }
+# The request and reply kinds of the applications driven. Path-only, as
+# the examples are `publish = false`.
+melin-example-echo = { path = "../../examples/echo" }
+melin-example-notary = { path = "../../examples/notary" }
+clap = { workspace = true }
+# Latency percentiles over millions of samples without keeping them.
+hdrhistogram = "7"
+# `--duration 60s`, the spelling the Exchange Core's bench takes, so the
+# suite passes the same durations to every application's client.
+humantime = "2"
+# The `--dpdk-*` flags, the node's own declaration.
+melin-dpdk = { workspace = true, optional = true, features = ["clap"] }
+
+[dev-dependencies]
+# `tests/load.rs`: an echo node and a notary node, in process, for the
+# binary to load, and their journals read back to count what it sent.
+melin-test-node = { path = "../../core/test-node" }
+melin-server-runtime = { workspace = true }
+melin-journal = { workspace = true }
+tempfile = "3"
+
+[features]
+default = []
+# `--transport dpdk`. Needs libdpdk to build; without the feature the
+# binary builds and runs over kernel TCP. The launcher's and the echo
+# example's `dpdk` too, for the DPDK test's node.
+dpdk = ["dep:melin-dpdk", "melin-client/dpdk", "melin-test-node/dpdk", "melin-example-echo/dpdk"]
+
+# Runs the binary over DPDK against a node on DPDK, so only with the
+# feature, and only under `scripts/dpdk/netns-runner.sh`.
+[[test]]
+name = "dpdk_load"
+required-features = ["dpdk"]
