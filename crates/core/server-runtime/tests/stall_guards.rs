@@ -18,7 +18,6 @@
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -423,19 +422,61 @@ fn logged(text: &str) -> bool {
     String::from_utf8_lossy(&log).contains(text)
 }
 
+/// A node stopped when the test ends, however it ends. A test that panics
+/// with its node running would leave the node's threads in the process,
+/// and under `cargo test` the next test here reads every thread of the
+/// process (see [`serial`]).
+struct StopOnDrop(Option<Node>);
+
+impl StopOnDrop {
+    fn node(&self) -> &Node {
+        self.0.as_ref().expect("held until dropped")
+    }
+}
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        let Some(node) = self.0.take() else {
+            return;
+        };
+        if std::thread::panicking() {
+            // Dropped result: the test is already failing, with its own
+            // message; the node is stopped for the next test's sake, and a
+            // second panic here would abort the process instead.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| node.stop()));
+        } else {
+            node.stop();
+        }
+    }
+}
+
 /// A primary warns about a replica that takes entries in but persists
 /// none, and says when it persists again.
 ///
-/// The replica is scripted: it acks every entry it reads as taken into its
-/// pipeline, and none as journaled, as a replica whose journal stage never
-/// started (or whose disk hangs) does. Such a replica satisfies an ack
-/// policy that counts in-memory copies, and used to go unnoticed until its
-/// input ring filled and its primary evicted it. The primary's ack policy
-/// here is `disk`, so the test's client does not depend on the replica.
+/// The replica is scripted: it acks the entries it has read as taken into
+/// its pipeline, and none as journaled, as a replica whose journal stage
+/// never started (or whose disk hangs) does. Such a replica satisfies an
+/// ack policy that counts in-memory copies, and used to go unnoticed until
+/// its input ring filled and its primary evicted it. The primary's ack
+/// policy here is `disk`, so the test's client does not depend on the
+/// replica.
+///
+/// A few entries, written once, are enough: the warning is on entries held
+/// unpersisted for `PERSIST_STALL_BOUND`, and the primary checks on every
+/// ack, so the replica re-sends the same ack until the warning comes. No
+/// stream runs meanwhile, so nothing can fill the primary's replication
+/// ring and evict the replica before the bound, as a client writing flat
+/// out did while this thread read behind it.
 #[test]
 fn a_replica_that_takes_entries_but_persists_none_is_reported() {
     const STALLED: &str = "replica accepts entries but persists none";
     const RESUMED: &str = "replica persisting again";
+    /// Entries for the replica to take in: any number above zero holds the
+    /// warning's condition.
+    const WRITES: usize = 10;
+    /// How often the replica re-sends its ack: well under the bound, so the
+    /// warning comes soon after it.
+    const ACK_INTERVAL: Duration = Duration::from_millis(100);
 
     let _serial = serial();
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -449,52 +490,38 @@ fn a_replica_that_takes_entries_but_persists_none_is_reported() {
         health_bind: Some(health),
         ..node_config(tmp.path(), "primary", &keys.primary, &keys_file)
     };
-    let primary = start_at(&primary_addrs, config);
+    let primary = StopOnDrop(Some(start_at(&primary_addrs, config)));
 
     // Up, so its replication endpoint is listening.
     wait_for_gauge(health, "melin_replicas_connected", 0);
     let mut replica = RawReplica::join(primary_addrs.replication(), &keys.scripted, FRAME_LIMIT);
     wait_for_gauge(health, "melin_replicas_connected", 1);
 
-    // A steady stream of entries for the replica to read, paced: the
-    // warning needs entries pending past `PERSIST_STALL_BOUND`, not
-    // throughput. Flat out, a `disk` ack lets the client write faster than
-    // this thread reads the replica's stream, the primary's replication
-    // ring fills behind it, and the replica is evicted for that before the
-    // bound is reached.
-    const WRITE_PACE: Duration = Duration::from_millis(1);
-    let stop = Arc::new(AtomicBool::new(false));
-    let writer = {
-        let stop = Arc::clone(&stop);
-        let addr = primary.addr();
-        let key = keys.client.clone();
-        std::thread::spawn(move || {
-            let deadline = Instant::now() + LIMIT;
-            let mut conn = Connection::connect_by(addr, &key, deadline).expect("client connects");
-            // The test's own bound, as in the placement test: a CI
-            // runner's disk sets the pace of a `disk` ack.
-            conn.set_read_timeout(LIMIT)
-                .expect("set the client's read timeout");
-            while !stop.load(Ordering::Relaxed) {
-                let reply = conn
-                    .request_one(&increment_request(1))
-                    .expect("a reply to the write");
-                assert_eq!(reply[0], KIND_RESP_ACK, "the write is acked");
-                std::thread::sleep(WRITE_PACE);
-            }
-        })
-    };
-
-    // Takes everything in, persists nothing past the handshake's zero.
     let deadline = Instant::now() + LIMIT;
-    let mut last = 0;
+    let mut client = Connection::connect_by(primary.node().addr(), &keys.client, deadline)
+        .expect("client connects");
+    // The test's own bound, as in the placement test: a CI runner's disk
+    // sets the pace of a `disk` ack.
+    client
+        .set_read_timeout(LIMIT)
+        .expect("set the client's read timeout");
+    for _ in 0..WRITES {
+        let reply = client
+            .request_one(&increment_request(1))
+            .expect("a reply to the write");
+        assert_eq!(reply[0], KIND_RESP_ACK, "the write is acked");
+    }
+    let head = gauge(health, "melin_journal_sequence").expect("the primary's sequence");
+    let taken = replica.read_through(head);
+
+    // Takes them in, persists nothing past the handshake's zero.
     while !logged(STALLED) {
         assert!(
             Instant::now() < deadline,
             "the primary never warned about a replica that persists nothing"
         );
-        last = replica.read_through(last + 1);
-        replica.ack_tracks(0, last);
+        replica.ack_tracks(0, taken);
+        std::thread::sleep(ACK_INTERVAL);
     }
     assert!(!logged(RESUMED), "no recovery before the replica persists");
 
@@ -504,12 +531,11 @@ fn a_replica_that_takes_entries_but_persists_none_is_reported() {
             Instant::now() < deadline,
             "the primary never said the replica persists again"
         );
-        replica.ack_tracks(last, last);
-        last = replica.read_through(last + 1);
+        replica.ack_tracks(taken, taken);
+        std::thread::sleep(ACK_INTERVAL);
     }
 
-    stop.store(true, Ordering::Relaxed);
-    writer.join().expect("the client thread");
+    drop(client);
     drop(replica);
-    primary.stop();
+    drop(primary);
 }
