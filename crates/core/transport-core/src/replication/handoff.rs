@@ -194,7 +194,7 @@ impl LiveHandoff {
                             self.phase = Phase::Backfill { chunk };
                         }
                         ChunkFate::Next => {
-                            if let Some(step) = self.forward(chunk, consumer, io)? {
+                            if let Some(step) = self.forward(chunk, batch, io) {
                                 return Ok(step);
                             }
                         }
@@ -220,13 +220,13 @@ impl LiveHandoff {
                             return Ok(HandoffStep::Pending);
                         }
                         // Reached: forward it as the inline drain does.
-                        if let Some(step) = self.forward(chunk, consumer, io)? {
+                        if let Some(step) = self.forward(chunk, batch, io) {
                             return Ok(step);
                         }
                     }
                 },
                 Phase::Forward { chunk } => {
-                    if let Some(step) = self.forward(chunk, consumer, io)? {
+                    if let Some(step) = self.forward(chunk, held(consumer)?, io) {
                         return Ok(step);
                     }
                 }
@@ -239,35 +239,36 @@ impl LiveHandoff {
         }
     }
 
-    /// Forward the held chunk, classified `chunk` when it was found at or
-    /// ahead of the position: a control frame always, an `InputBatch`
-    /// unless a back-fill has since covered it — the inline drain's rule.
-    /// Returns the step to end on, or `None` to go on draining.
+    /// Forward `batch`, the held chunk, classified `chunk` when it was
+    /// found at or ahead of the position: a control frame always, an
+    /// `InputBatch` unless a back-fill has since covered it — the inline
+    /// drain's rule. Returns the step to end on, or `None` to go on
+    /// draining.
     ///
-    /// A chunk the socket refuses stays held (`Phase::Forward`), so the
-    /// next step offers the same bytes again.
+    /// A chunk the socket refuses stays held (`Phase::Forward`): dropped
+    /// uncommitted, it is peeked again by the next step, which offers the
+    /// same bytes again.
     fn forward(
         &mut self,
         chunk: RingChunk,
-        consumer: &mut ReplicationConsumer,
+        batch: ReplicationBatch<'_>,
         io: &mut dyn HandoffIo,
-    ) -> io::Result<Option<HandoffStep>> {
-        let batch = held(consumer)?;
+    ) -> Option<HandoffStep> {
         let meta = batch.meta();
         let send = !chunk.batch || meta.end_sequence > self.sent.get();
         if send && !io.try_send(batch.data()) {
             self.phase = Phase::Forward { chunk };
-            return Ok(Some(HandoffStep::Pending));
+            return Some(HandoffStep::Pending);
         }
         if send && chunk.batch {
             self.sent.advance(meta.end_sequence);
         }
         batch.commit();
         if chunk.batch {
-            return Ok(Some(self.go_live()));
+            return Some(self.go_live());
         }
         self.phase = Phase::Drain;
-        Ok(None)
+        None
     }
 
     /// End the handoff: the sent high-water is the caller's from here.
@@ -277,11 +278,11 @@ impl LiveHandoff {
     }
 }
 
-/// The held chunk, peeked again: the chunk a back-fill ran for, or one the
-/// socket refused, still first in the ring since only `forward` and the
-/// covered-chunk arm commit. `Err` rather than a panic on an empty ring
-/// all the same, as a bug here must cost the replica its link, not the
-/// node its poll thread.
+/// The held chunk, peeked again by a step that resumes with it: the chunk
+/// a back-fill ran for, or one the socket refused, still first in the ring
+/// since only `forward` and the covered-chunk arm commit. `Err` rather
+/// than a panic on an empty ring all the same, as a bug here must cost the
+/// replica its link, not the node its poll thread.
 fn held(consumer: &mut ReplicationConsumer) -> io::Result<ReplicationBatch<'_>> {
     consumer
         .peek()
