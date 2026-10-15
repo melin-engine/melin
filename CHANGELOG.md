@@ -225,8 +225,8 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   from one pinned loop, over kernel TCP or, with `--features dpdk`, one
   DPDK NIC, writing its throughput and latency percentiles as JSON. See
   [docs/benchmarking.md](docs/benchmarking.md).
-- **`melin_dpdk::dial_addr`** (re-exported by `melin-client`'s `dpdk`
-  feature): the address check a DPDK dial needs before a NIC comes up,
+- **`melin_dpdk::dial_addr`** (with `dpdk-sys`; re-exported by
+  `melin-client`'s `dpdk` feature): the address check a DPDK dial needs before a NIC comes up,
   IPv4 and not loopback, with the reason to print. The echo client, the
   `shm-proxy` and `melin-bench` share it.
 - **`ByteStream` is implemented for `&mut S`** where `S: ByteStream`, so

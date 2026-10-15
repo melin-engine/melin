@@ -1,9 +1,6 @@
 //! What the binary's tests share: the nodes they load, the binary run
 //! against them, and its results read back.
 
-// Each test binary uses its own subset.
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 

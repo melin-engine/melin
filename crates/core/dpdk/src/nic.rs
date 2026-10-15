@@ -8,9 +8,6 @@
 //! The handle itself (`dpdk::nic_handle`) is this logic bound to the node
 //! transport's device and interface.
 
-// Without `dpdk-sys` nothing but the tests calls into this module.
-#![cfg_attr(not(feature = "dpdk-sys"), allow(dead_code))]
-
 use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4};
 

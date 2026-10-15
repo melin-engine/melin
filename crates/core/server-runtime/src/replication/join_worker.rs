@@ -29,20 +29,28 @@
 //! from the pinned, real-time poll thread would never be scheduled.
 
 use std::io;
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError, channel, sync_channel};
 use std::thread::JoinHandle;
 
-use melin_app::AppEvent;
-use melin_transport_core::fence::FenceState;
-use melin_transport_core::replication::catchup::{
-    CatchUpPublisher, CatchUpResult, can_catch_up_from_journal, catch_up_from_journal_with,
-    handoff_pass_from_journal, lineage_origin, preflight_snapshot_transfer, snapshot_transfer_with,
-};
-use melin_transport_core::replication::protocol::{
-    encode_hash_mismatch, encode_need_snapshot, encode_stream_start,
+use melin_transport_core::replication::catchup::CatchUpPublisher;
+// What the join itself reads and writes, compiled where it is (see
+// `JoinContext`).
+#[cfg(any(feature = "dpdk", not(feature = "no-persist")))]
+use {
+    melin_app::AppEvent,
+    melin_transport_core::fence::FenceState,
+    melin_transport_core::replication::catchup::{
+        CatchUpResult, can_catch_up_from_journal, catch_up_from_journal_with,
+        handoff_pass_from_journal, lineage_origin, preflight_snapshot_transfer,
+        snapshot_transfer_with,
+    },
+    melin_transport_core::replication::protocol::{
+        encode_hash_mismatch, encode_need_snapshot, encode_stream_start,
+    },
+    std::path::PathBuf,
+    std::sync::atomic::AtomicU8,
 };
 
 use super::validation_worker::{WorkerGone, spawn_unpinned};
@@ -382,8 +390,9 @@ impl JoinStallWatch {
 /// driver's lifetime, so held by the worker rather than sent per join.
 // Used by the DPDK sender and by the tests that run a join against a real
 // journal, which a `no-persist` build has none of: a `no-persist` test
-// build without `dpdk` compiles this module for its mechanics alone.
-#[cfg_attr(all(feature = "no-persist", not(feature = "dpdk")), allow(dead_code))]
+// build without `dpdk` compiles this module for its mechanics alone, and
+// so leaves this out.
+#[cfg(any(feature = "dpdk", not(feature = "no-persist")))]
 pub(crate) struct JoinContext {
     pub(crate) journal_path: PathBuf,
     /// Read when the `StreamStart` is encoded, as the inline join did.
@@ -405,8 +414,8 @@ pub(crate) struct JoinContext {
 /// the replica archives its lineage on the verdict, so a snapshot that
 /// cannot be produced must fail the join with nothing sent (see
 /// `preflight_snapshot_transfer`).
-// See `JoinContext` for the `no-persist` allowance.
-#[cfg_attr(all(feature = "no-persist", not(feature = "dpdk")), allow(dead_code))]
+// Compiled where `JoinContext` is.
+#[cfg(any(feature = "dpdk", not(feature = "no-persist")))]
 pub(crate) fn stream_join<E: AppEvent>(
     ctx: &JoinContext,
     request: &JoinRequest,
