@@ -97,6 +97,19 @@ use melin_wire_protocol::transport::BlockingTransportListener;
 /// hiccup rather than to save memory.
 const DEFAULT_REPLICATION_PIPELINE_DEPTH: usize = 256;
 
+/// A transport buffer size as the `--dpdk-client-*-kib` flags spell it:
+/// their defaults are the transport's own sizes, which are whole KiB (a
+/// test maps them back and compares).
+const fn kib_of(bytes: usize) -> u32 {
+    (bytes / 1024) as u32
+}
+
+/// A `--dpdk-client-*-kib` value as the transport's size in bytes.
+#[cfg(feature = "dpdk")]
+fn kib(value: u32) -> usize {
+    value as usize * 1024
+}
+
 /// CLI spelling of [`melin_journal::StagingMode`].
 ///
 /// A separate enum rather than a `clap::ValueEnum` derive on the journal
@@ -319,6 +332,40 @@ pub struct ServerConfig {
     #[command(flatten)]
     pub dpdk: DpdkArgs,
 
+    /// Receive buffer, in KiB, of each client connection on the DPDK
+    /// client port: the window advertised to the client.
+    // On the node rather than in `DpdkArgs`: only a node accepts client
+    // connections. `u32` KiB rather than bytes: a value an operator types,
+    // and at most 4 TiB once multiplied out on a 64-bit target.
+    #[arg(
+        long,
+        default_value_t = kib_of(melin_dpdk::SocketBuffers::DEFAULT.rx_buf_size),
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub dpdk_client_rx_buf_kib: u32,
+
+    /// Send buffer, in KiB, of each client connection on the DPDK client
+    /// port: the in-flight window, which caps one connection's response
+    /// bandwidth at this much per round trip. The default carries one
+    /// client at a million responses a second with headroom; a single
+    /// connection driven at the stack's full rate wants more (256). Every
+    /// client connection holds one, so it multiplies by their number.
+    #[arg(
+        long,
+        default_value_t = kib_of(melin_dpdk::SocketBuffers::DEFAULT.tx_buf_size),
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub dpdk_client_tx_buf_kib: u32,
+
+    /// Responses, in KiB, that may queue behind a client connection's
+    /// send buffer before the connection is dropped as fallen behind.
+    #[arg(
+        long,
+        default_value_t = kib_of(melin_dpdk::SocketBuffers::DEFAULT.tx_queue_limit),
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub dpdk_client_tx_queue_kib: u32,
+
     /// Address for the output event publisher. Subscribers connect here
     /// to receive a real-time stream of the application's reports, as the
     /// application's publisher encodes them. Ed25519 auth against the
@@ -484,6 +531,9 @@ impl Default for ServerConfig {
                 ip: Some(melin_dpdk::NicConfig::default().ip_addr),
                 ..DpdkArgs::default()
             },
+            dpdk_client_rx_buf_kib: kib_of(melin_dpdk::SocketBuffers::DEFAULT.rx_buf_size),
+            dpdk_client_tx_buf_kib: kib_of(melin_dpdk::SocketBuffers::DEFAULT.tx_buf_size),
+            dpdk_client_tx_queue_kib: kib_of(melin_dpdk::SocketBuffers::DEFAULT.tx_queue_limit),
             event_bind: None,
             health_bind: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9878)),
             admin_bind: None,
@@ -1397,14 +1447,24 @@ fn load_replication_key(
 /// `fd` for I/O; the `writer` keeps the fd alive via ownership.
 pub use crate::ControlEvent;
 
-/// Joinable handles for every long-lived thread spawned by a primary.
-/// Optional handles are `None` when their feature is disabled (e.g.,
-/// no replication, no health endpoint) or unsupported on a transport
-/// (e.g., DPDK runs without an event publisher or shadow snapshotter).
+/// Joinable handles for every long-lived thread a primary spawns,
+/// gathered as each one starts.
+///
+/// Startup fills it in thread by thread, and the ordered shutdown empties
+/// it through [`shutdown_pipeline_stages`]. Dropped with threads still in
+/// it — startup returned early, because a later stage could not start or
+/// for any other reason — it stops and joins them, so the error goes back
+/// to the caller with no stage left running. That matters beyond the
+/// process exiting anyway: [`run_with_shutdown`] hosts several nodes in
+/// one process, and a stage left spinning would outlive its node.
+///
+/// Every handle is optional, because startup has not reached it yet, its
+/// feature is disabled (no replication, no health endpoint), or its
+/// transport has no such thread (DPDK runs without an event publisher).
 struct PipelineHandles<A: Send + 'static, W: Send + 'static> {
-    journal: std::thread::JoinHandle<Result<W, JournalError>>,
-    matching: std::thread::JoinHandle<A>,
-    response: std::thread::JoinHandle<()>,
+    journal: Option<std::thread::JoinHandle<Result<W, JournalError>>>,
+    matching: Option<std::thread::JoinHandle<A>>,
+    response: Option<std::thread::JoinHandle<()>>,
     replication: Option<std::thread::JoinHandle<()>>,
     event_publisher: Option<std::thread::JoinHandle<()>>,
     shadow: Option<std::thread::JoinHandle<()>>,
@@ -1412,85 +1472,133 @@ struct PipelineHandles<A: Send + 'static, W: Send + 'static> {
     // No standalone tick thread on either transport: io_uring emits ticks
     // from inside the reader (via IORING_OP_TIMEOUT) and DPDK emits them
     // from inside the poll thread (via a wall-clock check between bursts).
+    /// The node's stop flag, raised before the threads are joined.
+    shutdown: Arc<AtomicBool>,
+    /// Lowered before the threads are joined, once the health endpoint
+    /// exists, so a probe during the teardown reads unhealthy.
+    pipeline_healthy: Option<Arc<AtomicBool>>,
 }
 
-/// Drain the pipeline and join every worker thread, surfacing panics
-/// and journal-stage errors as a single `pipeline failure` return.
-///
-/// `extras` is a list of pre-joined results (used by the DPDK path,
-/// which joins its poll threads before draining the pipeline).
-fn shutdown_pipeline_stages<A: Send + 'static, W: Send + 'static>(
-    handles: PipelineHandles<A, W>,
-    extras: Vec<(String, std::thread::Result<()>)>,
-    pipeline_healthy: &AtomicBool,
-    shutdown: &AtomicBool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    info!("shutdown: draining pipeline");
-    pipeline_healthy.store(false, Ordering::Relaxed);
-    shutdown.store(true, Ordering::Relaxed);
+impl<A: Send + 'static, W: Send + 'static> PipelineHandles<A, W> {
+    /// No thread started yet.
+    fn new(shutdown: Arc<AtomicBool>) -> Self {
+        Self {
+            journal: None,
+            matching: None,
+            response: None,
+            replication: None,
+            event_publisher: None,
+            shadow: None,
+            health: None,
+            shutdown,
+            pipeline_healthy: None,
+        }
+    }
 
-    let mut thread_panicked = false;
-    let mut check_join = |name: &str, result: std::thread::Result<()>| {
-        if let Err(panic) = result {
+    /// Whether a stage thread that only exits on shutdown or a panic has
+    /// exited: the accept loop's check for a broken pipeline.
+    fn stage_died(&self) -> bool {
+        fn finished<T>(handle: &Option<std::thread::JoinHandle<T>>) -> bool {
+            handle.as_ref().is_some_and(|h| h.is_finished())
+        }
+        finished(&self.journal)
+            || finished(&self.matching)
+            || finished(&self.response)
+            || finished(&self.event_publisher)
+            || finished(&self.shadow)
+    }
+
+    /// Raise the stop flag and join every thread held, logging each that
+    /// panicked or, for the journal stage, returned an error. Returns
+    /// whether any did. Leaves nothing held.
+    fn stop_and_join(&mut self) -> bool {
+        if let Some(healthy) = &self.pipeline_healthy {
+            healthy.store(false, Ordering::Relaxed);
+        }
+        self.shutdown.store(true, Ordering::Relaxed);
+
+        // Whether the joined thread panicked, logged if it did.
+        fn panicked(name: &str, result: std::thread::Result<()>) -> bool {
+            let Err(panic) = result else {
+                return false;
+            };
             let msg = panic
                 .downcast_ref::<&str>()
                 .copied()
                 .or_else(|| panic.downcast_ref::<String>().map(|s| s.as_str()))
                 .unwrap_or("<non-string panic>");
             error!(thread = name, message = msg, "pipeline thread panicked");
-            thread_panicked = true;
+            true
         }
-    };
 
-    let journal_result = handles.journal.join();
-    let journal_failed = matches!(&journal_result, Ok(Err(_)));
-    if let Ok(Err(ref e)) = journal_result {
-        error!(thread = "journal-seq", error = %e, "journal stage returned error");
+        let mut failed = false;
+        if let Some(h) = self.journal.take() {
+            let journal_result = h.join();
+            if let Ok(Err(ref e)) = journal_result {
+                error!(thread = "journal-seq", error = %e, "journal stage returned error");
+                failed = true;
+            }
+            failed |= panicked("journal-seq", journal_result.map(|_| ()));
+        }
+        if let Some(h) = self.matching.take() {
+            failed |= panicked("matching", h.join().map(|_| ()));
+        }
+        if let Some(h) = self.response.take() {
+            failed |= panicked("response", h.join());
+        }
+        if let Some(h) = self.replication.take() {
+            failed |= panicked("replication-sender", h.join());
+        }
+        if let Some(h) = self.event_publisher.take() {
+            failed |= panicked("event-publisher", h.join());
+        }
+        if let Some(h) = self.shadow.take() {
+            failed |= panicked("shadow", h.join());
+        }
+        if let Some(h) = self.health.take() {
+            failed |= panicked("health", h.join());
+        }
+        failed
     }
-    check_join("journal-seq", journal_result.map(|_| ()));
-    check_join("matching", handles.matching.join().map(|_| ()));
-    check_join("response", handles.response.join());
-    for (name, r) in extras {
-        check_join(&name, r);
+}
+
+impl<A: Send + 'static, W: Send + 'static> Drop for PipelineHandles<A, W> {
+    fn drop(&mut self) {
+        let started = self.journal.is_some()
+            || self.matching.is_some()
+            || self.response.is_some()
+            || self.replication.is_some()
+            || self.event_publisher.is_some()
+            || self.shadow.is_some()
+            || self.health.is_some();
+        if started {
+            info!("startup failed: stopping the stages already running");
+            // The failures this reports are logged as they are found, and
+            // what the caller needs is the error startup is returning.
+            self.stop_and_join();
+        }
     }
-    if let Some(h) = handles.replication {
-        check_join("replication-sender", h.join());
-    }
-    if let Some(h) = handles.event_publisher {
-        check_join("event-publisher", h.join());
-    }
-    if let Some(h) = handles.shadow {
-        check_join("shadow", h.join());
-    }
-    if let Some(h) = handles.health {
-        check_join("health", h.join());
-    }
+}
+
+/// Drain the pipeline and join every worker thread, surfacing panics
+/// and journal-stage errors as a single `pipeline failure` return.
+fn shutdown_pipeline_stages<A: Send + 'static, W: Send + 'static>(
+    mut handles: PipelineHandles<A, W>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    info!("shutdown: draining pipeline");
+    let failed = handles.stop_and_join();
 
     // After every stage thread has joined, dump the per-stage latency
     // histograms to stderr. No-op when `latency-trace` is disabled.
     melin_transport_core::trace::print_report_all();
 
-    if thread_panicked || journal_failed {
+    if failed {
         error!("shutdown complete (with pipeline failure)");
         return Err("pipeline failure".into());
     }
 
     info!("shutdown complete");
     Ok(())
-}
-
-/// Stop the stages a primary already spawned when a later one cannot
-/// start, so the startup error goes back to the caller with no thread
-/// left running behind it.
-fn abort_startup<A: Send + 'static, W: Send + 'static>(
-    handles: PipelineHandles<A, W>,
-    pipeline_healthy: &AtomicBool,
-    shutdown: &AtomicBool,
-) {
-    // Dropped result: the failures it can carry (a panicked thread, a
-    // journal error) are logged by `shutdown_pipeline_stages` itself, and
-    // the stage that could not start is the error the caller returns.
-    let _ = shutdown_pipeline_stages(handles, Vec::new(), pipeline_healthy, shutdown);
 }
 
 /// Used by both the normal primary startup path and the promotion path
@@ -1691,14 +1799,16 @@ where
     let shutdown_for_journal = Arc::clone(&shutdown);
     // Start the journal's disk and preparer threads here rather than on
     // journal-seq, which is pinned by the time it runs: a thread inherits
-    // its creator's placement. See `JournalStage::start`.
+    // its creator's placement. See `JournalStage::start`. For the same
+    // reason every stage thread below is spawned placed, never plainly.
     let sequencer = journal_stage
         .start()
         .map_err(|e| format!("start the journal stage: {e}"))?;
-    let journal_handle = std::thread::Builder::new()
-        .name("journal-seq".into())
-        .spawn(move || {
-            melin_app::affinity::pin_thread("journal-seq", cores.journal_seq.core);
+    // From here every thread started goes in `stages`, which stops and
+    // joins them on any early return.
+    let mut stages = PipelineHandles::new(Arc::clone(&shutdown));
+    stages.journal = Some(
+        melin_app::affinity::spawn_placed("journal-seq", cores.journal_seq.core, move || {
             let result = sequencer.run(&s1);
             let was_shutdown = shutdown_for_journal.load(Ordering::Relaxed);
             match &result {
@@ -1708,14 +1818,13 @@ where
             }
             result
         })
-        .map_err(|e| format!("spawn journal-seq thread: {e}"))?;
+        .map_err(|e| format!("spawn journal-seq thread: {e}"))?,
+    );
 
     let s2 = Arc::clone(&shutdown);
     let shutdown_for_matching = Arc::clone(&shutdown);
-    let matching_handle = std::thread::Builder::new()
-        .name("matching".into())
-        .spawn(move || {
-            melin_app::affinity::pin_thread("matching", cores.matching.core);
+    stages.matching = Some(
+        melin_app::affinity::spawn_placed("matching", cores.matching.core, move || {
             let app = matching_stage.run(&s2);
             let was_shutdown = shutdown_for_matching.load(Ordering::Relaxed);
             if was_shutdown {
@@ -1725,7 +1834,8 @@ where
             }
             app
         })
-        .map_err(|e| format!("spawn matching thread: {e}"))?;
+        .map_err(|e| format!("spawn matching thread: {e}"))?,
+    );
 
     let replication_metrics = build_replication_metrics(
         replication_consumers.is_some(),
@@ -1757,10 +1867,8 @@ where
     // The stage's startup report — see `Response::ready`. Capacity one so
     // the report never blocks the stage on this thread reaching `recv`.
     let (response_ready_tx, response_ready_rx) = std::sync::mpsc::sync_channel(1);
-    let response_handle = std::thread::Builder::new()
-        .name("response".into())
-        .spawn(move || {
-            melin_app::affinity::pin_thread("response", cores.response.core);
+    stages.response = Some(
+        melin_app::affinity::spawn_placed("response", cores.response.core, move || {
             let started = crate::response::run::<A>(
                 output_consumer,
                 control_rx,
@@ -1795,26 +1903,12 @@ where
                 error!("response thread returned without shutdown signal");
             }
         })
-        .map_err(|e| format!("spawn response thread: {e}"))?;
+        .map_err(|e| format!("spawn response thread: {e}"))?,
+    );
 
     // A stage without its ring is a node that cannot answer anyone:
-    // refuse to start, after stopping the stages already running.
-    if let Err(e) = crate::connection_limit::await_startup("response", &response_ready_rx) {
-        abort_startup(
-            PipelineHandles {
-                journal: journal_handle,
-                matching: matching_handle,
-                response: response_handle,
-                replication: None,
-                event_publisher: None,
-                shadow: None,
-                health: None,
-            },
-            &AtomicBool::new(false),
-            &shutdown,
-        );
-        return Err(e.into());
-    }
+    // refuse to start (`stages` stops the stages already running).
+    crate::connection_limit::await_startup("response", &response_ready_rx)?;
 
     // Spawn replication sender thread if enabled. The journal stage publishes
     // encoded batches to a pre-allocated ring; the sender thread consumes them.
@@ -1827,8 +1921,7 @@ where
     // snapshot reads consumer cursors from ReplicationMetrics and producer
     // cursors are not needed — ring depth is a secondary metric.
 
-    let replication_handle = if let Some((repl_consumer_1, repl_consumer_2)) = replication_consumers
-    {
+    stages.replication = if let Some((repl_consumer_1, repl_consumer_2)) = replication_consumers {
         let s_repl = Arc::clone(&shutdown);
         let repl_slots = cursors.replica_slot_cursors();
         let ready_flag = Arc::clone(&replica_ready);
@@ -1887,17 +1980,9 @@ where
             .spawn(move || {
                 // Deliberately NOT pinned. Reserving a core — at
                 // SCHED_FIFO, on an isolated one — for a thread that idles
-                // 99.9% of the time bought nothing.
-                //
-                // Staying unpinned is now load-bearing, not just thrifty.
-                // The handler threads are spawned from here and inherit
-                // this thread's affinity and scheduling policy at
-                // creation; a child of a pinned real-time parent cannot
-                // move itself off that core, because moving itself
-                // requires running. That is the DPDK handshake hang, and
-                // this path escaped it only because the 50 ms sleep
-                // happened to yield the core. See
-                // `replication::validation_worker`.
+                // 99.9% of the time bought nothing. The handler threads it
+                // spawns are created in their own placement, so this
+                // thread's does not reach them.
                 //
                 // `PipelineCores` consequently has no field for it, and
                 // `--cores` no name.
@@ -1938,7 +2023,7 @@ where
     // subscribers. Caller-supplied (an application with an output feed
     // wires its publisher; one without passes `None`), so the runtime
     // carries no application-specific reference.
-    let event_publisher_handle = spawn_event_publisher::<A>(
+    stages.event_publisher = spawn_event_publisher::<A>(
         event_publisher_consumer,
         event_publisher,
         config,
@@ -1947,7 +2032,7 @@ where
         &shutdown,
     )?;
 
-    let shadow_handle = spawn_shadow_stage::<A>(
+    stages.shadow = spawn_shadow_stage::<A>(
         shadow_consumer,
         shadow_app,
         chain_hash_lock,
@@ -1965,7 +2050,8 @@ where
     // *replication* endpoint, not the client port, so spawning health
     // here doesn't change accept semantics.
     let pipeline_healthy = Arc::new(AtomicBool::new(true));
-    let health_handle = spawn_health_endpoint(
+    stages.pipeline_healthy = Some(Arc::clone(&pipeline_healthy));
+    stages.health = spawn_health_endpoint(
         config,
         &active_connections,
         &events_processed,
@@ -2036,7 +2122,9 @@ where
     // If shutdown was requested while they were draining we still spawn the
     // reader so the unified shutdown sequence below joins every thread.
     let reader_shutdown = Arc::new(AtomicBool::new(false));
-    let mut reader_handle = match crate::reader::spawn_reader::<A, _>(
+    // No reader, no client is ever served: refuse to start (`stages` stops
+    // every stage already running).
+    let mut reader_handle = crate::reader::spawn_reader::<A, _>(
         input_producer,
         decoder,
         halt_gate,
@@ -2047,27 +2135,7 @@ where
         config.tick_interval(),
         ring_sizing,
         Arc::clone(&reader_shutdown),
-    ) {
-        Ok(handle) => handle,
-        Err(e) => {
-            // No reader, no client is ever served: refuse to start, after
-            // stopping every stage already running.
-            abort_startup(
-                PipelineHandles {
-                    journal: journal_handle,
-                    matching: matching_handle,
-                    response: response_handle,
-                    replication: replication_handle,
-                    event_publisher: event_publisher_handle,
-                    shadow: shadow_handle,
-                    health: health_handle,
-                },
-                &pipeline_healthy,
-                &shutdown,
-            );
-            return Err(e.into());
-        }
-    };
+    )?;
 
     // Health endpoint and `pipeline_healthy` were already spawned/created
     // earlier (before `journal_on_primary_events`) so probes can succeed
@@ -2101,17 +2169,7 @@ where
         // shutdown or panic — if one is finished while shutdown is false,
         // it panicked. Re-check shutdown to avoid a TOCTOU race where a
         // clean shutdown signal arrives between the two checks.
-        let event_pub_died = event_publisher_handle
-            .as_ref()
-            .is_some_and(|h| h.is_finished());
-        let shadow_died = shadow_handle.as_ref().is_some_and(|h| h.is_finished());
-        if (journal_handle.is_finished()
-            || matching_handle.is_finished()
-            || response_handle.is_finished()
-            || event_pub_died
-            || shadow_died)
-            && !shutdown.load(Ordering::Relaxed)
-        {
+        if stages.stage_died() && !shutdown.load(Ordering::Relaxed) {
             error!("pipeline thread died, initiating shutdown");
             pipeline_healthy.store(false, Ordering::Relaxed);
             break;
@@ -2248,20 +2306,7 @@ where
     reader_handle.join();
 
     // 2. Now drain the pipeline and join every worker thread.
-    shutdown_pipeline_stages(
-        PipelineHandles {
-            journal: journal_handle,
-            matching: matching_handle,
-            response: response_handle,
-            replication: replication_handle,
-            event_publisher: event_publisher_handle,
-            shadow: shadow_handle,
-            health: health_handle,
-        },
-        Vec::new(),
-        &pipeline_healthy,
-        &shutdown,
-    )
+    shutdown_pipeline_stages(stages)
 }
 
 /// Run the server with DPDK kernel-bypass networking.
@@ -2312,7 +2357,8 @@ where
 
 /// Translate the CLI surface into a [`melin_dpdk::DpdkConfig`]: the NIC
 /// from the `--dpdk-*` flags, with the node's default address where
-/// `--dpdk-ip` is not given, listening on `--bind`'s port with one queue.
+/// `--dpdk-ip` is not given, listening on `--bind`'s port with one queue,
+/// its client connections sized by the `--dpdk-client-*-kib` flags.
 ///
 /// The flags are validated by their own mapping, before EAL init and
 /// before any thread is spawned, and a bad value is returned as an error
@@ -2328,6 +2374,11 @@ fn dpdk_config_from(
             .dpdk
             .nic_config_or(melin_dpdk::NicConfig::default().ip_addr)?,
         listen_port: cfg.bind.port(),
+        client_buffers: melin_dpdk::SocketBuffers {
+            rx_buf_size: kib(cfg.dpdk_client_rx_buf_kib),
+            tx_buf_size: kib(cfg.dpdk_client_tx_buf_kib),
+            tx_queue_limit: kib(cfg.dpdk_client_tx_queue_kib),
+        },
         num_queues: 1,
     })
 }
@@ -2576,7 +2627,7 @@ where
                 // replication listener is added with the primary's other
                 // replication wiring, as at boot.
                 transport
-                    .add_listener(dpdk_config.listen_port)
+                    .add_client_listener(&dpdk_config)
                     .map_err(|e| format!("add the client listener on promotion: {e}"))?;
                 // As at boot: the switch may have aged out this port's MAC
                 // while the node only dialled out.
@@ -2911,26 +2962,28 @@ where
 
     let s1 = Arc::clone(&shutdown);
     // As on kernel TCP: start the journal's helper threads here, not on
-    // journal-seq. See `JournalStage::start`.
+    // journal-seq, and spawn every stage thread placed. See
+    // `JournalStage::start`.
     let sequencer = journal_stage
         .start()
         .map_err(|e| format!("start the journal stage: {e}"))?;
-    let journal_handle = std::thread::Builder::new()
-        .name("journal-seq".into())
-        .spawn(move || {
-            melin_app::affinity::pin_thread("journal-seq", cores.journal_seq.core);
+    // As on kernel TCP: from here every thread started goes in `stages`,
+    // which stops and joins them on any early return.
+    let mut stages = PipelineHandles::new(Arc::clone(&shutdown));
+    stages.journal = Some(
+        melin_app::affinity::spawn_placed("journal-seq", cores.journal_seq.core, move || {
             sequencer.run(&s1)
         })
-        .map_err(|e| format!("spawn journal-seq thread: {e}"))?;
+        .map_err(|e| format!("spawn journal-seq thread: {e}"))?,
+    );
 
     let s2 = Arc::clone(&shutdown);
-    let matching_handle = std::thread::Builder::new()
-        .name("matching".into())
-        .spawn(move || {
-            melin_app::affinity::pin_thread("matching", cores.matching.core);
+    stages.matching = Some(
+        melin_app::affinity::spawn_placed("matching", cores.matching.core, move || {
             matching_stage.run(&s2)
         })
-        .map_err(|e| format!("spawn matching thread: {e}"))?;
+        .map_err(|e| format!("spawn matching thread: {e}"))?,
+    );
 
     let replication_metrics = build_replication_metrics(
         replication_consumers.is_some(),
@@ -2956,10 +3009,8 @@ where
     let active_connections_response = Arc::clone(&active_connections);
     let s3 = Arc::clone(&shutdown);
     let response_utilization_thread = Arc::clone(&response_utilization);
-    let response_handle = std::thread::Builder::new()
-        .name("response".into())
-        .spawn(move || {
-            melin_app::affinity::pin_thread("response", cores.response.core);
+    stages.response = Some(
+        melin_app::affinity::spawn_placed("response", cores.response.core, move || {
             crate::dpdk_response::run::<A>(
                 output_consumer,
                 control_rx,
@@ -2977,9 +3028,10 @@ where
                 refusal_rx,
             );
         })
-        .map_err(|e| format!("spawn response thread: {e}"))?;
+        .map_err(|e| format!("spawn response thread: {e}"))?,
+    );
 
-    let shadow_handle = spawn_shadow_stage::<A>(
+    stages.shadow = spawn_shadow_stage::<A>(
         shadow_consumer,
         shadow_app,
         chain_hash_lock,
@@ -3091,10 +3143,8 @@ where
         }
         (None, 0)
     };
-    // The DPDK replication-sender thread used to be spawned here; with
-    // the single-queue / single-thread refactor the driver lives inside
-    // the client poll thread instead. Nothing to join.
-    let replication_handle: Option<std::thread::JoinHandle<()>> = None;
+    // No replication-sender thread on DPDK: the driver lives inside the
+    // client poll thread, so `stages.replication` stays empty.
 
     // Promotion fencing, as on kernel TCP: the bump is the first entry of
     // a promoted node's tenure, ahead of `on_primary`, and is applied
@@ -3135,7 +3185,8 @@ where
     // path achieves by deferring its `spawn_reader` call to after the drain.
 
     let pipeline_healthy = Arc::new(AtomicBool::new(true));
-    let health_handle = spawn_health_endpoint(
+    stages.pipeline_healthy = Some(Arc::clone(&pipeline_healthy));
+    stages.health = spawn_health_endpoint(
         config,
         &active_connections,
         &events_processed,
@@ -3188,26 +3239,10 @@ where
         repl_listen_port,
     );
 
-    // The client poll runs on the main thread, so no extra DPDK threads
-    // to join here — replication sender (if enabled) is joined below.
-    let dpdk_extras: Vec<(String, std::thread::Result<()>)> = Vec::new();
-
-    // The caller's raft guard drops — stopping the driver — after this
-    // returns.
-    shutdown_pipeline_stages(
-        PipelineHandles {
-            journal: journal_handle,
-            matching: matching_handle,
-            response: response_handle,
-            replication: replication_handle,
-            event_publisher: None,
-            shadow: shadow_handle,
-            health: health_handle,
-        },
-        dpdk_extras,
-        &pipeline_healthy,
-        &shutdown,
-    )
+    // The client poll ran on this thread, so there is no poll thread to
+    // join. The caller's raft guard drops — stopping the driver — after
+    // this returns.
+    shutdown_pipeline_stages(stages)
 }
 
 /// Promotion fencing: journal the `EpochBump` that opens a promoted
@@ -3737,23 +3772,20 @@ where
     let s_shadow = Arc::clone(shutdown);
     let shadow = cores.shadow;
     let shadow_initial_epoch = initial_epoch;
-    let handle = std::thread::Builder::new()
-        .name("shadow".into())
-        .spawn(move || {
-            melin_app::affinity::pin_thread("shadow", shadow.core);
-            melin_transport_core::shadow::run(
-                shadow_cons,
-                shadow_ex,
-                snap_path,
-                interval,
-                chain_hash,
-                &s_shadow,
-                shadow.wait,
-                shadow_initial_epoch,
-                genesis_entries,
-            );
-        })
-        .map_err(|e| format!("spawn shadow thread: {e}"))?;
+    let handle = melin_app::affinity::spawn_placed("shadow", shadow.core, move || {
+        melin_transport_core::shadow::run(
+            shadow_cons,
+            shadow_ex,
+            snap_path,
+            interval,
+            chain_hash,
+            &s_shadow,
+            shadow.wait,
+            shadow_initial_epoch,
+            genesis_entries,
+        );
+    })
+    .map_err(|e| format!("spawn shadow thread: {e}"))?;
 
     info!(
         interval_ms = config.snapshot_interval_ms,
@@ -3854,10 +3886,8 @@ where
     let s_event = Arc::clone(shutdown);
     let event_keys = Arc::clone(authorized_keys);
     let publisher = cores.event_publisher;
-    let event_handle = std::thread::Builder::new()
-        .name("event-publisher".into())
-        .spawn(move || {
-            melin_app::affinity::pin_thread("event-publisher", publisher.core);
+    let event_handle =
+        melin_app::affinity::spawn_placed("event-publisher", publisher.core, move || {
             run_fn(
                 event_consumer,
                 event_bind,
@@ -4097,6 +4127,50 @@ mod tests {
     use super::authenticate_connection;
     use super::{BootstrapSource, choose_bootstrap};
 
+    /// A primary whose startup returns early drops its `PipelineHandles`
+    /// with stage threads still in it, and the drop must stop and join
+    /// them: raise the node's stop flag, lower its health, and return only
+    /// once every thread has exited. Left to themselves they would spin
+    /// on, which `run_with_shutdown` — several nodes in one process —
+    /// would carry past the node's failure.
+    #[test]
+    fn dropped_pipeline_handles_stop_and_join_the_threads_started() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let healthy = Arc::new(AtomicBool::new(true));
+        let exited = Arc::new(AtomicUsize::new(0));
+        // A stage thread as far as stopping goes: it runs until the stop
+        // flag rises.
+        let stage = |value: u32| {
+            let shutdown = Arc::clone(&shutdown);
+            let exited = Arc::clone(&exited);
+            move || {
+                while !shutdown.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                exited.fetch_add(1, Ordering::AcqRel);
+                value
+            }
+        };
+
+        let mut stages = super::PipelineHandles::<u32, u32>::new(Arc::clone(&shutdown));
+        let journal = stage(1);
+        stages.journal = Some(std::thread::spawn(move || Ok(journal())));
+        stages.matching = Some(std::thread::spawn(stage(2)));
+        stages.pipeline_healthy = Some(Arc::clone(&healthy));
+        drop(stages);
+
+        assert!(shutdown.load(Ordering::Acquire), "the stop flag is raised");
+        assert!(!healthy.load(Ordering::Acquire), "and health lowered");
+        assert_eq!(
+            exited.load(Ordering::Acquire),
+            2,
+            "every thread started has exited by the time the drop returns"
+        );
+    }
+
     /// The node's `--dpdk-*` flags are `melin-dpdk`'s (whose tests cover
     /// their mapping), with the node's own default address, 10.0.0.1:
     /// `NicConfig::default()`'s, and the one `ServerConfig::default()`
@@ -4132,6 +4206,68 @@ mod tests {
             forgotten_value.is_err(),
             "a forgotten value must error, not swallow the next flag"
         );
+    }
+
+    /// The `--dpdk-client-*-kib` defaults are the transport's own sizes,
+    /// whole KiB, on a bare command line and in `ServerConfig::default()`
+    /// alike; a given value parses, and zero is refused.
+    #[test]
+    fn the_dpdk_client_buffer_flags_default_to_the_transport_sizes() {
+        use clap::Parser;
+        let sizes = melin_dpdk::SocketBuffers::DEFAULT;
+        for (flag_kib, bytes) in [
+            (super::kib_of(sizes.rx_buf_size), sizes.rx_buf_size),
+            (super::kib_of(sizes.tx_buf_size), sizes.tx_buf_size),
+            (super::kib_of(sizes.tx_queue_limit), sizes.tx_queue_limit),
+        ] {
+            assert_eq!(
+                flag_kib as usize * 1024,
+                bytes,
+                "a default not in whole KiB"
+            );
+        }
+
+        let parsed = super::ServerConfig::try_parse_from(["melin-server"]).expect("parses");
+        let built = super::ServerConfig::default();
+        for config in [&parsed, &built] {
+            assert_eq!(
+                (
+                    config.dpdk_client_rx_buf_kib,
+                    config.dpdk_client_tx_buf_kib,
+                    config.dpdk_client_tx_queue_kib,
+                ),
+                (
+                    super::kib_of(sizes.rx_buf_size),
+                    super::kib_of(sizes.tx_buf_size),
+                    super::kib_of(sizes.tx_queue_limit),
+                )
+            );
+        }
+
+        let given = super::ServerConfig::try_parse_from([
+            "melin-server",
+            "--dpdk-client-rx-buf-kib",
+            "256",
+            "--dpdk-client-tx-buf-kib",
+            "512",
+            "--dpdk-client-tx-queue-kib",
+            "32768",
+        ])
+        .expect("parses");
+        assert_eq!(given.dpdk_client_rx_buf_kib, 256);
+        assert_eq!(given.dpdk_client_tx_buf_kib, 512);
+        assert_eq!(given.dpdk_client_tx_queue_kib, 32768);
+
+        for flag in [
+            "--dpdk-client-rx-buf-kib",
+            "--dpdk-client-tx-buf-kib",
+            "--dpdk-client-tx-queue-kib",
+        ] {
+            assert!(
+                super::ServerConfig::try_parse_from(["melin-server", flag, "0"]).is_err(),
+                "{flag} 0 must be refused"
+            );
+        }
     }
 
     /// Full bootstrap decision matrix. The two archive-only cells are
@@ -5095,6 +5231,31 @@ mod dpdk_config_tests {
         assert_eq!(dpdk.num_queues, 1);
         assert_eq!(dpdk.nic.ip_addr, Ipv4Addr::new(10, 0, 0, 1));
         assert_eq!(dpdk.nic.peer_mac, None);
+    }
+
+    #[test]
+    fn the_client_buffers_default_to_the_transport_s() {
+        let dpdk = dpdk_config_from(&ServerConfig::default()).expect("valid config");
+        assert_eq!(dpdk.client_buffers, melin_dpdk::SocketBuffers::default());
+    }
+
+    #[test]
+    fn the_client_buffer_flags_are_in_kib() {
+        let cfg = ServerConfig {
+            dpdk_client_rx_buf_kib: 256,
+            dpdk_client_tx_buf_kib: 512,
+            dpdk_client_tx_queue_kib: 32768,
+            ..Default::default()
+        };
+        let dpdk = dpdk_config_from(&cfg).expect("valid config");
+        assert_eq!(
+            dpdk.client_buffers,
+            melin_dpdk::SocketBuffers {
+                rx_buf_size: 256 * 1024,
+                tx_buf_size: 512 * 1024,
+                tx_queue_limit: 32768 * 1024,
+            }
+        );
     }
 
     /// A config built in code with no address at all (not even the one

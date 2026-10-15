@@ -909,6 +909,16 @@ normal-case post-recovery state.
   return to target.
 - Every admin `ACK-POLICY` swap emits an info-level audit log with
   the `prev → next` transition.
+- The primary logs a warning, "replica accepts entries but persists
+  none", naming the replica's slot and its two positions (what it has
+  taken in, and what it has made durable), when a replica has held
+  entries for 5 seconds without persisting any. The replica is still
+  acknowledging what it receives, so a `ram` policy stays satisfied and
+  nothing else looks wrong yet; but its journal is not keeping up, or has
+  stopped (a failing or hung disk, or a stalled journal stage), and once
+  its input ring fills it is evicted for ring backpressure. Look at that
+  replica's disk and its log before then. An info-level "replica
+  persisting again" follows when it recovers.
 - On raft-enabled nodes, the `melin_raft_node_id` / `melin_raft_term` /
   `melin_raft_leader_id` / `melin_raft_role` / `melin_raft_is_leader` /
   `melin_raft_driver_running` gauges expose control-plane election

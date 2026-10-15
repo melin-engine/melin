@@ -131,6 +131,17 @@ impl<'a> ReplicaGate<'a> {
     }
 }
 
+/// Log a replica's join ending, on either sender: from here its slot
+/// streams live and the replica's acks count. Without it, a join that
+/// never ends and one that ended look alike in the log.
+pub(crate) fn log_replica_live(slot: usize, sent: &SentHighWater) {
+    tracing::info!(
+        slot,
+        sent_sequence = sent.get(),
+        "replica caught up, streaming live"
+    );
+}
+
 // Wire-protocol types, auth, catch-up, ack queueing, dual-track
 // cursor management, and per-replica metrics now live in
 // `melin_transport_core::replication`. Re-export the public types
@@ -643,54 +654,59 @@ where
     // A fresh pipeline is healthy — this also clears the latch after a
     // successful in-process resync rebuild.
     pipeline_healthy.store(true, Ordering::Release);
-    let journal_handle = std::thread::Builder::new()
-        .name("journal-seq".into())
-        .spawn(move || {
-            melin_app::affinity::pin_thread("journal-seq", journal_core);
+    // Every stage thread is created already in its own placement's
+    // context, and this thread is put back where it was after each. Left
+    // to inherit it, a stage thread starts wherever this thread is — after
+    // `start` above, possibly on the disk thread's isolated core, where
+    // that thread spins at real-time priority and the stage never runs.
+    //
+    // A stage thread that cannot be created, or does not start, fails the
+    // build. The stages already running are told to stop first, so a
+    // failed build leaves nothing spinning behind it.
+    let abandon = |e: String| -> Box<dyn std::error::Error> {
+        pipeline_shutdown.store(true, Ordering::Release);
+        e.into()
+    };
+    let journal_handle =
+        melin_app::affinity::spawn_placed("journal-seq", journal_core, move || {
             run_journal_stage(
                 || sequencer.run(&ps),
                 &journal_failed_latch,
                 &pipeline_healthy,
             )
         })
-        .expect("spawn journal thread");
+        .map_err(|e| abandon(format!("start the replica's journal-seq thread: {e}")))?;
 
     let ps = Arc::clone(&pipeline_shutdown);
     let matching_core = cores.matching.core;
     let matching_stage = pipeline.matching_stage;
-    let matching_handle = std::thread::Builder::new()
-        .name("matching".into())
-        .spawn(move || {
-            melin_app::affinity::pin_thread("matching", matching_core);
-            matching_stage.run(&ps)
-        })
-        .expect("spawn matching thread");
+    let matching_handle = melin_app::affinity::spawn_placed("matching", matching_core, move || {
+        matching_stage.run(&ps)
+    })
+    .map_err(|e| abandon(format!("start the replica's matching thread: {e}")))?;
 
     // Drain thread uses the response core — replicas have no response stage,
     // but the consumer needs to be drained so the output ring doesn't fill.
     let ps = Arc::clone(&pipeline_shutdown);
     let drain = cores.response;
     let drain_consumer = pipeline.drain_consumer;
-    let drain_handle = std::thread::Builder::new()
-        .name("drain".into())
-        .spawn(move || {
-            melin_app::affinity::pin_thread("drain", drain.core);
-            let mut consumer = drain_consumer;
-            let mut batch = vec![OutputSlot::<A::Report, A::QueryResponse>::default(); 256];
-            let mut waiter = drain.wait.waiter();
-            loop {
-                if ps.load(Ordering::Relaxed) {
-                    return;
-                }
-                let count = consumer.consume_batch(&mut batch, 256);
-                if count == 0 {
-                    waiter.idle();
-                } else {
-                    waiter.reset();
-                }
+    let drain_handle = melin_app::affinity::spawn_placed("drain", drain.core, move || {
+        let mut consumer = drain_consumer;
+        let mut batch = vec![OutputSlot::<A::Report, A::QueryResponse>::default(); 256];
+        let mut waiter = drain.wait.waiter();
+        loop {
+            if ps.load(Ordering::Relaxed) {
+                return;
             }
-        })
-        .expect("spawn drain thread");
+            let count = consumer.consume_batch(&mut batch, 256);
+            if count == 0 {
+                waiter.idle();
+            } else {
+                waiter.reset();
+            }
+        }
+    })
+    .map_err(|e| abandon(format!("start the replica's drain thread: {e}")))?;
 
     let shadow_handle = if let Some(shadow_cons) = pipeline.shadow_consumer {
         let snap_path = snapshot_path;
@@ -698,23 +714,20 @@ where
         let ps = Arc::clone(&pipeline_shutdown);
         let shadow = cores.shadow;
         Some(
-            std::thread::Builder::new()
-                .name("replica-shadow".into())
-                .spawn(move || {
-                    melin_app::affinity::pin_thread("replica-shadow", shadow.core);
-                    melin_transport_core::shadow::run(
-                        shadow_cons,
-                        shadow_app,
-                        snap_path,
-                        std::time::Duration::from_millis(snapshot_interval_ms),
-                        chain_lock,
-                        &ps,
-                        shadow.wait,
-                        shadow_initial_epoch,
-                        genesis_entries,
-                    );
-                })
-                .expect("spawn shadow thread"),
+            melin_app::affinity::spawn_placed("replica-shadow", shadow.core, move || {
+                melin_transport_core::shadow::run(
+                    shadow_cons,
+                    shadow_app,
+                    snap_path,
+                    std::time::Duration::from_millis(snapshot_interval_ms),
+                    chain_lock,
+                    &ps,
+                    shadow.wait,
+                    shadow_initial_epoch,
+                    genesis_entries,
+                );
+            })
+            .map_err(|e| abandon(format!("start the replica's shadow thread: {e}")))?,
         )
     } else {
         None
@@ -3594,6 +3607,123 @@ mod tests {
             "published slot must be the sentinel"
         );
         assert!(consumer.try_consume().is_none(), "exactly one sentinel");
+    }
+
+    /// The scheduling policy a running thread has now.
+    fn policy_of<T>(handle: &std::thread::JoinHandle<T>) -> libc::c_int {
+        use std::os::unix::thread::JoinHandleExt;
+        let mut policy: libc::c_int = 0;
+        let mut param = libc::sched_param { sched_priority: 0 };
+        let ret =
+            unsafe { libc::pthread_getschedparam(handle.as_pthread_t(), &mut policy, &mut param) };
+        assert_eq!(ret, 0, "pthread_getschedparam failed: {ret}");
+        policy
+    }
+
+    /// Every thread the replica pipeline builder spawns starts in the
+    /// scheduling context of its own placement, not in the builder's.
+    ///
+    /// A new thread inherits its creator's CPU mask and policy, and Linux
+    /// offers no way to change them before it first runs. On a tuned host
+    /// the builder can sit on an isolated core: the receiver after a
+    /// rebuild, or any thread whose home mask includes isolated CPUs. A
+    /// child created there has to run once to pin itself elsewhere, and
+    /// if a real-time thread spins on that core it never does — the stage
+    /// never starts, and the replica wedges when its input ring fills.
+    /// `JournalStage::start` hands the disk thread and the preparer their
+    /// context before they exist for that reason; the stage threads need
+    /// the same.
+    ///
+    /// Where a child started cannot be read back once it has pinned
+    /// itself, but its policy can (see `melin_test_node::sched`): the
+    /// builder runs at `SCHED_BATCH`, and a child that inherited its
+    /// context keeps it after its own pin, while one handed its own starts
+    /// at `SCHED_OTHER`. The end-to-end form, both nodes on both
+    /// transports, is `tests/stall_guards.rs`.
+    #[test]
+    fn replica_pipeline_threads_start_in_their_own_scheduling_context() {
+        let Some(core) = melin_test_node::sched::first_pinnable_cpu() else {
+            // No core to place a child on but the `0` sentinel.
+            eprintln!("skipped: this thread may run on CPU 0 only");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let policies = std::thread::spawn(move || {
+            // The context no child may start in.
+            melin_test_node::sched::set_batch_policy();
+
+            let writer = melin_journal::BufferedWriter::<CounterEvent>::create_continuing(
+                &dir.path().join("replica.journal"),
+                1,
+                [7; 32],
+                Some(5),
+            )
+            .expect("create journal");
+            // Every thread on the same core, yielding: what matters is
+            // that each has a core of its own to be placed on, not which.
+            let placed = crate::layout::Placement::yielding(core);
+            let cores = crate::layout::PipelineCores {
+                journal_seq: placed,
+                matching: placed,
+                response: placed,
+                shadow: placed,
+                journal_prep: placed,
+                journal_disk: placed,
+                ..crate::layout::PipelineCores::unpinned()
+            };
+            let handles = build_replica_pipeline_with_threads(
+                counter_server::Counter::default(),
+                writer,
+                cores,
+                melin_journal::StagingMode::Allocate,
+                // Non-zero so the shadow thread is spawned; long enough
+                // that it never takes a snapshot.
+                3_600_000,
+                dir.path().join("replica.snapshot"),
+                std::time::Duration::ZERO,
+                Arc::new(melin_transport_core::fence::FenceState::new(0)),
+                Arc::new(AtomicBool::new(true)),
+                &(),
+            )
+            .expect("build the replica pipeline");
+
+            let policies = [
+                ("journal-seq", Some(policy_of(&handles.journal_handle))),
+                ("matching", Some(policy_of(&handles.matching_handle))),
+                ("drain", Some(policy_of(&handles.drain_handle))),
+                (
+                    "replica-shadow",
+                    handles.shadow_handle.as_ref().map(policy_of),
+                ),
+            ];
+            let outcome = teardown_replica_pipeline(handles);
+            assert!(
+                matches!(outcome, TeardownOutcome::Clean(..)),
+                "the pipeline must tear down cleanly"
+            );
+            policies
+        })
+        .join()
+        .expect("builder thread");
+
+        let inherited: Vec<&str> = policies
+            .iter()
+            .map(|(name, policy)| {
+                (
+                    *name,
+                    policy.unwrap_or_else(|| panic!("{name} was not spawned")),
+                )
+            })
+            .filter(|&(_, policy)| policy == libc::SCHED_BATCH)
+            .map(|(name, _)| name)
+            .collect();
+        assert!(
+            inherited.is_empty(),
+            "{inherited:?} started in the builder's scheduling context instead of their \
+             own placement; on an isolated core held by a real-time spinner they would \
+             never run"
+        );
     }
 
     /// A session left three slots in the ring that the journal has not

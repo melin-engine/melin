@@ -26,12 +26,15 @@ melin-app = { workspace = true }
 # its own dependency on the runtime, not this crate's.
 melin-server-runtime = { workspace = true }
 melin-wire-protocol = { workspace = true }
-# Only the DPDK side needs these: the process-wide EAL and the per-node
-# devices on it, and the CPU set for EAL's lcore.
+# Only the DPDK side needs this: the process-wide EAL and the per-node
+# devices on it.
 melin-dpdk = { workspace = true, optional = true, features = ["dpdk-sys"] }
-libc = { workspace = true, optional = true }
+# The CPU set for EAL's lcore, and the scheduling helpers in `sched`.
+libc = { workspace = true }
+# The nodes' log in a failing test's report (`logs`).
+tracing-subscriber = { workspace = true }
 
 [features]
 ## Start nodes on the DPDK transport, on the network
 ## `scripts/dpdk/netns-runner.sh` builds. Needs libdpdk to build.
-dpdk = ["melin-server-runtime/dpdk", "dep:melin-dpdk", "dep:libc"]
+dpdk = ["melin-server-runtime/dpdk", "dep:melin-dpdk"]

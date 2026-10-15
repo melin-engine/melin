@@ -119,13 +119,89 @@ impl Default for NicConfig {
     }
 }
 
+/// smoltcp TCP RX buffer size. Determines the advertised receive window.
+/// 64 KiB provides enough window for pipelined requests (256+ in-flight
+/// messages at ~100 bytes each). The client port's default, and that of a
+/// socket the transport opens without sizes of its own.
+pub(crate) const SOCKET_RX_BUF_SIZE: usize = 64 * 1024;
+
+/// The client port's default send buffer: the in-flight window of each
+/// client connection. Four times what one connection needs at a million
+/// responses a second over a 70 µs round trip, and the headroom is the
+/// point: the round trip TCP sees includes the time the node's poll loop
+/// takes to get to the client's acks, which grows under exactly the load
+/// that fills the window. A single client running near the stack's limit
+/// still wants more (256 KiB).
+const CLIENT_TX_BUF_SIZE: usize = 64 * 1024;
+
+/// The client port's default queue limit: response bytes that may wait
+/// behind a client connection's send buffer before it is dropped as fallen
+/// behind. Several milliseconds of a client's hiccup at a million responses
+/// a second, where 64 KiB was a fraction of one. The queue grows only while
+/// the client is behind, so a client that keeps up never holds it; one
+/// that is behind is bounded by it.
+const CLIENT_TX_QUEUE_LIMIT: usize = 8 * 1024 * 1024;
+
+/// Per-connection buffering for the sockets accepted on a node's client
+/// port (`--dpdk-client-rx-buf-kib`, `--dpdk-client-tx-buf-kib`,
+/// `--dpdk-client-tx-queue-kib`).
+///
+/// Together these bound how far one client's responses may run ahead of
+/// what it has acknowledged. `tx_buf_size` is the in-flight window: the
+/// stack cannot have more than this on the wire per round trip, so it
+/// caps a single connection's response bandwidth at `tx_buf_size / RTT`.
+/// `tx_queue_limit` is the slack behind it, in the transport's queue; a
+/// connection that overruns it is dropped rather than allowed to back the
+/// response stage up into everyone else's path.
+///
+/// The defaults ([`Self::DEFAULT`]) carry one client at a million
+/// responses a second with headroom, or many at modest rates. A single
+/// connection driven at the stack's full rate (a load generator, a bulk
+/// client) wants a larger send buffer still. Each accepted connection
+/// allocates its send and receive buffers up front, so they multiply by the
+/// number of clients; the queue is allocated only as a client falls behind.
+/// Buffers above 64 KiB are advertised through window scaling, which the
+/// stack negotiates on its own.
+///
+/// `usize` fields, as the buffer lengths they become.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SocketBuffers {
+    /// smoltcp RX buffer, and the advertised receive window.
+    pub rx_buf_size: usize,
+    /// smoltcp TX buffer: the in-flight window.
+    pub tx_buf_size: usize,
+    /// Response bytes queued behind the socket before the connection is
+    /// dropped as fallen behind.
+    pub tx_queue_limit: usize,
+}
+
+impl SocketBuffers {
+    /// The client port's sizes when none are configured. A `const`, so a
+    /// binary's flags can take their defaults from it.
+    pub const DEFAULT: SocketBuffers = SocketBuffers {
+        rx_buf_size: SOCKET_RX_BUF_SIZE,
+        tx_buf_size: CLIENT_TX_BUF_SIZE,
+        tx_queue_limit: CLIENT_TX_QUEUE_LIMIT,
+    };
+}
+
+impl Default for SocketBuffers {
+    fn default() -> Self {
+        SocketBuffers::DEFAULT
+    }
+}
+
 /// Configuration for the DPDK transport of a node: its NIC, the port it
-/// listens on, and how many queue pairs it polls.
+/// listens on, how its client connections are buffered, and how many queue
+/// pairs it polls.
 #[derive(Clone, Debug)]
 pub struct DpdkConfig {
     /// The NIC the node's transport runs on.
     pub nic: NicConfig,
     pub listen_port: u16,
+    /// Buffering for the sockets accepted on `listen_port`, at boot and
+    /// on promotion alike. The replication listener carries its own sizes.
+    pub client_buffers: SocketBuffers,
     /// Number of RX/TX queue pairs per port. Each queue pair is polled
     /// by a separate thread. When > 1, RSS is enabled on the NIC to
     /// distribute TCP/IP flows across queues. Default: 1.
@@ -137,6 +213,7 @@ impl Default for DpdkConfig {
         DpdkConfig {
             nic: NicConfig::default(),
             listen_port: LISTEN_PORT,
+            client_buffers: SocketBuffers::default(),
             num_queues: 1,
         }
     }
@@ -153,6 +230,14 @@ mod tests {
         let config = DpdkConfig::default();
         assert_eq!(config.listen_port, 9876);
         assert_eq!(config.num_queues, 1);
+        assert_eq!(
+            config.client_buffers,
+            SocketBuffers {
+                rx_buf_size: 64 * 1024,
+                tx_buf_size: 64 * 1024,
+                tx_queue_limit: 8 * 1024 * 1024,
+            }
+        );
 
         let NicConfig {
             eal_args,

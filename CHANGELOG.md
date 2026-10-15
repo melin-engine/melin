@@ -14,6 +14,23 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Added
 
+- **`--dpdk-client-rx-buf-kib`, `--dpdk-client-tx-buf-kib`,
+  `--dpdk-client-tx-queue-kib`**: the per-connection buffering of the
+  client connections a DPDK node accepts, previously fixed at 64 KiB of
+  receive buffer, 16 KiB of send buffer and 64 KiB of queue. The send
+  buffer is the in-flight window, so it caps one connection's response
+  bandwidth at that much per round trip; the queue is the slack behind it
+  before the connection is dropped as fallen behind. The old sizes dropped a
+  single client at a million messages a second on the first round-trip
+  hiccup, with nothing but "the server closed the connection" on the
+  client's side, so the defaults rise: the send buffer to 64 KiB, which
+  carries such a client with headroom, and the queue to 8 MiB, several
+  milliseconds of its hiccups. The receive buffer stays at 64 KiB. A
+  connection driven at the stack's full rate wants a larger send buffer
+  still (256 KiB). Each client connection allocates its send and receive
+  buffers up front, so they multiply by the number of clients; the queue
+  is allocated only while a client is behind, up to the limit.
+
 - **`melin-shm-proxy`** (`crates/tools/melin-shm-proxy`, the `shm-proxy`
   binary) — a sidecar that holds one connection to a node, over kernel TCP
   or, with `--features dpdk`, kernel bypass, and offers it to a client in
@@ -214,9 +231,33 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   `shm-proxy` and `melin-bench` share it.
 - **`ByteStream` is implemented for `&mut S`** where `S: ByteStream`, so
   a caller holding its streams in a collection lends one per call.
+- **The primary warns when a replica accepts entries but persists none.**
+  A replica whose journal stops advancing while it keeps taking entries
+  still satisfies an ack policy that counts in-memory confirmations, and
+  used to go unnoticed until its input ring filled and it was evicted for
+  ring backpressure. After 5 s of entries pending with nothing persisted,
+  the primary now logs a warning naming the replica's slot and both
+  positions, and logs again when it persists once more.
+- **`melin_app::affinity::spawn_placed` and `with_child_context`**: the
+  one way to spawn a thread that has a placement (a core, or `0` for
+  unpinned). The thread is created already in that placement's
+  scheduling context, its spawner is put back where it was, CPU
+  included, and `spawn_placed` returns once the thread has pinned itself,
+  or a `SpawnPlacedError` naming the thread and its core when it has not
+  within 10 s. `with_child_context` runs the same handover around a spawn
+  of the caller's own, such as a scoped thread.
+- **`melin_transport_core::replication::catchup::handoff_pass_from_journal`**:
+  one journal pass of a handoff into live streaming, which both senders
+  run. It streams as `catch_up_from_journal_with` does, and reports a
+  start point lost to a prune as an error rather than a snapshot verdict.
 
 ### Changed
 
+- **`melin_dpdk::DpdkConfig` has a new field, `client_buffers:
+  SocketBuffers`**, the sizes behind the `--dpdk-client-*-kib` flags.
+  Source-breaking for a `DpdkConfig` built field by field: add it, or end
+  the literal with `..DpdkConfig::default()`. A promoted replica's client
+  listener now takes them too, through `DpdkTransport::add_client_listener`.
 - **`melin_client::Error` has a new variant, `Error::Nic(io::Error)`**,
   for a DPDK NIC that cannot be brought up (EAL initialisation, a missing
   port, the mbuf pool, the port's configuration). Only the `dpdk`
@@ -317,6 +358,26 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 - **`scripts/dpdk/dpdk-setup.sh` writes `DPDK_MAC`** in every mode (the
   address a peer sends to), and `VLAN_ID` on the mlx5 path when `--vlan`
   is given.
+- **`melin_app::affinity::capture_home_mask` leaves out isolated CPUs and
+  moves its caller.** The home mask, the CPU set an unpinned thread runs
+  on, is the startup mask without the CPUs the kernel reports isolated,
+  unless those are all the process was given, and `capture_home_mask`
+  now also narrows the calling thread to it, so the threads it spawns
+  start off the isolated CPUs too. It only ever narrows, never widens.
+
+### Removed
+
+- **`melin_app::affinity::take_context`, `prepare_child_context`,
+  `restore_context` and `SchedContext`** are private. They were the
+  steps of the handover that `spawn_placed` and `with_child_context` now
+  run; done by hand they were done partly, which is how pipeline threads
+  came to start on a core a real-time thread held. Spawn through either
+  function instead.
+- **`melin_dpdk::DpdkTransport::add_listener`**. It listened with the
+  client port's fixed sizes, which is how a promoted replica's client port
+  came to ignore the `--dpdk-client-*-kib` flags. Use
+  `add_client_listener` for the client port, and
+  `add_listener_with_buffers` for any other.
 
 ### Fixed
 
@@ -346,6 +407,45 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   each recycled buffer takes a submission entry on top of those the
   ring is sized for; a full queue is now flushed to the kernel instead
   of panicking the reader.
+- **Pipeline threads could start on an isolated core held by a real-time
+  thread, and never run.** On a host with `isolcpus`, real-time
+  throttling off and the node running with `CAP_SYS_NICE`, a replica's
+  sequencing, matching, drain and shadow threads could be created on the
+  journal disk thread's core and wait there forever behind it. The
+  replica kept acknowledging until its input ring filled, then stalled
+  and was evicted, without logging anything. Every thread with a core
+  assignment is now created on that core, and the thread that spawns it
+  is put back where it was, CPU included, and a pipeline thread that
+  still does not start within 10 s fails the node's startup with an
+  error naming the thread and its core. Threads with no core of their
+  own now stay off isolated CPUs even when the process was started on
+  them (`numactl --cpunodebind`, `taskset`), unless isolated CPUs are
+  all it was given. On such a node DPDK, given no core list of its own
+  (`-l`), now sees only those housekeeping cores, as under the earlier
+  `numactl --physcpubind` workaround, and no longer starts idle workers
+  on the isolated ones.
+- **A primary that failed to start could leave its pipeline threads
+  running.** When a stage that starts later (the replication sender, the
+  shadow or the event publisher, the health endpoint, the reader) could
+  not, startup returned with the stages already started still spinning.
+  A process that exits on the error ends them with it; one that hosts
+  several nodes through `run_with_shutdown` kept them past the node's
+  failure. Every early return now stops and joins the threads started.
+- **A DPDK primary could hold a write forever after a replica joined.**
+  It read and dropped the replica's acks while the catch-up was still
+  being sent, counting on a later ack to cover them. A replica acks only
+  when it holds something new, so when its last ack of the join landed in
+  that window, which a primary thread descheduled for a moment opens, the
+  primary went on believing the replica held nothing past its handshake:
+  a write accepted during the join and waiting on that replica under
+  `ram` or `disk+ram` was released only by the next journaled event, a
+  tick with ticks on (up to the tick interval late), and never on a quiet
+  primary with ticks off. The newest ack is now kept through the whole
+  join and counted once the replica streams, as on kernel TCP, whose
+  catch-up leaves acks in the socket until then. The end of a replica's
+  join is now logged on both transports (`replica caught up, streaming
+  live`), and the handoff's journal passes, which were logged as further
+  catch-ups, are logged at debug as what they are.
 
 ## [0.19.0] - 2026-10-10
 

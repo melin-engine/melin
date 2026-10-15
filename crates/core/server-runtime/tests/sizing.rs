@@ -209,14 +209,7 @@ fn every_node_sizes_its_own_instances_before_serving() {
     // Opt-in diagnostics, as in `replicated_failover.rs`: with RUST_LOG
     // set, the nodes' tracing output says which recovery and reconnect
     // path each took. No-op when RUST_LOG is unset.
-    if std::env::var_os("RUST_LOG").is_some() {
-        // Error dropped deliberately: try_init fails only when a
-        // subscriber is already installed, which is the state we want.
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .with_test_writer()
-            .try_init();
-    }
+    melin_test_node::logs::capture_if_requested();
     let tmp = tempfile::tempdir().expect("tempdir");
     let primary_key = SigningKey::from_bytes(&[0x81; 32]);
     let replica_key = SigningKey::from_bytes(&[0x82; 32]);

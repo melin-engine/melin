@@ -33,10 +33,19 @@
 //! process-wide EAL as the nodes. The peer MAC is the test's to pass
 //! (`mac_of`), as a replica's is the launcher's.
 //!
+//! A test that checks the context a node's threads start in uses
+//! [`sched`]: the node is started from a thread at `SCHED_BATCH`, and its
+//! placed threads must not be found at it.
+//!
+//! A test that wants its nodes' log in its report, when it fails, calls
+//! [`logs::capture`].
+//!
 //! See `docs/internal/dpdk-testing.md`.
 
 #[cfg(any(test, feature = "dpdk"))]
 mod layout;
+pub mod logs;
+pub mod sched;
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;

@@ -16,6 +16,7 @@ pub mod catchup;
 pub mod cursors;
 pub mod handoff;
 pub mod metrics;
+pub mod persist_watch;
 pub mod protocol;
 pub mod sent;
 pub mod validate;
@@ -25,4 +26,5 @@ mod handoff_test;
 
 pub use cursors::ReplicaCursors;
 pub use metrics::ReplicationMetrics;
+pub use persist_watch::PersistWatch;
 pub use sent::SentHighWater;

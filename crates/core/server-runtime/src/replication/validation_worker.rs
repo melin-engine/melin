@@ -18,14 +18,15 @@
 //! process name rather than the name it was given. The handshake then
 //! hangs forever: the verdict channel stays `Empty`, the slot stays
 //! `Handshaking`, and the replica waits for a `StreamStart` that is never
-//! sent. See [`melin_app::affinity::prepare_child_context`].
+//! sent. See [`melin_app::affinity::spawn_placed`].
 //!
 //! The fix is to take thread creation off the handshake path entirely.
 //! The worker is spawned once, at driver construction — which happens on
 //! the startup thread, before the poll thread pins itself — and parks on
-//! a channel. Handshake-time cost drops to one channel send. The spawn is
-//! still wrapped in the prepare/restore dance so the worker lands
-//! unpinned under `SCHED_OTHER` regardless of who constructs the driver.
+//! a channel. Handshake-time cost drops to one channel send. The spawn
+//! still goes through `melin_app::affinity::with_child_context`, so the
+//! worker lands unpinned under `SCHED_OTHER` regardless of who constructs
+//! the driver.
 
 use std::io;
 use std::path::PathBuf;
@@ -138,22 +139,9 @@ pub(super) fn spawn_unpinned(
     // Hand the worker its scheduling context before it exists. `0` is the
     // unpinned sentinel: these threads sleep and do blocking file I/O, so
     // they want the process's home CPU mask, not a reserved core.
-    let saved = melin_app::affinity::take_context();
-    if let Err(ref e) = saved {
-        tracing::warn!(worker = %name, error = %e, "cannot snapshot scheduling context");
-    }
-    if let Err(e) = melin_app::affinity::prepare_child_context(0) {
-        tracing::warn!(worker = %name, error = %e, "cannot prepare child context");
-    }
-    let spawned = std::thread::Builder::new().name(name.clone()).spawn(body);
-    // Restore before propagating a spawn failure: a failed spawn must
-    // not strand the caller on the child's (unpinned) context.
-    if let Ok(ctx) = saved
-        && let Err(e) = melin_app::affinity::restore_context(&ctx)
-    {
-        tracing::error!(worker = %name, error = %e, "caller could not restore its own affinity");
-    }
-    spawned
+    melin_app::affinity::with_child_context(&name, 0, || {
+        std::thread::Builder::new().name(name.clone()).spawn(body)
+    })
 }
 
 /// A parked replication worker's thread is gone (it panicked); nothing
@@ -341,25 +329,30 @@ mod tests {
             return;
         }
 
-        let saved = melin_app::affinity::take_context().expect("snapshot scheduling context");
         let core = first_cpu_in_mask().expect("at least one CPU in the mask");
-        melin_app::affinity::pin_to_core(core).expect("pin the test thread");
-
         let observed = Arc::new(AtomicUsize::new(0));
-        let sink = Arc::clone(&observed);
-        let worker = ValidationWorker::spawn(
-            "test-validate".into(),
-            PathBuf::from("/journal"),
-            move |_p: &std::path::Path, _h: &Handshake| {
-                sink.store(cpu_count_in_mask(), Ordering::Relaxed);
-                Ok(HandshakeValidation::Ok)
-            },
-        )
-        .unwrap();
-        let rx = worker.submit(handshake(1)).unwrap();
-        let verdict = rx.recv().unwrap().unwrap();
+        // The pinned parent is a thread of its own, not the test's, so the
+        // pin ends with it rather than outliving the test.
+        let verdict = {
+            let sink = Arc::clone(&observed);
+            std::thread::spawn(move || {
+                melin_app::affinity::pin_to_core(core).expect("pin the parent thread");
+                let worker = ValidationWorker::spawn(
+                    "test-validate".into(),
+                    PathBuf::from("/journal"),
+                    move |_p: &std::path::Path, _h: &Handshake| {
+                        sink.store(cpu_count_in_mask(), Ordering::Relaxed);
+                        Ok(HandshakeValidation::Ok)
+                    },
+                )
+                .unwrap();
+                let rx = worker.submit(handshake(1)).unwrap();
+                rx.recv().unwrap().unwrap()
+            })
+            .join()
+            .expect("parent thread")
+        };
 
-        melin_app::affinity::restore_context(&saved).expect("restore scheduling context");
         assert_eq!(verdict, HandshakeValidation::Ok);
         assert_eq!(
             observed.load(Ordering::Relaxed),

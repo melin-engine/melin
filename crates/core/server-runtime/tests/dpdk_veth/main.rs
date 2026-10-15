@@ -44,6 +44,10 @@ use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
 use melin_wire_protocol::control_codec::{TAG_AUTH_FAILED, TAG_CHALLENGE};
 
+#[path = "../common/raw_replica.rs"]
+mod raw_replica;
+use raw_replica::RawReplica;
+
 // ---------------------------------------------------------------------------
 // Time limits
 //
@@ -545,7 +549,11 @@ fn a_joiner_that_stops_reading_mid_handoff_holds_up_nothing() {
     // second: the streaming replica's is 0.
     let stall_limit = melin_dpdk::PeerLiveness::REPLICATION.timeout();
     let joined = Instant::now();
-    let mut joiner = RawReplica::join(Cluster::addrs(0).replication(), &Cluster::node_key(2));
+    let mut joiner = RawReplica::join(
+        Cluster::addrs(0).replication(),
+        &Cluster::node_key(2),
+        FRAME_LIMIT,
+    );
     wait_for_gauge(primary_health, "melin_replicas_connected", 2, STARTUP_LIMIT);
     // Time for the worker to read the history to its end.
     std::thread::sleep(Duration::from_secs(1));
@@ -707,14 +715,7 @@ fn a_joiner_that_acks_then_stops_reading_its_catch_up_is_dropped() {
     let cluster = Cluster::new();
     let primary_health = Cluster::health(0);
 
-    let journal = cluster.dir.path().join("primary.journal");
-    append_increments(&journal, 200_000);
-    let history = catch_up_bytes(&journal);
-    assert!(
-        history > 2 * JOIN_HISTORY_WIRE_BYTES,
-        "the history's catch-up is {history} bytes, too little to outlast what the primary \
-         queues for a replica"
-    );
+    write_history_outlasting_the_queue(&cluster.dir.path().join("primary.journal"));
     let primary = cluster.start_primary();
     let streaming = cluster.start_replica(1, "streaming");
     wait_for_gauge(primary_health, "melin_replicas_connected", 1, STARTUP_LIMIT);
@@ -722,7 +723,11 @@ fn a_joiner_that_acks_then_stops_reading_its_catch_up_is_dropped() {
 
     // The joiner reads the catch-up's first entries, acks them as a
     // replica that has journaled them does, and stops reading.
-    let mut joiner = RawReplica::join(Cluster::addrs(0).replication(), &Cluster::node_key(2));
+    let mut joiner = RawReplica::join(
+        Cluster::addrs(0).replication(),
+        &Cluster::node_key(2),
+        FRAME_LIMIT,
+    );
     wait_for_gauge(primary_health, "melin_replicas_connected", 2, STARTUP_LIMIT);
     let read = joiner.read_through(1);
     joiner.ack(read);
@@ -783,6 +788,116 @@ fn a_joiner_that_acks_then_stops_reading_its_catch_up_is_dropped() {
     drop(conn);
     streaming.stop();
     primary.stop();
+}
+
+/// An ack a joining replica sends during its catch-up still counts once it
+/// is live: the primary's view of what the replica holds starts from it.
+///
+/// Acks are cumulative, and a replica acks only when it holds something
+/// new. So an ack the primary reads and drops while the catch-up is still
+/// being sent is never repeated: on a quiet primary nothing more is
+/// journaled, the replica sends nothing more, and the primary goes on
+/// believing the replica holds only what its handshake said. A write held
+/// for that replica's ack is then never answered. That is what a primary
+/// with a fresh replica, ticks off and one client write did,
+/// intermittently, when the replica's last ack beat the end of the
+/// catch-up.
+///
+/// Here the race is forced: the history outlasts what the primary queues
+/// for a replica, so with the joiner reading only its start the catch-up
+/// cannot end while the joiner holds still after acking.
+#[test]
+fn an_ack_sent_during_the_catch_up_counts_once_the_joiner_is_live() {
+    let _serial = serialise();
+    let cluster = Cluster::new();
+    let primary_health = Cluster::health(0);
+
+    write_history_outlasting_the_queue(&cluster.dir.path().join("primary.journal"));
+    let primary = cluster.start_primary();
+    let deadline = Instant::now() + STARTUP_LIMIT;
+    let history_end = loop {
+        if let Some(sequence) = gauge(primary_health, "melin_journal_sequence") {
+            break sequence;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the primary's health endpoint never came up"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+
+    // The joiner, the primary's only replica (slot 0), reads the catch-up's
+    // first entries and acks them as a replica that has journaled them
+    // does. Then it holds still, long enough for the primary to read the
+    // ack, and well under the join stall limit, which the ack arms.
+    let mut joiner = RawReplica::join(
+        Cluster::addrs(0).replication(),
+        &Cluster::node_key(2),
+        FRAME_LIMIT,
+    );
+    let acked = joiner.read_through(1);
+    assert!(
+        acked < history_end,
+        "the first entries the joiner read ran to the history's end ({acked})"
+    );
+    joiner.ack(acked);
+    let pause = Duration::from_millis(500);
+    assert!(pause * 4 < melin_dpdk::PeerLiveness::REPLICATION.timeout());
+    std::thread::sleep(pause);
+    assert_eq!(
+        gauge(primary_health, "melin_replica_catching_up{slot=\"0\"}"),
+        Some(1),
+        "the joiner's catch-up ended while it was reading nothing: the history no longer \
+         exceeds what the primary queues for a replica"
+    );
+
+    // The joiner reads the rest of its catch-up, and acks nothing more:
+    // nothing new is journaled, so a replica would have nothing more to
+    // ack. Its join ends, and it streams.
+    assert_eq!(joiner.read_through(history_end), history_end);
+    wait_for_gauge(
+        primary_health,
+        "melin_replica_catching_up{slot=\"0\"}",
+        0,
+        STARTUP_LIMIT,
+    );
+
+    // The primary holds the joiner at what it acked: its handshake said 0.
+    let deadline = Instant::now() + FRAME_LIMIT;
+    loop {
+        let in_memory = gauge(
+            primary_health,
+            "melin_replica_in_memory_sequence{slot=\"0\"}",
+        );
+        let persisted = gauge(primary_health, "melin_replica_acked_sequence{slot=\"0\"}");
+        if in_memory == Some(acked) && persisted == Some(acked) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the joiner acked {acked} during its catch-up, but once live the primary holds it \
+             at in-memory {in_memory:?}, persisted {persisted:?}: the ack was dropped, and a \
+             write waiting on it would never be answered"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    drop(joiner);
+    primary.stop();
+}
+
+/// Write a journal at `path` whose catch-up is several times what the
+/// primary queues for a replica that reads nothing (see
+/// [`JOIN_HISTORY_WIRE_BYTES`]): a joiner reading only its start keeps the
+/// catch-up from ending.
+fn write_history_outlasting_the_queue(path: &std::path::Path) {
+    append_increments(path, 200_000);
+    let history = catch_up_bytes(path);
+    assert!(
+        history > 2 * JOIN_HISTORY_WIRE_BYTES,
+        "the history's catch-up is {history} bytes, too little to outlast what the primary \
+         queues for a replica"
+    );
 }
 
 /// How much catch-up the history of
@@ -879,143 +994,6 @@ impl Flood {
             writer.join().expect("a flooding client failed");
         }
     }
-}
-
-/// A replica written by hand: it authenticates and handshakes as a fresh
-/// replica, then reads the stream only when told to. A real replica reads
-/// as fast as its journal allows; this one is what one that has stopped
-/// reading looks like to its primary.
-struct RawReplica {
-    stream: TcpStream,
-}
-
-impl RawReplica {
-    /// The receive buffer asked for: small, so that what the replica holds
-    /// unread is a known, small part of what the primary has queued.
-    const RECEIVE_BUFFER: libc::c_int = 32 * 1024;
-
-    fn join(primary: SocketAddr, key: &SigningKey) -> Self {
-        use ed25519_dalek::Signer;
-        use melin_transport_core::replication::protocol::{
-            Handshake as ReplicaHandshake, decode_auth_result, decode_challenge,
-            encode_challenge_response, encode_handshake,
-        };
-
-        let mut stream = connect_with_receive_buffer(primary, Self::RECEIVE_BUFFER);
-        stream
-            .set_read_timeout(Some(FRAME_LIMIT))
-            .expect("set read timeout");
-        let challenge = read_any_frame(&mut stream).expect("the primary's challenge");
-        let nonce = decode_challenge(&challenge).expect("a challenge");
-        let mut out = Vec::new();
-        encode_challenge_response(
-            &key.sign(&nonce).to_bytes(),
-            key.verifying_key().as_bytes(),
-            &mut out,
-        );
-        stream.write_all(&out).expect("send the challenge response");
-        let verdict = read_any_frame(&mut stream).expect("the primary's verdict");
-        assert!(
-            decode_auth_result(&verdict).expect("an auth result"),
-            "the primary refused the replication key"
-        );
-        out.clear();
-        encode_handshake(
-            &ReplicaHandshake {
-                last_sequence: 0,
-                chain_hash: [0; 32],
-                epoch: 0,
-            },
-            &mut out,
-        );
-        stream.write_all(&out).expect("send the handshake");
-        RawReplica { stream }
-    }
-
-    /// Read the stream until an entry batch carries `sequence`, and return
-    /// that batch's last sequence.
-    fn read_through(&mut self, sequence: u64) -> u64 {
-        use melin_transport_core::replication_wire::{MSG_INPUT_BATCH, try_decode_input_batch};
-        loop {
-            let frame = read_any_frame(&mut self.stream).expect("the catch-up");
-            if frame.first() != Some(&MSG_INPUT_BATCH) {
-                continue; // StreamStart, and any other control frame.
-            }
-            let slots = try_decode_input_batch::<CounterEvent>(&frame).expect("an entry batch");
-            let last = slots.last().expect("a batch carries entries").sequence;
-            if last >= sequence {
-                return last;
-            }
-        }
-    }
-
-    /// Ack `sequence` as journaled, as a replica streaming does: the first
-    /// sign the primary has that the replica is past its install.
-    fn ack(&mut self, sequence: u64) {
-        use melin_transport_core::replication::protocol::{Ack, encode_ack};
-        let mut out = Vec::new();
-        encode_ack(
-            &Ack {
-                acked_sequence: sequence,
-                in_memory_sequence: sequence,
-            },
-            &mut out,
-        );
-        self.stream.write_all(&out).expect("send an ack");
-    }
-}
-
-/// A kernel-TCP connection to `peer` whose receive buffer was set before
-/// connecting, when it still bounds the window offered.
-fn connect_with_receive_buffer(peer: SocketAddr, receive_buffer: libc::c_int) -> TcpStream {
-    use std::os::fd::FromRawFd;
-    let SocketAddr::V4(peer) = peer else {
-        panic!("the runner's network is IPv4");
-    };
-    // SAFETY: a plain socket(2); its descriptor is owned by the `TcpStream`
-    // at once, which closes it on every path out.
-    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
-    assert!(fd >= 0, "socket: {}", io::Error::last_os_error());
-    // SAFETY: `fd` is a fresh socket that nothing else owns.
-    let stream = unsafe { TcpStream::from_raw_fd(fd) };
-    // SAFETY: the option value is a live `c_int`, of the length passed.
-    let rc = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
-            (&receive_buffer as *const libc::c_int).cast(),
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    assert_eq!(rc, 0, "SO_RCVBUF: {}", io::Error::last_os_error());
-    let address = libc::sockaddr_in {
-        sin_family: libc::AF_INET as libc::sa_family_t,
-        sin_port: peer.port().to_be(),
-        sin_addr: libc::in_addr {
-            s_addr: u32::from(*peer.ip()).to_be(),
-        },
-        sin_zero: [0; 8],
-    };
-    // SAFETY: `address` is a live `sockaddr_in`, of the length passed.
-    let rc = unsafe {
-        libc::connect(
-            fd,
-            (&address as *const libc::sockaddr_in).cast(),
-            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-        )
-    };
-    assert_eq!(rc, 0, "connect to {peer}: {}", io::Error::last_os_error());
-    stream
-}
-
-/// One length-prefixed frame's payload, of any size.
-fn read_any_frame(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
-    let mut prefix = [0u8; 4];
-    stream.read_exact(&mut prefix)?;
-    let mut payload = vec![0u8; u32::from_le_bytes(prefix) as usize];
-    stream.read_exact(&mut payload)?;
-    Ok(payload)
 }
 
 /// How long a request may take while another replica's join is stalled:
@@ -1340,19 +1318,7 @@ fn serialise() -> MutexGuard<'static, ()> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    // Deliberately ignored: a subscriber an earlier test in this process
-    // installed is just as good.
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new(
-                    "info,melin_server_runtime::dpdk_transport=debug",
-                )
-            }),
-        )
-        .with_test_writer()
-        .with_thread_names(true)
-        .try_init();
+    melin_test_node::logs::capture("info,melin_server_runtime::dpdk_transport=debug");
     serial
 }
 

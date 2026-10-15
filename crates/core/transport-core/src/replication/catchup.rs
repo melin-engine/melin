@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use melin_app::AppEvent;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::protocol::{
     encode_input_batch_from_journal, encode_rotate, peek_first_sequence, peek_frame_tag,
@@ -170,6 +170,62 @@ pub fn catch_up_from_journal_with<E: AppEvent>(
     publisher: CatchUpPublisher<'_>,
     shutdown: &AtomicBool,
 ) -> io::Result<CatchUpResult> {
+    stream_journal::<E>(
+        journal_path,
+        last_sequence,
+        publisher,
+        shutdown,
+        JournalPass::CatchUp,
+    )
+}
+
+/// One journal pass of a handoff into live streaming: what the journal
+/// holds past `from`, the end of the pass before, streamed as a catch-up
+/// streams it. Returns the last sequence sent, or `from` if there was
+/// nothing.
+///
+/// The pass before streamed up to `from`, so only a concurrent archive
+/// prune loses its start point: an error, on which the caller tears the
+/// link down, and the replica re-handshakes and is routed to a snapshot.
+pub fn handoff_pass_from_journal<E: AppEvent>(
+    journal_path: &std::path::Path,
+    from: u64,
+    publisher: CatchUpPublisher<'_>,
+    shutdown: &AtomicBool,
+) -> io::Result<u64> {
+    match stream_journal::<E>(
+        journal_path,
+        from,
+        publisher,
+        shutdown,
+        JournalPass::Handoff,
+    )? {
+        CatchUpResult::Ok(end) => Ok(end),
+        CatchUpResult::NeedSnapshot => Err(io::Error::other(
+            "journal history pruned during catch-up handoff: reconnect for snapshot transfer",
+        )),
+    }
+}
+
+/// Which of a join's journal passes [`stream_journal`] runs: the same
+/// walk either way, logged as what it is.
+#[derive(Clone, Copy)]
+enum JournalPass {
+    /// The catch-up: once per join, from the replica's position.
+    CatchUp,
+    /// One of the handoff's passes, from where the pass before ended:
+    /// usually nothing, and logged only at debug, so that the log shows
+    /// one catch-up per join rather than one per pass.
+    Handoff,
+}
+
+fn stream_journal<E: AppEvent>(
+    journal_path: &std::path::Path,
+    last_sequence: u64,
+    publisher: CatchUpPublisher<'_>,
+    shutdown: &AtomicBool,
+    pass: JournalPass,
+) -> io::Result<CatchUpResult> {
     use melin_journal::RawJournalScanner;
 
     let files = discover_journal_files(journal_path);
@@ -201,12 +257,19 @@ pub fn catch_up_from_journal_with<E: AppEvent>(
     let mut end_sequence = last_sequence;
     let mut batches_sent = 0u64;
 
-    info!(
-        last_sequence,
-        files = files.len(),
-        start_file = start_file_idx,
-        "starting journal catch-up"
-    );
+    match pass {
+        JournalPass::CatchUp => info!(
+            last_sequence,
+            files = files.len(),
+            start_file = start_file_idx,
+            "starting journal catch-up"
+        ),
+        JournalPass::Handoff => debug!(
+            from = last_sequence,
+            start_file = start_file_idx,
+            "starting handoff journal pass"
+        ),
+    }
 
     for path in &files[start_file_idx..] {
         if shutdown.load(Ordering::Relaxed) {
@@ -285,7 +348,10 @@ pub fn catch_up_from_journal_with<E: AppEvent>(
         }
     }
 
-    info!(end_sequence, batches_sent, "journal catch-up complete");
+    match pass {
+        JournalPass::CatchUp => info!(end_sequence, batches_sent, "journal catch-up complete"),
+        JournalPass::Handoff => debug!(end_sequence, batches_sent, "handoff journal pass complete"),
+    }
 
     Ok(CatchUpResult::Ok(end_sequence))
 }
@@ -613,23 +679,8 @@ pub fn bridge_catchup_to_live<E: AppEvent>(
 ) -> io::Result<super::sent::SentHighWater> {
     active_flag.store(true, Ordering::Release);
 
-    let residual_end = match catch_up_from_journal_with::<E>(
-        journal_path,
-        bulk_catchup_end,
-        &mut *publisher,
-        shutdown,
-    )? {
-        CatchUpResult::Ok(end) => end,
-        // The bulk pass just streamed up to `bulk_catchup_end`; only a
-        // concurrent archive prune could make the residual pass lose
-        // its start point. Tear the connection down — the replica
-        // re-handshakes and gets routed to snapshot transfer.
-        CatchUpResult::NeedSnapshot => {
-            return Err(io::Error::other(
-                "journal history pruned during catch-up handoff — reconnect for snapshot transfer",
-            ));
-        }
-    };
+    let residual_end =
+        handoff_pass_from_journal::<E>(journal_path, bulk_catchup_end, &mut *publisher, shutdown)?;
 
     let mut sent = super::sent::SentHighWater::seed(handshake_last_sequence, residual_end);
 
@@ -641,12 +692,7 @@ pub fn bridge_catchup_to_live<E: AppEvent>(
     // than the load-bearing guarantee for the common (under-load) case.
     let deadline = Instant::now() + HANDOFF_BRIDGE_TIMEOUT;
     let mut refill = |from: u64, fwd: &mut dyn FnMut(&[u8]) -> io::Result<()>| -> io::Result<u64> {
-        match catch_up_from_journal_with::<E>(journal_path, from, fwd, shutdown)? {
-            CatchUpResult::Ok(end) => Ok(end),
-            CatchUpResult::NeedSnapshot => Err(io::Error::other(
-                "journal history pruned during catch-up handoff backfill",
-            )),
-        }
+        handoff_pass_from_journal::<E>(journal_path, from, fwd, shutdown)
     };
     let mut expired = || Instant::now() >= deadline;
     drain_into_contiguity(
@@ -1332,6 +1378,34 @@ mod tests {
             can_catch_up_from_journal(&fresh, 0).unwrap(),
             "fresh replica of a fresh primary needs no snapshot"
         );
+    }
+
+    /// A handoff pass streams what lies past the pass before (nothing,
+    /// when nothing was journaled since), and a start point lost to a
+    /// prune between passes is an error, not a snapshot verdict: the
+    /// replica already has its stream, so the link must go.
+    #[test]
+    fn handoff_pass_streams_past_from_and_fails_on_a_pruned_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = three_segment_journal(dir.path());
+        let never = AtomicBool::new(false);
+        let mut publish = |_: &[u8]| -> io::Result<()> { Ok(()) };
+
+        assert_eq!(
+            handoff_pass_from_journal::<TestEvent>(&live, 2, &mut publish, &never).unwrap(),
+            3,
+            "the last entry, past the pass before"
+        );
+        assert_eq!(
+            handoff_pass_from_journal::<TestEvent>(&live, 3, &mut publish, &never).unwrap(),
+            3,
+            "nothing past the end: the pass ends where it began"
+        );
+
+        std::fs::remove_file(dir.path().join("j.journal.000001")).unwrap();
+        let err = handoff_pass_from_journal::<TestEvent>(&live, 0, &mut publish, &never)
+            .expect_err("the start point was pruned");
+        assert!(err.to_string().contains("pruned"), "{err}");
     }
 }
 

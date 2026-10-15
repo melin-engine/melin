@@ -185,9 +185,6 @@ struct State {
     /// rotation (tiny observed segment) from shrinking the target below
     /// what size-driven rotation needs.
     stage_floor: u64,
-    /// Core the worker pins itself to; `0` = unpinned. Read once at
-    /// worker startup.
-    pin_core: usize,
     /// Mutex<Option<…>> because the slot is mutated from two threads
     /// (worker writes, adopter takes) and has at most one entry. No
     /// contention on the hot path — the lock is only acquired at
@@ -256,7 +253,6 @@ impl SegmentPreparer {
             mode,
             stage_target: AtomicU64::new(stage_target),
             stage_floor,
-            pin_core,
             slot: Mutex::new(None),
             // Pre-arm at startup so the worker prepares the first spare
             // segment in parallel with server warm-up. The first rotation
@@ -274,27 +270,14 @@ impl SegmentPreparer {
         // which may be pinned. A child cannot move itself off a core
         // whose real-time occupant never yields, because moving itself
         // requires running — so the reset cannot happen inside the worker.
-        let saved = melin_app::affinity::take_context();
-        if let Err(ref e) = saved {
-            tracing::warn!(error = %e, "journal-prep: cannot snapshot scheduling context");
-        }
-        if let Err(e) = melin_app::affinity::prepare_child_context(pin_core) {
-            tracing::warn!(error = %e, "journal-prep: cannot prepare child context");
-        }
-        let spawned = std::thread::Builder::new()
-            .name("journal-prep".into())
-            .spawn(move || worker_loop(worker_state));
-        // Restore before unwrapping: a failed spawn must not strand the
-        // calling thread on the preparer's core.
-        if let Ok(ctx) = saved
-            && let Err(e) = melin_app::affinity::restore_context(&ctx)
-        {
-            tracing::error!(
-                error = %e,
-                "journal-prep: the starting thread could not restore its own affinity"
-            );
-        }
-        let handle = spawned.expect("failed to spawn journal-prep thread");
+        // A stuck preparer is kept rather than fail the journal: it is an
+        // optimisation, and until it runs, rotation takes the synchronous
+        // path it falls back to whenever no segment is staged.
+        let handle = melin_app::affinity::spawn_placed("journal-prep", pin_core, move || {
+            worker_loop(worker_state)
+        })
+        .or_else(melin_app::affinity::SpawnPlacedError::keep_stuck)
+        .expect("failed to spawn journal-prep thread");
 
         Self {
             state,
@@ -384,12 +367,10 @@ impl Drop for SegmentPreparer {
 /// (interrupted by shutdown) so transient ENOSPC / RO-FS conditions
 /// don't busy-loop the thread.
 fn worker_loop(state: Arc<State>) {
-    // Affinity and policy are already correct: `spawn` set them on the
-    // starting thread before creating this one, because a child of a
-    // pinned SCHED_FIFO parent cannot reconfigure itself — it would have
-    // to run first, on a core whose occupant never yields. Nothing to
-    // reset here.
-    melin_app::affinity::pin_thread("journal-prep", state.pin_core);
+    // Already placed and pinned: `spawn` created this thread through
+    // `spawn_placed`, because a child of a pinned SCHED_FIFO parent cannot
+    // reconfigure itself — it would have to run first, on a core whose
+    // occupant never yields.
     loop {
         // Wait for arm or shutdown.
         let mut armed = match state.armed.lock() {
