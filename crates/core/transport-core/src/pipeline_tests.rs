@@ -1246,9 +1246,9 @@ fn journal_stage_sends_replication_batches() {
     // The journal stage should have published a replication batch with
     // the exact same bytes it wrote to disk.
     let (repl_meta, repl_data) = loop {
-        if let Some((meta, data)) = repl_consumer.try_read() {
-            let data_copy = data.to_vec();
-            repl_consumer.commit();
+        if let Some(batch) = repl_consumer.peek() {
+            let (meta, data_copy) = (batch.meta(), batch.data().to_vec());
+            batch.commit();
             break (meta, data_copy);
         }
         std::hint::spin_loop();
@@ -1507,7 +1507,8 @@ fn primary_and_replica_journals_contiguous_and_chain_identical() {
     let t_relay = std::thread::spawn(move || {
         loop {
             let mut got_something = false;
-            if let Some((_meta, data)) = repl_c0.try_read() {
+            if let Some(batch) = repl_c0.peek() {
+                let data = batch.data();
                 let payload_len =
                     u32::from_le_bytes(data[..4].try_into().expect("4-byte length prefix"))
                         as usize;
@@ -1526,11 +1527,11 @@ fn primary_and_replica_journals_contiguous_and_chain_identical() {
                         recv_ts: mono_trace_ns(),
                     });
                 }
-                repl_c0.commit();
+                batch.commit();
                 got_something = true;
             }
-            if repl_c1.try_read().is_some() {
-                repl_c1.commit();
+            if let Some(batch) = repl_c1.peek() {
+                batch.commit();
                 got_something = true;
             }
             if !got_something {
@@ -2739,7 +2740,8 @@ fn primary_emits_chain_check_every_interval() {
     // (the 128th batch never happened), positioned after batch 64.
     let mut input_batches = 0u32;
     let mut checks = Vec::new();
-    while let Some((_meta, data)) = repl_consumers_0[0].try_read() {
+    while let Some(batch) = repl_consumers_0[0].peek() {
+        let data = batch.data();
         if peek_frame_tag(data).unwrap() == MSG_INPUT_BATCH {
             input_batches += 1;
         } else {
@@ -2751,7 +2753,7 @@ fn primary_emits_chain_check_every_interval() {
                 other => panic!("unexpected control frame: {other:?}"),
             }
         }
-        repl_consumers_0[0].commit();
+        batch.commit();
     }
     assert_eq!(input_batches, total as u32);
     assert_eq!(checks.len(), 1, "exactly one check in 70 batches");
@@ -2855,7 +2857,8 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
     let t_relay = std::thread::spawn(move || {
         loop {
             let mut got_something = false;
-            if let Some((_meta, data)) = repl_c0.try_read() {
+            if let Some(batch) = repl_c0.peek() {
+                let data = batch.data();
                 let payload_len =
                     u32::from_le_bytes(data[..4].try_into().expect("4-byte length prefix"))
                         as usize;
@@ -2904,11 +2907,11 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
                         other => panic!("unexpected control frame on ring: {other:?}"),
                     }
                 }
-                repl_c0.commit();
+                batch.commit();
                 got_something = true;
             }
-            if repl_c1.try_read().is_some() {
-                repl_c1.commit();
+            if let Some(batch) = repl_c1.peek() {
+                batch.commit();
                 got_something = true;
             }
             if !got_something {

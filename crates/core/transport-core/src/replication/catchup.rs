@@ -744,7 +744,7 @@ pub(super) fn drain_into_contiguity(
     expired: &mut dyn FnMut() -> bool,
 ) -> io::Result<()> {
     loop {
-        let Some((meta, data)) = consumer.try_read() else {
+        let Some(batch) = consumer.peek() else {
             // The ring carries nothing past the handoff point. Under load
             // the journal has published chunks since activation, so an
             // empty ring here means the disk has caught up to the ring and
@@ -758,13 +758,14 @@ pub(super) fn drain_into_contiguity(
             // the common case once the disk has drained the ring.)
             return Ok(());
         };
+        let (meta, data) = (batch.meta(), batch.data());
         let chunk = RingChunk::classify(meta.end_sequence, data, sent.get())?;
         if chunk.fate == ChunkFate::Covered {
-            consumer.commit();
+            batch.commit();
             continue;
         }
-        // At or ahead of the stream position. An ahead chunk's peek is
-        // held (refill never touches the consumer) while the disk is
+        // At or ahead of the stream position. An ahead chunk is held
+        // (refill never touches the consumer) while the disk is
         // back-filled until the chunk is no longer ahead.
         while RingChunk::classify(meta.end_sequence, data, sent.get())?.fate == ChunkFate::Ahead {
             let end = refill(sent.get(), forward)?;
@@ -781,7 +782,7 @@ pub(super) fn drain_into_contiguity(
             // forwarded even when the back-fill has since passed it (see
             // `RingChunk::classify`).
             forward(data)?;
-            consumer.commit();
+            batch.commit();
             continue;
         }
         // Contiguous now. Forward the held chunk unless the back-fill
@@ -791,7 +792,7 @@ pub(super) fn drain_into_contiguity(
             forward(data)?;
             sent.advance(meta.end_sequence);
         }
-        consumer.commit();
+        batch.commit();
         return Ok(());
     }
 }

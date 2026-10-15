@@ -2,13 +2,13 @@
 //! from the journal stage to one or more replication sender threads.
 //!
 //! Uses the generic disruptor ring for sequencing and backpressure, with a
-//! side array of pre-allocated 128 KiB byte buffers indexed by `seq & mask`.
-//! The journal stage copies batch bytes into the buffer, then publishes the
-//! metadata slot. Consumers read the metadata and reference the buffer
-//! directly (zero-copy read).
+//! side array of pre-allocated byte buffers, one [`CHUNK_SIZE`] chunk per
+//! slot, indexed by `seq & mask`. The journal stage copies batch bytes into
+//! the buffer, then publishes the metadata slot. Consumers read the
+//! metadata and reference the buffer directly (zero-copy read).
 //!
 //! This design avoids heap allocation on the journal thread. The only cost
-//! is a memcpy into the pre-allocated buffer (~80 KiB per batch).
+//! is one copy of each batch into its slot's buffer.
 
 use std::cell::UnsafeCell;
 use std::sync::Arc;
@@ -243,81 +243,103 @@ impl ReplicationProducer {
 
 /// Consumer end of the replication ring. One per replica sender thread.
 ///
-/// Uses two-phase consumption: `try_read` peeks at the next batch without
-/// advancing the cursor, and `commit` releases the slot back to the producer.
-/// The byte slice from `try_read` is valid until `commit` is called.
+/// Reads are peeks: [`Self::peek`] lends the next batch as a
+/// [`ReplicationBatch`] without consuming it, and only
+/// [`ReplicationBatch::commit`] consumes it and releases its slot to the
+/// producer. A batch that is not committed (the replica's socket has no
+/// room for it, say) is simply dropped, and the next `peek` lends the same
+/// batch again: no batch can be read past without being committed (only
+/// [`Self::skip_to_producer`] skips, deliberately, on eviction), and none
+/// committed without being read. The borrow checker holds the rest: a
+/// [`ReplicationBatch`] borrows the consumer, so no second batch can be
+/// peeked while one is held.
 pub struct ReplicationConsumer {
     inner: melin_pipeline::ring::Consumer<ReplicationMeta>,
     buffers: Arc<SharedBuffers>,
-    /// Metadata from the last `try_read`, held until `commit`.
-    pending_meta: Option<ReplicationMeta>,
-    /// Sequence of the last read (for buffer indexing).
-    pending_seq: u64,
+}
+
+/// A batch lent by [`ReplicationConsumer::peek`], not yet consumed.
+///
+/// Consumed only by [`Self::commit`]. Dropped instead, it stays first in the
+/// ring and the next `peek` lends it again. Its bytes are the slot's, valid
+/// for as long as the batch is held: the producer cannot reuse the slot
+/// before it is committed.
+///
+/// A batch dropped uncommitted is peeked again:
+///
+/// ```
+/// # use melin_journal::replication::build_replication_ring;
+/// # use melin_pipeline::wait::WaitStrategy;
+/// let (mut producer, mut consumers) = build_replication_ring(1, 2, WaitStrategy::SpinThenYield);
+/// let consumer = &mut consumers[0];
+/// producer.publish(b"frame", 1);
+/// let held = consumer.peek().expect("published");
+/// drop(held); // no room to send it, say
+/// let again = consumer.peek().expect("the same batch");
+/// assert_eq!(again.data(), b"frame");
+/// again.commit();
+/// ```
+///
+/// and no second batch can be peeked while one is held:
+///
+/// ```compile_fail
+/// # use melin_journal::replication::build_replication_ring;
+/// # use melin_pipeline::wait::WaitStrategy;
+/// let (mut producer, mut consumers) = build_replication_ring(1, 2, WaitStrategy::SpinThenYield);
+/// let consumer = &mut consumers[0];
+/// producer.publish(b"frame", 1);
+/// let held = consumer.peek().expect("published");
+/// let next = consumer.peek(); // the first is still held
+/// held.commit();
+/// drop(next);
+/// ```
+#[must_use = "a batch is consumed only by `commit`; dropped, it is peeked again"]
+pub struct ReplicationBatch<'a> {
+    inner: &'a mut melin_pipeline::ring::Consumer<ReplicationMeta>,
+    meta: ReplicationMeta,
+    data: &'a [u8],
+}
+
+impl ReplicationBatch<'_> {
+    /// The batch's length and last journal sequence.
+    pub fn meta(&self) -> ReplicationMeta {
+        self.meta
+    }
+
+    /// The batch's bytes: a wire-ready frame. Borrowed from the batch, not
+    /// the ring, so they cannot outlive the commit that frees the slot.
+    pub fn data(&self) -> &[u8] {
+        self.data
+    }
+
+    /// Consume the batch: release its slot to the producer, so that the
+    /// next `peek` lends the batch after it.
+    pub fn commit(self) {
+        self.inner.commit_consumed(1);
+    }
 }
 
 impl ReplicationConsumer {
-    /// Try to read the next replication batch without advancing the cursor.
-    ///
-    /// Returns `Some((meta, data_slice))` if a batch is available. The byte
-    /// slice is valid until `commit()` is called, which releases the slot
-    /// back to the producer.
-    ///
-    /// Must call `commit()` before calling `try_read` again.
-    pub fn try_read(&mut self) -> Option<(ReplicationMeta, &[u8])> {
-        debug_assert!(
-            self.pending_meta.is_none(),
-            "must commit() before reading again"
-        );
-        let mut buf = [ReplicationMeta::default(); 1];
-        let count = self.inner.read_batch(&mut buf, 1);
-        if count == 0 {
-            return None;
-        }
-        let meta = buf[0];
-        // read_batch advanced next_read but NOT the processed counter.
-        // The slot is safe to read until commit().
-        let seq = self.inner.next_read() - 1; // read_batch advanced past it
-        let idx = (seq & self.buffers.mask) as usize;
+    /// The next batch, without consuming it: the same batch on every call
+    /// until it is committed. `None` when the ring holds nothing unread.
+    pub fn peek(&mut self) -> Option<ReplicationBatch<'_>> {
+        let (first, _) = self.inner.peek_batch(1);
+        let meta = *first.first()?;
+        let idx = (self.inner.next_read() & self.buffers.mask) as usize;
+        // SAFETY: `peek_batch` returned the slot at `next_read`, so the
+        // producer has published it, and it cannot claim the slot again
+        // until this consumer's progress passes it, which only
+        // `ReplicationBatch::commit` does. The bytes are lent for the batch's
+        // lifetime, which ends at that commit at the latest.
         let data = unsafe {
             let chunk = &*self.buffers.chunks[idx].get();
             &chunk[..meta.len as usize]
         };
-        self.pending_meta = Some(meta);
-        self.pending_seq = seq;
-        Some((meta, data))
-    }
-
-    /// The batch the last `try_read` returned, while it is uncommitted.
-    ///
-    /// For a caller that holds a batch across calls — the DPDK sender's
-    /// catch-up→live handoff keeps the ring's first live batch while the
-    /// replica's socket has no room for it, and returns to its poll loop
-    /// in between — and so cannot keep the slice `try_read` lent it. The
-    /// slot is still the consumer's: the producer cannot reuse it before
-    /// `commit`, so these are the same bytes. `None` once committed (or
-    /// skipped past by [`Self::skip_to_producer`]).
-    pub fn pending(&self) -> Option<(ReplicationMeta, &[u8])> {
-        let meta = self.pending_meta?;
-        let idx = (self.pending_seq & self.buffers.mask) as usize;
-        // SAFETY: as in `try_read`: the slot at `pending_seq` was published
-        // before `try_read` returned it, and the producer cannot claim it
-        // again until `commit` advances this consumer's progress counter,
-        // which has not happened while `pending_meta` is set.
-        let data = unsafe {
-            let chunk = &*self.buffers.chunks[idx].get();
-            &chunk[..meta.len as usize]
-        };
-        Some((meta, data))
-    }
-
-    /// Release the last read slot back to the producer.
-    ///
-    /// Must be called after `try_read` returns `Some` and before the next
-    /// `try_read`. After this call, the byte slice from `try_read` is invalid.
-    pub fn commit(&mut self) {
-        if self.pending_meta.take().is_some() {
-            self.inner.commit();
-        }
+        Some(ReplicationBatch {
+            inner: &mut self.inner,
+            meta,
+            data,
+        })
     }
 
     /// Progress counter for this consumer.
@@ -340,8 +362,6 @@ impl ReplicationConsumer {
     /// pre-eviction position and gates the response stage.
     pub fn skip_to_producer(&mut self) {
         self.inner.skip_to_dependency();
-        self.pending_meta = None;
-        self.pending_seq = 0;
     }
 }
 
@@ -383,8 +403,6 @@ pub fn build_replication_ring(
         .map(|c| ReplicationConsumer {
             inner: c,
             buffers: Arc::clone(&buffers),
-            pending_meta: None,
-            pending_seq: 0,
         })
         .collect();
 
@@ -404,41 +422,54 @@ mod tests {
         let data = b"hello replication ring";
         producer.publish(data, 42);
 
-        let (meta, received) = consumer.try_read().unwrap();
-        assert_eq!(meta.end_sequence, 42);
-        assert_eq!(received, data);
-        consumer.commit();
+        let batch = consumer.peek().unwrap();
+        assert_eq!(batch.meta().end_sequence, 42);
+        assert_eq!(batch.data(), data);
+        batch.commit();
+        assert!(consumer.peek().is_none(), "consumed");
     }
 
-    /// A held read stays readable through `pending`, unchanged, and keeps
-    /// its slot from the producer, until it is committed.
+    /// A batch peeked and dropped without a commit is lent again, not read
+    /// past, and keeps its slot from the producer meanwhile: every batch
+    /// comes out once, in order, however many times it was peeked first.
     #[test]
-    fn pending_returns_the_held_batch_until_commit() {
+    fn an_uncommitted_batch_is_peeked_again_and_keeps_its_slot() {
         let (mut producer, mut consumers) =
             build_replication_ring(1, 2, WaitStrategy::SpinThenYield);
         let consumer = &mut consumers[0];
-        assert!(consumer.pending().is_none(), "nothing read yet");
+        assert!(consumer.peek().is_none(), "nothing published");
 
         producer.publish(b"first", 1);
         producer.publish(b"second", 2);
-        let (meta, data) = consumer.try_read().unwrap();
-        assert_eq!((meta.end_sequence, data), (1, &b"first"[..]));
+        let batch = consumer.peek().expect("the first batch");
+        assert_eq!(
+            (batch.meta().end_sequence, batch.data()),
+            (1, &b"first"[..])
+        );
+        // Not committed (no room for it, say).
+        drop(batch);
 
-        // The ring is full while the read is held: the producer cannot
-        // take the held slot, so `pending` keeps returning its bytes.
+        // The ring is full while the batch is unconsumed: the producer
+        // cannot take its slot, and the next peek lends the same bytes.
         assert!(producer.try_publish(b"third", 3).is_err());
-        let (meta, data) = consumer.pending().expect("the read is held");
-        assert_eq!((meta.end_sequence, data), (1, &b"first"[..]));
+        let batch = consumer.peek().expect("the same batch again");
+        assert_eq!(
+            (batch.meta().end_sequence, batch.data()),
+            (1, &b"first"[..])
+        );
+        batch.commit();
 
-        consumer.commit();
-        assert!(consumer.pending().is_none(), "committed");
         producer
             .try_publish(b"third", 3)
             .expect("the slot is free again");
-        let (meta, _) = consumer.try_read().unwrap();
-        assert_eq!(meta.end_sequence, 2);
+        let batch = consumer.peek().expect("the second batch");
+        assert_eq!(
+            (batch.meta().end_sequence, batch.data()),
+            (2, &b"second"[..])
+        );
+        batch.commit();
         consumer.skip_to_producer();
-        assert!(consumer.pending().is_none(), "skipped past");
+        assert!(consumer.peek().is_none(), "skipped past the third");
     }
 
     #[test]
@@ -453,14 +484,14 @@ mod tests {
         }
 
         for i in 0..10u64 {
-            let (meta, received) = consumer.try_read().unwrap();
-            assert_eq!(meta.end_sequence, i);
+            let batch = consumer.peek().unwrap();
+            assert_eq!(batch.meta().end_sequence, i);
             let expected = format!("batch {i}");
-            assert_eq!(received, expected.as_bytes());
-            consumer.commit();
+            assert_eq!(batch.data(), expected.as_bytes());
+            batch.commit();
         }
 
-        assert!(consumer.try_read().is_none());
+        assert!(consumer.peek().is_none());
     }
 
     #[test]
@@ -474,25 +505,25 @@ mod tests {
         producer.publish(b"second", 2);
 
         // c0 reads both.
-        let (m, d) = c0.try_read().unwrap();
-        assert_eq!(d, b"first");
-        assert_eq!(m.end_sequence, 1);
-        c0.commit();
-        let (m, d) = c0.try_read().unwrap();
-        assert_eq!(d, b"second");
-        assert_eq!(m.end_sequence, 2);
-        c0.commit();
+        let b = c0.peek().unwrap();
+        assert_eq!(b.data(), b"first");
+        assert_eq!(b.meta().end_sequence, 1);
+        b.commit();
+        let b = c0.peek().unwrap();
+        assert_eq!(b.data(), b"second");
+        assert_eq!(b.meta().end_sequence, 2);
+        b.commit();
 
         // c1 reads independently.
-        let (_, d) = c1.try_read().unwrap();
-        assert_eq!(d, b"first");
-        c1.commit();
-        let (_, d) = c1.try_read().unwrap();
-        assert_eq!(d, b"second");
-        c1.commit();
+        let b = c1.peek().unwrap();
+        assert_eq!(b.data(), b"first");
+        b.commit();
+        let b = c1.peek().unwrap();
+        assert_eq!(b.data(), b"second");
+        b.commit();
 
-        assert!(c0.try_read().is_none());
-        assert!(c1.try_read().is_none());
+        assert!(c0.peek().is_none());
+        assert!(c1.peek().is_none());
     }
 
     #[test]
@@ -504,12 +535,12 @@ mod tests {
         let data = vec![0xFFu8; CHUNK_SIZE];
         producer.publish(&data, 99);
 
-        let (meta, received) = consumer.try_read().unwrap();
-        assert_eq!(meta.len as usize, CHUNK_SIZE);
-        assert_eq!(meta.end_sequence, 99);
-        assert_eq!(received.len(), CHUNK_SIZE);
-        assert!(received.iter().all(|&b| b == 0xFF));
-        consumer.commit();
+        let batch = consumer.peek().unwrap();
+        assert_eq!(batch.meta().len as usize, CHUNK_SIZE);
+        assert_eq!(batch.meta().end_sequence, 99);
+        assert_eq!(batch.data().len(), CHUNK_SIZE);
+        assert!(batch.data().iter().all(|&b| b == 0xFF));
+        batch.commit();
     }
 
     #[test]
@@ -521,10 +552,10 @@ mod tests {
         for i in 0..REPLICATION_RING_CAPACITY as u64 * 3 {
             let data = i.to_le_bytes();
             producer.publish(&data, i);
-            let (meta, received) = consumer.try_read().unwrap();
-            assert_eq!(meta.end_sequence, i);
-            assert_eq!(received, &data);
-            consumer.commit();
+            let batch = consumer.peek().unwrap();
+            assert_eq!(batch.meta().end_sequence, i);
+            assert_eq!(batch.data(), &data);
+            batch.commit();
         }
     }
 
@@ -539,11 +570,11 @@ mod tests {
         let consumer_thread = std::thread::spawn(move || {
             let mut received = Vec::new();
             loop {
-                if let Some((meta, data)) = consumer.try_read() {
-                    let val = u64::from_le_bytes(data.try_into().unwrap());
-                    assert_eq!(val, meta.end_sequence);
+                if let Some(batch) = consumer.peek() {
+                    let val = u64::from_le_bytes(batch.data().try_into().unwrap());
+                    assert_eq!(val, batch.meta().end_sequence);
                     received.push(val);
-                    consumer.commit();
+                    batch.commit();
                     if received.len() == count as usize {
                         break;
                     }
@@ -574,10 +605,10 @@ mod tests {
         let result = producer.try_publish_timeout(b"data", 1, std::time::Duration::from_millis(10));
         assert!(result.is_ok());
 
-        let (meta, data) = consumer.try_read().unwrap();
-        assert_eq!(meta.end_sequence, 1);
-        assert_eq!(data, b"data");
-        consumer.commit();
+        let batch = consumer.peek().unwrap();
+        assert_eq!(batch.meta().end_sequence, 1);
+        assert_eq!(batch.data(), b"data");
+        batch.commit();
     }
 
     #[test]

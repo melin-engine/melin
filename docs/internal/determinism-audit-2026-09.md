@@ -61,7 +61,7 @@ Severity is a judgement from code reading.
 | 8 | Replicated entries have no end-to-end integrity; DPDK verifies no checksum on receive | High | Confirmed (fixed) |
 | 9 | The event publisher broadcasts reports before they are durable | High | Confirmed |
 | 10 | A runtime ack-policy change never reaches replicas while data flows | High | Confirmed |
-| 11 | The DPDK replication sender skips a batch that does not fit its transmit queue | High | Reproduced |
+| 11 | The DPDK replication sender skips a batch that does not fit its transmit queue | High | Reproduced (fixed) |
 | 12 | A primary disk stall makes a truthful replica look divergent | Medium | Confirmed |
 | 13 | Raft-mesh fencing ignores reply envelopes | Medium | Confirmed |
 | 14 | A replica adopts its primary's epoch before it holds that epoch's entries | Medium | Confirmed |
@@ -747,6 +747,15 @@ place (reported).
 **Fix direction.** Make `try_read` return the pending batch while one is
 outstanding, so it really is a peek until `commit()`, and clear the
 pending state in `go_idle`.
+
+**Status: fixed**, by going further than the direction: the misuse no
+longer compiles. `ReplicationConsumer::peek` lends the next batch as a
+`ReplicationBatch` without consuming it, and only
+`ReplicationBatch::commit` consumes it; a batch dropped uncommitted is
+peeked again, and a second batch cannot be peeked while one is held (the
+borrow checker refuses it, pinned by a `compile_fail` doctest). The consumer keeps no pending state, so `go_idle`
+has none to clear. Every reader of the ring (both senders, both
+catch-up→live drains, the idle drain) goes through it.
 
 ## Failover and fencing
 

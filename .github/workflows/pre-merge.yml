@@ -152,6 +152,12 @@ jobs:
           cargo check -p melin-dpdk --all-targets --locked
           cargo test -q -p melin-dpdk --features clap --lib --locked
 
+      # nextest runs no doctests, and the replication ring's reader pins its
+      # guarantee in one: a second batch cannot be peeked while one is held
+      # (a `compile_fail` doctest, which only a doctest build checks).
+      - name: Journal doctests
+        run: cargo test -q --doc -p melin-journal --locked
+
       # `--no-fail-fast` so one flaky cluster test cannot hide the verdict on
       # the rest of the suite. Costs nothing when the suite is green.
       - name: Tests

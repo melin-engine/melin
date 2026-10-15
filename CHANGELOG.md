@@ -253,6 +253,17 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Changed
 
+- **`melin_journal::replication::ReplicationConsumer` reads by
+  `peek`.** `try_read`, `pending` and `commit` are replaced by `peek`,
+  which lends the next batch as a `ReplicationBatch` without consuming
+  it, and `ReplicationBatch::commit`, which consumes it. A batch dropped
+  uncommitted is peeked again, and no second batch can be peeked while
+  one is held: the borrow checker refuses it, where `try_read` read past
+  an uncommitted batch in release builds. Source-breaking for every
+  reader of the ring:
+  `let Some(batch) = consumer.peek()`, then `batch.meta()`,
+  `batch.data()` and `batch.commit()`.
+
 - **`melin_dpdk::DpdkConfig` has a new field, `client_buffers:
   SocketBuffers`**, the sizes behind the `--dpdk-client-*-kib` flags.
   Source-breaking for a `DpdkConfig` built field by field: add it, or end
@@ -381,6 +392,15 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Fixed
 
+- **A DPDK primary no longer skips a batch when a replica's socket is
+  full.** A streaming replica whose socket had no room for the next batch
+  left it read but unsent, and the next tick read past it: a release
+  build never sent that batch (a skipped entry batch cost the replica a
+  reconnect, a skipped rotation left its journal misframed, a skipped
+  chain check went unchecked), and a debug build panicked the primary's
+  poll thread. The batch is now offered again until it is sent, and the
+  ring's reader makes reading past an unconsumed batch impossible (see
+  Changed).
 - **A DPDK node frees a client's slot when the client closes.** The
   client's FIN left the node's socket half-closed, which its stack still
   counts as active, so the connection and its slot were held until the

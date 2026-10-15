@@ -921,10 +921,11 @@ fn live_stream_uring(
         if !send_in_flight {
             let mut coalesced = 0;
             while coalesced < batch_size {
-                if let Some((meta, data)) = repl_consumer.try_read() {
-                    send_buf.extend_from_slice(data);
-                    repl_consumer.commit();
-                    sent.advance(meta.end_sequence);
+                if let Some(batch) = repl_consumer.peek() {
+                    send_buf.extend_from_slice(batch.data());
+                    let end_sequence = batch.meta().end_sequence;
+                    batch.commit();
+                    sent.advance(end_sequence);
                     coalesced += 1;
                 } else {
                     break;

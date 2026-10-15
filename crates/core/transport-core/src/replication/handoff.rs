@@ -22,11 +22,12 @@
 //!   advanced through [`HandoffIo`], which on DPDK runs them on the slot's
 //!   join worker, off the poll thread, and moves their frames into the
 //!   socket a tick's budget at a time.
-//! - **A ring chunk the socket has no room for** stays held: the consumer's
-//!   read is not committed, so the producer cannot reuse its slot, and the
-//!   next step re-borrows it ([`ReplicationConsumer::pending`]) and offers
-//!   it again. Nothing is read past it, so nothing is reordered, and it is
-//!   committed only once forwarded (or found covered), so nothing is lost.
+//! - **A ring chunk the socket has no room for** stays held: it is not
+//!   committed, so the producer cannot reuse its slot, and the next step
+//!   peeks it again ([`ReplicationConsumer::peek`] lends the same chunk
+//!   until it is committed) and offers it again. Nothing is read past it,
+//!   so nothing is reordered, and it is committed only once forwarded (or
+//!   found covered), so nothing is lost.
 //!
 //! The ring's single-consumer invariant holds as before: only the caller,
 //! through `step`, touches the consumer, and the journal passes never do.
@@ -35,7 +36,7 @@ use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use melin_journal::replication::ReplicationConsumer;
+use melin_journal::replication::{ReplicationBatch, ReplicationConsumer};
 
 use super::catchup::{ChunkFate, HANDOFF_BRIDGE_TIMEOUT, RingChunk};
 use super::sent::SentHighWater;
@@ -144,9 +145,8 @@ impl LiveHandoff {
     /// from.
     ///
     /// `Err` ends the handoff: the caller drops the replica, which
-    /// reconnects. The consumer may then hold an uncommitted read; the
-    /// caller releases it (commit, or skip to the producer) before the
-    /// ring is drained again.
+    /// reconnects. A chunk the handoff held uncommitted is then simply
+    /// first in the ring, for the caller to drain or skip like the rest.
     pub fn step(
         &mut self,
         consumer: &mut ReplicationConsumer,
@@ -174,23 +174,27 @@ impl LiveHandoff {
                     }
                 },
                 Phase::Drain => {
-                    let Some((meta, data)) = consumer.try_read() else {
+                    let Some(batch) = consumer.peek() else {
                         // Nothing past the handoff point: go live (see
                         // `drain_into_contiguity` for why an empty ring is
                         // not waited on).
                         return Ok(self.go_live());
                     };
-                    let chunk = RingChunk::classify(meta.end_sequence, data, self.sent.get())?;
+                    let chunk = RingChunk::classify(
+                        batch.meta().end_sequence,
+                        batch.data(),
+                        self.sent.get(),
+                    )?;
                     match chunk.fate {
-                        ChunkFate::Covered => consumer.commit(),
+                        ChunkFate::Covered => batch.commit(),
                         ChunkFate::Ahead => {
-                            // Hold the read (the passes never touch the
-                            // consumer) and back-fill from disk.
+                            // Hold the chunk, uncommitted (the passes never
+                            // touch the consumer), and back-fill from disk.
                             io.start_pass(self.sent.get())?;
                             self.phase = Phase::Backfill { chunk };
                         }
                         ChunkFate::Next => {
-                            if let Some(step) = self.forward(chunk, consumer, io)? {
+                            if let Some(step) = self.forward(chunk, batch, io) {
                                 return Ok(step);
                             }
                         }
@@ -200,9 +204,11 @@ impl LiveHandoff {
                     PassProgress::Pending => return Ok(HandoffStep::Pending),
                     PassProgress::Done(end) => {
                         self.sent.advance(end?);
-                        let (meta, data) = held(consumer)?;
+                        let batch = held(consumer)?;
+                        let meta = batch.meta();
                         let fate =
-                            RingChunk::classify(meta.end_sequence, data, self.sent.get())?.fate;
+                            RingChunk::classify(meta.end_sequence, batch.data(), self.sent.get())?
+                                .fate;
                         if fate == ChunkFate::Ahead {
                             if self.deadline.is_some_and(|d| now >= d) {
                                 return Err(chunk.stalled(meta.end_sequence, self.sent.get()));
@@ -214,13 +220,13 @@ impl LiveHandoff {
                             return Ok(HandoffStep::Pending);
                         }
                         // Reached: forward it as the inline drain does.
-                        if let Some(step) = self.forward(chunk, consumer, io)? {
+                        if let Some(step) = self.forward(chunk, batch, io) {
                             return Ok(step);
                         }
                     }
                 },
                 Phase::Forward { chunk } => {
-                    if let Some(step) = self.forward(chunk, consumer, io)? {
+                    if let Some(step) = self.forward(chunk, held(consumer)?, io) {
                         return Ok(step);
                     }
                 }
@@ -233,34 +239,36 @@ impl LiveHandoff {
         }
     }
 
-    /// Forward the held chunk, classified `chunk` when it was found at or
-    /// ahead of the position: a control frame always, an `InputBatch`
-    /// unless a back-fill has since covered it — the inline drain's rule.
-    /// Returns the step to end on, or `None` to go on draining.
+    /// Forward `batch`, the held chunk, classified `chunk` when it was
+    /// found at or ahead of the position: a control frame always, an
+    /// `InputBatch` unless a back-fill has since covered it — the inline
+    /// drain's rule. Returns the step to end on, or `None` to go on
+    /// draining.
     ///
-    /// A chunk the socket refuses stays held (`Phase::Forward`), so the
-    /// next step offers the same bytes again.
+    /// A chunk the socket refuses stays held (`Phase::Forward`): dropped
+    /// uncommitted, it is peeked again by the next step, which offers the
+    /// same bytes again.
     fn forward(
         &mut self,
         chunk: RingChunk,
-        consumer: &mut ReplicationConsumer,
+        batch: ReplicationBatch<'_>,
         io: &mut dyn HandoffIo,
-    ) -> io::Result<Option<HandoffStep>> {
-        let (meta, data) = held(consumer)?;
+    ) -> Option<HandoffStep> {
+        let meta = batch.meta();
         let send = !chunk.batch || meta.end_sequence > self.sent.get();
-        if send && !io.try_send(data) {
+        if send && !io.try_send(batch.data()) {
             self.phase = Phase::Forward { chunk };
-            return Ok(Some(HandoffStep::Pending));
+            return Some(HandoffStep::Pending);
         }
         if send && chunk.batch {
             self.sent.advance(meta.end_sequence);
         }
-        consumer.commit();
+        batch.commit();
         if chunk.batch {
-            return Ok(Some(self.go_live()));
+            return Some(self.go_live());
         }
         self.phase = Phase::Drain;
-        Ok(None)
+        None
     }
 
     /// End the handoff: the sent high-water is the caller's from here.
@@ -270,16 +278,14 @@ impl LiveHandoff {
     }
 }
 
-/// The consumer's held read: the chunk a back-fill ran for, or one the
-/// socket refused. Always there in the phases that call this, since only
-/// `forward` and the covered-chunk arm commit; `Err` rather than a panic
-/// all the same, as a bug here must cost the replica its link, not the
-/// node its poll thread.
-fn held(
-    consumer: &ReplicationConsumer,
-) -> io::Result<(melin_journal::replication::ReplicationMeta, &[u8])> {
+/// The held chunk, peeked again by a step that resumes with it: the chunk
+/// a back-fill ran for, or one the socket refused, still first in the ring
+/// since only `forward` and the covered-chunk arm commit. `Err` rather
+/// than a panic on an empty ring all the same, as a bug here must cost the
+/// replica its link, not the node its poll thread.
+fn held(consumer: &mut ReplicationConsumer) -> io::Result<ReplicationBatch<'_>> {
     consumer
-        .pending()
+        .peek()
         .ok_or_else(|| io::Error::other("catch-up handoff: the held ring chunk is gone"))
 }
 
@@ -650,9 +656,9 @@ mod tests {
         assert_eq!(entries(&io.wire), (11..=14).collect::<Vec<_>>());
         assert_eq!(sent.get(), 14);
         // The live stream goes on from the very next chunk.
-        let (meta, data) = consumer.try_read().expect("the second batch is left");
-        assert_eq!(decode(data), Wire::Batch(vec![15, 16]));
-        assert_eq!(meta.end_sequence, 16);
+        let batch = consumer.peek().expect("the second batch is left");
+        assert_eq!(decode(batch.data()), Wire::Batch(vec![15, 16]));
+        assert_eq!(batch.meta().end_sequence, 16);
     }
 
     /// The ring's first live chunk starts past what the disk has: the
@@ -718,8 +724,8 @@ mod tests {
                 handoff.step(&mut consumer, &active, &mut io, now).unwrap(),
                 HandoffStep::Pending
             ));
-            let (meta, _) = consumer.pending().expect("the chunk is held");
-            assert_eq!(meta.end_sequence, 12);
+            let held = consumer.peek().expect("the chunk is held");
+            assert_eq!(held.meta().end_sequence, 12);
         }
         match handoff.step(&mut consumer, &active, &mut io, now).unwrap() {
             HandoffStep::Live(sent) => assert_eq!(sent.get(), 12),
@@ -727,11 +733,11 @@ mod tests {
         }
         assert_eq!(offers.get(), 4);
         assert_eq!(entries(&io.wire), [11, 12], "taken once");
-        assert!(consumer.pending().is_none(), "committed once taken");
-        let (meta, _) = consumer
-            .try_read()
+        // Committed once taken: the next chunk is the live stream's.
+        let next = consumer
+            .peek()
             .expect("the next chunk is the live stream's");
-        assert_eq!(meta.end_sequence, 14);
+        assert_eq!(next.meta().end_sequence, 14);
     }
 
     /// A control frame the back-fill has since passed is still forwarded,
@@ -983,9 +989,8 @@ mod tests {
 
                 prop_assert_eq!(&io.wire, &inline_wire);
                 prop_assert_eq!(sent.get(), inline_sent.get());
-                prop_assert!(consumer.pending().is_none());
-                let next = consumer.try_read().map(|(m, _)| m.end_sequence);
-                let inline_next = inline_consumer.try_read().map(|(m, _)| m.end_sequence);
+                let next = consumer.peek().map(|b| b.meta().end_sequence);
+                let inline_next = inline_consumer.peek().map(|b| b.meta().end_sequence);
                 prop_assert_eq!(next, inline_next);
             }
         }

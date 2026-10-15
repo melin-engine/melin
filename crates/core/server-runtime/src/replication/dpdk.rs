@@ -580,11 +580,9 @@ impl DpdkReplicaSlot {
         // Abandons a join in progress (the catch-up, or a handoff pass):
         // its worker stops at its next frame.
         self.join = None;
-        // A handoff ended mid-way may hold a ring read (a chunk it was
-        // forwarding or back-filling for): release it, so the `Idle` arm's
-        // drain reads on from there. A no-op otherwise, and after an
-        // eviction's skip to the producer.
-        self.consumer.commit();
+        // Nothing to release in the ring: a chunk a handoff ended mid-way
+        // left uncommitted (one it was forwarding or back-filling for) is
+        // simply first in it, and the `Idle` arm drains it with the rest.
     }
 }
 
@@ -852,8 +850,8 @@ impl<A: Application> DpdkReplicationDriver<A> {
                     // Drain ring to keep it flowing. The journal stage
                     // skips inactive rings (active_flag=false), but there
                     // may be residual entries from before the flag was cleared.
-                    while slot.consumer.try_read().is_some() {
-                        slot.consumer.commit();
+                    while let Some(batch) = slot.consumer.peek() {
+                        batch.commit();
                     }
                 }
 
@@ -1402,10 +1400,13 @@ impl<A: Application> DpdkReplicationDriver<A> {
                         if batches_sent > 0 && bytes_this_tick >= MAX_REPL_BYTES_PER_TICK {
                             break;
                         }
-                        let Some((meta, data)) = slot.consumer.try_read() else {
+                        // A batch a previous tick found no room for is
+                        // peeked again: the `break`s below leave it
+                        // uncommitted, and only a commit moves past it.
+                        let Some(batch) = slot.consumer.peek() else {
                             break;
                         };
-                        let data_len = data.len();
+                        let data_len = batch.data().len();
                         if data_len > available {
                             // Batch doesn't fit — flush what we have so
                             // far, poll to drain the wire, then re-check
@@ -1427,9 +1428,10 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                 break;
                             }
                         }
-                        slot.send_buf.extend_from_slice(data);
-                        slot.consumer.commit();
-                        slot.sent.advance(meta.end_sequence);
+                        slot.send_buf.extend_from_slice(batch.data());
+                        let end_sequence = batch.meta().end_sequence;
+                        batch.commit();
+                        slot.sent.advance(end_sequence);
                         batches_sent += 1;
                         bytes_this_tick += data_len;
                         available = available.saturating_sub(data_len);
@@ -1485,7 +1487,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
 
                     // Eviction is handled by the journal-stage evict_flag check
                     // at the top of the loop (lines 3254+). No timeout-based
-                    // eviction here — try_read() returning None means the
+                    // eviction here — peek() returning None means the
                     // consumer caught up, not that it's slow.
                 }
             }
