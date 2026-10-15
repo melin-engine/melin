@@ -81,6 +81,11 @@ pub use args::{DpdkArgs, DpdkArgsError, parse_mac_flag};
 // too.
 mod nic;
 pub use nic::{LocalPorts, dial_addr};
+// Ungated for the same reason as `peer_liveness`: which listening socket a
+// SYN finds, and when a port's backlog hands a connection out and refills,
+// is TCP-stack logic, tested over an in-memory wire. The transport that
+// accepts through it is in the gated `dpdk` module.
+mod listen_backlog;
 #[cfg(test)]
 mod test_wire;
 

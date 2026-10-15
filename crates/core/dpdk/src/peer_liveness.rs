@@ -101,8 +101,8 @@ impl PeerLiveness {
     }
 
     /// Arm the rule on a socket. Done once the connection is established:
-    /// set on a listening socket, the timeout would also cover a half-open
-    /// handshake and close the listener itself, which nothing replaces.
+    /// a listening socket's handshake has a timeout of its own
+    /// (`listen_backlog`), lifted when its connection is accepted.
     pub(crate) fn apply(&self, socket: &mut tcp::Socket<'_>) {
         socket.set_keep_alive(Some(self.probe_interval.into()));
         socket.set_timeout(Some(self.timeout.into()));

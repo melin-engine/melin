@@ -36,34 +36,6 @@ Replication links no longer close this way: they go through
 client close could use the same call, or a graceful FIN, which needs the
 socket kept until the FIN is acknowledged.
 
-### DPDK refuses a SYN that arrives during another's handshake
-
-`DpdkTransport` keeps one listening socket per port and replaces it only
-once the accepted socket is established (`check_listener` in
-`crates/core/dpdk`), and the stack answers a TCP segment that matches no
-socket with an RST. So while one client's handshake is in progress on a
-port, a second client's SYN to that port is refused outright. The kernel
-queues it in the listen backlog and completes both. A client that dials
-several connections at once, or two clients that connect in the same
-instant, get a refusal on DPDK that they would not get on io_uring; the
-refused side sees connection refused, not a timeout, and retries only if
-it was written to. The Exchange Core's bench dials its connections one at
-a time for this reason, and so does the client NIC handle in
-`crates/core/dpdk` (`NicHandle::dial` returns only once the connection is
-established or has failed, and its documentation gives this reason), so
-every client on `melin-client`'s `dpdk` feature inherits the constraint
-(`dpdk-client-2026-10.md`). Sequential dials keep one client from
-refusing itself; two clients dialing the same node at once can still
-meet it.
-
-The DPDK side looks wrong: a backlog of listeners per port (several
-listening sockets, each replaced as it is accepted) would take as many
-concurrent handshakes as there are listeners, at the cost of their
-buffers. The handle's dial could then stop waiting for one connection
-before the next. No DPDK test yet; the one to write dials two
-connections to a node in the same poll, below the NIC handle since it
-dials one at a time, and expects both to be established.
-
 ### DPDK `PipelineFull` drops the client instead of sending ServerBusy
 
 `dpdk_transport.rs`, the `FrameAction::PipelineFull` arm. On a full input ring

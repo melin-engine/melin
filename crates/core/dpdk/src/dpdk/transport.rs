@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use crate::ffi;
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
-use smoltcp::socket::tcp::{self, OpaqueFrameHandle, State};
+use smoltcp::socket::tcp::{self, OpaqueFrameHandle};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 
@@ -19,6 +19,7 @@ use crate::config::{NicConfig, ReplicationNic};
 use crate::device::DpdkDevice;
 use crate::eal::{Eal, LcoreRegisterError, LcoreRegistration};
 use crate::eal_sharing::{EalGroup, OnEal};
+use crate::listen_backlog::{ListenerConfig, Listeners, tune_socket};
 use crate::mempool::Mempool;
 use crate::peer_liveness::{self, PeerLiveness, StackClock};
 use crate::port::{ChecksumOffloads, Port, RemovableRule};
@@ -27,30 +28,6 @@ use crate::steering::{QueuePlan, SteeringPlan, remove_until_promotion};
 // Defined outside the `dpdk-sys` gate (`crate::config`); re-exported here so
 // `melin_dpdk::transport::DpdkConfig` still names it.
 pub use crate::config::DpdkConfig;
-
-/// Apply low-latency TCP tuning to a smoltcp socket.
-///
-/// Called on every socket (listen, accepted and dialed) to configure for
-/// low latency, and crate-visible so that every socket the crate opens on
-/// a NIC carries the same tuning:
-/// - Nagle disabled (TCP_NODELAY): send small messages immediately
-/// - Delayed ACK disabled: ACK every segment without waiting 10ms
-/// - RTO floor and initial RTO both at 1ms — fastcp's minimum (its RTT
-///   estimator is u32-millisecond, so sub-ms truncates to 0 and panics).
-///   The response path (server->client) is what gates client-visible
-///   latency, and a 50ms initial RTO turned any dropped response segment
-///   into a 50ms tail; on a µs-RTT LAN the first retransmit should be ~1ms.
-/// - Initial congestion window raised to 64 KiB (skip slow start on LAN)
-///
-/// These settings sacrifice marginal bandwidth efficiency and RFC
-/// compliance for latency on a trusted, dedicated LAN.
-pub(crate) fn tune_socket(socket: &mut tcp::Socket<'_>) {
-    socket.set_nagle_enabled(false);
-    socket.set_ack_delay(None);
-    socket.set_min_rto(smoltcp::time::Duration::from_millis(1));
-    socket.set_initial_rto(smoltcp::time::Duration::from_millis(1));
-    socket.set_initial_congestion_window(64 * 1024);
-}
 
 /// Maximum concurrent TCP connections. Exposed so callers can pre-size
 /// per-connection state vectors that parallel the smoltcp socket set.
@@ -160,21 +137,6 @@ pub struct AcceptedConnection {
     /// (e.g. client port → client logic, replication port → replication
     /// state machine).
     pub listen_port: u16,
-}
-
-/// Per-listener state: port, handle, and buffer sizes for accepted sockets.
-struct ListenerEntry {
-    port: u16,
-    handle: SocketHandle,
-    /// smoltcp RX buffer size for sockets accepted on this port.
-    rx_buf_size: usize,
-    /// smoltcp TX buffer size for sockets accepted on this port.
-    tx_buf_size: usize,
-    /// TX queue limit for sockets accepted on this port.
-    tx_queue_limit: usize,
-    /// Data segments a socket accepted on this port may dispatch per egress
-    /// pass. See [`DpdkTransport::add_listener_with_buffers`].
-    dispatch_burst_limit: usize,
 }
 
 /// A NIC group: the ports of one NIC (one port, or an LACP bond's), the
@@ -345,15 +307,13 @@ pub struct DpdkTransport {
     device: DpdkDevice,
     iface: Interface,
     sockets: SocketSet<'static>,
-    /// (port, handle) for every TCP listening socket the transport
-    /// currently maintains. Initialised with one entry from
-    /// `config.listen_port` (none for `from_shared_unlistening`); callers
-    /// can add more via `add_listener`.
-    /// `check_listener` iterates this list, accepts any socket that
-    /// transitioned to Established, and replaces it with a fresh
-    /// listener on the same port — so the slot for that port stays
-    /// receptive while the accepted connection moves into `accepted`.
-    listeners: Vec<ListenerEntry>,
+    /// Every port the transport listens on, each with a backlog of
+    /// listening sockets. Initialised with `config.listen_port` (no port
+    /// for `from_shared_unlistening`); callers can add more via
+    /// `add_listener`. `check_listener` moves every connection whose
+    /// handshake completed into `accepted` and replaces its socket with a
+    /// fresh listening one, so the port keeps taking handshakes meanwhile.
+    listeners: Listeners,
     accepted: Vec<AcceptedConnection>,
     /// Per-connection TX buffers, indexed by `SocketHandle::index()`.
     /// Dense `Vec<Option<_>>` instead of a HashMap — HashMap hashing
@@ -800,29 +760,11 @@ impl DpdkTransport {
 
         let mut sockets = SocketSet::new(Vec::with_capacity(MAX_CONNECTIONS));
 
-        // A `Vec`, as `listeners` is: a transport holds one or two.
-        let mut listeners = Vec::with_capacity(2);
+        // Accepted handles index the per-connection tables, sized for
+        // MAX_CONNECTIONS.
+        let mut listeners = Listeners::new(MAX_CONNECTIONS);
         if let Some(port) = listen_port {
-            let listen_socket = {
-                let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_RX_BUF_SIZE]);
-                let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_TX_BUF_SIZE]);
-                let mut socket = tcp::Socket::new(rx_buf, tx_buf);
-                tune_socket(&mut socket);
-                socket
-                    .listen(port)
-                    .map_err(|e| format!("TCP listen failed: {e}"))?;
-                socket
-            };
-            listeners.push(ListenerEntry {
-                port,
-                handle: sockets.add(listen_socket),
-                rx_buf_size: SOCKET_RX_BUF_SIZE,
-                tx_buf_size: SOCKET_TX_BUF_SIZE,
-                tx_queue_limit: MAX_TX_QUEUE_SIZE,
-                // Client port: keep the fan-in default so one client's burst
-                // cannot delay its peers within an egress pass.
-                dispatch_burst_limit: tcp::DEFAULT_DISPATCH_BURST_LIMIT,
-            });
+            listeners.add(&mut sockets, client_listener(port))?;
         }
 
         match listen_port {
@@ -1172,113 +1114,37 @@ impl DpdkTransport {
     }
 
     fn check_listener(&mut self) {
-        // Iterate every (port, handle) pair: accept any whose listen
-        // socket has progressed to Established, replace it with a fresh
-        // listener on the same port. Each port is independent — the
-        // client port and the replication port (when both are used by
-        // the same transport) keep their own listener slots.
-        let mut i = 0;
-        while i < self.listeners.len() {
-            let port = self.listeners[i].port;
-            let handle = self.listeners[i].handle;
-            let (state, peer) = match self.sockets.try_get_mut::<tcp::Socket>(handle) {
-                Some(socket) => {
-                    if socket.state() != State::Established {
-                        i += 1;
-                        continue;
-                    }
-                    let peer = match socket.remote_endpoint() {
-                        Some(remote) => match remote.addr {
-                            IpAddress::Ipv4(ip) => {
-                                let octets = ip.octets();
-                                std::net::SocketAddr::new(
-                                    std::net::IpAddr::V4(Ipv4Addr::new(
-                                        octets[0], octets[1], octets[2], octets[3],
-                                    )),
-                                    remote.port,
-                                )
-                            }
-                        },
-                        None => {
-                            i += 1;
-                            continue;
-                        }
-                    };
-                    (socket.state(), peer)
-                }
-                None => {
-                    // Listener handle gone — caller raced an out-of-band
-                    // socket removal. Drop the entry so we stop probing
-                    // it and let the listener-replacement path put a
-                    // fresh socket back on this port on a later poll.
-                    tracing::warn!(
-                        handle = ?handle,
-                        port,
-                        site = "check_listener",
-                        "DPDK: stale listener handle, removing from listeners[]"
-                    );
-                    self.listeners.swap_remove(i);
-                    continue;
-                }
-            };
-            let _ = state; // used only for the early-continue above
-
-            // Register zero-copy callbacks on the accepted socket before
-            // it processes any data segments. If the handle has been
-            // removed between the read above and now (shouldn't happen —
-            // we don't yield in this function — but guard anyway), skip
-            // the entry instead of crashing.
-            // Copied out before the socket borrow so both can be held.
-            let dispatch_burst_limit = self.listeners[i].dispatch_burst_limit;
-            let Some(accepted_socket) = self.sockets.try_get_mut::<tcp::Socket>(handle) else {
-                tracing::warn!(
-                    handle = ?handle,
-                    port,
-                    site = "check_listener.accepted",
-                    "DPDK: accepted handle vanished mid-iteration"
-                );
-                self.listeners.swap_remove(i);
-                continue;
-            };
-            accepted_socket.set_zero_copy_retain_fn(retain_mbuf);
-            accepted_socket.set_zero_copy_release_fn(release_mbuf);
-            accepted_socket.set_dispatch_burst_limit(dispatch_burst_limit);
-
-            // Replace the listener slot in-place so the port stays
-            // receptive while the just-accepted handle is moved out
-            // into `accepted`.
-            let entry = &self.listeners[i];
-            let rx_buf_size = entry.rx_buf_size;
-            let tx_buf_size = entry.tx_buf_size;
-            let tx_queue_limit = entry.tx_queue_limit;
-
-            // Set per-handle TX queue limit for the accepted socket.
-            if handle.index() < self.tx_queue_limits.len() {
-                self.tx_queue_limits[handle.index()] = tx_queue_limit;
+        // Every port's completed handshakes, each socket replaced by a
+        // fresh listening one (see `Listeners::accept`). The accepted
+        // socket gets the zero-copy callbacks before it processes any
+        // data segment, and its port's TX queue limit.
+        let Self {
+            listeners,
+            iface,
+            sockets,
+            tx_queue_limits,
+            accepted,
+            ..
+        } = self;
+        listeners.accept(iface, sockets, |socket, conn| {
+            socket.set_zero_copy_retain_fn(retain_mbuf);
+            socket.set_zero_copy_release_fn(release_mbuf);
+            // In bounds: the backlog places no socket beyond
+            // MAX_CONNECTIONS, the table's length.
+            if let Some(limit) = tx_queue_limits.get_mut(conn.handle.index()) {
+                *limit = conn.config.tx_queue_limit;
             }
-
-            let new_listener = {
-                let rx_buf = tcp::SocketBuffer::new(vec![0u8; rx_buf_size]);
-                let tx_buf = tcp::SocketBuffer::new(vec![0u8; tx_buf_size]);
-                let mut socket = tcp::Socket::new(rx_buf, tx_buf);
-                tune_socket(&mut socket);
-                socket.listen(port).expect("re-listen after accept");
-                socket
-            };
-            let new_handle = self.sockets.add(new_listener);
-            self.listeners[i].handle = new_handle;
-
-            self.accepted.push(AcceptedConnection {
-                handle,
-                peer,
-                listen_port: port,
+            accepted.push(AcceptedConnection {
+                handle: conn.handle,
+                peer: conn.peer,
+                listen_port: conn.config.port,
             });
-
-            tracing::debug!(peer = %peer, listen_port = port, "DPDK: TCP connection accepted");
-            // Don't advance `i` — re-check this slot in case a fresh SYN
-            // already completed the handshake on the new listener within
-            // the same poll cycle.
-        }
+            tracing::debug!(
+                peer = %conn.peer,
+                listen_port = conn.config.port,
+                "DPDK: TCP connection accepted"
+            );
+        });
     }
 
     /// Add another TCP port to listen on, sharing the same DPDK NIC and
@@ -1287,18 +1153,18 @@ impl DpdkTransport {
     /// multiple distinct services (e.g. clients on 9876 and replication
     /// on 9877) without needing separate queues / threads.
     pub fn add_listener(&mut self, port: u16) -> Result<(), Box<dyn std::error::Error>> {
-        self.add_listener_with_buffers(
-            port,
-            SOCKET_RX_BUF_SIZE,
-            SOCKET_TX_BUF_SIZE,
-            MAX_TX_QUEUE_SIZE,
-            tcp::DEFAULT_DISPATCH_BURST_LIMIT,
-        )
+        self.listen(client_listener(port))
     }
 
     /// Like `add_listener` but with custom buffer sizes for sockets
     /// accepted on this port. Used for replication, which needs larger
     /// TX buffers to keep up with journal batch throughput.
+    ///
+    /// The port keeps a backlog of sockets listening, so that it takes
+    /// several handshakes at once, and each of them holds these buffers
+    /// and a slot of the socket set from the moment the listener is added.
+    /// The larger the buffers, the shorter the backlog: it is cut to keep
+    /// what the listening sockets hold bounded, down to two sockets.
     ///
     /// `dispatch_burst_limit` caps how many data segments a socket accepted
     /// here may dispatch in one egress pass. The stack repeats the pass over
@@ -1314,23 +1180,20 @@ impl DpdkTransport {
         tx_queue_limit: usize,
         dispatch_burst_limit: usize,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let rx_buf = tcp::SocketBuffer::new(vec![0u8; rx_buf_size]);
-        let tx_buf = tcp::SocketBuffer::new(vec![0u8; tx_buf_size]);
-        let mut socket = tcp::Socket::new(rx_buf, tx_buf);
-        tune_socket(&mut socket);
-        socket
-            .listen(port)
-            .map_err(|e| format!("TCP listen on port {port} failed: {e}"))?;
-        let handle = self.sockets.add(socket);
-        self.listeners.push(ListenerEntry {
+        self.listen(ListenerConfig {
             port,
-            handle,
             rx_buf_size,
             tx_buf_size,
             tx_queue_limit,
             dispatch_burst_limit,
-        });
-        tracing::info!(port, "DPDK transport: added listener");
+        })
+    }
+
+    /// The add-listener methods' common body: listen on `config.port`,
+    /// with the backlog its buffers allow (see `listen_backlog`).
+    fn listen(&mut self, config: ListenerConfig) -> Result<(), Box<dyn std::error::Error>> {
+        self.listeners.add(&mut self.sockets, config)?;
+        tracing::info!(port = config.port, "DPDK transport: added listener");
         Ok(())
     }
 
@@ -1502,6 +1365,7 @@ impl DpdkTransport {
             // connection is unindexed for its whole life and each of its
             // segments costs a linear scan over all sockets.
             self.iface.forget_tcp_socket(handle);
+            self.listeners.slot_freed();
         } else {
             tracing::warn!(
                 handle = ?handle,
@@ -1541,7 +1405,9 @@ impl DpdkTransport {
             self.cached_timestamp,
             DpdkDevice::flush_tx,
         );
-        if !removed {
+        if removed {
+            self.listeners.slot_freed();
+        } else {
             tracing::warn!(
                 handle = ?handle,
                 site = "reset",
@@ -1631,6 +1497,19 @@ impl DpdkTransport {
         let (mac, source) = crate::mac::resolve_peer_mac(self.peer_mac, peer_ip);
         self.seed_neighbor(peer_ip, mac);
         source
+    }
+}
+
+/// A client port's listener: the client socket buffers and TX queue
+/// limit, and the fan-in default egress burst, so that one client's burst
+/// cannot delay its peers within an egress pass.
+fn client_listener(port: u16) -> ListenerConfig {
+    ListenerConfig {
+        port,
+        rx_buf_size: SOCKET_RX_BUF_SIZE,
+        tx_buf_size: SOCKET_TX_BUF_SIZE,
+        tx_queue_limit: MAX_TX_QUEUE_SIZE,
+        dispatch_burst_limit: tcp::DEFAULT_DISPATCH_BURST_LIMIT,
     }
 }
 

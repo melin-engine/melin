@@ -102,9 +102,9 @@
 //!   handle for that call only. `NicHandle::service` advances every stream
 //!   at once, so it is called once per loop iteration, at the caller's own
 //!   monotonic nanosecond time (a calibrated TSC's will do). Dials are
-//!   sequential: a DPDK node refuses a SYN that arrives during another
-//!   connection's handshake, so a dial returns only once its connection
-//!   is established or has failed.
+//!   sequential: a dial returns only once its connection is established
+//!   or has failed, since a DPDK node takes only a few handshakes at once
+//!   on a port and refuses a SYN beyond them.
 //!
 //! Either way the stream's in-place send frames a request straight into
 //! the socket's transmit buffer. A NIC that cannot be brought up is
