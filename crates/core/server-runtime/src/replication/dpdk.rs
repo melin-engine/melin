@@ -579,10 +579,10 @@ impl DpdkReplicaSlot {
         self.pending_validation = None;
         // Abandons a join in progress (the catch-up, or a handoff pass):
         // its worker stops at its next frame.
-        // A chunk a handoff ended mid-way left uncommitted (one it was
-        // forwarding or back-filling for) is simply first in the ring, and
-        // the `Idle` arm drains it with the rest.
         self.join = None;
+        // Nothing to release in the ring: a chunk a handoff ended mid-way
+        // left uncommitted (one it was forwarding or back-filling for) is
+        // simply first in it, and the `Idle` arm drains it with the rest.
     }
 }
 

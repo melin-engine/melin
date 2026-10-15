@@ -248,8 +248,9 @@ impl ReplicationProducer {
 /// [`ReplicationBatch::commit`] consumes it and releases its slot to the
 /// producer. A batch that is not committed (the replica's socket has no
 /// room for it, say) is simply dropped, and the next `peek` lends the same
-/// batch again: no batch can be read past without being committed, and
-/// none committed without being read. The borrow checker holds the rest: a
+/// batch again: no batch can be read past without being committed (only
+/// [`Self::skip_to_producer`] skips, deliberately, on eviction), and none
+/// committed without being read. The borrow checker holds the rest: a
 /// [`ReplicationBatch`] borrows the consumer, so no second batch can be
 /// peeked while one is held.
 pub struct ReplicationConsumer {
