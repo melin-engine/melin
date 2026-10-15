@@ -310,6 +310,21 @@ impl ReplicationConsumer {
         Some((meta, data))
     }
 
+    /// The held read if there is one, else the next batch, as
+    /// [`Self::try_read`].
+    ///
+    /// For a caller that may stop between reading a batch and committing
+    /// it, and come back later: the DPDK sender's streaming loop, when the
+    /// replica's socket has no room for the batch it read. `try_read` there
+    /// would read past the held batch, and the next `commit` would release
+    /// both, the held one never sent.
+    pub fn read_or_held(&mut self) -> Option<(ReplicationMeta, &[u8])> {
+        if self.pending_meta.is_some() {
+            return self.pending();
+        }
+        self.try_read()
+    }
+
     /// Release the last read slot back to the producer.
     ///
     /// Must be called after `try_read` returns `Some` and before the next
@@ -439,6 +454,31 @@ mod tests {
         assert_eq!(meta.end_sequence, 2);
         consumer.skip_to_producer();
         assert!(consumer.pending().is_none(), "skipped past");
+    }
+
+    /// A read held across calls is offered again, not read past: every
+    /// batch comes out once, in order, whether or not its first read was
+    /// committed.
+    #[test]
+    fn read_or_held_offers_a_held_batch_again() {
+        let (mut producer, mut consumers) =
+            build_replication_ring(1, 4, WaitStrategy::SpinThenYield);
+        let consumer = &mut consumers[0];
+        assert!(consumer.read_or_held().is_none(), "nothing published");
+
+        producer.publish(b"first", 1);
+        producer.publish(b"second", 2);
+        let (meta, _) = consumer.read_or_held().expect("the first batch");
+        assert_eq!(meta.end_sequence, 1);
+        // Not committed (no room for it, say): the same batch again.
+        let (meta, data) = consumer.read_or_held().expect("the held batch");
+        assert_eq!((meta.end_sequence, data), (1, &b"first"[..]));
+        consumer.commit();
+
+        let (meta, data) = consumer.read_or_held().expect("the second batch");
+        assert_eq!((meta.end_sequence, data), (2, &b"second"[..]));
+        consumer.commit();
+        assert!(consumer.read_or_held().is_none(), "drained");
     }
 
     #[test]

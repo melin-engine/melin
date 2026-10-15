@@ -1402,7 +1402,11 @@ impl<A: Application> DpdkReplicationDriver<A> {
                         if batches_sent > 0 && bytes_this_tick >= MAX_REPL_BYTES_PER_TICK {
                             break;
                         }
-                        let Some((meta, data)) = slot.consumer.try_read() else {
+                        // The batch a previous tick read and found no room
+                        // for comes first: it is still held (see the
+                        // `break`s below), and reading past it would send
+                        // the replica a gap.
+                        let Some((meta, data)) = slot.consumer.read_or_held() else {
                             break;
                         };
                         let data_len = data.len();

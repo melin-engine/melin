@@ -381,6 +381,13 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Fixed
 
+- **A DPDK primary no longer skips a batch when a replica's socket is
+  full.** A streaming replica whose socket had no room for the next batch
+  left it read but unsent, and the next tick read past it: a release
+  build never sent that batch, leaving the replica a gap in its stream,
+  and a debug build panicked the primary's poll thread. The held batch
+  is now offered again first, through the new
+  `melin_journal::replication::ReplicationConsumer::read_or_held`.
 - **A DPDK node frees a client's slot when the client closes.** The
   client's FIN left the node's socket half-closed, which its stack still
   counts as active, so the connection and its slot were held until the
