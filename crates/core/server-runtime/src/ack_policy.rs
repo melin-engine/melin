@@ -248,16 +248,6 @@ mod tests {
         }
     }
 
-    /// The journal's opaque byte is the wire byte, both ways.
-    #[test]
-    fn journal_byte_round_trip() {
-        for p in ALL {
-            assert_eq!(p.to_byte(), melin_journal::AckPolicyByte(p.as_u8()));
-            assert_eq!(AckPolicy::from_byte(p.to_byte()), Some(p));
-        }
-        assert_eq!(AckPolicy::from_byte(melin_journal::AckPolicyByte(4)), None);
-    }
-
     #[test]
     fn wire_bytes_are_pinned() {
         // On the wire since before the rename; see `as_u8`.

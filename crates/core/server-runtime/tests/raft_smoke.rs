@@ -5,8 +5,6 @@
 //! this crate's `dpdk` feature; raft and the health endpoint are kernel
 //! TCP on every node, on the namespace's loopback under the runner.
 
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -17,18 +15,13 @@ use melin_server_runtime::server::ServerConfig;
 use melin_transport_core::test_ports::free_addr;
 use serial_test::serial;
 
+#[path = "common/probe.rs"]
+mod probe;
+use probe::http_metrics;
+
 /// Port range this file owns for `free_addr` (25000..30000);
 /// `raft_failover.rs` owns 20000..25000.
 const PORT_BASE: u16 = 25_000;
-
-fn http_metrics(addr: SocketAddr) -> Option<String> {
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(200)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
-    stream.write_all(b"GET /metrics HTTP/1.1\r\n\r\n").ok()?;
-    let mut body = String::new();
-    stream.read_to_string(&mut body).ok()?;
-    Some(body)
-}
 
 #[test]
 #[serial]

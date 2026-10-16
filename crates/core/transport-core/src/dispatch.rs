@@ -209,47 +209,29 @@ mod tests {
         observed
     }
 
+    /// Lineage metadata, and only it, reaches the lineage sink — and not
+    /// the application, whose state it leaves untouched.
     #[test]
-    fn epoch_bump_goes_to_the_lineage_sink_and_not_the_application() {
-        let mut app = TestApp::new();
-        assert_eq!(
-            lineage_of(&mut app, JournalEvent::EpochBump { epoch: 7 }),
-            Some(LineageEvent::Epoch(7))
-        );
-        assert_eq!(
-            app,
-            TestApp::new(),
-            "an epoch bump must not touch application state"
-        );
-    }
-
-    #[test]
-    fn ack_policy_change_goes_to_the_lineage_sink_and_not_the_application() {
-        let event = ack_policy_change(1, true);
-        let JournalEvent::AckPolicyChange(change) = event else {
+    fn only_lineage_metadata_reaches_the_lineage_sink() {
+        let policy_change = ack_policy_change(1, true);
+        let JournalEvent::AckPolicyChange(change) = policy_change else {
             unreachable!("the helper builds an ack-policy change")
         };
-        let mut app = TestApp::new();
-        assert_eq!(
-            lineage_of(&mut app, event),
-            Some(LineageEvent::AckPolicy(change))
-        );
-        assert_eq!(
-            app,
-            TestApp::new(),
-            "an ack-policy change must not touch application state"
-        );
-    }
-
-    /// Only lineage metadata reaches the sink.
-    #[test]
-    fn other_events_never_reach_the_lineage_sink() {
-        for event in [
-            JournalEvent::App(TestEvent::Add(1)),
-            JournalEvent::Tick { now_ns: 5 },
-            JournalEvent::Shutdown,
+        for (event, lineage) in [
+            (
+                JournalEvent::EpochBump { epoch: 7 },
+                Some(LineageEvent::Epoch(7)),
+            ),
+            (policy_change, Some(LineageEvent::AckPolicy(change))),
+            (JournalEvent::App(TestEvent::Add(1)), None),
+            (JournalEvent::Tick { now_ns: 5 }, None),
+            (JournalEvent::Shutdown, None),
         ] {
-            assert_eq!(lineage_of(&mut TestApp::new(), event), None, "{event:?}");
+            let mut app = TestApp::new();
+            assert_eq!(lineage_of(&mut app, event), lineage, "{event:?}");
+            if lineage.is_some() {
+                assert_eq!(app, TestApp::new(), "{event:?} touched application state");
+            }
         }
     }
 

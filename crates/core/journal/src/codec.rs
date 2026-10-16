@@ -1039,16 +1039,12 @@ mod tests {
         }
     }
 
-    /// The shared decoder's errors: a static reason for the journal's
-    /// error, and a description naming the tag or the app codec's own
-    /// error for the wire's.
+    /// An app codec's error is passed through whole: its static reason
+    /// for the journal's error, its description for the wire's. (The
+    /// transport branches' wording is pinned by the journal and wire
+    /// decode-error tests.)
     #[test]
-    fn event_decode_errors_describe_themselves() {
-        let unknown = decode_event::<TestEvent>(0x7f, &[]).unwrap_err();
-        assert_eq!(unknown, EventDecodeError::UnknownTag(0x7f));
-        assert_eq!(unknown.reason(), "unknown event tag");
-        assert_eq!(unknown.to_string(), "unknown event tag 0x7f");
-
+    fn an_app_decode_error_keeps_the_app_codecs_own() {
         let app = decode_event::<TestEvent>(TAG_APP, &[9]).unwrap_err();
         assert_eq!(app, EventDecodeError::App(CodecError::UnknownTag(9)));
         assert_eq!(app.reason(), "app codec: unknown event tag");
@@ -1056,28 +1052,23 @@ mod tests {
             app.to_string(),
             format!("app event decode failed: {}", CodecError::UnknownTag(9))
         );
-
-        let short = EventDecodeError::Malformed("Tick payload too short");
-        assert_eq!(short.reason(), "Tick payload too short");
-        assert_eq!(short.to_string(), "Tick payload too short");
     }
 
-    /// Every transport event is journaled; only an application query is
-    /// skipped. The journal stage's allocator and the matching stage's
-    /// wire-sequence shadow both decide through this predicate.
+    /// Every transport event is journaled: none is a query. The journal
+    /// stage's allocator and the matching stage's wire-sequence shadow
+    /// both decide through this predicate, which hands an application
+    /// event to the application's own.
     #[test]
-    fn only_an_application_query_is_a_query() {
+    fn no_transport_event_is_a_query() {
         for event in [
             JournalEvent::Tick { now_ns: 1 },
             JournalEvent::EpochBump { epoch: 1 },
             ack_policy_change(0, false),
             ack_policy_change(1, true),
             JournalEvent::Shutdown,
-            JournalEvent::App(TestEvent::Ping),
         ] {
             assert!(!event.is_query(), "{event:?}");
         }
-        assert!(JournalEvent::App(QueryEvent).is_query());
     }
 
     /// Only an ack-policy change carries one, witnessed or not, and as
@@ -1101,32 +1092,6 @@ mod tests {
             JournalEvent::App(TestEvent::Ping),
         ] {
             assert_eq!(other.ack_policy_change(), None, "{other:?}");
-        }
-    }
-
-    /// An application event that is a query, for
-    /// [`only_an_application_query_is_a_query`].
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    struct QueryEvent;
-
-    impl AppEvent for QueryEvent {
-        const MAX_ENCODED_SIZE: usize = 1;
-
-        fn encoded_size(&self) -> usize {
-            1
-        }
-
-        fn encode(&self, buf: &mut [u8]) -> usize {
-            buf[0] = 0;
-            1
-        }
-
-        fn decode(_buf: &[u8]) -> Result<Self, CodecError> {
-            Ok(QueryEvent)
-        }
-
-        fn is_query(&self) -> bool {
-            true
         }
     }
 

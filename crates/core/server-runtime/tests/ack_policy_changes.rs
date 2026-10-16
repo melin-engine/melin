@@ -195,10 +195,17 @@ impl Cluster {
     }
 }
 
+/// The reply to one increment: acked or refused.
+fn write_reply(conn: &mut Connection) -> u8 {
+    conn.request_one(&increment_request(1))
+        .expect("a reply to the write")[0]
+}
+
 /// A write answered on another thread, so the test can watch whether it
 /// is held.
 struct Pending {
-    reply: mpsc::Receiver<Vec<u8>>,
+    /// The reply's kind byte.
+    reply: mpsc::Receiver<u8>,
     thread: std::thread::JoinHandle<Connection>,
 }
 
@@ -206,12 +213,10 @@ impl Pending {
     fn send(mut conn: Connection) -> Self {
         let (tx, reply) = mpsc::channel();
         let thread = std::thread::spawn(move || {
-            let frame = conn
-                .request_one(&increment_request(1))
-                .expect("a reply to the write");
+            let kind = write_reply(&mut conn);
             // The receiver outlives the thread unless the test already
             // failed, and then there is no one to tell.
-            let _ = tx.send(frame);
+            let _ = tx.send(kind);
             conn
         });
         Pending { reply, thread }
@@ -225,11 +230,11 @@ impl Pending {
     /// The reply, which must come within the test's bound; the connection
     /// back.
     fn acked(self) -> Connection {
-        let frame = self
+        let kind = self
             .reply
             .recv_timeout(LIMIT)
             .expect("the write was never answered");
-        assert_eq!(frame[0], KIND_RESP_ACK, "the write is acked");
+        assert_eq!(kind, KIND_RESP_ACK, "the write is acked");
         self.thread.join().expect("the client thread panicked")
     }
 }
@@ -300,20 +305,15 @@ fn a_weakening_waits_for_the_replica_to_hold_the_change() {
     replica.ack_tracks(0, 3);
     let mut conn = pending.acked();
     wait_for_gauge(health, IN_FORCE, AckPolicy::Disk.as_u8().into());
-    let reply = conn
-        .request_one(&increment_request(1))
-        .expect("a reply to the write");
-    assert_eq!(reply[0], KIND_RESP_ACK, "acked on the disk alone");
+    assert_eq!(
+        write_reply(&mut conn),
+        KIND_RESP_ACK,
+        "acked on the disk alone"
+    );
 
     drop(conn);
     drop(replica);
     primary.stop();
-}
-
-/// The reply to one increment: acked or refused.
-fn write_reply(conn: &mut Connection) -> u8 {
-    conn.request_one(&increment_request(1))
-        .expect("a reply to the write")[0]
 }
 
 /// Halt-plan step 0, the manual-promotion playbook: a primary with no
@@ -481,10 +481,11 @@ fn a_restart_under_another_policy_journals_the_change_and_waits_for_a_replica() 
 
     // Under `disk` now: a write is acked without the replica.
     let mut conn = cluster.client(&primary);
-    let reply = conn
-        .request_one(&increment_request(1))
-        .expect("a reply to the write");
-    assert_eq!(reply[0], KIND_RESP_ACK, "acked on the disk alone");
+    assert_eq!(
+        write_reply(&mut conn),
+        KIND_RESP_ACK,
+        "acked on the disk alone"
+    );
 
     drop(conn);
     drop(replica);
@@ -506,10 +507,7 @@ fn a_standalone_restart_serves_under_the_configured_policy() {
     wait_for_gauge(health, JOURNALED, AckPolicy::Disk.as_u8().into());
 
     let mut conn = cluster.client(&primary);
-    let reply = conn
-        .request_one(&increment_request(1))
-        .expect("a reply to the write");
-    assert_eq!(reply[0], KIND_RESP_ACK);
+    assert_eq!(write_reply(&mut conn), KIND_RESP_ACK);
     drop(conn);
     primary.stop();
 

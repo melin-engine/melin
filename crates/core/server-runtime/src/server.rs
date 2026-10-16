@@ -5255,7 +5255,6 @@ mod primary_gate_policy_tests {
     use std::sync::atomic::AtomicU64;
 
     use counter_server::{Counter, CounterEvent};
-    use melin_journal::AckPolicyByte;
     use melin_pipeline::ring::DisruptorBuilder;
     use melin_pipeline::wait::WaitStrategy;
     use melin_transport_core::fence::FenceState;
@@ -5292,7 +5291,9 @@ mod primary_gate_policy_tests {
     }
 
     /// The lineage's policy wins over the requested one, seeds the
-    /// "journaled" gauge, and the gate reads the stage's forced cell.
+    /// "journaled" gauge, and the gate reads the stage's forced cell. The
+    /// rest of the resolution (no lineage policy, standalone, an unknown
+    /// byte) is `initial_gate_policy`'s, pinned in `durability_gate.rs`.
     #[test]
     fn the_lineage_policy_wins_and_seeds_the_journaled_gauge() {
         let stage = matching_stage();
@@ -5302,37 +5303,6 @@ mod primary_gate_policy_tests {
         assert_eq!(policy.initial, AckPolicy::TwoDisks);
         assert_eq!(stage.utilization().ack_policy_journaled.load(), lineage);
         assert_eq!(policy.forced.load(), None::<ForcedPolicy>);
-
-        let stage = matching_stage();
-        let policy =
-            primary_gate_policy(None, AckPolicy::Disk, true, &stage).expect("a known policy");
-        assert_eq!(policy.initial, AckPolicy::Disk, "no lineage policy");
-        assert_eq!(stage.utilization().ack_policy_journaled.load(), None);
-
-        // Standalone: the requested policy, the gauge still the lineage's.
-        let stage = matching_stage();
-        let policy =
-            primary_gate_policy(lineage, AckPolicy::Disk, false, &stage).expect("a known policy");
-        assert_eq!(policy.initial, AckPolicy::Disk);
-        assert_eq!(stage.utilization().ack_policy_journaled.load(), lineage);
-    }
-
-    /// An unknown lineage byte refuses the primary instead of serving
-    /// under a guess.
-    #[test]
-    fn an_unknown_policy_byte_refuses_the_primary() {
-        let stage = matching_stage();
-        for replication in [true, false] {
-            assert!(
-                primary_gate_policy(
-                    Some(AckPolicyByte(0xEE)),
-                    AckPolicy::Disk,
-                    replication,
-                    &stage
-                )
-                .is_err()
-            );
-        }
     }
 }
 

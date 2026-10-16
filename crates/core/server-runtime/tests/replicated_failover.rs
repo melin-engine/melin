@@ -66,7 +66,7 @@ use serial_test::serial;
 
 #[path = "common/probe.rs"]
 mod probe;
-use probe::{admin_command, wait_for_gauge};
+use probe::{admin_command, http_metrics, wait_for_gauge};
 
 /// Port range this file owns for `free_addr` (10000..15000);
 /// `melin-raft`'s election tests own 15000..20000, `raft_failover.rs`
@@ -195,15 +195,6 @@ fn serves_clients(addr: SocketAddr, patience: Duration) -> bool {
         return false;
     }
     matches!(read_frame(&mut stream), Ok(f) if f.first() == Some(&TAG_CHALLENGE))
-}
-
-fn http_metrics(addr: SocketAddr) -> Option<String> {
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(200)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
-    stream.write_all(b"GET /metrics HTTP/1.1\r\n\r\n").ok()?;
-    let mut body = String::new();
-    stream.read_to_string(&mut body).ok()?;
-    Some(body)
 }
 
 // ---------------------------------------------------------------------------

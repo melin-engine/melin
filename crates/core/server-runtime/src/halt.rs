@@ -434,10 +434,15 @@ mod tests {
 
     const HALTED: Verdict = Verdict::Refuse(RejectReason::ReplicaDisconnected);
 
+    /// Standalone never refuses, and journaling a change records nothing.
     #[test]
     fn standalone_never_refuses() {
         let gate = gate(None, Arc::new(FenceState::new(0)));
         assert_eq!(gate.verdict(), Verdict::Take);
+        for policy in [AckPolicy::Disk, AckPolicy::TwoDisks] {
+            journal(&gate, policy, Origin::Runtime);
+            assert_eq!(gate.verdict(), Verdict::Take);
+        }
     }
 
     #[test]
@@ -473,33 +478,17 @@ mod tests {
         gate.record_journaled(gate.decide(policy, origin));
     }
 
-    /// The entry a decision carries is the policy's byte, unwitnessed as
-    /// `is_unwitnessed` rules on the observation it was decided on.
+    /// The entry a decision carries is the policy's byte; standalone, it is
+    /// unwitnessed (nothing can witness it) but not forced, whatever the
+    /// policy and origin. The rule with replication on is
+    /// `policy_control`'s `the_forced_rule`, and the count it reads is
+    /// `a_decision_follows_the_replica_count`.
     #[test]
     fn a_decision_journals_its_policy_as_the_observation_rules() {
-        let replicas = test_support::presence(0);
-        let gate = gate(Some(Arc::clone(&replicas)), Arc::new(FenceState::new(0)));
-        for policy in [
-            AckPolicy::Disk,
-            AckPolicy::DiskAndRam,
-            AckPolicy::TwoDisks,
-            AckPolicy::Ram,
-        ] {
-            for origin in [Origin::Runtime, Origin::Staged] {
-                let decision = gate.decide(policy, origin);
-                assert_eq!(decision.policy(), policy);
-                assert_eq!(decision.change().policy, policy.to_byte());
-                let unwitnessed = is_unwitnessed(policy, origin, Witnesses::NoneConnected);
-                assert_eq!(decision.change().unwitnessed, unwitnessed);
-                assert_eq!(decision.is_forced(), unwitnessed, "{policy} {origin:?}");
-            }
-        }
-        replicas.lift();
-        let decision = gate.decide(AckPolicy::Disk, Origin::Runtime);
-        assert!(!decision.change().unwitnessed);
-        assert!(!decision.is_forced());
-        let standalone = self::gate(None, Arc::new(FenceState::new(0)));
+        let standalone = gate(None, Arc::new(FenceState::new(0)));
         let decision = standalone.decide(AckPolicy::Ram, Origin::Staged);
+        assert_eq!(decision.policy(), AckPolicy::Ram);
+        assert_eq!(decision.change().policy, AckPolicy::Ram.to_byte());
         assert!(decision.change().unwitnessed, "nothing can witness it");
         assert!(!decision.is_forced(), "unwitnessed for want of replication");
     }
@@ -522,6 +511,8 @@ mod tests {
             gate.decide(AckPolicy::Disk, Origin::Runtime).is_forced(),
             "still no witness: a later `disk` is forced too"
         );
+        journal(&gate, AckPolicy::Disk, Origin::Runtime);
+        assert_eq!(gate.verdict(), Verdict::Take, "re-sent, it stays lifted");
 
         replicas.lift();
         assert_eq!(gate.verdict(), Verdict::Take);
@@ -569,29 +560,6 @@ mod tests {
 
         journal(&gate, AckPolicy::Disk, Origin::Staged);
         assert_eq!(gate.verdict(), HALTED, "staged: never forced");
-    }
-
-    /// A forced `disk` re-sent keeps the halt lifted: only a policy that
-    /// needs a replica, or a connect, ends the override.
-    #[test]
-    fn a_repeated_forced_disk_keeps_the_halt_lifted() {
-        let gate = gate(
-            Some(test_support::presence(0)),
-            Arc::new(FenceState::new(0)),
-        );
-        journal(&gate, AckPolicy::Disk, Origin::Runtime);
-        journal(&gate, AckPolicy::Disk, Origin::Runtime);
-        assert_eq!(gate.verdict(), Verdict::Take);
-    }
-
-    /// Standalone never halts, and journaling records nothing.
-    #[test]
-    fn standalone_journals_without_an_override() {
-        let gate = gate(None, Arc::new(FenceState::new(0)));
-        for policy in [AckPolicy::Disk, AckPolicy::TwoDisks] {
-            journal(&gate, policy, Origin::Runtime);
-            assert_eq!(gate.verdict(), Verdict::Take);
-        }
     }
 
     /// The fence wins over the override: a superseded node closes.

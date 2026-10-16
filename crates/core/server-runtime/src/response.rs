@@ -4193,10 +4193,11 @@ mod tests {
         }
     }
 
-    /// A journaled policy change reaches the running stage as a slot: it
-    /// sends nothing, switches the policy for the slots after it, and a
-    /// forced change frees a reply the switched policy holds once its own
-    /// entry is on disk.
+    /// A journaled policy change reaches the running stage as a slot that
+    /// sends nothing, and a forced change frees a held reply only once its
+    /// own entry is on disk. The switch itself is pinned by the gate's
+    /// tests (`durability_gate.rs`), the in-force gauge by
+    /// `tests/ack_policy_changes.rs`.
     mod policy_change {
         use std::io::ErrorKind;
         use std::os::unix::io::AsRawFd;
@@ -4259,7 +4260,7 @@ mod tests {
         }
 
         #[test]
-        fn a_change_slot_switches_the_stage_and_a_forced_one_frees_it() {
+        fn a_change_slot_sends_nothing_and_a_forced_one_waits_for_its_entry() {
             let (mut producer, mut consumers) =
                 DisruptorBuilder::<OutputSlot<CounterReport, CounterQuery>>::new(64)
                     .add_consumer()
@@ -4301,8 +4302,9 @@ mod tests {
             thread::scope(|scope| {
                 let stage = scope.spawn(|| run::<Counter>(consumer, control_rx, config, &shutdown));
 
-                // The reply before the change goes out, and the change
-                // itself sends nothing.
+                // The reply before the change goes out; once the stage has
+                // taken the change, it has sent nothing for it (and the
+                // reply after it is held by `two-disks`).
                 let before = [read_frame(&mut client), read_frame(&mut client)];
                 let deadline = Instant::now() + SETTLE_TIMEOUT;
                 while utilization.ack_policy_in_force.load() != Some(AckPolicy::TwoDisks.to_byte())
@@ -4310,9 +4312,8 @@ mod tests {
                 {
                     thread::sleep(Duration::from_millis(1));
                 }
-                let switched = utilization.ack_policy_in_force.load();
                 thread::sleep(HOLD);
-                let held_by_the_new_policy = nothing_sent(&client);
+                let the_change_sent_nothing = nothing_sent(&client);
 
                 // A forced swap back to `disk`, not yet on disk itself.
                 forced_writer.store(ForcedPolicy {
@@ -4334,18 +4335,13 @@ mod tests {
                         [Seen::App(KIND_RESP_ACK), Seen::Protocol(TAG_BATCH_END)]
                     );
                 }
-                assert_eq!(switched, Some(AckPolicy::TwoDisks.to_byte()));
                 assert!(
-                    held_by_the_new_policy,
-                    "the slot after the change opened under disk"
+                    the_change_sent_nothing,
+                    "a frame went out for the change slot, or the reply it holds"
                 );
                 assert!(
                     held_until_the_entry_is_on_disk,
                     "the forced swap applied before its entry was on disk"
-                );
-                assert_eq!(
-                    utilization.ack_policy_in_force.load(),
-                    Some(AckPolicy::Disk.to_byte())
                 );
             });
         }

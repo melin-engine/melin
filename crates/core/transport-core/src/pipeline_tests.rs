@@ -516,60 +516,48 @@ fn change_payload(policy: u8, unwitnessed: bool) -> Option<melin_journal::AckPol
 /// the ring, stamped with the entry's wire sequence, even on connection
 /// 0, where a report-less event emits nothing: slot before, entry, slot
 /// after, in order. An unwitnessed change is also published to the
-/// forced cell, and the newest change is recorded as journaled.
+/// forced cell, and the newest change is recorded as journaled — in the
+/// run loop and the shutdown drain alike.
 #[test]
 fn matching_stage_emits_each_policy_change_at_its_slot() {
-    let run = run_matching_over(
-        TestApp::new(),
-        &[
-            (1, JournalEvent::App(TestEvent::Add(1)), 0),
-            (0, ack_policy_change(1, false), 0),
-            (1, JournalEvent::App(TestEvent::Add(2)), 0),
-            (0, ack_policy_change(0, true), 0),
-            (1, JournalEvent::App(TestEvent::Add(3)), 0),
-        ],
-        5,
-        false,
-    );
-    assert_eq!(
-        policy_slot_shape(&run.outputs),
-        vec![
-            (10, 1, true, None),
-            (11, 0, true, change_payload(1, false)),
-            (12, 1, true, None),
-            (13, 0, true, change_payload(0, true)),
-            (14, 1, true, None),
-        ]
-    );
-    assert_eq!(
-        run.forced,
-        Some(crate::lineage::ForcedPolicy {
-            wire_seq: 13,
-            policy: melin_journal::AckPolicyByte(0),
-        })
-    );
-    assert_eq!(run.journaled, Some(melin_journal::AckPolicyByte(0)));
-}
-
-/// The shutdown drain emits the change slot too, and a witnessed change
-/// leaves the forced cell empty.
-#[test]
-fn shutdown_drain_emits_the_policy_change_slot() {
-    let run = run_matching_over(
-        TestApp::new(),
-        &[
-            (0, ack_policy_change(2, false), 0),
-            (1, JournalEvent::App(TestEvent::Add(5)), 0),
-        ],
-        2,
-        true,
-    );
-    assert_eq!(
-        policy_slot_shape(&run.outputs),
-        vec![(10, 0, true, change_payload(2, false)), (11, 1, true, None)]
-    );
-    assert_eq!(run.forced, None);
-    assert_eq!(run.journaled, Some(melin_journal::AckPolicyByte(2)));
+    for on_shutdown in [false, true] {
+        let run = run_matching_over(
+            TestApp::new(),
+            &[
+                (1, JournalEvent::App(TestEvent::Add(1)), 0),
+                (0, ack_policy_change(1, false), 0),
+                (1, JournalEvent::App(TestEvent::Add(2)), 0),
+                (0, ack_policy_change(0, true), 0),
+                (1, JournalEvent::App(TestEvent::Add(3)), 0),
+            ],
+            5,
+            on_shutdown,
+        );
+        assert_eq!(
+            policy_slot_shape(&run.outputs),
+            vec![
+                (10, 1, true, None),
+                (11, 0, true, change_payload(1, false)),
+                (12, 1, true, None),
+                (13, 0, true, change_payload(0, true)),
+                (14, 1, true, None),
+            ],
+            "on_shutdown = {on_shutdown}"
+        );
+        assert_eq!(
+            run.forced,
+            Some(crate::lineage::ForcedPolicy {
+                wire_seq: 13,
+                policy: melin_journal::AckPolicyByte(0),
+            }),
+            "on_shutdown = {on_shutdown}"
+        );
+        assert_eq!(
+            run.journaled,
+            Some(melin_journal::AckPolicyByte(0)),
+            "on_shutdown = {on_shutdown}"
+        );
+    }
 }
 
 /// [`TestApp`] whose clock step reports, so a policy change can carry
@@ -615,7 +603,7 @@ impl melin_app::Application for TickReportingApp {
 
 /// The reports a change's clock step produces come first, and only the
 /// change slot closes the event — in the run loop and the shutdown drain
-/// alike.
+/// alike. The change is witnessed, so it leaves the forced cell empty.
 #[test]
 fn a_policy_change_closes_the_reports_its_clock_step_produced() {
     for on_shutdown in [false, true] {
@@ -637,6 +625,8 @@ fn a_policy_change_closes_the_reports_its_clock_step_produced() {
             run.outputs[0].payload,
             OutputPayload::Report(TestReport { total_after: 7 })
         ));
+        assert_eq!(run.forced, None, "on_shutdown = {on_shutdown}");
+        assert_eq!(run.journaled, Some(melin_journal::AckPolicyByte(3)));
     }
 }
 
@@ -4660,23 +4650,17 @@ fn a_repeated_request_reaches_apply_on_live_replay_and_shadow() {
 
     // The real shadow stage over the same slots, compared through the
     // snapshot it writes — the state recovery would restore.
-    let (shadow, _) = shadow_snapshot_of(dir.path(), &slots);
+    let (shadow, _) = shadow_snapshot_from(dir.path(), Lineage::GENESIS, &slots);
     assert_eq!(
         shadow, live,
         "the shadow's snapshot must apply every submission as live did"
     );
 }
 
-/// Run the real shadow stage, from a genesis lineage, over `slots` and
-/// return the application state and lineage of the snapshot it writes.
-#[cfg(not(feature = "no-persist"))]
-fn shadow_snapshot_of(dir: &std::path::Path, slots: &[TestInput]) -> (TestApp, Lineage) {
-    shadow_snapshot_from(dir, Lineage::GENESIS, slots)
-}
-
-/// [`shadow_snapshot_of`] from the lineage `initial`. The fsync pair
-/// claims every slot, so the only snapshot it can write is the one taken
-/// after consuming them all.
+/// Run the real shadow stage, from the lineage `initial`, over `slots`
+/// and return the application state and lineage of the snapshot it
+/// writes. The fsync pair claims every slot, so the only snapshot it can
+/// write is the one taken after consuming them all.
 #[cfg(not(feature = "no-persist"))]
 fn shadow_snapshot_from(
     dir: &std::path::Path,
@@ -4726,13 +4710,16 @@ fn shadow_snapshot_from(
 
 /// The shadow starts from the lineage it is given — what the live
 /// pipeline recovered, which its ring never carries — and records it in
-/// its snapshots until a journaled change replaces it.
+/// its snapshots until a lineage event replaces it. Lineage metadata goes
+/// to its lineage sink, never to the application: an epoch bump advances
+/// the epoch its snapshot records, an ack-policy change the policy, and
+/// neither touches the state.
 #[cfg(not(feature = "no-persist"))]
 #[test]
 fn the_shadow_records_its_initial_lineage_until_a_change() {
     let dir = tempfile::tempdir().unwrap();
     let initial = Lineage {
-        epoch: 4,
+        epoch: 2,
         ack_policy: Some(AckPolicyByte(1)),
     };
     let (_, lineage) = shadow_snapshot_from(dir.path(), initial, &[add_slot(5, 1)]);
@@ -4742,48 +4729,23 @@ fn the_shadow_records_its_initial_lineage_until_a_change() {
     let slots = [
         add_slot(5, 1),
         InputSlot {
-            event: ack_policy_change(0, false),
-            ..add_slot(0, 1)
-        },
-    ];
-    let (_, lineage) = shadow_snapshot_from(dir.path(), initial, &slots);
-    assert_eq!(
-        lineage,
-        Lineage {
-            epoch: 4,
-            ack_policy: Some(AckPolicyByte(0)),
-        },
-        "a journaled weakening replaces the seeded policy"
-    );
-}
-
-/// The shadow hands lineage metadata to its lineage sink, never to the
-/// application: an epoch bump advances the epoch its snapshot records, an
-/// ack-policy change the policy, and neither touches the state.
-#[cfg(not(feature = "no-persist"))]
-#[test]
-fn the_shadow_keeps_lineage_metadata_out_of_application_state() {
-    let dir = tempfile::tempdir().unwrap();
-    let slots = [
-        add_slot(5, 1),
-        InputSlot {
             event: JournalEvent::EpochBump { epoch: 3 },
             ..add_slot(0, 1)
         },
         InputSlot {
-            event: ack_policy_change(1, true),
+            event: ack_policy_change(0, true),
             ..add_slot(0, 1)
         },
         add_slot(7, 1),
     ];
-    let (shadow, lineage) = shadow_snapshot_of(dir.path(), &slots);
+    let (shadow, lineage) = shadow_snapshot_from(dir.path(), initial, &slots);
     assert_eq!(
         lineage,
         Lineage {
             epoch: 3,
-            ack_policy: Some(AckPolicyByte(1)),
+            ack_policy: Some(AckPolicyByte(0)),
         },
-        "both lineage events reached the shadow's lineage"
+        "both lineage events replaced the seed"
     );
     assert_eq!(
         shadow.total, 12,

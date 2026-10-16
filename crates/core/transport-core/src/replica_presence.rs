@@ -167,28 +167,8 @@ mod tests {
         assert_eq!(presence.observe(), Observed::NoneConnected(NoneSince(2)));
     }
 
-    #[test]
-    fn an_override_lifts_the_halt_until_cleared() {
-        let presence = ReplicaPresence::new();
-        presence.latch_override(none_since(&presence));
-        assert!(!presence.halted());
-        presence.clear_override();
-        assert!(presence.halted());
-    }
-
-    /// A connect voids the override, so the next departure halts again.
-    #[test]
-    fn a_connect_voids_the_override() {
-        let presence = ReplicaPresence::new();
-        presence.latch_override(none_since(&presence));
-        presence.lift();
-        assert!(!presence.halted());
-        presence.lower();
-        assert!(
-            presence.halted(),
-            "the override did not outlive the connect"
-        );
-    }
+    // Latching, clearing and a connect voiding the override are pinned
+    // through the halt gate, in `melin-server-runtime`'s `halt.rs` tests.
 
     /// The race the generation exists for: a replica connects between the
     /// observation and the latch. The latch lands after the connect and

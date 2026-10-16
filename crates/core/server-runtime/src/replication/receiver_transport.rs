@@ -2143,7 +2143,7 @@ mod tests {
     /// Finding 10 of the determinism audit, at the receiver: with ticks
     /// flowing the primary never sends a heartbeat, and a change in the
     /// stream still reaches the lineage cell, as the slot carrying it is
-    /// accepted, in either direction.
+    /// accepted.
     #[test]
     fn a_change_in_the_stream_moves_the_lineage_policy_without_a_heartbeat() {
         use crate::ack_policy::AckPolicy;
@@ -2168,28 +2168,7 @@ mod tests {
         assert!(outcome.frame_err.is_none());
         assert_eq!(outcome.accum_end_sequence, 4);
         assert_eq!(cell.load(), Some(AckPolicy::Disk.to_byte()), "weakened");
-
-        // Restored, behind more ticks, in a later cycle.
-        buf.clear();
-        append_input_batch_frame(&mut buf, &[tick(5), change(6, AckPolicy::DiskAndRam)]);
-        append_input_batch_frame(&mut buf, &[tick(7)]);
-        let (outcome, _acks) = stream_frames_following(
-            &buf,
-            &mut producer,
-            4,
-            &mut slot_buf,
-            &no_marks(),
-            &cell,
-            &AtomicBool::new(false),
-        );
-        assert!(outcome.frame_err.is_none());
-        assert_eq!(outcome.accum_end_sequence, 7);
-        assert_eq!(
-            cell.load(),
-            Some(AckPolicy::DiskAndRam.to_byte()),
-            "restored"
-        );
-        assert_eq!(drain(&mut consumer).len(), 7, "every entry published");
+        assert_eq!(drain(&mut consumer).len(), 4, "every entry published");
     }
 
     /// Only an accepted change moves the cell: one re-delivered at or

@@ -703,9 +703,8 @@ mod tests {
 
     /// An attached producer journals each request, in order, duplicates
     /// included, and the requester returns once the entry is on the ring.
-    /// The forced decision is the producer's, at publish time, and so is
-    /// the halt it lifts (the forced `disk`) and restores (`two-disks`
-    /// with no replica): the requester is answered after both.
+    /// The forced decision is the producer's, at publish time. (The halt a
+    /// forced swap lifts is the gate's: `halt.rs`.)
     #[test]
     fn an_attached_producer_journals_every_request() {
         let control = AckPolicyControl::new(AckPolicy::DiskAndRam);
@@ -713,7 +712,6 @@ mod tests {
         let replicas = presence(1);
         let halt = gate_over(Some(Arc::clone(&replicas)));
         let mut publisher = control.claim().attach(&mut producer, &halt, None);
-        let halted = Verdict::Refuse(melin_app::RejectReason::ReplicaDisconnected);
         let mut journal = |policy| {
             let outcome =
                 request_while_polling(&control, &mut publisher, &mut producer, policy, &halt);
@@ -723,15 +721,8 @@ mod tests {
         journal(AckPolicy::Disk);
         journal(AckPolicy::Disk);
         assert!(replicas.lower());
-        assert_eq!(halt.verdict(), halted, "witnessed swaps lift nothing");
         journal(AckPolicy::Disk);
-        assert_eq!(
-            halt.verdict(),
-            Verdict::Take,
-            "the forced swap lifts the halt"
-        );
         journal(AckPolicy::TwoDisks);
-        assert_eq!(halt.verdict(), halted, "two-disks restores it");
         assert_eq!(
             changes(&mut consumer),
             [

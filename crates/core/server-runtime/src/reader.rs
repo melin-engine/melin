@@ -1712,15 +1712,25 @@ mod tests {
     }
 
     /// A reader parked with nothing to do (no connection, no tick) is
-    /// woken by an `ACK-POLICY` request and journals it: the request
-    /// returns published, and the entry is on the ring, unwitnessed under
-    /// a gate with replication disabled.
+    /// woken by an `ACK-POLICY` request and journals it. Halt-plan step 0
+    /// through the reader: on a halted primary the operator's `disk` is
+    /// journaled forced, and the halt is lifted before the request returns
+    /// published, so the reader takes the next write. Once stopped, the
+    /// reader is detached.
     #[test]
     fn a_parked_reader_journals_an_ack_policy_request() {
         use crate::ack_policy::AckPolicy;
+        use crate::halt::Verdict;
+        use crate::halt::test_support::{gate_over, presence};
         use crate::policy_control::RequestOutcome;
 
-        let (handle, mut consumer, control) = spawn_parked_reader(gate(None, false), None);
+        let replicas = presence(0);
+        let halt = || gate_over(Some(Arc::clone(&replicas)));
+        assert_eq!(
+            halt().verdict(),
+            Verdict::Refuse(RejectReason::ReplicaDisconnected)
+        );
+        let (handle, mut consumer, control) = spawn_parked_reader(halt(), None);
         assert_eq!(control.request(AckPolicy::Disk), RequestOutcome::Published);
         let (_, slot) = consumer.try_consume().expect("the entry is on the ring");
         assert_eq!(
@@ -1730,6 +1740,7 @@ mod tests {
                 unwitnessed: true,
             })
         );
+        assert_eq!(halt().verdict(), Verdict::Take);
         handle.shutdown();
         handle.join();
         assert_eq!(
@@ -1811,37 +1822,6 @@ mod tests {
         .expect("the reader starts");
         std::thread::sleep(Duration::from_millis(50));
         (handle, consumer, control)
-    }
-
-    /// Halt-plan step 0 through the reader: a halted primary's reader
-    /// journals the operator's `disk` as forced and lifts the halt before
-    /// the request is answered, so the reader takes the next write.
-    #[test]
-    fn a_forced_swap_through_the_reader_lifts_the_halt() {
-        use crate::ack_policy::AckPolicy;
-        use crate::halt::Verdict;
-        use crate::halt::test_support::{gate_over, presence};
-        use crate::policy_control::RequestOutcome;
-
-        let replicas = presence(0);
-        let halt = || gate_over(Some(Arc::clone(&replicas)));
-        assert_eq!(
-            halt().verdict(),
-            Verdict::Refuse(RejectReason::ReplicaDisconnected)
-        );
-        let (handle, mut consumer, control) = spawn_parked_reader(halt(), None);
-        assert_eq!(control.request(AckPolicy::Disk), RequestOutcome::Published);
-        let (_, slot) = consumer.try_consume().expect("the entry is on the ring");
-        assert_eq!(
-            slot.event,
-            JournalEvent::AckPolicyChange(melin_journal::AckPolicyChange {
-                policy: AckPolicy::Disk.to_byte(),
-                unwitnessed: true,
-            })
-        );
-        assert_eq!(halt().verdict(), Verdict::Take);
-        handle.shutdown();
-        handle.join();
     }
 
     /// A refusal queue whose idle bound is never consulted by these tests.

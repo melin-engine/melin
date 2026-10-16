@@ -796,23 +796,6 @@ mod tests {
         );
     }
 
-    /// An unknown policy byte switches nothing: no re-seed, the cached
-    /// position kept.
-    #[test]
-    fn an_unknown_byte_keeps_the_prior_policy_untouched() {
-        let mut g = gate(AckPolicy::DiskAndRam, 5);
-        let_time_pass();
-        g.apply_change(1, AckPolicyByte(CORRUPT), "test");
-        assert_eq!(g.active_policy, AckPolicy::DiskAndRam);
-        assert_eq!(g.policy, AckPolicy::DiskAndRam.to_policy());
-        assert_eq!(degraded_nanos(&g), 0, "no re-seed on an unknown byte");
-
-        let mut g = gate(AckPolicy::Disk, 5);
-        g.apply_change(1, AckPolicyByte(CORRUPT), "test");
-        assert_eq!(g.active_policy, AckPolicy::Disk);
-        assert_eq!(g.cached_durable_pos, 5, "cached position kept");
-    }
-
     /// The lineage's policy wins over the requested one while replication
     /// is on; a lineage with none takes the requested one; with
     /// replication disabled the requested one wins (the standalone rule);
@@ -883,31 +866,6 @@ mod tests {
         assert_eq!(attributions(&g), (0, 0));
     }
 
-    /// The remediating forced `ACK-POLICY disk` reaches a gate already
-    /// wedged: the wait switches to it (its entry being on disk), flushes
-    /// the degraded time, and opens.
-    #[test]
-    fn a_forced_change_during_the_wait_unwedges_the_gate() {
-        let (mut g, mut forced) = build(AckPolicy::DiskAndRam, 5, None, None);
-        let_time_pass();
-        forced.store(ForcedPolicy {
-            wire_seq: 4,
-            policy: AckPolicy::Disk.to_byte(),
-        });
-        let shutdown = AtomicBool::new(false);
-        assert!(matches!(wait(&mut g, 3, &shutdown), GateOutcome::Open));
-        assert_eq!(g.active_policy, AckPolicy::Disk);
-        // Not a mutation guard for "the mid-wait switch keeps the cached
-        // position": the evaluation on the same pass overwrites it, so a
-        // reset there is unobservable from outside the wait.
-        assert_eq!(g.cached_durable_pos, 5);
-        assert_eq!(attributions(&g), (1, 0));
-        assert!(
-            degraded_nanos(&g) > 0,
-            "the re-seed flushes the wedged interval"
-        );
-    }
-
     /// A change takes effect at its slot: the slot before it is gated
     /// under the old policy, the slot after it under the new one, and the
     /// health gauge follows.
@@ -953,9 +911,10 @@ mod tests {
     }
 
     /// A forced swap frees a slot stuck ahead of it, but only once its own
-    /// entry is on this node's disk; later in-order changes at or below
-    /// it — its own slot included — are stale and ignored, and a change
-    /// after it applies again.
+    /// entry is on this node's disk; the wedged interval counts as
+    /// degraded, and the opened slot is attributed once, to the journal. Later
+    /// in-order changes at or below it — its own slot included — are stale
+    /// and ignored, and a change after it applies again.
     #[test]
     fn a_forced_swap_frees_an_earlier_stuck_slot_once_its_entry_is_on_disk() {
         // No replica connected: `disk+ram` cannot open at all.
@@ -969,6 +928,15 @@ mod tests {
         assert_held_until(&mut g, &reply(3), || journal.store(WireSeq::new(6)));
         assert_eq!(g.active_policy, AckPolicy::Disk);
         assert_eq!(in_force(&g), Some(AckPolicy::Disk));
+        // Some degraded time is on record across the forced unwedge. The
+        // switch's re-seed flushes the interval since construction too, so
+        // this does not tell the wait's own ticks from that flush
+        // (`a_switch_resets_the_cached_position_and_reseeds_the_logger`).
+        assert!(
+            degraded_nanos(&g) > 0,
+            "degraded time accrued during the wedge"
+        );
+        assert_eq!(attributions(&g), (1, 0), "opened on the journal, once");
 
         let cached = g.cached_durable_pos;
         admit_now(&mut g, &change(5, AckPolicy::TwoDisks, false));
@@ -999,23 +967,34 @@ mod tests {
     }
 
     /// A change naming a policy this build does not know keeps the prior
-    /// policy, in order and forced alike.
+    /// policy untouched, in order and forced alike: no switch, so no
+    /// re-seed and the cached durable position kept.
     #[test]
     fn an_unknown_policy_in_a_change_keeps_the_prior_policy() {
-        let (mut g, mut forced) = build(AckPolicy::Disk, 10, None, None);
+        let (mut g, mut forced) = build(AckPolicy::Disk, 4, None, None);
+        let journal = g.inputs.journal_persisted_wire_seq.clone();
         admit_now(&mut g, &change_byte(4, AckPolicyByte(CORRUPT), false));
         assert_eq!(g.active_policy, AckPolicy::Disk);
+        assert_eq!(g.policy, AckPolicy::Disk.to_policy());
+        assert_eq!(in_force(&g), Some(AckPolicy::Disk));
+        assert_eq!(g.cached_durable_pos, 4, "no switch: cached position kept");
+
+        // The next slot waits; once the forced entry is on disk the wait
+        // reads it, keeps the prior policy, and opens.
         forced.store(ForcedPolicy {
             wire_seq: 6,
             policy: AckPolicyByte(CORRUPT),
         });
-        // The journal is past the forced entry: the wait reads it and
-        // keeps the prior policy, then opens.
-        g.cached_durable_pos = 0;
-        let shutdown = AtomicBool::new(false);
-        assert!(matches!(wait(&mut g, 5, &shutdown), GateOutcome::Open));
+        assert_held_until(&mut g, &reply(5), || journal.store(WireSeq::new(6)));
         assert_eq!(g.active_policy, AckPolicy::Disk);
         assert_eq!(g.applied_through, 6, "the forced entry is consumed once");
+
+        // A re-seed would flush the degraded time accrued under `disk+ram`.
+        let mut g = gate(AckPolicy::DiskAndRam, 5);
+        let_time_pass();
+        g.apply_change(1, AckPolicyByte(CORRUPT), "test");
+        assert_eq!(g.active_policy, AckPolicy::DiskAndRam);
+        assert_eq!(degraded_nanos(&g), 0, "no re-seed on an unknown byte");
     }
 
     /// The flush hook runs only for a slot that has to wait.

@@ -42,7 +42,7 @@ use serial_test::serial;
 
 #[path = "common/probe.rs"]
 mod probe;
-use probe::{admin_command, gauge, wait_for_gauge};
+use probe::{admin_command, gauge, http_metrics, wait_for_gauge};
 
 /// Port range this file owns for `free_addr` (20000..25000);
 /// `raft_smoke.rs` owns 25000..30000, `melin-raft`'s election tests
@@ -63,16 +63,6 @@ const TICK_MS: u64 = 5;
 /// past the link-down grace, an election and a promotion, which a replica
 /// judging by a stale `disk+ram` would have completed.
 const NO_PROMOTION_WATCH: Duration = Duration::from_secs(12);
-
-fn http_metrics(addr: SocketAddr) -> Option<String> {
-    use std::io::Write;
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(200)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
-    stream.write_all(b"GET /metrics HTTP/1.1\r\n\r\n").ok()?;
-    let mut body = String::new();
-    stream.read_to_string(&mut body).ok()?;
-    Some(body)
-}
 
 /// Whether a client connect to `addr` is answered with the auth
 /// Challenge — the definitive "this node serves as primary" signal (a

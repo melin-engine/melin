@@ -1947,8 +1947,9 @@ mod tests {
 
     /// Replica recovery adopts the recovered lineage: the epoch as a
     /// maximum, the ack policy stored whole over whatever the cell held —
-    /// the newest journaled change, or nothing when the journal holds
-    /// none, or when there is no lineage at all.
+    /// the journaled change (a lower byte than the cell's: stored, not a
+    /// maximum), or nothing when the journal holds none, or when there is
+    /// no lineage at all.
     #[test]
     fn replica_recovery_stores_the_lineage_policy_whole() {
         use melin_journal::{AckPolicyByte, AckPolicyChange, JournalEvent};
@@ -1987,17 +1988,14 @@ mod tests {
         recover(&cell);
         assert_eq!(cell.load(), None);
 
-        // A strengthening then a weakening: the newest wins, not the
-        // highest byte.
-        let change = |policy| {
-            JournalEvent::AckPolicyChange(AckPolicyChange {
-                policy: AckPolicyByte(policy),
-                unwitnessed: false,
-            })
-        };
-        append(&mut w, change(1));
         append(&mut w, JournalEvent::EpochBump { epoch: 4 });
-        append(&mut w, change(0));
+        append(
+            &mut w,
+            JournalEvent::AckPolicyChange(AckPolicyChange {
+                policy: AckPolicyByte(0),
+                unwitnessed: false,
+            }),
+        );
         drop(w);
         cell.store(stale);
         recover(&cell);

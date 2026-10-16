@@ -19,15 +19,22 @@ use melin_client::{Connection, SigningKey};
 /// with a message.
 pub const GAUGE_LIMIT: Duration = Duration::from_secs(60);
 
-/// The value of one Prometheus gauge on a node's health endpoint, or `None`
-/// while the endpoint is not up, or the gauge is omitted.
-pub fn gauge(health: SocketAddr, name: &str) -> Option<u64> {
+/// The whole `/metrics` response of a node's health endpoint, or `None`
+/// while the endpoint is not up.
+pub fn http_metrics(health: SocketAddr) -> Option<String> {
     let mut stream = TcpStream::connect_timeout(&health, Duration::from_millis(200)).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
     stream.write_all(b"GET /metrics HTTP/1.1\r\n\r\n").ok()?;
     let mut body = String::new();
     stream.read_to_string(&mut body).ok()?;
-    body.lines()
+    Some(body)
+}
+
+/// The value of one Prometheus gauge on a node's health endpoint, or `None`
+/// while the endpoint is not up, or the gauge is omitted.
+pub fn gauge(health: SocketAddr, name: &str) -> Option<u64> {
+    http_metrics(health)?
+        .lines()
         .find_map(|line| line.strip_prefix(name)?.trim().parse().ok())
 }
 

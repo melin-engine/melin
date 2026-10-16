@@ -1361,24 +1361,10 @@ mod tests {
         assert!(unready.contains("recovery"), "{unready}");
     }
 
+    /// That the lineage's policy wins over the local one is
+    /// `auto_promotion_judges_by_the_lineage_policy_not_the_nodes_own`.
     #[test]
-    fn effective_ack_policy_prefers_the_lineage_policy() {
-        // The lineage's policy wins over the local fallback, in either
-        // direction.
-        assert_eq!(
-            effective_ack_policy(
-                Some(AckPolicy::Disk.to_byte()),
-                AckPolicy::DiskAndRam.as_u8()
-            ),
-            Some(AckPolicy::Disk)
-        );
-        assert_eq!(
-            effective_ack_policy(
-                Some(AckPolicy::DiskAndRam.to_byte()),
-                AckPolicy::Disk.as_u8()
-            ),
-            Some(AckPolicy::DiskAndRam)
-        );
+    fn effective_ack_policy_falls_back_and_refuses_garbage() {
         // A lineage holding no change falls back to this node's own policy.
         assert_eq!(
             effective_ack_policy(None, AckPolicy::DiskAndRam.as_u8()),

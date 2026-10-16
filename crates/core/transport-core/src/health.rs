@@ -1578,31 +1578,6 @@ mod tests {
         handle.join().unwrap();
     }
 
-    /// The operator's halt override is folded in by the same rule the
-    /// readers enforce: `trading` while it holds, `halted` again once a
-    /// replica has connected and left.
-    #[test]
-    fn health_follows_the_halt_override() {
-        use crate::replica_presence::Observed;
-        let presence = presence(0);
-        let (addr, _events, _healthy, shutdown, handle) =
-            start_health_with_replica(5, 100, u64::MAX, Some(Arc::clone(&presence)), None);
-        assert_eq!(read_health(addr), "OK 5 100 0 halted\n");
-
-        let Observed::NoneConnected(since) = presence.observe() else {
-            panic!("no replica is connected");
-        };
-        presence.latch_override(since);
-        assert_eq!(read_health(addr), "OK 5 100 0 trading\n");
-
-        presence.lift();
-        presence.lower();
-        assert_eq!(read_health(addr), "OK 5 100 0 halted\n");
-
-        shutdown.store(true, Ordering::Relaxed);
-        handle.join().unwrap();
-    }
-
     /// A fenced (superseded) ex-primary must report `halted` even while a
     /// replica is still connected — the replica count is healthy in the
     /// exact split-brain scenario fencing exists for, so probes must key

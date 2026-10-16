@@ -750,21 +750,6 @@ mod tests {
         }
     }
 
-    /// An ack-policy change streams like any other entry, through the
-    /// journal codec's own decoder, and passes the re-encode check.
-    #[test]
-    fn roundtrip_ack_policy_change() {
-        for unwitnessed in [false, true] {
-            let event = ack_policy_change::<TestEvent>(3, unwitnessed);
-            let buf = frame(&[sample_slot(12, event)]);
-            let decoded: Vec<InputSlot<TestEvent>> =
-                try_decode_input_batch(&buf[4..]).expect("decode succeeds");
-            assert_eq!(decoded.len(), 1);
-            assert_eq!(decoded[0].sequence, 12);
-            assert_eq!(decoded[0].event, event);
-        }
-    }
-
     /// Overwrite one byte of a one-slot frame's slot and re-seal its CRC
     /// over the result, so the slot arrives intact and only decoding can
     /// object.

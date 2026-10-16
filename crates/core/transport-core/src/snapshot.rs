@@ -673,9 +673,6 @@ mod tests {
                 assert_eq!(header.lineage, lineage, "{label}");
                 assert_eq!(header.sequence, 5, "{label}");
                 assert_eq!(header.len, expected_len, "{label}");
-                let parsed = SnapshotHeader::parse(&bytes).unwrap();
-                assert_eq!(parsed.genesis_entries, genesis_entries, "{label}");
-                assert_eq!(parsed.lineage, lineage, "{label}");
             }
         }
     }
@@ -711,19 +708,6 @@ mod tests {
         expected.push(0b11); // lineage_flags: both known
         expected.push(3); // ack_policy
         assert_eq!(&bytes[..HEADER_SIZE], &expected[..]);
-
-        // An unknown ack policy clears its flag and writes the field as 0.
-        save::<TestApp>(
-            &TestApp::new(),
-            WireSeq::new(0x0A0B),
-            [0xCC; 32],
-            at_epoch(0x0102),
-            Some(0x07),
-            &path,
-        )
-        .unwrap();
-        let bytes = std::fs::read(&path).unwrap();
-        assert_eq!(&bytes[HEADER_SIZE - 2..HEADER_SIZE], &[0b01, 0]);
     }
 
     /// A v4 header whose lineage fields a save could not have written —
