@@ -1353,6 +1353,96 @@ fn replica_quorum_always_starts_disengaged() {
     }
 }
 
+/// The event publisher's consumer on the output ring is chained behind the
+/// response stage's: it reads a slot only once the response stage has
+/// committed it, which the response stage does only after the slot has
+/// cleared the durability gate. Gated on the producer, as it was, the
+/// publisher broadcast reports before they held the copies the ack policy
+/// demands (finding 9 of `docs/internal/determinism-audit-2026-09.md`).
+///
+/// The real stages run; the test plays the response stage and the
+/// publisher on the two consumers. Without the publisher, the ring has the
+/// response stage's consumer alone.
+#[test]
+fn event_publisher_reads_only_what_the_response_stage_committed() {
+    let dir = tempfile::tempdir().unwrap();
+    let build = |name: &str, enable_event_publisher: bool| {
+        build_pipeline_with_replication(
+            TestApp::new(),
+            Writer::create(&dir.path().join(name)).unwrap(),
+            Duration::ZERO,
+            Arc::new(AtomicU64::new(0)),
+            false,
+            MAX_JOURNAL_BATCH,
+            REPLICATION_RING_CAPACITY,
+            StageWaits::uniform(WaitStrategy::SpinThenYield),
+            enable_event_publisher,
+            false,
+            Arc::new(crate::fence::FenceState::new(0)),
+        )
+    };
+
+    let without = build("without_publisher.journal", false);
+    assert_eq!(
+        without.output_consumers.len(),
+        1,
+        "no publisher, no consumer of its own"
+    );
+    drop(without);
+
+    let mut out = build("with_publisher.journal", true);
+    assert_eq!(out.output_consumers.len(), 2);
+    let mut publisher = out.output_consumers.pop().unwrap();
+    let mut response = out.output_consumers.pop().unwrap();
+    let mut input_producer = out.input_producer;
+    let journal_stage = out.journal_stage;
+    let matching_stage = out.matching_stage;
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let s1 = Arc::clone(&shutdown);
+    let s2 = Arc::clone(&shutdown);
+    let t_journal = std::thread::spawn(move || journal_stage.run(&s1));
+    let t_matching = std::thread::spawn(move || matching_stage.run(&s2));
+
+    input_producer.publish(add_slot(5, 0));
+    input_producer.publish(add_slot(7, 0));
+
+    // The response stage reads both events' slots...
+    let mut read: Vec<u64> = Vec::new();
+    let (mut spins, start) = (0u32, std::time::Instant::now());
+    while read.len() < 2 {
+        read.extend(response.read_contiguous(16).iter().map(|s| s.wire_seq));
+        if read.len() < 2 {
+            drain_backoff(&mut spins, start, "waiting for the response stage's slots");
+        }
+    }
+    assert_eq!(read, [1, 2], "one slot per event, in wire order");
+
+    // ...but has not committed them (it would be waiting on their gates),
+    // so the publisher, with the slots on the ring, reads none of them.
+    assert!(
+        publisher.read_contiguous(16).is_empty(),
+        "the publisher read a slot the response stage had not released"
+    );
+
+    // Released: the publisher sees exactly what the response stage did.
+    response.commit();
+    let mut published: Vec<u64> = Vec::new();
+    let (mut spins, start) = (0u32, std::time::Instant::now());
+    while published.len() < read.len() {
+        published.extend(publisher.read_contiguous(16).iter().map(|s| s.wire_seq));
+        if published.len() < read.len() {
+            drain_backoff(&mut spins, start, "waiting for the publisher's slots");
+        }
+    }
+    publisher.commit();
+    assert_eq!(published, read);
+
+    shutdown.store(true, Ordering::Relaxed);
+    let _writer = t_journal.join().unwrap();
+    let _app = t_matching.join().unwrap();
+}
+
 /// High-volume soak: a large multi-batch run through the journal stage
 /// must produce a journal whose user sequences are dense — no gaps, no
 /// duplicates — when scanned back. (Historically this guarded against

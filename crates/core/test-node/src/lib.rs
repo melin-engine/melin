@@ -396,7 +396,7 @@ where
 {
     #[cfg(not(feature = "dpdk"))]
     {
-        kernel::start::<A>(None, config, startup, sizing, decoder, encoder)
+        kernel::start::<A>(None, config, startup, sizing, decoder, encoder, None)
     }
     #[cfg(feature = "dpdk")]
     {
@@ -432,12 +432,48 @@ where
 {
     #[cfg(not(feature = "dpdk"))]
     {
-        kernel::start::<A>(Some(addrs), config, startup, sizing, decoder, encoder)
+        kernel::start::<A>(Some(addrs), config, startup, sizing, decoder, encoder, None)
     }
     #[cfg(feature = "dpdk")]
     {
         dpdk::start::<A>(addrs, config, startup, sizing, decoder, encoder)
     }
+}
+
+/// [`start_at`], with the application's event publisher, as a binary that
+/// has one hands it to the runtime: it runs when `config.event_bind` is
+/// set, which the test sets as it would any other field.
+///
+/// Kernel TCP only: a DPDK node never runs the event publisher (see "DPDK
+/// never runs the event publisher" in
+/// `docs/internal/transport-divergences-2026-10.md`), so there is nothing
+/// for a test of it to start there.
+#[cfg(not(feature = "dpdk"))]
+pub fn start_at_with_publisher<A>(
+    addrs: &Addrs,
+    config: ServerConfig,
+    startup: StartupEvents<A::Event>,
+    sizing: A::Sizing,
+    decoder: impl RequestDecoder<Event = A::Event> + 'static,
+    encoder: impl ResponseEncoder<Report = A::Report, Query = A::QueryResponse> + 'static,
+    publisher: melin_server_runtime::server::EventPublisherFn<A>,
+) -> Node
+where
+    A: Application + Send + 'static,
+    A::Event: Send + Sync + 'static,
+    A::Report: Send + 'static,
+    A::QueryResponse: Send + 'static,
+    A::Sizing: Send + 'static,
+{
+    kernel::start::<A>(
+        Some(addrs),
+        config,
+        startup,
+        sizing,
+        decoder,
+        encoder,
+        Some(publisher),
+    )
 }
 
 #[cfg(not(feature = "dpdk"))]
@@ -451,7 +487,7 @@ mod kernel {
     use melin_app::decoder::RequestDecoder;
     use melin_app::encoder::ResponseEncoder;
     use melin_server_runtime::StartupEvents;
-    use melin_server_runtime::server::{self, ServerConfig};
+    use melin_server_runtime::server::{self, EventPublisherFn, ServerConfig};
     use melin_wire_protocol::tcp::BlockingTcpListener;
 
     use super::{Addrs, Node};
@@ -463,6 +499,7 @@ mod kernel {
         sizing: A::Sizing,
         decoder: impl RequestDecoder<Event = A::Event> + 'static,
         encoder: impl ResponseEncoder<Report = A::Report, Query = A::QueryResponse> + 'static,
+        publisher: Option<EventPublisherFn<A>>,
     ) -> Node
     where
         A: Application + Send + 'static,
@@ -485,7 +522,7 @@ mod kernel {
         let sd = Arc::clone(&shutdown);
         let thread = std::thread::spawn(move || -> Result<(), String> {
             server::run_with_listener::<A>(
-                listener, config, startup, sizing, decoder, encoder, None, sd,
+                listener, config, startup, sizing, decoder, encoder, publisher, sd,
             )
             .map_err(|e| e.to_string())
         });

@@ -483,6 +483,19 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   join is now logged on both transports (`replica caught up, streaming
   live`), and the handoff's journal passes, which were logged as further
   catch-ups, are logged at debug as what they are.
+- **The event publisher no longer broadcasts reports before they are
+  durable.** It read each report as soon as the application produced it,
+  before the journal's fsync and before any replica held the event, so a
+  crash or a failover in that window could take back a trade its
+  subscribers had already seen. It now reads behind the response stage
+  and sees an event only once the event holds the copies the ack policy
+  demands, as the client's reply does: the feed trails the replies, and
+  stalls with them while the policy cannot be met. The publisher's
+  signature is unchanged. Publishers should stamp their frames with the
+  slot's wire sequence (`OutputSlot::wire_seq`), the event's journal
+  sequence, which survives restarts and failovers, rather than their
+  position in the output ring, which restarts at every boot. Finding 9 of
+  the September determinism audit.
 
 ## [0.19.0] - 2026-10-10
 

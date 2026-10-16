@@ -489,6 +489,11 @@ pub fn run<A: Application>(
 
         // Borrowed slots are dead here — hand the batch back to the
         // producer now that every one of them has cleared its gate.
+        //
+        // Invariant the event publisher depends on: this consumer's
+        // progress never passes a slot that has not cleared the gate
+        // (the publisher is chained behind it, so this commit releases
+        // events to it). See the same commit in `response::run`.
         consumer.commit();
 
         // Log degradation transitions / re-emit the reminder — after
