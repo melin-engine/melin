@@ -189,12 +189,10 @@ pub(crate) struct Listeners {
     /// lands at or above it is closed again, so no connection is ever
     /// handed out on a handle beyond the transport's per-connection
     /// tables. The set itself grows past it rather than refusing a socket.
+    /// Whether a slot below it is free is looked up when a socket is to be
+    /// opened ([`free_slot_below`]), never remembered: nothing has to tell
+    /// the backlog when a connection's socket leaves the set.
     slot_cap: usize,
-    /// Whether the last socket opened landed beyond `slot_cap`: no slot
-    /// below it was free. Until one is freed ([`Self::slot_freed`]) no
-    /// backlog is topped up, rather than allocating a socket's buffers on
-    /// every poll only to drop them.
-    full: bool,
 }
 
 impl Listeners {
@@ -203,7 +201,6 @@ impl Listeners {
         Self {
             ports: Vec::with_capacity(MAX_PORTS),
             slot_cap,
-            full: false,
         }
     }
 
@@ -249,8 +246,9 @@ impl Listeners {
             depth,
             pending: Vec::with_capacity(depth),
         };
-        self.full = !place(sockets, self.slot_cap, &mut port, first);
-        if port.pending.is_empty() {
+        if free_slot_below(sockets, self.slot_cap) {
+            port.pending.push(sockets.add(first));
+        } else {
             tracing::warn!(
                 port = config.port,
                 "DPDK: socket set full, port listens once a connection closes"
@@ -259,12 +257,6 @@ impl Listeners {
         self.ports.push(port);
         self.top_up(sockets);
         Ok(())
-    }
-
-    /// Note that a slot of the socket set was freed (a connection closed),
-    /// so a backlog a full set left short can be topped up again.
-    pub(crate) fn slot_freed(&mut self) {
-        self.full = false;
     }
 
     /// Hand every connection whose handshake has completed to `on_accept`,
@@ -307,7 +299,6 @@ impl Listeners {
                         "DPDK: stale listener handle, removing from the backlog"
                     );
                     port.pending.remove(i);
-                    self.full = false;
                     continue;
                 };
                 let remote = match socket.state() {
@@ -328,7 +319,6 @@ impl Listeners {
                     // that fresh socket (see `forget_tcp_socket`).
                     sockets.remove(handle);
                     iface.forget_tcp_socket(handle);
-                    self.full = false;
                     continue;
                 };
                 socket.set_timeout(None);
@@ -354,15 +344,19 @@ impl Listeners {
         loop {
             let mut opened = false;
             for port in &mut self.ports {
-                if self.full {
-                    return;
-                }
                 if port.pending.len() >= port.depth {
                     continue;
                 }
+                // Looked up before the socket's buffers are allocated, so
+                // that a full set costs no allocation on every poll.
+                if !free_slot_below(sockets, self.slot_cap) {
+                    return;
+                }
                 match port.config.listening_socket() {
                     Ok(socket) => {
-                        self.full = !place(sockets, self.slot_cap, port, socket);
+                        // Takes the slot just found: `add` fills the lowest
+                        // free one.
+                        port.pending.push(sockets.add(socket));
                         opened = true;
                     }
                     // The port was listened on once, so this cannot fail;
@@ -388,22 +382,23 @@ impl Listeners {
     }
 }
 
-/// Add `socket` to the set as one of `port`'s, unless it lands at or
-/// beyond `slot_cap`: then it is dropped again. Whether it was kept.
-fn place(
-    sockets: &mut SocketSet<'static>,
-    slot_cap: usize,
-    port: &mut PortBacklog,
-    socket: tcp::Socket<'static>,
-) -> bool {
-    let handle = sockets.add(socket);
-    if handle.index() < slot_cap {
-        port.pending.push(handle);
-        true
-    } else {
-        sockets.remove(handle);
-        false
-    }
+/// Whether the set has a free slot below `slot_cap`, where the next socket
+/// added would land (`add` fills the lowest free slot).
+///
+/// Found by adding a socket with no buffers, which allocates nothing, and
+/// taking it out again: the set keeps no count of its free slots, and its
+/// `add` scans for the first one anyway, so this is the cost of the add it
+/// precedes. Looked up every time rather than remembered, so that no
+/// removal from the set, the transport's or this module's, has to report
+/// a freed slot.
+fn free_slot_below(sockets: &mut SocketSet<'static>, slot_cap: usize) -> bool {
+    let probe = sockets.add(tcp::Socket::new(
+        tcp::SocketBuffer::new(Vec::new()),
+        tcp::SocketBuffer::new(Vec::new()),
+    ));
+    let free = probe.index() < slot_cap;
+    sockets.remove(probe);
+    free
 }
 
 #[cfg(test)]
@@ -761,9 +756,9 @@ mod tests {
         net.poll_node();
         assert_eq!(net.listeners.pending(PORT), 0);
 
+        // A slot freed with nothing told: the next poll finds it.
         let (closed, _, _) = net.accepted.remove(0);
         net.node_sockets.remove(closed);
-        net.listeners.slot_freed();
         net.poll_node();
         assert_eq!(net.listeners.pending(PORT), 1);
         net.connect(PORT);
@@ -787,7 +782,6 @@ mod tests {
 
         let (on_port, _, _) = net.accepted.remove(0);
         net.node_sockets.remove(on_port);
-        net.listeners.slot_freed();
         net.poll_node();
         assert_eq!(net.listeners.pending(OTHER_PORT), 1);
         net.connect(OTHER_PORT);

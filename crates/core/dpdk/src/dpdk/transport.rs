@@ -1166,7 +1166,6 @@ impl DpdkTransport {
             // connection is unindexed for its whole life and each of its
             // segments costs a linear scan over all sockets.
             self.iface.forget_tcp_socket(handle);
-            self.listeners.slot_freed();
         } else {
             tracing::warn!(
                 handle = ?handle,
@@ -1206,9 +1205,7 @@ impl DpdkTransport {
             self.cached_timestamp,
             DpdkDevice::flush_tx,
         );
-        if removed {
-            self.listeners.slot_freed();
-        } else {
+        if !removed {
             tracing::warn!(
                 handle = ?handle,
                 site = "reset",
