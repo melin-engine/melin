@@ -422,34 +422,6 @@ fn logged(text: &str) -> bool {
     String::from_utf8_lossy(&log).contains(text)
 }
 
-/// A node stopped when the test ends, however it ends. A test that panics
-/// with its node running would leave the node's threads in the process,
-/// and under `cargo test` the next test here reads every thread of the
-/// process (see [`serial`]).
-struct StopOnDrop(Option<Node>);
-
-impl StopOnDrop {
-    fn node(&self) -> &Node {
-        self.0.as_ref().expect("held until dropped")
-    }
-}
-
-impl Drop for StopOnDrop {
-    fn drop(&mut self) {
-        let Some(node) = self.0.take() else {
-            return;
-        };
-        if std::thread::panicking() {
-            // Dropped result: the test is already failing, with its own
-            // message; the node is stopped for the next test's sake, and a
-            // second panic here would abort the process instead.
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| node.stop()));
-        } else {
-            node.stop();
-        }
-    }
-}
-
 /// A primary warns about a replica that takes entries in but persists
 /// none, and says when it persists again.
 ///
@@ -490,7 +462,7 @@ fn a_replica_that_takes_entries_but_persists_none_is_reported() {
         health_bind: Some(health),
         ..node_config(tmp.path(), "primary", &keys.primary, &keys_file)
     };
-    let primary = StopOnDrop(Some(start_at(&primary_addrs, config)));
+    let primary = start_at(&primary_addrs, config);
 
     // Up, so its replication endpoint is listening.
     wait_for_gauge(health, "melin_replicas_connected", 0);
@@ -498,8 +470,8 @@ fn a_replica_that_takes_entries_but_persists_none_is_reported() {
     wait_for_gauge(health, "melin_replicas_connected", 1);
 
     let deadline = Instant::now() + LIMIT;
-    let mut client = Connection::connect_by(primary.node().addr(), &keys.client, deadline)
-        .expect("client connects");
+    let mut client =
+        Connection::connect_by(primary.addr(), &keys.client, deadline).expect("client connects");
     // The test's own bound, as in the placement test: a CI runner's disk
     // sets the pace of a `disk` ack.
     client
@@ -537,5 +509,5 @@ fn a_replica_that_takes_entries_but_persists_none_is_reported() {
 
     drop(client);
     drop(replica);
-    drop(primary);
+    primary.stop();
 }
