@@ -75,6 +75,13 @@ pub use args::{DpdkArgs, DpdkArgsError};
 mod nic;
 #[cfg(feature = "dpdk-sys")]
 pub use nic::dial_addr;
+// Which listening socket a SYN finds, and when a port's backlog hands a
+// connection out and refills, is TCP-stack logic, tested over an in-memory
+// wire on any host; the transport that accepts through it is in the gated
+// `dpdk` module, and is its only caller, so it is compiled for that and for
+// the tests.
+#[cfg(any(test, feature = "dpdk-sys"))]
+mod listen_backlog;
 #[cfg(test)]
 mod test_wire;
 

@@ -113,6 +113,47 @@ veth_test!(
     }
 );
 
+/// Clients that connect at once in [`clients_connecting_at_once_are_all_established`]:
+/// the four the bench rehearsal that found the refusal dialed, within the
+/// client port's backlog of listening sockets.
+const CLIENTS_AT_ONCE: usize = 4;
+
+veth_test!(
+    /// Clients connecting at once, every SYN sent before the first
+    /// handshake completes, as clients reconnecting after a failover do:
+    /// the node establishes every connection, where a port with one
+    /// listening socket answered all but the first with a reset. Connected
+    /// only: with `max_connections` at one, the node closes each of them
+    /// once it has accepted it, which this does not look at.
+    clients_connecting_at_once_are_all_established,
+    |node| {
+        // The node answering, and both ends' neighbours known, before the
+        // clients start: so that their SYNs go out together.
+        let (first, _) = connect_for_challenge(node);
+        let start = std::sync::Barrier::new(CLIENTS_AT_ONCE);
+        let connected: Vec<io::Result<TcpStream>> = std::thread::scope(|s| {
+            let clients: Vec<_> = (0..CLIENTS_AT_ONCE)
+                .map(|_| {
+                    s.spawn(|| {
+                        start.wait();
+                        TcpStream::connect_timeout(&node, FRAME_LIMIT)
+                    })
+                })
+                .collect();
+            clients
+                .into_iter()
+                .map(|client| client.join().expect("a client thread"))
+                .collect()
+        });
+        for (i, attempt) in connected.iter().enumerate() {
+            if let Err(e) = attempt {
+                panic!("client {i} of {CLIENTS_AT_ONCE} connecting at once: {e}");
+            }
+        }
+        drop(first);
+    }
+);
+
 veth_test!(
     /// One attempt per connection. A second ChallengeResponse after a
     /// failed one is not read, even one that would pass: no second

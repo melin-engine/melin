@@ -115,7 +115,8 @@ scripts against them (the proxy's crate documentation says so).
   the time expected connections in the order it dialed them. Every DPDK
   client inherits the constraint until the node keeps a backlog of
   listeners; it is a kernel-versus-DPDK divergence missing from
-  `transport-divergences-2026-10.md`.
+  `transport-divergences-2026-10.md`. (Since fixed: the node now keeps a
+  backlog of listening sockets per port, `listen_backlog`.)
 - **The proxy's transport seam is already the right shape.** Its
   `Transport` trait is non-blocking send, a service step, and receive into
   a caller's buffer, generic rather than dynamic so there is no indirection
@@ -259,7 +260,7 @@ with an RST (see "What the code shows"), so a second dial in flight would
 be refused, not queued. A stream is established and handed back before
 the next is dialed. The constraint lifts when the node keeps a backlog of
 listeners; until then the handle enforces it, and its documentation says
-why.
+why. (The node has since gained that backlog; see "What the code shows".)
 
 A stream is reset when it is dropped or closed, whatever its state, so the
 node frees the connection's slot promptly. Aborting a smoltcp socket only

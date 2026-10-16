@@ -223,7 +223,8 @@ pub(crate) enum DialProgress {
     /// The connection is established.
     Established,
     /// The peer answered with a reset: nothing listens there, or a DPDK
-    /// node is in another client's handshake (see `NicHandle`).
+    /// node has more handshakes under way on the port than its backlog
+    /// takes (see `NicHandle`).
     Refused,
 }
 
@@ -992,7 +993,7 @@ mod tests {
     }
 
     /// No listener: the server's stack answers the SYN with an RST, as a
-    /// DPDK node does a SYN during another client's handshake.
+    /// DPDK node does a SYN beyond its port's backlog.
     #[test]
     fn a_dial_to_no_listener_is_refused() {
         let mut link = Link::new(false, 4096);

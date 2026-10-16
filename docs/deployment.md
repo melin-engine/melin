@@ -44,3 +44,19 @@ one above: raise the limit for the node's service, or grant
 `CAP_IPC_LOCK`, which exempts the rings from the limit as well
 (`--no-mlock` changes neither). Short of that, lower `--max-connections`
 to the clients the node actually serves.
+
+## A trusted network for DPDK
+
+On DPDK a node runs its own TCP stack, which lacks the kernel's defence
+against a flood of connection attempts (SYN cookies). Each port keeps a
+few sockets ready for incoming connections, and an attempt holds one from
+its first packet until its handshake completes or, if the peer never
+answers, for 5 seconds. A host that keeps sending connection attempts and
+never completes them, a few a second, can hold every one of them, and the
+port refuses legitimate clients and replicas for as long as it does.
+Client authentication does not help: it starts after the handshake.
+
+So give a DPDK node's client and replication ports a network that only
+trusted hosts can reach: a dedicated VLAN or private subnet, or a firewall
+in front of the node that drops traffic from anywhere else. A node on
+kernel TCP has the kernel's defences and does not need this.
