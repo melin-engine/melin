@@ -17,7 +17,7 @@ use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Add
 use crate::config::{NicConfig, SOCKET_RX_BUF_SIZE, SocketBuffers};
 use crate::device::DpdkDevice;
 use crate::eal::Eal;
-use crate::listen_backlog::{ListenerConfig, Listeners, tune_socket};
+use crate::listen_backlog::{ListenerConfig, Listeners, MAX_LISTENING_SOCKETS, tune_socket};
 use crate::mempool::Mempool;
 use crate::peer_liveness::{self, PeerLiveness, StackClock};
 use crate::port::{ChecksumOffloads, Port};
@@ -29,6 +29,10 @@ pub use crate::config::DpdkConfig;
 /// Maximum concurrent TCP connections. Exposed so callers can pre-size
 /// per-connection state vectors that parallel the smoltcp socket set.
 pub const MAX_CONNECTIONS: usize = 1024;
+
+// Every port's listening sockets share the socket set with its
+// connections: whatever they take leaves most of it to connections.
+const _: () = assert!(MAX_LISTENING_SOCKETS * 8 <= MAX_CONNECTIONS);
 
 /// Retain callback for zero-copy RX segments. Called by smoltcp when it
 /// stores a segment in the zero-copy array. Bumps the mbuf refcount so

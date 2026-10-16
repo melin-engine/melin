@@ -84,6 +84,22 @@ const MIN_LISTEN_BACKLOG: usize = 2;
 /// sockets, down to [`MIN_LISTEN_BACKLOG`].
 const LISTEN_BACKLOG_BUFFER_BUDGET: usize = 1024 * 1024;
 
+// `listen_backlog` clamps between the two, which panics if they cross, and
+// a backlog below two refuses the SYN behind every handshake.
+const _: () = assert!(2 <= MIN_LISTEN_BACKLOG && MIN_LISTEN_BACKLOG <= MAX_LISTEN_BACKLOG);
+
+/// The most ports a transport listens on: clients and replication. Every
+/// port's backlog takes slots of the socket set its connections need, so
+/// the transport bounds what they take (`MAX_PORTS * MAX_LISTEN_BACKLOG`)
+/// against its connection count, and [`Listeners::add`] refuses a port
+/// beyond this.
+pub(crate) const MAX_PORTS: usize = 2;
+
+/// The most listening sockets a transport holds, every port's backlog full.
+/// For the transport's bound, so compiled with it.
+#[cfg(feature = "dpdk-sys")]
+pub(crate) const MAX_LISTENING_SOCKETS: usize = MAX_PORTS * MAX_LISTEN_BACKLOG;
+
 /// How long a listening socket waits in its handshake for the peer before
 /// it gives up, closes, and is replaced by a fresh one.
 ///
@@ -166,8 +182,8 @@ struct PortBacklog {
 
 /// Every port a transport listens on, each with its backlog.
 pub(crate) struct Listeners {
-    /// A `Vec`: a transport listens on one or two ports, scanned in full
-    /// every poll.
+    /// A `Vec`: a transport listens on [`MAX_PORTS`] ports at most,
+    /// scanned in full every poll.
     ports: Vec<PortBacklog>,
     /// Slots of the socket set a socket may take: a listening socket that
     /// lands at or above it is closed again, so no connection is ever
@@ -185,7 +201,7 @@ impl Listeners {
     /// No port listened on, sockets placed below `slot_cap`.
     pub(crate) fn new(slot_cap: usize) -> Self {
         Self {
-            ports: Vec::new(),
+            ports: Vec::with_capacity(MAX_PORTS),
             slot_cap,
             full: false,
         }
@@ -196,7 +212,8 @@ impl Listeners {
     ///
     /// # Errors
     ///
-    /// The stack refused to listen on the port (port zero).
+    /// The stack refused to listen on the port (port zero), or the
+    /// transport already listens on [`MAX_PORTS`] ports.
     pub(crate) fn add(
         &mut self,
         sockets: &mut SocketSet<'static>,
@@ -216,6 +233,12 @@ impl Listeners {
         config: ListenerConfig,
         depth: usize,
     ) -> Result<(), String> {
+        if self.ports.len() >= MAX_PORTS {
+            return Err(format!(
+                "TCP listen on port {}: the transport already listens on {MAX_PORTS} ports",
+                config.port
+            ));
+        }
         // Refused here, before the port is recorded, rather than on every
         // top-up after.
         let first = config
@@ -831,6 +854,24 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("TCP listen on port 0 failed"), "{err}");
         assert_eq!(net.listeners.ports.len(), 1);
+    }
+
+    /// A port beyond [`MAX_PORTS`] is refused, before any socket of it is
+    /// opened: the bound on what the backlogs take holds.
+    #[test]
+    fn a_port_beyond_the_most_a_transport_listens_on_is_refused() {
+        let mut net = Net::new(1, usize::MAX);
+        net.listeners
+            .add(&mut net.node_sockets, config(OTHER_PORT))
+            .expect("a second port");
+        let sockets_before = net.node_sockets.iter().count();
+        let err = net
+            .listeners
+            .add(&mut net.node_sockets, config(OTHER_PORT + 1))
+            .unwrap_err();
+        assert!(err.contains("already listens on 2 ports"), "{err}");
+        assert_eq!(net.listeners.ports.len(), MAX_PORTS);
+        assert_eq!(net.node_sockets.iter().count(), sockets_before);
     }
 
     /// Client-sized buffers get the whole backlog; buffers too large for
