@@ -16,9 +16,10 @@ The server uses a 3-stage pipeline plus a single reader thread, modeled after th
                   |                           |         | (multi-consumer)
   Startup events -+                           |         v
   (primary start)                             |  +--> Response Stage --> Clients
-                                              |  |
-                                              |  +--> Event Publisher --> Subscribers
-                                              |       (optional, --event-bind)
+                                              |         |
+                                              |         +--> Event Publisher --> Subscribers
+                                              |              (optional, --event-bind;
+                                              |               trails the replies)
                                               +----> Shadow Stage --> Snapshots
                                                      (gated on journal)
 ```
@@ -30,7 +31,7 @@ The server uses a 3-stage pipeline plus a single reader thread, modeled after th
 3. **Journal stage** -- batch-encodes events and writes them durably to disk via `pwrite` + `fdatasync`. Advances its cursor only after the write is durable.
 4. **Matching stage** -- applies each event to the application (the `matching` thread in `--cores`) and publishes the reports it produces to an output disruptor ring. Runs in parallel with the journal stage (does not wait for fsync).
 5. **Response stage** -- consumes from the output ring but gates on the journal cursor before sending responses to clients, enforcing the persist-before-ack invariant.
-6. **Event publisher** (optional) -- second consumer on the output ring, running a feed the application's binary supplies (a market-data broadcast, an audit stream) when `--event-bind` is set. An application that supplies none has no publisher.
+6. **Event publisher** (optional) -- second consumer on the output ring, running a feed the application's binary supplies (a market-data broadcast, an audit stream) when `--event-bind` is set. An application that supplies none has no publisher. It reads behind the response stage, so it sees an event only once the event holds the copies the ack policy demands, the same guarantee a client's reply carries: the feed trails the replies. While the policy cannot be met (the replicas it needs are gone), the feed stalls with the replies. A feed should stamp what it publishes with the event's journal sequence number, and subscribers should key on it to resume or deduplicate: it is the same on every node and survives restarts and failovers, where a count of the messages sent starts over at every restart.
 7. **Shadow stage** -- third consumer on the input ring, gated on the journal cursor. Periodically snapshots its own copy of the application on a dedicated thread, without pausing the matching stage. On by default; `--snapshot-interval-ms 0` disables it.
 
 **Why this design**: Single-threaded business logic (the matching stage) eliminates locks on the hot path. Parallelizing journal I/O with the application hides fsync latency. The persist-before-ack boundary is enforced at the response stage, not in the matching stage, so the application never stalls waiting for disk.
@@ -276,7 +277,7 @@ A query never reaches the journal; the matching stage hands it to the applicatio
 
 ### Parallelism with journal
 
-The matching stage does **not** wait for the journal stage. Both consumers are gated only on the producer, so matching proceeds as soon as events are published. The persist-before-ack check is deferred to the response stage. This means the matching stage may process events that are not yet durable -- but no client will see those results until the journal confirms durability.
+The matching stage does **not** wait for the journal stage. Both consumers are gated only on the producer, so matching proceeds as soon as events are published. The persist-before-ack check is deferred to the response stage. This means the matching stage may process events that are not yet durable -- but no client will see those results until the journal confirms durability, and neither will the event publisher's subscribers: the publisher reads behind the response stage.
 
 It also means the matching stage cannot refuse an event: by the time it sees one, the journal stage may already have recorded it, and replay would apply what was refused. A node that halts because it cannot honour its ack policy (see [replication.md](replication.md)) therefore refuses client writes at ingress, before they are published, and the matching stage applies everything it is given.
 
@@ -367,7 +368,7 @@ The output SPSC queue connects the matching stage to the response stage. Defined
 
 **Capacity**: `OUTPUT_RING_CAPACITY = 1 << 20` (1,048,576 slots). Matches the input ring size because one input event can produce several reports, followed by a `BatchEnd`.
 
-**Multi-consumer**: When `--event-bind` is set, the output ring has two consumers: (1) the response stage (per-client, gated on durability cursors), and (2) the event publisher (TCP broadcast to subscribers). Both consumers run in parallel. The producer is gated on the slowest consumer.
+**Multi-consumer**: When `--event-bind` is set, the output ring has two consumers: (1) the response stage (per-client, gated on durability cursors), and (2) the event publisher (TCP broadcast to subscribers), chained behind the response stage: it reads an event only after the response stage has released its replies, so it never publishes what the ack policy has not confirmed. The producer is gated on the publisher, which is never ahead of the response stage, so a slow subscriber feed backpressures the matching stage just as a slow response stage does.
 
 **`OutputSlot` layout**:
 

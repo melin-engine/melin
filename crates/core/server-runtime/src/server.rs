@@ -94,6 +94,12 @@ type OutputSlot<A> =
 /// failovers, so a subscriber can key on it to resume or deduplicate. The
 /// consumer's own position in the output ring is not: it restarts at
 /// every boot.
+///
+/// The consumer also yields the ack-policy changes the journal records
+/// ([`OutputPayload::AckPolicyChange`](melin_transport_core::pipeline::OutputPayload::AckPolicyChange)),
+/// at their place in the order. They carry no application output: skip
+/// them, or publish them to subscribers that audit the cluster's
+/// durability.
 pub type EventPublisherFn<A> = fn(
     consumer: Consumer<OutputSlot<A>>,
     bind_addr: SocketAddr,
