@@ -576,6 +576,10 @@ fn a_joiner_that_stops_reading_mid_handoff_holds_up_nothing() {
             "the joiner's catch-up ended while it was reading nothing: the history no longer \
              exceeds what the primary queues for a replica (JOIN_HISTORY_WIRE_BYTES)"
         );
+        // The test's own client is served throughout, and kept from
+        // idling: on a slow runner the flood outlasts the node's idle
+        // timeout, which would close the client before the checks below.
+        assert_acked(&mut conn, "while clients write the handoff's backlog");
         std::thread::sleep(Duration::from_millis(100));
     }
     flood.stop();
@@ -672,13 +676,18 @@ const SPARED_MARGIN: Duration = Duration::from_secs(2);
 /// promptly, with the joiner of
 /// `a_joiner_that_stops_reading_mid_handoff_holds_up_nothing` connected,
 /// and still catching up, throughout.
+///
+/// Checks once even when `until` has already passed, as it has when a slow
+/// runner spent the window on the step before: the joiner still connected
+/// past it is what the window was for, and a check that ran no round
+/// would pass on nothing.
 fn serve_sparing_the_joiner(
     conn: &mut Connection,
     primary_health: SocketAddr,
     until: Instant,
     when: &str,
 ) {
-    while Instant::now() < until {
+    loop {
         assert_eq!(
             gauge(primary_health, "melin_replicas_connected"),
             Some(2),
@@ -696,6 +705,9 @@ fn serve_sparing_the_joiner(
             "a request took {:?} {when}",
             asked.elapsed()
         );
+        if Instant::now() >= until {
+            return;
+        }
         std::thread::sleep(Duration::from_millis(200));
     }
 }
