@@ -15,8 +15,7 @@
 //! The tests share one process's threads and its log, so they run one at a
 //! time (see [`serial`]).
 
-use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::io::{self, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
@@ -36,6 +35,10 @@ use melin_transport_core::test_ports::free_addr;
 #[path = "common/raw_replica.rs"]
 mod raw_replica;
 use raw_replica::RawReplica;
+
+#[path = "common/probe.rs"]
+mod probe;
+use probe::{gauge, wait_for_gauge};
 
 /// Port range for `free_addr`, shared with the other cluster tests: every
 /// other range below the ephemeral floor is taken. Sharing is safe only
@@ -143,30 +146,6 @@ fn node_config(dir: &Path, name: &str, key: &SigningKey, keys_file: &Path) -> Se
         journal_staging_mode: JournalStagingMode::Allocate,
         replication_key: Some(key_path),
         ..melin_test_node::config()
-    }
-}
-
-/// The value of one Prometheus gauge on a node's health endpoint, or `None`
-/// while the endpoint is not up.
-fn gauge(health: SocketAddr, name: &str) -> Option<u64> {
-    let mut stream = TcpStream::connect_timeout(&health, Duration::from_millis(200)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
-    stream.write_all(b"GET /metrics HTTP/1.1\r\n\r\n").ok()?;
-    let mut body = String::new();
-    stream.read_to_string(&mut body).ok()?;
-    body.lines()
-        .find_map(|line| line.strip_prefix(name)?.trim().parse().ok())
-}
-
-fn wait_for_gauge(health: SocketAddr, name: &str, value: u64) {
-    let deadline = Instant::now() + LIMIT;
-    while gauge(health, name) != Some(value) {
-        assert!(
-            Instant::now() < deadline,
-            "{name} never reached {value} (last: {:?})",
-            gauge(health, name)
-        );
-        std::thread::sleep(Duration::from_millis(100));
     }
 }
 

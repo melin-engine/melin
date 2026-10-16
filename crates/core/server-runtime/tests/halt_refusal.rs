@@ -20,8 +20,6 @@
 //! `scripts/dpdk/netns-runner.sh` (see
 //! `docs/internal/dpdk-testing.md`).
 
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -37,6 +35,10 @@ use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
 use melin_test_node::{Addrs, Node};
 use melin_transport_core::test_ports::free_addr;
+
+#[path = "common/probe.rs"]
+mod probe;
+use probe::wait_for_gauge;
 
 /// Port range for `free_addr`, shared with `replicated_failover.rs`: every
 /// other range below the ephemeral floor is taken. Sharing is safe only
@@ -59,30 +61,6 @@ fn spawn_node(addrs: &Addrs, config: ServerConfig) -> Node {
         RequestDecoder,
         ResponseEncoder,
     )
-}
-
-/// The value of one Prometheus gauge on a node's health endpoint, or `None`
-/// while the endpoint is not up.
-fn gauge(health: SocketAddr, name: &str) -> Option<u64> {
-    let mut stream = TcpStream::connect_timeout(&health, Duration::from_millis(200)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
-    stream.write_all(b"GET /metrics HTTP/1.1\r\n\r\n").ok()?;
-    let mut body = String::new();
-    stream.read_to_string(&mut body).ok()?;
-    body.lines()
-        .find_map(|line| line.strip_prefix(name)?.trim().parse().ok())
-}
-
-fn wait_for_gauge(health: SocketAddr, name: &str, value: u64) {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while gauge(health, name) != Some(value) {
-        assert!(
-            Instant::now() < deadline,
-            "{name} never reached {value} (last: {:?})",
-            gauge(health, name)
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
 }
 
 /// Send one request and return the single frame of its reply.
@@ -150,10 +128,10 @@ fn a_write_refused_while_halted_is_not_replayed() {
 
     // --- Taking writes: the replica is attached, the write is taken. ---
     wait_for_gauge(primary_health, "melin_replicas_connected", 1);
-    // The gate runs the configured policy (`disk`, byte 0), and the new
-    // lineage has journaled none.
+    // The gate runs the configured policy (`disk`, byte 0), which the new
+    // lineage journaled as it began.
     wait_for_gauge(primary_health, "melin_ack_policy_in_force", 0);
-    assert_eq!(gauge(primary_health, "melin_ack_policy_journaled"), None);
+    wait_for_gauge(primary_health, "melin_ack_policy_journaled", 0);
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut conn = Connection::connect_by(primary.addr(), &client_key, deadline)
         .expect("client connects to the primary");

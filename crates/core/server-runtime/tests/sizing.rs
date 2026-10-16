@@ -17,8 +17,7 @@
 //! `scripts/dpdk/netns-runner.sh` (see
 //! `docs/internal/dpdk-testing.md`).
 
-use std::io::{Read as _, Write as _};
-use std::net::{SocketAddr, TcpStream};
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -36,6 +35,10 @@ use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
 use melin_test_node::{Addrs, Node};
 use melin_transport_core::test_ports::free_addr;
+
+#[path = "common/probe.rs"]
+mod probe;
+use probe::wait_for_gauge;
 
 /// Port range for `free_addr`, shared with the other cluster tests: every
 /// other range below the ephemeral floor is taken. Sharing is safe only
@@ -154,30 +157,6 @@ fn spawn_node(
     )
 }
 
-/// The value of one Prometheus gauge on a node's health endpoint, or `None`
-/// while the endpoint is not up.
-fn gauge(health: SocketAddr, name: &str) -> Option<u64> {
-    let mut stream = TcpStream::connect_timeout(&health, Duration::from_millis(200)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
-    stream.write_all(b"GET /metrics HTTP/1.1\r\n\r\n").ok()?;
-    let mut body = String::new();
-    stream.read_to_string(&mut body).ok()?;
-    body.lines()
-        .find_map(|line| line.strip_prefix(name)?.trim().parse().ok())
-}
-
-fn wait_for_gauge(health: SocketAddr, name: &str, value: u64) {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while gauge(health, name) != Some(value) {
-        assert!(
-            Instant::now() < deadline,
-            "{name} never reached {value} (last: {:?})",
-            gauge(health, name)
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
 fn connect(addr: SocketAddr, key: &SigningKey) -> Connection {
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut conn = Connection::connect_by(addr, key, deadline).expect("client connects");
@@ -293,12 +272,14 @@ fn every_node_sizes_its_own_instances_before_serving() {
     // counts it connected from the handshake, before its pipeline even
     // exists — so wait until the replica has journaled everything (it
     // acks only after its fsync) before reading its log or stopping it,
-    // or the restart below would recover an empty journal. ---
+    // or the restart below would recover an empty journal. The journal
+    // holds the genesis, the ack policy the new lineage journaled as it
+    // began, and the increment. ---
     increment(&mut conn, 5);
     wait_for_gauge(
         primary_health,
         "melin_replica_acked_sequence{slot=\"0\"}",
-        2,
+        3,
     );
     assert_eq!(
         replica_sizing.calls(),

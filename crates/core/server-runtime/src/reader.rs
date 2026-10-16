@@ -30,6 +30,7 @@ use tracing::{debug, error};
 use crate::ControlEvent;
 use crate::buf_ring::BufRing;
 use crate::halt::{HaltGate, RefusalSender};
+use crate::policy_control::{AckPolicyPublisher, PublisherClaim};
 use melin_app::Application;
 use melin_app::auth::{ClientRole, RoleId};
 use melin_app::decoder::ErasedDecoder;
@@ -137,15 +138,7 @@ impl<R> UringReaderHandle<R> {
     /// error and signals shutdown so the server can restart cleanly.
     pub fn register(&mut self, registration: ReaderRegistration<R>) {
         if self.tx.send(registration).is_ok() {
-            // Signal the eventfd to wake the reader from io_uring_enter.
-            let val: u64 = 1;
-            unsafe {
-                libc::write(
-                    self.event_fd.as_raw_fd(),
-                    &val as *const u64 as *const libc::c_void,
-                    8,
-                );
-            }
+            wake_reader(&self.event_fd);
         } else {
             error!("reader thread dead, cannot register connection");
             self.shutdown.store(true, Ordering::Relaxed);
@@ -155,14 +148,7 @@ impl<R> UringReaderHandle<R> {
     /// Signal the reader thread to shut down and wake it from io_uring_enter.
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
-        let val: u64 = 1;
-        unsafe {
-            libc::write(
-                self.event_fd.as_raw_fd(),
-                &val as *const u64 as *const libc::c_void,
-                8,
-            );
-        }
+        wake_reader(&self.event_fd);
     }
 
     /// Join the reader thread. Call after `shutdown()`.
@@ -177,6 +163,26 @@ impl<R> UringReaderHandle<R> {
                 .unwrap_or("<non-string panic>");
             error!(message = msg, "reader thread panicked");
         }
+    }
+}
+
+/// Wake the reader from `io_uring_enter` through its eventfd: the loop
+/// comes back round, and sees whatever it was woken for (a registration,
+/// shutdown, an ack-policy request).
+///
+/// A failed write is not reported: on a nonblocking eventfd it can only be
+/// `EAGAIN`, the counter at its maximum, which means a wakeup is already
+/// pending.
+pub(crate) fn wake_reader(event_fd: &OwnedFd) {
+    let val: u64 = 1;
+    // SAFETY: `event_fd` is a live descriptor (borrowed from its owner), and
+    // the buffer is a live `u64`, of the length passed.
+    unsafe {
+        libc::write(
+            event_fd.as_raw_fd(),
+            &val as *const u64 as *const libc::c_void,
+            8,
+        );
     }
 }
 
@@ -199,6 +205,11 @@ impl<R> UringReaderHandle<R> {
 /// While `halt` refuses writes, the reader answers them through
 /// `refusals` instead of publishing them — see [`crate::halt`].
 ///
+/// The reader also journals the admin `ACK-POLICY` command's requests: it
+/// attaches `ack_policy` with its wakeup eventfd, so a request posted while
+/// it is parked brings it back round its loop, which publishes the entry
+/// (see [`crate::policy_control`]).
+///
 /// `sizing` sets the ring's depth and the provided-buffer pool (see
 /// [`RingSizing`]). Returns once the reader holds its io_uring instance
 /// and buffer pool, or with the error that kept it from getting them —
@@ -211,6 +222,7 @@ pub fn spawn_reader<A: Application, R: AsRawFd + Send + 'static>(
     decoder: RequestDecoderArc<A>,
     halt: HaltGate,
     refusals: RefusalSender<A::Report>,
+    ack_policy: PublisherClaim,
     control_tx: mpsc::Sender<ControlEvent>,
     core: usize,
     connection_timeout: Option<Duration>,
@@ -240,6 +252,9 @@ where
     let event_fd = Arc::new(unsafe { OwnedFd::from_raw_fd(raw_event_fd) });
     let wakeup_fd = Arc::clone(&event_fd);
     let shutdown_clone = Arc::clone(&shutdown);
+    // Attached here, with the eventfd: if the thread never starts, the
+    // publisher is dropped with its closure and detaches.
+    let ack_policy = ack_policy.attach(Some(Arc::clone(&event_fd)));
 
     // The thread's startup report. The ring has to be created on the
     // thread that submits to it (it is SINGLE_ISSUER: the kernel binds
@@ -259,6 +274,7 @@ where
             &*decoder,
             &halt,
             refusals,
+            ack_policy,
             &control_tx,
             connection_timeout,
             tick_cadence,
@@ -421,6 +437,7 @@ fn reader_loop<A: Application, R: AsRawFd>(
     decoder: &dyn ErasedDecoder<A::Event>,
     halt: &HaltGate,
     mut refusals: RefusalSender<A::Report>,
+    mut ack_policy: AckPolicyPublisher,
     control_tx: &mpsc::Sender<ControlEvent>,
     connection_timeout: Option<Duration>,
     tick_cadence: Option<Duration>,
@@ -600,6 +617,11 @@ fn reader_loop<A: Application, R: AsRawFd>(
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
+
+        // An `ACK-POLICY` request: journaled here, by the ring's one
+        // producer, before parking again. One load when none waits; the
+        // requester's eventfd write is what brought a parked loop here.
+        ack_policy.poll(&mut producer, || halt.witnesses());
 
         // Tick generator: emit any due tick before sleeping again. Done before
         // the timeout-arm so that a freshly-emitted tick re-arms a timeout for
@@ -1681,6 +1703,66 @@ mod tests {
         refused.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// The ack-policy mailbox's producer side, for a reader no test sends
+    /// a request to.
+    fn policy_claim() -> crate::policy_control::PublisherClaim {
+        crate::policy_control::AckPolicyControl::new(crate::ack_policy::AckPolicy::Disk).claim()
+    }
+
+    /// A reader parked with nothing to do (no connection, no tick) is
+    /// woken by an `ACK-POLICY` request and journals it: the request
+    /// returns published, and the entry is on the ring, unwitnessed under
+    /// a gate with replication disabled.
+    #[test]
+    fn a_parked_reader_journals_an_ack_policy_request() {
+        use crate::ack_policy::AckPolicy;
+        use crate::policy_control::{AckPolicyControl, RequestOutcome};
+
+        let (producer, mut consumers) = DisruptorBuilder::<InputSlot<TestEvent>>::new(64)
+            .add_consumer()
+            .build(melin_pipeline::wait::WaitStrategy::SpinThenYield);
+        let mut consumer = consumers.pop().expect("consumer");
+        let (control_tx, _control_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        // Long enough that a reader that is never woken fails the request.
+        let control =
+            AckPolicyControl::with_publish_wait(AckPolicy::DiskAndRam, Duration::from_secs(30));
+        let handle = spawn_reader::<TestApp, UnixStream>(
+            producer,
+            Arc::new(ByteDecoder),
+            gate(None, false),
+            refusal_channel().0,
+            control.claim(),
+            control_tx,
+            0,
+            None,
+            None, // no tick: nothing but the wakeup brings the loop round
+            RingSizing::for_max_connections(4).expect("a supported cap"),
+            Arc::clone(&shutdown),
+        )
+        .expect("the reader starts");
+        // Parked by now, in all likelihood; the request must not depend on
+        // it either way.
+        std::thread::sleep(Duration::from_millis(50));
+
+        assert_eq!(control.request(AckPolicy::Disk), RequestOutcome::Published);
+        let (_, slot) = consumer.try_consume().expect("the entry is on the ring");
+        assert_eq!(
+            slot.event,
+            JournalEvent::AckPolicyChange(melin_journal::AckPolicyChange {
+                policy: AckPolicy::Disk.to_byte(),
+                unwitnessed: true,
+            })
+        );
+        handle.shutdown();
+        handle.join();
+        assert_eq!(
+            control.request(AckPolicy::Ram),
+            RequestOutcome::Staged,
+            "a stopped reader is detached"
+        );
+    }
+
     /// A refusal queue whose idle bound is never consulted by these tests.
     fn refusal_channel() -> (
         RefusalSender<TestReport>,
@@ -2422,6 +2504,7 @@ mod tests {
             Arc::new(ByteDecoder),
             gate(None, false),
             refusal_channel().0,
+            policy_claim(),
             control_tx,
             0,    // "do not pin" sentinel
             None, // no idle timeout — a CI stall must not disconnect
@@ -2541,6 +2624,7 @@ mod tests {
             Arc::new(ByteDecoder),
             gate(None, false),
             refusal_channel().0,
+            policy_claim(),
             control_tx,
             0,    // "do not pin" sentinel
             None, // no idle timeout
@@ -2619,6 +2703,7 @@ mod tests {
             Arc::new(ByteDecoder),
             gate(None, false),
             refusal_channel().0,
+            policy_claim(),
             control_tx,
             0,
             None,
@@ -2750,6 +2835,7 @@ mod tests {
             Arc::new(ByteDecoder),
             gate(None, false),
             refusal_channel().0,
+            policy_claim(),
             control_tx,
             0,
             None,

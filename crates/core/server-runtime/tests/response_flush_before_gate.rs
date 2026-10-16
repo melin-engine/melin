@@ -15,7 +15,7 @@
 use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -87,8 +87,6 @@ fn config_for(journal_cursor: DurableWireSeqCursor) -> Response<Counter> {
         journal_persisted_wire_seq: journal_cursor,
         policy: response::GatePolicy {
             initial: AckPolicy::Disk,
-            admin: Arc::new(AtomicU8::new(AckPolicy::Disk.as_u8())),
-            admin_seen: AckPolicy::Disk.as_u8(),
             forced: melin_transport_core::lineage::forced_policy_cell().1,
         },
         replication_metrics: None,

@@ -23,13 +23,13 @@
 //! kernel socket of the test's own, on the address the nodes reach the
 //! test at.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::Write;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
 use counter_server::{Counter, CounterEvent, RequestDecoder, ResponseEncoder};
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::SigningKey;
 use melin_journal::{JournalEvent, JournalReader};
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
@@ -43,7 +43,10 @@ use melin_transport_core::replication::protocol::{
 };
 use melin_transport_core::replication_wire::encode_input_batch;
 use melin_transport_core::test_ports::free_addr;
-use melin_wire_protocol::control_codec::{TAG_CHALLENGE, TAG_CHALLENGE_RESPONSE, TAG_SERVER_READY};
+
+#[path = "common/probe.rs"]
+mod probe;
+use probe::admin_command;
 
 /// Port range for `free_addr`, shared with the other cluster binaries:
 /// safe because they are all in nextest's `cluster-serial` group.
@@ -133,15 +136,6 @@ impl Cluster {
     }
 }
 
-/// Write one length-prefixed frame.
-fn write_frame(stream: &mut TcpStream, payload: &[u8]) {
-    stream
-        .write_all(&(payload.len() as u32).to_le_bytes())
-        .expect("write frame length");
-    stream.write_all(payload).expect("write frame payload");
-    stream.flush().expect("flush");
-}
-
 /// Send `PROMOTE` to the admin endpoint at `addr`, retrying until the
 /// endpoint answers. Returns its reply line.
 fn promote(addr: SocketAddr, key: &SigningKey) -> String {
@@ -153,38 +147,6 @@ fn promote(addr: SocketAddr, key: &SigningKey) -> String {
         assert!(Instant::now() < deadline, "admin endpoint never answered");
         std::thread::sleep(Duration::from_millis(100));
     }
-}
-
-/// One admin command over a fresh authenticated connection; `None` if
-/// the endpoint is not up yet.
-fn admin_command(addr: SocketAddr, key: &SigningKey, command: &str) -> Option<String> {
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(300)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-    let read_one = |stream: &mut TcpStream| -> Option<Vec<u8>> {
-        let mut len = [0u8; 4];
-        stream.read_exact(&mut len).ok()?;
-        let mut payload = vec![0u8; u32::from_le_bytes(len) as usize];
-        stream.read_exact(&mut payload).ok()?;
-        Some(payload)
-    };
-    let challenge = read_one(&mut stream)?;
-    if challenge.first() != Some(&TAG_CHALLENGE) {
-        return None;
-    }
-    let mut response = vec![TAG_CHALLENGE_RESPONSE];
-    response.extend_from_slice(&key.sign(&challenge[1..33]).to_bytes());
-    response.extend_from_slice(&key.verifying_key().to_bytes());
-    write_frame(&mut stream, &response);
-    let ready = read_one(&mut stream)?;
-    if ready.first() != Some(&TAG_SERVER_READY) {
-        return None;
-    }
-    stream.write_all(command.as_bytes()).ok()?;
-    stream.write_all(b"\n").ok()?;
-    stream.flush().ok()?;
-    let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line).ok()?;
-    Some(line.trim_end().to_owned())
 }
 
 /// The counter's value, read by a client of the node at `addr` once it

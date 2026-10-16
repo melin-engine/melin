@@ -4,8 +4,8 @@
 //!
 //! Shared by the io_uring stage ([`crate::response`]) and the DPDK stage
 //! (`crate::dpdk_response`). Both used to carry their own copy of this
-//! state machine — startup resolve, runtime `ACK-POLICY` swaps, the gate
-//! wait, degraded-time accrual — and a fix to one copy had to be
+//! state machine — startup resolve, policy changes, the gate wait,
+//! degraded-time accrual — and a fix to one copy had to be
 //! remembered in the other. What differs between the two stages is
 //! egress (socket buffers vs. the poll thread's TX rings); what a reply
 //! waits *for* does not, so it lives here once.
@@ -28,7 +28,7 @@
 //! then ignores every in-order change at or below it.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use melin_app::amortized_timer::AmortizedTimer;
@@ -79,23 +79,12 @@ pub(crate) enum GateOutcome {
 }
 
 /// Where the gate's policy comes from: the one it starts under, and the
-/// two ways it changes while running.
+/// forced changes that may overtake the in-order ones. Every other change
+/// reaches the gate as an output slot.
 pub struct GatePolicy {
-    /// The policy in force when the gate starts — the lineage's, or the
-    /// requested one while the lineage holds no change (a primary resolves
-    /// it with the crate's `initial_gate_policy`).
+    /// The policy in force when the gate starts (a primary resolves it
+    /// with the crate's `initial_gate_policy`).
     pub initial: AckPolicy,
-    /// The admin `ACK-POLICY` command's atomic, observed for changes.
-    /// Transitional: the gate follows a change of the byte, not the byte
-    /// itself, so a gate started from the lineage keeps that policy until
-    /// an operator sends one. Retired once the command journals its
-    /// change instead.
-    pub admin: Arc<AtomicU8>,
-    /// The admin byte `initial` was resolved against. The gate applies
-    /// any later change of the atomic, including one made between the
-    /// resolution and the gate's start, which the atomic's value at
-    /// startup would hide.
-    pub admin_seen: u8,
     /// Forced changes the matching stage has dispatched — see
     /// [`ForcedPolicyReader`] and the module docs.
     pub forced: ForcedPolicyReader,
@@ -103,7 +92,14 @@ pub struct GatePolicy {
 
 /// The policy a primary's gate starts under: the one the lineage has in
 /// force, or `requested` (the configured or staged one) while the lineage
-/// holds no change.
+/// holds no change. A requested policy different from the lineage's takes
+/// effect through the change the primary journals as it starts, in order.
+///
+/// With replication disabled, `requested` regardless: no replica can ever
+/// witness the start's change, so a lineage last run under a policy that
+/// needs one (restarted standalone under `disk`) would hold every reply
+/// forever. The change is journaled unwitnessed all the same, as the
+/// record of the switch.
 ///
 /// A lineage byte this build does not know is refused rather than
 /// replaced: the events it governs were acknowledged under a policy this
@@ -111,16 +107,25 @@ pub struct GatePolicy {
 pub(crate) fn initial_gate_policy(
     lineage: Option<AckPolicyByte>,
     requested: AckPolicy,
+    replication_enabled: bool,
 ) -> Result<AckPolicy, String> {
     match lineage {
         None => Ok(requested),
-        Some(byte) => AckPolicy::from_byte(byte).ok_or_else(|| {
-            format!(
-                "the journal's ack policy (byte {}) is unknown to this build; \
+        Some(byte) => AckPolicy::from_byte(byte)
+            .map(|lineage| {
+                if replication_enabled {
+                    lineage
+                } else {
+                    requested
+                }
+            })
+            .ok_or_else(|| {
+                format!(
+                    "the journal's ack policy (byte {}) is unknown to this build; \
                  refusing to serve under it",
-                byte.0
-            )
-        }),
+                    byte.0
+                )
+            }),
     }
 }
 
@@ -156,12 +161,8 @@ pub(crate) struct GateInputs {
 /// policy goes through [`Self::switch_to`].
 pub(crate) struct DurabilityGate {
     inputs: GateInputs,
-    /// Which stage owns this gate, for the swap / corruption logs.
+    /// Which stage owns this gate, for the switch / unknown-policy logs.
     stage: &'static str,
-    /// See [`GatePolicy::admin`].
-    admin: Arc<AtomicU8>,
-    /// The admin byte last observed: the gate reacts to a change of it.
-    admin_seen: u8,
     /// See [`GatePolicy::forced`].
     forced: ForcedPolicyReader,
     /// Wire seq of the newest journaled change the gate has applied, in
@@ -197,8 +198,6 @@ impl DurabilityGate {
     pub(crate) fn new(inputs: GateInputs, policy: GatePolicy, stage: &'static str) -> Self {
         let GatePolicy {
             initial: active_policy,
-            admin,
-            admin_seen,
             forced,
         } = policy;
         inputs
@@ -225,8 +224,6 @@ impl DurabilityGate {
         Self {
             inputs,
             stage,
-            admin,
-            admin_seen,
             forced,
             applied_through: 0,
             active_policy,
@@ -264,34 +261,6 @@ impl DurabilityGate {
             .utilization
             .ack_policy_in_force
             .store(Some(next.to_byte()));
-    }
-
-    /// Observe a runtime policy swap from the admin `ACK-POLICY` command
-    /// (transitional, see [`GatePolicy::admin`]). Called once per
-    /// outer-loop iteration and on every spin of the wait. Relaxed load
-    /// (single writer is the admin handler, single reader is this
-    /// thread).
-    ///
-    /// Reacts to a change of the byte, once. An unknown byte is treated as
-    /// memory corruption: logged, and the prior policy kept rather than
-    /// silently downgraded.
-    #[inline]
-    pub(crate) fn observe_policy_swap(&mut self) {
-        let observed_byte = self.admin.load(Ordering::Relaxed);
-        if observed_byte == self.admin_seen {
-            return;
-        }
-        self.admin_seen = observed_byte;
-        match AckPolicy::from_u8(observed_byte) {
-            Some(next) => self.switch_to(next, "admin swap"),
-            None => {
-                tracing::error!(
-                    stage = self.stage,
-                    byte = observed_byte,
-                    "ack_policy atomic held a corrupted byte; retaining prior policy"
-                );
-            }
-        }
     }
 
     /// Apply the journaled change at `wire_seq`, unless a change at or
@@ -393,11 +362,11 @@ impl DurabilityGate {
     /// waiter per gate entry: the spin budget is meant to cover one
     /// durability lag, not to carry over from the idle loop.
     ///
-    /// A forced change (and, transitionally, an admin swap) is observed
-    /// inside the wait too. Without it, a slot whose gate became
-    /// structurally unsatisfiable (every replica gone under `disk+ram`)
-    /// would wedge the stage forever, even after an operator sent the
-    /// remediating `ACK-POLICY disk` — its slot sits behind the stuck one.
+    /// A forced change is observed inside the wait. Without it, a slot
+    /// whose gate became structurally unsatisfiable (every replica gone
+    /// under `disk+ram`) would wedge the stage forever, even after an
+    /// operator sent the remediating `ACK-POLICY disk` — its slot sits
+    /// behind the stuck one.
     ///
     /// Shutdown is observed for the same reason: a gate that cannot open
     /// would otherwise hold this thread until a replica returned, and the
@@ -413,9 +382,6 @@ impl DurabilityGate {
     ) -> GateOutcome {
         let mut gate_waiter = self.inputs.wait.waiter();
         loop {
-            // ~1 cycle on x86; cheaper than the wait below.
-            self.observe_policy_swap();
-
             if shutdown.load(Ordering::Relaxed) {
                 return GateOutcome::Shutdown;
             }
@@ -577,11 +543,11 @@ mod tests {
 
     use super::*;
 
-    /// A byte no `AckPolicy` maps to, standing in for a corrupted atomic.
+    /// A byte no `AckPolicy` maps to: a policy from a newer build, or a
+    /// bug.
     const CORRUPT: u8 = 0xEE;
 
-    /// A gate starting under `initial`, its admin atomic holding the same
-    /// policy, and the writer of its forced cell.
+    /// A gate starting under `initial`, and the writer of its forced cell.
     fn build(
         initial: AckPolicy,
         journal_pos: u64,
@@ -596,12 +562,7 @@ mod tests {
             utilization: Arc::new(StageUtilization::new()),
             wait: WaitStrategy::SpinThenYield,
         };
-        let policy = GatePolicy {
-            initial,
-            admin: Arc::new(AtomicU8::new(initial.as_u8())),
-            admin_seen: initial.as_u8(),
-            forced,
-        };
+        let policy = GatePolicy { initial, forced };
         (DurabilityGate::new(inputs, policy, "test"), forced_writer)
     }
 
@@ -821,11 +782,9 @@ mod tests {
     /// re-seeds the logger — flushing the degraded time accrued under
     /// the old policy, which is how the re-seed shows from outside.
     #[test]
-    fn a_policy_swap_resets_the_cached_position_and_reseeds_the_logger() {
+    fn a_switch_resets_the_cached_position_and_reseeds_the_logger() {
         let mut g = gate(AckPolicy::Disk, 5);
-        g.admin
-            .store(AckPolicy::TwoDisks.as_u8(), Ordering::Relaxed);
-        g.observe_policy_swap();
+        g.apply_change(1, AckPolicy::TwoDisks.to_byte(), "test");
         assert_eq!(g.active_policy, AckPolicy::TwoDisks);
         assert_eq!(g.policy, AckPolicy::TwoDisks.to_policy());
         assert_eq!(g.cached_durable_pos, 0);
@@ -833,102 +792,57 @@ mod tests {
 
         let mut g = gate(AckPolicy::DiskAndRam, 5);
         let_time_pass();
-        g.admin.store(AckPolicy::Disk.as_u8(), Ordering::Relaxed);
-        g.observe_policy_swap();
+        g.apply_change(1, AckPolicy::Disk.to_byte(), "test");
         assert_eq!(g.active_policy, AckPolicy::Disk);
         assert!(
             degraded_nanos(&g) > 0,
-            "the re-seed flushes the degraded interval before the swap"
+            "the re-seed flushes the degraded interval before the switch"
         );
     }
 
+    /// An unknown policy byte switches nothing: no re-seed, the cached
+    /// position kept.
     #[test]
-    fn a_corrupted_byte_keeps_the_prior_policy() {
+    fn an_unknown_byte_keeps_the_prior_policy_untouched() {
         let mut g = gate(AckPolicy::DiskAndRam, 5);
         let_time_pass();
-        g.admin.store(CORRUPT, Ordering::Relaxed);
-        g.observe_policy_swap();
+        g.apply_change(1, AckPolicyByte(CORRUPT), "test");
         assert_eq!(g.active_policy, AckPolicy::DiskAndRam);
         assert_eq!(g.policy, AckPolicy::DiskAndRam.to_policy());
-        assert_eq!(degraded_nanos(&g), 0, "no re-seed on a corrupted byte");
+        assert_eq!(degraded_nanos(&g), 0, "no re-seed on an unknown byte");
 
         let mut g = gate(AckPolicy::Disk, 5);
-        g.admin.store(CORRUPT, Ordering::Relaxed);
-        g.observe_policy_swap();
+        g.apply_change(1, AckPolicyByte(CORRUPT), "test");
         assert_eq!(g.active_policy, AckPolicy::Disk);
         assert_eq!(g.cached_durable_pos, 5, "cached position kept");
     }
 
-    /// A gate started under `initial`, its policy resolved against an
-    /// admin byte of `admin_seen`, the atomic now holding `admin_now`.
-    fn gate_resolved_against(
-        initial: AckPolicy,
-        admin_seen: AckPolicy,
-        admin_now: AckPolicy,
-    ) -> (DurabilityGate, Arc<AtomicU8>) {
-        let admin = Arc::new(AtomicU8::new(admin_now.as_u8()));
-        let g = DurabilityGate::new(
-            GateInputs {
-                journal_persisted_wire_seq: DurableWireSeqCursor::detached(WireSeq::new(5)),
-                replication_metrics: None,
-                replica_active: None,
-                utilization: Arc::new(StageUtilization::new()),
-                wait: WaitStrategy::SpinThenYield,
-            },
-            GatePolicy {
-                initial,
-                admin: Arc::clone(&admin),
-                admin_seen: admin_seen.as_u8(),
-                forced: forced_policy_cell().1,
-            },
-            "test",
-        );
-        (g, admin)
-    }
-
-    /// The admin atomic is followed by its changes, not its value: a gate
-    /// started from the lineage under a policy other than the requested
-    /// one keeps it until an operator sends a policy.
-    #[test]
-    fn the_gate_follows_admin_changes_not_the_admin_byte() {
-        let (mut g, admin) =
-            gate_resolved_against(AckPolicy::TwoDisks, AckPolicy::Disk, AckPolicy::Disk);
-        assert_eq!(in_force(&g), Some(AckPolicy::TwoDisks));
-        g.observe_policy_swap();
-        assert_eq!(g.active_policy, AckPolicy::TwoDisks, "no admin change yet");
-        admin.store(AckPolicy::Ram.as_u8(), Ordering::Relaxed);
-        g.observe_policy_swap();
-        assert_eq!(g.active_policy, AckPolicy::Ram);
-    }
-
-    /// An admin swap landing after the initial policy was resolved but
-    /// before the gate started is still applied.
-    #[test]
-    fn an_admin_swap_before_the_gate_starts_is_not_lost() {
-        let (mut g, _admin) = gate_resolved_against(
-            AckPolicy::DiskAndRam,
-            AckPolicy::DiskAndRam,
-            AckPolicy::Disk,
-        );
-        g.observe_policy_swap();
-        assert_eq!(g.active_policy, AckPolicy::Disk);
-    }
-
-    /// The lineage's policy wins over the requested one; a lineage with
-    /// none takes the requested one; an unknown lineage byte is refused.
+    /// The lineage's policy wins over the requested one while replication
+    /// is on; a lineage with none takes the requested one; with
+    /// replication disabled the requested one wins (the standalone rule);
+    /// an unknown lineage byte is refused either way.
     #[test]
     fn the_initial_policy_is_the_lineages_when_it_has_one() {
+        let two_disks = Some(AckPolicy::TwoDisks.to_byte());
+        for replication in [true, false] {
+            assert_eq!(
+                initial_gate_policy(None, AckPolicy::Disk, replication),
+                Ok(AckPolicy::Disk)
+            );
+            let refused =
+                initial_gate_policy(Some(AckPolicyByte(CORRUPT)), AckPolicy::Disk, replication)
+                    .expect_err("an unknown byte is refused");
+            assert!(refused.contains("238"), "names the byte: {refused}");
+        }
         assert_eq!(
-            initial_gate_policy(None, AckPolicy::Disk),
-            Ok(AckPolicy::Disk)
-        );
-        assert_eq!(
-            initial_gate_policy(Some(AckPolicy::TwoDisks.to_byte()), AckPolicy::Disk),
+            initial_gate_policy(two_disks, AckPolicy::Disk, true),
             Ok(AckPolicy::TwoDisks)
         );
-        let refused = initial_gate_policy(Some(AckPolicyByte(CORRUPT)), AckPolicy::Disk)
-            .expect_err("an unknown byte is refused");
-        assert!(refused.contains("238"), "names the byte: {refused}");
+        assert_eq!(
+            initial_gate_policy(two_disks, AckPolicy::Disk, false),
+            Ok(AckPolicy::Disk),
+            "standalone serves the requested policy"
+        );
     }
 
     #[test]
@@ -973,17 +887,21 @@ mod tests {
         assert_eq!(attributions(&g), (0, 0));
     }
 
-    /// The remediating `ACK-POLICY` reaches a gate already wedged: the
-    /// wait swaps to the new policy, flushes the degraded time, and opens.
+    /// The remediating forced `ACK-POLICY disk` reaches a gate already
+    /// wedged: the wait switches to it (its entry being on disk), flushes
+    /// the degraded time, and opens.
     #[test]
-    fn a_swap_during_the_wait_unwedges_the_gate() {
-        let mut g = gate(AckPolicy::DiskAndRam, 5);
+    fn a_forced_change_during_the_wait_unwedges_the_gate() {
+        let (mut g, mut forced) = build(AckPolicy::DiskAndRam, 5, None, None);
         let_time_pass();
-        g.admin.store(AckPolicy::Disk.as_u8(), Ordering::Relaxed);
+        forced.store(ForcedPolicy {
+            wire_seq: 4,
+            policy: AckPolicy::Disk.to_byte(),
+        });
         let shutdown = AtomicBool::new(false);
         assert!(matches!(wait(&mut g, 3, &shutdown), GateOutcome::Open));
         assert_eq!(g.active_policy, AckPolicy::Disk);
-        // Not a mutation guard for "the mid-wait swap keeps the cached
+        // Not a mutation guard for "the mid-wait switch keeps the cached
         // position": the evaluation on the same pass overwrites it, so a
         // reset there is unobservable from outside the wait.
         assert_eq!(g.cached_durable_pos, 5);
@@ -992,18 +910,6 @@ mod tests {
             degraded_nanos(&g) > 0,
             "the re-seed flushes the wedged interval"
         );
-    }
-
-    /// Replicas are caught up so any policy would open the gate: what is
-    /// pinned is that the corrupted byte changes none of it.
-    #[test]
-    fn a_corrupted_byte_during_the_wait_is_ignored() {
-        let mut g = gate_with_replicas(AckPolicy::Disk, 5);
-        g.admin.store(CORRUPT, Ordering::Relaxed);
-        let shutdown = AtomicBool::new(false);
-        assert!(matches!(wait(&mut g, 3, &shutdown), GateOutcome::Open));
-        assert_eq!(g.active_policy, AckPolicy::Disk);
-        assert_eq!(g.policy, AckPolicy::Disk.to_policy());
     }
 
     /// A change takes effect at its slot: the slot before it is gated

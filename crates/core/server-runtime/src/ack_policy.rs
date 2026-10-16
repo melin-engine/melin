@@ -144,17 +144,15 @@ impl AckPolicy {
         }
     }
 
-    /// Stable u8 discriminant. The response stage publishes the
-    /// operator-selected policy through an
-    /// [`AtomicU8`](std::sync::atomic::AtomicU8) so it can detect
-    /// a runtime swap (via the admin `ACK-POLICY` command) with a
-    /// relaxed load on every gate iteration — cheaper than crossing a
-    /// `Mutex` or carrying a refcounted `Arc<Policy>` snapshot.
+    /// Stable u8 discriminant: the byte a journaled `AckPolicyChange`
+    /// carries ([`to_byte`](Self::to_byte)), and the one the health gauges
+    /// export.
     ///
     /// **These values are a wire format**, not just an in-process ABI:
-    /// the primary stamps this byte onto every `StreamStart` and
-    /// `Heartbeat`, and the replica decodes it with [`from_u8`](Self::from_u8) to
-    /// judge auto-promotion (see `raft_promotion`). So they must stay
+    /// they are in every journal holding a policy change, the primary
+    /// stamps this byte onto every `StreamStart` and `Heartbeat`, and the
+    /// replica decodes it with [`from_u8`](Self::from_u8) to judge
+    /// auto-promotion (see `raft_promotion`). So they must stay
     /// stable across releases in two directions — the round-trip
     /// `from_u8(as_u8(x)) == Some(x)` has to hold, *and* a value once
     /// released can never be reassigned to a different policy, or a
@@ -179,12 +177,11 @@ impl AckPolicy {
         }
     }
 
-    /// Inverse of [`as_u8`](Self::as_u8). Returns `None` for an unknown byte —
-    /// callers initialise the atomic from a valid policy and the admin
-    /// path only writes `as_u8(parse(s)?)`, so an unknown byte
-    /// indicates memory corruption or a programmer bug. The response
-    /// stage logs and retains the prior policy in that case rather than
-    /// silently falling back.
+    /// Inverse of [`as_u8`](Self::as_u8). Returns `None` for an unknown
+    /// byte — one a newer build wrote, or a bug. A primary refuses to
+    /// start on a lineage holding one; the response stage, meeting one in
+    /// a change it journaled itself, logs and retains the prior policy
+    /// rather than silently falling back.
     pub fn from_u8(b: u8) -> Option<Self> {
         match b {
             0 => Some(AckPolicy::Disk),
@@ -232,7 +229,7 @@ mod tests {
             assert_eq!(AckPolicy::from_u8(p.as_u8()), Some(p));
         }
         // Unknown bytes surface as None — the response stage relies on
-        // this to detect a corrupted atomic and retain the prior policy.
+        // this to retain the prior policy on a change it cannot read.
         for b in [4, 5, 255] {
             assert_eq!(AckPolicy::from_u8(b), None);
         }

@@ -367,6 +367,22 @@ impl<E: AppEvent> Default for InputSlot<E> {
 }
 
 impl<E: AppEvent> InputSlot<E> {
+    /// An event the node publishes itself (a tick, an epoch bump, an
+    /// ack-policy change): no client connection, no auth key (`key_hash`
+    /// 0, the identity of events no client submitted), and `sequence` 0
+    /// because the journal stage allocates it (see [`Self::sequence`]).
+    pub fn node_event(event: melin_journal::JournalEvent<E>, timestamp_ns: u64) -> Self {
+        Self {
+            connection_id: 0,
+            key_hash: 0,
+            sequence: 0,
+            timestamp_ns,
+            event,
+            publish_ts: mono_trace_ns(),
+            recv_ts: mono_trace_ns(),
+        }
+    }
+
     /// Build the pipeline-shutdown sentinel slot. The producer (receiver
     /// or reader thread) publishes this as its last action before exit;
     /// each downstream stage stops at this slot, completing any pending

@@ -515,10 +515,6 @@ pub fn run<A: Application>(
     let mut last_input_seq = u64::MAX;
 
     'run: loop {
-        // Observe runtime policy swaps from the admin `ACK-POLICY`
-        // command — see `DurabilityGate::observe_policy_swap`.
-        gate.observe_policy_swap();
-
         if shutdown.load(Ordering::Relaxed) {
             // Fence: a superseded ex-primary must not acknowledge any
             // further in-flight work — skip the best-effort flush so
@@ -3648,7 +3644,7 @@ mod tests {
         use std::io::{Read, Write};
         use std::os::unix::io::AsRawFd;
         use std::os::unix::net::UnixStream;
-        use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
         use std::sync::{Arc, mpsc};
         use std::thread;
         use std::time::Duration;
@@ -3712,8 +3708,6 @@ mod tests {
                 journal_persisted_wire_seq: DurableWireSeqCursor::detached(WireSeq::new(1)),
                 policy: crate::response::GatePolicy {
                     initial: AckPolicy::Disk,
-                    admin: Arc::new(AtomicU8::new(AckPolicy::Disk.as_u8())),
-                    admin_seen: AckPolicy::Disk.as_u8(),
                     forced: melin_transport_core::lineage::forced_policy_cell().1,
                 },
                 replication_metrics: None,
@@ -3791,7 +3785,7 @@ mod tests {
         use std::io::{ErrorKind, Read, Write};
         use std::os::unix::io::AsRawFd;
         use std::os::unix::net::UnixStream;
-        use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
         use std::sync::{Arc, mpsc};
         use std::thread;
         use std::time::Duration;
@@ -4070,8 +4064,6 @@ mod tests {
                 journal_persisted_wire_seq: journal_cursor,
                 policy: crate::response::GatePolicy {
                     initial: AckPolicy::Disk,
-                    admin: Arc::new(AtomicU8::new(AckPolicy::Disk.as_u8())),
-                    admin_seen: AckPolicy::Disk.as_u8(),
                     forced: melin_transport_core::lineage::forced_policy_cell().1,
                 },
                 replication_metrics: None,

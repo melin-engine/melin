@@ -43,7 +43,7 @@
 //! going, so failover completes only if they notice the silence
 //! themselves (the replica end of a DPDK link's liveness deadline).
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
@@ -63,6 +63,10 @@ use melin_wire_protocol::control_codec::{
     TAG_APP, TAG_BATCH_END, TAG_CHALLENGE, TAG_CHALLENGE_RESPONSE, TAG_LEN, TAG_SERVER_READY,
 };
 use serial_test::serial;
+
+#[path = "common/probe.rs"]
+mod probe;
+use probe::admin_command;
 
 /// Port range this file owns for `free_addr` (10000..15000);
 /// `melin-raft`'s election tests own 15000..20000, `raft_failover.rs`
@@ -178,21 +182,6 @@ fn read_until_batch_end(stream: &mut TcpStream) -> Vec<Vec<u8>> {
         }
     }
     responses
-}
-
-/// Send one admin command over a fresh authenticated connection and
-/// return the server's reply line, or `None` if the connection or
-/// handshake failed (node not up yet — caller retries).
-fn admin_command(addr: SocketAddr, key: &SigningKey, command: &str) -> Option<String> {
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(300)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-    answer_challenge(&mut stream, key)?;
-    stream.write_all(command.as_bytes()).ok()?;
-    stream.write_all(b"\n").ok()?;
-    stream.flush().ok()?;
-    let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line).ok()?;
-    Some(line.trim_end().to_owned())
 }
 
 /// Whether a client connect to `addr` is answered with the auth

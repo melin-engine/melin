@@ -67,6 +67,8 @@ use melin_pipeline::spsc;
 use melin_pipeline::wait::WaitStrategy;
 use melin_transport_core::fence::FenceState;
 
+use crate::policy_control::Witnesses;
+
 /// Refusals the response stage can hold before a reader has to shed load.
 ///
 /// Refusals only queue while the response stage is held up behind a reply
@@ -113,6 +115,18 @@ impl HaltGate {
             replicas_connected,
             fence_state,
             refused,
+        }
+    }
+
+    /// Who could witness an ack-policy change published now — see
+    /// [`crate::policy_control::is_unwitnessed`]. One relaxed load, like
+    /// [`Self::verdict`].
+    #[inline]
+    pub fn witnesses(&self) -> Witnesses {
+        match &self.replicas_connected {
+            None => Witnesses::Disabled,
+            Some(count) if count.load(Ordering::Relaxed) == 0 => Witnesses::NoneConnected,
+            Some(_) => Witnesses::Connected,
         }
     }
 
@@ -321,6 +335,19 @@ mod tests {
         );
         count.store(1, Ordering::Relaxed);
         assert_eq!(gate.verdict(), Verdict::Take);
+    }
+
+    #[test]
+    fn witnesses_follow_the_replica_count() {
+        assert_eq!(
+            gate(None, Arc::new(FenceState::new(0))).witnesses(),
+            Witnesses::Disabled
+        );
+        let count = Arc::new(AtomicU32::new(0));
+        let gate = gate(Some(Arc::clone(&count)), Arc::new(FenceState::new(0)));
+        assert_eq!(gate.witnesses(), Witnesses::NoneConnected);
+        count.store(2, Ordering::Relaxed);
+        assert_eq!(gate.witnesses(), Witnesses::Connected);
     }
 
     #[test]

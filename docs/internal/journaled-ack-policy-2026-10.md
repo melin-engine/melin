@@ -374,6 +374,72 @@ and is committed on its own. Tests land with the step they pin.
    until the replica holds the entry, and are afterwards; restart with a
    different `--ack-policy`; standalone restart; the frozen-replica
    gate-stall test with a change journaled (deferred from step 1).
+
+   *As landed:* the mailbox is `AckPolicyControl` in `server-runtime`'s
+   `policy_control` module, one per process, shared by the admin listener
+   and both roles. Its state sits behind a mutex the producer only takes
+   when a request waits; the producer's per-loop cost is one acquire load
+   of a `pending` flag. A primary tenure takes a `PublisherClaim` (the
+   policy to request as it starts) before its gate is resolved, journals
+   the boot or promotion entry from the main thread after the
+   `EpochBump` (`boot_change`, `journal_boot_policy_change`), and the
+   claim is attached by the producer (`PublisherClaim::attach`, with the
+   io_uring reader's eventfd as the wake handle, none on DPDK), which
+   polls it once per loop (the DPDK poll thread on the tick check's
+   counter, ticks on or off). The forced rule is one function,
+   `is_unwitnessed`, over the request's `Origin` (runtime or staged) and
+   the reader's `Witnesses` (`HaltGate::witnesses`: replication disabled,
+   none connected, connected). The gate's atomic is gone: `GatePolicy` is
+   `{ initial, forced }`, and `initial_gate_policy` takes the standalone
+   rule (requested policy when replication is disabled). The atomic's
+   other readers (the senders' `StreamStart`/`Heartbeat` byte and
+   auto-promotion's fallback, both step 5's) read the mailbox's
+   `requested_byte`, updated when a request is staged or journaled.
+
+   Three things the plan did not settle. First, **a request with no
+   producer attached is staged, and the reply says so**: `OK staged`, not
+   `OK`, on a replica and on a primary still starting, so tooling that
+   waits for `OK` after a `PROMOTE` (the failover tests, the notary
+   example's) retries until the promoted node journals it, and a staged
+   request is never mistaken for a forced one. Second, **a request staged
+   between the claim and the attach** (a primary in bring-up) is queued at
+   attach as a staged request rather than lost; a request staged before
+   the claim is the claim's own policy. A runtime request made while such
+   a request waits is published after it, never merged. Third, a refused
+   request (input ring full past `PUBLISH_WAIT`, or the producer stopped)
+   is withdrawn under the lock the producer publishes under, so a refusal
+   is never followed by the entry. The frozen-replica gate-stall test
+   named in step 1 no longer exists in this repository (it went with the
+   Exchange Core, `ddf8d8cc`); the scripted-replica test that replaces
+   it is `ack_policy_changes::a_weakening_waits_for_the_replica_to_hold_the_change`,
+   whose replica holds nothing past the change: the write after it stays
+   held though it is on the primary's disk.
+
+   **The promoted primary judges by the receive-time cell.** A
+   promotion's lineage policy is `ReplicaControlPlane::lineage_ack_policy`
+   as the replica left it, and that one value feeds the shadow seed (step
+   2's note), the promotion entry (`journal_boot_policy_change` writes
+   none when the requested policy equals it) and the gate's initial
+   policy. Now that changes are journaled, the cell lags them until
+   step 5 writes it at receive time: a replica whose cell says `disk`
+   while the stream's last change says `disk+ram`, promoted with `disk`
+   requested, journals no entry and starts its gate under `disk`. That is
+   harmless while replicas still judge by the heartbeat byte, and step 5
+   closes it; its tests should include a promotion right after a
+   streamed change, checking both the entry and the gate.
+
+   **Not yet covered on DPDK.** The DPDK poll thread's mailbox poll
+   (on the tick check's counter, ticks on or off) is covered under the
+   netns runner by `tests/ack_policy_changes.rs`, whose nodes start
+   through melin-test-node:
+   `a_weakening_waits_for_the_replica_to_hold_the_change` sends
+   `ACK-POLICY disk` to a primary with ticks off and needs `OK`, which on
+   DPDK only the poll thread's publisher produces. The io_uring reader's
+   parked case is tested too
+   (`a_parked_reader_journals_an_ack_policy_request`). What DPDK still
+   lacks is the forced case, owed to step 7: `ACK-POLICY disk` to a DPDK
+   primary with no replica connected replies `OK` and the journaled gauge
+   moves to `disk`.
 5. **The replica side.** The cell written at receive time; the policy
    byte removed from `StreamStart` and `Heartbeat`, their senders and
    receivers; auto-promotion on the lineage cell and the new

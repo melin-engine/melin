@@ -613,8 +613,9 @@ pub struct DpdkReplicationDriver<A: Application> {
     /// primary's epoch onto each `StreamStart` and to self-demote when a
     /// replica handshakes with a higher epoch.
     fence_state: Arc<melin_transport_core::fence::FenceState>,
-    /// The active ack policy — stamped on `StreamStart` and
-    /// `Heartbeat` (see the kernel-TCP `Sender::ack_policy`).
+    /// The requested ack policy, which may not be in force yet — stamped
+    /// on `StreamStart` and `Heartbeat` (see the kernel-TCP
+    /// `Sender::ack_policy`).
     ack_policy: Arc<std::sync::atomic::AtomicU8>,
     /// Operator key table. `Arc` because it's shared, read-only, with the
     /// client-auth path and the kernel-TCP sender; the driver only ever

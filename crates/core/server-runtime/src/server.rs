@@ -15,7 +15,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tracing::{debug, error, info, warn};
 
@@ -940,13 +940,13 @@ where
     };
     log_layout(&config.cores);
 
-    // Shared ack-policy atomic, constructed once per process and
-    // threaded through both roles. Wiring it on the replica path
-    // (where the live node has no response stage) lets an operator
-    // pre-stage the post-promotion policy with `ACK-POLICY <policy>`
-    // before issuing `PROMOTE`; the same `Arc` becomes the response
-    // stage's source of truth after the replica → primary transition.
-    let ack_policy_atomic = Arc::new(AtomicU8::new(config.ack_policy.as_u8()));
+    // The ack-policy mailbox, constructed once per process and threaded
+    // through both roles. On the replica path (no input ring producer)
+    // `ACK-POLICY <policy>` stages the post-promotion policy; after the
+    // replica → primary transition the same mailbox feeds the new
+    // primary's producer, which journals each change. See
+    // `crate::policy_control`.
+    let ack_policy = crate::policy_control::AckPolicyControl::new(config.ack_policy);
 
     // Validate before the bind below and before anything touches the
     // journal directory, so a refused boot has no side effects and leaves
@@ -1025,7 +1025,7 @@ where
                     addr,
                     Some(promotion_request.clone()),
                     rotate_flag.clone(),
-                    Some(Arc::clone(&ack_policy_atomic)),
+                    Some(Arc::clone(&ack_policy)),
                     Arc::clone(&shutdown),
                     Arc::clone(&authorized_keys),
                 )
@@ -1078,7 +1078,7 @@ where
                 wiring.status,
                 control.clone(),
                 Arc::clone(&fence_state),
-                Arc::clone(&ack_policy_atomic),
+                ack_policy.requested_byte(),
                 wiring.peer_tips,
                 wiring.peer_ids,
                 wiring.elect_requested,
@@ -1160,7 +1160,7 @@ where
                     Arc::clone(&shutdown),
                     authorized_keys,
                     rotate_flag,
-                    ack_policy_atomic,
+                    ack_policy,
                     fence_state,
                     control.lineage_ack_policy.load(),
                     promotion_request.pending(), // promoted — EpochBump with the request's epoch floor
@@ -1184,7 +1184,7 @@ where
                 addr,
                 None,
                 rotate_flag.clone(),
-                Some(Arc::clone(&ack_policy_atomic)),
+                Some(Arc::clone(&ack_policy)),
                 Arc::clone(&shutdown),
                 Arc::clone(&authorized_keys),
             )
@@ -1263,7 +1263,7 @@ where
         Arc::clone(&shutdown),
         authorized_keys,
         rotate_flag,
-        ack_policy_atomic,
+        ack_policy,
         fence_state,
         recovered_lineage.ack_policy,
         None, // not promoted — no EpochBump injection
@@ -1635,11 +1635,14 @@ fn run_as_primary<A, L>(
     shutdown: Arc<AtomicBool>,
     authorized_keys: Arc<AuthorizedKeys>,
     rotate_flag: Option<Arc<AtomicBool>>,
-    ack_policy_atomic: Arc<AtomicU8>,
+    // The ack-policy mailbox: the policy this primary requests as it
+    // starts, and the `ACK-POLICY` requests its reader journals.
+    ack_policy: Arc<crate::policy_control::AckPolicyControl>,
     fence_state: Arc<melin_transport_core::fence::FenceState>,
     // The ack policy the lineage has in force (`Lineage::ack_policy`): the
     // recovered one at boot, the replica's record of it at promotion.
-    // Seeds the shadow stage's lineage next to the fence epoch.
+    // Seeds the shadow stage's lineage next to the fence epoch, and the
+    // gate's starting policy.
     lineage_ack_policy: Option<AckPolicyByte>,
     promotion: Option<u64>,
     // This boot began the history (`InitializedEngine::began_history`):
@@ -1798,8 +1801,15 @@ where
     let matching_utilization = matching_stage.utilization();
     let response_utilization = Arc::new(melin_transport_core::pipeline::StageUtilization::new());
     // Resolved before any stage starts, so a lineage under an unknown
-    // policy refuses here with nothing to unwind.
-    let gate_policy = primary_gate_policy(lineage_ack_policy, &ack_policy_atomic, &matching_stage)?;
+    // policy refuses here with nothing to unwind. The claim is this
+    // tenure's: its policy is journaled below, and the reader attaches it.
+    let ack_policy_claim = ack_policy.claim();
+    let gate_policy = primary_gate_policy(
+        lineage_ack_policy,
+        ack_policy_claim.policy(),
+        enable_replication,
+        &matching_stage,
+    )?;
 
     // Wrap each spawn closure with a tail log so a thread that returns
     // (cleanly OR via `Err`) is visible in the trace stream — the
@@ -1972,7 +1982,7 @@ where
             .ok_or("replication_metrics must be Some when replication is enabled")?;
         let handlers = [cores.repl_handler_0, cores.repl_handler_1];
         let sender_fence = Arc::clone(&fence_state);
-        let sender_ack_policy = Arc::clone(&ack_policy_atomic);
+        let sender_ack_policy = ack_policy.requested_byte();
         // Bound in `run_impl` before any pipeline thread was spawned —
         // see the `repl_listener` parameter doc.
         let repl_listener = repl_listener
@@ -2090,6 +2100,14 @@ where
             &shutdown,
         );
     }
+    // The policy this tenure requests, after the bump; see
+    // `journal_boot_policy_change`.
+    journal_boot_policy_change(
+        lineage_ack_policy,
+        ack_policy_claim.policy(),
+        halt_gate.witnesses(),
+        &mut input_producer,
+    );
 
     // Bring-up gate: a primary that began the history with replication
     // on serves no client until its first replica is streaming live. A
@@ -2138,6 +2156,7 @@ where
         decoder,
         halt_gate,
         refusal_tx,
+        ack_policy_claim,
         control_tx.clone(),
         config.cores.reader.core,
         connection_timeout,
@@ -2432,10 +2451,10 @@ where
         );
     }
 
-    // Mirrors the kernel-TCP `run` path: one atomic per
-    // process, threaded into both replica (pre-staging for promotion)
-    // and primary admin listeners.
-    let ack_policy_atomic = Arc::new(AtomicU8::new(config.ack_policy.as_u8()));
+    // Mirrors the kernel-TCP `run` path: one ack-policy mailbox per
+    // process, threaded into both replica (staging for promotion) and
+    // primary admin listeners.
+    let ack_policy = crate::policy_control::AckPolicyControl::new(config.ack_policy);
     // As on the kernel-TCP path: refuse a configuration no primary can run
     // under before EAL init and before anything touches the journal, in
     // every role — a replica's configuration is the one it serves under
@@ -2494,7 +2513,7 @@ where
                     addr,
                     Some(promotion_request.clone()),
                     rotate_flag.clone(),
-                    Some(Arc::clone(&ack_policy_atomic)),
+                    Some(Arc::clone(&ack_policy)),
                     Arc::clone(&shutdown),
                     Arc::clone(&authorized_keys),
                 )
@@ -2542,7 +2561,7 @@ where
                 wiring.status,
                 control.clone(),
                 Arc::clone(&fence_state),
-                Arc::clone(&ack_policy_atomic),
+                ack_policy.requested_byte(),
                 wiring.peer_tips,
                 wiring.peer_ids,
                 wiring.elect_requested,
@@ -2658,7 +2677,7 @@ where
                     Arc::clone(&shutdown),
                     authorized_keys,
                     rotate_flag,
-                    ack_policy_atomic,
+                    ack_policy,
                     fence_state,
                     control.lineage_ack_policy.load(),
                     promotion_request.pending(), // promoted — EpochBump with the request's epoch floor
@@ -2765,7 +2784,7 @@ where
                 addr,
                 None,
                 rotate_flag.clone(),
-                Some(Arc::clone(&ack_policy_atomic)),
+                Some(Arc::clone(&ack_policy)),
                 Arc::clone(&shutdown),
                 Arc::clone(&authorized_keys),
             )
@@ -2786,7 +2805,7 @@ where
         Arc::clone(&shutdown),
         authorized_keys,
         rotate_flag,
-        ack_policy_atomic,
+        ack_policy,
         fence_state,
         recovered_lineage.ack_policy,
         None, // not promoted — no EpochBump injection
@@ -2826,7 +2845,7 @@ fn run_as_primary_dpdk<A>(
     shutdown: Arc<AtomicBool>,
     authorized_keys: Arc<AuthorizedKeys>,
     rotate_flag: Option<Arc<AtomicBool>>,
-    ack_policy_atomic: Arc<AtomicU8>,
+    ack_policy: Arc<crate::policy_control::AckPolicyControl>,
     fence_state: Arc<melin_transport_core::fence::FenceState>,
     lineage_ack_policy: Option<AckPolicyByte>,
     promotion: Option<u64>,
@@ -2971,8 +2990,15 @@ where
     let journal_utilization = journal_stage.utilization();
     let matching_utilization = matching_stage.utilization();
     let response_utilization = Arc::new(melin_transport_core::pipeline::StageUtilization::new());
-    // As on kernel TCP: resolved before any stage starts.
-    let gate_policy = primary_gate_policy(lineage_ack_policy, &ack_policy_atomic, &matching_stage)?;
+    // As on kernel TCP: resolved before any stage starts, from this
+    // tenure's claim, which the poll thread attaches.
+    let ack_policy_claim = ack_policy.claim();
+    let gate_policy = primary_gate_policy(
+        lineage_ack_policy,
+        ack_policy_claim.policy(),
+        enable_replication,
+        &matching_stage,
+    )?;
 
     let s1 = Arc::clone(&shutdown);
     // As on kernel TCP: start the journal's helper threads here, not on
@@ -3140,7 +3166,7 @@ where
             batch_size,
             heartbeat_secs,
             Arc::clone(&fence_state),
-            Arc::clone(&ack_policy_atomic),
+            ack_policy.requested_byte(),
             Arc::clone(&authorized_keys),
         )?;
         // Legacy text match — `lan-bench-suite.sh` `wait_for_log` keys
@@ -3170,6 +3196,13 @@ where
             &shutdown,
         );
     }
+    // As on kernel TCP: the policy this tenure requests, after the bump.
+    journal_boot_policy_change(
+        lineage_ack_policy,
+        ack_policy_claim.policy(),
+        halt_gate.witnesses(),
+        &mut input_producer,
+    );
 
     // Journal `on_primary` through the pipeline. Genesis is already in
     // the journal (`init_engine` creates the journal with it); replicas
@@ -3238,6 +3271,8 @@ where
         decoder,
         halt_gate,
         refusal_tx,
+        // No wakeup: the poll thread never parks.
+        ack_policy_claim.attach(None),
         control_tx,
         tx_rx_0,
         &shutdown,
@@ -3286,7 +3321,6 @@ fn journal_promotion_epoch_bump<E: melin_app::AppEvent>(
 ) {
     use melin_app::unix_epoch_nanos;
     use melin_journal::JournalEvent;
-    use melin_transport_core::trace::mono_trace_ns;
 
     let new_epoch = fence_state.epoch().saturating_add(1).max(requested_epoch);
     // Re-validate the term↔epoch alignment at the moment the epoch is
@@ -3312,15 +3346,10 @@ fn journal_promotion_epoch_bump<E: melin_app::AppEvent>(
         new_epoch,
         requested_epoch, "promotion: injecting epoch bump"
     );
-    input_producer.publish(InputSlot {
-        connection_id: 0,
-        key_hash: 0,
-        sequence: 0,
-        timestamp_ns: unix_epoch_nanos(),
-        event: JournalEvent::EpochBump { epoch: new_epoch },
-        publish_ts: mono_trace_ns(),
-        recv_ts: mono_trace_ns(),
-    });
+    input_producer.publish(InputSlot::node_event(
+        JournalEvent::EpochBump { epoch: new_epoch },
+        unix_epoch_nanos(),
+    ));
     // Wait until the matching stage observes the bump (epoch raised) so
     // the node advertises `new_epoch` on the very first handshake. Bounded
     // by the shutdown flag so a stuck pipeline can't wedge startup.
@@ -3357,7 +3386,6 @@ fn journal_on_primary_events<E: melin_app::AppEvent>(
 ) {
     use melin_app::unix_epoch_nanos;
     use melin_journal::JournalEvent;
-    use melin_transport_core::trace::mono_trace_ns;
 
     let on_primary_count = on_primary.len();
     // Nothing published: the cursors never advance past a target, so
@@ -3372,15 +3400,10 @@ fn journal_on_primary_events<E: melin_app::AppEvent>(
     // event as `JournalEvent::App` and stamps transport-level metadata.
     let mut last_published_seq = 0u64;
     for event in on_primary {
-        last_published_seq = input_producer.publish(InputSlot {
-            connection_id: 0,
-            key_hash: 0,
-            sequence: 0,
-            timestamp_ns: unix_epoch_nanos(),
-            event: JournalEvent::App(event),
-            publish_ts: mono_trace_ns(),
-            recv_ts: mono_trace_ns(),
-        });
+        last_published_seq = input_producer.publish(InputSlot::node_event(
+            JournalEvent::App(event),
+            unix_epoch_nanos(),
+        ));
     }
     let publish_elapsed = start.elapsed();
 
@@ -3741,20 +3764,22 @@ fn build_replication_metrics(
 }
 
 /// The response gate's policy on a new primary pipeline: it starts under
-/// the lineage's policy, or the requested one (`ack_policy_atomic`: the
-/// configured policy, or one an operator staged) while the lineage holds
-/// none — see [`initial_gate_policy`](crate::durability_gate::initial_gate_policy).
+/// the lineage's policy, or `requested` (the configured policy, or one an
+/// operator staged) while the lineage holds none or replication is
+/// disabled — see [`initial_gate_policy`](crate::durability_gate::initial_gate_policy).
 /// Seeds the health endpoint's "journaled" gauge with the lineage's
 /// policy, and wires the matching stage's forced changes to the gate.
 fn primary_gate_policy<A: Application>(
     lineage_ack_policy: Option<AckPolicyByte>,
-    ack_policy_atomic: &Arc<AtomicU8>,
+    requested: crate::ack_policy::AckPolicy,
+    replication_enabled: bool,
     matching_stage: &melin_transport_core::pipeline::MatchingStage<A>,
 ) -> Result<crate::durability_gate::GatePolicy, String> {
-    let requested_byte = ack_policy_atomic.load(Ordering::Relaxed);
-    let requested = crate::ack_policy::AckPolicy::from_u8(requested_byte)
-        .ok_or_else(|| format!("the requested ack policy byte {requested_byte} is corrupted"))?;
-    let initial = crate::durability_gate::initial_gate_policy(lineage_ack_policy, requested)?;
+    let initial = crate::durability_gate::initial_gate_policy(
+        lineage_ack_policy,
+        requested,
+        replication_enabled,
+    )?;
     matching_stage
         .utilization()
         .ack_policy_journaled
@@ -3768,10 +3793,33 @@ fn primary_gate_policy<A: Application>(
     );
     Ok(crate::durability_gate::GatePolicy {
         initial,
-        admin: Arc::clone(ack_policy_atomic),
-        admin_seen: requested_byte,
         forced: matching_stage.forced_policy(),
     })
+}
+
+/// Journal the ack-policy change a primary starts or is promoted with, if
+/// any (see [`boot_change`](crate::policy_control::boot_change)): the
+/// requested policy, when the lineage holds another or none. From the main
+/// thread, while it is still the input ring's only producer, ahead of
+/// `on_primary` and of any client. Not waited on: the gate switches at the
+/// entry's slot, in order, once the policy before it has cleared it.
+fn journal_boot_policy_change<E: melin_app::AppEvent>(
+    lineage_ack_policy: Option<AckPolicyByte>,
+    requested: crate::ack_policy::AckPolicy,
+    witnesses: crate::policy_control::Witnesses,
+    input_producer: &mut melin_pipeline::ring::Producer<InputSlot<E>>,
+) {
+    let Some(change) = crate::policy_control::boot_change(lineage_ack_policy, requested, witnesses)
+    else {
+        return;
+    };
+    info!(
+        policy = %requested,
+        unwitnessed = change.unwitnessed,
+        lineage = ?lineage_ack_policy.map(|byte| byte.0),
+        "journaling the requested ack policy"
+    );
+    input_producer.publish(crate::policy_control::change_slot(change));
 }
 
 fn spawn_shadow_stage<A: Application + Send + 'static>(
@@ -5240,7 +5288,7 @@ mod genesis_tests {
 #[cfg(test)]
 mod primary_gate_policy_tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU8, AtomicU64};
+    use std::sync::atomic::AtomicU64;
 
     use counter_server::{Counter, CounterEvent};
     use melin_journal::AckPolicyByte;
@@ -5284,30 +5332,86 @@ mod primary_gate_policy_tests {
     #[test]
     fn the_lineage_policy_wins_and_seeds_the_journaled_gauge() {
         let stage = matching_stage();
-        let requested = Arc::new(AtomicU8::new(AckPolicy::Disk.as_u8()));
         let lineage = Some(AckPolicy::TwoDisks.to_byte());
-        let policy = primary_gate_policy(lineage, &requested, &stage).expect("a known policy");
+        let policy =
+            primary_gate_policy(lineage, AckPolicy::Disk, true, &stage).expect("a known policy");
         assert_eq!(policy.initial, AckPolicy::TwoDisks);
-        assert!(Arc::ptr_eq(&policy.admin, &requested));
-        assert_eq!(policy.admin_seen, AckPolicy::Disk.as_u8());
         assert_eq!(stage.utilization().ack_policy_journaled.load(), lineage);
         assert_eq!(policy.forced.load(), None::<ForcedPolicy>);
 
         let stage = matching_stage();
-        let policy = primary_gate_policy(None, &requested, &stage).expect("a known policy");
+        let policy =
+            primary_gate_policy(None, AckPolicy::Disk, true, &stage).expect("a known policy");
         assert_eq!(policy.initial, AckPolicy::Disk, "no lineage policy");
         assert_eq!(stage.utilization().ack_policy_journaled.load(), None);
+
+        // Standalone: the requested policy, the gauge still the lineage's.
+        let stage = matching_stage();
+        let policy =
+            primary_gate_policy(lineage, AckPolicy::Disk, false, &stage).expect("a known policy");
+        assert_eq!(policy.initial, AckPolicy::Disk);
+        assert_eq!(stage.utilization().ack_policy_journaled.load(), lineage);
     }
 
-    /// An unknown byte, in the lineage or in the requested atomic, refuses
-    /// the primary instead of serving under a guess.
+    /// An unknown lineage byte refuses the primary instead of serving
+    /// under a guess.
     #[test]
     fn an_unknown_policy_byte_refuses_the_primary() {
         let stage = matching_stage();
-        let requested = Arc::new(AtomicU8::new(AckPolicy::Disk.as_u8()));
-        assert!(primary_gate_policy(Some(AckPolicyByte(0xEE)), &requested, &stage).is_err());
-        let corrupted = Arc::new(AtomicU8::new(0xEE));
-        assert!(primary_gate_policy(None, &corrupted, &stage).is_err());
+        for replication in [true, false] {
+            assert!(
+                primary_gate_policy(
+                    Some(AckPolicyByte(0xEE)),
+                    AckPolicy::Disk,
+                    replication,
+                    &stage
+                )
+                .is_err()
+            );
+        }
+    }
+
+    /// The boot entry is published on the input ring as the node's own
+    /// event when the lineage holds another policy, and not at all when it
+    /// holds the requested one.
+    #[test]
+    fn the_boot_change_is_published_only_when_the_lineage_differs() {
+        use crate::policy_control::Witnesses;
+        use melin_journal::{AckPolicyChange, JournalEvent};
+
+        let (mut producer, mut consumers) = DisruptorBuilder::<InputSlot<CounterEvent>>::new(8)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
+        let mut consumer = consumers.pop().expect("one consumer");
+        let disk = Some(AckPolicy::Disk.to_byte());
+        super::journal_boot_policy_change(
+            disk,
+            AckPolicy::Disk,
+            Witnesses::NoneConnected,
+            &mut producer,
+        );
+        assert!(consumer.try_consume().is_none(), "nothing to change");
+        super::journal_boot_policy_change(
+            disk,
+            AckPolicy::DiskAndRam,
+            Witnesses::NoneConnected,
+            &mut producer,
+        );
+        let (_, slot) = consumer.try_consume().expect("the change");
+        assert_eq!(
+            (slot.connection_id, slot.key_hash, slot.sequence),
+            (0, 0, 0)
+        );
+        let JournalEvent::AckPolicyChange(change) = slot.event else {
+            panic!("not a policy change");
+        };
+        assert_eq!(
+            change,
+            AckPolicyChange {
+                policy: AckPolicy::DiskAndRam.to_byte(),
+                unwitnessed: false,
+            }
+        );
     }
 }
 

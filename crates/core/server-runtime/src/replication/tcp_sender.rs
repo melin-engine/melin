@@ -76,10 +76,11 @@ pub struct Sender {
     /// `StreamStart`, and to self-demote when a replica handshakes with a
     /// higher epoch (this primary has been superseded). See `crate::fence`.
     pub fence_state: Arc<melin_transport_core::fence::FenceState>,
-    /// The active ack policy, shared with the response gate and the
-    /// admin `ACK-POLICY` command. Stamped on every `StreamStart` and
-    /// `Heartbeat` so replicas judge auto-promotion against the policy
-    /// this primary actually acks under.
+    /// The requested ack policy's byte (`AckPolicyControl::requested_byte`):
+    /// the policy last staged or journaled, which may not be in force yet
+    /// (a witnessed change waits for its witnesses). Stamped on every
+    /// `StreamStart` and `Heartbeat` so replicas judge auto-promotion
+    /// against it.
     pub ack_policy: Arc<std::sync::atomic::AtomicU8>,
 }
 

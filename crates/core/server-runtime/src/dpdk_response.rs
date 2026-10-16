@@ -209,10 +209,6 @@ pub fn run<A: Application>(
     let mut last_stats_flush = Instant::now();
 
     'run: loop {
-        // Observe runtime policy swaps from the admin `ACK-POLICY`
-        // command — see `DurabilityGate::observe_policy_swap`.
-        gate.observe_policy_swap();
-
         // Fencing note: a superseded ex-primary exits through this same
         // shutdown branch (`FenceState::fence_if_superseded` co-sets
         // `shutdown`). Unlike the kernel response stage there is no
