@@ -20,8 +20,6 @@
 //! `scripts/dpdk/netns-runner.sh` (see
 //! `docs/internal/dpdk-testing.md`).
 
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -37,6 +35,10 @@ use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
 use melin_test_node::{Addrs, Node};
 use melin_transport_core::test_ports::free_addr;
+
+#[path = "common/health.rs"]
+mod health;
+use health::wait_for_gauge;
 
 /// Port range for `free_addr`, shared with `replicated_failover.rs`: every
 /// other range below the ephemeral floor is taken. Sharing is safe only
@@ -59,30 +61,6 @@ fn spawn_node(addrs: &Addrs, config: ServerConfig) -> Node {
         RequestDecoder,
         ResponseEncoder,
     )
-}
-
-/// The value of one Prometheus gauge on a node's health endpoint, or `None`
-/// while the endpoint is not up.
-fn gauge(health: SocketAddr, name: &str) -> Option<u64> {
-    let mut stream = TcpStream::connect_timeout(&health, Duration::from_millis(200)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
-    stream.write_all(b"GET /metrics HTTP/1.1\r\n\r\n").ok()?;
-    let mut body = String::new();
-    stream.read_to_string(&mut body).ok()?;
-    body.lines()
-        .find_map(|line| line.strip_prefix(name)?.trim().parse().ok())
-}
-
-fn wait_for_gauge(health: SocketAddr, name: &str, value: u64) {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while gauge(health, name) != Some(value) {
-        assert!(
-            Instant::now() < deadline,
-            "{name} never reached {value} (last: {:?})",
-            gauge(health, name)
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
 }
 
 /// Send one request and return the single frame of its reply.
