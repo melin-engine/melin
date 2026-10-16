@@ -40,6 +40,7 @@ pub mod journal_disk;
 pub mod journaled_app;
 pub mod lineage;
 pub mod pipeline;
+pub mod replica_presence;
 /// Replication wire protocol, journal-file catch-up, ack queueing,
 /// and per-replica observability metrics. Generic over
 /// `E: AppEvent`; connection orchestration and key authorization live

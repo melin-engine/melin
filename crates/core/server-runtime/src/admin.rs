@@ -794,19 +794,28 @@ mod tests {
         let mut publisher = control.claim().attach(None);
         let (key, addr, shutdown) = spawn_with_policy(&control);
         let polling = Arc::new(AtomicBool::new(true));
+        // No replica connected: the node is halted.
+        let replicas = crate::halt::test_support::presence(0);
+        let halt = crate::halt::test_support::gate_over(Some(Arc::clone(&replicas)));
+        let halted = crate::halt::Verdict::Refuse(melin_app::RejectReason::ReplicaDisconnected);
+        assert_eq!(halt.verdict(), halted);
         let poller = {
             let polling = Arc::clone(&polling);
             std::thread::spawn(move || {
                 while polling.load(Ordering::Relaxed) {
-                    publisher.poll(&mut producer, || {
-                        crate::policy_control::Witnesses::NoneConnected
-                    });
+                    publisher.poll(&mut producer, &halt);
                     std::thread::yield_now();
                 }
             })
         };
 
         assert_eq!(send_command(addr, &key, b"ACK-POLICY disk\n"), "OK");
+        // The halt is lifted by the time the operator reads `OK`.
+        let lifted = crate::halt::test_support::gate_over(Some(Arc::clone(&replicas)));
+        assert_eq!(lifted.verdict(), crate::halt::Verdict::Take);
+        // `ram` needs a replica: journaling it halts the node again.
+        assert_eq!(send_command(addr, &key, b"ACK-POLICY ram\n"), "OK");
+        assert_eq!(lifted.verdict(), halted);
         polling.store(false, Ordering::Relaxed);
         poller.join().expect("the producer panicked");
         let (_, slot) = consumer.try_consume().expect("the entry is on the ring");

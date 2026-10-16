@@ -39,6 +39,11 @@
 //! unwitnessed, which the gate applies once its entry is on this node's
 //! disk. A node with replication disabled has no witness for any change,
 //! so its entries are all unwitnessed too. The rule is [`is_unwitnessed`].
+//!
+//! Journaling a forced change is also the operator's consent to serve on
+//! this node's disk alone, so it lifts the halt on client writes until a
+//! replica connects; journaling a policy that needs a replica restores it
+//! (see `halt`). The producer records both as it journals the entry.
 
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -52,6 +57,7 @@ use melin_transport_core::pipeline::InputSlot;
 use tracing::{info, warn};
 
 use crate::ack_policy::AckPolicy;
+use crate::halt::{Decision, HaltGate};
 
 /// How long an `ACK-POLICY` command waits for its entry to be published
 /// before it is refused. The producer checks the mailbox on every loop, so
@@ -100,6 +106,15 @@ pub fn is_unwitnessed(policy: AckPolicy, origin: Origin, witnesses: Witnesses) -
     }
 }
 
+/// Whether `change`, journaled while `witnesses` were streaming, is a
+/// forced swap: unwitnessed for want of a connected replica, rather than
+/// because replication is disabled. Only an explicit runtime `disk` is
+/// (see [`is_unwitnessed`]). It warns, and lifts the halt
+/// (`HaltGate::record_journaled`).
+pub fn is_forced(change: AckPolicyChange, witnesses: Witnesses) -> bool {
+    change.unwitnessed && witnesses == Witnesses::NoneConnected
+}
+
 /// The change a primary journals as it starts or is promoted, from the
 /// main thread before any other producer runs: the requested policy, when
 /// the lineage holds a different one, or none yet (a new history, or a
@@ -122,19 +137,20 @@ pub fn change_slot<E: AppEvent>(change: AckPolicyChange) -> InputSlot<E> {
 }
 
 /// Log a change being journaled, at the level its risk calls for.
-fn log_journaled(policy: AckPolicy, change: AckPolicyChange, origin: Origin, witnesses: Witnesses) {
-    if change.unwitnessed && witnesses == Witnesses::NoneConnected {
+fn log_journaled(decision: Decision, origin: Origin) {
+    let policy = decision.policy();
+    if decision.is_forced() {
         warn!(
             policy = %policy,
-            "ack policy change forced with no replica connected: it takes effect once on this \
-             node's disk, and a replica that was offline does not hold it — if this node fails \
-             before that replica rejoins, it may auto-promote over events acknowledged under \
-             the new policy"
+            "ack policy change forced with no replica connected: client writes are taken again \
+             until a replica connects, the change takes effect once on this node's disk, and a \
+             replica that was offline does not hold it — if this node fails before that replica \
+             rejoins, it may auto-promote over events acknowledged under the new policy"
         );
     } else {
         info!(
             policy = %policy,
-            unwitnessed = change.unwitnessed,
+            unwitnessed = decision.change().unwitnessed,
             origin = ?origin,
             "ack policy change journaled"
         );
@@ -384,16 +400,20 @@ impl AckPolicyPublisher {
     /// Journal the waiting request, if any. One acquire load when none
     /// waits. On a full ring the request stays, for the next call.
     ///
-    /// `witnesses` is read only when a request waits: it decides whether
-    /// the entry is unwitnessed ([`is_unwitnessed`]).
+    /// `halt` is the producer's own halt gate, read only when a request
+    /// waits: who is streaming decides whether the entry is unwitnessed
+    /// ([`is_unwitnessed`]), and the journaled change then lifts or
+    /// restores the halt ([`HaltGate::record_journaled`]). Taking the gate
+    /// rather than a reading of it is what keeps the two in step: the
+    /// producer cannot journal a forced change without lifting the halt.
     #[inline]
     pub fn poll<E: AppEvent>(
         &mut self,
         producer: &mut ring::Producer<InputSlot<E>>,
-        witnesses: impl FnOnce() -> Witnesses,
+        halt: &HaltGate,
     ) {
         if self.control.pending.load(Ordering::Acquire) {
-            self.publish(producer, witnesses());
+            self.publish(producer, halt);
         }
     }
 
@@ -401,7 +421,7 @@ impl AckPolicyPublisher {
     fn publish<E: AppEvent>(
         &mut self,
         producer: &mut ring::Producer<InputSlot<E>>,
-        witnesses: Witnesses,
+        halt: &HaltGate,
     ) {
         let control = &*self.control;
         let mut state = control.lock();
@@ -409,14 +429,17 @@ impl AckPolicyPublisher {
             // Withdrawn since the flag was read.
             return;
         };
-        let change = AckPolicyChange {
-            policy: request.policy.to_byte(),
-            unwitnessed: is_unwitnessed(request.policy, request.origin, witnesses),
-        };
-        if producer.try_publish(change_slot(change)).is_err() {
+        let decision = halt.observe().decide(request.policy, request.origin);
+        if producer
+            .try_publish(change_slot(decision.change()))
+            .is_err()
+        {
             // Full: the requester's bounded wait decides when to give up.
             return;
         }
+        // Before the requester is released, so a write it sends once told
+        // `OK` meets the halt the change leaves.
+        halt.record_journaled(decision);
         state.request = None;
         state.published = request.ticket;
         state.staged = request.policy;
@@ -426,7 +449,7 @@ impl AckPolicyPublisher {
         control.pending.store(false, Ordering::Release);
         control.changed.notify_all();
         drop(state);
-        log_journaled(request.policy, change, request.origin, witnesses);
+        log_journaled(decision, request.origin);
     }
 }
 
@@ -446,6 +469,8 @@ impl Drop for AckPolicyPublisher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::halt::Verdict;
+    use crate::halt::test_support::{gate_over, presence};
     use counter_server::CounterEvent as TestEvent;
     use melin_pipeline::ring::{Consumer, DisruptorBuilder};
     use melin_pipeline::wait::WaitStrategy;
@@ -561,37 +586,55 @@ mod tests {
         publisher: &mut AckPolicyPublisher,
         producer: &mut ring::Producer<Slot>,
         policy: AckPolicy,
-        witnesses: Witnesses,
+        halt: &HaltGate,
     ) -> RequestOutcome {
         std::thread::scope(|s| {
             let requesting = s.spawn(|| control.request(policy));
             while !requesting.is_finished() {
-                publisher.poll(producer, || witnesses);
+                publisher.poll(producer, halt);
                 std::thread::yield_now();
             }
             requesting.join().expect("the request panicked")
         })
     }
 
+    /// The halt gate of a replicated primary with no replica connected:
+    /// halted, and a runtime `disk` journaled through it is forced.
+    fn halted_gate() -> HaltGate {
+        gate_over(Some(presence(0)))
+    }
+
     /// An attached producer journals each request, in order, duplicates
     /// included, and the requester returns once the entry is on the ring.
-    /// The forced decision is the producer's, at publish time.
+    /// The forced decision is the producer's, at publish time, and so is
+    /// the halt it lifts (the forced `disk`) and restores (`two-disks`
+    /// with no replica): the requester is answered after both.
     #[test]
     fn an_attached_producer_journals_every_request() {
         let control = AckPolicyControl::new(AckPolicy::DiskAndRam);
         let (mut producer, mut consumer) = ring(8);
         let mut publisher = control.claim().attach(None);
-
-        for (policy, witnesses) in [
-            (AckPolicy::Disk, Witnesses::Connected),
-            (AckPolicy::Disk, Witnesses::Connected),
-            (AckPolicy::Disk, Witnesses::NoneConnected),
-            (AckPolicy::TwoDisks, Witnesses::NoneConnected),
-        ] {
+        let replicas = presence(1);
+        let halt = gate_over(Some(Arc::clone(&replicas)));
+        let halted = Verdict::Refuse(melin_app::RejectReason::ReplicaDisconnected);
+        let mut journal = |policy| {
             let outcome =
-                request_while_polling(&control, &mut publisher, &mut producer, policy, witnesses);
+                request_while_polling(&control, &mut publisher, &mut producer, policy, &halt);
             assert_eq!(outcome, RequestOutcome::Published);
-        }
+        };
+
+        journal(AckPolicy::Disk);
+        journal(AckPolicy::Disk);
+        assert!(replicas.lower());
+        assert_eq!(halt.verdict(), halted, "witnessed swaps lift nothing");
+        journal(AckPolicy::Disk);
+        assert_eq!(
+            halt.verdict(),
+            Verdict::Take,
+            "the forced swap lifts the halt"
+        );
+        journal(AckPolicy::TwoDisks);
+        assert_eq!(halt.verdict(), halted, "two-disks restores it");
         assert_eq!(
             changes(&mut consumer),
             [
@@ -608,17 +651,16 @@ mod tests {
         assert_eq!(control.claim().policy(), AckPolicy::TwoDisks);
     }
 
-    /// Nothing waits: polling publishes nothing and never asks who is
-    /// connected.
+    /// Nothing waits: polling publishes nothing and leaves the halt alone.
     #[test]
     fn polling_with_nothing_requested_publishes_nothing() {
         let control = AckPolicyControl::new(AckPolicy::Disk);
         let (mut producer, mut consumer) = ring(8);
         let mut publisher = control.claim().attach(None);
-        publisher.poll(&mut producer, || {
-            panic!("witnesses read with nothing to publish")
-        });
+        let halt = halted_gate();
+        publisher.poll(&mut producer, &halt);
         assert!(changes(&mut consumer).is_empty());
+        assert_ne!(halt.verdict(), Verdict::Take);
     }
 
     /// A ring that stays full past the bound refuses the request, which
@@ -635,21 +677,24 @@ mod tests {
                 .expect("room");
         }
         let mut publisher = control.claim().attach(None);
+        // A `disk` that would be forced: refused, it lifts nothing.
+        let halt = halted_gate();
         let outcome = request_while_polling(
             &control,
             &mut publisher,
             &mut producer,
             AckPolicy::Disk,
-            Witnesses::Connected,
+            &halt,
         );
         assert_eq!(outcome, RequestOutcome::Refused);
         assert_eq!(changes(&mut consumer).len(), 2, "only what filled the ring");
-        publisher.poll(&mut producer, || Witnesses::Connected);
+        publisher.poll(&mut producer, &halt);
         assert!(changes(&mut consumer).is_empty(), "withdrawn");
         assert_eq!(
             control.requested_byte().load(Ordering::Relaxed),
             AckPolicy::DiskAndRam.as_u8()
         );
+        assert_ne!(halt.verdict(), Verdict::Take, "still halted");
     }
 
     /// A producer that stops (shutdown) refuses the request waiting on it,
@@ -675,8 +720,8 @@ mod tests {
 
     /// A request staged between the claim and the attach (a primary still
     /// starting) is journaled by the producer once it attaches, never
-    /// forced; one staged before the claim is the claim's own policy and
-    /// is not journaled twice.
+    /// forced, so it lifts no halt; one staged before the claim is the
+    /// claim's own policy and is not journaled twice.
     #[test]
     fn a_request_staged_after_the_claim_is_journaled_at_attach() {
         let control = AckPolicyControl::new(AckPolicy::DiskAndRam);
@@ -686,13 +731,19 @@ mod tests {
         assert_eq!(control.request(AckPolicy::Disk), RequestOutcome::Staged);
         let (mut producer, mut consumer) = ring(8);
         let mut publisher = claim.attach(None);
-        publisher.poll(&mut producer, || Witnesses::NoneConnected);
+        let halt = halted_gate();
+        publisher.poll(&mut producer, &halt);
         assert_eq!(changes(&mut consumer), [change(AckPolicy::Disk, false)]);
+        assert_ne!(
+            halt.verdict(),
+            Verdict::Take,
+            "a staged `disk` is no consent"
+        );
 
         let control = AckPolicyControl::new(AckPolicy::DiskAndRam);
         assert_eq!(control.request(AckPolicy::TwoDisks), RequestOutcome::Staged);
         let mut publisher = control.claim().attach(None);
-        publisher.poll(&mut producer, || Witnesses::NoneConnected);
+        publisher.poll(&mut producer, &halt);
         assert!(changes(&mut consumer).is_empty());
     }
 
@@ -705,12 +756,13 @@ mod tests {
         assert_eq!(control.request(AckPolicy::TwoDisks), RequestOutcome::Staged);
         let (mut producer, mut consumer) = ring(8);
         let mut publisher = claim.attach(None);
+        let halt = halted_gate();
         let outcome = request_while_polling(
             &control,
             &mut publisher,
             &mut producer,
             AckPolicy::Disk,
-            Witnesses::NoneConnected,
+            &halt,
         );
         assert_eq!(outcome, RequestOutcome::Published);
         assert_eq!(
@@ -720,6 +772,7 @@ mod tests {
                 change(AckPolicy::Disk, true)
             ]
         );
+        assert_eq!(halt.verdict(), Verdict::Take, "the forced swap came last");
     }
 
     /// A staged request the producer cannot publish in time holds the

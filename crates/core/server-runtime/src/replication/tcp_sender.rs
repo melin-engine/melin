@@ -7,15 +7,16 @@
 use std::io::{self, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::{debug, error, info, warn};
 
 use melin_journal::replication::ReplicationConsumer;
 use melin_pipeline::wait::WaitStrategy;
+use melin_transport_core::replica_presence::ReplicaPresence;
 
 use super::auth::authenticate_replica;
-use super::{ReplicaCursors, ReplicaGate, ReplicationMetrics, SentHighWater};
+use super::{ReplicaCursors, ReplicationMetrics, SentHighWater};
 use crate::layout::Placement;
 use crate::uring_teardown::{DrainBackoff, wake_pending_ops};
 use melin_app::Application;
@@ -87,7 +88,7 @@ pub fn run_sender<A: Application>(
     config: Sender,
     shutdown: &AtomicBool,
     replica_ready: &AtomicBool,
-    replicas_connected: &AtomicU32,
+    replicas_connected: &ReplicaPresence,
 ) {
     let Sender {
         listener,
@@ -203,7 +204,7 @@ pub fn run_sender<A: Application>(
             // `join()` ordered the handler's post-auth writes before here.
             // `lower` warns "halted" if this was the last replica.
             if authenticated_flags[slot_idx].swap(false, Ordering::AcqRel) {
-                ReplicaGate::new(replicas_connected).lower();
+                replicas_connected.lower();
             }
             // Disengage cursors BEFORE clearing the active flag — ordering
             // contract B2 (see `ReplicaCursors`).
@@ -307,7 +308,7 @@ pub fn run_sender<A: Application>(
                     let handler = handlers[slot_idx];
                     let shutdown_flag = shutdown as *const AtomicBool as usize;
                     let ready_flag = replica_ready as *const AtomicBool as usize;
-                    let connected_flag = replicas_connected as *const AtomicU32 as usize;
+                    let connected_flag = replicas_connected as *const ReplicaPresence as usize;
                     // Pinned to a dedicated core if configured (> 0),
                     // otherwise on the home mask — created in that
                     // placement rather than inheriting the accept
@@ -326,7 +327,8 @@ pub fn run_sender<A: Application>(
                             // Safety: replicas_connected outlives this thread —
                             // same lifetime argument as shutdown/replica_ready
                             // above (the parent blocks on join during shutdown).
-                            let connected_ref = unsafe { &*(connected_flag as *const AtomicU32) };
+                            let connected_ref =
+                                unsafe { &*(connected_flag as *const ReplicaPresence) };
                             let ctx = SlotContext {
                                 cursors: &slot_cursors,
                                 journal_path: &jpath,
@@ -407,9 +409,9 @@ struct SlotContext<'a> {
     batch_size: usize,
     heartbeat_secs: u64,
     wait: WaitStrategy,
-    /// Halt gate. The handler lifts it (`fetch_add`) only after auth
-    /// succeeds; the main loop lowers it on teardown, gated by `authenticated`.
-    replicas_connected: &'a AtomicU32,
+    /// Halt gate. The handler lifts it only after auth succeeds; the main
+    /// loop lowers it on teardown, gated by `authenticated`.
+    replicas_connected: &'a ReplicaPresence,
     /// Per-slot latch the handler sets true once this connection passes auth,
     /// so the main loop knows whether this slot lifted the gate.
     authenticated: &'a AtomicBool,
@@ -471,7 +473,7 @@ fn handle_replica_connection<A: Application>(
     // it on slot teardown, reading `authenticated` to know this connection
     // lifted it. Set the latch after the increment so a post-join read of the
     // latch implies the increment is visible too.
-    ReplicaGate::new(replicas_connected).lift();
+    replicas_connected.lift();
     authenticated.store(true, Ordering::Release);
 
     // Read handshake.

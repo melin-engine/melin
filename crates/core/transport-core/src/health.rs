@@ -30,7 +30,7 @@
 use std::io::{Cursor, Read as _, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use melin_pipeline::padding::Sequence;
@@ -39,6 +39,7 @@ use tracing::{debug, error, info};
 
 use crate::cursors::{PipelineCursors, RingPos, WireSeq};
 use crate::pipeline::{INPUT_RING_CAPACITY, StageUtilization};
+use crate::replica_presence::ReplicaPresence;
 
 /// Shared monitoring state passed to the health loop.
 /// Bundles all the atomics/cursors into one struct to avoid parameter explosion.
@@ -62,7 +63,9 @@ pub struct HealthState {
     /// consumer position to compute input queue depth.
     pub input_cursor: Box<dyn QueueCursor>,
     pub pipeline_healthy: Arc<AtomicBool>,
-    pub replicas_connected: Option<Arc<AtomicU32>>,
+    /// Connected replicas and the halt override. `None` in standalone
+    /// mode, which never halts for want of a replica.
+    pub replicas_connected: Option<Arc<ReplicaPresence>>,
     /// Node fencing state. Folded into the `trading` flag so a fenced
     /// (superseded) ex-primary reports `halted` to probes and monitoring
     /// for the short window before the process finishes winding down —
@@ -114,7 +117,7 @@ impl HealthState {
     /// (the runtime feeds the replica pipeline's journal-failure latch)
     /// and drives `/health` OK/ERR plus the `melin_pipeline_healthy`
     /// gauge. The queue/journal/replication gauges are intentionally
-    /// unpopulated (0); `replicas_connected: Some(0)` makes the node
+    /// unpopulated (0); `replicas_connected` with none connected makes the node
     /// report `halted` (it is following, not serving writes), and the fence
     /// state still surfaces a superseded ex-primary. This reuses the one
     /// `/metrics` implementation and exposition format rather than
@@ -135,9 +138,9 @@ impl HealthState {
             ),
             input_cursor: Box::new(ZeroCursor),
             pipeline_healthy,
-            // `Some(0)` (not `None`) so the trading flag reports
+            // `Some` with none connected (not `None`) so the trading flag reports
             // `halted` — a replica is not accepting client writes.
-            replicas_connected: Some(Arc::new(AtomicU32::new(0))),
+            replicas_connected: Some(Arc::new(ReplicaPresence::new())),
             fence_state: Some(fence_state),
             replication_metrics: None,
             replica_active: None,
@@ -383,24 +386,26 @@ impl HealthSnapshot {
             None => 0,
         };
 
-        // Trading state: "trading" when standalone or at least one replica
-        // connected, "halted" when replication is enabled but all replicas
-        // are disconnected — or when the node has been fenced (superseded
-        // by a higher-epoch primary). Mirrors the readers' halt gate
-        // (`HaltGate` in the server runtime) so probes agree with what the
-        // node enforces.
+        // Trading state: "trading" when standalone, with at least one
+        // replica connected, or with the operator's halt override in
+        // force; "halted" when replication is enabled but all replicas are
+        // disconnected — or when the node has been fenced (superseded by a
+        // higher-epoch primary). The same rule as the readers' halt gate
+        // (`HaltGate` in the server runtime, through
+        // `ReplicaPresence::halted`) so probes agree with what the node
+        // enforces.
         let fenced = state.fence_state.as_ref().is_some_and(|f| f.is_fenced());
         let trading = !fenced
             && state
                 .replicas_connected
                 .as_ref()
-                .is_none_or(|count| count.load(Ordering::Relaxed) > 0);
+                .is_none_or(|presence| !presence.halted());
 
         // Per-replica metrics from the replication sender (if enabled).
         let replicas_connected_val = state
             .replicas_connected
             .as_ref()
-            .map_or(0, |c| c.load(Ordering::Relaxed));
+            .map_or(0, |presence| presence.connected());
 
         type ReplMetricsTuple = (
             [u64; 2],
@@ -1267,6 +1272,15 @@ mod tests {
         cursors
     }
 
+    /// A replica presence with `connected` replicas streaming.
+    fn presence(connected: u32) -> Arc<ReplicaPresence> {
+        let presence = Arc::new(ReplicaPresence::new());
+        for _ in 0..connected {
+            presence.lift();
+        }
+        presence
+    }
+
     /// Helper: create a non-blocking listener and spawn the health loop.
     /// Returns (addr, events_processed, pipeline_healthy, shutdown_flag, join_handle).
     /// `replicas_connected` is None (standalone mode) unless overridden.
@@ -1292,7 +1306,7 @@ mod tests {
         active: u64,
         journal_seq: u64,
         repl_acked: u64,
-        replicas_connected: Option<Arc<AtomicU32>>,
+        replicas_connected: Option<Arc<ReplicaPresence>>,
         fence_state: Option<Arc<crate::fence::FenceState>>,
     ) -> (
         SocketAddr,
@@ -1548,17 +1562,42 @@ mod tests {
 
     #[test]
     fn health_shows_halted_when_replica_disconnected() {
-        let replica_count = Arc::new(AtomicU32::new(0)); // no replicas connected
+        let presence = presence(0); // no replicas connected
         let (addr, _events, _healthy, shutdown, handle) =
-            start_health_with_replica(5, 100, u64::MAX, Some(Arc::clone(&replica_count)), None);
+            start_health_with_replica(5, 100, u64::MAX, Some(Arc::clone(&presence)), None);
 
         let buf = read_health(addr);
         assert_eq!(buf, "OK 5 100 0 halted\n");
 
         // Connect a replica — should switch to trading.
-        replica_count.store(1, Ordering::Relaxed);
+        presence.lift();
         let buf = read_health(addr);
         assert_eq!(buf, "OK 5 100 0 trading\n");
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    /// The operator's halt override is folded in by the same rule the
+    /// readers enforce: `trading` while it holds, `halted` again once a
+    /// replica has connected and left.
+    #[test]
+    fn health_follows_the_halt_override() {
+        use crate::replica_presence::Observed;
+        let presence = presence(0);
+        let (addr, _events, _healthy, shutdown, handle) =
+            start_health_with_replica(5, 100, u64::MAX, Some(Arc::clone(&presence)), None);
+        assert_eq!(read_health(addr), "OK 5 100 0 halted\n");
+
+        let Observed::NoneConnected(since) = presence.observe() else {
+            panic!("no replica is connected");
+        };
+        presence.latch_override(since);
+        assert_eq!(read_health(addr), "OK 5 100 0 trading\n");
+
+        presence.lift();
+        presence.lower();
+        assert_eq!(read_health(addr), "OK 5 100 0 halted\n");
 
         shutdown.store(true, Ordering::Relaxed);
         handle.join().unwrap();
@@ -1570,13 +1609,12 @@ mod tests {
     /// off the fence latch, not just the count.
     #[test]
     fn health_shows_halted_when_fenced() {
-        let replica_count = Arc::new(AtomicU32::new(1)); // replica still connected
         let fence = Arc::new(crate::fence::FenceState::new(0));
         let (addr, _events, _healthy, shutdown, handle) = start_health_with_replica(
             5,
             100,
             u64::MAX,
-            Some(Arc::clone(&replica_count)),
+            Some(presence(1)), // replica still connected
             Some(Arc::clone(&fence)),
         );
 
@@ -1683,9 +1721,9 @@ mod tests {
     #[test]
     fn metrics_boolean_encoding() {
         // Verify that unhealthy + halted → 0 values.
-        let replica_count = Arc::new(AtomicU32::new(0)); // disconnected → halted
+        // Disconnected → halted.
         let (addr, _events, healthy, shutdown, handle) =
-            start_health_with_replica(0, 0, u64::MAX, Some(Arc::clone(&replica_count)), None);
+            start_health_with_replica(0, 0, u64::MAX, Some(presence(0)), None);
 
         healthy.store(false, Ordering::Relaxed);
 
@@ -2255,7 +2293,7 @@ mod tests {
             cursors: test_cursors(1000, 1000, 1000, 800),
             input_cursor: Box::new(MockCursor(AtomicU64::new(1000))),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
-            replicas_connected: Some(Arc::new(AtomicU32::new(2))),
+            replicas_connected: Some(presence(2)),
             fence_state: None,
             replication_metrics: Some(metrics),
             replica_active: Some([
@@ -2339,7 +2377,7 @@ mod tests {
             cursors: test_cursors(1_000, 1_000, 1_000, 0),
             input_cursor: Box::new(MockCursor(AtomicU64::new(1_000))),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
-            replicas_connected: Some(Arc::new(AtomicU32::new(1))),
+            replicas_connected: Some(presence(1)),
             fence_state: None,
             replication_metrics: Some(metrics),
             replica_active: Some([
@@ -2419,7 +2457,7 @@ mod tests {
             cursors: cursors.clone(),
             input_cursor: Box::new(MockCursor(AtomicU64::new(0))),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
-            replicas_connected: Some(Arc::new(AtomicU32::new(2))),
+            replicas_connected: Some(presence(2)),
             fence_state: None,
             replication_metrics: Some(Arc::clone(&metrics)),
             replica_active: Some([Arc::clone(&active[0]), Arc::clone(&active[1])]),

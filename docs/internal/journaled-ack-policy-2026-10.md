@@ -496,6 +496,64 @@ and is committed on its own. Tests land with the step they pin.
    rewrites it.
 6. **The halt latch** (halt-plan step 0). Tests per that plan's step-0
    list: a forced swap lifts the halt, a returning replica clears it.
+
+   *As landed:* the replica count and the latch are one type,
+   `ReplicaPresence` in `transport-core`'s `replica_presence` module, in
+   place of the bare `Arc<AtomicU32>` (`Pipeline::replicas_connected`
+   and `HealthState::replicas_connected` change type, and `HaltGate::new`
+   takes an `Option<Arc<ReplicaPresence>>`, so step 7's CHANGELOG lists
+   all three under **Changed**). It owns `lift`/`lower` (the
+   senders' `ReplicaGate` is gone) and the one rule, `halted()`, that the
+   readers' `HaltGate::verdict` and the health endpoint's `trading` flag
+   both call, so probes report `trading` while the override holds.
+
+   Two things the plan did not settle. First, **a connect does not clear
+   a flag; it voids the latch by generation.** The producer decides on a
+   replica count read before it publishes, so a replica connecting in
+   between would clear a latch not yet set, and the latch would then
+   outlive the connect: the next departure would not halt. Each `lift`
+   bumps a connect generation, the latch records the generation its
+   observation saw (`NoneSince`, made only by `ReplicaPresence::observe`
+   when none was connected), and it holds only while the generation is
+   unchanged. Second, **the producer cannot journal a change without
+   recording it**: `AckPolicyPublisher::poll` takes the producer's
+   `HaltGate` rather than a witnesses closure, observes once
+   (`HaltGate::observe`), and decides the entry on that observation
+   (`Observation::decide`, which yields a `halt::Decision` holding the
+   policy, the entry and the observation, so the entry published and the
+   policy the latch acts on cannot disagree); after the entry is on the
+   ring it calls `HaltGate::record_journaled` with that decision before
+   releasing the requester, so the
+   operator's `OK` means the halt is already lifted (or restored). The
+   rule there: a policy that needs a replica (`AckPolicy::needs_replica`,
+   derived from the clauses) clears the latch; a forced change
+   (`policy_control::is_forced`, the same predicate as the forced-swap
+   warning) latches it; anything else (a witnessed or staged `disk`)
+   leaves it. A refused request records nothing. Standalone records
+   nothing (it never halts). The guarantee covers the publisher, the
+   only path that journals while serving; the boot entry
+   (`journal_boot_policy_change`) journals from `HaltGate::witnesses`
+   without recording, which is sound because it runs before any
+   publisher or reader, on a fresh `ReplicaPresence` with no override
+   to clear, and a boot entry is never forced, so there is no latch to
+   set.
+
+   Tests: `ReplicaPresence` unit tests (count, override, a connect
+   voiding it, the observe-then-connect race); `HaltGate` tests for the
+   halt plan's step-0 list (a `disk` node halts; a forced `disk` lifts
+   it; a returning replica voids it; each replica-backed policy restores
+   it; a witnessed or staged `disk` lifts nothing; the fence wins); the
+   publisher's tests check the verdict after each journaled change and
+   after a refused one; the admin command's test checks the halt is
+   lifted by the time `OK` is read; a reader test drives the forced swap
+   through a parked io_uring reader; the health endpoint follows the
+   override; and `ack_policy_changes::a_forced_disk_lifts_the_halt_until_a_replica_returns`
+   runs the playbook on a live node with a scripted replica (passes under
+   the netns runner with the `dpdk` feature as well, so the DPDK sender's
+   `lift`/`lower` and the poll thread's publisher are covered). The
+   operator docs (`docs/replication.md`'s halt and manual-promotion
+   sections, which already describe the playbook that now works) and the
+   CHANGELOG entry the halt plan's step 0 asks for are step 7's.
 7. **Docs and DPDK coverage.** `docs/replication.md` (the policy section,
    runtime swap, the forced swap and its limitation, manual promotion,
    the wire table, upgrade notes, observability), `docs/journal.md`

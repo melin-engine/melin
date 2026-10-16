@@ -621,7 +621,7 @@ fn reader_loop<A: Application, R: AsRawFd>(
         // An `ACK-POLICY` request: journaled here, by the ring's one
         // producer, before parking again. One load when none waits; the
         // requester's eventfd write is what brought a parked loop here.
-        ack_policy.poll(&mut producer, || halt.witnesses());
+        ack_policy.poll(&mut producer, halt);
 
         // Tick generator: emit any due tick before sleeping again. Done before
         // the timeout-arm so that a freshly-emitted tick re-arms a timeout for
@@ -1693,7 +1693,7 @@ mod tests {
             fence.fence();
         }
         HaltGate::new(
-            replicas.map(|count| Arc::new(std::sync::atomic::AtomicU32::new(count))),
+            replicas.map(crate::halt::test_support::presence),
             fence,
             refused,
         )
@@ -1716,35 +1716,9 @@ mod tests {
     #[test]
     fn a_parked_reader_journals_an_ack_policy_request() {
         use crate::ack_policy::AckPolicy;
-        use crate::policy_control::{AckPolicyControl, RequestOutcome};
+        use crate::policy_control::RequestOutcome;
 
-        let (producer, mut consumers) = DisruptorBuilder::<InputSlot<TestEvent>>::new(64)
-            .add_consumer()
-            .build(melin_pipeline::wait::WaitStrategy::SpinThenYield);
-        let mut consumer = consumers.pop().expect("consumer");
-        let (control_tx, _control_rx) = mpsc::channel();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        // Long enough that a reader that is never woken fails the request.
-        let control =
-            AckPolicyControl::with_publish_wait(AckPolicy::DiskAndRam, Duration::from_secs(30));
-        let handle = spawn_reader::<TestApp, UnixStream>(
-            producer,
-            Arc::new(ByteDecoder),
-            gate(None, false),
-            refusal_channel().0,
-            control.claim(),
-            control_tx,
-            0,
-            None,
-            None, // no tick: nothing but the wakeup brings the loop round
-            RingSizing::for_max_connections(4).expect("a supported cap"),
-            Arc::clone(&shutdown),
-        )
-        .expect("the reader starts");
-        // Parked by now, in all likelihood; the request must not depend on
-        // it either way.
-        std::thread::sleep(Duration::from_millis(50));
-
+        let (handle, mut consumer, control) = spawn_parked_reader(gate(None, false));
         assert_eq!(control.request(AckPolicy::Disk), RequestOutcome::Published);
         let (_, slot) = consumer.try_consume().expect("the entry is on the ring");
         assert_eq!(
@@ -1761,6 +1735,77 @@ mod tests {
             RequestOutcome::Staged,
             "a stopped reader is detached"
         );
+    }
+
+    /// A reader over `halt` with no connection and no tick, parked (in all
+    /// likelihood: the callers must not depend on it either way), whose
+    /// mailbox starts at `disk+ram`; and the consumer of its input ring.
+    fn spawn_parked_reader(
+        halt: HaltGate,
+    ) -> (
+        UringReaderHandle<UnixStream>,
+        ring::Consumer<InputSlot<TestEvent>>,
+        Arc<crate::policy_control::AckPolicyControl>,
+    ) {
+        use crate::ack_policy::AckPolicy;
+        use crate::policy_control::AckPolicyControl;
+
+        let (producer, mut consumers) = DisruptorBuilder::<InputSlot<TestEvent>>::new(64)
+            .add_consumer()
+            .build(melin_pipeline::wait::WaitStrategy::SpinThenYield);
+        let consumer = consumers.pop().expect("consumer");
+        // Dropped: the reader's sends to it are best-effort.
+        let (control_tx, _) = mpsc::channel();
+        // Long enough that a reader that is never woken fails the request.
+        let control =
+            AckPolicyControl::with_publish_wait(AckPolicy::DiskAndRam, Duration::from_secs(30));
+        let handle = spawn_reader::<TestApp, UnixStream>(
+            producer,
+            Arc::new(ByteDecoder),
+            halt,
+            refusal_channel().0,
+            control.claim(),
+            control_tx,
+            0,
+            None,
+            None, // no tick: nothing but the wakeup brings the loop round
+            RingSizing::for_max_connections(4).expect("a supported cap"),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("the reader starts");
+        std::thread::sleep(Duration::from_millis(50));
+        (handle, consumer, control)
+    }
+
+    /// Halt-plan step 0 through the reader: a halted primary's reader
+    /// journals the operator's `disk` as forced and lifts the halt before
+    /// the request is answered, so the reader takes the next write.
+    #[test]
+    fn a_forced_swap_through_the_reader_lifts_the_halt() {
+        use crate::ack_policy::AckPolicy;
+        use crate::halt::Verdict;
+        use crate::halt::test_support::{gate_over, presence};
+        use crate::policy_control::RequestOutcome;
+
+        let replicas = presence(0);
+        let halt = || gate_over(Some(Arc::clone(&replicas)));
+        assert_eq!(
+            halt().verdict(),
+            Verdict::Refuse(RejectReason::ReplicaDisconnected)
+        );
+        let (handle, mut consumer, control) = spawn_parked_reader(halt());
+        assert_eq!(control.request(AckPolicy::Disk), RequestOutcome::Published);
+        let (_, slot) = consumer.try_consume().expect("the entry is on the ring");
+        assert_eq!(
+            slot.event,
+            JournalEvent::AckPolicyChange(melin_journal::AckPolicyChange {
+                policy: AckPolicy::Disk.to_byte(),
+                unwitnessed: true,
+            })
+        );
+        assert_eq!(halt().verdict(), Verdict::Take);
+        handle.shutdown();
+        handle.join();
     }
 
     /// A refusal queue whose idle bound is never consulted by these tests.

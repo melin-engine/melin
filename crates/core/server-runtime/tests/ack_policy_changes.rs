@@ -12,6 +12,9 @@
 //!   waits for a replica like any other: a boot entry is never forced.
 //! - A lineage last run replicated under `disk+ram`, restarted
 //!   `--standalone --ack-policy disk`, serves at once.
+//! - A forced `ACK-POLICY disk` (no replica connected) lifts the halt on
+//!   client writes until a replica connects or a policy that needs one is
+//!   journaled.
 //!
 //! Nodes are started through `melin-test-node`: on kernel TCP by default,
 //! on DPDK with this crate's `dpdk` feature, under
@@ -23,7 +26,9 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
-use counter_server::{Counter, KIND_RESP_ACK, RequestDecoder, ResponseEncoder, increment_request};
+use counter_server::{
+    Counter, KIND_RESP_ACK, KIND_RESP_REJECTED, RequestDecoder, ResponseEncoder, increment_request,
+};
 use ed25519_dalek::SigningKey;
 use melin_client::Connection;
 use melin_server_runtime::StartupEvents;
@@ -299,6 +304,82 @@ fn a_weakening_waits_for_the_replica_to_hold_the_change() {
 
     drop(conn);
     drop(replica);
+    primary.stop();
+}
+
+/// The reply to one increment: acked or refused.
+fn write_reply(conn: &mut Connection) -> u8 {
+    conn.request_one(&increment_request(1))
+        .expect("a reply to the write")[0]
+}
+
+/// Halt-plan step 0, the manual-promotion playbook: a primary with no
+/// replica halts under every policy, `disk` included; the operator's
+/// `ACK-POLICY disk` sent while it has none lifts the halt; a policy that
+/// needs a replica restores it; a replica connecting ends the override,
+/// so its departure halts the node again; and a `disk` sent while a
+/// replica was connected is no consent once it leaves.
+#[test]
+fn a_forced_disk_lifts_the_halt_until_a_replica_returns() {
+    const TRADING: &str = "melin_trading_active";
+    let cluster = Cluster::new();
+    let config = cluster.config(AckPolicy::Disk, false);
+    let health = config.health_bind.expect("set");
+    let admin = config.admin_bind.expect("set");
+    let primary = cluster.start(config);
+    let ack_policy = |policy: &str| {
+        assert_eq!(
+            admin_command(
+                admin,
+                &cluster.keys.operator,
+                &format!("ACK-POLICY {policy}")
+            )
+            .as_deref(),
+            Some("OK"),
+            "ACK-POLICY {policy}"
+        );
+    };
+
+    // A swap to `disk` while a replica is connected: witnessed, so when the
+    // replica leaves, the node halts like any other.
+    let replica = cluster.join_replica(health);
+    wait_for_gauge(health, TRADING, 1);
+    ack_policy("disk");
+    drop(replica);
+    wait_for_gauge(health, "melin_replicas_connected", 0);
+    wait_for_gauge(health, TRADING, 0);
+    let mut conn = cluster.client(&primary);
+    assert_eq!(
+        write_reply(&mut conn),
+        KIND_RESP_REJECTED,
+        "halted under `disk`"
+    );
+
+    // With none connected, the operator's `disk` is consent: forced, and
+    // the halt is lifted by the time it is answered.
+    ack_policy("disk");
+    assert_eq!(gauge(health, TRADING), Some(1));
+    assert_eq!(write_reply(&mut conn), KIND_RESP_ACK, "the halt is lifted");
+
+    // A policy that needs a replica restores the halt; consent again lifts
+    // it.
+    ack_policy("disk+ram");
+    assert_eq!(write_reply(&mut conn), KIND_RESP_REJECTED, "halted again");
+    ack_policy("disk");
+    assert_eq!(write_reply(&mut conn), KIND_RESP_ACK, "lifted again");
+
+    // A replica connecting ends the override: its departure halts the node.
+    let replica = cluster.join_replica(health);
+    drop(replica);
+    wait_for_gauge(health, "melin_replicas_connected", 0);
+    assert_eq!(
+        write_reply(&mut conn),
+        KIND_RESP_REJECTED,
+        "the override did not outlive the replica"
+    );
+    wait_for_gauge(health, TRADING, 0);
+
+    drop(conn);
     primary.stop();
 }
 

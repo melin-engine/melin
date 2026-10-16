@@ -9,7 +9,7 @@
 use std::io;
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::{debug, error, info, warn};
 
@@ -30,13 +30,14 @@ use super::receiver_transport::{
 };
 use super::validation_worker::ValidationWorker;
 use super::{
-    ReceiverResult, ReplicaCursors, ReplicaGate, ReplicaPipelineHandles, ReplicationMetrics,
-    ResumePoint, ResyncDecision, SentHighWater, StreamStartVerdict,
-    build_replica_pipeline_with_threads, handle_resync_verdict, handle_session_exit,
-    journal_failed_while_disconnected, recover_replica_state, sleep_then_double_backoff,
-    take_pipeline_for_promotion, teardown_replica_pipeline,
+    ReceiverResult, ReplicaCursors, ReplicaPipelineHandles, ReplicationMetrics, ResumePoint,
+    ResyncDecision, SentHighWater, StreamStartVerdict, build_replica_pipeline_with_threads,
+    handle_resync_verdict, handle_session_exit, journal_failed_while_disconnected,
+    recover_replica_state, sleep_then_double_backoff, take_pipeline_for_promotion,
+    teardown_replica_pipeline,
 };
 use melin_app::auth::AuthorizedKeys;
+use melin_transport_core::replica_presence::ReplicaPresence;
 use melin_transport_core::replication::PersistWatch;
 use melin_transport_core::replication::catchup::CatchUpPublisher;
 use melin_transport_core::replication::handoff::{
@@ -553,7 +554,7 @@ impl DpdkReplicaSlot {
         transport: &mut melin_dpdk::DpdkTransport,
         cursors: &ReplicaCursors,
         metrics: &ReplicationMetrics,
-        replicas_connected: &AtomicU32,
+        replicas_connected: &ReplicaPresence,
     ) {
         if let SlotState::Authenticating(h)
         | SlotState::Handshaking(h)
@@ -570,7 +571,7 @@ impl DpdkReplicaSlot {
             self.active_flag.store(false, Ordering::Release);
             metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
             if was_authenticated {
-                ReplicaGate::new(replicas_connected).lower();
+                replicas_connected.lower();
             }
         }
         self.state = SlotState::Idle;
@@ -605,7 +606,7 @@ pub struct DpdkReplicationDriver<A: Application> {
     /// acked positions and the gate's gauge pair).
     cursors: ReplicaCursors,
     replica_ready: Arc<AtomicBool>,
-    replicas_connected: Arc<AtomicU32>,
+    replicas_connected: Arc<ReplicaPresence>,
     metrics: Arc<ReplicationMetrics>,
     batch_size: usize,
     heartbeat_interval: std::time::Duration,
@@ -634,7 +635,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
         replica_slots: Arc<melin_transport_core::ReplicaSlotCursors>,
         journal_path: std::path::PathBuf,
         replica_ready: Arc<AtomicBool>,
-        replicas_connected: Arc<AtomicU32>,
+        replicas_connected: Arc<ReplicaPresence>,
         evict_flags: [Arc<AtomicBool>; 2],
         active_flags: [Arc<AtomicBool>; 2],
         metrics: Arc<ReplicationMetrics>,
@@ -877,7 +878,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                             // Proven a Replication key — only now does this
                             // connection lift the halt gate (lowered by
                             // `go_idle` on teardown).
-                            ReplicaGate::new(replicas_connected).lift();
+                            replicas_connected.lift();
                             slot.state = SlotState::Handshaking(handle);
                         }
                         AuthOutcome::Rejected => {

@@ -99,6 +99,17 @@ impl AckPolicy {
         Policy::new(clauses).expect("AckPolicy::to_policy: hand-constructed clauses must validate")
     }
 
+    /// Whether the policy can only be met with a replica: some clause
+    /// counts more than one copy. Derived from [`Self::to_policy`] so it
+    /// cannot drift from the clauses. Builds the policy, so it is for cold
+    /// paths (journaling a change), not per slot.
+    pub fn needs_replica(self) -> bool {
+        self.to_policy()
+            .clauses()
+            .iter()
+            .any(|clause| clause.count > 1)
+    }
+
     /// CLI / log-friendly name. Matches the `clap::ValueEnum` spelling.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -225,6 +236,15 @@ mod tests {
         // this to retain the prior policy on a change it cannot read.
         for b in [4, 5, 255] {
             assert_eq!(AckPolicy::from_u8(b), None);
+        }
+    }
+
+    /// Only `disk` is met by one node alone: it is the one policy whose
+    /// journaling never restores the halt.
+    #[test]
+    fn only_disk_needs_no_replica() {
+        for p in ALL {
+            assert_eq!(p.needs_replica(), p != AckPolicy::Disk, "{p}");
         }
     }
 

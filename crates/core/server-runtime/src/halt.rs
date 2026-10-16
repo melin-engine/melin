@@ -8,6 +8,24 @@
 //! that sends anything while it winds down is closed, and the client
 //! reconnects to the new primary.
 //!
+//! # Lifted by the operator's consent
+//!
+//! The halt applies under every ack policy, `disk` included: it is what
+//! stops a primary a partition has cut off from its replicas, which
+//! fencing reaches only on contact. An operator who knows the node has no
+//! replica can consent to serving on its disk alone with `ACK-POLICY
+//! disk`: sent while no replica is connected, the change is journaled as
+//! forced, and journaling it lifts the halt
+//! ([`HaltGate::record_journaled`]). The override lasts until a replica
+//! connects or a policy that needs one is journaled; the next loss of the
+//! last replica then halts the node again. A swap to `disk` made while a
+//! replica is still connected lifts nothing when it leaves: consent counts
+//! only once the operator knows the node has none. The input ring's
+//! producer, which journals the change, is also the reader that enforces
+//! the halt, so the first write after the change's entry is taken. The
+//! override and the count live together in
+//! [`ReplicaPresence`], which the health endpoint reads too.
+//!
 //! # Refused at ingress
 //!
 //! The readers decide, before a request is published. A refused write
@@ -59,15 +77,18 @@
 //! turned away, whatever the client was told.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use melin_app::RejectReason;
+use melin_journal::AckPolicyChange;
 use melin_pipeline::padding::Sequence;
 use melin_pipeline::spsc;
 use melin_pipeline::wait::WaitStrategy;
 use melin_transport_core::fence::FenceState;
+use melin_transport_core::replica_presence::{Observed, ReplicaPresence};
 
-use crate::policy_control::Witnesses;
+use crate::ack_policy::AckPolicy;
+use crate::policy_control::{Origin, Witnesses, is_forced, is_unwitnessed};
 
 /// Refusals the response stage can hold before a reader has to shed load.
 ///
@@ -93,21 +114,83 @@ pub enum Verdict {
 /// A reader's view of whether this node takes client writes.
 pub struct HaltGate {
     /// Replicas currently streaming, maintained by the replication
-    /// senders. `None` in standalone mode, which never halts for want of
-    /// a replica.
-    replicas_connected: Option<Arc<AtomicU32>>,
+    /// senders, and the operator's halt override. `None` in standalone
+    /// mode, which never halts for want of a replica.
+    replicas_connected: Option<Arc<ReplicaPresence>>,
     /// Latched once a newer primary is observed.
     fence_state: Arc<FenceState>,
     /// Writes refused so far; shared with the health endpoint.
     refused: Arc<AtomicU64>,
 }
 
+/// Who was streaming when the input ring's producer looked, taken just
+/// before it journals an ack-policy change: decides whether the change is
+/// forced ([`Self::witnesses`]) and, once journaled, what it does to the
+/// halt override ([`HaltGate::record_journaled`]). One observation for
+/// both, so the two decisions cannot rest on different replica counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Observation(Option<Observed>);
+
+impl Observation {
+    /// Who could witness a change published now — see
+    /// [`crate::policy_control::is_unwitnessed`].
+    pub fn witnesses(self) -> Witnesses {
+        match self.0 {
+            None => Witnesses::Disabled,
+            Some(Observed::NoneConnected(_)) => Witnesses::NoneConnected,
+            Some(Observed::Connected) => Witnesses::Connected,
+        }
+    }
+
+    /// Decide the entry that journals a change to `policy` from `origin`
+    /// on this observation — see [`crate::policy_control::is_unwitnessed`].
+    pub fn decide(self, policy: AckPolicy, origin: Origin) -> Decision {
+        Decision {
+            policy,
+            change: AckPolicyChange {
+                policy: policy.to_byte(),
+                unwitnessed: is_unwitnessed(policy, origin, self.witnesses()),
+            },
+            seen: self,
+        }
+    }
+}
+
+/// An ack-policy change decided on one [`Observation`]: the policy, the
+/// entry that journals it, and the observation it rests on. Built only by
+/// [`Observation::decide`], so the entry the producer publishes and the
+/// policy and observation [`HaltGate::record_journaled`] acts on cannot
+/// disagree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Decision {
+    policy: AckPolicy,
+    change: AckPolicyChange,
+    seen: Observation,
+}
+
+impl Decision {
+    /// The policy changed to.
+    pub fn policy(self) -> AckPolicy {
+        self.policy
+    }
+
+    /// The entry to journal.
+    pub fn change(self) -> AckPolicyChange {
+        self.change
+    }
+
+    /// Whether the change is forced — see [`is_forced`].
+    pub fn is_forced(self) -> bool {
+        is_forced(self.change, self.seen.witnesses())
+    }
+}
+
 impl HaltGate {
-    /// A gate over the node's replica count (`None` in standalone mode)
+    /// A gate over the node's replica presence (`None` in standalone mode)
     /// and its fence latch — the same two the health endpoint folds into
     /// its status word — that counts what it refuses into `refused`.
     pub fn new(
-        replicas_connected: Option<Arc<AtomicU32>>,
+        replicas_connected: Option<Arc<ReplicaPresence>>,
         fence_state: Arc<FenceState>,
         refused: Arc<AtomicU64>,
     ) -> Self {
@@ -118,15 +201,37 @@ impl HaltGate {
         }
     }
 
+    /// Who is streaming now. Two loads.
+    #[inline]
+    pub fn observe(&self) -> Observation {
+        Observation(self.replicas_connected.as_ref().map(|p| p.observe()))
+    }
+
     /// Who could witness an ack-policy change published now — see
-    /// [`crate::policy_control::is_unwitnessed`]. One relaxed load, like
-    /// [`Self::verdict`].
+    /// [`crate::policy_control::is_unwitnessed`].
     #[inline]
     pub fn witnesses(&self) -> Witnesses {
-        match &self.replicas_connected {
-            None => Witnesses::Disabled,
-            Some(count) if count.load(Ordering::Relaxed) == 0 => Witnesses::NoneConnected,
-            Some(_) => Witnesses::Connected,
+        self.observe().witnesses()
+    }
+
+    /// The input ring's producer journaled `decision`'s change: a forced
+    /// change (the operator's explicit `disk` with no
+    /// replica connected) lifts the halt; a change to a policy that needs
+    /// a replica drops any such override, so the node halts again while
+    /// none is connected. Any other change leaves the override as it is:
+    /// a witnessed `disk` was decided with a replica connected, whose
+    /// connect has voided any override already. Standalone never halts,
+    /// so there is nothing to record.
+    pub fn record_journaled(&self, decision: Decision) {
+        let (Some(presence), Some(observed)) = (&self.replicas_connected, decision.seen.0) else {
+            return;
+        };
+        if decision.policy.needs_replica() {
+            presence.clear_override();
+        } else if let Observed::NoneConnected(since) = observed
+            && decision.is_forced()
+        {
+            presence.latch_override(since);
         }
     }
 
@@ -141,9 +246,10 @@ impl HaltGate {
     /// The verdict on a client write arriving now. Fencing wins: a
     /// superseded node is shutting down whatever its replica count.
     ///
-    /// Two relaxed loads. Relaxed is enough: a halt that starts between the
-    /// check and the publish is the case a write published just before the
-    /// halt already covers — see the module docs.
+    /// Two relaxed loads while a replica is connected, the override's two
+    /// more while none is. Relaxed is enough: a halt that starts between
+    /// the check and the publish is the case a write published just before
+    /// the halt already covers — see the module docs.
     #[inline]
     pub fn verdict(&self) -> Verdict {
         if self.fence_state.is_fenced() {
@@ -151,7 +257,7 @@ impl HaltGate {
         } else if self
             .replicas_connected
             .as_ref()
-            .is_some_and(|count| count.load(Ordering::Relaxed) == 0)
+            .is_some_and(|presence| presence.halted())
         {
             Verdict::Refuse(RejectReason::ReplicaDisconnected)
         } else {
@@ -297,6 +403,33 @@ impl<R: Copy> RefusalQueue<R> {
     }
 }
 
+/// Halt gates for the crate's tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// A replica presence with `connected` replicas streaming. (The
+    /// health endpoint's tests in `melin-transport-core` keep their own:
+    /// a test helper cannot cross the crate boundary.)
+    pub(crate) fn presence(connected: u32) -> Arc<ReplicaPresence> {
+        let presence = Arc::new(ReplicaPresence::new());
+        for _ in 0..connected {
+            presence.lift();
+        }
+        presence
+    }
+
+    /// An unfenced gate over `replicas` (`None`: replication disabled)
+    /// that counts its refusals nowhere anyone reads.
+    pub(crate) fn gate_over(replicas: Option<Arc<ReplicaPresence>>) -> HaltGate {
+        HaltGate::new(
+            replicas,
+            Arc::new(FenceState::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,9 +448,11 @@ mod tests {
         }
     }
 
-    fn gate(replicas_connected: Option<Arc<AtomicU32>>, fence: Arc<FenceState>) -> HaltGate {
+    fn gate(replicas_connected: Option<Arc<ReplicaPresence>>, fence: Arc<FenceState>) -> HaltGate {
         HaltGate::new(replicas_connected, fence, Arc::new(AtomicU64::new(0)))
     }
+
+    const HALTED: Verdict = Verdict::Refuse(RejectReason::ReplicaDisconnected);
 
     #[test]
     fn standalone_never_refuses() {
@@ -327,13 +462,10 @@ mod tests {
 
     #[test]
     fn no_replica_refuses_with_replica_disconnected_until_one_connects() {
-        let count = Arc::new(AtomicU32::new(0));
-        let gate = gate(Some(Arc::clone(&count)), Arc::new(FenceState::new(0)));
-        assert_eq!(
-            gate.verdict(),
-            Verdict::Refuse(RejectReason::ReplicaDisconnected)
-        );
-        count.store(1, Ordering::Relaxed);
+        let replicas = test_support::presence(0);
+        let gate = gate(Some(Arc::clone(&replicas)), Arc::new(FenceState::new(0)));
+        assert_eq!(gate.verdict(), HALTED);
+        replicas.lift();
         assert_eq!(gate.verdict(), Verdict::Take);
     }
 
@@ -343,17 +475,156 @@ mod tests {
             gate(None, Arc::new(FenceState::new(0))).witnesses(),
             Witnesses::Disabled
         );
-        let count = Arc::new(AtomicU32::new(0));
-        let gate = gate(Some(Arc::clone(&count)), Arc::new(FenceState::new(0)));
+        let replicas = test_support::presence(0);
+        let gate = gate(Some(Arc::clone(&replicas)), Arc::new(FenceState::new(0)));
         assert_eq!(gate.witnesses(), Witnesses::NoneConnected);
-        count.store(2, Ordering::Relaxed);
+        replicas.lift();
+        replicas.lift();
         assert_eq!(gate.witnesses(), Witnesses::Connected);
+    }
+
+    /// Journal `policy` as the producer would: observe, decide the entry,
+    /// record it.
+    fn journal(gate: &HaltGate, policy: AckPolicy, origin: Origin) {
+        gate.record_journaled(gate.observe().decide(policy, origin));
+    }
+
+    /// The entry a decision carries is the policy's byte, unwitnessed as
+    /// `is_unwitnessed` rules on the observation it was decided on.
+    #[test]
+    fn a_decision_journals_its_policy_as_the_observation_rules() {
+        let replicas = test_support::presence(0);
+        let gate = gate(Some(Arc::clone(&replicas)), Arc::new(FenceState::new(0)));
+        for policy in [
+            AckPolicy::Disk,
+            AckPolicy::DiskAndRam,
+            AckPolicy::TwoDisks,
+            AckPolicy::Ram,
+        ] {
+            for origin in [Origin::Runtime, Origin::Staged] {
+                let decision = gate.observe().decide(policy, origin);
+                assert_eq!(decision.policy(), policy);
+                assert_eq!(decision.change().policy, policy.to_byte());
+                let unwitnessed = is_unwitnessed(policy, origin, Witnesses::NoneConnected);
+                assert_eq!(decision.change().unwitnessed, unwitnessed);
+                assert_eq!(decision.is_forced(), unwitnessed, "{policy} {origin:?}");
+            }
+        }
+        replicas.lift();
+        let decision = gate.observe().decide(AckPolicy::Disk, Origin::Runtime);
+        assert!(!decision.change().unwitnessed);
+        assert!(!decision.is_forced());
+        let standalone = self::gate(None, Arc::new(FenceState::new(0)));
+        let decision = standalone.observe().decide(AckPolicy::Ram, Origin::Staged);
+        assert!(decision.change().unwitnessed, "nothing can witness it");
+        assert!(!decision.is_forced(), "unwitnessed for want of replication");
+    }
+
+    /// Halt-plan step 0. A node under `disk` that loses its replica halts
+    /// like any other; the operator's `disk` during the halt lifts it; a
+    /// returning replica voids the override, so its next departure halts
+    /// the node again.
+    #[test]
+    fn a_forced_disk_lifts_the_halt_until_a_replica_returns() {
+        let replicas = test_support::presence(1);
+        let gate = gate(Some(Arc::clone(&replicas)), Arc::new(FenceState::new(0)));
+        assert_eq!(gate.verdict(), Verdict::Take);
+        assert!(replicas.lower());
+        assert_eq!(gate.verdict(), HALTED, "the halt ignores the policy");
+
+        journal(&gate, AckPolicy::Disk, Origin::Runtime);
+        assert_eq!(gate.verdict(), Verdict::Take, "consent lifts the halt");
+        assert_eq!(
+            gate.witnesses(),
+            Witnesses::NoneConnected,
+            "still no witness: a later `disk` is forced too"
+        );
+
+        replicas.lift();
+        assert_eq!(gate.verdict(), Verdict::Take);
+        assert!(replicas.lower());
+        assert_eq!(
+            gate.verdict(),
+            HALTED,
+            "the override did not outlive the replica"
+        );
+    }
+
+    /// A swap back to a policy that needs a replica, with none connected,
+    /// restores the halt; each of them does.
+    #[test]
+    fn a_swap_to_a_replica_backed_policy_restores_the_halt() {
+        for policy in [AckPolicy::Ram, AckPolicy::DiskAndRam, AckPolicy::TwoDisks] {
+            let gate = gate(
+                Some(test_support::presence(0)),
+                Arc::new(FenceState::new(0)),
+            );
+            journal(&gate, AckPolicy::Disk, Origin::Runtime);
+            assert_eq!(gate.verdict(), Verdict::Take);
+            journal(&gate, policy, Origin::Runtime);
+            assert_eq!(gate.verdict(), HALTED, "{policy}");
+            journal(&gate, AckPolicy::Disk, Origin::Runtime);
+            assert_eq!(
+                gate.verdict(),
+                Verdict::Take,
+                "a forced swap again: {policy}"
+            );
+        }
+    }
+
+    /// Consent counts only once the operator knows the node has no
+    /// replica: a `disk` journaled while one is connected lifts nothing
+    /// when it leaves, and neither does a staged one (a boot or promotion
+    /// entry) with none connected.
+    #[test]
+    fn a_disk_not_forced_does_not_lift_the_halt() {
+        let replicas = test_support::presence(1);
+        let gate = gate(Some(Arc::clone(&replicas)), Arc::new(FenceState::new(0)));
+        journal(&gate, AckPolicy::Disk, Origin::Runtime);
+        assert!(replicas.lower());
+        assert_eq!(gate.verdict(), HALTED, "witnessed: no consent");
+
+        journal(&gate, AckPolicy::Disk, Origin::Staged);
+        assert_eq!(gate.verdict(), HALTED, "staged: never forced");
+    }
+
+    /// A forced `disk` re-sent keeps the halt lifted: only a policy that
+    /// needs a replica, or a connect, ends the override.
+    #[test]
+    fn a_repeated_forced_disk_keeps_the_halt_lifted() {
+        let gate = gate(
+            Some(test_support::presence(0)),
+            Arc::new(FenceState::new(0)),
+        );
+        journal(&gate, AckPolicy::Disk, Origin::Runtime);
+        journal(&gate, AckPolicy::Disk, Origin::Runtime);
+        assert_eq!(gate.verdict(), Verdict::Take);
+    }
+
+    /// Standalone never halts, and journaling records nothing.
+    #[test]
+    fn standalone_journals_without_an_override() {
+        let gate = gate(None, Arc::new(FenceState::new(0)));
+        for policy in [AckPolicy::Disk, AckPolicy::TwoDisks] {
+            journal(&gate, policy, Origin::Runtime);
+            assert_eq!(gate.verdict(), Verdict::Take);
+        }
+    }
+
+    /// The fence wins over the override: a superseded node closes.
+    #[test]
+    fn a_fenced_node_closes_despite_the_override() {
+        let fence = Arc::new(FenceState::new(0));
+        let gate = gate(Some(test_support::presence(0)), Arc::clone(&fence));
+        journal(&gate, AckPolicy::Disk, Origin::Runtime);
+        fence.fence();
+        assert_eq!(gate.verdict(), Verdict::Close);
     }
 
     #[test]
     fn a_fenced_node_closes_whatever_its_replica_count() {
         let fence = Arc::new(FenceState::new(1));
-        let gate = gate(Some(Arc::new(AtomicU32::new(1))), Arc::clone(&fence));
+        let gate = gate(Some(test_support::presence(1)), Arc::clone(&fence));
         assert_eq!(gate.verdict(), Verdict::Take);
         assert_eq!(
             fence.fence_if_superseded(2, &AtomicBool::new(false)),

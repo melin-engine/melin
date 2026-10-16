@@ -301,7 +301,7 @@ pub fn run_dpdk_poll<A: Application>(
         tick_check_counter = tick_check_counter.wrapping_add(1);
         if tick_check_counter >= TICK_CHECK_INTERVAL {
             tick_check_counter = 0;
-            ack_policy.poll(&mut producer, || halt.witnesses());
+            ack_policy.poll(&mut producer, &halt);
             if tick_enabled {
                 // Nothing to re-arm on a published tick: the poll loop
                 // never sleeps, so the counter above is its only timer.

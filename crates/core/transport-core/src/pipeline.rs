@@ -26,7 +26,7 @@
 //! thread that performed the sync, after it returned.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -34,6 +34,7 @@ use crate::dispatch::{LineageEvent, dispatch};
 use crate::lineage::{
     ForcedPolicy, ForcedPolicyReader, ForcedPolicyWriter, LineagePolicyCell, forced_policy_cell,
 };
+use crate::replica_presence::ReplicaPresence;
 use crate::trace::{MonoTraceInstant, mono_trace_ns};
 use melin_app::{AppEvent, Application, ApplyCtx, QueryCtx};
 use melin_journal::BufferedWriter;
@@ -3144,7 +3145,7 @@ pub struct Pipeline<A: Application> {
     pub events_processed: Arc<AtomicU64>,
     pub input_cursor: Box<dyn ring::QueueCursor>,
     pub replication_consumers: Option<(ReplicationConsumer, ReplicationConsumer)>,
-    pub replicas_connected: Option<Arc<AtomicU32>>,
+    pub replicas_connected: Option<Arc<ReplicaPresence>>,
     pub shadow_consumer: Option<ring::Consumer<InputSlot<A::Event>>>,
     pub chain_hash_lock: Option<SeqLockReader<FsyncState>>,
     pub replication_ring_progress: Option<ReplicationRingProgress>,
@@ -3472,13 +3473,13 @@ where
     let chain_hash_lock =
         enable_shadow.then(|| setup_chain_hash_publisher(&mut journal_stage, fsync_at_open));
 
-    // Connected replica count: when replication is enabled, starts at 0
-    // (no replicas yet). The replication sender increments on connect,
-    // decrements on disconnect. The server's readers check it once per
-    // receive and refuse client writes when 0. In standalone mode, None —
-    // no halt check. u32 counter supports dual replication.
+    // Connected replicas and the halt override: when replication is
+    // enabled, starts with none (halted). The replication sender lifts on
+    // connect and lowers on disconnect. The server's readers check it once
+    // per receive and refuse client writes while halted. In standalone
+    // mode, None — no halt check.
     let replicas_connected = if enable_replication {
-        Some(Arc::new(AtomicU32::new(0)))
+        Some(Arc::new(ReplicaPresence::new()))
     } else {
         None
     };

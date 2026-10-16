@@ -3878,7 +3878,7 @@ fn spawn_health_endpoint(
     cursors: &melin_transport_core::PipelineCursors,
     input_cursor: Box<dyn melin_pipeline::ring::QueueCursor>,
     pipeline_healthy: &Arc<AtomicBool>,
-    replicas_connected: &Option<Arc<std::sync::atomic::AtomicU32>>,
+    replicas_connected: &Option<Arc<melin_transport_core::replica_presence::ReplicaPresence>>,
     fence_state: &Arc<melin_transport_core::fence::FenceState>,
     replication_metrics: &Option<Arc<crate::replication::ReplicationMetrics>>,
     replica_active: &Option<[Arc<AtomicBool>; 2]>,
