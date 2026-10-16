@@ -28,7 +28,7 @@
 //! - **Ack**: `[len:u32][0x02][acked_sequence:u64][in_memory_sequence:u64]`
 //!
 //! ### Primary → Replica
-//! - **StreamStart**: `[len:u32][0x10][start_sequence:u64][segment_start_sequence:u64][anchor_hash:[u8;32]][epoch:u64][ack_policy:u8][genesis_known:u8][genesis_entries:u64]`
+//! - **StreamStart**: `[len:u32][0x10][start_sequence:u64][segment_start_sequence:u64][anchor_hash:[u8;32]][epoch:u64][genesis_known:u8][genesis_entries:u64]`
 //!   — the segment header identity a fresh replica creates its journal
 //!   with (lineage origin for full catch-up, the seeded segment's
 //!   identity after a snapshot transfer), and the lineage's genesis
@@ -189,28 +189,26 @@ pub struct ReplicaControlPlane {
     /// because a *different* node's raft died) must not depose a
     /// healthy primary.
     pub primary_link_up: std::sync::Arc<AtomicBool>,
-    /// The ack policy last advertised by the primary
-    /// (`AckPolicy::as_u8`; `ACK_POLICY_UNKNOWN` until first
-    /// contact), refreshed by `StreamStart` and every `Heartbeat`. The
-    /// raft driver's auto-promotion refusal reads this — the policy the
-    /// *primary* acked under decides whether an election win proves
-    /// this replica holds every acked write, not this node's own
-    /// (possibly pre-staged) configuration. Falls back to this node's
-    /// own policy while unknown, which is exactly the pre-propagation
-    /// behavior.
-    pub primary_ack_policy: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    /// Set once a primary's `StreamStart` has been accepted since this
+    /// process booted, and never cleared: the auto-promotion rule's
+    /// "a primary has been seen" input, which tells a blank genesis node
+    /// from a replica that followed a primary before it died.
+    pub primary_observed: std::sync::Arc<AtomicBool>,
     /// The ack policy the lineage this replica holds has in force: the
     /// newest journaled `AckPolicyChange` it holds, or `None` when it
-    /// holds none. Stored whole from the recovered lineage at boot and
-    /// after a divergence recovery, from the snapshot at a resync, and
-    /// cleared when the local lineage is archived, so a change in a
-    /// divergent tail disappears with the tail. Seeds the replica's shadow
-    /// snapshots and a promoted primary's.
+    /// holds none. The raft driver's auto-promotion refusal judges by it,
+    /// so it judges the policy the entries this replica holds were acked
+    /// under, never one advertised ahead of them. It seeds the replica's
+    /// shadow snapshots and a promoted primary's lineage too.
     ///
-    /// Not yet written as entries are received, so it lags the stream
-    /// until step 5 of `docs/internal/journaled-ack-policy-2026-10.md`,
-    /// which also moves the auto-promotion check onto it from
-    /// `primary_ack_policy`.
+    /// One writer, the receive thread: stored whole from the recovered
+    /// lineage at boot and after a divergence recovery, from the snapshot
+    /// at a resync, cleared when the local lineage is archived (so a change
+    /// in a divergent tail disappears with the tail), and written as each
+    /// change is accepted from the stream, before the advertised tip moves
+    /// past it (see `receiver_transport::process_streaming_frames`). Not by
+    /// the replica's matching stage, which lags the receive thread: two
+    /// writers would let an older value overwrite a newer one.
     pub lineage_ack_policy: std::sync::Arc<LineagePolicyCell>,
     /// Whether the replica's pipeline is healthy — fed to the replica's
     /// minimal health endpoint (`/health` OK/ERR and the
@@ -224,8 +222,8 @@ pub struct ReplicaControlPlane {
 
 impl ReplicaControlPlane {
     /// Fresh handles for a replica boot: nothing requested, tip not
-    /// trustworthy yet, tip sequence 0, primary link down, no lineage
-    /// policy held, pipeline healthy (nothing has failed yet).
+    /// trustworthy yet, tip sequence 0, primary link down and never seen,
+    /// no lineage policy held, pipeline healthy (nothing has failed yet).
     pub fn new() -> Self {
         Self {
             promote: crate::promotion::PromotionRequest::new(),
@@ -234,9 +232,7 @@ impl ReplicaControlPlane {
                 melin_transport_core::WireSeq::new(0),
             ),
             primary_link_up: std::sync::Arc::new(AtomicBool::new(false)),
-            primary_ack_policy: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
-                crate::ack_policy::ACK_POLICY_UNKNOWN,
-            )),
+            primary_observed: std::sync::Arc::new(AtomicBool::new(false)),
             lineage_ack_policy: std::sync::Arc::new(LineagePolicyCell::new(None)),
             pipeline_healthy: std::sync::Arc::new(AtomicBool::new(true)),
         }
@@ -1455,7 +1451,6 @@ where
             anchor_hash,
             genesis_entries,
             epoch,
-            ack_policy,
         } => {
             if segment_start_sequence != seeded_info.starting_sequence
                 || anchor_hash != seeded_info.anchor_hash
@@ -1474,14 +1469,13 @@ where
             // We just rebased onto this primary's snapshot, so adopt its
             // epoch wholesale (no stale-primary refusal — our prior state
             // was discarded).
+            // The lineage policy came with the snapshot (stored by the
+            // transfer); the stream's changes keep it current from here.
             fence_state.observe_epoch(epoch);
-            control
-                .primary_ack_policy
-                .store(ack_policy, Ordering::Release);
+            control.primary_observed.store(true, Ordering::Release);
             tracing::info!(
                 start_sequence,
                 epoch,
-                ack_policy,
                 "streaming resumed after snapshot transfer"
             );
             // The transfer is installed and validated: the node's holdings
@@ -1632,8 +1626,8 @@ pub(in crate::replication) enum StreamStartVerdict {
     /// and retries with backoff. The handshake already carried our higher
     /// epoch, so the stale primary fences itself on its side.
     StalePrimary,
-    /// Follow the primary. Its epoch and ack policy are adopted; the
-    /// lineage — `(segment start, anchor, genesis length)` — is what a
+    /// Follow the primary. Its epoch is adopted, and the primary recorded
+    /// as observed; the lineage — `(segment start, anchor, genesis length)` — is what a
     /// fresh replica creates its journal from.
     Follow((u64, [u8; 32], Option<u64>)),
 }
@@ -1650,8 +1644,6 @@ pub(in crate::replication) struct StreamStart {
     pub lineage: (u64, [u8; 32], Option<u64>),
     /// The primary's fencing epoch.
     pub epoch: u64,
-    /// The primary's ack-policy byte, as carried on the wire.
-    pub ack_policy: u8,
 }
 
 /// Accept or refuse a primary's `StreamStart`, shared by the kernel-TCP
@@ -1663,8 +1655,9 @@ pub(in crate::replication) struct StreamStart {
 /// journal — before anything is touched; record the primary's genesis
 /// length in an empty pre-upgrade journal; refuse a lineage whose genesis
 /// length disagrees with ours; then adopt the primary's epoch (streamed
-/// `EpochBump`s keep it current thereafter) and its ack policy
-/// (heartbeats keep it current mid-session).
+/// `EpochBump`s keep it current thereafter) and record that a primary has
+/// been observed. The ack policy is not taken from the primary: the
+/// replica learns it from the changes its lineage holds.
 ///
 /// An `Err` is fatal for the receive loop: the journal could not be read
 /// or rewritten, or the two journals do not share one lineage.
@@ -1688,7 +1681,6 @@ where
         start_sequence,
         lineage,
         epoch,
-        ack_policy,
     } = start;
     if fence_state.refuses_primary(epoch) {
         tracing::warn!(
@@ -1708,16 +1700,8 @@ where
         check_advertised_genesis(local, lineage.2)?;
     }
     fence_state.observe_epoch(epoch);
-    control
-        .primary_ack_policy
-        .store(ack_policy, Ordering::Release);
-    tracing::info!(
-        transport,
-        start_sequence,
-        epoch,
-        ack_policy,
-        "streaming started"
-    );
+    control.primary_observed.store(true, Ordering::Release);
+    tracing::info!(transport, start_sequence, epoch, "streaming started");
     Ok(StreamStartVerdict::Follow(lineage))
 }
 
@@ -2058,8 +2042,8 @@ mod tests {
     }
 
     /// A primary behind this node's fencing epoch is refused before
-    /// anything is adopted: not its epoch, not its ack policy, not its
-    /// genesis length into our journal.
+    /// anything is adopted: not its epoch, not its genesis length into our
+    /// journal, and it does not count as a primary observed.
     #[test]
     fn a_stale_primary_is_refused_before_anything_is_adopted() {
         type Writer = melin_journal::BufferedWriter<CounterEvent>;
@@ -2076,7 +2060,6 @@ mod tests {
                 start_sequence: 1,
                 lineage: (1, anchor, Some(3)),
                 epoch: 4,
-                ack_policy: crate::ack_policy::AckPolicy::Disk.as_u8(),
             },
             "test",
             &None,
@@ -2088,10 +2071,7 @@ mod tests {
 
         assert!(matches!(verdict, StreamStartVerdict::StalePrimary));
         assert_eq!(fence.epoch(), 5);
-        assert_eq!(
-            control.primary_ack_policy.load(Ordering::Acquire),
-            crate::ack_policy::ACK_POLICY_UNKNOWN
-        );
+        assert!(!control.primary_observed.load(Ordering::Acquire));
         let header = journal_writer
             .as_ref()
             .expect("writer")
@@ -2100,11 +2080,12 @@ mod tests {
         assert_eq!(header.genesis_entries, None, "journal left untouched");
     }
 
-    /// Following a primary adopts its epoch and ack policy, records its
-    /// genesis length in an empty pre-upgrade journal, and hands back the
-    /// lineage the fresh-journal path creates from.
+    /// Following a primary adopts its epoch, records it as observed and
+    /// its genesis length in an empty pre-upgrade journal, and hands back
+    /// the lineage the fresh-journal path creates from. The lineage's ack
+    /// policy is left to the entries this replica holds.
     #[test]
-    fn following_a_primary_adopts_its_epoch_policy_and_genesis() {
+    fn following_a_primary_adopts_its_epoch_and_genesis() {
         type Writer = melin_journal::BufferedWriter<CounterEvent>;
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("replica.journal");
@@ -2113,14 +2094,14 @@ mod tests {
             Some(Writer::create_continuing(&path, 1, anchor, None).expect("create"));
         let fence = melin_transport_core::fence::FenceState::new(5);
         let control = ReplicaControlPlane::new();
-        let policy = crate::ack_policy::AckPolicy::Disk.as_u8();
+        let held = Some(crate::ack_policy::AckPolicy::DiskAndRam.to_byte());
+        control.lineage_ack_policy.store(held);
 
         let verdict = accept_stream_start::<counter_server::Counter, Writer>(
             StreamStart {
                 start_sequence: 1,
                 lineage: (1, anchor, Some(3)),
                 epoch: 7,
-                ack_policy: policy,
             },
             "test",
             &None,
@@ -2135,7 +2116,8 @@ mod tests {
         };
         assert_eq!(lineage, (1, anchor, Some(3)));
         assert_eq!(fence.epoch(), 7);
-        assert_eq!(control.primary_ack_policy.load(Ordering::Acquire), policy);
+        assert!(control.primary_observed.load(Ordering::Acquire));
+        assert_eq!(control.lineage_ack_policy.load(), held, "untouched");
         let header = journal_writer
             .as_ref()
             .expect("writer")
@@ -2162,7 +2144,6 @@ mod tests {
                 start_sequence: 1,
                 lineage: (1, anchor, Some(3)),
                 epoch: 7,
-                ack_policy: crate::ack_policy::AckPolicy::Disk.as_u8(),
             },
             "test",
             &None,
@@ -2234,8 +2215,8 @@ mod tests {
     #[test]
     fn stream_start_encode_decode_round_trip() {
         let mut buf = Vec::new();
-        // Non-zero epoch/policy so a dropped/zeroed field is caught.
-        encode_stream_start(99, 42, [0xAA; 32], Some(7), 5, 2, &mut buf);
+        // Non-zero epoch so a dropped/zeroed field is caught.
+        encode_stream_start(99, 42, [0xAA; 32], Some(7), 5, &mut buf);
 
         let payload = &buf[4..];
         let msg = decode_primary_message(payload).unwrap();
@@ -2246,13 +2227,11 @@ mod tests {
                 anchor_hash,
                 genesis_entries,
                 epoch,
-                ack_policy,
             } => {
                 assert_eq!(start_sequence, 99);
                 assert_eq!(segment_start_sequence, 42);
                 assert_eq!(anchor_hash, [0xAA; 32]);
                 assert_eq!(genesis_entries, Some(7));
-                assert_eq!(ack_policy, 2);
                 assert_eq!(epoch, 5);
             }
             _ => panic!("expected StreamStart"),
@@ -2262,18 +2241,12 @@ mod tests {
     #[test]
     fn heartbeat_encode_decode_round_trip() {
         let mut buf = Vec::new();
-        encode_heartbeat(123, 2, &mut buf);
+        encode_heartbeat(123, &mut buf);
 
         let payload = &buf[4..];
         let msg = decode_primary_message(payload).unwrap();
         match msg {
-            PrimaryMessage::Heartbeat {
-                sequence,
-                ack_policy,
-            } => {
-                assert_eq!(sequence, 123);
-                assert_eq!(ack_policy, 2);
-            }
+            PrimaryMessage::Heartbeat { sequence } => assert_eq!(sequence, 123),
             _ => panic!("expected Heartbeat"),
         }
     }
@@ -2706,7 +2679,7 @@ mod tests {
 
         // Send StreamStart.
         let mut buf = Vec::new();
-        encode_stream_start(0, 1, [0u8; 32], Some(0), 0, 1, &mut buf); // fake lineage for test
+        encode_stream_start(0, 1, [0u8; 32], Some(0), 0, &mut buf); // fake lineage for test
         p_writer.write_all(&buf).unwrap();
         p_writer.flush().unwrap();
         buf.clear();
@@ -2803,7 +2776,7 @@ mod tests {
         ));
 
         // Send StreamStart.
-        encode_stream_start(0, 1, [0u8; 32], Some(0), 0, 1, &mut buf);
+        encode_stream_start(0, 1, [0u8; 32], Some(0), 0, &mut buf);
         p_writer.write_all(&buf).unwrap();
         p_writer.flush().unwrap();
         buf.clear();
@@ -2835,7 +2808,7 @@ mod tests {
         // Heartbeat messages carry the last known sequence so the replica
         // can verify it hasn't missed any data.
         let mut buf = Vec::new();
-        encode_heartbeat(999, 1, &mut buf);
+        encode_heartbeat(999, &mut buf);
 
         let payload = &buf[4..];
         match decode_primary_message(payload).unwrap() {
@@ -2914,15 +2887,7 @@ mod tests {
         assert_eq!(handshake.chain_hash, [0xBB; 32]);
 
         // Send StreamStart echoing the replica's sequence.
-        encode_stream_start(
-            handshake.last_sequence,
-            1,
-            [0u8; 32],
-            Some(0),
-            0,
-            1,
-            &mut buf,
-        );
+        encode_stream_start(handshake.last_sequence, 1, [0u8; 32], Some(0), 0, &mut buf);
         p_writer.write_all(&buf).unwrap();
         p_writer.flush().unwrap();
         buf.clear();
@@ -2981,7 +2946,6 @@ mod tests {
                 [0u8; 32],
                 Some(0),
                 STALE_EPOCH,
-                1,
                 &mut buf,
             );
             writer.write_all(&buf).unwrap();

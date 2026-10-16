@@ -8,10 +8,10 @@
 //! auth. A client sends increments and collects acks — proof the
 //! RAM-quorum gate opens on live replica cursors. The primary is then
 //! killed; exactly one replica must auto-promote (exercising the
-//! ack-policy byte end-to-end: the primary advertised `ram` on the
-//! replication stream, and the promotion policy must accept it on the
-//! same grounds as `disk+ram`). The operator then swaps the promoted
-//! node to `disk` over the admin endpoint — the documented
+//! journaled policy end-to-end: the primary journaled `ram` as its
+//! lineage began, the replicas hold that change, and the promotion policy
+//! must accept it on the same grounds as `disk+ram`). The operator then
+//! swaps the promoted node to `disk` over the admin endpoint — the documented
 //! post-failover workflow, since its own gate is unsatisfiable with no
 //! replicas attached — and a fresh client connection must read back the
 //! full acked total: nothing the client was told about died with the
@@ -66,7 +66,7 @@ use serial_test::serial;
 
 #[path = "common/probe.rs"]
 mod probe;
-use probe::admin_command;
+use probe::{admin_command, wait_for_gauge};
 
 /// Port range this file owns for `free_addr` (10000..15000);
 /// `melin-raft`'s election tests own 15000..20000, `raft_failover.rs`
@@ -397,10 +397,10 @@ fn acked_events_survive_primary_death_under_ram_policy() {
     primary.stop();
 
     // --- Phase 4: exactly one replica auto-promotes. The promotion
-    // policy sees the ack policy the dead primary advertised on the
-    // replication stream — `ram` — and must accept it (an ack
-    // always waited for a second node, so the election recency filter
-    // proves the winner holds every acked event). ---
+    // policy sees the ack policy the replica's lineage holds — the `ram`
+    // the dead primary journaled — and must accept it (an ack always
+    // waited for a second node, so the election recency filter proves the
+    // winner holds every acked event). ---
     let deadline = Instant::now() + Duration::from_secs(60);
     let winner = loop {
         assert!(
@@ -422,6 +422,13 @@ fn acked_events_survive_primary_death_under_ram_policy() {
         !serves_clients(nodes[loser].addrs.client(), Duration::from_secs(2)),
         "the losing replica must not serve clients"
     );
+    // The lineage's `ram` came over with the stream: the promoted node's
+    // journaled policy is the one its replica phase received.
+    wait_for_gauge(
+        nodes[winner].health_addr,
+        "melin_ack_policy_journaled",
+        AckPolicy::Ram.as_u8().into(),
+    );
 
     // --- Phase 5: the documented post-failover workflow. The promoted
     // node still runs `ram`, whose gate is structurally
@@ -442,6 +449,13 @@ fn acked_events_survive_primary_death_under_ram_policy() {
             }
         }
     }
+    // Journaled, and in force: the promoted node runs with replication
+    // disabled, so nothing could witness the change.
+    wait_for_gauge(
+        nodes[winner].health_addr,
+        "melin_ack_policy_in_force",
+        AckPolicy::Disk.as_u8().into(),
+    );
 
     // --- Phase 6: the acked total survived. A fresh client reads the
     // counter from the new primary; every event the old primary acked

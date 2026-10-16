@@ -447,6 +447,53 @@ and is committed on its own. Tests land with the step they pin.
    flowing, no heartbeat, the replica's promotion decision sees `disk`);
    the reverse direction (`disk+ram` restored, auto-failover proceeds);
    `replicated_failover` and `raft_failover` updated.
+
+   *As landed:* the cell is written by one function, `accept_slot` in
+   `receiver_transport.rs`, the only way a slot from the primary reaches
+   the replica's input ring: it pushes the slot and, once it is on the
+   ring, stores the policy of an `AckPolicyChange`
+   (`LineagePolicyCell::change_in`, an exhaustive match over the journal
+   variants, so a new one has to decide whether it moves the policy). So
+   a duplicate re-delivered below the resume point or a change past a
+   gap never moves it, and the advertised tip, advanced after the frames
+   are processed, never runs ahead of it; auto-promotion loads the tip
+   before the cell. `ReplicaControlPlane::primary_ack_policy` is gone, and
+   with it `ack_policy::ACK_POLICY_UNKNOWN`. All public, so step 7's
+   CHANGELOG lists each under **Changed**: the removed constant; the
+   `ReplicaControlPlane` field `primary_ack_policy` removed and
+   `primary_observed` added; the `ack_policy` field removed from
+   `PrimaryMessage::StreamStart` and `PrimaryMessage::Heartbeat`; and the
+   `encode_stream_start`, `encode_heartbeat` and `snapshot_transfer_with`
+   signatures that lost the byte. The
+   auto-promotion fallback, used only while the lineage holds no change,
+   is the mailbox's `requested_byte`, its last reader.
+
+   Two things the plan did not say. First, **the promotion drain follows
+   changes too**: it publishes slots on the same `accept_slot`, so a
+   change still in flight when a promotion starts is in the cell the
+   promoted primary seeds its lineage, its promotion entry and its gate
+   from. This closes step 4's note on the lagging cell. Second, **the
+   reproductions are integration tests in `raft_failover.rs`** (ticks
+   every few milliseconds on the primary, so the sender never heartbeats,
+   and the replicas requesting the policy the stream does *not* end on):
+   `a_weakening_streamed_between_ticks_stops_auto_promotion` (no replica
+   serves for well past the grace and an election once the primary dies)
+   and `a_strengthening_streamed_between_ticks_lets_the_failover_proceed`,
+   whose replicas bind a replication address, so the winner replicates and
+   the standalone rule does not apply: it journals its own `disk` as its
+   promotion entry and its gate stays under the streamed `disk+ram`, since
+   the other replica keeps following the dead primary and never witnesses
+   the entry. Both fail on the step-4 tree. The unit level pins the same
+   at the receiver (a change between ticks moves the cell in either
+   direction; a duplicate or a change past a gap does not; the promotion
+   drain moves it) and at the decision (`consider_auto_promotion` judges
+   the cell over the node's own requested policy, both ways).
+   `replicated_failover` checks that the promoted node's journaled gauge
+   is the streamed `ram` and that `ACK-POLICY disk` puts `disk` in force
+   on it. Both receivers share `receiver_transport`, and the cluster tests
+   above pass under the netns runner with the `dpdk` feature as well.
+   `docs/replication.md` still describes the advertised byte; step 7
+   rewrites it.
 6. **The halt latch** (halt-plan step 0). Tests per that plan's step-0
    list: a forced swap lifts the halt, a returning replica clears it.
 7. **Docs and DPDK coverage.** `docs/replication.md` (the policy section,

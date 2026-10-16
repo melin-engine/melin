@@ -59,7 +59,10 @@ pub const MSG_HEARTBEAT: u8 = 0x30;
 /// already has). A v6 replica would ignore it and lose the promotion
 /// check it feeds, so mixed pairs must not stream;
 /// 8 = the entry stream can carry an ack-policy change (journal tag
-/// 0x05), which a v7 replica refuses as an unknown entry mid-stream.
+/// 0x05), which a v7 replica refuses as an unknown entry mid-stream, and
+/// `StreamStart` and `Heartbeat` no longer carry the policy byte (a
+/// replica judges by the changes its lineage holds), so both frames
+/// changed layout.
 pub const REPL_PROTOCOL_VERSION: u16 = 8;
 
 /// Maximum frame size for control messages (handshake, ack, etc.).
@@ -130,14 +133,12 @@ pub enum PrimaryMessage {
         /// observed a *higher* epoch refuses to follow this (stale) primary;
         /// a replica behind it adopts the epoch as the stream's `EpochBump`s
         /// replay. See `crate::fence`.
+        ///
+        /// No ack policy rides here: the policy is lineage metadata, which
+        /// a replica learns from the `AckPolicyChange` entries it holds, so
+        /// it never believes a policy before it holds the entries behind
+        /// it.
         epoch: u64,
-        /// The primary's active ack policy, in the server-runtime
-        /// `AckPolicy::as_u8` encoding — opaque at this layer.
-        /// Refreshed by every `Heartbeat`; the replica's auto-promotion
-        /// refusal reads the last-observed value, so it judges the
-        /// policy the dead primary actually acked under instead of its
-        /// own locally-configured one.
-        ack_policy: u8,
     },
     NeedSnapshot,
     HashMismatch,
@@ -156,11 +157,9 @@ pub enum PrimaryMessage {
     SnapshotEnd {
         crc32c: u32,
     },
+    /// Liveness on an idle link: the last sequence sent.
     Heartbeat {
         sequence: u64,
-        /// See `StreamStart::ack_policy` — heartbeats keep the
-        /// replica's view current across runtime `ACK-POLICY` retunes.
-        ack_policy: u8,
     },
     /// Primary-driven segment rotation. Sent in-stream, after the last
     /// entry of the outgoing segment (`boundary_seq`) and before the
@@ -275,7 +274,6 @@ struct SnapshotEndFrame {
 struct HeartbeatFrame {
     tag: u8,
     sequence: U64,
-    ack_policy: u8,
 }
 
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
@@ -295,7 +293,6 @@ struct StreamStartFrame {
     segment_start_sequence: U64,
     anchor_hash: [u8; 32],
     epoch: U64,
-    ack_policy: u8,
     /// 1 when `genesis_entries` is known, 0 when it is not. A flag byte
     /// rather than a sentinel value, so "unknown" can never be read as a
     /// length; any other value is refused.
@@ -321,8 +318,8 @@ const _: () = assert!(core::mem::size_of::<ChallengeFrame>() == 33);
 const _: () = assert!(core::mem::size_of::<ChallengeResponseFrame>() == 97);
 const _: () = assert!(core::mem::size_of::<SnapshotBeginFrame>() == 49);
 const _: () = assert!(core::mem::size_of::<SnapshotEndFrame>() == 5);
-const _: () = assert!(core::mem::size_of::<HeartbeatFrame>() == 10);
-const _: () = assert!(core::mem::size_of::<StreamStartFrame>() == 67);
+const _: () = assert!(core::mem::size_of::<HeartbeatFrame>() == 9);
+const _: () = assert!(core::mem::size_of::<StreamStartFrame>() == 66);
 const _: () = assert!(core::mem::size_of::<SeqHashFrame>() == 41);
 const _: () = assert!(core::mem::size_of::<SegmentSeedBeginFrame>() == 9);
 
@@ -414,7 +411,6 @@ pub fn encode_stream_start(
     anchor_hash: [u8; 32],
     genesis_entries: Option<u64>,
     epoch: u64,
-    ack_policy: u8,
     buf: &mut Vec<u8>,
 ) {
     let frame = StreamStartFrame {
@@ -423,7 +419,6 @@ pub fn encode_stream_start(
         segment_start_sequence: U64::new(segment_start_sequence),
         anchor_hash,
         epoch: U64::new(epoch),
-        ack_policy,
         genesis_known: u8::from(genesis_entries.is_some()),
         genesis_entries: U64::new(genesis_entries.unwrap_or(0)),
     };
@@ -484,13 +479,11 @@ pub fn encode_hash_mismatch(buf: &mut Vec<u8>) {
     buf.push(MSG_HASH_MISMATCH);
 }
 
-/// Encode a Heartbeat message: the last-sent sequence plus the
-/// primary's current ack policy.
-pub fn encode_heartbeat(sequence: u64, ack_policy: u8, buf: &mut Vec<u8>) {
+/// Encode a Heartbeat message: the last-sent sequence.
+pub fn encode_heartbeat(sequence: u64, buf: &mut Vec<u8>) {
     let frame = HeartbeatFrame {
         tag: MSG_HEARTBEAT,
         sequence: U64::new(sequence),
-        ack_policy,
     };
     let payload = frame.as_bytes();
     write_length_prefix(buf, payload.len() as u32);
@@ -671,7 +664,6 @@ pub fn decode_primary_message(payload: &[u8]) -> io::Result<PrimaryMessage> {
                 anchor_hash: frame.anchor_hash,
                 genesis_entries,
                 epoch: frame.epoch.get(),
-                ack_policy: frame.ack_policy,
             })
         }
         MSG_NEED_SNAPSHOT => Ok(PrimaryMessage::NeedSnapshot),
@@ -698,7 +690,6 @@ pub fn decode_primary_message(payload: &[u8]) -> io::Result<PrimaryMessage> {
                 .map_err(|_| io::Error::other("Heartbeat too short"))?;
             Ok(PrimaryMessage::Heartbeat {
                 sequence: frame.sequence.get(),
-                ack_policy: frame.ack_policy,
             })
         }
         MSG_ROTATE => {
@@ -736,7 +727,7 @@ mod tests {
 
     fn stream_start(genesis_entries: Option<u64>) -> Vec<u8> {
         let mut buf = Vec::new();
-        encode_stream_start(9, 1, [0x77; 32], genesis_entries, 4, 2, &mut buf);
+        encode_stream_start(9, 1, [0x77; 32], genesis_entries, 4, &mut buf);
         buf
     }
 
@@ -753,14 +744,13 @@ mod tests {
                     anchor_hash,
                     genesis_entries,
                     epoch,
-                    ack_policy,
                 } => {
                     assert_eq!(genesis_entries, sent);
                     assert_eq!(
                         (start_sequence, segment_start_sequence, anchor_hash),
                         (9, 1, [0x77; 32])
                     );
-                    assert_eq!((epoch, ack_policy), (4, 2));
+                    assert_eq!(epoch, 4);
                 }
                 other => panic!("expected StreamStart, got {other:?}"),
             }

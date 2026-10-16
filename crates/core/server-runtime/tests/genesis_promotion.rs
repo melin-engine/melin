@@ -213,15 +213,7 @@ fn a_replica_configured_without_genesis_refuses_promotion_mid_genesis() {
         other => panic!("expected a handshake, got {other:?}"),
     }
     buf.clear();
-    encode_stream_start(
-        0,
-        1,
-        [0x3D; 32],
-        Some(3),
-        0,
-        AckPolicy::Disk.as_u8(),
-        &mut buf,
-    );
+    encode_stream_start(0, 1, [0x3D; 32], Some(3), 0, &mut buf);
     stream.write_all(&buf).expect("StreamStart");
     // The first two genesis entries.
     let slots: Vec<InputSlot<CounterEvent>> = [1_000, 2_000]

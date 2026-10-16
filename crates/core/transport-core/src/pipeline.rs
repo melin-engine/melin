@@ -2546,9 +2546,11 @@ fn ack_policy_change_slot<R: Copy, Q: Copy>(
 ///
 /// Exhaustive on purpose: a new lineage-metadata variant that also needs
 /// a switch point in the output ring must break the build here rather
-/// than fall silently into `None`.
+/// than fall silently into `None`. The one decision point for the
+/// question: [`LineagePolicyCell::change_in`](crate::lineage::LineagePolicyCell::change_in)
+/// answers it for a replica through this function.
 #[inline]
-fn policy_change_of<E: AppEvent>(
+pub(crate) fn policy_change_of<E: AppEvent>(
     event: &melin_journal::JournalEvent<E>,
 ) -> Option<melin_journal::AckPolicyChange> {
     use melin_journal::JournalEvent;

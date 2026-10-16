@@ -211,9 +211,10 @@ pub struct AckPolicyControl {
     /// Set while a request waits for the producer: the one load the
     /// producer's loop pays.
     pending: AtomicBool,
-    /// The requested policy's byte, for the readers that do not take the
-    /// lock: the replication senders' advertisement and auto-promotion's
-    /// fallback. Updated when a request is staged or journaled.
+    /// The requested policy's byte, for a reader that does not take the
+    /// lock: auto-promotion's fallback, used only while a replica's
+    /// lineage holds no change. Updated when a request is staged or
+    /// journaled.
     requested: Arc<AtomicU8>,
     publish_wait: Duration,
 }

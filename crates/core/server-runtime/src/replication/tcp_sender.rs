@@ -76,12 +76,6 @@ pub struct Sender {
     /// `StreamStart`, and to self-demote when a replica handshakes with a
     /// higher epoch (this primary has been superseded). See `crate::fence`.
     pub fence_state: Arc<melin_transport_core::fence::FenceState>,
-    /// The requested ack policy's byte (`AckPolicyControl::requested_byte`):
-    /// the policy last staged or journaled, which may not be in force yet
-    /// (a witnessed change waits for its witnesses). Stamped on every
-    /// `StreamStart` and `Heartbeat` so replicas judge auto-promotion
-    /// against it.
-    pub ack_policy: Arc<std::sync::atomic::AtomicU8>,
 }
 
 /// Run the replication sender. Listens for replica connections,
@@ -109,7 +103,6 @@ pub fn run_sender<A: Application>(
         batch_size,
         heartbeat_secs,
         fence_state,
-        ack_policy,
     } = config;
     // Unwrap the invariant-carrying newtype — from here `listener` is a
     // plain TcpListener, known non-blocking.
@@ -310,7 +303,6 @@ pub fn run_sender<A: Application>(
                     let slot_active = Arc::clone(&active_flags[slot_idx]);
                     let slot_evict = Arc::clone(&evict_flags[slot_idx]);
                     let slot_fence = Arc::clone(&fence_state);
-                    let slot_ack_policy = Arc::clone(&ack_policy);
                     let slot_authenticated = Arc::clone(&authenticated_flags[slot_idx]);
                     let handler = handlers[slot_idx];
                     let shutdown_flag = shutdown as *const AtomicBool as usize;
@@ -345,7 +337,6 @@ pub fn run_sender<A: Application>(
                                 evict_flag: &slot_evict,
                                 metrics: &slot_metrics,
                                 fence_state: &slot_fence,
-                                ack_policy: &slot_ack_policy,
                                 slot_idx,
                                 batch_size,
                                 heartbeat_secs,
@@ -412,9 +403,6 @@ struct SlotContext<'a> {
     evict_flag: &'a AtomicBool,
     metrics: &'a ReplicationMetrics,
     fence_state: &'a melin_transport_core::fence::FenceState,
-    /// The primary's active ack policy — stamped on `StreamStart` and
-    /// `Heartbeat` (see `Sender::ack_policy`).
-    ack_policy: &'a std::sync::atomic::AtomicU8,
     slot_idx: usize,
     batch_size: usize,
     heartbeat_secs: u64,
@@ -456,7 +444,6 @@ fn handle_replica_connection<A: Application>(
         evict_flag: _,
         metrics,
         fence_state,
-        ack_policy,
         slot_idx,
         batch_size: _,
         heartbeat_secs,
@@ -587,7 +574,6 @@ fn handle_replica_connection<A: Application>(
             origin.anchor_hash,
             origin.genesis_entries,
             fence_state.epoch(),
-            ack_policy.load(Ordering::Relaxed),
             &mut send_buf,
         );
         publish(&send_buf)?;
@@ -625,12 +611,7 @@ fn handle_replica_connection<A: Application>(
         }
         publish(&send_buf)?;
         send_buf.clear();
-        match snapshot_transfer_with::<A::Event>(
-            journal_path,
-            &mut publish,
-            shutdown,
-            ack_policy.load(Ordering::Relaxed),
-        )? {
+        match snapshot_transfer_with::<A::Event>(journal_path, &mut publish, shutdown)? {
             CatchUpResult::Ok(end) => end,
             CatchUpResult::NeedSnapshot => {
                 return Err(io::Error::other(
@@ -813,7 +794,6 @@ fn live_stream_uring(
         slot_idx,
         batch_size,
         wait,
-        ack_policy,
         // Only used during handshake/catch-up (handle_replica_connection).
         journal_path: _,
         authorized_keys: _,
@@ -962,7 +942,7 @@ fn live_stream_uring(
                     .tick(heartbeat_interval, waiter.spinning())
                     .is_some()
                 {
-                    encode_heartbeat(sent.get(), ack_policy.load(Ordering::Relaxed), send_buf);
+                    encode_heartbeat(sent.get(), send_buf);
                     let sqe = opcode::Send::new(
                         types::Fixed(0),
                         send_buf.as_ptr(),

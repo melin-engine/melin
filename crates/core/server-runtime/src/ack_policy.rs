@@ -25,13 +25,6 @@ pub use melin_transport_core::ack_policy::{
     Blocker, Clause, CursorView, EvalStatus, Level, MAX_CLUSTER_SIZE, Policy, PolicyError,
 };
 
-/// Sentinel for "no primary ack policy observed yet" in the replica-side
-/// gauge the replication stream feeds (see
-/// `ReplicaControlPlane::primary_ack_policy`). Deliberately outside the
-/// `as_u8` range so `from_u8` maps it to `None`; `u8::MAX` leaves the
-/// low values free for future policies.
-pub const ACK_POLICY_UNKNOWN: u8 = u8::MAX;
-
 /// Operator-facing ack policy: which copies of an event must exist
 /// before its response is released. Each variant maps to a named
 /// [`Clause`] list composed directly in code. See `docs/replication.md`
@@ -149,9 +142,9 @@ impl AckPolicy {
     /// export.
     ///
     /// **These values are a wire format**, not just an in-process ABI:
-    /// they are in every journal holding a policy change, the primary
-    /// stamps this byte onto every `StreamStart` and `Heartbeat`, and the
-    /// replica decodes it with [`from_u8`](Self::from_u8) to judge
+    /// they are in every journal holding a policy change, streamed to
+    /// every replica with the entries, and a replica decodes the one its
+    /// lineage holds with [`from_byte`](Self::from_byte) to judge
     /// auto-promotion (see `raft_promotion`). So they must stay
     /// stable across releases in two directions — the round-trip
     /// `from_u8(as_u8(x)) == Some(x)` has to hold, *and* a value once
@@ -164,7 +157,7 @@ impl AckPolicy {
     ///
     /// A peer that does not know a byte gets `None` and refuses to
     /// auto-promote on it — fail-closed, and the reason replicas must
-    /// be upgraded before a primary starts advertising a new policy.
+    /// be upgraded before a primary starts journaling a new policy.
     pub fn as_u8(self) -> u8 {
         match self {
             AckPolicy::Disk => 0,

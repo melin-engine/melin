@@ -577,8 +577,8 @@ where
         tip_ready,
         journal_tip,
         primary_link_up,
-        // Stored by `accept_stream_start`, which takes `control` whole.
-        primary_ack_policy: _,
+        // Set by `accept_stream_start`, which takes `control` whole.
+        primary_observed: _,
         lineage_ack_policy,
         pipeline_healthy,
     } = control;
@@ -787,13 +787,11 @@ where
                 anchor_hash,
                 genesis_entries,
                 epoch,
-                ack_policy,
             } => match super::accept_stream_start(
                 super::StreamStart {
                     start_sequence,
                     lineage: (segment_start_sequence, anchor_hash, genesis_entries),
                     epoch,
-                    ack_policy,
                 },
                 "tcp",
                 &pipeline,
@@ -1443,7 +1441,6 @@ mod tests {
                 lineage_anchor,
                 lineage_genesis,
                 0,
-                1,
                 &mut buf,
             );
             s1.write_all(&buf).expect("StreamStart 1");
@@ -1520,7 +1517,6 @@ mod tests {
                 &primary_journal,
                 &mut publish,
                 &transfer_shutdown,
-                1,
             )
             .expect("snapshot transfer");
             assert_eq!(
@@ -1678,7 +1674,7 @@ mod tests {
             // session and wait for its ack.
             let stream_one = |s: &mut TcpStream, buf: &mut Vec<u8>| {
                 buf.clear();
-                encode_stream_start(0, lineage_start, lineage_anchor, lineage_genesis, 0, 1, buf);
+                encode_stream_start(0, lineage_start, lineage_anchor, lineage_genesis, 0, buf);
                 s.write_all(buf).expect("StreamStart");
                 buf.clear();
                 melin_transport_core::replication_wire::encode_input_batch(
@@ -1753,7 +1749,6 @@ mod tests {
                     &primary_journal,
                     &mut publish,
                     &transfer_shutdown,
-                    1,
                 )
                 .expect_err("the scripted primary drops before the seed");
             }
@@ -1895,7 +1890,6 @@ mod tests {
                 lineage_anchor,
                 lineage_genesis,
                 0,
-                1,
                 &mut buf,
             );
             s1.write_all(&buf).expect("StreamStart 1");
@@ -1941,7 +1935,6 @@ mod tests {
                     &primary_journal,
                     &mut publish,
                     &transfer_shutdown,
-                    1,
                 )
                 .expect("snapshot transfer");
             }
@@ -2189,7 +2182,6 @@ mod tests {
                 lineage_anchor,
                 lineage_genesis,
                 0,
-                1,
                 &mut buf,
             );
             s1.write_all(&buf).expect("StreamStart");
@@ -2345,7 +2337,6 @@ mod tests {
                 lineage.anchor_hash,
                 lineage.genesis_entries,
                 0,
-                1,
                 &mut buf,
             );
             stream.write_all(&buf).expect("StreamStart");
@@ -2976,7 +2967,6 @@ mod tests {
                 lineage_anchor,
                 lineage_genesis,
                 0,
-                1,
                 &mut buf,
             );
             s1.write_all(&buf).expect("StreamStart");

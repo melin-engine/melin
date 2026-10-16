@@ -1010,8 +1010,8 @@ where
 
         // The replica's control-plane bundle: promotion request (admin
         // PROMOTE / raft auto-promotion), tip readiness + advertised
-        // journal tip (vote recency), primary link state, and the
-        // primary's advertised ack policy. Constructed before
+        // journal tip (vote recency), primary link state, and the ack
+        // policy the replica's lineage holds. Constructed before
         // mode-detection so it survives a replica → primary transition.
         // The rotate flag is re-wired into the new primary's journal
         // stage by `run_as_primary`.
@@ -1982,7 +1982,6 @@ where
             .ok_or("replication_metrics must be Some when replication is enabled")?;
         let handlers = [cores.repl_handler_0, cores.repl_handler_1];
         let sender_fence = Arc::clone(&fence_state);
-        let sender_ack_policy = ack_policy.requested_byte();
         // Bound in `run_impl` before any pipeline thread was spawned —
         // see the `repl_listener` parameter doc.
         let repl_listener = repl_listener
@@ -2017,7 +2016,6 @@ where
                         batch_size,
                         heartbeat_secs,
                         fence_state: sender_fence,
-                        ack_policy: sender_ack_policy,
                     },
                     &s_repl,
                     &ready_flag,
@@ -3166,7 +3164,6 @@ where
             batch_size,
             heartbeat_secs,
             Arc::clone(&fence_state),
-            ack_policy.requested_byte(),
             Arc::clone(&authorized_keys),
         )?;
         // Legacy text match — `lan-bench-suite.sh` `wait_for_log` keys
