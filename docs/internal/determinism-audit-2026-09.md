@@ -60,7 +60,7 @@ Severity is a judgement from code reading.
 | 7 | A flipped bit in an entry's length field bypasses the CRC | Medium | Reproduced (fixed) |
 | 8 | Replicated entries have no end-to-end integrity; DPDK verifies no checksum on receive | High | Confirmed (fixed) |
 | 9 | The event publisher broadcasts reports before they are durable | High | Confirmed |
-| 10 | A runtime ack-policy change never reaches replicas while data flows | High | Confirmed |
+| 10 | A runtime ack-policy change never reaches replicas while data flows | High | Confirmed (fixed) |
 | 11 | The DPDK replication sender skips a batch that does not fit its transmit queue | High | Reproduced (fixed) |
 | 12 | A primary disk stall makes a truthful replica look divergent | Medium | Confirmed |
 | 13 | Raft-mesh fencing ignores reply envelopes | Medium | Confirmed |
@@ -79,7 +79,7 @@ Severity is a judgement from code reading.
 | 26 | The application codec contract is unenforced | Low | Confirmed |
 | 27 | The DPDK response stage drops a connection without closing it | Low | Reported |
 | 28 | A half-open replica slot can count one replica twice | Low | Reported |
-| 29 | Tightening the ack policy lags the in-flight batch | Low | Reported |
+| 29 | Tightening the ack policy lags the in-flight batch | Low | Reported (fixed) |
 | 30 | `no-persist` fakes durability without a signal | Low | Reported |
 | 31 | Fence suppression is partial | Low | Reported |
 | 32 | Epoch uniqueness has holes | Low | Confirmed in part |
@@ -784,6 +784,36 @@ auto-failover refuses indefinitely.
 dedicated frame on each swap or a policy byte in every `InputBatch`
 header, not only on idle heartbeats.
 
+**Status: fixed**, by going further than the direction: a frame or a
+byte sent on the stream still cannot reach a replica that is
+disconnected when the policy is weakened, and still advertises a policy
+before the replica holds the events behind it (finding 14's mistake).
+The plan is [journaled-ack-policy-2026-10.md](journaled-ack-policy-2026-10.md).
+
+- The policy is lineage metadata, like the epoch: an `AckPolicyChange`
+  journal entry (tag `0x05`), replicated in order, replayed on recovery
+  and recorded in snapshots (framing v4). `StreamStart` and `Heartbeat`
+  no longer carry a policy byte (replication protocol 8).
+- A replica's view is the newest change it holds, written where a slot
+  reaches its input ring (`receiver_transport::accept_slot`, the
+  promotion drain included); auto-promotion reads it, and falls back to
+  the node's requested policy only while the lineage holds none.
+- The primary's gate switches at the change's own output slot, once the
+  change is durable under the policy before it, so a weakening takes
+  effect only once the nodes the old policy relied on hold it: a replica
+  that lacks it lacks every event acked under the new policy, and loses
+  to the peer-tip veto or judges by the older policy. The one exception
+  is a forced `disk` with no replica connected, which nothing can
+  witness: it is journaled as unwitnessed, warned about, and documented
+  as a limitation in `docs/replication.md`.
+- Regression tests: the reproduction (ticks flowing, no heartbeat,
+  promotion refused after a streamed weakening) and the reverse
+  direction are `raft_failover`'s
+  `a_weakening_streamed_between_ticks_stops_auto_promotion` and
+  `a_strengthening_streamed_between_ticks_lets_the_failover_proceed`;
+  `ack_policy_changes` pins the in-order switch on live nodes. Both pass
+  under the netns DPDK runner too.
+
 ### 12. A primary disk stall makes a truthful replica look divergent
 
 **Medium. Confirmed.** Breaks promise 7.
@@ -1122,6 +1152,11 @@ every build.
 29. **Tightening the ack policy lags the in-flight batch.** The rest of a
     response batch keeps releasing against a position cached under the
     old, weaker policy. Reported.
+    **Status: fixed** with finding 10. A change is an output slot of its
+    own, and the gate switches there through one `switch_to`, which
+    drops the cached position, so every slot after it is evaluated under
+    the new policy (`durability_gate`'s
+    `a_change_applies_from_its_own_slot_on`).
 30. **`no-persist` fakes durability without a signal.** The disk thread
     publishes durable cursors without writing, nothing warns at startup,
     and a `no-persist` replica's persisted acks are fake. No workspace
@@ -1239,8 +1274,9 @@ Not determinism, but each one defeats failover or stalls a node.
   multi-consumer disruptor. Its durability sentence contradicts finding 9.
 - `docs/replication.md` says "a process crash loses nothing" under `disk`,
   `disk+ram` and `two-disks`, which ignores batches still in the journal's
-  write ring. It says the ack policy "is advertised to replicas on the
-  replication stream" (finding 10). Findings 13 and 31 contradict its
+  write ring. (Its claim that the ack policy "is advertised to replicas
+  on the replication stream", finding 10, was rewritten with that fix.)
+  Findings 13 and 31 contradict its
   fencing claims, and "queries keep answering" during a halt is the
   roadmap's "Answer queries on a halted node".
 - `docs/journal.md` promises that a gap is an error (finding 5), that the

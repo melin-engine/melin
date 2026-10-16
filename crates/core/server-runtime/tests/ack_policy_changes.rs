@@ -15,6 +15,9 @@
 //! - A forced `ACK-POLICY disk` (no replica connected) lifts the halt on
 //!   client writes until a replica connects or a policy that needs one is
 //!   journaled.
+//! - The same forced `disk` releases a write held under `disk+ram` by a
+//!   replica that left without acking it: the change overtakes the write
+//!   once its own entry is on the primary's disk.
 //!
 //! Nodes are started through `melin-test-node`: on kernel TCP by default,
 //! on DPDK with this crate's `dpdk` feature, under
@@ -378,6 +381,62 @@ fn a_forced_disk_lifts_the_halt_until_a_replica_returns() {
         "the override did not outlive the replica"
     );
     wait_for_gauge(health, TRADING, 0);
+
+    drop(conn);
+    primary.stop();
+}
+
+/// The forced swap's reason to exist: under `disk+ram`, a write the
+/// replica never acked is held, and once the replica is gone nothing can
+/// release it in order (the change would queue behind it). `ACK-POLICY
+/// disk` sent with no replica connected is journaled unwitnessed, answered
+/// `OK`, and releases the held write once its own entry is on the
+/// primary's disk: `disk` is in force, journaled and applied.
+#[test]
+fn a_forced_disk_releases_a_write_held_under_disk_and_ram() {
+    let cluster = Cluster::new();
+    let config = cluster.config(AckPolicy::DiskAndRam, false);
+    let health = config.health_bind.expect("set");
+    let admin = config.admin_bind.expect("set");
+    let primary = cluster.start(config);
+    let mut replica = cluster.join_replica(health);
+    wait_for_gauge(health, IN_FORCE, AckPolicy::DiskAndRam.as_u8().into());
+
+    // A write the replica takes but never acks: entry 2, on the primary's
+    // disk and held.
+    let pending = Pending::send(cluster.client(&primary));
+    wait_durable(health, 2);
+    replica.read_through(2);
+    assert!(
+        pending.held_for(HOLD),
+        "the write was acked under `disk+ram` without the replica"
+    );
+
+    // The replica leaves: the write stays held, under the old policy.
+    drop(replica);
+    wait_for_gauge(health, "melin_replicas_connected", 0);
+    assert!(
+        pending.held_for(HOLD),
+        "the write was acked with no replica to hold it"
+    );
+    assert_eq!(
+        gauge(health, IN_FORCE),
+        Some(AckPolicy::DiskAndRam.as_u8().into())
+    );
+
+    // The operator's consent: entry 3, forced. It overtakes the held
+    // write, which is acked on the disk alone.
+    assert_eq!(
+        admin_command(admin, &cluster.keys.operator, "ACK-POLICY disk").as_deref(),
+        Some("OK")
+    );
+    wait_for_gauge(health, JOURNALED, AckPolicy::Disk.as_u8().into());
+    // Wait for entry 3 to be durable before taking the ack. That the gate
+    // releases the held write only once the forced change is on disk is
+    // pinned by the gate's own unit tests, not by this wait.
+    wait_durable(health, 3);
+    let conn = pending.acked();
+    wait_for_gauge(health, IN_FORCE, AckPolicy::Disk.as_u8().into());
 
     drop(conn);
     primary.stop();

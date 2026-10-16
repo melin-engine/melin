@@ -1,6 +1,7 @@
 # Degraded acks on a halted node (plan)
 
-Status: **proposed** (2026-10). Covers the roadmap item "Degraded acks on
+Status: **step 0 done** (with journaled ack-policy changes, see below);
+the rest **proposed** (2026-10). Covers the roadmap item "Degraded acks on
 a halted node", which replaces the former items "Halt refusals behind a
 stalled ack gate" and "Answer queries on a halted node": both are
 symptoms of the same stall, and one change resolves both.
@@ -33,7 +34,8 @@ way, and refusals stop waiting behind either.
   the verdict never reads the policy, so the halt continues. As
   documented, the playbook does not work, and a promoted primary with no
   replica has no way to resume writes short of a replica joining. Step 0
-  below fixes it ahead of everything else.
+  below fixes it ahead of everything else (done: a `disk` swap sent with
+  no replica connected now lifts the halt).
 - **The response stage parks in the gate.** One thread per stage
   (`response.rs`, `dpdk_response.rs`) waits inside
   `DurabilityGate` on each slot in order. Under `ram`, `disk+ram` or
@@ -281,6 +283,23 @@ boot does not.
    back to a replica-backed policy with no replica halts again; a swap
    to `disk` made while a replica is connected does not stop the halt
    when it leaves. A bug fix on its own, landing first.
+
+   *As landed* (step 6 of
+   [journaled-ack-policy-2026-10.md](journaled-ack-policy-2026-10.md),
+   which made the admin swap a journaled entry, so it is the input ring's
+   producer, not the admin handler, that publishes it and sets or clears
+   the latch): the replica count and the latch are one type,
+   `ReplicaPresence`, whose `halted()` both the verdict and the health
+   endpoint's `trading` flag read. A connect voids the latch by
+   generation rather than clearing a flag, so a replica connecting
+   between the producer's observation and its latch cannot leave a latch
+   that outlives it. "No replica connected" is decided by the producer
+   when it journals the swap, and the latch is recorded before the
+   operator's `OK`. The tests above are `halt.rs`'s and
+   `ack_policy_changes::a_forced_disk_lifts_the_halt_until_a_replica_returns`
+   (kernel TCP and DPDK). `docs/replication.md`'s halt and
+   manual-promotion sections and the CHANGELOG entry landed with that
+   plan's step 7.
 1. **Root-cause the `disk` hang.** Write the failing test first: a
    primary and one replica started through `melin-test-node`, policy
    `disk`, replica killed, then a query that must answer within a

@@ -41,6 +41,11 @@ Findings that confirm, sharpen or correct the roadmap entry.
   `next_sequence` and `chain_hash` across that handoff for the same
   reason. Seeding inside `run_as_primary` covers boot, snapshot boot
   and promotion with one code path.
+- *Stale (2026-10):* the premise below predates 0.19.0, which released
+  format 16 and protocol 7; protocol 8 (journaled ack-policy changes)
+  followed. Format 15 and 16 journals are released formats that current
+  builds read, so how the new replay rule treats them has to be
+  re-decided. Re-derive this bullet, and decision 7, before starting.
 - **Format 15 and protocol 5 are unreleased, but not unused.** Both sit
   under `[Unreleased]` in the CHANGELOG, and the journal reader accepts
   only `FORMAT_VERSION`, so there is no released journal to replay under
@@ -435,8 +440,11 @@ over accurate), but the operator and the application author must know:
 
 The new replay rule refuses what format-15 journals written by `main`
 contain, and the `Tick` layout changes in both the journal and the
-replication stream (step 4). Format 17 and protocol 8 (the recorded
-genesis length took format 16 and protocol 7) turn a misleading
+replication stream (step 4). Format 17 and protocol 9 (the recorded
+genesis length took format 16 and protocol 7, and journaled ack-policy
+changes took protocol 8, see
+[journaled-ack-policy-2026-10.md](journaled-ack-policy-2026-10.md);
+neither changed the journal format) turn a misleading
 failure into the refusal an older build's journal or peer should get
 (`UnsupportedVersion`, a handshake refusal). Released users are
 unaffected: 0.17 writes format 14, so they cross 14 to 17 in the one

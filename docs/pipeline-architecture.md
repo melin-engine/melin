@@ -206,7 +206,7 @@ Because the journal and matching consumers are gated only on the producer, they 
 | `key_hash: u64` | Hash of the client's public key; 0 for events the node journals on its own behalf |
 | `sequence: u64` | Journal sequence; assigned by the journal stage on a primary, carried from the primary's stream on a replica |
 | `timestamp_ns: u64` | Wall-clock time stamped at ingress; zero for queries |
-| `event: JournalEvent` | An application event, or one the runtime journals itself (a tick, an epoch bump) |
+| `event: JournalEvent` | An application event, or one the runtime journals itself (a tick, an epoch bump, an ack-policy change) |
 | `publish_ts: TraceTimestamp` | Disruptor publish timestamp (zero-sized when `latency-trace` disabled) |
 | `recv_ts: TraceTimestamp` | Wire receive timestamp (zero-sized when `latency-trace` disabled) |
 
@@ -313,10 +313,10 @@ The response stage runs on a dedicated OS thread and is the final stage in the p
 
 ### Ack gating (persist-before-ack)
 
-Before sending any response, the response stage verifies that the corresponding event satisfies the configured ack policy:
+Before sending any response, the response stage verifies that the corresponding event satisfies the ack policy in force:
 
 1. Each response carries the sequence number the event was assigned in the journal, which is the same number replicas report progress against.
-2. The acked position is derived from the configured ack policy (`--ack-policy`), which says which *copies* of the event must exist — not which nodes must hold them:
+2. The acked position is derived from the ack policy in force (`--ack-policy`, or the one the journal records, below), which says which *copies* of the event must exist — not which nodes must hold them:
    - **`disk`**: one fsynced copy, on whichever node's disk confirms first. The only policy allowed with `--standalone`.
    - **`ram`**: two copies in memory (the primary's plus one replica's). Every fsync trails off the ack path.
    - **`disk+ram`** (default): one fsynced copy plus a second copy in another node's memory. A disk spike on the primary lets the replica's fsync satisfy the disk clause.
@@ -324,7 +324,9 @@ Before sending any response, the response stage verifies that the corresponding 
 3. If the acked position has not reached that response's own sequence number, spin-wait until it does.
 4. Once confirmed, the response is encoded and sent.
 
-The check is made **per response**, not once per batch. A response is released as soon as its own event satisfies the policy, so a request does not wait on unrelated requests that happened to be processed alongside it. Since the acked position is a high-water mark, a client that receives a response knows that event and every event before it satisfies the configured policy.
+The policy is the one in force at the event's place in the order, not a setting read at send time. A policy change is journaled like an event, and reaches the response stage as an output slot of its own between the replies before it and the replies after it; the stage switches to the new policy there, once the change itself satisfies the policy before it (see "Runtime policy swap" in [replication.md](replication.md)). The one exception is a forced swap to `disk` on a primary with no replica, which the stage applies as soon as its entry is on the primary's disk, overtaking the replies it was holding.
+
+The check is made **per response**, not once per batch. A response is released as soon as its own event satisfies the policy, so a request does not wait on unrelated requests that happened to be processed alongside it. Since the acked position is a high-water mark, a client that receives a response knows that event and every event before it satisfies the policy in force.
 
 The one reply exempt from the wait is the refusal of a write while the node is halted. The write is refused before it enters the pipeline, so there is no event to wait on; the refusal is sent once the replies to everything received before it on that connection have gone out, keeping replies in request order.
 
@@ -373,7 +375,7 @@ The output SPSC queue connects the matching stage to the response stage. Defined
 |-------|-------------|
 | `connection_id: u64` | Target client connection |
 | `input_seq: u64` | Input disruptor sequence (for journal cursor gating) |
-| `payload: OutputPayload` | `Report` (an application report), `QueryResponse`, `BatchEnd`, or `EngineError` |
+| `payload: OutputPayload` | `Report` (an application report), `QueryResponse`, `BatchEnd`, `EngineError`, or `AckPolicyChange` (a journaled policy change, at its place in the order; it produces no frame) |
 | `match_complete_ts` | Matching completion timestamp (zero-sized when `latency-trace` disabled) |
 | `recv_ts` | Wire receive timestamp (zero-sized when `latency-trace` disabled) |
 

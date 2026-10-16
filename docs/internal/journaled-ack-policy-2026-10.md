@@ -1,6 +1,6 @@
 # Journaled ack-policy changes (plan)
 
-Status: **in progress** (2026-10). Fixes finding 10 of the
+Status: **done** (2026-10). Fixes finding 10 of the
 [determinism audit](determinism-audit-2026-09.md), "A runtime ack-policy
 change never reaches replicas while data flows", and the deeper problem
 behind it: a replica that is disconnected when the policy is weakened can
@@ -563,6 +563,49 @@ and is committed on its own. Tests land with the step they pin.
    the roadmap (finding 10 done, halt step 0 done), the halt and
    monotonic-time plans. DPDK cases under the netns runner, if not
    already landed with steps 4–6.
+
+   *As landed:* the DPDK case owed since step 4 is
+   `ack_policy_changes::a_forced_disk_releases_a_write_held_under_disk_and_ram`:
+   under `disk+ram`, a write the scripted replica took but never acked
+   is held; the replica leaves; `ACK-POLICY disk` replies `OK`, the
+   journaled gauge moves to `disk`, the held write is acked, and `disk`
+   is in force. It is the first live-node test of the forced cell
+   overtaking a held slot (step 3 had it at the gate and the kernel
+   response stage only), so it covers the DPDK response stage's
+   `admit` and the poll thread's forced publish as well. The whole
+   `ack_policy_changes` binary passes on kernel TCP and under the netns
+   runner with the `dpdk` feature. Departures from the list above:
+
+   - **`dispatch` is crate-private**, so its signature is not in the
+     CHANGELOG; the public breaks it lists are the ones reachable from
+     outside (the new variants, `snapshot::load`/`save`, `shadow::run`,
+     `JournaledApp`, the protocol frames and encoders, the server-runtime
+     structs, the `ReplicaPresence` type changes, the removed constants).
+   - **There is no guarantees and limitations page yet** (a roadmap
+     item), so decision 5's limitation is a section of
+     `docs/replication.md`'s Limitations, with the operational rule, and
+     the roadmap item now lists it among what that page must state.
+   - **Finding 29** ("Tightening the ack policy lags the in-flight
+     batch") is fixed by step 3's in-order switch, which drops the cached
+     position; the audit marks it so, citing the gate test that pins it.
+   - **`docs/pipeline-architecture.md`** described the gate as reading
+     the configured policy; its ack-gating section and slot tables now
+     describe the in-order switch and the new slot.
+   - **The monotonic-time plan** now names protocol 9 for itself; its
+     "unreleased format 15" premise is marked stale (0.19.0 released
+     format 16 and protocol 7) and to be re-derived before it starts.
+
+   **Not fixed here (pre-existing, documented):** a runtime
+   `ACK-POLICY` naming a policy that needs a replica, sent to a primary
+   that accepts none (no `--replication-bind`), is journaled
+   unwitnessed and applied once on disk, so the gate holds every reply
+   until a restart under `disk` (the standalone rule then serves at
+   once). The admin atomic did the same before this plan. Refusing such
+   a request at the mailbox (`Witnesses::Disabled` with
+   `AckPolicy::needs_replica`) would prevent it; `docs/replication.md`
+   warns against it meanwhile, and the roadmap tracks the refusal as
+   its own item ("Refuse an ack policy that needs a replica on a node
+   that accepts none").
 
 ## Downstream impact (Exchange Core)
 
