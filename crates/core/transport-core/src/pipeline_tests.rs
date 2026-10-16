@@ -30,9 +30,13 @@ use crate::cursors::{DurableWireSeqCursor, WireSeq};
 // no-persist gates off — same reason as `JournalReader` above.
 #[cfg(not(feature = "no-persist"))]
 use crate::journaled_app::JournaledApp;
+#[cfg(not(feature = "no-persist"))]
+use crate::lineage::Lineage;
 use crate::pipeline::StageWaits;
 #[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
 use crate::pipeline::build_replica_pipeline;
+#[cfg(not(feature = "no-persist"))]
+use melin_journal::AckPolicyByte;
 // Only the hash-chain mark tests touch these.
 #[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
 use crate::pipeline::{AdoptedRotation, StreamMark};
@@ -2096,7 +2100,7 @@ fn barrier_fsync_state_pair_is_self_consistent_for_the_shadow() {
                 fsync_reader,
                 &shutdown2,
                 WaitStrategy::SpinThenYield,
-                0,
+                crate::lineage::Lineage::GENESIS,
                 Some(0),
             );
         })
@@ -2106,12 +2110,12 @@ fn barrier_fsync_state_pair_is_self_consistent_for_the_shadow() {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(snap_path.exists(), "the aligned shadow must snapshot");
-    let (restored, journal_seq, _, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
+    let (restored, header) = snapshot::load::<TestApp>(&snap_path).unwrap();
     assert_eq!(
         restored.total, 3,
         "state = Add(1)+Add(2), exactly the prefix"
     );
-    assert_eq!(journal_seq, 2);
+    assert_eq!(header.sequence, 2);
 
     // Now the window: the disk thread, publishing the tail batch, stores
     // progress first and the seqlock second. Freeze it between the two.
@@ -2134,9 +2138,9 @@ fn barrier_fsync_state_pair_is_self_consistent_for_the_shadow() {
     shutdown.store(true, Ordering::Relaxed);
     handle.join().unwrap();
 
-    let (restored, journal_seq, _, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
+    let (restored, header) = snapshot::load::<TestApp>(&snap_path).unwrap();
     assert_eq!(
-        (restored.total, journal_seq),
+        (restored.total, header.sequence),
         (3, 2),
         "a stale-but-consistent pair must not let the shadow snapshot past its journal_seq"
     );
@@ -2276,7 +2280,7 @@ fn fsync_state_pairs_stay_consistent_across_adopted_rotations() {
                     fsync_reader,
                     &shutdown,
                     WaitStrategy::SpinThenYield,
-                    0,
+                    crate::lineage::Lineage::GENESIS,
                     Some(0),
                 );
             })
@@ -2289,10 +2293,12 @@ fn fsync_state_pairs_stay_consistent_across_adopted_rotations() {
     // NotFound here just means "try again next round".
     let mut snapshots: BTreeMap<u64, std::path::PathBuf> = BTreeMap::new();
     let collect = |snapshots: &mut BTreeMap<u64, std::path::PathBuf>| {
-        if let Ok((_, seq, _, _)) = snapshot::load::<TestApp>(&snap_path)
-            && !snapshots.contains_key(&seq)
+        if let Ok((_, header)) = snapshot::load::<TestApp>(&snap_path)
+            && !snapshots.contains_key(&header.sequence)
         {
-            let copy = dir.path().join(format!("snap-{seq}.snapshot"));
+            let copy = dir
+                .path()
+                .join(format!("snap-{}.snapshot", header.sequence));
             // The shadow may replace the file between our load and copy;
             // a copy of a *newer* complete snapshot is still a valid
             // sample, keyed by whatever it turns out to hold.
@@ -2301,8 +2307,8 @@ fn fsync_state_pairs_stay_consistent_across_adopted_rotations() {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
                 Err(e) => panic!("copying the shadow snapshot: {e}"),
             }
-            let (_, actual, _, _) = snapshot::load::<TestApp>(&copy).unwrap();
-            snapshots.insert(actual, copy);
+            let (_, actual) = snapshot::load::<TestApp>(&copy).unwrap();
+            snapshots.insert(actual.sequence, copy);
         }
     };
 
@@ -4420,12 +4426,22 @@ fn a_repeated_request_reaches_apply_on_live_replay_and_shadow() {
     );
 }
 
-/// Run the real shadow stage, from epoch 0, over `slots` and return the
-/// application state and epoch of the snapshot it writes. The fsync pair
+/// Run the real shadow stage, from a genesis lineage, over `slots` and
+/// return the application state and lineage of the snapshot it writes.
+#[cfg(not(feature = "no-persist"))]
+fn shadow_snapshot_of(dir: &std::path::Path, slots: &[TestInput]) -> (TestApp, Lineage) {
+    shadow_snapshot_from(dir, Lineage::GENESIS, slots)
+}
+
+/// [`shadow_snapshot_of`] from the lineage `initial`. The fsync pair
 /// claims every slot, so the only snapshot it can write is the one taken
 /// after consuming them all.
 #[cfg(not(feature = "no-persist"))]
-fn shadow_snapshot_of(dir: &std::path::Path, slots: &[TestInput]) -> (TestApp, u64) {
+fn shadow_snapshot_from(
+    dir: &std::path::Path,
+    initial: Lineage,
+    slots: &[TestInput],
+) -> (TestApp, Lineage) {
     let (mut shadow_producer, mut shadow_consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
         .build(WaitStrategy::SpinThenYield);
@@ -4449,7 +4465,7 @@ fn shadow_snapshot_of(dir: &std::path::Path, slots: &[TestInput]) -> (TestApp, u
                 fsync_reader,
                 &shutdown,
                 WaitStrategy::SpinThenYield,
-                0,
+                initial,
                 Some(0),
             )
         })
@@ -4463,13 +4479,46 @@ fn shadow_snapshot_of(dir: &std::path::Path, slots: &[TestInput]) -> (TestApp, u
     }
     shadow_shutdown.store(true, Ordering::Relaxed);
     t_shadow.join().unwrap();
-    let (app, _, _, epoch) = crate::snapshot::load::<TestApp>(&snap_path).unwrap();
-    (app, epoch)
+    let (app, header) = crate::snapshot::load::<TestApp>(&snap_path).unwrap();
+    (app, header.lineage)
+}
+
+/// The shadow starts from the lineage it is given — what the live
+/// pipeline recovered, which its ring never carries — and records it in
+/// its snapshots until a journaled change replaces it.
+#[cfg(not(feature = "no-persist"))]
+#[test]
+fn the_shadow_records_its_initial_lineage_until_a_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let initial = Lineage {
+        epoch: 4,
+        ack_policy: Some(AckPolicyByte(1)),
+    };
+    let (_, lineage) = shadow_snapshot_from(dir.path(), initial, &[add_slot(5, 1)]);
+    assert_eq!(lineage, initial, "no lineage event: the seed is recorded");
+
+    let dir = tempfile::tempdir().unwrap();
+    let slots = [
+        add_slot(5, 1),
+        InputSlot {
+            event: ack_policy_change(0, false),
+            ..add_slot(0, 1)
+        },
+    ];
+    let (_, lineage) = shadow_snapshot_from(dir.path(), initial, &slots);
+    assert_eq!(
+        lineage,
+        Lineage {
+            epoch: 4,
+            ack_policy: Some(AckPolicyByte(0)),
+        },
+        "a journaled weakening replaces the seeded policy"
+    );
 }
 
 /// The shadow hands lineage metadata to its lineage sink, never to the
-/// application: an epoch bump advances the epoch its snapshot records,
-/// and an ack-policy change leaves both the epoch and the state alone.
+/// application: an epoch bump advances the epoch its snapshot records, an
+/// ack-policy change the policy, and neither touches the state.
 #[cfg(not(feature = "no-persist"))]
 #[test]
 fn the_shadow_keeps_lineage_metadata_out_of_application_state() {
@@ -4486,8 +4535,15 @@ fn the_shadow_keeps_lineage_metadata_out_of_application_state() {
         },
         add_slot(7, 1),
     ];
-    let (shadow, epoch) = shadow_snapshot_of(dir.path(), &slots);
-    assert_eq!(epoch, 3, "the epoch bump reached the shadow's epoch");
+    let (shadow, lineage) = shadow_snapshot_of(dir.path(), &slots);
+    assert_eq!(
+        lineage,
+        Lineage {
+            epoch: 3,
+            ack_policy: Some(AckPolicyByte(1)),
+        },
+        "both lineage events reached the shadow's lineage"
+    );
     assert_eq!(
         shadow.total, 12,
         "only the application events reached the application"

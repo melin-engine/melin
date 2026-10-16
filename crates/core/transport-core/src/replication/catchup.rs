@@ -438,7 +438,8 @@ fn publish_chunked_body(
 ///
 /// Checks: snapshot file exists, its header parses, and an on-disk
 /// segment still contains the snapshot boundary. Reads at most the
-/// 64-byte snapshot header plus segment headers — never a body.
+/// largest snapshot header (`MAX_HEADER_SIZE`) plus segment headers —
+/// never a body.
 pub fn preflight_snapshot_transfer(journal_path: &std::path::Path) -> io::Result<()> {
     use std::io::Read as _;
 
@@ -523,7 +524,7 @@ pub fn snapshot_transfer_with<E: AppEvent>(
     })?;
     let snap_sequence = header.sequence;
     let snap_chain_hash = header.chain_hash;
-    let snap_epoch = header.epoch;
+    let snap_epoch = header.lineage.epoch;
     let snap_len = snap_data.len() as u64;
 
     info!(
@@ -1206,7 +1207,10 @@ mod tests {
             &TestApp::new(),
             WireSeq::new(4),
             chain_at_4,
-            7,
+            crate::lineage::Lineage {
+                epoch: 7,
+                ack_policy: None,
+            },
             Some(2),
             &snap_path,
         )

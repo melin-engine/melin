@@ -248,6 +248,45 @@ and is committed on its own. Tests land with the step they pin.
    with the entry, v1–v4 snapshot parsing, snapshot plus tail with the
    entry before the snapshot and its segment gone, rebase dropping a
    divergent change.
+
+   *As landed:* `Lineage { epoch, ack_policy: Option<AckPolicyByte> }`
+   lives in `transport-core`'s `lineage` module, with the one fold
+   (`Lineage::observe`: epoch a maximum, policy last-writer-wins) that
+   recovery and the shadow call; `JournaledApp::recovered_lineage`
+   replaces `recovered_epoch`, and `from_parts` and `shadow::run` take a
+   `Lineage`. `snapshot::load` returns `(A, SnapshotHeader)` (the
+   header's `epoch` became `lineage`; `load_with_header` is gone) and
+   `snapshot::save` takes a `Lineage`. The live matching stage still
+   ignores the policy (step 3).
+
+   Two departures from decision 2. First, **the v4 layout carries a
+   flags byte** (`[genesis_entries: u64][lineage_flags: u8][ack_policy:
+   u8]`, bit 0 genesis known, bit 1 policy known, an absent field
+   written as zero, anything else refused): a lineage whose genesis
+   length is unknown (pre-v16 headers) gets a policy entry on its first
+   boot under step 4, and writing it as v2, as "keep the rule" read
+   literally, would drop the policy from its snapshots. The rule kept is
+   the intent: a lineage that knows neither field still writes v2; any
+   other writes v4; v3 is read only. Second, **the replica's cell lands
+   here**, as `ReplicaControlPlane::lineage_ack_policy`
+   (`LineagePolicyCell`, an `Option<AckPolicyByte>` in an atomic), next
+   to `primary_ack_policy`, which step 5 retires. It is stored whole
+   from the recovered lineage at boot and after a divergence recovery,
+   from the transferred snapshot at a resync, and cleared when the local
+   lineage is archived or a transfer fails; it seeds the replica's
+   shadow, and a promoted primary's (`run_as_primary*` take the policy,
+   from the recovered lineage at boot). Until step 5 writes it at
+   receive time it lags the stream, so a primary promoted between steps
+   4 and 5 seeds its shadow with the policy as of the replica's last
+   recovery or resync; nothing journals a change before step 4. The
+   rebase test is the in-process divergence resync end to end
+   (`mid_stream_divergence_resyncs_in_process`, whose forked entry is
+   now a policy change and whose primary's snapshot records a different
+   one: the cell must hold the primary's after the resync, and the
+   rebuilt shadow's own snapshot must record it too). The cleared cell
+   after a transfer that fails once the snapshot was adopted is pinned
+   by `resync_transfer_failure_rebuilds_clean_not_over_stale_writer`,
+   whose primary now drops before the segment seed.
 3. **The gate.** The output slot and its arm in both response stages and
    the frame encoder; `DurabilityGate` from an initial policy, the
    in-order switch, the forced cell; the health exports. The admin path

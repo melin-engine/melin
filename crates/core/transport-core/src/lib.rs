@@ -38,6 +38,7 @@ pub mod fence;
 pub mod health;
 pub mod journal_disk;
 pub mod journaled_app;
+pub mod lineage;
 pub mod pipeline;
 /// Replication wire protocol, journal-file catch-up, ack queueing,
 /// and per-replica observability metrics. Generic over

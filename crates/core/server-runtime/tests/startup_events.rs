@@ -178,7 +178,8 @@ fn genesis_only() -> StartupEvents<CounterEvent> {
 /// is no readable snapshot there yet.
 fn snapshot_value(path: &Path) -> Option<u64> {
     use melin_app::Application as _;
-    let (app, _seq, _chain, _epoch) = melin_transport_core::snapshot::load::<Counter>(path).ok()?;
+    // `None` while there is no readable snapshot yet, as documented above.
+    let (app, _header) = melin_transport_core::snapshot::load::<Counter>(path).ok()?;
     // The counter keeps its value private; its snapshot is the value in
     // little-endian.
     let mut buf = Vec::new();

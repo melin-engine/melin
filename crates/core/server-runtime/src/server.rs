@@ -19,10 +19,12 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use tracing::{debug, error, info, warn};
 
+use melin_journal::AckPolicyByte;
 use melin_journal::BufferedWriter;
 use melin_journal::JournalError;
 use melin_journal::JournalWrite;
 use melin_transport_core::journaled_app::JournaledApp;
+use melin_transport_core::lineage::Lineage;
 use melin_transport_core::pipeline::{
     InputSlot, OutputSlot as GenericOutputSlot, Pipeline as GenericPipeline,
     build_pipeline_with_replication,
@@ -1160,6 +1162,7 @@ where
                     rotate_flag,
                     ack_policy_atomic,
                     fence_state,
+                    control.lineage_ack_policy.load(),
                     promotion_request.pending(), // promoted — EpochBump with the request's epoch floor
                     false, // a promoted node continues the history it streamed
                     raft_status,
@@ -1196,7 +1199,7 @@ where
     let InitializedEngine {
         mut app,
         writer,
-        recovered_epoch,
+        recovered_lineage,
         began_history,
     } = init_engine::<A, BufferedWriter<A::Event>>(
         &config,
@@ -1213,7 +1216,7 @@ where
     // A primary booting directly (not via promotion) keeps whatever epoch
     // its journal recovered; no bump.
     let fence_state = Arc::new(melin_transport_core::fence::FenceState::new(
-        recovered_epoch,
+        recovered_lineage.epoch,
     ));
 
     // Control-plane raft (observational election). The primary needs the
@@ -1262,6 +1265,7 @@ where
         rotate_flag,
         ack_policy_atomic,
         fence_state,
+        recovered_lineage.ack_policy,
         None, // not promoted — no EpochBump injection
         began_history,
         raft_status,
@@ -1633,6 +1637,10 @@ fn run_as_primary<A, L>(
     rotate_flag: Option<Arc<AtomicBool>>,
     ack_policy_atomic: Arc<AtomicU8>,
     fence_state: Arc<melin_transport_core::fence::FenceState>,
+    // The ack policy the lineage has in force (`Lineage::ack_policy`): the
+    // recovered one at boot, the replica's record of it at promotion.
+    // Seeds the shadow stage's lineage next to the fence epoch.
+    lineage_ack_policy: Option<AckPolicyByte>,
     promotion: Option<u64>,
     // This boot began the history (`InitializedEngine::began_history`):
     // with replication on, client service waits for the first replica.
@@ -2039,7 +2047,10 @@ where
         config,
         &cores,
         &shutdown,
-        fence_state.epoch(),
+        Lineage {
+            epoch: fence_state.epoch(),
+            ack_policy: lineage_ack_policy,
+        },
         genesis_entries,
     )?;
 
@@ -2651,6 +2662,7 @@ where
                     rotate_flag,
                     ack_policy_atomic,
                     fence_state,
+                    control.lineage_ack_policy.load(),
                     promotion_request.pending(), // promoted — EpochBump with the request's epoch floor
                     raft_status,
                     journal_tip,
@@ -2701,7 +2713,7 @@ where
     let InitializedEngine {
         mut app,
         writer,
-        recovered_epoch,
+        recovered_lineage,
         began_history: _,
     } = init_engine::<A, BufferedWriter<A::Event>>(
         &config,
@@ -2712,7 +2724,7 @@ where
 
     // Fencing state for this DPDK primary, seeded with the recovered epoch.
     let fence_state = Arc::new(melin_transport_core::fence::FenceState::new(
-        recovered_epoch,
+        recovered_lineage.epoch,
     ));
 
     // Control-plane raft (kernel TCP even on DPDK — off the hot path, no
@@ -2778,6 +2790,7 @@ where
         rotate_flag,
         ack_policy_atomic,
         fence_state,
+        recovered_lineage.ack_policy,
         None, // not promoted — no EpochBump injection
         raft_status,
         journal_tip,
@@ -2817,6 +2830,7 @@ fn run_as_primary_dpdk<A>(
     rotate_flag: Option<Arc<AtomicBool>>,
     ack_policy_atomic: Arc<AtomicU8>,
     fence_state: Arc<melin_transport_core::fence::FenceState>,
+    lineage_ack_policy: Option<AckPolicyByte>,
     promotion: Option<u64>,
     raft_status: Option<Arc<melin_transport_core::health::RaftStatus>>,
     journal_tip: melin_transport_core::AdvertisedJournalTip,
@@ -3038,7 +3052,10 @@ where
         config,
         &cores,
         &shutdown,
-        fence_state.epoch(),
+        Lineage {
+            epoch: fence_state.epoch(),
+            ack_policy: lineage_ack_policy,
+        },
         genesis_entries,
     )?;
 
@@ -3511,9 +3528,10 @@ fn genesis_target<E: melin_app::AppEvent>(
 pub(crate) struct InitializedEngine<A, W> {
     pub(crate) app: A,
     pub(crate) writer: W,
-    /// The fencing epoch recovered from the snapshot + journal (0 for a
-    /// genesis node); the caller seeds the node's `FenceState` with it.
-    pub(crate) recovered_epoch: u64,
+    /// The lineage recovered from the snapshot + journal (the genesis
+    /// lineage for a new node): the caller seeds the node's `FenceState`
+    /// with its epoch, and its shadow snapshots with the whole of it.
+    pub(crate) recovered_lineage: melin_transport_core::lineage::Lineage,
     /// This boot began the history: it created the journal (with its
     /// genesis), or journaled the genesis into a journal that held no
     /// entry. A primary uses it to hold client service until its first
@@ -3620,14 +3638,14 @@ where
                 );
                 // The lineage's genesis length comes from the snapshot,
                 // the only record of the lineage left on disk.
-                let (app, snap) = melin_transport_core::snapshot::load_with_header::<A>(snap_path)?;
+                let (app, snap) = melin_transport_core::snapshot::load::<A>(snap_path)?;
                 let writer = W::create_continuing(
                     &config.journal,
                     snap.sequence + 1,
                     snap.chain_hash,
                     snap.genesis_entries,
                 )?;
-                JournaledApp::<A, W>::from_parts(app, writer, snap.epoch)
+                JournaledApp::<A, W>::from_parts(app, writer, snap.lineage)
             }
             BootstrapSource::JournalOnly => {
                 info!("recovering from journal");
@@ -3707,12 +3725,12 @@ where
         }
     }
 
-    let recovered_epoch = engine.recovered_epoch();
+    let recovered_lineage = engine.recovered_lineage();
     let (app, writer) = engine.into_parts();
     Ok(InitializedEngine {
         app,
         writer,
-        recovered_epoch,
+        recovered_lineage,
         began_history,
     })
 }
@@ -3753,7 +3771,7 @@ fn spawn_shadow_stage<A: Application + Send + 'static>(
     config: &ServerConfig,
     cores: &PipelineCores,
     shutdown: &Arc<AtomicBool>,
-    initial_epoch: u64,
+    initial_lineage: Lineage,
     // The lineage's genesis length, from the journal header — stamped
     // into every snapshot (see `shadow::run`).
     genesis_entries: Option<u64>,
@@ -3771,7 +3789,6 @@ where
     let shadow_ex = shadow_app.ok_or("shadow application must be Some when shadow is enabled")?;
     let s_shadow = Arc::clone(shutdown);
     let shadow = cores.shadow;
-    let shadow_initial_epoch = initial_epoch;
     let handle = melin_app::affinity::spawn_placed("shadow", shadow.core, move || {
         melin_transport_core::shadow::run(
             shadow_cons,
@@ -3781,7 +3798,7 @@ where
             chain_hash,
             &s_shadow,
             shadow.wait,
-            shadow_initial_epoch,
+            initial_lineage,
             genesis_entries,
         );
     })
@@ -4790,13 +4807,13 @@ mod genesis_tests {
     }
 
     /// Save a snapshot of a booted engine as the shadow stage would:
-    /// its state, position, chain, epoch and lineage genesis length.
+    /// its state, position, chain, lineage and lineage genesis length.
     fn save_snapshot(engine: &super::InitializedEngine<Counter, Writer>, path: &Path) {
         melin_transport_core::snapshot::save::<Counter>(
             &engine.app,
             melin_transport_core::WireSeq::new(engine.writer.next_sequence() - 1),
             engine.writer.chain_hash().unwrap_or([0u8; 32]),
-            engine.recovered_epoch,
+            engine.recovered_lineage,
             engine
                 .writer
                 .read_header_info()

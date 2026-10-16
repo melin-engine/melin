@@ -903,6 +903,10 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
         // Recovery seeded it long before any streaming session.
         tip_ready: _,
         primary_link_up: _,
+        // Stored by recovery and resync only, until step 5 of
+        // `docs/internal/journaled-ack-policy-2026-10.md` writes it here
+        // as entries are received.
+        lineage_ack_policy: _,
         // Latched by the journal thread's failure wrapper, not here.
         pipeline_healthy: _,
     } = control;

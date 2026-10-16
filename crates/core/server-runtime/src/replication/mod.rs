@@ -65,6 +65,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use melin_journal::{BufferedWriter, JournalWrite};
 
 use melin_app::Application;
+use melin_transport_core::lineage::LineagePolicyCell;
 use melin_transport_core::pipeline::{InputSlot, OutputSlot};
 use melin_transport_core::replication::archive::{ArchiveReason, archive_local_lineage};
 use melin_transport_core::replication::protocol::{MAX_CONTROL_FRAME, decode_primary_message};
@@ -198,6 +199,19 @@ pub struct ReplicaControlPlane {
     /// own policy while unknown, which is exactly the pre-propagation
     /// behavior.
     pub primary_ack_policy: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    /// The ack policy the lineage this replica holds has in force: the
+    /// newest journaled `AckPolicyChange` it holds, or `None` when it
+    /// holds none. Stored whole from the recovered lineage at boot and
+    /// after a divergence recovery, from the snapshot at a resync, and
+    /// cleared when the local lineage is archived, so a change in a
+    /// divergent tail disappears with the tail. Seeds the replica's shadow
+    /// snapshots and a promoted primary's.
+    ///
+    /// Not yet written as entries are received, so it lags the stream
+    /// until step 5 of `docs/internal/journaled-ack-policy-2026-10.md`,
+    /// which also moves the auto-promotion check onto it from
+    /// `primary_ack_policy`.
+    pub lineage_ack_policy: std::sync::Arc<LineagePolicyCell>,
     /// Whether the replica's pipeline is healthy — fed to the replica's
     /// minimal health endpoint (`/health` OK/ERR and the
     /// `melin_pipeline_healthy` gauge). Process-lifetime (the per-session
@@ -210,8 +224,8 @@ pub struct ReplicaControlPlane {
 
 impl ReplicaControlPlane {
     /// Fresh handles for a replica boot: nothing requested, tip not
-    /// trustworthy yet, tip sequence 0, primary link down, pipeline
-    /// healthy (nothing has failed yet).
+    /// trustworthy yet, tip sequence 0, primary link down, no lineage
+    /// policy held, pipeline healthy (nothing has failed yet).
     pub fn new() -> Self {
         Self {
             promote: crate::promotion::PromotionRequest::new(),
@@ -223,6 +237,7 @@ impl ReplicaControlPlane {
             primary_ack_policy: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
                 crate::ack_policy::ACK_POLICY_UNKNOWN,
             )),
+            lineage_ack_policy: std::sync::Arc::new(LineagePolicyCell::new(None)),
             pipeline_healthy: std::sync::Arc::new(AtomicBool::new(true)),
         }
     }
@@ -591,6 +606,10 @@ pub(super) fn build_replica_pipeline_with_threads<A>(
     snapshot_path: std::path::PathBuf,
     group_commit_delay: std::time::Duration,
     fence_state: Arc<melin_transport_core::fence::FenceState>,
+    // The lineage's ack policy as recovered (see
+    // `ReplicaControlPlane::lineage_ack_policy`), seeding the shadow
+    // stage's next to the fence epoch.
+    lineage_policy: &LineagePolicyCell,
     // Process-lifetime health mirror for the replica health endpoint —
     // see `ReplicaControlPlane::pipeline_healthy`. Reset `true` here (a
     // fresh pipeline is healthy) and latched `false` by the journal
@@ -615,9 +634,14 @@ where
     let shadow_app = <A as Application>::clone_via_snapshot(&app)?;
 
     let enable_shadow = snapshot_interval_ms > 0;
-    // Shadow snapshot seeds its epoch from the fence state's current value
-    // (set from the replica's recovered journal before this builder runs).
-    let shadow_initial_epoch = fence_state.epoch();
+    // Shadow snapshot seeds its lineage from the fence state's epoch and
+    // the lineage policy cell (both set from the replica's recovered
+    // journal, or the snapshot a resync installed, before this builder
+    // runs).
+    let shadow_initial_lineage = melin_transport_core::lineage::Lineage {
+        epoch: fence_state.epoch(),
+        ack_policy: lineage_policy.load(),
+    };
     // The lineage's genesis length, stamped into the replica's own
     // snapshots — the same value its journal header holds.
     let genesis_entries = writer.read_header_info()?.genesis_entries;
@@ -723,7 +747,7 @@ where
                     chain_lock,
                     &ps,
                     shadow.wait,
-                    shadow_initial_epoch,
+                    shadow_initial_lineage,
                     genesis_entries,
                 );
             })
@@ -823,6 +847,7 @@ pub(super) fn recover_replica_state<A, W>(
     journal_path: &std::path::Path,
     snapshot_path: &std::path::Path,
     fence_state: &melin_transport_core::fence::FenceState,
+    lineage_policy: &LineagePolicyCell,
     // Applied to a genesis instance before the journal is replayed into
     // it — see `init_engine`. The pipeline build sizes the result again.
     sizing: &A::Sizing,
@@ -837,6 +862,9 @@ where
     let lineage_exists =
         journal_path.exists() || !melin_journal::segment::list_archives(journal_path)?.is_empty();
     if !lineage_exists {
+        // Nothing held, so no policy either (the epoch stays: fencing
+        // never moves it back).
+        lineage_policy.store(None);
         return Ok((None, None, 0u64, [0u8; 32]));
     }
     let engine = if snapshot_path.exists() {
@@ -853,11 +881,26 @@ where
     let next = engine.next_sequence();
     let last = next.saturating_sub(1);
     let hash = engine.chain_hash().unwrap_or([0u8; 32]);
-    // Seed the observed epoch from the replica's own recovered journal.
-    // Streaming `EpochBump`s and the snapshot-resync path raise it later.
-    fence_state.observe_epoch(engine.recovered_epoch());
+    // Seed the lineage from the replica's own recovered journal.
+    // Streaming `EpochBump`s and the snapshot-resync path raise the epoch
+    // later.
+    adopt_recovered_lineage(fence_state, lineage_policy, engine.recovered_lineage());
     let (app, writer) = engine.into_parts();
     Ok((Some(app), Some(writer), last, hash))
+}
+
+/// Adopt a lineage recovered from disk (a journal replay, or a snapshot
+/// the primary sent) as this replica's. The epoch is observed, a maximum,
+/// since fencing never moves it back; the ack policy is stored whole,
+/// since the recovered lineage replaces whatever this node held, and a
+/// change in a tail it dropped must go with the tail.
+fn adopt_recovered_lineage(
+    fence_state: &melin_transport_core::fence::FenceState,
+    lineage_policy: &LineagePolicyCell,
+    lineage: melin_transport_core::lineage::Lineage,
+) {
+    fence_state.observe_epoch(lineage.epoch);
+    lineage_policy.store(lineage.ack_policy);
 }
 
 /// Reconnect backoff cap shared by both receivers — exponential from
@@ -942,7 +985,7 @@ impl<A, W> AfterSession<A, W> {
 /// frees the local socket-set entry; the kernel-TCP receiver passes a
 /// no-op (its `TcpStream` is dropped by the caller, and the kernel tells
 /// the primary).
-// Twelve arguments is a lot, but each is a distinct piece of the
+// Thirteen arguments is a lot, but each is a distinct piece of the
 // receiver loop's state; bundling them would only move the noise.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::replication) fn handle_session_exit<A, W>(
@@ -954,6 +997,7 @@ pub(in crate::replication) fn handle_session_exit<A, W>(
     journal_path: &std::path::Path,
     snapshot_path: &std::path::Path,
     fence_state: &melin_transport_core::fence::FenceState,
+    lineage_policy: &LineagePolicyCell,
     shutdown: &AtomicBool,
     promote: &crate::promotion::PromotionRequest,
     close: impl FnOnce(),
@@ -1034,7 +1078,13 @@ where
                 max_attempts = MAX_INPROCESS_DIVERGENCE_RESYNCS,
                 "mid-stream chain divergence — re-deriving local state for in-process resync"
             );
-            match recover_replica_state::<A, W>(journal_path, snapshot_path, fence_state, sizing) {
+            match recover_replica_state::<A, W>(
+                journal_path,
+                snapshot_path,
+                fence_state,
+                lineage_policy,
+                sizing,
+            ) {
                 Ok((app, journal_writer, seq, hash)) => AfterSession::Resync {
                     app,
                     journal_writer,
@@ -1187,6 +1237,7 @@ fn receive_resync_transfer<A, S>(
     snapshot_path: &std::path::Path,
     journal_path: &std::path::Path,
     fence_state: &melin_transport_core::fence::FenceState,
+    lineage_policy: &LineagePolicyCell,
 ) -> Result<ResyncTransfer<A>, Box<dyn std::error::Error + Send + Sync>>
 where
     A: Application + Send,
@@ -1210,8 +1261,9 @@ where
 
     // The primary is already sending the seed: a large state must not
     // leave the link unanswered while it loads (see `serviced`).
-    let (snap_app, _snap_seq, snap_hash, snap_epoch) =
+    let (snap_app, snap_header) =
         source.serviced(|| melin_transport_core::snapshot::load::<A>(snapshot_path))?;
+    let snap_hash = snap_header.chain_hash;
     if snap_hash != snap_chain_hash {
         return Err(format!(
             "snapshot chain hash mismatch: primary sent {snap_chain_hash:02x?}, \
@@ -1219,9 +1271,10 @@ where
         )
         .into());
     }
-    // Adopt the primary's snapshot epoch — the resync rebases this replica
-    // onto the primary's lineage, including its epoch.
-    fence_state.observe_epoch(snap_epoch);
+    // Adopt the primary's snapshot lineage — the resync rebases this
+    // replica onto the primary's lineage, its epoch and ack policy
+    // included.
+    adopt_recovered_lineage(fence_state, lineage_policy, snap_header.lineage);
 
     // Segment seed: the raw byte prefix of the primary's segment
     // containing `snap_sequence`. Written verbatim as our live segment, it
@@ -1340,9 +1393,11 @@ where
         drop(old_writer);
         archive_local_lineage(journal_path, snapshot_path, reason)
     })?;
-    // Archived — a retried handshake must present as a fresh replica.
+    // Archived — a retried handshake must present as a fresh replica,
+    // holding no lineage, so no policy either.
     *last_sequence = 0;
     *chain_hash = [0u8; 32];
+    control.lineage_ack_policy.store(None);
     // The advertised control-plane tip must shrink with the holdings:
     // the archived suffix is either divergent (never acked) or being
     // replaced wholesale, so this is the one legitimate tip regression
@@ -1351,18 +1406,25 @@ where
         .journal_tip
         .reset(melin_transport_core::WireSeq::new(0));
 
-    let (snap_app, snap_sequence, snap_chain_hash, seed_len) =
-        match receive_resync_transfer::<A, S>(source, snapshot_path, journal_path, fence_state) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(error = %e, "snapshot transfer failed — retrying");
-                // Half-applied resync state, not audit material — drop it
-                // so the retry starts clean (the pre-resync lineage is
-                // already archived; this is not it).
-                let _ = std::fs::remove_file(snapshot_path);
-                return Ok(ResyncDecision::Retry);
-            }
-        };
+    let (snap_app, snap_sequence, snap_chain_hash, seed_len) = match receive_resync_transfer::<A, S>(
+        source,
+        snapshot_path,
+        journal_path,
+        fence_state,
+        &control.lineage_ack_policy,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "snapshot transfer failed — retrying");
+            // Half-applied resync state, not audit material — drop it
+            // so the retry starts clean (the pre-resync lineage is
+            // already archived; this is not it). That includes a
+            // policy adopted from a snapshot whose seed then failed.
+            control.lineage_ack_policy.store(None);
+            let _ = std::fs::remove_file(snapshot_path);
+            return Ok(ResyncDecision::Retry);
+        }
+    };
     *app = Some(snap_app);
 
     // Open the seeded segment for appending at the snapshot position —
@@ -1907,6 +1969,7 @@ mod tests {
             &journal,
             &snapshot,
             &fence,
+            &LineagePolicyCell::new(None),
             &(),
         )
         .expect("recover");
@@ -1925,12 +1988,73 @@ mod tests {
             &journal,
             &snapshot,
             &fence,
+            &LineagePolicyCell::new(None),
             &(),
         )
         .expect("recover");
         assert!(writer.is_some());
         assert_eq!(last, 1);
         assert!(!staging.exists(), "swept beside a journal with history");
+    }
+
+    /// Replica recovery adopts the recovered lineage: the epoch as a
+    /// maximum, the ack policy stored whole over whatever the cell held —
+    /// the newest journaled change, or nothing when the journal holds
+    /// none, or when there is no lineage at all.
+    #[test]
+    fn replica_recovery_stores_the_lineage_policy_whole() {
+        use melin_journal::{AckPolicyByte, AckPolicyChange, JournalEvent};
+        type Writer = melin_journal::BufferedWriter<CounterEvent>;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fence = melin_transport_core::fence::FenceState::new(0);
+        let journal = dir.path().join("replica.journal");
+        let snapshot = dir.path().join("replica.snapshot");
+        // A value no recovery below produces, so a cell left alone shows.
+        let stale = Some(AckPolicyByte(2));
+        let cell = LineagePolicyCell::new(stale);
+        let recover = |cell: &LineagePolicyCell| {
+            recover_replica_state::<counter_server::Counter, Writer>(
+                &journal,
+                &snapshot,
+                &fence,
+                cell,
+                &(),
+            )
+            .expect("recover")
+        };
+
+        // No lineage: nothing held.
+        recover(&cell);
+        assert_eq!(cell.load(), None);
+
+        // A journal with no change: nothing held either.
+        let mut w = Writer::create_continuing(&journal, 1, [0; 32], None).expect("create");
+        let append = |w: &mut Writer, event: JournalEvent<CounterEvent>| {
+            let seq = w.allocate_sequence();
+            w.encode_event(seq, 0, &event, 0).expect("encode");
+            w.flush_batch_sync().expect("flush");
+        };
+        append(&mut w, JournalEvent::Tick { now_ns: 0 });
+        cell.store(stale);
+        recover(&cell);
+        assert_eq!(cell.load(), None);
+
+        // A strengthening then a weakening: the newest wins, not the
+        // highest byte.
+        let change = |policy| {
+            JournalEvent::AckPolicyChange(AckPolicyChange {
+                policy: AckPolicyByte(policy),
+                unwitnessed: false,
+            })
+        };
+        append(&mut w, change(1));
+        append(&mut w, JournalEvent::EpochBump { epoch: 4 });
+        append(&mut w, change(0));
+        drop(w);
+        cell.store(stale);
+        recover(&cell);
+        assert_eq!(cell.load(), Some(AckPolicyByte(0)));
+        assert_eq!(fence.epoch(), 4);
     }
 
     /// A primary behind this node's fencing epoch is refused before
@@ -3683,6 +3807,7 @@ mod tests {
                 dir.path().join("replica.snapshot"),
                 std::time::Duration::ZERO,
                 Arc::new(melin_transport_core::fence::FenceState::new(0)),
+                &LineagePolicyCell::new(None),
                 Arc::new(AtomicBool::new(true)),
                 &(),
             )
@@ -3912,6 +4037,7 @@ mod tests {
             &dir.path().join("r.journal"),
             &dir.path().join("r.snapshot"),
             &melin_transport_core::fence::FenceState::new(0),
+            &LineagePolicyCell::new(None),
             &AtomicBool::new(false),
             &crate::promotion::PromotionRequest::new(),
             || closes += 1,
@@ -3973,6 +4099,7 @@ mod tests {
                 &dir.path().join("r.journal"),
                 &dir.path().join("r.snapshot"),
                 &melin_transport_core::fence::FenceState::new(0),
+                &LineagePolicyCell::new(None),
                 &shutdown,
                 &crate::promotion::PromotionRequest::new(),
                 || closes += 1,
@@ -4013,6 +4140,7 @@ mod tests {
             &dir.path().join("r.journal"),
             &dir.path().join("r.snapshot"),
             &melin_transport_core::fence::FenceState::new(0),
+            &LineagePolicyCell::new(None),
             &shutdown,
             &promote,
             || {},
@@ -4110,6 +4238,7 @@ mod tests {
             &dir.path().join("r.journal"),
             &dir.path().join("r.snapshot"),
             &melin_transport_core::fence::FenceState::new(0),
+            &LineagePolicyCell::new(None),
             &shutdown,
             &promote,
             || closed = true,

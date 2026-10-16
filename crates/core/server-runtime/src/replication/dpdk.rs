@@ -1575,6 +1575,7 @@ where
             journal_path,
             &snapshot_path,
             &fence_state,
+            &control.lineage_ack_policy,
             sizing,
         )?;
     // Fence epoch now reflects the recovered journal; seed the advertised
@@ -1587,6 +1588,7 @@ where
         primary_link_up,
         // Stored by `accept_stream_start`, which takes `control` whole.
         primary_ack_policy: _,
+        lineage_ack_policy,
         pipeline_healthy,
     } = control;
     journal_tip.advance(melin_transport_core::WireSeq::new(last_sequence));
@@ -1658,6 +1660,7 @@ where
                         journal_path,
                         &snapshot_path,
                         &fence_state,
+                        lineage_ack_policy,
                         shutdown,
                         promote,
                         // No session is open: the last one's socket was
@@ -2089,6 +2092,7 @@ where
                 snapshot_path.clone(),
                 group_commit_delay,
                 Arc::clone(&fence_state),
+                lineage_ack_policy,
                 Arc::clone(pipeline_healthy),
                 sizing,
             ) {
@@ -2150,6 +2154,7 @@ where
             journal_path,
             &snapshot_path,
             &fence_state,
+            lineage_ack_policy,
             shutdown,
             promote,
             // End the smoltcp session on every exit, a stop or a promotion
