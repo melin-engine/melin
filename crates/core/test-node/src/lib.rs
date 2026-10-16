@@ -225,15 +225,24 @@ pub fn dpdk_client_process_eal_args(file_prefix: &str) -> Vec<String> {
 
 /// A node running on its own thread of this process.
 ///
-/// No `Drop`: a test that fails mid-way leaves its node running until the
-/// process exits, as the tests did before this crate. Stopping it from a
-/// destructor would run during the unwind and could turn one clear panic
-/// into a second, muddier one.
+/// Stopped when dropped, if [`Node::stop`] or [`Node::join`] has not ended
+/// it first: a test that fails mid-way does not leave its node running
+/// behind it, where later tests of the same process would find its threads
+/// (a test that reads every thread of the process) or, on DPDK, its runner
+/// slot still held. The drop never panics, so it cannot turn a failing
+/// test's panic into a second one: it asks the node to stop, waits for it
+/// as long as a clean shutdown may take at most, and ignores what it
+/// returns. A node that
+/// does not stop in time is left running, and on DPDK keeps its slot.
+/// [`Node::stop`] is still the way to end a node whose outcome the test
+/// checks.
 pub struct Node {
     /// Where clients connect: `127.0.0.1` and a kernel-assigned port, or
     /// the address [`start_at`] was given.
     addr: SocketAddr,
-    thread: JoinHandle<Result<(), String>>,
+    /// The node's thread. `Some` until [`Node::stop`], [`Node::join`] or
+    /// the drop takes it, so that each of them ends the node once.
+    thread: Option<JoinHandle<Result<(), String>>>,
     /// The node's shutdown flag: set by [`Node::stop`], or by the node
     /// itself when it fences.
     shutdown: Arc<AtomicBool>,
@@ -251,7 +260,21 @@ impl Node {
     /// Whether the node has returned, on its own or because it was told
     /// to stop.
     pub fn is_finished(&self) -> bool {
-        self.thread.is_finished()
+        self.thread().is_finished()
+    }
+
+    /// The node's thread, held until the node is ended.
+    fn thread(&self) -> &JoinHandle<Result<(), String>> {
+        self.thread
+            .as_ref()
+            .expect("held until stop, join or the drop takes it")
+    }
+
+    /// Take the node's thread, to end the node.
+    fn take_thread(&mut self) -> JoinHandle<Result<(), String>> {
+        self.thread
+            .take()
+            .expect("held until stop, join or the drop takes it")
     }
 
     /// Whether the node's shutdown flag is set. The test sets it only
@@ -265,11 +288,44 @@ impl Node {
     /// returned. For a node that is expected to fail, or to stop itself;
     /// [`Node::stop`] is the way to end one that is serving. Panics if the
     /// node's thread panicked.
-    pub fn join(self) -> Result<(), String> {
-        let result = self.thread.join().expect("node thread panicked");
+    pub fn join(mut self) -> Result<(), String> {
+        let result = self.take_thread().join().expect("node thread panicked");
         #[cfg(feature = "dpdk")]
         dpdk::release(self.slot);
         result
+    }
+}
+
+/// How long a node may take to stop once asked: its clean shutdown on the
+/// way out of a test, or its drop.
+const SHUTDOWN_LIMIT: Duration = Duration::from_secs(20);
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        // Ended already, by `stop` or `join`.
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        self.request_stop();
+        let deadline = std::time::Instant::now() + SHUTDOWN_LIMIT;
+        while !thread.is_finished() {
+            if std::time::Instant::now() >= deadline {
+                // Not a panic: this may run during a failing test's unwind.
+                eprintln!(
+                    "melin-test-node: a node dropped without being stopped did not stop within \
+                     {SHUTDOWN_LIMIT:?}; left running"
+                );
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Dropped result: the node was dropped, not stopped, so nothing
+        // checks how it ended; a failing test's own panic is the report.
+        let _ = thread.join();
+        #[cfg(feature = "dpdk")]
+        if let Err(e) = dpdk::try_release(self.slot) {
+            eprintln!("melin-test-node: {e}; the slot stays held");
+        }
     }
 }
 
@@ -435,22 +491,28 @@ mod kernel {
         });
         Node {
             addr,
-            thread,
+            thread: Some(thread),
             shutdown,
         }
     }
 
     impl Node {
         /// Stop the node cleanly and wait for it; panics if it failed.
-        pub fn stop(self) {
+        pub fn stop(mut self) {
+            let thread = self.take_thread();
+            self.request_stop();
+            thread
+                .join()
+                .expect("node thread panicked")
+                .expect("node returned an error");
+        }
+
+        /// Ask the node to stop, without waiting for it.
+        pub(super) fn request_stop(&self) {
             self.shutdown.store(true, Ordering::Relaxed);
             // Best-effort poke so the accept loop wakes and sees the flag;
             // whether the connect itself succeeds is irrelevant.
             let _ = TcpStream::connect_timeout(&self.addr, Duration::from_millis(100));
-            self.thread
-                .join()
-                .expect("node thread panicked")
-                .expect("node returned an error");
         }
     }
 }
@@ -471,10 +533,7 @@ mod dpdk {
     use melin_server_runtime::server::{self, ServerConfig};
 
     use super::layout::{self, Layout};
-    use super::{Addrs, DpdkClient, Node};
-
-    /// How long a clean shutdown may take.
-    const SHUTDOWN_LIMIT: Duration = Duration::from_secs(20);
+    use super::{Addrs, DpdkClient, Node, SHUTDOWN_LIMIT};
 
     /// The runner's layout, read once. Kept with its error, so that every
     /// node asked for in a process not under the runner says why.
@@ -574,11 +633,20 @@ mod dpdk {
     /// Detach the slot's device, which its node has closed, so that the
     /// next node on the slot can attach it again, and free the slot.
     pub(super) fn release(slot: usize) {
+        try_release(slot).unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// [`release`], returning the failure rather than panicking: for a
+    /// node's drop, which may run during a failing test's unwind. The slot
+    /// stays held if its device cannot be detached, so no later node takes
+    /// a slot whose device is still attached.
+    pub(super) fn try_release(slot: usize) -> Result<(), String> {
         let (device, _) = layout::vdev(slot, &layout().slot(slot).iface);
-        if let Err(e) = eal().detach_vdev(&device) {
-            panic!("detach {device} after its node returned: {e}");
-        }
+        eal()
+            .detach_vdev(&device)
+            .map_err(|e| format!("detach {device} after its node returned: {e}"))?;
         in_use()[slot] = false;
+        Ok(())
     }
 
     /// The process-wide EAL, initialized by the first node.
@@ -789,7 +857,7 @@ mod dpdk {
             .expect("spawn the node thread");
         Node {
             addr: addrs.client,
-            thread,
+            thread: Some(thread),
             shutdown,
             slot: slot_id,
         }
@@ -798,15 +866,15 @@ mod dpdk {
     impl Node {
         /// Stop the node cleanly and wait for it; panics if it failed.
         pub fn stop(self) {
-            if self.thread.is_finished() {
+            if self.is_finished() {
                 panic!(
                     "the node stopped before the test asked it to: {:?}",
                     self.join()
                 );
             }
-            self.shutdown.store(true, Ordering::Relaxed);
+            self.request_stop();
             let deadline = Instant::now() + SHUTDOWN_LIMIT;
-            while !self.thread.is_finished() {
+            while !self.is_finished() {
                 assert!(
                     Instant::now() < deadline,
                     "the node did not shut down within {SHUTDOWN_LIMIT:?}"
@@ -814,6 +882,12 @@ mod dpdk {
                 std::thread::sleep(Duration::from_millis(50));
             }
             self.join().expect("node returned an error");
+        }
+
+        /// Ask the node to stop, without waiting for it: its poll loop
+        /// reads the flag on every pass.
+        pub(super) fn request_stop(&self) {
+            self.shutdown.store(true, Ordering::Relaxed);
         }
 
         /// Cut the node off the runner's network, as a pulled cable or a
