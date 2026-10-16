@@ -417,7 +417,7 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   slot beyond the node's per-connection tables, which could panic its
   poll thread, and a connection its peer closed or reset in the poll
   that completed its handshake no longer leaves its port without a
-  listener for good. The divergence entry is closed.
+  listener for good.
 - **A DPDK node frees a client's slot when the client closes.** The
   client's FIN left the node's socket half-closed, which its stack still
   counts as active, so the connection and its slot were held until the

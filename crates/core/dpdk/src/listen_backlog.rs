@@ -59,7 +59,8 @@ pub(crate) fn tune_socket(socket: &mut tcp::Socket<'_>) {
 /// SYN in the same poll); the rest takes clients that connect at once, as
 /// after a failover, whose SYNs land within one handshake of each other.
 /// A SYN beyond the backlog is still refused, and a client that retries
-/// its connect (`melin-client` does) gets in on a later attempt.
+/// its connect gets in on a later attempt: `melin-client`'s `connect_by`
+/// does, until its deadline; its plain `connect` reports the refusal.
 ///
 /// Every listening socket is a slot of the transport's socket set, which
 /// its connections fill too (`MAX_CONNECTIONS` slots, the bound every
