@@ -1128,6 +1128,15 @@ pub fn run<A: Application>(
         // back to the producer. Publishing progress is deliberately the
         // last thing the iteration does with the ring: every slot has
         // cleared its durability gate and been encoded by now.
+        //
+        // Invariant the event publisher depends on: this consumer's
+        // progress never passes a slot that has not cleared the gate.
+        // The publisher's consumer is chained behind this one (see
+        // `build_pipeline_with_replication`), so this commit is what
+        // releases events to it; committing earlier, or on the shutdown
+        // path out of a gate wait (which goes back to the top of the
+        // loop without committing), would broadcast events the ack
+        // policy has not confirmed. The DPDK stage keeps the same one.
         consumer.commit();
 
         // Remove connections that exceeded the send buffer limit. Like

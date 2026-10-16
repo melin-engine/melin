@@ -41,12 +41,44 @@ pub fn wait_for_gauge(health: SocketAddr, name: &str, value: u64) {
 
 /// Wait, at most `limit`, until `name` reads `value`.
 pub fn wait_for_gauge_within(health: SocketAddr, name: &str, value: u64, limit: Duration) {
+    wait_for_gauge_matching(
+        health,
+        name,
+        &format!("reached {value}"),
+        |v| v == value,
+        limit,
+    );
+}
+
+/// Wait, at most [`PROBE_LIMIT`], until `name` reads a value `accept`
+/// takes, and return it; the failure says the gauge never `what`.
+pub fn wait_for_gauge_where(
+    health: SocketAddr,
+    name: &str,
+    what: &str,
+    accept: impl Fn(u64) -> bool,
+) -> u64 {
+    wait_for_gauge_matching(health, name, what, accept, PROBE_LIMIT)
+}
+
+fn wait_for_gauge_matching(
+    health: SocketAddr,
+    name: &str,
+    what: &str,
+    accept: impl Fn(u64) -> bool,
+    limit: Duration,
+) -> u64 {
     let deadline = Instant::now() + limit;
-    while gauge(health, name) != Some(value) {
+    loop {
+        let last = gauge(health, name);
+        if let Some(value) = last
+            && accept(value)
+        {
+            return value;
+        }
         assert!(
             Instant::now() < deadline,
-            "{name} did not reach {value} within {limit:?} (last: {:?})",
-            gauge(health, name)
+            "{name} never {what} within {limit:?} (last: {last:?})"
         );
         std::thread::sleep(Duration::from_millis(100));
     }

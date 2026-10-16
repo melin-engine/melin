@@ -78,6 +78,22 @@ type OutputSlot<A> =
 /// Threaded into [`run`] (and `run_dpdk` under `feature = "dpdk"`) as `Option<EventPublisherFn>`:
 /// `None` disables the publisher unconditionally, `Some(_)` wires it up
 /// when `--event-bind` is also set.
+///
+/// The consumer trails the response stage: it yields a slot only once
+/// the response stage has passed it through the durability gate, so
+/// every slot it yields belongs to an event that holds the copies the
+/// ack policy demands: a report the publisher sees is exactly as durable as the
+/// reply its client was given. While the policy cannot be satisfied (the
+/// replicas it needs are gone), the consumer yields nothing, as the
+/// clients get no replies; the publisher must observe `shutdown` on its
+/// own while it waits, not on a new slot arriving.
+///
+/// Stamp each published frame with the slot's wire sequence
+/// ([`OutputSlot::wire_seq`](melin_transport_core::pipeline::OutputSlot::wire_seq)),
+/// the event's position in the journal: stable across restarts and
+/// failovers, so a subscriber can key on it to resume or deduplicate. The
+/// consumer's own position in the output ring is not: it restarts at
+/// every boot.
 pub type EventPublisherFn<A> = fn(
     consumer: Consumer<OutputSlot<A>>,
     bind_addr: SocketAddr,
@@ -1750,7 +1766,10 @@ where
     let matching_cursor = cursors.matching_ring_arc();
 
     // Consumer 0 is always the response stage. Consumer 1 (if present)
-    // is the event publisher — only created when --event-bind is set.
+    // is the event publisher — only created when --event-bind is set —
+    // chained behind the response stage, so it reads only slots the
+    // response stage has committed, which have cleared the durability
+    // gate (see `build_pipeline_with_replication`).
     let output_consumer = output_consumers.remove(0);
     let event_publisher_consumer = if enable_event_publisher {
         Some(output_consumers.remove(0))
