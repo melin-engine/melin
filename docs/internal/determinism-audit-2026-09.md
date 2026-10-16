@@ -784,35 +784,15 @@ auto-failover refuses indefinitely.
 dedicated frame on each swap or a policy byte in every `InputBatch`
 header, not only on idle heartbeats.
 
-**Status: fixed**, by going further than the direction: a frame or a
-byte sent on the stream still cannot reach a replica that is
-disconnected when the policy is weakened, and still advertises a policy
-before the replica holds the events behind it (finding 14's mistake).
-The plan is [journaled-ack-policy-2026-10.md](journaled-ack-policy-2026-10.md).
-
-- The policy is lineage metadata, like the epoch: an `AckPolicyChange`
-  journal entry (tag `0x05`), replicated in order, replayed on recovery
-  and recorded in snapshots (framing v4). `StreamStart` and `Heartbeat`
-  no longer carry a policy byte (replication protocol 8).
-- A replica's view is the newest change it holds, written where a slot
-  reaches its input ring (`receiver_transport::accept_slot`, the
-  promotion drain included); auto-promotion reads it, and falls back to
-  the node's requested policy only while the lineage holds none.
-- The primary's gate switches at the change's own output slot, once the
-  change is durable under the policy before it, so a weakening takes
-  effect only once the nodes the old policy relied on hold it: a replica
-  that lacks it lacks every event acked under the new policy, and loses
-  to the peer-tip veto or judges by the older policy. The one exception
-  is a forced `disk` with no replica connected, which nothing can
-  witness: it is journaled as unwitnessed, warned about, and documented
-  as a limitation in `docs/replication.md`.
-- Regression tests: the reproduction (ticks flowing, no heartbeat,
-  promotion refused after a streamed weakening) and the reverse
-  direction are `raft_failover`'s
-  `a_weakening_streamed_between_ticks_stops_auto_promotion` and
-  `a_strengthening_streamed_between_ticks_lets_the_failover_proceed`;
-  `ack_policy_changes` pins the in-order switch on live nodes. Both pass
-  under the netns DPDK runner too.
+**Status: fixed** by journaling the policy as lineage metadata, in
+order with the events it governs, rather than sending it on the stream
+([journaled-ack-policy-2026-10.md](journaled-ack-policy-2026-10.md)).
+Regression tests: `raft_failover`'s
+`a_weakening_streamed_between_ticks_stops_auto_promotion` and
+`a_strengthening_streamed_between_ticks_lets_the_failover_proceed`, and
+`ack_policy_changes` on live nodes, on kernel TCP and the netns DPDK
+runner. Limitation: a forced `disk` with no replica connected is
+unwitnessed (documented in `docs/replication.md`).
 
 ### 12. A primary disk stall makes a truthful replica look divergent
 

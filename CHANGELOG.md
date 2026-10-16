@@ -20,19 +20,12 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   value (`0` `disk`, `1` `disk+ram`, `2` `two-disks`, `3` `ram`). They
   differ while a change waits for the nodes the old policy relied on.
 - **The pieces of journaled ack-policy changes, public for embedders and
-  tools.** In `melin-journal`: `AckPolicyByte`, `AckPolicyChange`,
-  `JournalEvent::ack_policy_change` (the change an event carries, if
-  any), and `codec::decode_event` (one decoder for every entry tag, the
-  replicated slot's included) with its `EventDecodeError`. In
-  `melin-transport-core`: the `lineage` module (`Lineage`, the epoch and
-  policy a history has in force; `LineagePolicyCell`; the forced-change
-  cell `forced_policy_cell`, `ForcedPolicy`, `ForcedPolicyWriter` and
-  `ForcedPolicyReader`), the `replica_presence` module,
-  `InputSlot::node_event` and `MatchingStage::forced_policy`. In
-  `melin-server-runtime`: the `policy_control` module's
-  `AckPolicyControl`, `PublisherClaim` and `AckPolicyPublisher`, the
-  types of the ack-policy mailbox between the admin command and the
-  input ring's producer, which the server's start-up builds.
+  tools.** In `melin-journal`: `AckPolicyChange` (with `AckPolicyByte`
+  and `JournalEvent::ack_policy_change`) and `codec::decode_event`, one
+  decoder for every entry tag. In `melin-transport-core`: the `lineage`
+  and `replica_presence` modules, `InputSlot::node_event` and
+  `MatchingStage::forced_policy`. In `melin-server-runtime`: the
+  `policy_control` module.
 - **`--dpdk-client-rx-buf-kib`, `--dpdk-client-tx-buf-kib`,
   `--dpdk-client-tx-queue-kib`**: the per-connection buffering of the
   client connections a DPDK node accepts, previously fixed at 64 KiB of
@@ -278,7 +271,10 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   events it governs and never delivered to the application, like an
   epoch bump. The response gate switches at the change's place in the
   order, once the change's own entry is durable under the policy before
-  it; two pending changes are applied one by one, never merged.
+  it, so a weakening waits for the nodes the old policy relied on, and
+  every reply after the change, the rest of an in-flight batch included,
+  is held to the new policy; two pending changes are applied one by
+  one, never merged.
   Snapshots record the policy in force at their sequence (framing
   version 4 adds a flags byte and the policy after `genesis_entries`;
   versions 1 to 3 are still read, and a history that records neither
@@ -301,8 +297,7 @@ Anything source-breaking is called out under **Removed** or **Changed**.
     is journaled when the node serves as primary, unless its history
     already holds it. Every command a serving primary takes is
     journaled, repeats of the policy in force included.
-  - A weakening waits for the nodes the old policy relied on to hold the
-    change. `ACK-POLICY disk` sent while no replica is connected is
+  - `ACK-POLICY disk` sent while no replica is connected is
     *forced*: journaled as unwitnessed, in force once its own entry is on
     the primary's disk (releasing replies held under the old policy),
     lifting the write halt until a replica connects or a policy that
@@ -515,25 +510,16 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   auto-promotion skipped its `disk` refusal and lost events acknowledged
   on the primary's disk alone; after a swap back to `disk+ram`,
   auto-failover refused indefinitely. A replica disconnected during a
-  swap could never be told at all. The policy is now part of the journal
-  (see Changed): every change is an entry, replicated in order with the
-  events it governs, and a weakening takes effect only once the nodes
-  the old policy relied on hold it, so a replica that may be promoted
-  always knows the policy the events it lacks were acknowledged under.
-  The audit's reproductions are regression tests, on kernel TCP and
-  DPDK.
+  swap could never be told at all. See Changed (the policy is
+  journaled); the audit's reproductions are regression tests, on kernel
+  TCP and DPDK.
 - **Tightening the ack policy no longer lags the in-flight batch**
   (finding 29). The rest of a response batch was released against a
-  durable position cached under the old, weaker policy. A change now
-  switches the gate at its own place in the order and drops the cached
-  position, so every reply after it is held to the new policy.
+  durable position cached under the old, weaker policy. See Changed.
 - **`ACK-POLICY disk` lifts the write halt, as the manual-promotion
-  playbook says.** A primary with no replica halts client writes under
-  every policy, and the swap the playbook prescribed released replies
+  playbook says.** The swap the playbook prescribed released replies
   held at the gate but never lifted the halt, so a promoted node with no
-  replica had no way to resume writes. `ACK-POLICY disk` sent while no
-  replica is connected now lifts it, until a replica connects or a
-  policy that needs one is set (see Changed).
+  replica had no way to resume writes. See Changed (the forced swap).
 - **A DPDK primary no longer skips a batch when a replica's socket is
   full.** A streaming replica whose socket had no room for the next batch
   left it read but unsent, and the next tick read past it: a release

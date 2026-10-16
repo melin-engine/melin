@@ -175,21 +175,15 @@ the journal never sees a refused write, the node counts them: the
 `melin_writes_refused_total` counter on `/metrics` says how many writes a
 halt cost.
 
-An operator lifts the halt by sending `ACK-POLICY disk` while the node
-has no replica connected (a *forced* swap, see "Runtime policy swap"):
-that is the explicit consent to keep taking writes on the primary's disk
-alone. The override lasts until a replica connects, or until a policy
-that needs a replica is set; after that, losing the last replica halts
-the node again. A `disk` swap made while a replica was still connected
-is no such consent and lifts nothing when that replica leaves: send it
-again once it has. The health endpoint reports `trading` while the
-override holds.
+An operator lifts the halt with a *forced* `ACK-POLICY disk`, sent while
+the node has no replica connected (see [the forced
+swap](#runtime-policy-swap)). The health endpoint reports `trading`
+while the override holds.
 
 Writes the node accepted just before the halt are applied as usual, and
 their replies wait on the ack policy like any other — sent once a replica
-is back (or an operator forces `disk`, which releases them once the swap
-itself is on the primary's disk), never if the node is superseded or
-stopped first. A node stopped while such a reply waits stops
+is back (or an operator forces `disk`), never if the node is superseded
+or stopped first. A node stopped while such a reply waits stops
 promptly and drops it; the write stays journaled and applied, so a retry
 after reconnect applies it again unless the application recognises the
 repeat.
@@ -296,16 +290,20 @@ and a swap queued behind them could never take effect. So
 `ACK-POLICY disk` sent while **no replica is connected** is *forced*:
 it is journaled as unwitnessed, and takes effect as soon as its own
 entry is on the primary's disk, releasing the replies held under the old
-policy and lifting the write halt (see "Writes halt when all replicas
-disconnect"). The node logs a warning naming the risk. Only that case is
-forced: any other policy, or `disk` sent while a replica is connected,
-waits. If the last replica leaves while a swap to `disk` still waits
-for it, re-send the swap: the second one is forced, and overtakes the
-first.
-
-A forced swap is not witnessed by any replica: one that was offline when
-it was made does not hold it (see "A forced swap is not witnessed"
-under Limitations).
+policy and lifting the [write
+halt](#writes-halt-when-all-replicas-disconnect) by the time the
+operator reads `OK`: it is the explicit consent to keep taking writes on
+the primary's disk alone. The node logs a warning naming the risk. The
+halt stays lifted until a replica connects, or until a policy that
+needs a replica is set; after that,
+losing the last replica halts the node again. Only that case is forced:
+any other policy, or `disk` sent while a replica is connected, waits,
+and such a `disk` lifts nothing when that replica later leaves: send it
+again once it has. If the
+last replica leaves while a swap to `disk` still waits for it, re-send
+the swap: the second one is forced, and overtakes the first. A forced
+swap is not witnessed by any replica (see [A forced swap is not
+witnessed](#a-forced-swap-is-not-witnessed)).
 
 **Restarts and promotions journal the requested policy.** A primary
 starts under the policy its journal records, not its `--ack-policy`. If
@@ -331,10 +329,9 @@ The intended workflow is failover:
 2. The promoted node has no replica, and halts writes. Under `disk+ram`
    its gate is also structurally unsatisfiable (no second node to hold
    the in-memory copy), so any reply it was holding stays held.
-3. Once it serves (an `ACK-POLICY` before then answers `OK staged`), the
-   operator sends `ACK-POLICY disk` → forced: the halt is lifted by the
-   time `OK` is read, and held replies go out once the swap is on disk,
-   no restart, no dropped client connections.
+3. Once it serves, the operator sends `ACK-POLICY disk` → forced (see
+   "The forced swap" above; a staged one is not, see below): writes and
+   held replies resume, no restart, no dropped client connections.
 4. New replicas are spun up and connect. The first one to connect ends
    the halt override.
 5. Operator sends `ACK-POLICY disk+ram` → in force once the old policy
@@ -444,17 +441,11 @@ After promotion the new primary will halt new writes if it has no
 replicas connected (see above) — the operator's playbook is to either
 spin up new replicas immediately or send `ACK-POLICY disk` to resume
 writes under the single-copy policy. Send it once the promoted node
-serves: with no replica connected it is forced, lifts the halt, and
-releases any reply held under the old policy (see "Runtime policy
-swap"). A `disk` staged before `PROMOTE` is journaled by the promotion
-but is not forced, so it does not lift the halt on its own.
-
-The promoted node serves under the policy its journal records, the one
-the old primary last journaled and the replica received, not its own
-`--ack-policy`. If it requests another one (its own flag, or one staged
-on it), the promotion journals that as a swap, which takes effect once
-the old policy's nodes hold it; a node promoted without a
-`--replication-bind` serves under the requested policy at once instead.
+serves, so that it is [forced](#runtime-policy-swap); one staged before
+`PROMOTE` is not. The promoted node serves under the policy the old
+primary last journaled, not its own `--ack-policy`, until the policy it
+requests takes effect (see "Restarts and promotions journal the
+requested policy" under "Runtime policy swap").
 
 The old primary should still be stopped promptly, but epoch fencing
 (below) now closes the split-brain window if it isn't: the moment the
@@ -563,16 +554,13 @@ Auto-promotion is deliberately conservative. The elected replica
 - the primary was acking under the `disk` policy — acks never waited
   for a second copy on another node, so no election can prove the
   winner holds every acked event; failover stays a manual, eyes-on
-  decision under `disk`. The replica judges by the newest policy swap
-  its own journal holds (see "The policy is part of the journal"), and
-  only while its history records none (written by an earlier release)
-  by the policy it would request itself. A weakening to `disk` takes
-  effect only once the replicas the old policy relied on hold it, so a
-  replica that lacks it lacks every event acked under `disk` too: it
-  either loses to a peer that holds them (the next rule), or
-  judges by the policy before the swap, which protects what was acked
-  before it as that policy always did. The exception is a forced swap
-  (see Limitations);
+  decision under `disk`. The replica judges by the newest policy its
+  own journal holds (see [The policy is part of the
+  journal](#the-policy-is-part-of-the-journal)), or by the one it would
+  request while its history records none; a replica that lacks a
+  swap to `disk` also lacks every event acked under it, since the swap
+  [takes effect in order](#runtime-policy-swap). The exception is a
+  forced swap (see [Limitations](#a-forced-swap-is-not-witnessed));
 - **a reachable peer holds more data than it does.** Election steering
   is best-effort, so a behind replica can end up holding leadership —
   and under `disk+ram`/`ram` an ack only requires the *fastest*
@@ -827,7 +815,7 @@ requiring the full journal history.
 | `--replica-of <addr>` | No | — | Run as a replica connected to the given primary. |
 | `--replication-key <path>` | Replica | — | Ed25519 private key for replication auth. Required when `--replica-of` is set. The corresponding public key must be in the primary's `authorized_keys` under the `replication` role. |
 | `--admin-bind <addr>` | Any | — | Address for the operator admin endpoint. Accepts `PROMOTE`, `ROTATE`, and `ACK-POLICY <policy>`. Bound at startup; the server fails to start if the address cannot be bound, so a node never runs with its admin commands silently unavailable. |
-| `--ack-policy <policy>` | Primary | `disk+ram` | The ack policy the node requests when it starts as primary or is promoted: which copies of an event must exist before its response is released. `disk`, `ram`, `disk+ram`, or `two-disks`. A history that already records another policy keeps serving under it until the swap to this one, journaled at startup, takes effect (see "Runtime policy swap"). Can be swapped at runtime via admin `ACK-POLICY`. |
+| `--ack-policy <policy>` | Primary | `disk+ram` | The ack policy the node requests when it starts as primary or is promoted: which copies of an event must exist before its response is released. `disk`, `ram`, `disk+ram`, or `two-disks`. Not in force at once over a history that records another policy (see "Runtime policy swap"). Can be swapped at runtime via admin `ACK-POLICY`. |
 | `--dpdk-peer-mac <mac>` | Replica on DPDK | derived | Ethernet address of the primary named by `--replica-of`. Only consulted when replicating over DPDK. See below. |
 
 ### Addressing the primary over DPDK
@@ -962,23 +950,19 @@ normal-case post-recovery state.
   node running an earlier release refuse each other at the handshake,
   in either direction, rather than stream entries the other cannot
   verify. Journals and snapshots are unaffected.
-  The release that records the history's genesis length (replication
-  protocol 7) is another: its `StreamStart` hands a replica that length,
-  which a protocol-6 replica would ignore, so a node running it and a
-  node running an earlier release refuse each other at the handshake,
-  in either direction. Its journals and snapshots are read by it as
-  they are (see "Journals written by earlier releases" in
+  The releases that record the history's genesis length (replication
+  protocol 7: its `StreamStart` hands a replica that length, which a
+  protocol-6 replica would ignore) and that journal the ack policy
+  (protocol 8: its stream carries ack-policy entries a protocol-7
+  replica cannot read, and `StreamStart` and `Heartbeat` no longer carry
+  the policy) are others: a node running one and a node running an
+  earlier release refuse each other at the handshake, in either
+  direction. Their journals and snapshots are read by them as they are
+  (see "Journals written by earlier releases" in
   [journal.md](journal.md)): stop the whole cluster, deploy, and restart
-  every node on its existing files.
-  The release that journals the ack policy (replication protocol 8) is
-  another: its stream carries ack-policy entries a protocol-7 replica
-  cannot read, and `StreamStart` and `Heartbeat` no longer carry the
-  policy, so a node running it and a node running an earlier release
-  refuse each other at the handshake, in either direction. Stop the
-  whole cluster, deploy, and restart every node on its existing files.
-  An existing history records no policy yet, so the first primary to
-  serve it under this release (by boot or promotion) serves under the
-  policy it requests and journals it.
+  every node on its existing files. An existing history records no
+  policy yet, so the first primary to serve it under protocol 8 (by boot
+  or promotion) serves under the policy it requests and journals it.
 - **Snapshots are forward-compatible.** This release reads snapshots
   written by pre-fencing releases (their epoch is taken as 0, which
   is exact — they predate any promotion), snapshots written before
@@ -986,20 +970,18 @@ normal-case post-recovery state.
   written before the ack policy was recorded (they record none; the
   node goes by the journal after them, or by its `--ack-policy` when
   that records none either). No action needed before upgrading.
-- **Rolling back across a promotion needs care.** Once a promotion
-  has been journaled, binaries older than this release cannot replay
-  that journal — they stop at the promotion marker and report the
-  entry as unreadable. The journal is healthy; the old binary simply
-  predates the entry type. To roll back anyway, restore the node from
-  a snapshot taken by the older release, or re-sync it as a fresh
-  replica of a node running the older version.
-- **Rolling back across the ack-policy release needs the same care.**
-  Its first boot journals an ack-policy entry, and its snapshots record
-  the policy in a framing earlier releases do not read. An older binary
-  refuses to start on either (an unreadable entry, an unsupported
-  snapshot version) rather than discard anything: restore the node from
-  a snapshot the older release took, or re-sync it as a fresh replica of
-  a node running the older version.
+- **Rolling back across a promotion, or across the ack-policy release,
+  needs care.** Once a promotion has been journaled, binaries older than
+  this release cannot replay that journal — they stop at the promotion
+  marker and report the entry as unreadable. The journal is healthy; the
+  old binary simply predates the entry type. Likewise the ack-policy
+  release journals an ack-policy entry on its first boot, and its
+  snapshots record the policy in a framing earlier releases do not read:
+  an older binary refuses to start on either (an unreadable entry, an
+  unsupported snapshot version) rather than discard anything. To
+  roll back anyway, restore the node from a snapshot taken by the older
+  release, or re-sync it as a fresh replica of a node running the older
+  version.
 
 ## Observability
 
@@ -1043,24 +1025,15 @@ normal-case post-recovery state.
   that has not taken the swap (forcing `disk` is the remedy when none
   is connected, see "Runtime policy swap"). The journaled gauge is
   omitted while the history records no policy.
-- The journal entry is the audit trail of every swap. The logs say the
-  rest. An operator's `ACK-POLICY` logs an info-level line once it is
-  journaled ("ack policy change requested by operator") or staged on a
-  node not yet serving as primary ("ack policy staged by operator").
-  The entry itself logs "ack policy change journaled", naming its
-  policy, whether it was witnessed, and whether it came from a live
-  command (`Runtime`) or one staged before the primary began taking
-  them (`Staged`); a forced one logs a warning instead. The entry a
-  start or promotion records when the policy it starts with differs
-  from the one the history recorded, or the history records none (a
-  new history's first start among them), logs its own
-  info-level line, "journaling the requested ack policy", naming the
-  policy, whether it was witnessed, and the one the history recorded
-  before it. When a swap takes effect, an info-level "ack policy
-  switched" gives the `prev → next` transition. A swap that cannot be
-  journaled is refused with a warning.
-- While a forced `disk` holds the halt off, the health endpoint
-  reports `trading`, with no replica connected.
+- The journal entry is the audit record of every swap, whether an
+  operator sent it, staged it before a promotion, or a start or
+  promotion journaled the requested policy. The node logs at info level
+  when a swap is staged, naming the policy, and when one is journaled,
+  naming the policy, whether a replica witnessed it and, for the entry a
+  start or promotion journals, the policy the history recorded before
+  it; warns instead when the swap is forced, and when one cannot be
+  journaled and is refused; and logs at info level when a swap takes
+  effect, with the `prev → next` transition.
 - The primary logs a warning, "replica accepts entries but persists
   none", naming the replica's slot and its two positions (what it has
   taken in, and what it has made durable), when a replica has held
