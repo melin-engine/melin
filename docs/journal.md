@@ -277,11 +277,15 @@ The journal participates in a 3-stage LMAX disruptor pipeline:
                      ▼           │
                Output Disruptor Ring (multi-consumer)
                      │
-            ┌────────┴────────┐
-            │                 │
-      Response Stage    Event Publisher
-      gates on cursor   (optional, --event-bind)
-      sends to clients  broadcasts to subscribers
+                     ▼
+               Response Stage
+               gates on cursor
+               sends to clients
+                     │
+                     ▼
+               Event Publisher (optional, --event-bind)
+               reads behind the response stage
+               broadcasts to subscribers
 ```
 
 - **Journal and Matching run in parallel** on the same events. The matching stage — the thread that applies events to the application, `matching` in `--cores` — does not wait for the journal: it applies each event immediately. This overlaps the application's latency with journal I/O latency.

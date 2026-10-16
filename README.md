@@ -82,8 +82,8 @@ A node runs a fixed set of pinned threads connected by lock-free disruptor rings
  clients ──> Reader ──┬──> Journal ──┬──> Journal Disk ┄┄┄┄┐
  (TCP or DPDK)        │              └──> Replication ┄┄┄┄┄┤ durability cursors
                       │                                    v (gate)
-                      ├──> Application ───────────┬──> Response ──> clients
-                      │                           └──> Event publisher ──> subscribers
+                      ├──> Application ──────────────> Response ──> clients
+                      │                                  └──> Event publisher ──> subscribers
                       └──> Shadow ──> snapshots
 ```
 
@@ -91,7 +91,7 @@ A node runs a fixed set of pinned threads connected by lock-free disruptor rings
 - **Journal**: its `journal-seq` thread sequences, encodes, and hash-chains events and feeds encoded batches to the replication senders. A separate `journal-disk` thread writes and syncs the batches and publishes the durability cursors. Because the two are split, a slow disk stalls neither ordering nor the replica feed.
 - **Application**: consumes the input ring in parallel with the journal. Runs your logic and publishes results to the output ring. Never waits on disk.
 - **Response**: drains the output ring but gates each response on the journal and replication cursors before sending it, so persist-before-ack is enforced without stalling the application.
-- **Event publisher**: broadcasts application output to subscribers (market data, audit, analytics).
+- **Event publisher**: broadcasts application output to subscribers (market data, audit, analytics). It reads behind the response stage, so subscribers see an event only once it is as durable as the client's reply.
 - **Shadow**: a third consumer on the input ring, gated on the journal cursor, that takes periodic snapshots without pausing the application.
 
 The full data flow, ring sizes, and threading model are in [pipeline architecture](docs/pipeline-architecture.md); the on-disk format in [journal](docs/journal.md).
