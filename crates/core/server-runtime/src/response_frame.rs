@@ -66,7 +66,9 @@ pub(crate) fn frame_app_response(
 /// application's encoder and [`frame_app_response`]; `EngineError` is
 /// transport-shaped and encoded by the runtime directly. `BatchEnd` carries
 /// no body and returns `None` — the wire terminator is emitted from the
-/// slot's `is_last_in_request` flag, not from the payload.
+/// slot's `is_last_in_request` flag, not from the payload. So does
+/// `AckPolicyChange`, which the durability gate consumes and no client
+/// receives.
 #[inline]
 pub(crate) fn encode_slot_payload<R: Copy, Q: Copy>(
     payload: &OutputPayload<R, Q>,
@@ -84,7 +86,8 @@ pub(crate) fn encode_slot_payload<R: Copy, Q: Copy>(
             control_codec::encode_transport_response(&TransportResponse::EngineError, buf)
                 .map_err(|_| "encode error"),
         ),
-        OutputPayload::BatchEnd => None,
+        // A policy change is the gate's, not a reply: it has no client.
+        OutputPayload::BatchEnd | OutputPayload::AckPolicyChange(_) => None,
     }
 }
 
@@ -155,6 +158,16 @@ mod tests {
         let mut buf = [0u8; MAX_APP_FRAME];
         let n = encode_slot_payload(&OutputPayload::<u8, u16>::BatchEnd, &ByteEncoder, &mut buf);
         assert_eq!(n, None);
+    }
+
+    #[test]
+    fn a_policy_change_has_no_payload_frame() {
+        let mut buf = [0u8; MAX_APP_FRAME];
+        let change = OutputPayload::<u8, u16>::AckPolicyChange(melin_journal::AckPolicyChange {
+            policy: melin_journal::AckPolicyByte(0),
+            unwitnessed: false,
+        });
+        assert_eq!(encode_slot_payload(&change, &ByteEncoder, &mut buf), None);
     }
 
     fn frame(

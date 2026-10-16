@@ -1797,6 +1797,9 @@ where
     let journal_utilization = journal_stage.utilization();
     let matching_utilization = matching_stage.utilization();
     let response_utilization = Arc::new(melin_transport_core::pipeline::StageUtilization::new());
+    // Resolved before any stage starts, so a lineage under an unknown
+    // policy refuses here with nothing to unwind.
+    let gate_policy = primary_gate_policy(lineage_ack_policy, &ack_policy_atomic, &matching_stage)?;
 
     // Wrap each spawn closure with a tail log so a thread that returns
     // (cleanly OR via `Err`) is visible in the trace stream — the
@@ -1845,11 +1848,7 @@ where
         .map_err(|e| format!("spawn matching thread: {e}"))?,
     );
 
-    let replication_metrics = build_replication_metrics(
-        replication_consumers.is_some(),
-        &ack_policy_atomic,
-        config.ack_policy,
-    );
+    let replication_metrics = build_replication_metrics(replication_consumers.is_some());
 
     // Per-slot active flags exposed by the journal stage's replication
     // ring; the response gate filters disconnected slots out of the
@@ -1866,7 +1865,6 @@ where
     let journal_persisted_wire_seq_response = cursors.durable_wire_seq();
     let replication_metrics_response = replication_metrics.as_ref().map(Arc::clone);
     let replica_active_response = replica_active.clone();
-    let ack_policy_response = Arc::clone(&ack_policy_atomic);
     let s3 = Arc::clone(&shutdown);
     let shutdown_for_response = Arc::clone(&shutdown);
     let response_utilization_thread = Arc::clone(&response_utilization);
@@ -1882,7 +1880,7 @@ where
                 control_rx,
                 crate::response::Response::<A> {
                     journal_persisted_wire_seq: journal_persisted_wire_seq_response,
-                    ack_policy: ack_policy_response,
+                    policy: gate_policy,
                     replication_metrics: replication_metrics_response,
                     replica_active: replica_active_response,
                     heartbeat_interval,
@@ -2973,6 +2971,8 @@ where
     let journal_utilization = journal_stage.utilization();
     let matching_utilization = matching_stage.utilization();
     let response_utilization = Arc::new(melin_transport_core::pipeline::StageUtilization::new());
+    // As on kernel TCP: resolved before any stage starts.
+    let gate_policy = primary_gate_policy(lineage_ack_policy, &ack_policy_atomic, &matching_stage)?;
 
     let s1 = Arc::clone(&shutdown);
     // As on kernel TCP: start the journal's helper threads here, not on
@@ -2999,11 +2999,7 @@ where
         .map_err(|e| format!("spawn matching thread: {e}"))?,
     );
 
-    let replication_metrics = build_replication_metrics(
-        replication_consumers.is_some(),
-        &ack_policy_atomic,
-        config.ack_policy,
-    );
+    let replication_metrics = build_replication_metrics(replication_consumers.is_some());
 
     let replica_active: Option<[Arc<AtomicBool>; 2]> =
         replication_ring_progress.as_ref().map(|rp| {
@@ -3019,7 +3015,6 @@ where
     let journal_persisted_wire_seq_response = cursors.durable_wire_seq();
     let replication_metrics_response = replication_metrics.as_ref().map(Arc::clone);
     let replica_active_response = replica_active.clone();
-    let ack_policy_response = Arc::clone(&ack_policy_atomic);
     let active_connections_response = Arc::clone(&active_connections);
     let s3 = Arc::clone(&shutdown);
     let response_utilization_thread = Arc::clone(&response_utilization);
@@ -3029,7 +3024,7 @@ where
                 output_consumer,
                 control_rx,
                 journal_persisted_wire_seq_response,
-                ack_policy_response,
+                gate_policy,
                 replication_metrics_response,
                 replica_active_response,
                 &s3,
@@ -3741,25 +3736,42 @@ where
 
 fn build_replication_metrics(
     has_replication: bool,
-    ack_policy_atomic: &AtomicU8,
-    config_policy: crate::ack_policy::AckPolicy,
 ) -> Option<Arc<crate::replication::ReplicationMetrics>> {
-    let metrics = if has_replication {
-        Some(Arc::new(crate::replication::ReplicationMetrics::default()))
-    } else {
-        None
-    };
+    has_replication.then(|| Arc::new(crate::replication::ReplicationMetrics::default()))
+}
 
-    let active_policy =
-        crate::ack_policy::AckPolicy::from_u8(ack_policy_atomic.load(Ordering::Relaxed))
-            .unwrap_or(config_policy);
+/// The response gate's policy on a new primary pipeline: it starts under
+/// the lineage's policy, or the requested one (`ack_policy_atomic`: the
+/// configured policy, or one an operator staged) while the lineage holds
+/// none — see [`initial_gate_policy`](crate::durability_gate::initial_gate_policy).
+/// Seeds the health endpoint's "journaled" gauge with the lineage's
+/// policy, and wires the matching stage's forced changes to the gate.
+fn primary_gate_policy<A: Application>(
+    lineage_ack_policy: Option<AckPolicyByte>,
+    ack_policy_atomic: &Arc<AtomicU8>,
+    matching_stage: &melin_transport_core::pipeline::MatchingStage<A>,
+) -> Result<crate::durability_gate::GatePolicy, String> {
+    let requested_byte = ack_policy_atomic.load(Ordering::Relaxed);
+    let requested = crate::ack_policy::AckPolicy::from_u8(requested_byte)
+        .ok_or_else(|| format!("the requested ack policy byte {requested_byte} is corrupted"))?;
+    let initial = crate::durability_gate::initial_gate_policy(lineage_ack_policy, requested)?;
+    matching_stage
+        .utilization()
+        .ack_policy_journaled
+        .store(lineage_ack_policy);
     info!(
-        ack_policy = %active_policy,
-        clauses = %active_policy.to_policy(),
+        ack_policy = %initial,
+        clauses = %initial.to_policy(),
+        requested = %requested,
+        from_lineage = lineage_ack_policy.is_some(),
         "ack policy active"
     );
-
-    metrics
+    Ok(crate::durability_gate::GatePolicy {
+        initial,
+        admin: Arc::clone(ack_policy_atomic),
+        admin_seen: requested_byte,
+        forced: matching_stage.forced_policy(),
+    })
 }
 
 fn spawn_shadow_stage<A: Application + Send + 'static>(
@@ -5220,6 +5232,82 @@ mod genesis_tests {
         check_recovered_history_holds_genesis(1, Some(0)).expect("no genesis");
         check_recovered_history_holds_genesis(1, None).expect("unknown: not checked");
         check_recovered_history_holds_genesis(3, None).expect("unknown: not checked");
+    }
+}
+
+/// How a new primary pipeline resolves the policy its response gate
+/// starts under, and what it seeds alongside.
+#[cfg(test)]
+mod primary_gate_policy_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU8, AtomicU64};
+
+    use counter_server::{Counter, CounterEvent};
+    use melin_journal::AckPolicyByte;
+    use melin_pipeline::ring::DisruptorBuilder;
+    use melin_pipeline::wait::WaitStrategy;
+    use melin_transport_core::fence::FenceState;
+    use melin_transport_core::lineage::ForcedPolicy;
+    use melin_transport_core::pipeline::{InputSlot, MatchingStage, OutputSlot};
+    use melin_transport_core::{DurableWireSeqCursor, WireSeq};
+
+    use super::primary_gate_policy;
+    use crate::ack_policy::AckPolicy;
+
+    fn matching_stage() -> MatchingStage<Counter> {
+        let (_, mut inputs) = DisruptorBuilder::<InputSlot<CounterEvent>>::new(8)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
+        let (output, _) = DisruptorBuilder::<
+            OutputSlot<
+                <Counter as melin_app::Application>::Report,
+                <Counter as melin_app::Application>::QueryResponse,
+            >,
+        >::new(8)
+        .add_consumer()
+        .build(WaitStrategy::SpinThenYield);
+        MatchingStage::new(
+            Counter::default(),
+            inputs.pop().expect("one consumer"),
+            output,
+            Arc::new(AtomicU64::new(0)),
+            DurableWireSeqCursor::detached(WireSeq::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(FenceState::new(0)),
+            WaitStrategy::SpinThenYield,
+            1,
+        )
+    }
+
+    /// The lineage's policy wins over the requested one, seeds the
+    /// "journaled" gauge, and the gate reads the stage's forced cell.
+    #[test]
+    fn the_lineage_policy_wins_and_seeds_the_journaled_gauge() {
+        let stage = matching_stage();
+        let requested = Arc::new(AtomicU8::new(AckPolicy::Disk.as_u8()));
+        let lineage = Some(AckPolicy::TwoDisks.to_byte());
+        let policy = primary_gate_policy(lineage, &requested, &stage).expect("a known policy");
+        assert_eq!(policy.initial, AckPolicy::TwoDisks);
+        assert!(Arc::ptr_eq(&policy.admin, &requested));
+        assert_eq!(policy.admin_seen, AckPolicy::Disk.as_u8());
+        assert_eq!(stage.utilization().ack_policy_journaled.load(), lineage);
+        assert_eq!(policy.forced.load(), None::<ForcedPolicy>);
+
+        let stage = matching_stage();
+        let policy = primary_gate_policy(None, &requested, &stage).expect("a known policy");
+        assert_eq!(policy.initial, AckPolicy::Disk, "no lineage policy");
+        assert_eq!(stage.utilization().ack_policy_journaled.load(), None);
+    }
+
+    /// An unknown byte, in the lineage or in the requested atomic, refuses
+    /// the primary instead of serving under a guess.
+    #[test]
+    fn an_unknown_policy_byte_refuses_the_primary() {
+        let stage = matching_stage();
+        let requested = Arc::new(AtomicU8::new(AckPolicy::Disk.as_u8()));
+        assert!(primary_gate_policy(Some(AckPolicyByte(0xEE)), &requested, &stage).is_err());
+        let corrupted = Arc::new(AtomicU8::new(0xEE));
+        assert!(primary_gate_policy(None, &corrupted, &stage).is_err());
     }
 }
 

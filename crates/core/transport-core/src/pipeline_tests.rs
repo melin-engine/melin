@@ -313,13 +313,14 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
     //   7  | AckPolicyChange      | yes → 15          | 15
     //
     // All slots carry `connection_id = 1` so events that produce no
-    // application reports (Tick, EpochBump, AckPolicyChange) still emit a
-    // `BatchEnd` terminator on the output ring; that way every input
-    // event appears exactly once in the assertions below regardless of
-    // payload shape. `EpochBump` and `AckPolicyChange` are the regression
-    // guards for the seq-allocation policy: lineage metadata must follow
-    // the *same* allocate rule as App/Tick (it is not a query), so wire
-    // space and journal-allocator space stay in lockstep.
+    // application reports (Tick, EpochBump) still emit a `BatchEnd`
+    // terminator on the output ring, and the AckPolicyChange its own
+    // slot; that way every input event appears exactly once in the
+    // assertions below regardless of payload shape. `EpochBump` and
+    // `AckPolicyChange` are the regression guards for the seq-allocation
+    // policy: lineage metadata must follow the *same* allocate rule as
+    // App/Tick (it is not a query), so wire space and journal-allocator
+    // space stay in lockstep.
     let conn_id = 1u64;
     let mut publish = |event: JournalEvent<TestEvent>| {
         input_producer.publish(InputSlot {
@@ -380,6 +381,7 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
             OutputPayload::QueryResponse(_) => "QueryResponse",
             OutputPayload::BatchEnd => "BatchEnd",
             OutputPayload::EngineError => "EngineError",
+            OutputPayload::AckPolicyChange(_) => "AckPolicyChange",
         })
         .collect();
     assert_eq!(
@@ -391,12 +393,251 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
             "Report",
             "BatchEnd",
             "BatchEnd",
-            "BatchEnd"
+            "AckPolicyChange"
         ],
     );
 
     shutdown.store(true, Ordering::Relaxed);
     let _app = handle.join().unwrap();
+}
+
+/// What a matching stage left behind: its output slots, the forced
+/// change it published for the response gate, and the policy it recorded
+/// as journaled last.
+struct MatchingRun {
+    outputs: Vec<TestOutput>,
+    forced: Option<crate::lineage::ForcedPolicy>,
+    journaled: Option<melin_journal::AckPolicyByte>,
+}
+
+/// The wire sequence the stages under [`run_matching_over`] start at:
+/// not 1, so a slot stamped from the input position instead would show.
+const POLICY_RUN_WIRE_SEQ: u64 = 10;
+
+/// Run a matching stage over `events` (connection, event, timestamp) and
+/// collect `expected` output slots. `on_shutdown` publishes everything
+/// with shutdown already requested, so the stage handles every event in
+/// its shutdown drain rather than its run loop.
+fn run_matching_over<A>(
+    app: A,
+    events: &[(u64, JournalEvent<TestEvent>, u64)],
+    expected: usize,
+    on_shutdown: bool,
+) -> MatchingRun
+where
+    A: melin_app::Application<Event = TestEvent, Report = TestReport, QueryResponse = TestQuery>
+        + Send
+        + 'static,
+{
+    let (mut input_producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
+        .add_consumer()
+        .build(WaitStrategy::SpinThenYield);
+    let (output_producer, mut output_consumers) = ring::DisruptorBuilder::<TestOutput>::new(64)
+        .add_consumer()
+        .build(WaitStrategy::SpinThenYield);
+    let mut output_consumer = output_consumers.pop().unwrap();
+    let stage = MatchingStage::new(
+        app,
+        consumers.pop().unwrap(),
+        output_producer,
+        Arc::new(AtomicU64::new(0)),
+        dummy_durable_cursor(),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(crate::fence::FenceState::new(0)),
+        WaitStrategy::SpinThenYield,
+        POLICY_RUN_WIRE_SEQ,
+    );
+    let forced = stage.forced_policy();
+    let utilization = stage.utilization();
+
+    let shutdown = Arc::new(AtomicBool::new(on_shutdown));
+    for &(connection_id, event, timestamp_ns) in events {
+        input_producer.publish(InputSlot {
+            connection_id,
+            key_hash: 0,
+            sequence: 0,
+            timestamp_ns,
+            event,
+            publish_ts: mono_trace_ns(),
+            recv_ts: mono_trace_ns(),
+        });
+    }
+    let shutdown2 = Arc::clone(&shutdown);
+    let handle = std::thread::spawn(move || stage.run(&shutdown2));
+
+    let mut outputs = Vec::with_capacity(expected);
+    let mut spins = 0u32;
+    let drain_start = std::time::Instant::now();
+    while outputs.len() < expected {
+        if let Some((_, slot)) = output_consumer.try_consume() {
+            outputs.push(slot);
+        } else {
+            drain_backoff(&mut spins, drain_start, "draining outputs");
+        }
+    }
+    shutdown.store(true, Ordering::Relaxed);
+    let _app = handle.join().unwrap();
+    assert!(
+        output_consumer.try_consume().is_none(),
+        "more output slots than expected"
+    );
+    MatchingRun {
+        outputs,
+        forced: forced.load(),
+        journaled: utilization.ack_policy_journaled.load(),
+    }
+}
+
+/// `(wire_seq, connection_id, is_last_in_request, change)` per slot, the
+/// change `None` for every payload but a policy change.
+fn policy_slot_shape(
+    outputs: &[TestOutput],
+) -> Vec<(u64, u64, bool, Option<melin_journal::AckPolicyChange>)> {
+    outputs
+        .iter()
+        .map(|s| {
+            let change = match s.payload {
+                OutputPayload::AckPolicyChange(change) => Some(change),
+                _ => None,
+            };
+            (s.wire_seq, s.connection_id, s.is_last_in_request, change)
+        })
+        .collect()
+}
+
+fn change_payload(policy: u8, unwitnessed: bool) -> Option<melin_journal::AckPolicyChange> {
+    Some(melin_journal::AckPolicyChange {
+        policy: melin_journal::AckPolicyByte(policy),
+        unwitnessed,
+    })
+}
+
+/// A policy change emits its own output slot at its exact position in
+/// the ring, stamped with the entry's wire sequence, even on connection
+/// 0, where a report-less event emits nothing: slot before, entry, slot
+/// after, in order. An unwitnessed change is also published to the
+/// forced cell, and the newest change is recorded as journaled.
+#[test]
+fn matching_stage_emits_each_policy_change_at_its_slot() {
+    let run = run_matching_over(
+        TestApp::new(),
+        &[
+            (1, JournalEvent::App(TestEvent::Add(1)), 0),
+            (0, ack_policy_change(1, false), 0),
+            (1, JournalEvent::App(TestEvent::Add(2)), 0),
+            (0, ack_policy_change(0, true), 0),
+            (1, JournalEvent::App(TestEvent::Add(3)), 0),
+        ],
+        5,
+        false,
+    );
+    assert_eq!(
+        policy_slot_shape(&run.outputs),
+        vec![
+            (10, 1, true, None),
+            (11, 0, true, change_payload(1, false)),
+            (12, 1, true, None),
+            (13, 0, true, change_payload(0, true)),
+            (14, 1, true, None),
+        ]
+    );
+    assert_eq!(
+        run.forced,
+        Some(crate::lineage::ForcedPolicy {
+            wire_seq: 13,
+            policy: melin_journal::AckPolicyByte(0),
+        })
+    );
+    assert_eq!(run.journaled, Some(melin_journal::AckPolicyByte(0)));
+}
+
+/// The shutdown drain emits the change slot too, and a witnessed change
+/// leaves the forced cell empty.
+#[test]
+fn shutdown_drain_emits_the_policy_change_slot() {
+    let run = run_matching_over(
+        TestApp::new(),
+        &[
+            (0, ack_policy_change(2, false), 0),
+            (1, JournalEvent::App(TestEvent::Add(5)), 0),
+        ],
+        2,
+        true,
+    );
+    assert_eq!(
+        policy_slot_shape(&run.outputs),
+        vec![(10, 0, true, change_payload(2, false)), (11, 1, true, None)]
+    );
+    assert_eq!(run.forced, None);
+    assert_eq!(run.journaled, Some(melin_journal::AckPolicyByte(2)));
+}
+
+/// [`TestApp`] whose clock step reports, so a policy change can carry
+/// reports from the scheduled work its timestamp fires.
+#[derive(Default)]
+struct TickReportingApp(TestApp);
+
+impl melin_app::Application for TickReportingApp {
+    type Event = TestEvent;
+    type Report = TestReport;
+    type QueryResponse = TestQuery;
+    type Sizing = ();
+
+    const APP_VERSION: u16 = TestApp::APP_VERSION;
+
+    fn apply(&mut self, event: TestEvent, ctx: &melin_app::ApplyCtx, out: &mut Vec<TestReport>) {
+        self.0.apply(event, ctx, out);
+    }
+
+    fn query(&self, event: TestEvent, ctx: &melin_app::QueryCtx) -> Option<TestQuery> {
+        self.0.query(event, ctx)
+    }
+
+    fn tick(&mut self, now_ns: u64, out: &mut Vec<TestReport>) {
+        self.0.tick(now_ns, out);
+        out.push(TestReport {
+            total_after: now_ns,
+        });
+    }
+
+    fn build_reject(event: &TestEvent, reason: melin_app::RejectReason) -> TestReport {
+        TestApp::build_reject(event, reason)
+    }
+
+    fn snapshot<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        self.0.snapshot(w)
+    }
+
+    fn restore<R: std::io::Read>(r: &mut R) -> std::io::Result<Self> {
+        TestApp::restore(r).map(Self)
+    }
+}
+
+/// The reports a change's clock step produces come first, and only the
+/// change slot closes the event — in the run loop and the shutdown drain
+/// alike.
+#[test]
+fn a_policy_change_closes_the_reports_its_clock_step_produced() {
+    for on_shutdown in [false, true] {
+        let run = run_matching_over(
+            TickReportingApp(TestApp::new()),
+            &[(0, ack_policy_change(3, false), 7)],
+            2,
+            on_shutdown,
+        );
+        assert_eq!(
+            policy_slot_shape(&run.outputs),
+            vec![
+                (10, 0, false, None),
+                (10, 0, true, change_payload(3, false))
+            ],
+            "on_shutdown = {on_shutdown}"
+        );
+        assert!(matches!(
+            run.outputs[0].payload,
+            OutputPayload::Report(TestReport { total_after: 7 })
+        ));
+    }
 }
 
 /// Regression tripwire for the pre-v14 durability-gate hole: the

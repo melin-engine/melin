@@ -150,6 +150,10 @@ fn a_write_refused_while_halted_is_not_replayed() {
 
     // --- Taking writes: the replica is attached, the write is taken. ---
     wait_for_gauge(primary_health, "melin_replicas_connected", 1);
+    // The gate runs the configured policy (`disk`, byte 0), and the new
+    // lineage has journaled none.
+    wait_for_gauge(primary_health, "melin_ack_policy_in_force", 0);
+    assert_eq!(gauge(primary_health, "melin_ack_policy_journaled"), None);
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut conn = Connection::connect_by(primary.addr(), &client_key, deadline)
         .expect("client connects to the primary");

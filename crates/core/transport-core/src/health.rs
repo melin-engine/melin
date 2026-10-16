@@ -319,6 +319,14 @@ struct HealthSnapshot {
     /// can `rate()` time-in-degraded over a window — see
     /// `StageUtilization::policy_degraded_nanos`.
     response_policy_degraded_nanos: u64,
+    /// Wire byte of the ack policy the response gate enforces —
+    /// `StageUtilization::ack_policy_in_force`. `None` until a gate runs
+    /// (a replica), and then the series is omitted.
+    ack_policy_in_force: Option<u8>,
+    /// Wire byte of the policy the newest journaled change puts in force
+    /// — `StageUtilization::ack_policy_journaled`. `None` while the
+    /// lineage holds no change, and then the series is omitted.
+    ack_policy_journaled: Option<u8>,
     /// Journal rotations that adopted a pre-staged segment (fast path).
     journal_rotations_fast_path: u64,
     /// Journal rotations that fell back to the synchronous allocate
@@ -557,6 +565,16 @@ impl HealthSnapshot {
                 .response_utilization
                 .policy_degraded_nanos
                 .load(Ordering::Relaxed),
+            ack_policy_in_force: state
+                .response_utilization
+                .ack_policy_in_force
+                .load()
+                .map(|p| p.0),
+            ack_policy_journaled: state
+                .matching_utilization
+                .ack_policy_journaled
+                .load()
+                .map(|p| p.0),
             journal_rotations_fast_path: state
                 .journal_utilization
                 .rotations_fast_path
@@ -767,6 +785,27 @@ impl HealthSnapshot {
             if self.response_policy_degraded { 1 } else { 0 },
             self.response_policy_degraded_nanos as f64 / 1e9,
         );
+        // The two policy gauges exist only while their value is known —
+        // a node with no response gate (a replica) has no policy in
+        // force, a lineage with no change has none journaled — rather
+        // than exporting a byte that names a real policy. Best-effort
+        // like the block above.
+        if let Some(byte) = self.ack_policy_in_force {
+            let _ = write!(
+                c,
+                "# HELP melin_ack_policy_in_force Ack policy the response gate enforces, as its wire byte. Differs from melin_ack_policy_journaled while a journaled change waits for the policy before it to clear its entry.\n\
+                 # TYPE melin_ack_policy_in_force gauge\n\
+                 melin_ack_policy_in_force {byte}\n",
+            );
+        }
+        if let Some(byte) = self.ack_policy_journaled {
+            let _ = write!(
+                c,
+                "# HELP melin_ack_policy_journaled Ack policy the newest journaled policy change puts in force, as its wire byte.\n\
+                 # TYPE melin_ack_policy_journaled gauge\n\
+                 melin_ack_policy_journaled {byte}\n",
+            );
+        }
         // Raft gauges only exist on raft-enabled nodes — omitting the
         // series entirely (rather than exporting zeros) keeps dashboards
         // from suggesting a one-node "cluster" on standalone deployments.
@@ -2537,6 +2576,14 @@ mod tests {
         response_util
             .policy_degraded_nanos
             .store(2_500_000_000, Ordering::Relaxed);
+        // A change journaled but not yet in force: the two gauges differ.
+        response_util
+            .ack_policy_in_force
+            .store(Some(melin_journal::AckPolicyByte(1)));
+        let matching_util = Arc::new(StageUtilization::new());
+        matching_util
+            .ack_policy_journaled
+            .store(Some(melin_journal::AckPolicyByte(0)));
 
         let state = HealthState {
             active_connections: Arc::new(AtomicU64::new(0)),
@@ -2552,7 +2599,7 @@ mod tests {
             replication_ring_producer_cursors: None,
             replication_ring_consumer_cursors: None,
             journal_utilization: Arc::new(StageUtilization::new()),
-            matching_utilization: Arc::new(StageUtilization::new()),
+            matching_utilization: matching_util,
             response_utilization: response_util,
             raft: None,
         };
@@ -2587,7 +2634,33 @@ mod tests {
             response.contains("melin_durability_policy_degraded_seconds_total 2.500000\n"),
             "deprecated policy_degraded_seconds_total alias: {response}"
         );
+        assert!(
+            response.contains("melin_ack_policy_in_force 1\n"),
+            "policy in force: {response}"
+        );
+        assert!(
+            response.contains("melin_ack_policy_journaled 0\n"),
+            "policy journaled: {response}"
+        );
 
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    /// With no gate running and no change journaled, the two policy
+    /// gauges are left out rather than exported as a byte that names a
+    /// real policy.
+    #[test]
+    fn metrics_omit_the_policy_gauges_while_unknown() {
+        let (body, shutdown, handle) = prometheus_with_full_replication_state();
+        assert!(
+            !body.contains("melin_ack_policy_in_force"),
+            "in force: {body}"
+        );
+        assert!(
+            !body.contains("melin_ack_policy_journaled"),
+            "journaled: {body}"
+        );
         shutdown.store(true, Ordering::Relaxed);
         handle.join().unwrap();
     }

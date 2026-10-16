@@ -31,6 +31,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::dispatch::{LineageEvent, dispatch};
+use crate::lineage::{
+    ForcedPolicy, ForcedPolicyReader, ForcedPolicyWriter, LineagePolicyCell, forced_policy_cell,
+};
 use crate::trace::{MonoTraceInstant, mono_trace_ns};
 use melin_app::{AppEvent, Application, ApplyCtx, QueryCtx};
 use melin_journal::BufferedWriter;
@@ -185,6 +188,17 @@ pub struct StageUtilization {
     /// stall. Alert on it approaching the ring depth, not on it being
     /// briefly non-zero. Only used by the journal stage.
     pub journal_disk_lag: AtomicU64,
+    /// The ack policy the response gate enforces. Written by the gate at
+    /// startup and on every switch, read by the health endpoint. Differs
+    /// from the matching stage's `ack_policy_journaled` while a journaled
+    /// change waits for the policy before it to clear its entry. `None`
+    /// until a gate runs. Only used by the response stage.
+    pub ack_policy_in_force: LineagePolicyCell,
+    /// The policy the newest journaled `AckPolicyChange` puts in force:
+    /// seeded from the recovered lineage, then written by the matching
+    /// stage as it dispatches each change. `None` while the lineage holds
+    /// no change. Only used by the matching stage.
+    pub ack_policy_journaled: LineagePolicyCell,
 }
 
 impl StageUtilization {
@@ -200,6 +214,8 @@ impl StageUtilization {
             rotations_sync_fallback: AtomicU64::new(0),
             rotations_failed: AtomicU64::new(0),
             journal_disk_lag: AtomicU64::new(0),
+            ack_policy_in_force: LineagePolicyCell::new(None),
+            ack_policy_journaled: LineagePolicyCell::new(None),
         }
     }
 }
@@ -446,6 +462,13 @@ pub enum OutputPayload<R: Copy, Q: Copy> {
     BatchEnd,
     /// Internal error during matching.
     EngineError,
+    /// A journaled ack-policy change, at its exact position in the ring:
+    /// the slot's `wire_seq` is the entry's. Carries no reply. The
+    /// response stage switches policy here, for every slot after it, once
+    /// the entry is durable under the policy in force before it. Emitted
+    /// for every change, whatever its connection, so the switch point is
+    /// never lost.
+    AckPolicyChange(melin_journal::AckPolicyChange),
 }
 
 impl<R: Copy, Q: Copy> Default for OutputSlot<R, Q> {
@@ -2451,16 +2474,74 @@ impl<E: AppEvent> JournalStage<E> {
 /// The matching stage's lineage sink, for its run loop and its shutdown
 /// drain alike.
 ///
-/// An epoch bump advances the fencing state. An ack-policy change is not
-/// acted on here yet: nothing journals one, and the response stage's
-/// switch at the entry's slot is a later step of
-/// `docs/internal/journaled-ack-policy-2026-10.md`.
-fn observe_live_lineage(fence: &crate::fence::FenceState, lineage: LineageEvent) {
+/// An epoch bump advances the fencing state. An ack-policy change is
+/// recorded in the "journaled" gauge; the response stage switches to it
+/// in order at the entry's own output slot, and an unwitnessed change is
+/// also published to the forced cell, for a gate stuck on a slot ahead
+/// of it (`docs/internal/journaled-ack-policy-2026-10.md`).
+fn observe_live_lineage(
+    fence: &crate::fence::FenceState,
+    journaled_policy: &LineagePolicyCell,
+    forced_policy: &mut ForcedPolicyWriter,
+    wire_seq: u64,
+    lineage: LineageEvent,
+) {
     match lineage {
         LineageEvent::Epoch(epoch) => {
             fence.observe_epoch(epoch);
         }
-        LineageEvent::AckPolicy(_) => {}
+        LineageEvent::AckPolicy(change) => {
+            journaled_policy.store(Some(change.policy));
+            // The in-order switch rides the change's output slot; a
+            // forced one is also published here, for a gate stuck on a
+            // slot ahead of it.
+            if change.unwitnessed {
+                forced_policy.store(ForcedPolicy {
+                    wire_seq,
+                    policy: change.policy,
+                });
+            }
+        }
+    }
+}
+
+/// The output slot an `AckPolicyChange` entry emits — see
+/// [`OutputPayload::AckPolicyChange`]. Always the event's last slot.
+#[inline]
+fn ack_policy_change_slot<R: Copy, Q: Copy>(
+    input: &InputSlot<impl AppEvent>,
+    input_seq: u64,
+    wire_seq: u64,
+    change: melin_journal::AckPolicyChange,
+    match_complete_ts: MonoTraceInstant,
+) -> OutputSlot<R, Q> {
+    OutputSlot {
+        connection_id: input.connection_id,
+        input_seq,
+        wire_seq,
+        payload: OutputPayload::AckPolicyChange(change),
+        match_complete_ts,
+        recv_ts: input.recv_ts,
+        is_last_in_request: true,
+    }
+}
+
+/// The ack-policy change an event carries, if it is one.
+///
+/// Exhaustive on purpose: a new lineage-metadata variant that also needs
+/// a switch point in the output ring must break the build here rather
+/// than fall silently into `None`.
+#[inline]
+fn policy_change_of<E: AppEvent>(
+    event: &melin_journal::JournalEvent<E>,
+) -> Option<melin_journal::AckPolicyChange> {
+    use melin_journal::JournalEvent;
+    match event {
+        JournalEvent::AckPolicyChange(change) => Some(*change),
+        JournalEvent::Tick { .. }
+        | JournalEvent::EpochBump { .. }
+        | JournalEvent::Shutdown
+        | JournalEvent::App(_) => None,
     }
 }
 
@@ -2522,6 +2603,14 @@ pub struct MatchingStage<A: Application> {
     /// off-by-one the wire-seq field exists to eliminate. Tests pin this
     /// invariant.
     next_wire_seq: u64,
+    /// Where an unwitnessed `AckPolicyChange` is published as it is
+    /// dispatched, for the response gate to apply out of order (see
+    /// [`ForcedPolicy`]). Created with the stage, so a new primary tenure
+    /// (a fresh pipeline) never inherits an earlier tenure's change.
+    forced_policy: ForcedPolicyWriter,
+    /// The response gate's half of `forced_policy`, handed out by
+    /// [`Self::forced_policy`].
+    forced_policy_reader: ForcedPolicyReader,
 }
 
 impl<A: Application> MatchingStage<A> {
@@ -2538,6 +2627,7 @@ impl<A: Application> MatchingStage<A> {
         wait: WaitStrategy,
         starting_wire_seq: u64,
     ) -> Self {
+        let (forced_policy, forced_policy_reader) = forced_policy_cell();
         Self {
             app,
             consumer,
@@ -2550,12 +2640,20 @@ impl<A: Application> MatchingStage<A> {
             utilization: Arc::new(StageUtilization::new()),
             last_drain_ns: 0,
             next_wire_seq: starting_wire_seq,
+            forced_policy,
+            forced_policy_reader,
         }
     }
 
     /// Shared utilization counters for health endpoint monitoring.
     pub fn utilization(&self) -> Arc<StageUtilization> {
         Arc::clone(&self.utilization)
+    }
+
+    /// The forced ack-policy changes this stage dispatches, for the
+    /// response gate. See [`ForcedPolicy`].
+    pub fn forced_policy(&self) -> ForcedPolicyReader {
+        self.forced_policy_reader.clone()
     }
 
     /// Run the matching stage loop. Blocks until shutdown.
@@ -2729,7 +2827,15 @@ impl<A: Application> MatchingStage<A> {
                             key_hash: slot.key_hash,
                         },
                         &mut self.last_drain_ns,
-                        |lineage| observe_live_lineage(&self.fence_state, lineage),
+                        |lineage| {
+                            observe_live_lineage(
+                                &self.fence_state,
+                                &self.utilization.ack_policy_journaled,
+                                &mut self.forced_policy,
+                                wire_seq,
+                                lineage,
+                            )
+                        },
                         &mut reports,
                     );
                     None
@@ -2780,10 +2886,14 @@ impl<A: Application> MatchingStage<A> {
                 // ring slot per event when there is at least one
                 // report or query response to mark. When the event
                 // produces no payload at all, fall back to a single
-                // `BatchEnd`-payload slot.
+                // `BatchEnd`-payload slot. An ack-policy change always
+                // ends with its own slot, after any report the clock
+                // step produced, whatever its connection.
+                let policy_change = policy_change_of(&slot.event);
                 let report_count = reports.len();
                 let last_is_query = query_report.is_some();
-                if report_count == 0 && !last_is_query {
+                let last_is_change = policy_change.is_some();
+                if report_count == 0 && !last_is_query && !last_is_change {
                     // Transport-internal events (Tick published by the
                     // reader thread) carry
                     // `connection_id == 0` and have no client to reply
@@ -2811,7 +2921,7 @@ impl<A: Application> MatchingStage<A> {
                     }
                 } else {
                     for (j, report) in reports.iter().enumerate() {
-                        let is_last = j + 1 == report_count && !last_is_query;
+                        let is_last = j + 1 == report_count && !last_is_query && !last_is_change;
                         out_batch.push_with(|s| {
                             *s = OutputSlot {
                                 connection_id: slot.connection_id,
@@ -2835,6 +2945,17 @@ impl<A: Application> MatchingStage<A> {
                                 recv_ts: slot.recv_ts,
                                 is_last_in_request: true,
                             };
+                        });
+                    }
+                    if let Some(change) = policy_change {
+                        out_batch.push_with(|s| {
+                            *s = ack_policy_change_slot(
+                                slot,
+                                input_seq,
+                                wire_seq,
+                                change,
+                                match_complete_ts,
+                            );
                         });
                     }
                 }
@@ -2910,7 +3031,15 @@ impl<A: Application> MatchingStage<A> {
                     key_hash: slot.key_hash,
                 },
                 &mut self.last_drain_ns,
-                |lineage| observe_live_lineage(&self.fence_state, lineage),
+                |lineage| {
+                    observe_live_lineage(
+                        &self.fence_state,
+                        &self.utilization.ack_policy_journaled,
+                        &mut self.forced_policy,
+                        wire_seq,
+                        lineage,
+                    )
+                },
                 reports,
             );
 
@@ -2920,9 +3049,11 @@ impl<A: Application> MatchingStage<A> {
             // Same is_last_in_request convention as the run loop: mark
             // the final report (or a fallback BatchEnd-payload slot) as
             // the request terminator so the response stage emits the
-            // wire BatchEnd.
+            // wire BatchEnd. An ack-policy change ends with its own slot,
+            // as in the run loop.
+            let policy_change = policy_change_of(&slot.event);
             let report_count = reports.len();
-            if report_count == 0 {
+            if report_count == 0 && policy_change.is_none() {
                 self.output.publish(OutputSlot {
                     connection_id: slot.connection_id,
                     input_seq,
@@ -2934,7 +3065,7 @@ impl<A: Application> MatchingStage<A> {
                 });
             } else {
                 for (j, report) in reports.iter().enumerate() {
-                    let is_last = j + 1 == report_count;
+                    let is_last = j + 1 == report_count && policy_change.is_none();
                     self.output.publish(OutputSlot {
                         connection_id: slot.connection_id,
                         input_seq,
@@ -2944,6 +3075,15 @@ impl<A: Application> MatchingStage<A> {
                         recv_ts: slot.recv_ts,
                         is_last_in_request: is_last,
                     });
+                }
+                if let Some(change) = policy_change {
+                    self.output.publish(ack_policy_change_slot(
+                        &slot,
+                        input_seq,
+                        wire_seq,
+                        change,
+                        match_complete_ts,
+                    ));
                 }
             }
         }

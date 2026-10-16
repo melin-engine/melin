@@ -20,7 +20,7 @@ use melin_pipeline::ring;
 use melin_pipeline::spsc;
 use melin_pipeline::wait::WaitStrategy;
 
-use crate::durability_gate::{DurabilityGate, GateInputs, GateOutcome};
+use crate::durability_gate::{DurabilityGate, GateInputs, GateOutcome, GatePolicy};
 use crate::halt::RefusalQueue;
 use melin_app::Application;
 use melin_app::amortized_timer::AmortizedTimer;
@@ -116,7 +116,7 @@ pub fn run<A: Application>(
     mut consumer: ring::Consumer<OutputSlot<A::Report, A::QueryResponse>>,
     control_rx: mpsc::Receiver<ControlEvent>,
     journal_persisted_wire_seq: DurableWireSeqCursor,
-    ack_policy: Arc<std::sync::atomic::AtomicU8>,
+    policy: GatePolicy,
     replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>>,
     replica_active: Option<[Arc<AtomicBool>; 2]>,
     shutdown: &AtomicBool,
@@ -135,12 +135,12 @@ pub fn run<A: Application>(
     let mut gate = DurabilityGate::new(
         GateInputs {
             journal_persisted_wire_seq,
-            ack_policy,
             replication_metrics,
             replica_active,
             utilization: Arc::clone(&utilization),
             wait,
         },
+        policy,
         "dpdk response",
     );
     // Track known connections (for heartbeat scheduling).
@@ -391,16 +391,19 @@ pub fn run<A: Application>(
             // (the old `+1` compensated for the input-seq
             // off-by-(starting-1), which is gone now).
             //
+            // A policy change slot is the switch point (see
+            // `DurabilityGate::admit`). Nothing to flush before a wait:
+            // every slot's frames are released as soon as it is encoded.
+            //
             // A gate that cannot open does not hold the shutdown sequence;
             // the reply the policy never confirmed is not queued.
-            if gate.needs_wait(slot)
-                && let GateOutcome::Shutdown = gate.wait_durable(
-                    slot.wire_seq,
-                    shutdown,
-                    #[cfg(feature = "tick-to-trade")]
-                    &mut gate_tracker,
-                )
-            {
+            if let GateOutcome::Shutdown = gate.admit(
+                slot,
+                shutdown,
+                #[cfg(feature = "tick-to-trade")]
+                &mut gate_tracker,
+                || {},
+            ) {
                 continue 'run;
             }
 

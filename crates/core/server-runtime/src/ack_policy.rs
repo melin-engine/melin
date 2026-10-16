@@ -194,6 +194,18 @@ impl AckPolicy {
             _ => None,
         }
     }
+
+    /// The policy a journaled `AckPolicyChange` names: the journal carries
+    /// the [`as_u8`](Self::as_u8) byte opaquely, and this is where it is
+    /// validated. `None` for a byte this build does not know.
+    pub fn from_byte(byte: melin_journal::AckPolicyByte) -> Option<Self> {
+        Self::from_u8(byte.0)
+    }
+
+    /// The journal's opaque form of this policy.
+    pub fn to_byte(self) -> melin_journal::AckPolicyByte {
+        melin_journal::AckPolicyByte(self.as_u8())
+    }
 }
 
 impl fmt::Display for AckPolicy {
@@ -224,6 +236,16 @@ mod tests {
         for b in [4, 5, 255] {
             assert_eq!(AckPolicy::from_u8(b), None);
         }
+    }
+
+    /// The journal's opaque byte is the wire byte, both ways.
+    #[test]
+    fn journal_byte_round_trip() {
+        for p in ALL {
+            assert_eq!(p.to_byte(), melin_journal::AckPolicyByte(p.as_u8()));
+            assert_eq!(AckPolicy::from_byte(p.to_byte()), Some(p));
+        }
+        assert_eq!(AckPolicy::from_byte(melin_journal::AckPolicyByte(4)), None);
     }
 
     #[test]

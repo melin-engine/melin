@@ -85,7 +85,12 @@ fn read_ack(sock: &mut UnixStream) -> std::io::Result<u64> {
 fn config_for(journal_cursor: DurableWireSeqCursor) -> Response<Counter> {
     Response::<Counter> {
         journal_persisted_wire_seq: journal_cursor,
-        ack_policy: Arc::new(AtomicU8::new(AckPolicy::Disk.as_u8())),
+        policy: response::GatePolicy {
+            initial: AckPolicy::Disk,
+            admin: Arc::new(AtomicU8::new(AckPolicy::Disk.as_u8())),
+            admin_seen: AckPolicy::Disk.as_u8(),
+            forced: melin_transport_core::lineage::forced_policy_cell().1,
+        },
         replication_metrics: None,
         replica_active: None,
         heartbeat_interval: None,

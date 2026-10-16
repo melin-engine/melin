@@ -173,7 +173,12 @@ fn large_frame_batch_is_delivered_not_disconnected() {
     let (control_tx, control_rx) = mpsc::channel();
     let config = Response::<PadApp> {
         journal_persisted_wire_seq: journal_cursor.clone(),
-        ack_policy: Arc::new(AtomicU8::new(AckPolicy::Disk.as_u8())),
+        policy: response::GatePolicy {
+            initial: AckPolicy::Disk,
+            admin: Arc::new(AtomicU8::new(AckPolicy::Disk.as_u8())),
+            admin_seen: AckPolicy::Disk.as_u8(),
+            forced: melin_transport_core::lineage::forced_policy_cell().1,
+        },
         replication_metrics: None,
         replica_active: None,
         heartbeat_interval: None,

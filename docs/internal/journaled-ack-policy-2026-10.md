@@ -294,6 +294,77 @@ and is committed on its own. Tests land with the step they pin.
    after; a change held until the old policy clears its entry; never
    merging two pending changes; a forced swap freeing an earlier stuck
    slot only once its entry is on disk, and later stale slots ignored.
+
+   *As landed:* `OutputPayload::AckPolicyChange(AckPolicyChange)`. The
+   matching stage emits it for every change, on any connection (a
+   report-less connection-0 event otherwise emits nothing), after any
+   report the change's clock step produced, as the event's last slot;
+   the shutdown drain does the same. Both response stages hand every
+   slot to one method, `DurabilityGate::admit`, which waits (running a
+   `before_wait` hook, where the kernel stage flushes) and then, for a
+   change slot, switches through the private `switch_to`; the frame
+   encoder gives the slot no frame. The gate is built from a
+   `GatePolicy { initial, admin, admin_seen, forced }`.
+
+   - **The forced cell** is `ForcedPolicyWriter` / `ForcedPolicyReader`
+     in `transport-core`'s `lineage` module: a seqlock over `[wire_seq,
+     present | policy]`, so a reader never pairs one change's sequence
+     with another's policy. It is created with each `MatchingStage`, so
+     a new primary tenure (a fresh pipeline) never inherits a forced
+     change; a replica's matching stage writes its own, which nothing
+     reads.
+   - **One staleness mark for both paths.** The plan says the gate
+     ignores in-order changes at or below an applied forced one. The
+     reverse also needs saying: a forced change the gate reaches in
+     order (its entry already durable, no wait) must not be applied a
+     second time by a later wait, after an in-order change has moved
+     on. The gate keeps `applied_through`, the wire seq of the newest
+     change applied either way; a change at or below it, in order or
+     forced, is stale. A stale change slot is neither waited on nor
+     applied.
+   - **The initial policy** is `initial_gate_policy`: the lineage's, or
+     the requested one (the admin atomic: configured or staged) while
+     the lineage holds none. An unknown lineage byte refuses the primary
+     (boot and promotion alike, before any stage starts); decision 1's
+     validation lands here because the gate is its first consumer. An
+     unknown byte in a live change slot or the forced cell keeps the
+     prior policy with an `error!` (this node journaled it: a bug, and
+     refusing every later reply would turn it into an outage).
+   - **The transitional admin path** follows *changes* of the atomic,
+     against the byte the initial policy was resolved from
+     (`admin_seen`, so a swap landing between that and the gate's start
+     is not lost), not its value: otherwise a gate started from a
+     lineage policy would be swapped straight back to the configured
+     one. Until step 4, a lineage holding a policy different from the
+     configured one therefore serves under the lineage's until an
+     operator sends an `ACK-POLICY` that changes the atomic's byte: one
+     naming the configured policy stores the byte already there, so the
+     gate keeps the lineage's and the operator has to send another
+     policy first. Nothing journals a change before step 4, so no lineage
+     holds one yet, and step 4 removes the atomic.
+   - **Health exports** are `/metrics` gauges, `melin_ack_policy_in_force`
+     (written by the gate at start and on every switch) and
+     `melin_ack_policy_journaled` (seeded from the recovered lineage at
+     primary start, written by the matching stage per change), both as
+     the policy's wire byte and omitted while unknown (no gate on a
+     replica; no change in the lineage). They live in `StageUtilization`
+     (`LineagePolicyCell`s), so no health wiring changed. The one-line
+     status of `GET /` is not extended: probes parse it positionally.
+     Step 7 documents the gauges, including that only the primary seeds
+     the journaled gauge from the lineage: were a replica's matching
+     utilization ever exported, its gauge would stay omitted until a
+     change streamed in.
+   - **Tests.** Gate unit tests for the four listed cases, plus the
+     in-order forced change not re-applied, unknown bytes, the
+     `before_wait` hook, the admin path following changes, and the
+     initial policy; a kernel response-stage test driving a change slot
+     and a forced swap through the running stage; matching-stage tests
+     for the slot's position and wire seq (run loop, shutdown drain,
+     after clock-step reports), the forced cell and the journaled cell;
+     the gauges rendered and omitted; the primary's policy resolution;
+     `halt_refusal` checks the gauges on a live node. The DPDK response
+     stage calls the same `admit` and is lint-checked with the DPDK
+     features; it gets no netns case in this step (step 7).
 4. **The producers.** The mailbox and wake, for the io_uring reader and
    the DPDK poll thread; the forced decision; the boot and promotion
    entries on both transports; the standalone rule; the gate's atomic

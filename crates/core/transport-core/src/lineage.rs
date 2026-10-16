@@ -48,8 +48,10 @@ impl Lineage {
     }
 }
 
-/// A shared `Option<AckPolicyByte>`: a replica's record of the lineage's
-/// ack policy, read by threads other than the one that writes it.
+/// A shared `Option<AckPolicyByte>`, read by threads other than the one
+/// that writes it: a replica's record of the lineage's ack policy, and on
+/// a primary the health gauges' view of the policy journaled last and of
+/// the one the response gate enforces.
 ///
 /// Stored, never merged (see [`Lineage::ack_policy`]): after a recovery or
 /// a snapshot resync the cell takes the recovered value whole, so a change
@@ -86,6 +88,75 @@ fn encode(policy: Option<AckPolicyByte>) -> u16 {
 
 fn decode(raw: u16) -> Option<AckPolicyByte> {
     u8::try_from(raw).ok().map(AckPolicyByte)
+}
+
+/// An unwitnessed ack-policy change the matching stage has dispatched:
+/// the entry's wire sequence and the policy it puts in force.
+///
+/// The response gate applies it out of order, as soon as the entry itself
+/// is durable on the primary's disk, rather than at the entry's slot: the
+/// slot a halted gate is stuck on comes before the change in the output
+/// ring, so an in-order switch would never be reached. A change is forced
+/// only with the operator's explicit consent (a weakening sent while no
+/// replica is connected) or on a node without replication; every other
+/// change is applied in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForcedPolicy {
+    /// The change entry's wire sequence.
+    pub wire_seq: u64,
+    /// The policy it puts in force.
+    pub policy: AckPolicyByte,
+}
+
+/// The seqlock payload behind [`ForcedPolicyWriter`]: `[wire_seq,
+/// FORCED_PRESENT | policy]`, or all zero before any forced change. Two
+/// `u64` words rather than one packed word so every wire sequence stays
+/// representable, and a seqlock rather than two atomics so a reader never
+/// pairs one change's sequence with another's policy.
+type ForcedWords = [u64; 2];
+
+/// Set in the second word once a forced change has been stored, so a
+/// policy byte of zero is told apart from "none".
+const FORCED_PRESENT: u64 = 1 << 8;
+
+/// Create the forced-policy cell: its single writer (the matching stage)
+/// and a reader for the response gate, both empty.
+pub fn forced_policy_cell() -> (ForcedPolicyWriter, ForcedPolicyReader) {
+    let (writer, reader) = melin_pipeline::seqlock::split::<ForcedWords>([0, 0]);
+    (ForcedPolicyWriter(writer), ForcedPolicyReader(reader))
+}
+
+/// The matching stage's half of the forced-policy cell. Not `Clone`, and
+/// [`store`](Self::store) takes `&mut self`: one writer, by construction.
+pub struct ForcedPolicyWriter(melin_pipeline::seqlock::SeqLockWriter<ForcedWords>);
+
+impl ForcedPolicyWriter {
+    /// Publish the newest forced change, replacing any earlier one: a
+    /// later forced change supersedes an earlier one the gate has not
+    /// applied yet.
+    #[inline]
+    pub fn store(&mut self, forced: ForcedPolicy) {
+        self.0
+            .store([forced.wire_seq, FORCED_PRESENT | u64::from(forced.policy.0)]);
+    }
+}
+
+/// The response gate's half of the forced-policy cell.
+#[derive(Clone)]
+pub struct ForcedPolicyReader(melin_pipeline::seqlock::SeqLockReader<ForcedWords>);
+
+impl ForcedPolicyReader {
+    /// The newest forced change, `None` before the first.
+    #[inline]
+    pub fn load(&self) -> Option<ForcedPolicy> {
+        let [wire_seq, policy] = self.0.load();
+        (policy & FORCED_PRESENT != 0).then_some(ForcedPolicy {
+            wire_seq,
+            // Truncation intended: the low byte is the policy, the bit
+            // above it the presence flag.
+            policy: AckPolicyByte(policy as u8),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -144,5 +215,23 @@ mod tests {
             LineagePolicyCell::new(Some(AckPolicyByte(3))).load(),
             Some(AckPolicyByte(3))
         );
+    }
+
+    /// The forced cell starts empty, holds every policy byte (zero
+    /// included, which the presence bit tells apart from "none") at any
+    /// wire sequence, and a later store replaces an earlier one whole.
+    #[test]
+    fn the_forced_cell_starts_empty_and_holds_the_newest_change() {
+        let (mut writer, reader) = forced_policy_cell();
+        assert_eq!(reader.load(), None);
+        for (wire_seq, byte) in [(1, 0), (7, u8::MAX), (u64::MAX, 3)] {
+            let forced = ForcedPolicy {
+                wire_seq,
+                policy: AckPolicyByte(byte),
+            };
+            writer.store(forced);
+            assert_eq!(reader.load(), Some(forced));
+            assert_eq!(reader.clone().load(), Some(forced), "clones share the cell");
+        }
     }
 }
