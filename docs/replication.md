@@ -284,9 +284,10 @@ within 2 seconds (its pipeline is stalled and its input is full) or is
 stopping, it answers `ERR ACK-POLICY not journaled: ...` and nothing
 changes. On a replica, or on a primary still starting, it answers
 `OK staged`: the policy is kept and journaled when the node serves as
-primary (below). Every command is journaled, a repeat of the policy
-already in force included: the entries are the audit trail of what
-operators asked for, and re-sending is how a waiting swap is forced.
+primary (below), unless its history already holds it. Every command a
+serving primary takes is journaled, a repeat of the policy already in
+force included: the entries are the audit trail of what operators asked
+for, and re-sending is how a waiting swap is forced.
 
 **The forced swap.** A swap normally waits for the nodes the old policy
 relied on. A primary that lost its last replica under `ram`, `disk+ram`

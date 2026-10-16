@@ -1593,10 +1593,10 @@ mod tests {
         /// fix (mirrors the DPDK receiver): after the failed transfer the
         /// retry creates a fresh live journal from the StreamStart lineage.
         ///
-        /// The transfer fails AFTER the snapshot was received and its
-        /// lineage adopted (the primary drops before the segment seed),
-        /// so the retry must also shed the half-applied snapshot's ack
-        /// policy: a fresh replica holds no lineage, so no policy.
+        /// The transfer fails AFTER the snapshot was received but before
+        /// the segment seed (the primary drops), so the snapshot's lineage
+        /// must not be adopted: a fresh replica holds no lineage, so no
+        /// ack policy.
         #[test]
         fn resync_transfer_failure_rebuilds_clean_not_over_stale_writer() {
             let dir = tempfile::tempdir().expect("tempdir");
@@ -1714,8 +1714,9 @@ mod tests {
             // --- Session 2: reconnect at the recovered position (seq 1),
             // verdict HashMismatch (archives the live journal aside), send
             // the snapshot, then DROP the connection before the segment
-            // seed — the transfer fails after the snapshot's lineage was
-            // adopted, and the receiver must retry as a fresh replica.
+            // seed — the transfer fails after the snapshot is received but
+            // before the seed, so its lineage must not be adopted, and the
+            // receiver must retry as a fresh replica.
             let mut s2 = accept_within(&listener, 30);
             let mut s2r = s2.try_clone().expect("clone");
             authenticate_replica(&mut s2r, &authorized_keys).expect("auth 2");
@@ -1772,12 +1773,13 @@ mod tests {
                 ),
                 other => panic!("expected Handshake, got {other:?}"),
             }
-            // The Retry stored the cell before this reconnect, and no
-            // recovery runs on that path, so this read is deterministic.
+            // The archive cleared the cell before the transfer began, a
+            // failed transfer adopts nothing, and no recovery runs on the
+            // Retry path, so this read is deterministic.
             assert_eq!(
                 control.lineage_ack_policy.load(),
                 None,
-                "a failed transfer must shed the adopted snapshot's policy"
+                "a failed transfer must not adopt the snapshot's policy"
             );
             stream_one(&mut s3, &mut buf);
             wait_for_ack(&mut s3, 1);

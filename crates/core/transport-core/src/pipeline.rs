@@ -2543,27 +2543,6 @@ fn ack_policy_change_slot<R: Copy, Q: Copy>(
     }
 }
 
-/// The ack-policy change an event carries, if it is one.
-///
-/// Exhaustive on purpose: a new lineage-metadata variant that also needs
-/// a switch point in the output ring must break the build here rather
-/// than fall silently into `None`. The one decision point for the
-/// question: [`LineagePolicyCell::change_in`](crate::lineage::LineagePolicyCell::change_in)
-/// answers it for a replica through this function.
-#[inline]
-pub(crate) fn policy_change_of<E: AppEvent>(
-    event: &melin_journal::JournalEvent<E>,
-) -> Option<melin_journal::AckPolicyChange> {
-    use melin_journal::JournalEvent;
-    match event {
-        JournalEvent::AckPolicyChange(change) => Some(*change),
-        JournalEvent::Tick { .. }
-        | JournalEvent::EpochBump { .. }
-        | JournalEvent::Shutdown
-        | JournalEvent::App(_) => None,
-    }
-}
-
 /// Matching stage: consumes from the input disruptor (in parallel with
 /// the journal stage), applies events to the application, and publishes
 /// responses to the output SPSC.
@@ -2908,7 +2887,7 @@ impl<A: Application> MatchingStage<A> {
                 // `BatchEnd`-payload slot. An ack-policy change always
                 // ends with its own slot, after any report the clock
                 // step produced, whatever its connection.
-                let policy_change = policy_change_of(&slot.event);
+                let policy_change = slot.event.ack_policy_change();
                 let report_count = reports.len();
                 let last_is_query = query_report.is_some();
                 let last_is_change = policy_change.is_some();
@@ -3070,7 +3049,7 @@ impl<A: Application> MatchingStage<A> {
             // the request terminator so the response stage emits the
             // wire BatchEnd. An ack-policy change ends with its own slot,
             // as in the run loop.
-            let policy_change = policy_change_of(&slot.event);
+            let policy_change = slot.event.ack_policy_change();
             let report_count = reports.len();
             if report_count == 0 && policy_change.is_none() {
                 self.output.publish(OutputSlot {

@@ -109,24 +109,21 @@ pub(crate) fn initial_gate_policy(
     requested: AckPolicy,
     replication_enabled: bool,
 ) -> Result<AckPolicy, String> {
-    match lineage {
-        None => Ok(requested),
-        Some(byte) => AckPolicy::from_byte(byte)
-            .map(|lineage| {
-                if replication_enabled {
-                    lineage
-                } else {
-                    requested
-                }
-            })
-            .ok_or_else(|| {
-                format!(
-                    "the journal's ack policy (byte {}) is unknown to this build; \
-                 refusing to serve under it",
-                    byte.0
-                )
-            }),
-    }
+    let Some(byte) = lineage else {
+        return Ok(requested);
+    };
+    let Some(in_force) = AckPolicy::from_byte(byte) else {
+        return Err(format!(
+            "the journal's ack policy (byte {}) is unknown to this build; \
+             refusing to serve under it",
+            byte.0
+        ));
+    };
+    Ok(if replication_enabled {
+        in_force
+    } else {
+        requested
+    })
 }
 
 /// The cursors and shared state the gate reads. Grouped so the two
@@ -290,11 +287,11 @@ impl DurabilityGate {
 
     /// Apply the newest forced change once its own entry is durable on
     /// this node's disk (`journal_pos`), so the record of the swap exists
-    /// before any reply relies on it.
+    /// before any reply relies on it. One already applied is skipped by
+    /// [`Self::apply_change`].
     #[inline]
     fn observe_forced(&mut self, journal_pos: u64) {
         if let Some(forced) = self.forced.load()
-            && forced.wire_seq > self.applied_through
             && journal_pos >= forced.wire_seq
         {
             self.apply_change(forced.wire_seq, forced.policy, "forced change");
@@ -309,8 +306,12 @@ impl DurabilityGate {
     /// `before_wait` runs once, only when the slot has to wait — the
     /// kernel stage flushes its buffered replies there.
     ///
-    /// A change a forced one has overtaken is stale: it is neither waited
-    /// on (it carries no reply) nor applied.
+    /// A change a forced one has overtaken is stale, and not applied
+    /// ([`Self::apply_change`]). Waiting on it holds nothing back: the
+    /// forced change was applied only once its own entry, which comes after
+    /// the stale one, was on this node's disk, so a forced `disk` finds the
+    /// stale slot durable at once, and any other forced policy (a node
+    /// without replication) holds the next reply as long.
     #[inline]
     pub(crate) fn admit<R: Copy, Q: Copy>(
         &mut self,
@@ -320,12 +321,7 @@ impl DurabilityGate {
         before_wait: impl FnOnce(),
     ) -> GateOutcome {
         let change = match slot.payload {
-            OutputPayload::AckPolicyChange(change) => {
-                if slot.wire_seq <= self.applied_through {
-                    return GateOutcome::Open;
-                }
-                Some(change)
-            }
+            OutputPayload::AckPolicyChange(change) => Some(change),
             OutputPayload::Report(_)
             | OutputPayload::QueryResponse(_)
             | OutputPayload::BatchEnd

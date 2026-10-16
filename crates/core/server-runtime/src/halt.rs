@@ -16,7 +16,7 @@
 //! replica can consent to serving on its disk alone with `ACK-POLICY
 //! disk`: sent while no replica is connected, the change is journaled as
 //! forced, and journaling it lifts the halt
-//! ([`HaltGate::record_journaled`]). The override lasts until a replica
+//! (`HaltGate::record_journaled`). The override lasts until a replica
 //! connects or a policy that needs one is journaled; the next loss of the
 //! last replica then halts the node again. A swap to `disk` made while a
 //! replica is still connected lifts nothing when it leaves: consent counts
@@ -88,7 +88,7 @@ use melin_transport_core::fence::FenceState;
 use melin_transport_core::replica_presence::{Observed, ReplicaPresence};
 
 use crate::ack_policy::AckPolicy;
-use crate::policy_control::{Origin, Witnesses, is_forced, is_unwitnessed};
+use crate::policy_control::{Origin, Witnesses, is_unwitnessed};
 
 /// Refusals the response stage can hold before a reader has to shed load.
 ///
@@ -123,65 +123,38 @@ pub struct HaltGate {
     refused: Arc<AtomicU64>,
 }
 
-/// Who was streaming when the input ring's producer looked, taken just
-/// before it journals an ack-policy change: decides whether the change is
-/// forced ([`Self::witnesses`]) and, once journaled, what it does to the
-/// halt override ([`HaltGate::record_journaled`]). One observation for
-/// both, so the two decisions cannot rest on different replica counts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Observation(Option<Observed>);
-
-impl Observation {
-    /// Who could witness a change published now — see
-    /// [`crate::policy_control::is_unwitnessed`].
-    pub fn witnesses(self) -> Witnesses {
-        match self.0 {
-            None => Witnesses::Disabled,
-            Some(Observed::NoneConnected(_)) => Witnesses::NoneConnected,
-            Some(Observed::Connected) => Witnesses::Connected,
-        }
-    }
-
-    /// Decide the entry that journals a change to `policy` from `origin`
-    /// on this observation — see [`crate::policy_control::is_unwitnessed`].
-    pub fn decide(self, policy: AckPolicy, origin: Origin) -> Decision {
-        Decision {
-            policy,
-            change: AckPolicyChange {
-                policy: policy.to_byte(),
-                unwitnessed: is_unwitnessed(policy, origin, self.witnesses()),
-            },
-            seen: self,
-        }
-    }
-}
-
-/// An ack-policy change decided on one [`Observation`]: the policy, the
-/// entry that journals it, and the observation it rests on. Built only by
-/// [`Observation::decide`], so the entry the producer publishes and the
-/// policy and observation [`HaltGate::record_journaled`] acts on cannot
+/// An ack-policy change decided on one look at who was streaming, taken
+/// just before the input ring's producer journals it: the policy, the
+/// entry that journals it, and what was seen. Built only by
+/// [`HaltGate::decide`], so the entry the producer publishes and the
+/// policy and replica count [`HaltGate::record_journaled`] acts on cannot
 /// disagree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Decision {
+pub(crate) struct Decision {
     policy: AckPolicy,
     change: AckPolicyChange,
-    seen: Observation,
+    /// Who was streaming; `None` in standalone mode.
+    seen: Option<Observed>,
 }
 
 impl Decision {
     /// The policy changed to.
-    pub fn policy(self) -> AckPolicy {
+    pub(crate) fn policy(self) -> AckPolicy {
         self.policy
     }
 
     /// The entry to journal.
-    pub fn change(self) -> AckPolicyChange {
+    pub(crate) fn change(self) -> AckPolicyChange {
         self.change
     }
 
-    /// Whether the change is forced — see [`is_forced`].
-    pub fn is_forced(self) -> bool {
-        is_forced(self.change, self.seen.witnesses())
+    /// Whether the change is a forced swap: unwitnessed for want of a
+    /// connected replica, rather than because replication is disabled.
+    /// Only an explicit runtime `disk` is (see
+    /// [`crate::policy_control::is_unwitnessed`]). It warns, and lifts the
+    /// halt ([`HaltGate::record_journaled`]).
+    pub(crate) fn is_forced(self) -> bool {
+        self.change.unwitnessed && matches!(self.seen, Some(Observed::NoneConnected(_)))
     }
 }
 
@@ -201,17 +174,24 @@ impl HaltGate {
         }
     }
 
-    /// Who is streaming now. Two loads.
-    #[inline]
-    pub fn observe(&self) -> Observation {
-        Observation(self.replicas_connected.as_ref().map(|p| p.observe()))
-    }
-
-    /// Who could witness an ack-policy change published now — see
+    /// Decide the entry that journals a change to `policy` from `origin`,
+    /// on who is streaming now (two loads) — see
     /// [`crate::policy_control::is_unwitnessed`].
-    #[inline]
-    pub fn witnesses(&self) -> Witnesses {
-        self.observe().witnesses()
+    pub(crate) fn decide(&self, policy: AckPolicy, origin: Origin) -> Decision {
+        let seen = self.replicas_connected.as_ref().map(|p| p.observe());
+        let witnesses = match seen {
+            None => Witnesses::Disabled,
+            Some(Observed::NoneConnected(_)) => Witnesses::NoneConnected,
+            Some(Observed::Connected) => Witnesses::Connected,
+        };
+        Decision {
+            policy,
+            change: AckPolicyChange {
+                policy: policy.to_byte(),
+                unwitnessed: is_unwitnessed(policy, origin, witnesses),
+            },
+            seen,
+        }
     }
 
     /// The input ring's producer journaled `decision`'s change: a forced
@@ -222,8 +202,8 @@ impl HaltGate {
     /// a witnessed `disk` was decided with a replica connected, whose
     /// connect has voided any override already. Standalone never halts,
     /// so there is nothing to record.
-    pub fn record_journaled(&self, decision: Decision) {
-        let (Some(presence), Some(observed)) = (&self.replicas_connected, decision.seen.0) else {
+    pub(crate) fn record_journaled(&self, decision: Decision) {
+        let (Some(presence), Some(observed)) = (&self.replicas_connected, decision.seen) else {
             return;
         };
         if decision.policy.needs_replica() {
@@ -469,24 +449,28 @@ mod tests {
         assert_eq!(gate.verdict(), Verdict::Take);
     }
 
+    /// A decision follows the replica count at the time it is made: a
+    /// runtime `disk` is unwitnessed standalone (not forced), forced with
+    /// no replica connected, and witnessed once one connects.
     #[test]
-    fn witnesses_follow_the_replica_count() {
-        assert_eq!(
-            gate(None, Arc::new(FenceState::new(0))).witnesses(),
-            Witnesses::Disabled
-        );
+    fn a_decision_follows_the_replica_count() {
+        let standalone =
+            gate(None, Arc::new(FenceState::new(0))).decide(AckPolicy::Disk, Origin::Runtime);
+        assert!(standalone.change().unwitnessed && !standalone.is_forced());
         let replicas = test_support::presence(0);
         let gate = gate(Some(Arc::clone(&replicas)), Arc::new(FenceState::new(0)));
-        assert_eq!(gate.witnesses(), Witnesses::NoneConnected);
+        let none = gate.decide(AckPolicy::Disk, Origin::Runtime);
+        assert!(none.change().unwitnessed && none.is_forced());
         replicas.lift();
         replicas.lift();
-        assert_eq!(gate.witnesses(), Witnesses::Connected);
+        let connected = gate.decide(AckPolicy::Disk, Origin::Runtime);
+        assert!(!connected.change().unwitnessed && !connected.is_forced());
     }
 
-    /// Journal `policy` as the producer would: observe, decide the entry,
-    /// record it.
+    /// Journal `policy` as the producer would: decide the entry, record
+    /// it.
     fn journal(gate: &HaltGate, policy: AckPolicy, origin: Origin) {
-        gate.record_journaled(gate.observe().decide(policy, origin));
+        gate.record_journaled(gate.decide(policy, origin));
     }
 
     /// The entry a decision carries is the policy's byte, unwitnessed as
@@ -502,7 +486,7 @@ mod tests {
             AckPolicy::Ram,
         ] {
             for origin in [Origin::Runtime, Origin::Staged] {
-                let decision = gate.observe().decide(policy, origin);
+                let decision = gate.decide(policy, origin);
                 assert_eq!(decision.policy(), policy);
                 assert_eq!(decision.change().policy, policy.to_byte());
                 let unwitnessed = is_unwitnessed(policy, origin, Witnesses::NoneConnected);
@@ -511,11 +495,11 @@ mod tests {
             }
         }
         replicas.lift();
-        let decision = gate.observe().decide(AckPolicy::Disk, Origin::Runtime);
+        let decision = gate.decide(AckPolicy::Disk, Origin::Runtime);
         assert!(!decision.change().unwitnessed);
         assert!(!decision.is_forced());
         let standalone = self::gate(None, Arc::new(FenceState::new(0)));
-        let decision = standalone.observe().decide(AckPolicy::Ram, Origin::Staged);
+        let decision = standalone.decide(AckPolicy::Ram, Origin::Staged);
         assert!(decision.change().unwitnessed, "nothing can witness it");
         assert!(!decision.is_forced(), "unwitnessed for want of replication");
     }
@@ -534,9 +518,8 @@ mod tests {
 
         journal(&gate, AckPolicy::Disk, Origin::Runtime);
         assert_eq!(gate.verdict(), Verdict::Take, "consent lifts the halt");
-        assert_eq!(
-            gate.witnesses(),
-            Witnesses::NoneConnected,
+        assert!(
+            gate.decide(AckPolicy::Disk, Origin::Runtime).is_forced(),
             "still no witness: a later `disk` is forced too"
         );
 

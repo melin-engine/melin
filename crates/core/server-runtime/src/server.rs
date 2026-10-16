@@ -2099,13 +2099,8 @@ where
         );
     }
     // The policy this tenure requests, after the bump; see
-    // `journal_boot_policy_change`.
-    journal_boot_policy_change(
-        lineage_ack_policy,
-        ack_policy_claim.policy(),
-        halt_gate.witnesses(),
-        &mut input_producer,
-    );
+    // `PublisherClaim::journal_boot`.
+    ack_policy_claim.journal_boot(lineage_ack_policy, &mut input_producer, &halt_gate);
 
     // Bring-up gate: a primary that began the history with replication
     // on serves no client until its first replica is streaming live. A
@@ -3194,12 +3189,7 @@ where
         );
     }
     // As on kernel TCP: the policy this tenure requests, after the bump.
-    journal_boot_policy_change(
-        lineage_ack_policy,
-        ack_policy_claim.policy(),
-        halt_gate.witnesses(),
-        &mut input_producer,
-    );
+    ack_policy_claim.journal_boot(lineage_ack_policy, &mut input_producer, &halt_gate);
 
     // Journal `on_primary` through the pipeline. Genesis is already in
     // the journal (`init_engine` creates the journal with it); replicas
@@ -3262,14 +3252,16 @@ where
     // Exactly one client poll queue (LMAX: single reader → single
     // matcher), on this thread.
     melin_app::affinity::pin_thread("dpdk-poll-0", reader_core);
+    // Attached while this thread still owns the producer alone, before the
+    // poll loop serves anyone. No wakeup: the poll thread never parks.
+    let ack_policy = ack_policy_claim.attach(&mut input_producer, &halt_gate, None);
     crate::dpdk_transport::run_dpdk_poll::<A>(
         transport,
         input_producer,
         decoder,
         halt_gate,
         refusal_tx,
-        // No wakeup: the poll thread never parks.
-        ack_policy_claim.attach(None),
+        ack_policy,
         control_tx,
         tx_rx_0,
         &shutdown,
@@ -3792,31 +3784,6 @@ fn primary_gate_policy<A: Application>(
         initial,
         forced: matching_stage.forced_policy(),
     })
-}
-
-/// Journal the ack-policy change a primary starts or is promoted with, if
-/// any (see [`boot_change`](crate::policy_control::boot_change)): the
-/// requested policy, when the lineage holds another or none. From the main
-/// thread, while it is still the input ring's only producer, ahead of
-/// `on_primary` and of any client. Not waited on: the gate switches at the
-/// entry's slot, in order, once the policy before it has cleared it.
-fn journal_boot_policy_change<E: melin_app::AppEvent>(
-    lineage_ack_policy: Option<AckPolicyByte>,
-    requested: crate::ack_policy::AckPolicy,
-    witnesses: crate::policy_control::Witnesses,
-    input_producer: &mut melin_pipeline::ring::Producer<InputSlot<E>>,
-) {
-    let Some(change) = crate::policy_control::boot_change(lineage_ack_policy, requested, witnesses)
-    else {
-        return;
-    };
-    info!(
-        policy = %requested,
-        unwitnessed = change.unwitnessed,
-        lineage = ?lineage_ack_policy.map(|byte| byte.0),
-        "journaling the requested ack policy"
-    );
-    input_producer.publish(crate::policy_control::change_slot(change));
 }
 
 fn spawn_shadow_stage<A: Application + Send + 'static>(
@@ -5366,49 +5333,6 @@ mod primary_gate_policy_tests {
                 .is_err()
             );
         }
-    }
-
-    /// The boot entry is published on the input ring as the node's own
-    /// event when the lineage holds another policy, and not at all when it
-    /// holds the requested one.
-    #[test]
-    fn the_boot_change_is_published_only_when_the_lineage_differs() {
-        use crate::policy_control::Witnesses;
-        use melin_journal::{AckPolicyChange, JournalEvent};
-
-        let (mut producer, mut consumers) = DisruptorBuilder::<InputSlot<CounterEvent>>::new(8)
-            .add_consumer()
-            .build(WaitStrategy::SpinThenYield);
-        let mut consumer = consumers.pop().expect("one consumer");
-        let disk = Some(AckPolicy::Disk.to_byte());
-        super::journal_boot_policy_change(
-            disk,
-            AckPolicy::Disk,
-            Witnesses::NoneConnected,
-            &mut producer,
-        );
-        assert!(consumer.try_consume().is_none(), "nothing to change");
-        super::journal_boot_policy_change(
-            disk,
-            AckPolicy::DiskAndRam,
-            Witnesses::NoneConnected,
-            &mut producer,
-        );
-        let (_, slot) = consumer.try_consume().expect("the change");
-        assert_eq!(
-            (slot.connection_id, slot.key_hash, slot.sequence),
-            (0, 0, 0)
-        );
-        let JournalEvent::AckPolicyChange(change) = slot.event else {
-            panic!("not a policy change");
-        };
-        assert_eq!(
-            change,
-            AckPolicyChange {
-                policy: AckPolicy::DiskAndRam.to_byte(),
-                unwitnessed: false,
-            }
-        );
     }
 }
 

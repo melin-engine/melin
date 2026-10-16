@@ -21,18 +21,18 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   differ while a change waits for the nodes the old policy relied on.
 - **The pieces of journaled ack-policy changes, public for embedders and
   tools.** In `melin-journal`: `AckPolicyByte`, `AckPolicyChange`,
-  `codec::decode_event` (one decoder for every entry tag, the replicated
-  slot's included) with its `EventDecodeError`, and
-  `codec::ACK_POLICY_CHANGE_PAYLOAD_SIZE`. In `melin-transport-core`: the
-  `lineage` module (`Lineage`, the epoch and policy a history has in
-  force; `LineagePolicyCell`; the forced-change cell
-  `forced_policy_cell`, `ForcedPolicyWriter` and `ForcedPolicyReader`),
-  the `replica_presence` module, `InputSlot::node_event` and
-  `MatchingStage::forced_policy`. In `melin-server-runtime`: the
-  `policy_control` module (the `AckPolicyControl` mailbox between the
-  admin command and the input ring's producer, and the witnessed or
-  forced rule), `AckPolicy::needs_replica`, `from_byte` and `to_byte`,
-  and `HaltGate::observe`, `witnesses` and `record_journaled`.
+  `JournalEvent::ack_policy_change` (the change an event carries, if
+  any), and `codec::decode_event` (one decoder for every entry tag, the
+  replicated slot's included) with its `EventDecodeError`. In
+  `melin-transport-core`: the `lineage` module (`Lineage`, the epoch and
+  policy a history has in force; `LineagePolicyCell`; the forced-change
+  cell `forced_policy_cell`, `ForcedPolicy`, `ForcedPolicyWriter` and
+  `ForcedPolicyReader`), the `replica_presence` module,
+  `InputSlot::node_event` and `MatchingStage::forced_policy`. In
+  `melin-server-runtime`: the `policy_control` module's
+  `AckPolicyControl`, `PublisherClaim` and `AckPolicyPublisher`, the
+  types of the ack-policy mailbox between the admin command and the
+  input ring's producer, which the server's start-up builds.
 - **`--dpdk-client-rx-buf-kib`, `--dpdk-client-tx-buf-kib`,
   `--dpdk-client-tx-queue-kib`**: the per-connection buffering of the
   client connections a DPDK node accepts, previously fixed at 64 KiB of
@@ -298,7 +298,8 @@ Anything source-breaking is called out under **Removed** or **Changed**.
     `ERR ACK-POLICY not journaled: ...` if the change cannot be journaled
     within 2 s (input ring full) or the node is stopping. On a replica,
     or a primary still starting, it replies `OK staged`, and the policy
-    is journaled when the node serves as primary. Every command is
+    is journaled when the node serves as primary, unless its history
+    already holds it. Every command a serving primary takes is
     journaled, repeats of the policy in force included.
   - A weakening waits for the nodes the old policy relied on to hold the
     change. `ACK-POLICY disk` sent while no replica is connected is
@@ -339,13 +340,21 @@ Anything source-breaking is called out under **Removed** or **Changed**.
     `encode_heartbeat` and `replication::catchup::snapshot_transfer_with`
     their `ack_policy` argument.
   - `melin_server_runtime::replication::ReplicaControlPlane` lost
-    `primary_ack_policy` and gained `primary_observed` and
-    `lineage_ack_policy`; `replication::Sender` lost `ack_policy`.
+    `primary_ack_policy` and gained crate-private fields, so it can no
+    longer be built with a struct literal (use `ReplicaControlPlane::new()`
+    or `Default`); `replication::Sender` lost `ack_policy`.
   - `melin_server_runtime::response::Response` and
     `dpdk_response::run` take `policy: GatePolicy` (the initial policy and the forced
     change reader) in place of the `ack_policy` atomic, and
     `admin::spawn` takes the `policy_control::AckPolicyControl` mailbox
-    in place of the atomic.
+    in place of the atomic. `reader::spawn_reader` takes a
+    `policy_control::PublisherClaim`, and `dpdk_transport::run_dpdk_poll`
+    an `AckPolicyPublisher`: the input ring's producer journals the
+    `ACK-POLICY` requests. The mailbox, the claim and the publisher are
+    built only by the server's start-up (`AckPolicyControl::new` and
+    `claim` are crate-private), so outside the crate `admin::spawn`
+    takes `None` and these two entry points are driven by the server
+    alone; there is no outside migration path.
   - The replica count is a `melin_transport_core::replica_presence::ReplicaPresence`
     (count and halt override in one type) where it was an
     `Arc<AtomicU32>`: `Pipeline::replicas_connected`,

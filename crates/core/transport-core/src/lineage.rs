@@ -80,23 +80,6 @@ impl LineagePolicyCell {
     pub fn store(&self, policy: Option<AckPolicyByte>) {
         self.0.store(encode(policy), Ordering::Release);
     }
-
-    /// The policy `event` puts in force once accepted into the lineage
-    /// this cell tracks: `Some` for an ack-policy change, which the cell
-    /// then [stores](Self::store) whole (last writer wins, as in
-    /// [`Lineage::ack_policy`]), and `None` for every other entry, which
-    /// leaves the policy as it is.
-    ///
-    /// For a writer following entries one at a time (a replica's receive
-    /// thread), as [`Lineage`]'s `observe` folds them on replay. It asks
-    /// the matching stage's exhaustive match, so a new journal variant
-    /// decides once, for both, whether it moves the policy.
-    #[inline]
-    pub fn change_in<E: melin_app::AppEvent>(
-        event: &melin_journal::JournalEvent<E>,
-    ) -> Option<AckPolicyByte> {
-        crate::pipeline::policy_change_of(event).map(|change| change.policy)
-    }
 }
 
 fn encode(policy: Option<AckPolicyByte>) -> u16 {
@@ -232,30 +215,6 @@ mod tests {
             LineagePolicyCell::new(Some(AckPolicyByte(3))).load(),
             Some(AckPolicyByte(3))
         );
-    }
-
-    /// Only an ack-policy change moves the cell, to its own policy whether
-    /// witnessed or not; every other entry, the epoch bump included,
-    /// leaves it as it is.
-    #[test]
-    fn only_an_ack_policy_change_moves_the_cell() {
-        use crate::test_support::{TestEvent, ack_policy_change};
-        use melin_journal::JournalEvent;
-
-        for unwitnessed in [false, true] {
-            assert_eq!(
-                LineagePolicyCell::change_in(&ack_policy_change::<TestEvent>(2, unwitnessed)),
-                Some(AckPolicyByte(2))
-            );
-        }
-        for other in [
-            JournalEvent::Tick { now_ns: 1 },
-            JournalEvent::EpochBump { epoch: 3 },
-            JournalEvent::Shutdown,
-            JournalEvent::App(TestEvent::Add(4)),
-        ] {
-            assert_eq!(LineagePolicyCell::change_in(&other), None, "{other:?}");
-        }
     }
 
     /// The forced cell starts empty, holds every policy byte (zero

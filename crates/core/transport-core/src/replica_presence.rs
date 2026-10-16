@@ -73,7 +73,7 @@ impl ReplicaPresence {
 
     /// Replicas currently streaming, for the gauge. Relaxed: a reading.
     #[inline]
-    pub fn connected(&self) -> u32 {
+    pub(crate) fn connected(&self) -> u32 {
         self.connected.load(Ordering::Relaxed)
     }
 

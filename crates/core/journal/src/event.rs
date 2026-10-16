@@ -107,6 +107,25 @@ impl<E: AppEvent> JournalEvent<E> {
         }
     }
 
+    /// The ack-policy change this event carries, if it is one.
+    ///
+    /// The one decision point for the question, on the matching stage
+    /// (where the change's output slot goes) and on a replica's receive
+    /// thread (where its lineage cell follows it). Names every variant,
+    /// like [`Self::is_query`]: a new lineage-metadata variant that also
+    /// moves the policy must break the build here rather than fall into a
+    /// wildcard's `None`.
+    #[inline]
+    pub fn ack_policy_change(&self) -> Option<AckPolicyChange> {
+        match self {
+            JournalEvent::AckPolicyChange(change) => Some(*change),
+            JournalEvent::Tick { .. }
+            | JournalEvent::EpochBump { .. }
+            | JournalEvent::Shutdown
+            | JournalEvent::App(_) => None,
+        }
+    }
+
     /// Returns `true` for the pipeline-shutdown sentinel. Each stage
     /// stops at this slot (after completing any pending work) and exits.
     #[inline]

@@ -103,7 +103,7 @@ impl AckPolicy {
     /// counts more than one copy. Derived from [`Self::to_policy`] so it
     /// cannot drift from the clauses. Builds the policy, so it is for cold
     /// paths (journaling a change), not per slot.
-    pub fn needs_replica(self) -> bool {
+    pub(crate) fn needs_replica(self) -> bool {
         self.to_policy()
             .clauses()
             .iter()
@@ -149,13 +149,13 @@ impl AckPolicy {
     }
 
     /// Stable u8 discriminant: the byte a journaled `AckPolicyChange`
-    /// carries ([`to_byte`](Self::to_byte)), and the one the health gauges
+    /// carries (`to_byte`), and the one the health gauges
     /// export.
     ///
     /// **These values are a wire format**, not just an in-process ABI:
     /// they are in every journal holding a policy change, streamed to
     /// every replica with the entries, and a replica decodes the one its
-    /// lineage holds with [`from_byte`](Self::from_byte) to judge
+    /// lineage holds with `from_byte` to judge
     /// auto-promotion (see `raft_promotion`). So they must stay
     /// stable across releases in two directions — the round-trip
     /// `from_u8(as_u8(x)) == Some(x)` has to hold, *and* a value once
@@ -199,12 +199,12 @@ impl AckPolicy {
     /// The policy a journaled `AckPolicyChange` names: the journal carries
     /// the [`as_u8`](Self::as_u8) byte opaquely, and this is where it is
     /// validated. `None` for a byte this build does not know.
-    pub fn from_byte(byte: melin_journal::AckPolicyByte) -> Option<Self> {
+    pub(crate) fn from_byte(byte: melin_journal::AckPolicyByte) -> Option<Self> {
         Self::from_u8(byte.0)
     }
 
     /// The journal's opaque form of this policy.
-    pub fn to_byte(self) -> melin_journal::AckPolicyByte {
+    pub(crate) fn to_byte(self) -> melin_journal::AckPolicyByte {
         melin_journal::AckPolicyByte(self.as_u8())
     }
 }

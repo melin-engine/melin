@@ -300,7 +300,7 @@ const _: () = assert!(ENTRY_FRAMING_SIZE == 33);
 
 /// Payload width of the widest transport-intrinsic variants — `Tick`'s
 /// `now_ns` and `EpochBump`'s `epoch`, both a `u64`. (`AckPolicyChange`
-/// is narrower; see [`ACK_POLICY_CHANGE_PAYLOAD_SIZE`].)
+/// is narrower: two bytes.)
 ///
 /// The journal writes these whatever `E` is, so an entry's true ceiling is
 /// this *or* the app's declared bound, whichever is larger. An application
@@ -310,7 +310,7 @@ pub const TRANSPORT_PAYLOAD_SIZE: usize = 8;
 
 /// Payload width of [`JournalEvent::AckPolicyChange`]:
 /// `[policy: u8][flags: u8]`.
-pub const ACK_POLICY_CHANGE_PAYLOAD_SIZE: usize = 2;
+const ACK_POLICY_CHANGE_PAYLOAD_SIZE: usize = 2;
 
 // Every reservation is sized from `TRANSPORT_PAYLOAD_SIZE`, so no
 // transport payload may be wider.
@@ -755,7 +755,7 @@ pub enum EventDecodeError {
 impl EventDecodeError {
     /// A static description, for [`JournalError::CorruptEntry`], which
     /// cannot carry the details.
-    pub fn reason(self) -> &'static str {
+    fn reason(self) -> &'static str {
         match self {
             EventDecodeError::UnknownTag(_) => "unknown event tag",
             EventDecodeError::Malformed(reason) => reason,
@@ -1078,6 +1078,30 @@ mod tests {
             assert!(!event.is_query(), "{event:?}");
         }
         assert!(JournalEvent::App(QueryEvent).is_query());
+    }
+
+    /// Only an ack-policy change carries one, witnessed or not, and as
+    /// it was journaled; every other event, the epoch bump included,
+    /// carries none.
+    #[test]
+    fn only_an_ack_policy_change_carries_one() {
+        for unwitnessed in [false, true] {
+            assert_eq!(
+                ack_policy_change(2, unwitnessed).ack_policy_change(),
+                Some(AckPolicyChange {
+                    policy: AckPolicyByte(2),
+                    unwitnessed,
+                })
+            );
+        }
+        for other in [
+            JournalEvent::Tick { now_ns: 1 },
+            JournalEvent::EpochBump { epoch: 3 },
+            JournalEvent::Shutdown,
+            JournalEvent::App(TestEvent::Ping),
+        ] {
+            assert_eq!(other.ack_policy_change(), None, "{other:?}");
+        }
     }
 
     /// An application event that is a query, for

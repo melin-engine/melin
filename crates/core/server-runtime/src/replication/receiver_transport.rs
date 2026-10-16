@@ -401,10 +401,10 @@ fn accept_slot<E: AppEvent>(
     lineage_policy: &LineagePolicyCell,
     abort: impl FnMut() -> bool,
 ) -> Result<u64, melin_pipeline::ring::Full> {
-    let change = LineagePolicyCell::change_in(&slot.event);
+    let change = slot.event.ack_policy_change();
     let index = batch.push_with_or_abort(|s| *s = slot, abort)?;
-    if change.is_some() {
-        lineage_policy.store(change);
+    if let Some(change) = change {
+        lineage_policy.store(Some(change.policy));
     }
     Ok(index)
 }

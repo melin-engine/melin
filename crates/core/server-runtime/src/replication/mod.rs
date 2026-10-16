@@ -151,7 +151,7 @@ pub struct ReplicaControlPlane {
     /// process booted, and never cleared: the auto-promotion rule's
     /// "a primary has been seen" input, which tells a blank genesis node
     /// from a replica that followed a primary before it died.
-    pub primary_observed: std::sync::Arc<AtomicBool>,
+    pub(crate) primary_observed: std::sync::Arc<AtomicBool>,
     /// The ack policy the lineage this replica holds has in force: the
     /// newest journaled `AckPolicyChange` it holds, or `None` when it
     /// holds none. The raft driver's auto-promotion refusal judges by it,
@@ -167,7 +167,7 @@ pub struct ReplicaControlPlane {
     /// past it (see `receiver_transport::process_streaming_frames`). Not by
     /// the replica's matching stage, which lags the receive thread: two
     /// writers would let an older value overwrite a newer one.
-    pub lineage_ack_policy: std::sync::Arc<LineagePolicyCell>,
+    pub(crate) lineage_ack_policy: std::sync::Arc<LineagePolicyCell>,
     /// Whether the replica's pipeline is healthy — fed to the replica's
     /// minimal health endpoint (`/health` OK/ERR and the
     /// `melin_pipeline_healthy` gauge). Process-lifetime (the per-session
@@ -1152,9 +1152,17 @@ where
     }
 }
 
-/// The four facts a successful snapshot + segment-seed transfer yields:
-/// `(snapshot App, snapshot sequence, snapshot chain hash, seed length)`.
-type ResyncTransfer<A> = (A, u64, [u8; 32], u64);
+/// The facts a successful snapshot + segment-seed transfer yields:
+/// `(snapshot App, snapshot sequence, snapshot chain hash, seed length,
+/// snapshot lineage)`. The lineage is adopted by the caller once the
+/// whole transfer has succeeded, so a failed one leaves none behind.
+type ResyncTransfer<A> = (
+    A,
+    u64,
+    [u8; 32],
+    u64,
+    melin_transport_core::lineage::Lineage,
+);
 
 /// What [`handle_resync_verdict`] resolved a `NeedSnapshot` /
 /// `HashMismatch` verdict to.
@@ -1180,8 +1188,8 @@ pub(in crate::replication) enum ResyncDecision {
 /// Receive the snapshot + segment-seed transfer that follows a resync
 /// verdict, installing both (snapshot → `snapshot_path`, seed →
 /// `journal_path`). Returns the snapshot App, its sequence + chain hash,
-/// and the seed length (the journal's `valid_end`). Shared by both
-/// receivers via [`ControlFrameSource`].
+/// the seed length (the journal's `valid_end`) and the snapshot's
+/// lineage. Shared by both receivers via [`ControlFrameSource`].
 ///
 /// Errors here are network-shaped — the caller retries (see
 /// [`ResyncDecision::Retry`]); the post-transfer install in
@@ -1190,8 +1198,6 @@ fn receive_resync_transfer<A, S>(
     source: &mut S,
     snapshot_path: &std::path::Path,
     journal_path: &std::path::Path,
-    fence_state: &melin_transport_core::fence::FenceState,
-    lineage_policy: &LineagePolicyCell,
 ) -> Result<ResyncTransfer<A>, Box<dyn std::error::Error + Send + Sync>>
 where
     A: Application + Send,
@@ -1225,10 +1231,6 @@ where
         )
         .into());
     }
-    // Adopt the primary's snapshot lineage — the resync rebases this
-    // replica onto the primary's lineage, its epoch and ack policy
-    // included.
-    adopt_recovered_lineage(fence_state, lineage_policy, snap_header.lineage);
 
     // Segment seed: the raw byte prefix of the primary's segment
     // containing `snap_sequence`. Written verbatim as our live segment, it
@@ -1258,7 +1260,13 @@ where
         melin_journal::segment::fsync_parent_dir(journal_path)?;
         Ok(())
     })?;
-    Ok((snap_app, snap_sequence, snap_chain_hash, seed_len))
+    Ok((
+        snap_app,
+        snap_sequence,
+        snap_chain_hash,
+        seed_len,
+        snap_header.lineage,
+    ))
 }
 
 /// Handle a `NeedSnapshot` / `HashMismatch` resync verdict — shared by
@@ -1360,25 +1368,22 @@ where
         .journal_tip
         .reset(melin_transport_core::WireSeq::new(0));
 
-    let (snap_app, snap_sequence, snap_chain_hash, seed_len) = match receive_resync_transfer::<A, S>(
-        source,
-        snapshot_path,
-        journal_path,
-        fence_state,
-        &control.lineage_ack_policy,
-    ) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(error = %e, "snapshot transfer failed — retrying");
-            // Half-applied resync state, not audit material — drop it
-            // so the retry starts clean (the pre-resync lineage is
-            // already archived; this is not it). That includes a
-            // policy adopted from a snapshot whose seed then failed.
-            control.lineage_ack_policy.store(None);
-            let _ = std::fs::remove_file(snapshot_path);
-            return Ok(ResyncDecision::Retry);
-        }
-    };
+    let (snap_app, snap_sequence, snap_chain_hash, seed_len, snap_lineage) =
+        match receive_resync_transfer::<A, S>(source, snapshot_path, journal_path) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "snapshot transfer failed — retrying");
+                // Half-applied resync state, not audit material — drop it
+                // so the retry starts clean (the pre-resync lineage is
+                // already archived; this is not it).
+                let _ = std::fs::remove_file(snapshot_path);
+                return Ok(ResyncDecision::Retry);
+            }
+        };
+    // Adopt the primary's snapshot lineage — the resync rebases this
+    // replica onto the primary's lineage, its epoch and ack policy
+    // included. Only now: a transfer that failed part-way adopts nothing.
+    adopt_recovered_lineage(fence_state, &control.lineage_ack_policy, snap_lineage);
     *app = Some(snap_app);
 
     // Open the seeded segment for appending at the snapshot position —
@@ -1427,8 +1432,9 @@ where
             // We just rebased onto this primary's snapshot, so adopt its
             // epoch wholesale (no stale-primary refusal — our prior state
             // was discarded).
-            // The lineage policy came with the snapshot (stored by the
-            // transfer); the stream's changes keep it current from here.
+            // The lineage policy came with the snapshot (adopted above,
+            // once the transfer succeeded); the stream's changes keep it
+            // current from here.
             fence_state.observe_epoch(epoch);
             control.primary_observed.store(true, Ordering::Release);
             tracing::info!(

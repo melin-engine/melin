@@ -781,24 +781,17 @@ mod tests {
     /// journaled the change: the entry is on the input ring.
     #[test]
     fn ack_policy_command_is_journaled_by_the_producer() {
-        use melin_pipeline::ring::DisruptorBuilder;
-        use melin_pipeline::wait::WaitStrategy;
-        use melin_transport_core::pipeline::InputSlot;
-
-        type Slot = InputSlot<counter_server::CounterEvent>;
         let control = AckPolicyControl::new(AckPolicy::DiskAndRam);
-        let (mut producer, mut consumers) = DisruptorBuilder::<Slot>::new(8)
-            .add_consumer()
-            .build(WaitStrategy::SpinThenYield);
-        let mut consumer = consumers.pop().expect("one consumer");
-        let mut publisher = control.claim().attach(None);
-        let (key, addr, shutdown) = spawn_with_policy(&control);
-        let polling = Arc::new(AtomicBool::new(true));
+        let (mut producer, mut consumer) =
+            crate::policy_control::test_support::ring::<counter_server::CounterEvent>(8);
         // No replica connected: the node is halted.
         let replicas = crate::halt::test_support::presence(0);
         let halt = crate::halt::test_support::gate_over(Some(Arc::clone(&replicas)));
         let halted = crate::halt::Verdict::Refuse(melin_app::RejectReason::ReplicaDisconnected);
         assert_eq!(halt.verdict(), halted);
+        let mut publisher = control.claim().attach(&mut producer, &halt, None);
+        let (key, addr, shutdown) = spawn_with_policy(&control);
+        let polling = Arc::new(AtomicBool::new(true));
         let poller = {
             let polling = Arc::clone(&polling);
             std::thread::spawn(move || {
@@ -837,9 +830,10 @@ mod tests {
     /// refused once the bounded wait is out, and nothing changes.
     #[test]
     fn ack_policy_command_refused_when_it_cannot_be_journaled() {
-        let control =
-            AckPolicyControl::with_publish_wait(AckPolicy::DiskAndRam, Duration::from_millis(50));
-        let _publisher = control.claim().attach(None);
+        use crate::policy_control::test_support::{attach, control_with_publish_wait, ring};
+        let control = control_with_publish_wait(AckPolicy::DiskAndRam, Duration::from_millis(50));
+        let (mut producer, _consumer) = ring::<counter_server::CounterEvent>(8);
+        let _publisher = attach(&control, &mut producer);
         let (key, addr, shutdown) = spawn_with_policy(&control);
         let resp = send_command(addr, &key, b"ACK-POLICY disk\n");
         assert!(resp.starts_with("ERR ACK-POLICY not journaled"), "{resp}");

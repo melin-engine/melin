@@ -218,7 +218,7 @@ pub(crate) fn wake_reader(event_fd: &OwnedFd) {
 /// operator-fixable condition the node has to report.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_reader<A: Application, R: AsRawFd + Send + 'static>(
-    producer: ring::Producer<InputSlot<A::Event>>,
+    mut producer: ring::Producer<InputSlot<A::Event>>,
     decoder: RequestDecoderArc<A>,
     halt: HaltGate,
     refusals: RefusalSender<A::Report>,
@@ -252,9 +252,11 @@ where
     let event_fd = Arc::new(unsafe { OwnedFd::from_raw_fd(raw_event_fd) });
     let wakeup_fd = Arc::clone(&event_fd);
     let shutdown_clone = Arc::clone(&shutdown);
-    // Attached here, with the eventfd: if the thread never starts, the
-    // publisher is dropped with its closure and detaches.
-    let ack_policy = ack_policy.attach(Some(Arc::clone(&event_fd)));
+    // Attached here, on this thread, which still owns the producer alone
+    // (a policy staged during bring-up is journaled now), with the
+    // eventfd: if the thread never starts, the publisher is dropped with
+    // its closure and detaches.
+    let ack_policy = ack_policy.attach(&mut producer, &halt, Some(Arc::clone(&event_fd)));
 
     // The thread's startup report. The ring has to be created on the
     // thread that submits to it (it is SINGLE_ISSUER: the kernel binds
@@ -1718,7 +1720,7 @@ mod tests {
         use crate::ack_policy::AckPolicy;
         use crate::policy_control::RequestOutcome;
 
-        let (handle, mut consumer, control) = spawn_parked_reader(gate(None, false));
+        let (handle, mut consumer, control) = spawn_parked_reader(gate(None, false), None);
         assert_eq!(control.request(AckPolicy::Disk), RequestOutcome::Published);
         let (_, slot) = consumer.try_consume().expect("the entry is on the ring");
         assert_eq!(
@@ -1737,18 +1739,49 @@ mod tests {
         );
     }
 
+    /// A policy staged while the primary started is journaled as the
+    /// reader attaches, before it runs: ahead of a runtime request it
+    /// then publishes, and never forced.
+    #[test]
+    fn a_reader_journals_a_policy_staged_during_bring_up_first() {
+        use crate::ack_policy::AckPolicy;
+        use crate::halt::test_support::{gate_over, presence};
+        use crate::policy_control::RequestOutcome;
+
+        let (handle, mut consumer, control) =
+            spawn_parked_reader(gate_over(Some(presence(0))), Some(AckPolicy::Disk));
+        assert_eq!(control.request(AckPolicy::Disk), RequestOutcome::Published);
+        handle.shutdown();
+        handle.join();
+        let mut changes = Vec::new();
+        while let Some((_, slot)) = consumer.try_consume() {
+            if let JournalEvent::AckPolicyChange(change) = slot.event {
+                changes.push(change.unwitnessed);
+            }
+        }
+        assert_eq!(
+            changes,
+            [false, true],
+            "staged first, then the forced runtime one"
+        );
+    }
+
     /// A reader over `halt` with no connection and no tick, parked (in all
     /// likelihood: the callers must not depend on it either way), whose
-    /// mailbox starts at `disk+ram`; and the consumer of its input ring.
+    /// mailbox starts at `disk+ram` and had `staged` requested between its
+    /// claim and the reader's start (a primary still starting); and the
+    /// consumer of its input ring.
     fn spawn_parked_reader(
         halt: HaltGate,
+        staged: Option<crate::ack_policy::AckPolicy>,
     ) -> (
         UringReaderHandle<UnixStream>,
         ring::Consumer<InputSlot<TestEvent>>,
         Arc<crate::policy_control::AckPolicyControl>,
     ) {
         use crate::ack_policy::AckPolicy;
-        use crate::policy_control::AckPolicyControl;
+        use crate::policy_control::RequestOutcome;
+        use crate::policy_control::test_support::control_with_publish_wait;
 
         let (producer, mut consumers) = DisruptorBuilder::<InputSlot<TestEvent>>::new(64)
             .add_consumer()
@@ -1757,14 +1790,17 @@ mod tests {
         // Dropped: the reader's sends to it are best-effort.
         let (control_tx, _) = mpsc::channel();
         // Long enough that a reader that is never woken fails the request.
-        let control =
-            AckPolicyControl::with_publish_wait(AckPolicy::DiskAndRam, Duration::from_secs(30));
+        let control = control_with_publish_wait(AckPolicy::DiskAndRam, Duration::from_secs(30));
+        let claim = control.claim();
+        if let Some(policy) = staged {
+            assert_eq!(control.request(policy), RequestOutcome::Staged);
+        }
         let handle = spawn_reader::<TestApp, UnixStream>(
             producer,
             Arc::new(ByteDecoder),
             halt,
             refusal_channel().0,
-            control.claim(),
+            claim,
             control_tx,
             0,
             None,
@@ -1793,7 +1829,7 @@ mod tests {
             halt().verdict(),
             Verdict::Refuse(RejectReason::ReplicaDisconnected)
         );
-        let (handle, mut consumer, control) = spawn_parked_reader(halt());
+        let (handle, mut consumer, control) = spawn_parked_reader(halt(), None);
         assert_eq!(control.request(AckPolicy::Disk), RequestOutcome::Published);
         let (_, slot) = consumer.try_consume().expect("the entry is on the ring");
         assert_eq!(
