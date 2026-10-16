@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use tracing::{error, info};
 
-use crate::dispatch::dispatch;
+use crate::dispatch::{LineageEvent, dispatch};
 use crate::pipeline::{FsyncState, InputSlot};
 use crate::snapshot;
 use melin_app::amortized_timer::AmortizedTimer;
@@ -137,7 +137,16 @@ pub fn run<A: Application>(
                     key_hash: slot.key_hash,
                 },
                 &mut last_drain_ns,
-                |epoch| crate::fence::observe_into(&mut shadow_epoch, epoch),
+                |lineage| match lineage {
+                    LineageEvent::Epoch(epoch) => {
+                        crate::fence::observe_into(&mut shadow_epoch, epoch);
+                    }
+                    // Snapshots do not record the policy yet (snapshot
+                    // framing v4, a later step of
+                    // `docs/internal/journaled-ack-policy-2026-10.md`),
+                    // and nothing journals a change before then.
+                    LineageEvent::AckPolicy(_) => {}
+                },
                 &mut reports,
             );
             reports.clear();

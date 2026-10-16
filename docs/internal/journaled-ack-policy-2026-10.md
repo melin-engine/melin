@@ -227,6 +227,22 @@ and is committed on its own. Tests land with the step they pin.
    the pipeline's outlier label, `REPL_PROTOCOL_VERSION = 8`. Tests:
    codec round trip and golden bytes, wire decode, dispatch, the extended
    allocator agreement tests. Amend the roadmap trigger text.
+
+   *As landed:* the variant is `AckPolicyChange(AckPolicyChange)`, a
+   payload struct `{ policy: AckPolicyByte, unwitnessed: bool }`, so the
+   later steps can pass the change around (lineage cell, forced cell)
+   without destructuring it. Decode refuses reserved flag bits, so an
+   entry decodes only if it re-encodes to the same bytes. The shared
+   decoder is `codec::decode_event`, for every tag (application events
+   included, so both paths report an application codec's refusal the
+   same way), with its own `EventDecodeError`. The lineage sink is a
+   `LineageEvent` enum (`Epoch`, `AckPolicy`) handed to one callback,
+   which every consumer matches exhaustively; the `Lineage` struct that
+   tracks both is step 2's, and until then the live stage, recovery and
+   the shadow ignore `AckPolicy` (nothing journals one yet). The
+   frozen-replica gate-stall integration test drives real nodes, so it
+   cannot carry the entry before step 4 gives it a producer; it is
+   extended there.
 2. **Lineage tracking.** Recovery, shadow, snapshot framing v4, replica
    boot / snapshot install / rebase storing the cell. Tests: recovery
    with the entry, v1–v4 snapshot parsing, snapshot plus tail with the
@@ -246,7 +262,8 @@ and is committed on its own. Tests land with the step they pin.
    replica (`common/raw_replica.rs`) where, under `disk+ram` then
    `ACK-POLICY disk`, writes are not acked on the primary's fsync alone
    until the replica holds the entry, and are afterwards; restart with a
-   different `--ack-policy`; standalone restart.
+   different `--ack-policy`; standalone restart; the frozen-replica
+   gate-stall test with a change journaled (deferred from step 1).
 5. **The replica side.** The cell written at receive time; the policy
    byte removed from `StreamStart` and `Heartbeat`, their senders and
    receivers; auto-promotion on the lineage cell and the new

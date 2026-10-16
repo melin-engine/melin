@@ -29,7 +29,7 @@ use std::path::Path;
 use melin_app::{Application, ApplyCtx};
 use melin_journal::{JournalError, JournalReader, JournalWrite};
 
-use crate::dispatch::dispatch;
+use crate::dispatch::{LineageEvent, dispatch};
 use crate::snapshot;
 
 /// Error surfaced by every [`JournaledApp`] method — wraps journal I/O errors and
@@ -780,7 +780,8 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
                 key_hash: 0,
             },
             &mut self.last_drain_ns,
-            // Neither an application event nor a tick carries an epoch.
+            // Neither an application event nor a tick carries lineage
+            // metadata.
             |_| {},
             out,
         );
@@ -846,7 +847,16 @@ fn replay_segment<A: Application>(
                             key_hash: entry.key_hash,
                         },
                         last_drain_ns,
-                        |epoch| crate::fence::observe_into(recovered_epoch, epoch),
+                        |lineage| match lineage {
+                            LineageEvent::Epoch(epoch) => {
+                                crate::fence::observe_into(recovered_epoch, epoch);
+                            }
+                            // Recovery does not return the policy yet (a
+                            // later step of
+                            // `docs/internal/journaled-ack-policy-2026-10.md`),
+                            // and nothing journals a change before then.
+                            LineageEvent::AckPolicy(_) => {}
+                        },
                         reports,
                     );
                     reports.clear();

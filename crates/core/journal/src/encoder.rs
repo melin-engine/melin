@@ -503,6 +503,10 @@ mod tests {
         for event in [
             JournalEvent::<TinyEvent>::Tick { now_ns: u64::MAX },
             JournalEvent::<TinyEvent>::EpochBump { epoch: u64::MAX },
+            JournalEvent::<TinyEvent>::AckPolicyChange(crate::event::AckPolicyChange {
+                policy: crate::event::AckPolicyByte(u8::MAX),
+                unwitnessed: true,
+            }),
         ] {
             let len = encode_len(event);
             assert!(

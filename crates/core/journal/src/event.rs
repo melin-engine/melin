@@ -45,6 +45,12 @@ pub enum JournalEvent<E: AppEvent> {
     /// segment header. Replayed on recovery and replication to advance a
     /// node's observed epoch; never delivered to the `Application`.
     EpochBump { epoch: u64 },
+    /// A change of the ack policy in force. Lineage metadata like
+    /// [`EpochBump`](Self::EpochBump), and journaled for the same reason:
+    /// the policy governs the events after it, so it must be totally
+    /// ordered against them, replayed on recovery and replicated with
+    /// them. Never delivered to the `Application`.
+    AckPolicyChange(AckPolicyChange),
     /// Pipeline-shutdown sentinel. Published by the receiver/reader as
     /// the last slot before exit; downstream stages stop at this slot
     /// (after completing any pending work) and exit.
@@ -61,15 +67,43 @@ pub enum JournalEvent<E: AppEvent> {
     App(E),
 }
 
+/// The ack policy's wire byte, carried opaquely: the named policies are
+/// the server runtime's, which validates the byte when it applies the
+/// entry. A newtype rather than a bare `u8` so it cannot be confused with
+/// the entry's other bytes (its flags) or passed where a policy is not
+/// meant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AckPolicyByte(pub u8);
+
+/// The payload of [`JournalEvent::AckPolicyChange`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AckPolicyChange {
+    /// The policy in force for the events after this entry.
+    pub policy: AckPolicyByte,
+    /// Applied without the nodes the previous policy relied on holding
+    /// this entry: an operator's explicit weakening while no replica was
+    /// connected, or a node running without replication. Recorded so the
+    /// lineage says where nobody witnessed the change.
+    pub unwitnessed: bool,
+}
+
 impl<E: AppEvent> JournalEvent<E> {
     /// Returns `true` for events the journal stage must skip (read-only
-    /// queries). `Tick` is always journaled; app events delegate to
-    /// [`AppEvent::is_query`].
+    /// queries). App events delegate to [`AppEvent::is_query`]; every
+    /// transport event is journaled.
+    ///
+    /// The journal stage's sequence allocator and the matching stage's
+    /// wire-sequence shadow both decide through this predicate, so it
+    /// names every variant: a new one has to choose here, at compile
+    /// time, rather than fall into a wildcard.
     #[inline]
     pub fn is_query(&self) -> bool {
         match self {
             JournalEvent::App(e) => e.is_query(),
-            _ => false,
+            JournalEvent::Tick { .. }
+            | JournalEvent::EpochBump { .. }
+            | JournalEvent::AckPolicyChange(_)
+            | JournalEvent::Shutdown => false,
         }
     }
 

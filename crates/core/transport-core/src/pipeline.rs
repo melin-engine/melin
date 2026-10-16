@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::dispatch::dispatch;
+use crate::dispatch::{LineageEvent, dispatch};
 use crate::trace::{MonoTraceInstant, mono_trace_ns};
 use melin_app::{AppEvent, Application, ApplyCtx, QueryCtx};
 use melin_journal::BufferedWriter;
@@ -2448,6 +2448,22 @@ impl<E: AppEvent> JournalStage<E> {
     }
 }
 
+/// The matching stage's lineage sink, for its run loop and its shutdown
+/// drain alike.
+///
+/// An epoch bump advances the fencing state. An ack-policy change is not
+/// acted on here yet: nothing journals one, and the response stage's
+/// switch at the entry's slot is a later step of
+/// `docs/internal/journaled-ack-policy-2026-10.md`.
+fn observe_live_lineage(fence: &crate::fence::FenceState, lineage: LineageEvent) {
+    match lineage {
+        LineageEvent::Epoch(epoch) => {
+            fence.observe_epoch(epoch);
+        }
+        LineageEvent::AckPolicy(_) => {}
+    }
+}
+
 /// Matching stage: consumes from the input disruptor (in parallel with
 /// the journal stage), applies events to the application, and publishes
 /// responses to the output SPSC.
@@ -2713,9 +2729,7 @@ impl<A: Application> MatchingStage<A> {
                             key_hash: slot.key_hash,
                         },
                         &mut self.last_drain_ns,
-                        |epoch| {
-                            self.fence_state.observe_epoch(epoch);
-                        },
+                        |lineage| observe_live_lineage(&self.fence_state, lineage),
                         &mut reports,
                     );
                     None
@@ -2736,6 +2750,7 @@ impl<A: Application> MatchingStage<A> {
                             melin_journal::JournalEvent::App(_) => "app",
                             melin_journal::JournalEvent::Tick { .. } => "tick",
                             melin_journal::JournalEvent::EpochBump { .. } => "epoch_bump",
+                            melin_journal::JournalEvent::AckPolicyChange(_) => "ack_policy_change",
                             melin_journal::JournalEvent::Shutdown => "shutdown",
                         };
                         tracing::warn!(
@@ -2895,9 +2910,7 @@ impl<A: Application> MatchingStage<A> {
                     key_hash: slot.key_hash,
                 },
                 &mut self.last_drain_ns,
-                |epoch| {
-                    self.fence_state.observe_epoch(epoch);
-                },
+                |lineage| observe_live_lineage(&self.fence_state, lineage),
                 reports,
             );
 

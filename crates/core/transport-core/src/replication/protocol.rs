@@ -57,8 +57,10 @@ pub const MSG_HEARTBEAT: u8 = 0x30;
 /// 7 = `StreamStart` carries the lineage's genesis length, which a
 /// replica records in its journal header (and checks against the one it
 /// already has). A v6 replica would ignore it and lose the promotion
-/// check it feeds, so mixed pairs must not stream.
-pub const REPL_PROTOCOL_VERSION: u16 = 7;
+/// check it feeds, so mixed pairs must not stream;
+/// 8 = the entry stream can carry an ack-policy change (journal tag
+/// 0x05), which a v7 replica refuses as an unknown entry mid-stream.
+pub const REPL_PROTOCOL_VERSION: u16 = 8;
 
 /// Maximum frame size for control messages (handshake, ack, etc.).
 /// `InputBatch` frames can be much larger (up to a full 512 KiB ring chunk).
@@ -792,8 +794,8 @@ mod tests {
     }
 
     /// The primary refuses a replica speaking another protocol version,
-    /// naming both — v6 in particular, which would ignore the genesis
-    /// length this version's `StreamStart` carries.
+    /// naming both — v7 in particular, which would refuse an ack-policy
+    /// change mid-stream as an unknown entry.
     #[test]
     fn a_handshake_from_another_protocol_version_is_refused() {
         let mut buf = Vec::new();
@@ -809,12 +811,12 @@ mod tests {
             decode_replica_message(&buf[4..]).unwrap(),
             ReplicaMessage::Handshake(_)
         ));
-        assert_eq!(REPL_PROTOCOL_VERSION, 7);
+        assert_eq!(REPL_PROTOCOL_VERSION, 8);
 
         let version_at = buf.len() - 2;
-        buf[version_at..].copy_from_slice(&6u16.to_le_bytes());
-        let err = decode_replica_message(&buf[4..]).expect_err("v6 replica");
+        buf[version_at..].copy_from_slice(&7u16.to_le_bytes());
+        let err = decode_replica_message(&buf[4..]).expect_err("v7 replica");
         let msg = err.to_string();
-        assert!(msg.contains("v6") && msg.contains("v7"), "{msg}");
+        assert!(msg.contains("v7") && msg.contains("v8"), "{msg}");
     }
 }
