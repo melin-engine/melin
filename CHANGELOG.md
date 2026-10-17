@@ -565,7 +565,8 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   takes it, and `StageUtilization` gains `degraded_acks`: code that
   builds any of these by hand has to supply them (`None` keeps the
   previous stall). `ReplicaPresence` records when its count last dropped
-  to zero, and `ReplicaPresence::halted_for` reads it.
+  to zero, and `ReplicaPresence::last_loss` reads it (a `LastLoss`: the
+  instant, or `Unknown` when the stamp was cleared).
 - **A reply batch says what backs it: a new `BatchEndDegraded` frame,
   and `melin_client`'s `Frame::BatchEnd(Ack)` / `Reply::BatchEnd(Ack)`.**
   The wire protocol gains `TAG_BATCH_END_DEGRADED` (`0x0A`) and

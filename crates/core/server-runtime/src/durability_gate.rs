@@ -74,6 +74,7 @@ use melin_journal::{AckPolicyByte, AckPolicyChange};
 use melin_pipeline::wait::WaitStrategy;
 use melin_transport_core::lineage::{ForcedPolicyReader, LineagePolicy};
 use melin_transport_core::pipeline::{OutputPayload, OutputSlot, StageUtilization};
+use melin_transport_core::replica_presence::LastLoss;
 #[cfg(feature = "tick-to-trade")]
 use melin_transport_core::trace;
 use melin_transport_core::{DurableWireSeqCursor, WireSeq};
@@ -386,6 +387,10 @@ pub(crate) struct DurabilityGate {
     /// released degraded, a halted node's operator swap.
     pending: VecDeque<PendingChange>,
     active_policy: AckPolicy,
+    /// `active_policy.needs_replica()`, kept with it: asked on every spin
+    /// of a halted gate, where building the policy to answer would
+    /// allocate.
+    needs_replica: bool,
     policy: Policy,
     /// Highest wire seq known durable under `policy`, cached so a slot
     /// whose event is already durable passes without touching an atomic.
@@ -403,8 +408,8 @@ pub(crate) struct DurabilityGate {
     /// ~65 k cumulative spin iterations.
     accrual_timer: AmortizedTimer,
     /// When the current halt began: the latest loss's stamp, or the
-    /// earliest sighting when the stamp is missing (see
-    /// `ReplicaPresence::halted_for`); `None` while a replica streams.
+    /// earliest sighting when the stamp is missing (see [`halt_start`]);
+    /// `None` once a replica is seen streaming.
     halt_started: Option<Instant>,
     /// The degraded release is under way: the halt has outlasted the
     /// grace period. Kept for the `warn!` on entering and leaving it.
@@ -466,6 +471,7 @@ impl DurabilityGate {
             applied_through: None,
             pending: pending.into_iter().collect(),
             active_policy,
+            needs_replica: active_policy.needs_replica(),
             policy,
             cached_durable_pos: status.durable_pos,
             degraded_logger,
@@ -529,71 +535,57 @@ impl DurabilityGate {
     /// the grace period. Also tracks the halt's start and logs entering
     /// and leaving the release.
     ///
-    /// One acquire load while a replica is connected (the normal path,
-    /// where this runs only once the policy has already failed a slot); a
-    /// clock read on top while halted.
+    /// One acquire load while a replica is connected: `wait_durable` calls
+    /// this on every spin in which the local journal holds the slot but
+    /// the policy has not confirmed it, the normal `disk+ram`/`two-disks`
+    /// path while a replica acks. The clock is read only while none is
+    /// streaming.
     fn degraded_release_open(&mut self) -> bool {
         let Some(release) = self.inputs.degraded_release.as_ref() else {
             return false;
         };
-        let now = Instant::now();
-        let started = match release.presence.halted_for(now) {
-            None => {
-                self.halt_started = None;
-                None
+        let grace = release.grace;
+        let Some(loss) = release.presence.last_loss() else {
+            self.halt_started = None;
+            if self.releasing_degraded {
+                self.log_degraded_release(false, true, grace);
             }
-            Some(halted_for) => {
-                // An `Instant` before the process's clock origin is not
-                // representable; such a halt began at the origin at the
-                // latest, and `now` is no later than that by much.
-                let stamped = now.checked_sub(halted_for).unwrap_or(now);
-                // A non-zero age comes from the loss's own stamp, which is
-                // authoritative: it is the *latest* loss, so a replica
-                // that joined and left again between two of the gate's
-                // looks (unseen while idle, checked once a second)
-                // restarts the grace period. Only a zero age — the stamp
-                // went missing, or the halt has just begun — falls back to
-                // the earliest start seen, so a halt whose stamp was
-                // cleared still ages from its first sighting.
-                let started = if halted_for.is_zero() {
-                    self.halt_started.map_or(stamped, |seen| seen.min(stamped))
-                } else {
-                    stamped
-                };
-                self.halt_started = Some(started);
-                Some(started)
-            }
+            return false;
         };
+        let now = Instant::now();
+        let started = halt_start(loss, self.halt_started, now);
+        self.halt_started = Some(started);
         // Under a policy the primary's own disk satisfies (`disk`), the
         // policy itself confirms on the same cursor: nothing is weaker
         // than it, and there is nothing to release.
-        let open = match started {
-            Some(started) if self.active_policy.needs_replica() => {
-                now.saturating_duration_since(started) >= release.grace
-            }
-            _ => false,
-        };
+        let open = self.needs_replica && now.saturating_duration_since(started) >= grace;
         if open != self.releasing_degraded {
-            self.releasing_degraded = open;
-            if open {
-                tracing::warn!(
-                    stage = self.stage,
-                    policy = self.active_policy.as_str(),
-                    grace_ms = release.grace.as_millis() as u64,
-                    "no replica for the grace period: replies held for the ack policy are now \
-                     released once this node's own journal holds them, marked as backed by the \
-                     primary alone (BatchEndDegraded)"
-                );
-            } else {
-                tracing::warn!(
-                    stage = self.stage,
-                    policy = self.active_policy.as_str(),
-                    replica_connected = started.is_none(),
-                    "degraded release stopped: held replies wait for the ack policy again"
-                );
-            }
+            self.log_degraded_release(open, false, grace);
         }
         open
+    }
+
+    /// Record and log entering (`open`) or leaving the degraded release.
+    #[cold]
+    fn log_degraded_release(&mut self, open: bool, replica_connected: bool, grace: Duration) {
+        self.releasing_degraded = open;
+        if open {
+            tracing::warn!(
+                stage = self.stage,
+                policy = self.active_policy.as_str(),
+                grace_ms = grace.as_millis() as u64,
+                "no replica for the grace period: replies held for the ack policy are now \
+                 released once this node's own journal holds them, marked as backed by the \
+                 primary alone (BatchEndDegraded)"
+            );
+        } else {
+            tracing::warn!(
+                stage = self.stage,
+                policy = self.active_policy.as_str(),
+                replica_connected,
+                "degraded release stopped: held replies wait for the ack policy again"
+            );
+        }
     }
 
     /// The one place the policy in force changes.
@@ -622,6 +614,7 @@ impl DurabilityGate {
             "ack policy switched"
         );
         self.active_policy = next;
+        self.needs_replica = next.needs_replica();
         self.policy = next.to_policy();
         self.cached_durable_pos = 0;
         self.degraded_logger
@@ -1023,6 +1016,20 @@ impl DurabilityGate {
             DEGRADED_LOG_INTERVAL,
         );
         self.last_policy_check = ticked_at;
+    }
+}
+
+/// When the current halt began, given the presence's `loss` and the
+/// start the gate last recorded for it (`seen`, `None` if it has not seen
+/// this halt before). A stamped loss is authoritative: it is the *latest*
+/// one, so a replica that joined and left again between two of the gate's
+/// looks (unseen while idle, checked once a second) restarts the grace
+/// period. A missing stamp falls back to the earliest sighting of the
+/// halt, `now` on the first, so the halt still ages from it.
+fn halt_start(loss: LastLoss, seen: Option<Instant>, now: Instant) -> Instant {
+    match loss {
+        LastLoss::At(at) => at,
+        LastLoss::Unknown => seen.unwrap_or(now),
     }
 }
 
@@ -1908,6 +1915,59 @@ mod tests {
             p.gate.degraded_release_open(),
             "past the grace from the second loss"
         );
+    }
+
+    /// A stamped loss is the halt's start, even over an earlier sighting
+    /// (the unseen-rejoin case above); a missing stamp ages from the
+    /// earliest sighting of the halt, or from now on the first.
+    #[test]
+    fn a_missing_loss_stamp_ages_from_the_first_sighting() {
+        let seen = Instant::now();
+        let now = seen + Duration::from_secs(10);
+        let lost = seen + Duration::from_secs(3);
+        assert_eq!(
+            halt_start(LastLoss::Unknown, None, now),
+            now,
+            "first sighting"
+        );
+        assert_eq!(halt_start(LastLoss::Unknown, Some(seen), now), seen);
+        assert_eq!(halt_start(LastLoss::At(lost), Some(seen), now), lost);
+        assert_eq!(halt_start(LastLoss::At(lost), None, now), lost);
+    }
+
+    /// The gate forgets a halt once it sees a replica streaming, and keeps
+    /// the stamped start while halted.
+    #[test]
+    fn the_halt_start_is_tracked_while_halted_and_dropped_on_a_replica() {
+        let mut p = Primary::new(AckPolicy::DiskAndRam, 5, true, NO_GRACE);
+        assert!(!p.gate.degraded_release_open());
+        assert_eq!(p.gate.halt_started, None);
+
+        let before = Instant::now();
+        p.replica_leaves();
+        assert!(p.gate.degraded_release_open());
+        let started = p.gate.halt_started.expect("halted");
+        assert!(started >= before, "the loss's own stamp");
+        assert!(p.gate.degraded_release_open());
+        assert_eq!(p.gate.halt_started, Some(started), "the same halt");
+
+        p.replica_streams(5);
+        assert!(!p.gate.degraded_release_open());
+        assert_eq!(p.gate.halt_started, None);
+        assert!(!p.gate.releasing_degraded);
+    }
+
+    /// Whether the policy needs a replica follows every switch, both ways.
+    #[test]
+    fn the_release_follows_a_switch_to_and_from_a_policy_needing_a_replica() {
+        let mut p = Primary::new(AckPolicy::Disk, 5, false, NO_GRACE);
+        assert!(!p.gate.degraded_release_open(), "disk needs no replica");
+        p.gate.switch_to(AckPolicy::TwoDisks, "test");
+        assert!(p.gate.degraded_release_open());
+        assert!(p.gate.releasing_degraded);
+        p.gate.switch_to(AckPolicy::Disk, "test");
+        assert!(!p.gate.degraded_release_open());
+        assert!(!p.gate.releasing_degraded);
     }
 
     /// `disk` is met by the same cursor: every reply is a full one, halted

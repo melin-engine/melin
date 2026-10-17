@@ -56,7 +56,7 @@
 //! the count drops to zero. The senders stamp that moment here as they
 //! lower the count ([`ReplicaPresence::lower`]), so the grace is measured
 //! from the loss itself rather than from whenever the stage next looks
-//! ([`ReplicaPresence::halted_for`]). A presence starts out with no
+//! ([`ReplicaPresence::last_loss`]). A presence starts out with no
 //! replica, so it is stamped when it is made, with the primary pipeline.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -141,6 +141,17 @@ pub struct Seen(());
 #[derive(Debug, PartialEq, Eq)]
 pub struct NoneSince(u64);
 
+/// When the last replica left, as [`ReplicaPresence::last_loss`] reads it
+/// while none is streaming.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LastLoss {
+    /// The count last dropped to zero at this instant.
+    At(Instant),
+    /// The moment was not recorded: its stamp was cleared by a replica
+    /// counted since, which may itself be gone already.
+    Unknown,
+}
+
 /// What a replica's departure left behind ([`ReplicaPresence::lower`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lowered {
@@ -217,7 +228,7 @@ impl ReplicaPresence {
     ///
     /// The moment is stamped first, in case this is the last, and the count
     /// lowered after it (`Release`), so a reader that sees the count at
-    /// zero (`Acquire`, [`halted_for`](Self::halted_for)) sees this stamp
+    /// zero (`Acquire`, [`last_loss`](Self::last_loss)) sees this stamp
     /// or a later one, never an earlier loss's. A stamp left by a replica
     /// that was not the last is harmless: nothing reads it while the count
     /// is above zero, and the next one counted clears it.
@@ -245,27 +256,26 @@ impl ReplicaPresence {
         self.connected.load(Ordering::Relaxed) == 0 && !self.overridden()
     }
 
-    /// How long no replica has been streaming, or `None` while one is. The
+    /// When the halt began, or `None` while a replica is streaming. The
     /// halt as the count alone defines it: the operator's override, which
     /// only ever stands beside the `disk` policy, does not change it.
     ///
-    /// When the moment of the loss is unknown (a replica counted after the
-    /// leaving one wrote its stamp cleared it, and has left again before
-    /// stamping), the halt reads as having just begun, which errs towards a
-    /// longer wait. A caller that polls keeps the earliest start it has
-    /// seen in that case, so the halt's age still grows from its first
-    /// sighting.
+    /// The instant of the *latest* loss, so a replica that joined and left
+    /// again restarts the halt. [`LastLoss::Unknown`] when its stamp is
+    /// missing: a replica counted between this call's read of the count
+    /// and its read of the stamp cleared it. A caller that polls ages such
+    /// a halt from the earliest sighting it has of it; this type holds no
+    /// clock reading of the caller's, so it cannot be compared with one
+    /// read before the stamp.
     #[inline]
-    pub fn halted_for(&self, now: Instant) -> Option<Duration> {
+    pub fn last_loss(&self) -> Option<LastLoss> {
         if self.connected.load(Ordering::Acquire) != 0 {
             return None;
         }
-        let stamp = self.last_lost.load(Ordering::Relaxed);
-        if stamp == 0 {
-            return Some(Duration::ZERO);
-        }
-        let lost_at = self.origin + Duration::from_nanos(stamp - 1);
-        Some(now.saturating_duration_since(lost_at))
+        Some(match self.last_lost.load(Ordering::Relaxed) {
+            0 => LastLoss::Unknown,
+            stamp => LastLoss::At(self.origin + Duration::from_nanos(stamp - 1)),
+        })
     }
 
     fn stamp_loss(&self) {
@@ -384,18 +394,24 @@ mod tests {
         assert!(presence.halted());
     }
 
+    /// The loss instant, which panics if a replica streams.
+    fn lost_at(presence: &ReplicaPresence) -> Instant {
+        match presence.last_loss() {
+            Some(LastLoss::At(at)) => at,
+            other => panic!("expected a stamped loss, got {other:?}"),
+        }
+    }
+
     /// A primary starts with no replica: halted from the presence's making.
     #[test]
     fn the_halt_is_timed_from_the_making_on_a_node_that_starts_alone() {
         let before = Instant::now();
         let presence = ReplicaPresence::new();
-        let halted_for = presence
-            .halted_for(before + Duration::from_secs(5))
-            .expect("no replica");
-        assert!(halted_for <= Duration::from_secs(5), "{halted_for:?}");
+        let after = Instant::now();
+        let at = lost_at(&presence);
         assert!(
-            halted_for >= Duration::from_secs(4),
-            "timed from the making, not from later: {halted_for:?}"
+            before <= at && at <= after,
+            "{before:?} <= {at:?} <= {after:?}"
         );
     }
 
@@ -403,32 +419,46 @@ mod tests {
     fn the_halt_is_timed_from_the_last_replica_leaving() {
         let presence = ReplicaPresence::new();
         drop(presence.lift());
-        assert_eq!(presence.halted_for(Instant::now()), None, "a replica is up");
+        assert_eq!(presence.last_loss(), None, "a replica is up");
 
         std::thread::sleep(Duration::from_millis(20));
+        let before = Instant::now();
         assert_eq!(presence.lower(), Lowered::LastHalted);
-        let left = Instant::now();
-        let halted_for = presence
-            .halted_for(left + Duration::from_secs(3))
-            .expect("no replica");
+        let after = Instant::now();
+        let at = lost_at(&presence);
         assert!(
-            halted_for >= Duration::from_secs(3) && halted_for < Duration::from_secs(4),
-            "{halted_for:?}"
+            before <= at && at <= after,
+            "{before:?} <= {at:?} <= {after:?}"
+        );
+    }
+
+    /// With several replicas, the halt starts when the last one leaves,
+    /// not when the first did.
+    #[test]
+    fn the_halt_starts_with_the_last_departure() {
+        let presence = ReplicaPresence::new();
+        drop(presence.lift());
+        drop(presence.lift());
+        assert_eq!(presence.lower(), Lowered::OthersRemain);
+        assert_eq!(presence.last_loss(), None, "one still streams");
+        std::thread::sleep(Duration::from_millis(20));
+        let before = Instant::now();
+        assert_eq!(presence.lower(), Lowered::LastHalted);
+        assert!(
+            lost_at(&presence) >= before,
+            "the earlier departure's stamp"
         );
     }
 
     /// A replica counted clears the stamp, so a loss whose stamp is missing
-    /// reads as a halt that just began, never as an earlier loss's.
+    /// reads as unknown, never as an earlier loss's.
     #[test]
-    fn an_unknown_loss_reads_as_a_halt_that_just_began() {
+    fn a_missing_stamp_reads_as_an_unknown_loss() {
         let presence = ReplicaPresence::new();
         drop(presence.lift());
         // The departure as seen before its stamp lands: the count only.
         presence.connected.fetch_sub(1, Ordering::Release);
-        assert_eq!(
-            presence.halted_for(Instant::now() + Duration::from_secs(60)),
-            Some(Duration::ZERO)
-        );
+        assert_eq!(presence.last_loss(), Some(LastLoss::Unknown));
     }
 
     /// An override latched after earlier first acks holds at its own
