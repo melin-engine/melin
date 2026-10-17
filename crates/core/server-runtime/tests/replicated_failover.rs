@@ -8,10 +8,10 @@
 //! auth. A client sends increments and collects acks — proof the
 //! RAM-quorum gate opens on live replica cursors. The primary is then
 //! killed; exactly one replica must auto-promote (exercising the
-//! ack-policy byte end-to-end: the primary advertised `ram` on the
-//! replication stream, and the promotion policy must accept it on the
-//! same grounds as `disk+ram`). The operator then swaps the promoted
-//! node to `disk` over the admin endpoint — the documented
+//! journaled policy end-to-end: the primary journaled `ram` as its
+//! lineage began, the replicas hold that change, and the promotion policy
+//! must accept it on the same grounds as `disk+ram`). The operator then
+//! swaps the promoted node to `disk` over the admin endpoint — the documented
 //! post-failover workflow, since its own gate is unsatisfiable with no
 //! replicas attached — and a fresh client connection must read back the
 //! full acked total: nothing the client was told about died with the
@@ -43,7 +43,7 @@
 //! going, so failover completes only if they notice the silence
 //! themselves (the replica end of a DPDK link's liveness deadline).
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
@@ -58,6 +58,7 @@ use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
 use melin_test_node::Addrs;
+use melin_test_node::probe::{admin_until_ok, http_metrics, wait_for_gauge};
 use melin_transport_core::test_ports::free_addr;
 use melin_wire_protocol::control_codec::{
     TAG_APP, TAG_BATCH_END, TAG_CHALLENGE, TAG_CHALLENGE_RESPONSE, TAG_LEN, TAG_SERVER_READY,
@@ -180,21 +181,6 @@ fn read_until_batch_end(stream: &mut TcpStream) -> Vec<Vec<u8>> {
     responses
 }
 
-/// Send one admin command over a fresh authenticated connection and
-/// return the server's reply line, or `None` if the connection or
-/// handshake failed (node not up yet — caller retries).
-fn admin_command(addr: SocketAddr, key: &SigningKey, command: &str) -> Option<String> {
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(300)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-    answer_challenge(&mut stream, key)?;
-    stream.write_all(command.as_bytes()).ok()?;
-    stream.write_all(b"\n").ok()?;
-    stream.flush().ok()?;
-    let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line).ok()?;
-    Some(line.trim_end().to_owned())
-}
-
 /// Whether a client connect to `addr` is answered with the auth
 /// Challenge — the definitive "this node serves as primary" signal (a
 /// replica's client listener never accepts).
@@ -206,15 +192,6 @@ fn serves_clients(addr: SocketAddr, patience: Duration) -> bool {
         return false;
     }
     matches!(read_frame(&mut stream), Ok(f) if f.first() == Some(&TAG_CHALLENGE))
-}
-
-fn http_metrics(addr: SocketAddr) -> Option<String> {
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(200)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
-    stream.write_all(b"GET /metrics HTTP/1.1\r\n\r\n").ok()?;
-    let mut body = String::new();
-    stream.read_to_string(&mut body).ok()?;
-    Some(body)
 }
 
 // ---------------------------------------------------------------------------
@@ -408,10 +385,10 @@ fn acked_events_survive_primary_death_under_ram_policy() {
     primary.stop();
 
     // --- Phase 4: exactly one replica auto-promotes. The promotion
-    // policy sees the ack policy the dead primary advertised on the
-    // replication stream — `ram` — and must accept it (an ack
-    // always waited for a second node, so the election recency filter
-    // proves the winner holds every acked event). ---
+    // policy sees the ack policy the replica's lineage holds — the `ram`
+    // the dead primary journaled — and must accept it (an ack always
+    // waited for a second node, so the election recency filter proves the
+    // winner holds every acked event). ---
     let deadline = Instant::now() + Duration::from_secs(60);
     let winner = loop {
         assert!(
@@ -433,6 +410,13 @@ fn acked_events_survive_primary_death_under_ram_policy() {
         !serves_clients(nodes[loser].addrs.client(), Duration::from_secs(2)),
         "the losing replica must not serve clients"
     );
+    // The lineage's `ram` came over with the stream: the promoted node's
+    // journaled policy is the one its replica phase received.
+    wait_for_gauge(
+        nodes[winner].health_addr,
+        "melin_ack_policy_journaled",
+        AckPolicy::Ram.as_u8().into(),
+    );
 
     // --- Phase 5: the documented post-failover workflow. The promoted
     // node still runs `ram`, whose gate is structurally
@@ -440,19 +424,14 @@ fn acked_events_survive_primary_death_under_ram_policy() {
     // operator swaps it to `disk` over the admin endpoint. Retried:
     // the admin listener is up from boot, but promotion may still be
     // settling when the first command lands.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        match admin_command(nodes[winner].admin_addr, &client_key, "ACK-POLICY disk") {
-            Some(reply) if reply == "OK" => break,
-            reply => {
-                assert!(
-                    Instant::now() < deadline,
-                    "ACK-POLICY disk never accepted by the promoted node; last reply: {reply:?}"
-                );
-                std::thread::sleep(Duration::from_millis(200));
-            }
-        }
-    }
+    admin_until_ok(nodes[winner].admin_addr, &client_key, "ACK-POLICY disk");
+    // Journaled, and in force: the promoted node runs with replication
+    // disabled, so nothing could witness the change.
+    wait_for_gauge(
+        nodes[winner].health_addr,
+        "melin_ack_policy_in_force",
+        AckPolicy::Disk.as_u8().into(),
+    );
 
     // --- Phase 6: the acked total survived. A fresh client reads the
     // counter from the new primary; every event the old primary acked

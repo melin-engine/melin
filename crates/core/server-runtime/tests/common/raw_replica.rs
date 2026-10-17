@@ -3,11 +3,9 @@
 //! stream and acks only when, and what, its test tells it to.
 //!
 //! Each test binary that uses it includes this file as a module (`#[path]`),
-//! and compiles its own copy.
-
-// Each test binary compiles its own copy of this module and uses a subset
-// of it; what one binary leaves unused is another's.
-#![allow(dead_code)]
+//! and compiles its own copy. It carries no dead-code allowance: an item
+//! one includer leaves unused warns there, and is moved or dropped rather
+//! than hidden.
 
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -33,10 +31,20 @@ impl RawReplica {
     /// Join `primary`'s replication endpoint as a fresh replica keyed by
     /// `key`, waiting at most `frame_limit` for each frame the primary owes.
     pub fn join(primary: SocketAddr, key: &SigningKey, frame_limit: Duration) -> Self {
+        Self::authenticate(primary, key, frame_limit).handshake()
+    }
+
+    /// Authenticate to `primary`'s replication endpoint as `join` does, and
+    /// stop there: the handshake is not sent until
+    /// [`Authenticated::handshake`].
+    pub fn authenticate(
+        primary: SocketAddr,
+        key: &SigningKey,
+        frame_limit: Duration,
+    ) -> Authenticated {
         use ed25519_dalek::Signer;
         use melin_transport_core::replication::protocol::{
-            Handshake as ReplicaHandshake, decode_auth_result, decode_challenge,
-            encode_challenge_response, encode_handshake,
+            decode_auth_result, decode_challenge, encode_challenge_response,
         };
 
         let mut stream = connect_with_receive_buffer(primary, Self::RECEIVE_BUFFER);
@@ -57,7 +65,25 @@ impl RawReplica {
             decode_auth_result(&verdict).expect("an auth result"),
             "the primary refused the replication key"
         );
-        out.clear();
+        Authenticated { stream }
+    }
+}
+
+/// A [`RawReplica`] that has authenticated and not yet sent its handshake:
+/// what a replica the primary has admitted, and not yet begun streaming
+/// to, looks like.
+pub struct Authenticated {
+    stream: TcpStream,
+}
+
+impl Authenticated {
+    /// Send the handshake of a fresh replica, and become one streaming.
+    pub fn handshake(mut self) -> RawReplica {
+        use melin_transport_core::replication::protocol::{
+            Handshake as ReplicaHandshake, encode_handshake,
+        };
+
+        let mut out = Vec::new();
         encode_handshake(
             &ReplicaHandshake {
                 last_sequence: 0,
@@ -66,10 +92,14 @@ impl RawReplica {
             },
             &mut out,
         );
-        stream.write_all(&out).expect("send the handshake");
-        RawReplica { stream }
+        self.stream.write_all(&out).expect("send the handshake");
+        RawReplica {
+            stream: self.stream,
+        }
     }
+}
 
+impl RawReplica {
     /// Read the stream until an entry batch carries `sequence`, and return
     /// that batch's last sequence.
     pub fn read_through(&mut self, sequence: u64) -> u64 {

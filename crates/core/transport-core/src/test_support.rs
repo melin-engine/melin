@@ -12,6 +12,16 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 
 use melin_app::{AppEvent, Application, ApplyCtx, CodecError, QueryCtx, RejectReason};
+use melin_journal::{AckPolicyByte, AckPolicyChange, JournalEvent};
+
+/// An ack-policy change entry carrying the policy byte `policy`, for any
+/// application's event type.
+pub fn ack_policy_change<E: AppEvent>(policy: u8, unwitnessed: bool) -> JournalEvent<E> {
+    JournalEvent::AckPolicyChange(AckPolicyChange {
+        policy: AckPolicyByte(policy),
+        unwitnessed,
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TestEvent {

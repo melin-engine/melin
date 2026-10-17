@@ -23,18 +23,19 @@
 //! kernel socket of the test's own, on the address the nodes reach the
 //! test at.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::Write;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
 use counter_server::{Counter, CounterEvent, RequestDecoder, ResponseEncoder};
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::SigningKey;
 use melin_journal::{JournalEvent, JournalReader};
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
+use melin_test_node::probe::admin_reply_when_up;
 use melin_test_node::{Addrs, Node};
 use melin_transport_core::pipeline::InputSlot;
 use melin_transport_core::replication::protocol::{
@@ -43,7 +44,6 @@ use melin_transport_core::replication::protocol::{
 };
 use melin_transport_core::replication_wire::encode_input_batch;
 use melin_transport_core::test_ports::free_addr;
-use melin_wire_protocol::control_codec::{TAG_CHALLENGE, TAG_CHALLENGE_RESPONSE, TAG_SERVER_READY};
 
 /// Port range for `free_addr`, shared with the other cluster binaries:
 /// safe because they are all in nextest's `cluster-serial` group.
@@ -133,60 +133,6 @@ impl Cluster {
     }
 }
 
-/// Write one length-prefixed frame.
-fn write_frame(stream: &mut TcpStream, payload: &[u8]) {
-    stream
-        .write_all(&(payload.len() as u32).to_le_bytes())
-        .expect("write frame length");
-    stream.write_all(payload).expect("write frame payload");
-    stream.flush().expect("flush");
-}
-
-/// Send `PROMOTE` to the admin endpoint at `addr`, retrying until the
-/// endpoint answers. Returns its reply line.
-fn promote(addr: SocketAddr, key: &SigningKey) -> String {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Some(reply) = admin_command(addr, key, "PROMOTE") {
-            return reply;
-        }
-        assert!(Instant::now() < deadline, "admin endpoint never answered");
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
-/// One admin command over a fresh authenticated connection; `None` if
-/// the endpoint is not up yet.
-fn admin_command(addr: SocketAddr, key: &SigningKey, command: &str) -> Option<String> {
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(300)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-    let read_one = |stream: &mut TcpStream| -> Option<Vec<u8>> {
-        let mut len = [0u8; 4];
-        stream.read_exact(&mut len).ok()?;
-        let mut payload = vec![0u8; u32::from_le_bytes(len) as usize];
-        stream.read_exact(&mut payload).ok()?;
-        Some(payload)
-    };
-    let challenge = read_one(&mut stream)?;
-    if challenge.first() != Some(&TAG_CHALLENGE) {
-        return None;
-    }
-    let mut response = vec![TAG_CHALLENGE_RESPONSE];
-    response.extend_from_slice(&key.sign(&challenge[1..33]).to_bytes());
-    response.extend_from_slice(&key.verifying_key().to_bytes());
-    write_frame(&mut stream, &response);
-    let ready = read_one(&mut stream)?;
-    if ready.first() != Some(&TAG_SERVER_READY) {
-        return None;
-    }
-    stream.write_all(command.as_bytes()).ok()?;
-    stream.write_all(b"\n").ok()?;
-    stream.flush().ok()?;
-    let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line).ok()?;
-    Some(line.trim_end().to_owned())
-}
-
 /// The counter's value, read by a client of the node at `addr` once it
 /// serves.
 fn value_at(addr: SocketAddr, key: &SigningKey) -> u64 {
@@ -251,15 +197,7 @@ fn a_replica_configured_without_genesis_refuses_promotion_mid_genesis() {
         other => panic!("expected a handshake, got {other:?}"),
     }
     buf.clear();
-    encode_stream_start(
-        0,
-        1,
-        [0x3D; 32],
-        Some(3),
-        0,
-        AckPolicy::Disk.as_u8(),
-        &mut buf,
-    );
+    encode_stream_start(0, 1, [0x3D; 32], Some(3), 0, &mut buf);
     stream.write_all(&buf).expect("StreamStart");
     // The first two genesis entries.
     let slots: Vec<InputSlot<CounterEvent>> = [1_000, 2_000]
@@ -290,7 +228,7 @@ fn a_replica_configured_without_genesis_refuses_promotion_mid_genesis() {
     drop(stream);
     drop(primary);
 
-    promote(replica_admin, &cluster.operator_key);
+    admin_reply_when_up(replica_admin, &cluster.operator_key, "PROMOTE");
     let deadline = Instant::now() + Duration::from_secs(30);
     while !replica.is_finished() {
         assert!(
@@ -354,7 +292,7 @@ fn a_replica_configured_with_a_larger_genesis_is_promoted() {
     }
     primary.stop();
 
-    promote(replica_admin, &cluster.operator_key);
+    admin_reply_when_up(replica_admin, &cluster.operator_key, "PROMOTE");
     assert_eq!(
         value_at(replica.addr(), &cluster.operator_key),
         GENESIS,

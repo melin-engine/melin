@@ -42,6 +42,7 @@ use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
+use melin_test_node::probe::{gauge, wait_for_gauge_within};
 use melin_wire_protocol::control_codec::{TAG_AUTH_FAILED, TAG_CHALLENGE};
 
 #[path = "../common/raw_replica.rs"]
@@ -292,7 +293,7 @@ fn a_replica_cut_off_is_dropped_and_its_primary_halts() {
     let primary = cluster.start_primary();
     let replica = cluster.start_replica(1, "replica");
 
-    wait_for_gauge(primary_health, "melin_replicas_connected", 1, STARTUP_LIMIT);
+    wait_for_gauge_within(primary_health, "melin_replicas_connected", 1, STARTUP_LIMIT);
     let mut conn = served_within(primary.addr(), STARTUP_LIMIT, "with the replica attached");
 
     replica.cut_off();
@@ -300,7 +301,7 @@ fn a_replica_cut_off_is_dropped_and_its_primary_halts() {
     // primary is sending to it: heartbeats); the margin covers the gauge
     // poll and a slow runner.
     let bound = melin_dpdk::PeerLiveness::REPLICATION.timeout() * 2 + FRAME_LIMIT;
-    wait_for_gauge(primary_health, "melin_replicas_connected", 0, bound);
+    wait_for_gauge_within(primary_health, "melin_replicas_connected", 0, bound);
     let refused = conn
         .request_one(&increment_request(1))
         .expect("the halted primary answers");
@@ -328,7 +329,7 @@ fn a_replica_refuses_clients_until_promoted() {
 
     let primary = cluster.start_primary();
     let replica = cluster.start_replica(1, "replica");
-    wait_for_gauge(
+    wait_for_gauge_within(
         Cluster::health(0),
         "melin_replicas_connected",
         1,
@@ -372,7 +373,7 @@ fn a_stalled_join_costs_the_other_replica_nothing() {
 
     let primary = cluster.start_primary();
     let streaming = cluster.start_replica(1, "streaming");
-    wait_for_gauge(primary_health, "melin_replicas_connected", 1, STARTUP_LIMIT);
+    wait_for_gauge_within(primary_health, "melin_replicas_connected", 1, STARTUP_LIMIT);
     let mut conn = served_within(primary.addr(), STARTUP_LIMIT, "with one replica attached");
     for _ in 0..4 {
         assert_acked(&mut conn, "before the join");
@@ -395,7 +396,7 @@ fn a_stalled_join_costs_the_other_replica_nothing() {
 
     // The join has begun once the primary has judged the replica
     // divergent: from there the join reads the snapshot, and blocks.
-    wait_for_gauge(
+    wait_for_gauge_within(
         primary_health,
         "melin_replica_divergence_total",
         1,
@@ -481,7 +482,7 @@ fn large_joins_complete_a_tick_at_a_time() {
 
     // The fresh replica: full catch-up from the journal.
     let fresh = cluster.start_replica(1, "fresh");
-    wait_for_gauge(primary_health, "melin_replicas_connected", 1, STARTUP_LIMIT);
+    wait_for_gauge_within(primary_health, "melin_replicas_connected", 1, STARTUP_LIMIT);
     let mut conn = served_within(primary.addr(), STARTUP_LIMIT, "with the fresh replica");
     // Events through the pipeline, so the shadow stage snapshots.
     for _ in 0..4 {
@@ -503,13 +504,13 @@ fn large_joins_complete_a_tick_at_a_time() {
         .expect("append");
     drop(writer);
     let divergent = cluster.start_replica(2, "divergent");
-    wait_for_gauge(
+    wait_for_gauge_within(
         primary_health,
         "melin_replica_divergence_total",
         1,
         STARTUP_LIMIT,
     );
-    wait_for_gauge(primary_health, "melin_replicas_connected", 2, STARTUP_LIMIT);
+    wait_for_gauge_within(primary_health, "melin_replicas_connected", 2, STARTUP_LIMIT);
 
     // One more event, past every join, and both replicas journal it: each
     // acks the primary's whole history.
@@ -517,7 +518,7 @@ fn large_joins_complete_a_tick_at_a_time() {
     let head = gauge(primary_health, "melin_journal_sequence").expect("the primary's sequence");
     assert!(head > HISTORY, "the primary's history ends at {head}");
     for slot in ["0", "1"] {
-        wait_for_gauge(
+        wait_for_gauge_within(
             primary_health,
             &format!("melin_replica_acked_sequence{{slot=\"{slot}\"}}"),
             head,
@@ -581,7 +582,7 @@ fn a_joiner_that_stops_reading_mid_handoff_holds_up_nothing() {
     );
     let primary = cluster.start_primary();
     let streaming = cluster.start_replica(1, "streaming");
-    wait_for_gauge(primary_health, "melin_replicas_connected", 1, STARTUP_LIMIT);
+    wait_for_gauge_within(primary_health, "melin_replicas_connected", 1, STARTUP_LIMIT);
     let mut conn = served_within(primary.addr(), STARTUP_LIMIT, "with one replica attached");
     let history_end =
         gauge(primary_health, "melin_journal_sequence").expect("the primary's sequence");
@@ -595,7 +596,7 @@ fn a_joiner_that_stops_reading_mid_handoff_holds_up_nothing() {
         &Cluster::node_key(2),
         FRAME_LIMIT,
     );
-    wait_for_gauge(primary_health, "melin_replicas_connected", 2, STARTUP_LIMIT);
+    wait_for_gauge_within(primary_health, "melin_replicas_connected", 2, STARTUP_LIMIT);
     // Time for the worker to read the history to its end.
     std::thread::sleep(Duration::from_secs(1));
 
@@ -695,7 +696,7 @@ fn a_joiner_that_stops_reading_mid_handoff_holds_up_nothing() {
     // The other replica streamed throughout, and is current.
     assert_acked(&mut conn, "after the joiner was dropped");
     let head = gauge(primary_health, "melin_journal_sequence").expect("the primary's sequence");
-    wait_for_gauge(
+    wait_for_gauge_within(
         primary_health,
         "melin_replica_acked_sequence{slot=\"0\"}",
         head,
@@ -771,7 +772,7 @@ fn a_joiner_that_acks_then_stops_reading_its_catch_up_is_dropped() {
     write_history_outlasting_the_queue(&cluster.dir.path().join("primary.journal"));
     let primary = cluster.start_primary();
     let streaming = cluster.start_replica(1, "streaming");
-    wait_for_gauge(primary_health, "melin_replicas_connected", 1, STARTUP_LIMIT);
+    wait_for_gauge_within(primary_health, "melin_replicas_connected", 1, STARTUP_LIMIT);
     let mut conn = served_within(primary.addr(), STARTUP_LIMIT, "with one replica attached");
 
     // The joiner reads the catch-up's first entries, acks them as a
@@ -781,7 +782,7 @@ fn a_joiner_that_acks_then_stops_reading_its_catch_up_is_dropped() {
         &Cluster::node_key(2),
         FRAME_LIMIT,
     );
-    wait_for_gauge(primary_health, "melin_replicas_connected", 2, STARTUP_LIMIT);
+    wait_for_gauge_within(primary_health, "melin_replicas_connected", 2, STARTUP_LIMIT);
     let read = joiner.read_through(1);
     joiner.ack(read);
     let stopped = Instant::now();
@@ -830,7 +831,7 @@ fn a_joiner_that_acks_then_stops_reading_its_catch_up_is_dropped() {
     // The other replica streamed throughout, and is current.
     assert_acked(&mut conn, "after the joiner was dropped");
     let head = gauge(primary_health, "melin_journal_sequence").expect("the primary's sequence");
-    wait_for_gauge(
+    wait_for_gauge_within(
         primary_health,
         "melin_replica_acked_sequence{slot=\"0\"}",
         head,
@@ -908,7 +909,7 @@ fn an_ack_sent_during_the_catch_up_counts_once_the_joiner_is_live() {
     // nothing new is journaled, so a replica would have nothing more to
     // ack. Its join ends, and it streams.
     assert_eq!(joiner.read_through(history_end), history_end);
-    wait_for_gauge(
+    wait_for_gauge_within(
         primary_health,
         "melin_replica_catching_up{slot=\"0\"}",
         0,
@@ -1373,31 +1374,6 @@ fn serialise() -> MutexGuard<'static, ()> {
 
     melin_test_node::logs::capture("info,melin_server_runtime::dpdk_transport=debug");
     serial
-}
-
-/// The value of one Prometheus gauge on a node's health endpoint, or
-/// `None` while the endpoint is not up.
-fn gauge(health: SocketAddr, name: &str) -> Option<u64> {
-    let mut stream = TcpStream::connect_timeout(&health, Duration::from_millis(200)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
-    stream.write_all(b"GET /metrics HTTP/1.1\r\n\r\n").ok()?;
-    let mut body = String::new();
-    stream.read_to_string(&mut body).ok()?;
-    body.lines()
-        .find_map(|line| line.strip_prefix(name)?.trim().parse().ok())
-}
-
-/// Wait, at most `limit`, for gauge `name` to read `value`.
-fn wait_for_gauge(health: SocketAddr, name: &str, value: u64, limit: Duration) {
-    let deadline = Instant::now() + limit;
-    while gauge(health, name) != Some(value) {
-        assert!(
-            Instant::now() < deadline,
-            "{name} did not reach {value} within {limit:?} (last: {:?})",
-            gauge(health, name)
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
 }
 
 /// Run `body` against a fresh counter node on DPDK, then stop the node.

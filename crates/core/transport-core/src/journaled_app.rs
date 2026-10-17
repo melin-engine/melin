@@ -30,6 +30,7 @@ use melin_app::{Application, ApplyCtx};
 use melin_journal::{JournalError, JournalReader, JournalWrite};
 
 use crate::dispatch::dispatch;
+use crate::lineage::Lineage;
 use crate::snapshot;
 
 /// Error surfaced by every [`JournaledApp`] method — wraps journal I/O errors and
@@ -200,12 +201,14 @@ impl From<std::io::Error> for JournaledAppError {
 pub struct JournaledApp<A: Application, W: JournalWrite<A::Event>> {
     app: A,
     writer: W,
-    /// Fencing epoch recovered from the snapshot + journal replay (the
-    /// highest `EpochBump` observed, or the snapshot's epoch if newer, or
-    /// `0` for a genesis node). The boot site reads this via
-    /// [`Self::recovered_epoch`] to seed the node's `FenceState` before
-    /// the pipeline starts. Not part of `(A, W)` — extracted separately.
-    recovered_epoch: u64,
+    /// The lineage recovered from the snapshot + journal replay: the
+    /// snapshot's, with every replayed lineage event folded in
+    /// ([`Lineage::observe`]), or [`Lineage::GENESIS`] for a genesis
+    /// node. The boot site reads this via [`Self::recovered_lineage`] to
+    /// seed the node's `FenceState` and its record of the ack policy
+    /// before the pipeline starts. Not part of `(A, W)` — extracted
+    /// separately.
+    recovered_lineage: Lineage,
     /// The per-event clock of the shared dispatch step (see
     /// [`crate::dispatch`]) as replay left it: the newest timestamp an
     /// entry was applied under. The test-only single-thread helpers
@@ -223,11 +226,11 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
     /// `A::default()`.
     pub fn create(app: A, journal_path: &Path) -> Result<Self, JournaledAppError> {
         let writer = W::create(journal_path)?;
-        // Genesis node — no prior promotion, so epoch starts at 0.
+        // Genesis node — no prior promotion, no policy journaled.
         Ok(Self {
             app,
             writer,
-            recovered_epoch: 0,
+            recovered_lineage: Lineage::GENESIS,
             #[cfg(any(test, feature = "test-utils"))]
             last_drain_ns: 0,
         })
@@ -249,20 +252,16 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         snapshot_path: &Path,
         journal_path: &Path,
     ) -> Result<Self, JournaledAppError> {
-        let (app, snap_sequence, snap_chain_hash, snap_epoch) = snapshot::load::<A>(snapshot_path)?;
-        Self::recover_inner(
-            app,
-            journal_path,
-            Some((snap_sequence, snap_chain_hash, snap_epoch)),
-        )
+        let (app, header) = snapshot::load::<A>(snapshot_path)?;
+        Self::recover_inner(app, journal_path, Some(header))
     }
 
     /// Shared multi-segment recovery driver.
     ///
-    /// `snapshot` carries `(sequence, chain_hash, epoch)` when the caller
-    /// has already restored from a snapshot; events with `seq <= sequence`
-    /// are skipped during replay but still walked so per-segment chain
-    /// validation runs. The epoch seeds the recovered-epoch accumulator.
+    /// `snapshot` carries the header of the snapshot the caller has
+    /// already restored from; events with `seq <= sequence` are skipped
+    /// during replay but still walked so per-segment chain validation
+    /// runs. Its lineage seeds the recovered-lineage accumulator.
     ///
     /// Cross-segment continuity is enforced before each segment is
     /// replayed: its header anchor must equal the previous segment's
@@ -272,22 +271,23 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
     fn recover_inner(
         mut app: A,
         journal_path: &Path,
-        snapshot: Option<(u64, [u8; 32], u64)>,
+        snapshot: Option<snapshot::SnapshotHeader>,
     ) -> Result<Self, JournaledAppError> {
         let archives = melin_journal::segment::list_archives(journal_path)?;
-        // Highest fencing epoch observed during replay. Seeded from the
-        // snapshot's epoch (replay only walks entries strictly after the
-        // snapshot, so an `EpochBump` folded into the snapshot is invisible
-        // here) and raised by each replayed `EpochBump`.
-        let mut recovered_epoch = snapshot.map(|(_, _, e)| e).unwrap_or(0);
+        // The lineage as of the replayed position. Seeded from the
+        // snapshot's (replay only walks entries strictly after the
+        // snapshot, so a lineage event folded into the snapshot is
+        // invisible here, and its segment may be gone) and advanced by
+        // each replayed lineage event.
+        let mut recovered_lineage = snapshot.map_or(Lineage::GENESIS, |s| s.lineage);
 
         let has_snapshot = snapshot.is_some();
-        let snap_sequence = snapshot.map(|(s, _, _)| s).unwrap_or(0);
+        let snap_sequence = snapshot.map_or(0, |s| s.sequence);
         // Expected chain hash at the snapshot's anchor sequence. Compared
         // inside `replay_segment` when the anchor entry is observed, and
         // against a successor segment's header anchor when the snapshot
         // is anchored exactly at a rotation boundary.
-        let snap_chain_check: Option<[u8; 32]> = snapshot.map(|(_, h, _)| h);
+        let snap_chain_check: Option<[u8; 32]> = snapshot.map(|s| s.chain_hash);
 
         let mut reports: Vec<A::Report> = Vec::new();
         let mut last_drain_ns: u64 = 0;
@@ -346,7 +346,7 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
                 snap_sequence,
                 snap_chain_check,
                 &mut last_drain_ns,
-                &mut recovered_epoch,
+                &mut recovered_lineage,
                 &mut reports,
             )?;
             // Carry forward only when this segment actually had a chain
@@ -416,7 +416,7 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
             return Ok(Self {
                 app,
                 writer,
-                recovered_epoch,
+                recovered_lineage,
                 #[cfg(any(test, feature = "test-utils"))]
                 last_drain_ns,
             });
@@ -442,7 +442,7 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
             snap_sequence,
             snap_chain_check,
             &mut last_drain_ns,
-            &mut recovered_epoch,
+            &mut recovered_lineage,
             &mut reports,
         )?;
 
@@ -486,7 +486,7 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         Ok(Self {
             app,
             writer,
-            recovered_epoch,
+            recovered_lineage,
             #[cfg(any(test, feature = "test-utils"))]
             last_drain_ns,
         })
@@ -500,13 +500,13 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         let seq = crate::cursors::WireSeq::new(self.writer.next_sequence().saturating_sub(1));
         let chain_hash = self.writer.chain_hash().unwrap_or([0u8; 32]);
         // Runtime snapshots are produced by the shadow stage (which tracks
-        // the live epoch); this convenience method snapshots from the
-        // recovered epoch, correct for the boot/test paths that use it.
+        // the live lineage); this convenience method snapshots from the
+        // recovered lineage, correct for the boot/test paths that use it.
         snapshot::save::<A>(
             &self.app,
             seq,
             chain_hash,
-            self.recovered_epoch,
+            self.recovered_lineage,
             self.genesis_entries()?,
             snapshot_path,
         )?;
@@ -563,12 +563,12 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
 
     /// Construct from pre-built parts. Used by the server's
     /// "snapshot-only" recovery path (journal missing post-rotation),
-    /// which supplies the epoch read from the snapshot it loaded.
-    pub fn from_parts(app: A, writer: W, recovered_epoch: u64) -> Self {
+    /// which supplies the lineage read from the snapshot it loaded.
+    pub fn from_parts(app: A, writer: W, recovered_lineage: Lineage) -> Self {
         Self {
             app,
             writer,
-            recovered_epoch,
+            recovered_lineage,
             // Nothing was replayed, so there is no replayed clock: zero,
             // as the matching stage starts from at every boot.
             #[cfg(any(test, feature = "test-utils"))]
@@ -581,10 +581,11 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         (self.app, self.writer)
     }
 
-    /// Fencing epoch recovered from the snapshot + journal. The boot site
-    /// reads this to seed the node's `FenceState`.
-    pub fn recovered_epoch(&self) -> u64 {
-        self.recovered_epoch
+    /// The lineage recovered from the snapshot + journal: its epoch seeds
+    /// the node's `FenceState`, its ack policy the node's record of the
+    /// policy in force.
+    pub fn recovered_lineage(&self) -> Lineage {
+        self.recovered_lineage
     }
 }
 
@@ -780,7 +781,8 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
                 key_hash: 0,
             },
             &mut self.last_drain_ns,
-            // Neither an application event nor a tick carries an epoch.
+            // Neither an application event nor a tick carries lineage
+            // metadata.
             |_| {},
             out,
         );
@@ -813,7 +815,7 @@ fn replay_segment<A: Application>(
     snap_sequence: u64,
     snap_chain: Option<[u8; 32]>,
     last_drain_ns: &mut u64,
-    recovered_epoch: &mut u64,
+    recovered_lineage: &mut Lineage,
     reports: &mut Vec<A::Report>,
 ) -> Result<(), JournaledAppError> {
     loop {
@@ -838,6 +840,8 @@ fn replay_segment<A: Application>(
                     // Replay produces no output: the client got its reply
                     // when the event was live. A query is never journaled,
                     // so every entry here is one `apply` handled live.
+                    // The entry's sequence is its wire sequence.
+                    let wire_seq = crate::cursors::WireSeq::new(entry.sequence);
                     dispatch(
                         app,
                         entry.event,
@@ -846,7 +850,7 @@ fn replay_segment<A: Application>(
                             key_hash: entry.key_hash,
                         },
                         last_drain_ns,
-                        |epoch| crate::fence::observe_into(recovered_epoch, epoch),
+                        |event| recovered_lineage.observe(wire_seq, event),
                         reports,
                     );
                     reports.clear();
@@ -958,8 +962,9 @@ fn verify_boundary_snapshot_anchor<E: melin_app::AppEvent>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TestApp, TestEvent};
-    use melin_journal::{BufferedWriter, JournalEvent, JournalReader};
+    use crate::lineage::LineagePolicy;
+    use crate::test_support::{TestApp, TestEvent, ack_policy_change};
+    use melin_journal::{AckPolicyByte, BufferedWriter, JournalEvent, JournalReader};
     use std::collections::HashMap;
 
     // Concrete writer used by every test. The buffered path covers
@@ -969,6 +974,15 @@ mod tests {
     /// Write events with auto-allocated sequences and fsync them to disk,
     /// each submitted under `key_hash = 1`.
     fn append_events(ja: TestApp_, events: &[TestEvent]) -> TestApp_ {
+        let events: Vec<_> = events.iter().map(|e| JournalEvent::App(*e)).collect();
+        append_journal_events(ja, &events)
+    }
+
+    /// [`append_events`] for any journal events, lineage metadata
+    /// included. Like it, journals without applying: the returned value
+    /// keeps the application state and recovered lineage it was given.
+    fn append_journal_events(ja: TestApp_, events: &[JournalEvent<TestEvent>]) -> TestApp_ {
+        let lineage = ja.recovered_lineage();
         let (app, mut writer) = ja.into_parts();
         for (i, e) in events.iter().enumerate() {
             let seq = writer.allocate_sequence();
@@ -976,13 +990,13 @@ mod tests {
                 .encode_event(
                     seq,
                     /* timestamp_ns */ 1_000 * (i as u64 + 1),
-                    &JournalEvent::App(*e),
+                    e,
                     /* key_hash */ 1,
                 )
                 .unwrap();
         }
         writer.flush_batch_sync().unwrap();
-        JournaledApp::from_parts(app, writer, 0)
+        JournaledApp::from_parts(app, writer, lineage)
     }
 
     /// Compute the TestApp state that results from applying `events` in
@@ -1242,7 +1256,7 @@ mod tests {
         .unwrap();
         let recovered = TestApp_::recover(TestApp::new(), &path).unwrap();
         recovered.save_snapshot(&snap).unwrap();
-        let (_, header) = snapshot::load_with_header::<TestApp>(&snap).unwrap();
+        let (_, header) = snapshot::load::<TestApp>(&snap).unwrap();
         assert_eq!(header.genesis_entries, Some(3));
     }
 
@@ -1271,29 +1285,26 @@ mod tests {
 
         // Genesis: no promotion yet, so the recovered epoch is 0.
         let ja = TestApp_::create(TestApp::new(), &path).unwrap();
-        assert_eq!(ja.recovered_epoch(), 0, "genesis epoch must be 0");
-        let (app, mut writer) = ja.into_parts();
+        assert_eq!(
+            ja.recovered_lineage(),
+            Lineage::GENESIS,
+            "genesis epoch must be 0, with no policy journaled"
+        );
 
         // Journal an App event, then an EpochBump (the promotion marker),
         // then another App event — the shape a promoted primary produces.
-        let s0 = writer.allocate_sequence();
-        writer
-            .encode_event(s0, 1_000, &JournalEvent::App(TestEvent::Add(5)), 1)
-            .unwrap();
-        let s1 = writer.allocate_sequence();
-        writer
-            .encode_event(s1, 2_000, &JournalEvent::EpochBump { epoch: 3 }, 0)
-            .unwrap();
-        let s2 = writer.allocate_sequence();
-        writer
-            .encode_event(s2, 3_000, &JournalEvent::App(TestEvent::Add(7)), 1)
-            .unwrap();
-        writer.flush_batch_sync().unwrap();
-        drop(JournaledApp::from_parts(app, writer, 0));
+        drop(append_journal_events(
+            ja,
+            &[
+                JournalEvent::App(TestEvent::Add(5)),
+                JournalEvent::EpochBump { epoch: 3 },
+                JournalEvent::App(TestEvent::Add(7)),
+            ],
+        ));
 
         let recovered = TestApp_::recover(TestApp::new(), &path).unwrap();
         assert_eq!(
-            recovered.recovered_epoch(),
+            recovered.recovered_lineage().epoch,
             3,
             "epoch must be recovered from the journaled EpochBump"
         );
@@ -1302,6 +1313,125 @@ mod tests {
             recovered.app().total,
             12,
             "App events must apply and the EpochBump must not touch app state"
+        );
+    }
+
+    /// The lineage policy `policy`, in force since the transition at
+    /// `wire_seq` from `previous`.
+    fn lineage_policy(
+        policy: u8,
+        unwitnessed: bool,
+        wire_seq: u64,
+        previous: Option<u8>,
+    ) -> Option<LineagePolicy> {
+        Some(LineagePolicy {
+            change: melin_journal::AckPolicyChange {
+                policy: AckPolicyByte(policy),
+                unwitnessed,
+            },
+            wire_seq: crate::cursors::WireSeq::new(wire_seq),
+            previous: previous.map(AckPolicyByte),
+        })
+    }
+
+    /// Recovery returns the ack policy the newest journaled change put in
+    /// force — newest, not highest: a weakening after a strengthening
+    /// wins — with the policy before it and the change's own sequence,
+    /// alongside the epoch, and the changes never touch application
+    /// state.
+    #[test]
+    fn recovers_the_ack_policy_from_journaled_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.journal");
+        let ja = TestApp_::create(TestApp::new(), &path).unwrap();
+        drop(append_journal_events(
+            ja,
+            &[
+                JournalEvent::App(TestEvent::Add(5)),
+                ack_policy_change(1, false),
+                JournalEvent::EpochBump { epoch: 2 },
+                JournalEvent::App(TestEvent::Add(7)),
+                ack_policy_change(0, true),
+            ],
+        ));
+
+        let recovered = TestApp_::recover(TestApp::new(), &path).unwrap();
+        assert_eq!(
+            recovered.recovered_lineage(),
+            Lineage {
+                epoch: 2,
+                ack_policy: lineage_policy(0, true, 5, Some(1)),
+            }
+        );
+        assert_eq!(recovered.app().total, 12);
+
+        // A journal with no change recovers no policy, not a default one.
+        let plain = dir.path().join("plain.journal");
+        let ja = TestApp_::create(TestApp::new(), &plain).unwrap();
+        drop(append_events(ja, &[TestEvent::Add(1)]));
+        let recovered = TestApp_::recover(TestApp::new(), &plain).unwrap();
+        assert_eq!(recovered.recovered_lineage(), Lineage::GENESIS);
+    }
+
+    /// A change journaled before a snapshot, whose segment is then gone,
+    /// is still known after a recovery from the snapshot: the snapshot
+    /// records the policy in force at its sequence, and replay, which
+    /// skips what the snapshot covers, starts from it. A change in the
+    /// tail after the snapshot then overrides it.
+    #[test]
+    fn a_snapshot_carries_the_policy_past_its_entrys_pruned_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("journal.bin");
+        let snap_path = dir.path().join("snap.bin");
+
+        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let mut ja = append_journal_events(
+            ja,
+            &[
+                JournalEvent::App(TestEvent::Add(1)),
+                ack_policy_change(1, false),
+            ],
+        );
+        ja.rotate_segment().unwrap();
+        drop(append_events(ja, &[TestEvent::Add(2)]));
+
+        // Snapshot the recovered state (through sequence 3), then start
+        // a new segment past it, so every archive is the snapshot's.
+        let mut recovered = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
+        assert_eq!(
+            recovered.recovered_lineage().ack_policy,
+            lineage_policy(1, false, 2, None)
+        );
+        recovered.save_snapshot(&snap_path).unwrap();
+        recovered.rotate_segment().unwrap();
+        drop(append_events(recovered, &[TestEvent::Add(4)]));
+
+        // Prune every archive: the change's segment is gone.
+        let archives = melin_journal::segment::list_archives(&journal_path).unwrap();
+        assert_eq!(archives.len(), 2);
+        for (_, archive) in &archives {
+            std::fs::remove_file(archive).unwrap();
+        }
+
+        let re = TestApp_::recover_from_snapshot(&snap_path, &journal_path).unwrap();
+        assert_eq!(
+            re.recovered_lineage(),
+            Lineage {
+                epoch: 0,
+                ack_policy: lineage_policy(1, false, 2, None),
+            },
+            "the snapshot must carry the policy its pruned segment journaled, \
+             and the transition to it"
+        );
+        assert_eq!(re.app().total, 1 + 2 + 4);
+
+        // A newer change in the tail wins over the snapshot's, folded on
+        // top of it: the policy before it is the snapshot's.
+        drop(append_journal_events(re, &[ack_policy_change(3, false)]));
+        let re = TestApp_::recover_from_snapshot(&snap_path, &journal_path).unwrap();
+        assert_eq!(
+            re.recovered_lineage().ack_policy,
+            lineage_policy(3, false, 5, Some(1))
         );
     }
 
@@ -1424,11 +1554,11 @@ mod tests {
         let ja = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
         ja.save_snapshot(&snap_path).unwrap();
 
-        let (restored, seq, _chain, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let (restored, header) = snapshot::load::<TestApp>(&snap_path).unwrap();
         assert_eq!(restored, expected_state(&events));
         // Sequences are 1-indexed; after N events, next_sequence = N + 1
         // and save_snapshot records the last issued sequence (next - 1) = N.
-        assert_eq!(seq, events.len() as u64);
+        assert_eq!(header.sequence, events.len() as u64);
     }
 
     #[test]
@@ -1519,7 +1649,7 @@ mod tests {
         // no sequence number.
         assert_eq!(ja.next_sequence(), pre_rotate_next_seq);
         // Snapshot captures the pre-rotate state.
-        let (snap_app, _seq, _chain, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let (snap_app, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
         assert_eq!(snap_app, pre_rotate_state);
 
         // The new journal is fresh — recovering it without the snapshot
@@ -1929,14 +2059,15 @@ mod tests {
         std::fs::remove_file(&archive).unwrap();
 
         // Forge the snapshot's chain hash; sequence stays at the boundary.
-        let (loaded_app, snap_seq, real_hash, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let (loaded_app, header) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let (snap_seq, real_hash) = (header.sequence, header.chain_hash);
         let bad_hash = [0xEE; 32];
         assert_ne!(real_hash, bad_hash);
         snapshot::save::<TestApp>(
             &loaded_app,
             crate::cursors::WireSeq::new(snap_seq),
             bad_hash,
-            0,
+            header.lineage,
             Some(0),
             &snap_path,
         )
@@ -1987,9 +2118,9 @@ mod tests {
         let ja = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
         ja.save_snapshot(&snap_path).unwrap();
 
-        let (_, snap_seq, _, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let (_, header) = snapshot::load::<TestApp>(&snap_path).unwrap();
         assert_eq!(
-            snap_seq,
+            header.sequence,
             pre.len() as u64,
             "snapshot sequence must equal the journaled event count"
         );
@@ -2173,8 +2304,8 @@ mod tests {
         ja.save_snapshot(&snap_path).unwrap();
         drop(ja);
 
-        let (_, snap_seq, _, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
-        assert_eq!(snap_seq, 0, "fresh snapshot anchors at sequence 0");
+        let (_, header) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        assert_eq!(header.sequence, 0, "fresh snapshot anchors at sequence 0");
 
         let recovered = TestApp_::recover_from_snapshot(&snap_path, &journal_path).unwrap();
         assert_eq!(*recovered.app(), TestApp::new());
@@ -2312,7 +2443,8 @@ mod tests {
         ja.save_snapshot(&snap_path).unwrap();
         drop(ja);
 
-        let (_app, snap_seq, _hash, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let (_app, header) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let snap_seq = header.sequence;
         assert!(snap_seq > 0);
 
         // Replace the journal with a stale copy that holds only the
@@ -2369,7 +2501,8 @@ mod tests {
         // sequence but a deliberately wrong chain hash. The journal
         // itself is unchanged, so recovery should compute the original
         // chain hash at the anchor sequence and detect the mismatch.
-        let (loaded_app, snap_seq, real_hash, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let (loaded_app, header) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let (snap_seq, real_hash) = (header.sequence, header.chain_hash);
         assert_ne!(
             real_hash, [0u8; 32],
             "hash-chain feature must produce a non-sentinel hash for this test"
@@ -2379,7 +2512,7 @@ mod tests {
             &loaded_app,
             crate::cursors::WireSeq::new(snap_seq),
             bad_hash,
-            0,
+            header.lineage,
             Some(0),
             &snap_path,
         )
@@ -2435,7 +2568,8 @@ mod tests {
 
         // Round-trip the snapshot with a deliberately wrong chain hash
         // at the same anchor sequence.
-        let (loaded_app, snap_seq, real_hash, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let (loaded_app, header) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let (snap_seq, real_hash) = (header.sequence, header.chain_hash);
         assert_ne!(
             real_hash, [0u8; 32],
             "hash-chain feature must produce a non-sentinel hash for this test"
@@ -2445,7 +2579,7 @@ mod tests {
             &loaded_app,
             crate::cursors::WireSeq::new(snap_seq),
             bad_hash,
-            0,
+            header.lineage,
             Some(0),
             &snap_path,
         )
@@ -2601,8 +2735,8 @@ mod tests {
         let final_seq = ja.next_sequence();
         drop(ja);
 
-        let (snap_app, snap_seq, snap_chain_hash, _) =
-            snapshot::load::<TestApp>(&snap_path).unwrap();
+        let (snap_app, header) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let (snap_seq, snap_chain_hash) = (header.sequence, header.chain_hash);
         let snap_total = snap_app.total;
         assert!(snap_total > 0, "snapshot must capture pre-rotation state");
 
@@ -2663,7 +2797,7 @@ mod tests {
             Some(0),
         )
         .unwrap();
-        let je = JournaledApp::from_parts(snap_app, writer, 0);
+        let je = JournaledApp::from_parts(snap_app, writer, header.lineage);
         assert_eq!(je.app().total, snap_total);
     }
 

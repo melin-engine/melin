@@ -13,13 +13,21 @@
 //!   boundary and start a fresh one. Available only when the spawn
 //!   caller wired a rotation flag (any node with `--max-journal-mib >
 //!   0` or runtime rotation enabled).
-//! - `ACK-POLICY <disk|ram|disk+ram|two-disks>` — atomically swap the
-//!   active ack policy on a node running a response stage (primary, or
-//!   post-promotion replica). Lets an operator resume taking writes under a
-//!   weaker policy immediately after a promotion (no restart, no client
-//!   reconnects) and restore the target policy once replicas reattach.
-//!   Available only when the spawn caller wired the shared policy
-//!   atomic. `DURABILITY <local|replicated|hybrid|durably-replicated>`
+//! - `ACK-POLICY <disk|ram|disk+ram|two-disks>` — change the ack policy.
+//!   The change is journaled, in order with the events it governs, and
+//!   takes effect once the nodes the previous policy relied on hold it
+//!   (see [`crate::policy_control`]). On a primary the reply is `OK` once
+//!   the entry is published, or an `ERR` if the input ring stays full
+//!   past a bounded wait; with no replica connected, `ACK-POLICY disk` is
+//!   forced and takes effect once on this node's disk. On a replica, or a
+//!   primary still starting, the policy is staged and the reply is
+//!   `OK staged`: it is journaled when the node is promoted (or its
+//!   producer starts) — not forced, so an operator re-sends it once the
+//!   node serves if it must take effect with no replica connected. Lets an
+//!   operator resume taking writes under a weaker policy after a promotion
+//!   (no restart, no client reconnects) and restore the target policy
+//!   once replicas reattach. Available only when the spawn caller wired
+//!   the policy mailbox. `DURABILITY <local|replicated|hybrid|durably-replicated>`
 //!   is accepted as a deprecated alias for one release and logged at
 //!   `warn!`.
 //!
@@ -36,11 +44,12 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::ack_policy::AckPolicy;
+use crate::policy_control::{AckPolicyControl, Refused, RequestOutcome};
 use crate::promotion::PromotionRequest;
 
 use ed25519_dalek::{Verifier, VerifyingKey};
@@ -69,7 +78,7 @@ pub fn spawn(
     bind_addr: SocketAddr,
     promote: Option<PromotionRequest>,
     rotate_requested: Option<Arc<AtomicBool>>,
-    ack_policy: Option<Arc<AtomicU8>>,
+    ack_policy: Option<Arc<AckPolicyControl>>,
     shutdown: Arc<AtomicBool>,
     authorized_keys: Arc<AuthorizedKeys>,
 ) -> Result<(JoinHandle<()>, SocketAddr), Box<dyn std::error::Error>> {
@@ -121,7 +130,7 @@ fn run(
     addr: SocketAddr,
     promote: Option<&PromotionRequest>,
     rotate_requested: Option<&AtomicBool>,
-    ack_policy: Option<&AtomicU8>,
+    ack_policy: Option<&AckPolicyControl>,
     shutdown: &AtomicBool,
     authorized_keys: &AuthorizedKeys,
 ) {
@@ -271,7 +280,7 @@ fn handle_connection(
     mut stream: TcpStream,
     promote: Option<&PromotionRequest>,
     rotate_requested: Option<&AtomicBool>,
-    ack_policy: Option<&AtomicU8>,
+    ack_policy: Option<&AckPolicyControl>,
     authorized_keys: &AuthorizedKeys,
 ) {
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
@@ -368,16 +377,16 @@ fn handle_connection(
     }
 }
 
-/// Apply an `ACK-POLICY <policy>` command. Validates the argument,
-/// publishes the new policy through the shared atomic if the node has
-/// a response stage wired, and emits an INFO log carrying the prev →
-/// next transition for the audit trail. Auth is enforced upstream in
+/// Apply an `ACK-POLICY <policy>` command. Validates the argument, has
+/// the change journaled (or staged, see the module docs), and replies
+/// with the outcome. The journal entry is the change's audit trail; the
+/// log line says who asked. Auth is enforced upstream in
 /// [`authenticate`], so reaching this point already implies an
 /// operator-signed request.
-fn handle_ack_policy(stream: &mut TcpStream, ack_policy: Option<&AtomicU8>, arg: &str) {
-    let Some(atomic) = ack_policy else {
+fn handle_ack_policy(stream: &mut TcpStream, ack_policy: Option<&AckPolicyControl>, arg: &str) {
+    let Some(control) = ack_policy else {
         send_best_effort(stream, b"ERR ACK-POLICY not available on this node\n");
-        debug!("rejected ACK-POLICY — atomic not wired (replica node?)");
+        debug!("rejected ACK-POLICY — policy mailbox not wired");
         return;
     };
     if arg.is_empty() {
@@ -399,20 +408,75 @@ fn handle_ack_policy(stream: &mut TcpStream, ack_policy: Option<&AtomicU8>, arg:
         debug!(received = %arg, "rejected ACK-POLICY — unknown policy");
         return;
     };
-    // Relaxed exchange: the only writer is the admin handler itself
-    // (the response stage only reads), and only the current policy
-    // matters — losing the ordering of prev observations relative to
-    // unrelated events on other threads is fine.
-    let prev_byte = atomic.swap(next.as_u8(), Ordering::Relaxed);
-    let prev = AckPolicy::from_u8(prev_byte)
-        .map(|p| p.as_str())
-        .unwrap_or("<corrupted>");
-    send_best_effort(stream, b"OK\n");
-    info!(
-        prev = prev,
-        next = next.as_str(),
-        "ack policy changed by operator"
-    );
+    let outcome = control.request(next);
+    send_best_effort(stream, ack_policy_reply(outcome));
+    match outcome {
+        RequestOutcome::Published => {
+            info!(
+                policy = next.as_str(),
+                "ack policy change requested by operator"
+            );
+        }
+        RequestOutcome::Staged => {
+            info!(
+                policy = next.as_str(),
+                "ack policy staged by operator: journaled when this node serves as primary"
+            );
+        }
+        RequestOutcome::Refused(Refused::RingFull) => {
+            // A full input ring is the pipeline stalled behind its gate:
+            // degraded operation, not an operator mistake.
+            warn!(
+                policy = next.as_str(),
+                "ack policy change refused: the input ring stayed full, so it could not be journaled in time"
+            );
+        }
+        RequestOutcome::Refused(Refused::ProducerStopped) => {
+            info!(
+                policy = next.as_str(),
+                "ack policy change refused: the node stopped serving as primary (stepping down or shutting down) before journaling it"
+            );
+        }
+        RequestOutcome::Refused(Refused::AnotherWaiting) => {
+            // The admin listener serves one command at a time, so a
+            // second requester is unexpected: handled, but worth a look.
+            warn!(
+                policy = next.as_str(),
+                "ack policy change refused: another request was still waiting to be journaled"
+            );
+        }
+        RequestOutcome::Refused(Refused::NoReplicaCanAttach) => {
+            // Journaled, it would have held every reply: worth a look at
+            // whoever sent it.
+            warn!(
+                policy = next.as_str(),
+                "ack policy change refused: the policy needs a replica and this node accepts none (no --replication-bind), so it could never be met"
+            );
+        }
+    }
+}
+
+/// The admin reply to an `ACK-POLICY` request's outcome. Each refusal
+/// names its cause, since each calls for something different: retry once
+/// the pipeline drains, find the new primary, wait for the request
+/// already in flight, or pick a policy this node can meet.
+fn ack_policy_reply(outcome: RequestOutcome) -> &'static [u8] {
+    match outcome {
+        RequestOutcome::Published => b"OK\n",
+        RequestOutcome::Staged => b"OK staged\n",
+        RequestOutcome::Refused(Refused::RingFull) => {
+            b"ERR ACK-POLICY not journaled: the input ring stayed full; retry once the pipeline drains\n"
+        }
+        RequestOutcome::Refused(Refused::ProducerStopped) => {
+            b"ERR ACK-POLICY not journaled: the node stopped serving as primary (stepping down or shutting down)\n"
+        }
+        RequestOutcome::Refused(Refused::AnotherWaiting) => {
+            b"ERR ACK-POLICY not journaled: another ACK-POLICY request is still waiting\n"
+        }
+        RequestOutcome::Refused(Refused::NoReplicaCanAttach) => {
+            b"ERR ACK-POLICY not journaled: this policy needs a replica and this node accepts none (no --replication-bind), so it could never be met\n"
+        }
+    }
 }
 
 /// Format an "unknown policy" diagnostic into `buf` without allocating.
@@ -715,35 +779,157 @@ mod tests {
         shutdown.store(true, Ordering::Release);
     }
 
-    /// Driver: spawn an admin listener with only the ack-policy
-    /// atomic wired (mirrors a primary-only node in commit 2), pre-seed
-    /// it with `initial`, send the supplied command, and return
-    /// `(response, policy_after)`.
-    fn run_ack_policy(initial: AckPolicy, cmd: &[u8]) -> (String, Option<AckPolicy>) {
+    /// Spawn an admin listener with only the ack-policy mailbox wired.
+    fn spawn_with_policy(
+        control: &Arc<AckPolicyControl>,
+    ) -> (SigningKey, SocketAddr, Arc<AtomicBool>) {
         let (key, auth_keys) = operator_keys();
-        let policy = Arc::new(AtomicU8::new(initial.as_u8()));
         let shutdown = Arc::new(AtomicBool::new(false));
         let (_h, addr) = spawn(
             "127.0.0.1:0".parse().unwrap(),
             None,
             None,
-            Some(Arc::clone(&policy)),
+            Some(Arc::clone(control)),
             Arc::clone(&shutdown),
             auth_keys,
         )
         .expect("spawn admin listener");
+        (key, addr, shutdown)
+    }
 
+    /// Driver: spawn an admin listener whose mailbox starts at `initial`
+    /// with no producer attached (a replica, or a primary still
+    /// starting), send the supplied command, and return `(response,
+    /// policy_after)`: the policy the next promotion would request.
+    fn run_ack_policy(initial: AckPolicy, cmd: &[u8]) -> (String, AckPolicy) {
+        run_ack_policy_on(
+            crate::policy_control::test_support::replicated(initial),
+            cmd,
+        )
+    }
+
+    /// As [`run_ack_policy`], on `control`.
+    fn run_ack_policy_on(control: Arc<AckPolicyControl>, cmd: &[u8]) -> (String, AckPolicy) {
+        let (key, addr, shutdown) = spawn_with_policy(&control);
         let resp = send_command(addr, &key, cmd);
-        let after = AckPolicy::from_u8(policy.load(Ordering::Relaxed));
+        let after = control.claim().policy();
         shutdown.store(true, Ordering::Release);
         (resp, after)
     }
 
     #[test]
-    fn ack_policy_command_swaps_policy() {
+    fn ack_policy_command_stages_the_policy_with_no_producer() {
         let (resp, after) = run_ack_policy(AckPolicy::DiskAndRam, b"ACK-POLICY disk\n");
-        assert_eq!(resp, "OK");
-        assert_eq!(after, Some(AckPolicy::Disk));
+        assert_eq!(resp, "OK staged");
+        assert_eq!(after, AckPolicy::Disk);
+    }
+
+    /// On a node that accepts no replica, a policy that needs one is
+    /// refused with the reason, and nothing is staged.
+    #[test]
+    fn ack_policy_command_refuses_a_policy_no_replica_can_meet() {
+        let standalone =
+            || AckPolicyControl::new(AckPolicy::Disk, crate::halt::Replication::Disabled);
+        let (resp, after) = run_ack_policy_on(standalone(), b"ACK-POLICY disk+ram\n");
+        assert_eq!(
+            format!("{resp}\n").as_bytes(),
+            ack_policy_reply(RequestOutcome::Refused(Refused::NoReplicaCanAttach)),
+            "{resp}"
+        );
+        assert_eq!(after, AckPolicy::Disk, "nothing staged");
+        let (resp, _) = run_ack_policy_on(standalone(), b"ACK-POLICY disk\n");
+        assert_eq!(resp, "OK staged", "`disk` is still taken");
+    }
+
+    /// On a serving primary the command replies `OK` once its producer has
+    /// journaled the change: the entry is on the input ring.
+    #[test]
+    fn ack_policy_command_is_journaled_by_the_producer() {
+        let control = crate::policy_control::test_support::replicated(AckPolicy::DiskAndRam);
+        let (mut producer, mut consumer) =
+            crate::policy_control::test_support::ring::<counter_server::CounterEvent>(8);
+        // No replica connected: a runtime `disk` is forced.
+        let replicas = crate::halt::test_support::presence(0);
+        let halt = crate::halt::test_support::gate_over(Some(replicas));
+        let mut publisher = crate::policy_control::test_support::booted(&control).attach(
+            &mut producer,
+            &halt,
+            None,
+        );
+        let (key, addr, shutdown) = spawn_with_policy(&control);
+        let polling = Arc::new(AtomicBool::new(true));
+        let poller = {
+            let polling = Arc::clone(&polling);
+            std::thread::spawn(move || {
+                while polling.load(Ordering::Relaxed) {
+                    publisher.poll(&mut producer, &halt);
+                    std::thread::yield_now();
+                }
+            })
+        };
+
+        assert_eq!(send_command(addr, &key, b"ACK-POLICY disk\n"), "OK");
+        polling.store(false, Ordering::Relaxed);
+        poller.join().expect("the producer panicked");
+        let (_, slot) = consumer.try_consume().expect("the entry is on the ring");
+        let melin_journal::JournalEvent::AckPolicyChange(change) = slot.event else {
+            panic!("not a policy change");
+        };
+        assert_eq!(
+            change,
+            melin_journal::AckPolicyChange {
+                policy: AckPolicy::Disk.to_byte(),
+                unwitnessed: true,
+            },
+            "a runtime `disk` with no replica connected is forced"
+        );
+        shutdown.store(true, Ordering::Release);
+    }
+
+    /// A producer that never publishes (its ring full) gets the command
+    /// refused once the bounded wait is out, and nothing changes.
+    #[test]
+    fn ack_policy_command_refused_when_it_cannot_be_journaled() {
+        use crate::policy_control::test_support::{attach, control_with_publish_wait, ring};
+        let control = control_with_publish_wait(AckPolicy::DiskAndRam, Duration::from_millis(50));
+        let (mut producer, _consumer) = ring::<counter_server::CounterEvent>(8);
+        let _publisher = attach(&control, &mut producer);
+        let (key, addr, shutdown) = spawn_with_policy(&control);
+        let resp = send_command(addr, &key, b"ACK-POLICY disk\n");
+        assert_eq!(
+            format!("{resp}\n").as_bytes(),
+            ack_policy_reply(RequestOutcome::Refused(Refused::RingFull)),
+            "{resp}"
+        );
+        assert_eq!(control.requested(), AckPolicy::DiskAndRam);
+        shutdown.store(true, Ordering::Release);
+    }
+
+    /// Each outcome has its own reply, and each refusal names its cause.
+    #[test]
+    fn the_ack_policy_reply_names_each_outcome() {
+        let reply = |outcome| std::str::from_utf8(ack_policy_reply(outcome)).expect("ASCII");
+        assert_eq!(reply(RequestOutcome::Published), "OK\n");
+        assert_eq!(reply(RequestOutcome::Staged), "OK staged\n");
+        for (cause, names) in [
+            (Refused::RingFull, "the input ring stayed full"),
+            (
+                Refused::ProducerStopped,
+                "stopped serving as primary (stepping down or shutting down)",
+            ),
+            (Refused::AnotherWaiting, "another ACK-POLICY request"),
+            (
+                Refused::NoReplicaCanAttach,
+                "needs a replica and this node accepts none (no --replication-bind), so it could never be met",
+            ),
+        ] {
+            let text = reply(RequestOutcome::Refused(cause));
+            assert!(
+                text.starts_with("ERR ACK-POLICY not journaled: ") && text.contains(names),
+                "{cause:?}: {text}"
+            );
+            assert!(text.ends_with('\n') && !text[..text.len() - 1].contains('\n'));
+        }
     }
 
     #[test]
@@ -751,20 +937,20 @@ mod tests {
         // `DURABILITY local` from muscle memory must still work, and
         // land on the policy the old name meant.
         let (resp, after) = run_ack_policy(AckPolicy::DiskAndRam, b"DURABILITY local\n");
-        assert_eq!(resp, "OK");
-        assert_eq!(after, Some(AckPolicy::Disk));
+        assert_eq!(resp, "OK staged");
+        assert_eq!(after, AckPolicy::Disk);
 
         let (resp, after) = run_ack_policy(AckPolicy::Disk, b"DURABILITY durably-replicated\n");
-        assert_eq!(resp, "OK");
-        assert_eq!(after, Some(AckPolicy::TwoDisks));
+        assert_eq!(resp, "OK staged");
+        assert_eq!(after, AckPolicy::TwoDisks);
 
         // The alias also takes the new names, and still rejects junk.
         let (resp, after) = run_ack_policy(AckPolicy::Disk, b"DURABILITY ram\n");
-        assert_eq!(resp, "OK");
-        assert_eq!(after, Some(AckPolicy::Ram));
+        assert_eq!(resp, "OK staged");
+        assert_eq!(after, AckPolicy::Ram);
         let (resp, after) = run_ack_policy(AckPolicy::Disk, b"DURABILITY fast\n");
         assert!(resp.starts_with("ERR ACK-POLICY unknown policy"), "{resp}");
-        assert_eq!(after, Some(AckPolicy::Disk));
+        assert_eq!(after, AckPolicy::Disk);
     }
 
     #[test]
@@ -777,8 +963,8 @@ mod tests {
         ] {
             let cmd = format!("ACK-POLICY {}\n", target.as_str());
             let (resp, after) = run_ack_policy(AckPolicy::Disk, cmd.as_bytes());
-            assert_eq!(resp, "OK", "policy {target}");
-            assert_eq!(after, Some(target));
+            assert_eq!(resp, "OK staged", "policy {target}");
+            assert_eq!(after, target);
         }
     }
 
@@ -789,8 +975,8 @@ mod tests {
             resp.starts_with("ERR ACK-POLICY unknown policy"),
             "expected unknown-policy ERR, got {resp}"
         );
-        // Atomic must NOT have been clobbered on a bad command.
-        assert_eq!(after, Some(AckPolicy::DiskAndRam));
+        // The requested policy must NOT have been clobbered on a bad command.
+        assert_eq!(after, AckPolicy::DiskAndRam);
     }
 
     #[test]
@@ -800,7 +986,7 @@ mod tests {
             resp.starts_with("ERR ACK-POLICY requires a policy"),
             "expected missing-arg ERR, got {resp}"
         );
-        assert_eq!(after, Some(AckPolicy::DiskAndRam));
+        assert_eq!(after, AckPolicy::DiskAndRam);
     }
 
     #[test]

@@ -21,6 +21,7 @@ pub mod connection_limit;
 mod durability_gate;
 pub mod halt;
 pub mod layout;
+pub mod policy_control;
 pub mod process;
 pub mod promotion;
 mod raft;

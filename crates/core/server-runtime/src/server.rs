@@ -15,7 +15,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tracing::{debug, error, info, warn};
 
@@ -23,6 +23,7 @@ use melin_journal::BufferedWriter;
 use melin_journal::JournalError;
 use melin_journal::JournalWrite;
 use melin_transport_core::journaled_app::JournaledApp;
+use melin_transport_core::lineage::{Lineage, LineagePolicy};
 use melin_transport_core::pipeline::{
     InputSlot, OutputSlot as GenericOutputSlot, Pipeline as GenericPipeline,
     build_pipeline_with_replication,
@@ -551,6 +552,18 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
+    /// Whether this node accepts replicas: whether `--replication-bind`
+    /// is set, in either role (a replica holds the port from boot, and
+    /// serves replicas on it once promoted). The one answer the
+    /// ack-policy mailbox and a primary pipeline (its replica presence,
+    /// hence its halt gate) are both built on.
+    pub(crate) fn replication(&self) -> crate::halt::Replication {
+        match self.replication_bind {
+            Some(_) => crate::halt::Replication::Enabled,
+            None => crate::halt::Replication::Disabled,
+        }
+    }
+
     /// Group commit delay as a Duration.
     pub fn group_commit_delay(&self) -> std::time::Duration {
         std::time::Duration::from_micros(self.group_commit_us)
@@ -938,13 +951,14 @@ where
     };
     log_layout(&config.cores);
 
-    // Shared ack-policy atomic, constructed once per process and
-    // threaded through both roles. Wiring it on the replica path
-    // (where the live node has no response stage) lets an operator
-    // pre-stage the post-promotion policy with `ACK-POLICY <policy>`
-    // before issuing `PROMOTE`; the same `Arc` becomes the response
-    // stage's source of truth after the replica → primary transition.
-    let ack_policy_atomic = Arc::new(AtomicU8::new(config.ack_policy.as_u8()));
+    // The ack-policy mailbox, constructed once per process and threaded
+    // through both roles. On the replica path (no input ring producer)
+    // `ACK-POLICY <policy>` stages the post-promotion policy; after the
+    // replica → primary transition the same mailbox feeds the new
+    // primary's producer, which journals each change. See
+    // `crate::policy_control`.
+    let ack_policy =
+        crate::policy_control::AckPolicyControl::new(config.ack_policy, config.replication());
 
     // Validate before the bind below and before anything touches the
     // journal directory, so a refused boot has no side effects and leaves
@@ -1008,8 +1022,8 @@ where
 
         // The replica's control-plane bundle: promotion request (admin
         // PROMOTE / raft auto-promotion), tip readiness + advertised
-        // journal tip (vote recency), primary link state, and the
-        // primary's advertised ack policy. Constructed before
+        // journal tip (vote recency), primary link state, and the ack
+        // policy the replica's lineage holds. Constructed before
         // mode-detection so it survives a replica → primary transition.
         // The rotate flag is re-wired into the new primary's journal
         // stage by `run_as_primary`.
@@ -1023,7 +1037,7 @@ where
                     addr,
                     Some(promotion_request.clone()),
                     rotate_flag.clone(),
-                    Some(Arc::clone(&ack_policy_atomic)),
+                    Some(Arc::clone(&ack_policy)),
                     Arc::clone(&shutdown),
                     Arc::clone(&authorized_keys),
                 )
@@ -1076,7 +1090,7 @@ where
                 wiring.status,
                 control.clone(),
                 Arc::clone(&fence_state),
-                Arc::clone(&ack_policy_atomic),
+                Arc::clone(&ack_policy),
                 wiring.peer_tips,
                 wiring.peer_ids,
                 wiring.elect_requested,
@@ -1158,8 +1172,9 @@ where
                     Arc::clone(&shutdown),
                     authorized_keys,
                     rotate_flag,
-                    ack_policy_atomic,
+                    ack_policy,
                     fence_state,
+                    control.lineage_ack_policy.load(),
                     promotion_request.pending(), // promoted — EpochBump with the request's epoch floor
                     false, // a promoted node continues the history it streamed
                     raft_status,
@@ -1181,7 +1196,7 @@ where
                 addr,
                 None,
                 rotate_flag.clone(),
-                Some(Arc::clone(&ack_policy_atomic)),
+                Some(Arc::clone(&ack_policy)),
                 Arc::clone(&shutdown),
                 Arc::clone(&authorized_keys),
             )
@@ -1196,7 +1211,7 @@ where
     let InitializedEngine {
         mut app,
         writer,
-        recovered_epoch,
+        recovered_lineage,
         began_history,
     } = init_engine::<A, BufferedWriter<A::Event>>(
         &config,
@@ -1213,7 +1228,7 @@ where
     // A primary booting directly (not via promotion) keeps whatever epoch
     // its journal recovered; no bump.
     let fence_state = Arc::new(melin_transport_core::fence::FenceState::new(
-        recovered_epoch,
+        recovered_lineage.epoch,
     ));
 
     // Control-plane raft (observational election). The primary needs the
@@ -1260,8 +1275,9 @@ where
         Arc::clone(&shutdown),
         authorized_keys,
         rotate_flag,
-        ack_policy_atomic,
+        ack_policy,
         fence_state,
+        recovered_lineage.ack_policy,
         None, // not promoted — no EpochBump injection
         began_history,
         raft_status,
@@ -1631,8 +1647,16 @@ fn run_as_primary<A, L>(
     shutdown: Arc<AtomicBool>,
     authorized_keys: Arc<AuthorizedKeys>,
     rotate_flag: Option<Arc<AtomicBool>>,
-    ack_policy_atomic: Arc<AtomicU8>,
+    // The ack-policy mailbox: the policy this primary requests as it
+    // starts, and the `ACK-POLICY` requests its reader journals.
+    ack_policy: Arc<crate::policy_control::AckPolicyControl>,
     fence_state: Arc<melin_transport_core::fence::FenceState>,
+    // The ack policy the lineage has in force (`Lineage::ack_policy`): the
+    // recovered one at boot, the replica's record of it at promotion.
+    // Seeds the shadow stage's lineage next to the fence epoch, and the
+    // gate's start: the policy before the newest change, with the change
+    // pending (`initial_gate_policy`).
+    lineage_ack_policy: Option<LineagePolicy>,
     promotion: Option<u64>,
     // This boot began the history (`InitializedEngine::began_history`):
     // with replication on, client service waits for the first replica.
@@ -1659,7 +1683,7 @@ where
     // Determine replication mode. Every application's binary ships the
     // full durable transport (journal + replication + shadow), so the
     // same config knob drives any of them.
-    let enable_replication = config.replication_bind.is_some();
+    let enable_replication = config.replication() == crate::halt::Replication::Enabled;
     // Re-checked: a promotion reaches here without the boot-time check.
     validate_primary_config(config)?;
     // The reader's and the response stage's io_uring sizes, from the
@@ -1669,6 +1693,9 @@ where
     // The lineage's genesis length, read before the writer moves into
     // the pipeline: the shadow stage stamps it into every snapshot.
     let genesis_entries = writer.read_header_info()?.genesis_entries;
+    // The wire sequence of the first entry this tenure journals: the
+    // shadow stage counts from it.
+    let starting_wire_seq = writer.next_sequence();
     // Clone the application for the shadow snapshot stage before the pipeline
     // consumes it. `Application` does not require `Clone`, so this goes
     // through `clone_via_snapshot` (a snapshot round-trip unless the
@@ -1789,6 +1816,16 @@ where
     let journal_utilization = journal_stage.utilization();
     let matching_utilization = matching_stage.utilization();
     let response_utilization = Arc::new(melin_transport_core::pipeline::StageUtilization::new());
+    // Resolved before any stage starts, so a lineage under an unknown
+    // policy refuses here with nothing to unwind. The claim is this
+    // tenure's: its policy is journaled below, and the reader attaches it.
+    let ack_policy_claim = ack_policy.claim();
+    let gate_policy = primary_gate_policy(
+        lineage_ack_policy,
+        ack_policy_claim.policy(),
+        halt_gate.replication(),
+        &matching_stage,
+    )?;
 
     // Wrap each spawn closure with a tail log so a thread that returns
     // (cleanly OR via `Err`) is visible in the trace stream — the
@@ -1837,11 +1874,7 @@ where
         .map_err(|e| format!("spawn matching thread: {e}"))?,
     );
 
-    let replication_metrics = build_replication_metrics(
-        replication_consumers.is_some(),
-        &ack_policy_atomic,
-        config.ack_policy,
-    );
+    let replication_metrics = build_replication_metrics(replication_consumers.is_some());
 
     // Per-slot active flags exposed by the journal stage's replication
     // ring; the response gate filters disconnected slots out of the
@@ -1858,7 +1891,6 @@ where
     let journal_persisted_wire_seq_response = cursors.durable_wire_seq();
     let replication_metrics_response = replication_metrics.as_ref().map(Arc::clone);
     let replica_active_response = replica_active.clone();
-    let ack_policy_response = Arc::clone(&ack_policy_atomic);
     let s3 = Arc::clone(&shutdown);
     let shutdown_for_response = Arc::clone(&shutdown);
     let response_utilization_thread = Arc::clone(&response_utilization);
@@ -1874,7 +1906,7 @@ where
                 control_rx,
                 crate::response::Response::<A> {
                     journal_persisted_wire_seq: journal_persisted_wire_seq_response,
-                    ack_policy: ack_policy_response,
+                    policy: gate_policy,
                     replication_metrics: replication_metrics_response,
                     replica_active: replica_active_response,
                     heartbeat_interval,
@@ -1966,7 +1998,6 @@ where
             .ok_or("replication_metrics must be Some when replication is enabled")?;
         let handlers = [cores.repl_handler_0, cores.repl_handler_1];
         let sender_fence = Arc::clone(&fence_state);
-        let sender_ack_policy = Arc::clone(&ack_policy_atomic);
         // Bound in `run_impl` before any pipeline thread was spawned —
         // see the `repl_listener` parameter doc.
         let repl_listener = repl_listener
@@ -2001,7 +2032,6 @@ where
                         batch_size,
                         heartbeat_secs,
                         fence_state: sender_fence,
-                        ack_policy: sender_ack_policy,
                     },
                     &s_repl,
                     &ready_flag,
@@ -2039,7 +2069,11 @@ where
         config,
         &cores,
         &shutdown,
-        fence_state.epoch(),
+        Lineage {
+            epoch: fence_state.epoch(),
+            ack_policy: lineage_ack_policy,
+        },
+        starting_wire_seq,
         genesis_entries,
     )?;
 
@@ -2081,6 +2115,11 @@ where
             &shutdown,
         );
     }
+    // The policy this tenure requests, after the bump; see
+    // `PublisherClaim::journal_boot`. Only the booted claim attaches the
+    // reader.
+    let ack_policy_claim =
+        ack_policy_claim.journal_boot(lineage_ack_policy, &mut input_producer, &halt_gate);
 
     // Bring-up gate: a primary that began the history with replication
     // on serves no client until its first replica is streaming live. A
@@ -2129,6 +2168,7 @@ where
         decoder,
         halt_gate,
         refusal_tx,
+        ack_policy_claim,
         control_tx.clone(),
         config.cores.reader.core,
         connection_timeout,
@@ -2423,10 +2463,11 @@ where
         );
     }
 
-    // Mirrors the kernel-TCP `run` path: one atomic per
-    // process, threaded into both replica (pre-staging for promotion)
-    // and primary admin listeners.
-    let ack_policy_atomic = Arc::new(AtomicU8::new(config.ack_policy.as_u8()));
+    // Mirrors the kernel-TCP `run` path: one ack-policy mailbox per
+    // process, threaded into both replica (staging for promotion) and
+    // primary admin listeners.
+    let ack_policy =
+        crate::policy_control::AckPolicyControl::new(config.ack_policy, config.replication());
     // As on the kernel-TCP path: refuse a configuration no primary can run
     // under before EAL init and before anything touches the journal, in
     // every role — a replica's configuration is the one it serves under
@@ -2485,7 +2526,7 @@ where
                     addr,
                     Some(promotion_request.clone()),
                     rotate_flag.clone(),
-                    Some(Arc::clone(&ack_policy_atomic)),
+                    Some(Arc::clone(&ack_policy)),
                     Arc::clone(&shutdown),
                     Arc::clone(&authorized_keys),
                 )
@@ -2533,7 +2574,7 @@ where
                 wiring.status,
                 control.clone(),
                 Arc::clone(&fence_state),
-                Arc::clone(&ack_policy_atomic),
+                Arc::clone(&ack_policy),
                 wiring.peer_tips,
                 wiring.peer_ids,
                 wiring.elect_requested,
@@ -2649,8 +2690,9 @@ where
                     Arc::clone(&shutdown),
                     authorized_keys,
                     rotate_flag,
-                    ack_policy_atomic,
+                    ack_policy,
                     fence_state,
+                    control.lineage_ack_policy.load(),
                     promotion_request.pending(), // promoted — EpochBump with the request's epoch floor
                     raft_status,
                     journal_tip,
@@ -2701,7 +2743,7 @@ where
     let InitializedEngine {
         mut app,
         writer,
-        recovered_epoch,
+        recovered_lineage,
         began_history: _,
     } = init_engine::<A, BufferedWriter<A::Event>>(
         &config,
@@ -2712,7 +2754,7 @@ where
 
     // Fencing state for this DPDK primary, seeded with the recovered epoch.
     let fence_state = Arc::new(melin_transport_core::fence::FenceState::new(
-        recovered_epoch,
+        recovered_lineage.epoch,
     ));
 
     // Control-plane raft (kernel TCP even on DPDK — off the hot path, no
@@ -2755,7 +2797,7 @@ where
                 addr,
                 None,
                 rotate_flag.clone(),
-                Some(Arc::clone(&ack_policy_atomic)),
+                Some(Arc::clone(&ack_policy)),
                 Arc::clone(&shutdown),
                 Arc::clone(&authorized_keys),
             )
@@ -2776,8 +2818,9 @@ where
         Arc::clone(&shutdown),
         authorized_keys,
         rotate_flag,
-        ack_policy_atomic,
+        ack_policy,
         fence_state,
+        recovered_lineage.ack_policy,
         None, // not promoted — no EpochBump injection
         raft_status,
         journal_tip,
@@ -2815,8 +2858,10 @@ fn run_as_primary_dpdk<A>(
     shutdown: Arc<AtomicBool>,
     authorized_keys: Arc<AuthorizedKeys>,
     rotate_flag: Option<Arc<AtomicBool>>,
-    ack_policy_atomic: Arc<AtomicU8>,
+    ack_policy: Arc<crate::policy_control::AckPolicyControl>,
     fence_state: Arc<melin_transport_core::fence::FenceState>,
+    // As `run_as_primary`'s.
+    lineage_ack_policy: Option<LineagePolicy>,
     promotion: Option<u64>,
     raft_status: Option<Arc<melin_transport_core::health::RaftStatus>>,
     journal_tip: melin_transport_core::AdvertisedJournalTip,
@@ -2833,6 +2878,7 @@ where
     // As on the kernel-TCP path: read before the writer moves into the
     // pipeline, for the shadow stage's snapshots.
     let genesis_entries = writer.read_header_info()?.genesis_entries;
+    let starting_wire_seq = writer.next_sequence();
 
     // Clone the application's state for the shadow snapshot stage before
     // moving it into the pipeline (same as the kernel TCP path).
@@ -2847,7 +2893,7 @@ where
 
     // Replication setup (same as TCP path). The configuration was
     // validated before `init_engine`.
-    let enable_replication = config.replication_bind.is_some();
+    let enable_replication = config.replication() == crate::halt::Replication::Enabled;
 
     // Build disruptor pipeline (same flags as the kernel TCP path).
     // DPDK doesn't currently spawn the publisher thread (see
@@ -2959,6 +3005,15 @@ where
     let journal_utilization = journal_stage.utilization();
     let matching_utilization = matching_stage.utilization();
     let response_utilization = Arc::new(melin_transport_core::pipeline::StageUtilization::new());
+    // As on kernel TCP: resolved before any stage starts, from this
+    // tenure's claim, which the poll thread attaches.
+    let ack_policy_claim = ack_policy.claim();
+    let gate_policy = primary_gate_policy(
+        lineage_ack_policy,
+        ack_policy_claim.policy(),
+        halt_gate.replication(),
+        &matching_stage,
+    )?;
 
     let s1 = Arc::clone(&shutdown);
     // As on kernel TCP: start the journal's helper threads here, not on
@@ -2985,11 +3040,7 @@ where
         .map_err(|e| format!("spawn matching thread: {e}"))?,
     );
 
-    let replication_metrics = build_replication_metrics(
-        replication_consumers.is_some(),
-        &ack_policy_atomic,
-        config.ack_policy,
-    );
+    let replication_metrics = build_replication_metrics(replication_consumers.is_some());
 
     let replica_active: Option<[Arc<AtomicBool>; 2]> =
         replication_ring_progress.as_ref().map(|rp| {
@@ -3005,7 +3056,6 @@ where
     let journal_persisted_wire_seq_response = cursors.durable_wire_seq();
     let replication_metrics_response = replication_metrics.as_ref().map(Arc::clone);
     let replica_active_response = replica_active.clone();
-    let ack_policy_response = Arc::clone(&ack_policy_atomic);
     let active_connections_response = Arc::clone(&active_connections);
     let s3 = Arc::clone(&shutdown);
     let response_utilization_thread = Arc::clone(&response_utilization);
@@ -3015,7 +3065,7 @@ where
                 output_consumer,
                 control_rx,
                 journal_persisted_wire_seq_response,
-                ack_policy_response,
+                gate_policy,
                 replication_metrics_response,
                 replica_active_response,
                 &s3,
@@ -3038,7 +3088,11 @@ where
         config,
         &cores,
         &shutdown,
-        fence_state.epoch(),
+        Lineage {
+            epoch: fence_state.epoch(),
+            ack_policy: lineage_ack_policy,
+        },
+        starting_wire_seq,
         genesis_entries,
     )?;
 
@@ -3128,7 +3182,6 @@ where
             batch_size,
             heartbeat_secs,
             Arc::clone(&fence_state),
-            Arc::clone(&ack_policy_atomic),
             Arc::clone(&authorized_keys),
         )?;
         // Legacy text match — `lan-bench-suite.sh` `wait_for_log` keys
@@ -3158,6 +3211,10 @@ where
             &shutdown,
         );
     }
+    // As on kernel TCP: the policy this tenure requests, after the bump,
+    // and the booted claim the poll thread attaches.
+    let ack_policy_claim =
+        ack_policy_claim.journal_boot(lineage_ack_policy, &mut input_producer, &halt_gate);
 
     // Journal `on_primary` through the pipeline. Genesis is already in
     // the journal (`init_engine` creates the journal with it); replicas
@@ -3220,12 +3277,16 @@ where
     // Exactly one client poll queue (LMAX: single reader → single
     // matcher), on this thread.
     melin_app::affinity::pin_thread("dpdk-poll-0", reader_core);
+    // Attached while this thread still owns the producer alone, before the
+    // poll loop serves anyone. No wakeup: the poll thread never parks.
+    let ack_policy = ack_policy_claim.attach(&mut input_producer, &halt_gate, None);
     crate::dpdk_transport::run_dpdk_poll::<A>(
         transport,
         input_producer,
         decoder,
         halt_gate,
         refusal_tx,
+        ack_policy,
         control_tx,
         tx_rx_0,
         &shutdown,
@@ -3274,7 +3335,6 @@ fn journal_promotion_epoch_bump<E: melin_app::AppEvent>(
 ) {
     use melin_app::unix_epoch_nanos;
     use melin_journal::JournalEvent;
-    use melin_transport_core::trace::mono_trace_ns;
 
     let new_epoch = fence_state.epoch().saturating_add(1).max(requested_epoch);
     // Re-validate the term↔epoch alignment at the moment the epoch is
@@ -3300,15 +3360,10 @@ fn journal_promotion_epoch_bump<E: melin_app::AppEvent>(
         new_epoch,
         requested_epoch, "promotion: injecting epoch bump"
     );
-    input_producer.publish(InputSlot {
-        connection_id: 0,
-        key_hash: 0,
-        sequence: 0,
-        timestamp_ns: unix_epoch_nanos(),
-        event: JournalEvent::EpochBump { epoch: new_epoch },
-        publish_ts: mono_trace_ns(),
-        recv_ts: mono_trace_ns(),
-    });
+    input_producer.publish(InputSlot::node_event(
+        JournalEvent::EpochBump { epoch: new_epoch },
+        unix_epoch_nanos(),
+    ));
     // Wait until the matching stage observes the bump (epoch raised) so
     // the node advertises `new_epoch` on the very first handshake. Bounded
     // by the shutdown flag so a stuck pipeline can't wedge startup.
@@ -3345,7 +3400,6 @@ fn journal_on_primary_events<E: melin_app::AppEvent>(
 ) {
     use melin_app::unix_epoch_nanos;
     use melin_journal::JournalEvent;
-    use melin_transport_core::trace::mono_trace_ns;
 
     let on_primary_count = on_primary.len();
     // Nothing published: the cursors never advance past a target, so
@@ -3360,15 +3414,10 @@ fn journal_on_primary_events<E: melin_app::AppEvent>(
     // event as `JournalEvent::App` and stamps transport-level metadata.
     let mut last_published_seq = 0u64;
     for event in on_primary {
-        last_published_seq = input_producer.publish(InputSlot {
-            connection_id: 0,
-            key_hash: 0,
-            sequence: 0,
-            timestamp_ns: unix_epoch_nanos(),
-            event: JournalEvent::App(event),
-            publish_ts: mono_trace_ns(),
-            recv_ts: mono_trace_ns(),
-        });
+        last_published_seq = input_producer.publish(InputSlot::node_event(
+            JournalEvent::App(event),
+            unix_epoch_nanos(),
+        ));
     }
     let publish_elapsed = start.elapsed();
 
@@ -3511,9 +3560,10 @@ fn genesis_target<E: melin_app::AppEvent>(
 pub(crate) struct InitializedEngine<A, W> {
     pub(crate) app: A,
     pub(crate) writer: W,
-    /// The fencing epoch recovered from the snapshot + journal (0 for a
-    /// genesis node); the caller seeds the node's `FenceState` with it.
-    pub(crate) recovered_epoch: u64,
+    /// The lineage recovered from the snapshot + journal (the genesis
+    /// lineage for a new node): the caller seeds the node's `FenceState`
+    /// with its epoch, and its shadow snapshots with the whole of it.
+    pub(crate) recovered_lineage: melin_transport_core::lineage::Lineage,
     /// This boot began the history: it created the journal (with its
     /// genesis), or journaled the genesis into a journal that held no
     /// entry. A primary uses it to hold client service until its first
@@ -3620,14 +3670,14 @@ where
                 );
                 // The lineage's genesis length comes from the snapshot,
                 // the only record of the lineage left on disk.
-                let (app, snap) = melin_transport_core::snapshot::load_with_header::<A>(snap_path)?;
+                let (app, snap) = melin_transport_core::snapshot::load::<A>(snap_path)?;
                 let writer = W::create_continuing(
                     &config.journal,
                     snap.sequence + 1,
                     snap.chain_hash,
                     snap.genesis_entries,
                 )?;
-                JournaledApp::<A, W>::from_parts(app, writer, snap.epoch)
+                JournaledApp::<A, W>::from_parts(app, writer, snap.lineage)
             }
             BootstrapSource::JournalOnly => {
                 info!("recovering from journal");
@@ -3707,12 +3757,12 @@ where
         }
     }
 
-    let recovered_epoch = engine.recovered_epoch();
+    let recovered_lineage = engine.recovered_lineage();
     let (app, writer) = engine.into_parts();
     Ok(InitializedEngine {
         app,
         writer,
-        recovered_epoch,
+        recovered_lineage,
         began_history,
     })
 }
@@ -3723,27 +3773,47 @@ where
 
 fn build_replication_metrics(
     has_replication: bool,
-    ack_policy_atomic: &AtomicU8,
-    config_policy: crate::ack_policy::AckPolicy,
 ) -> Option<Arc<crate::replication::ReplicationMetrics>> {
-    let metrics = if has_replication {
-        Some(Arc::new(crate::replication::ReplicationMetrics::default()))
-    } else {
-        None
-    };
-
-    let active_policy =
-        crate::ack_policy::AckPolicy::from_u8(ack_policy_atomic.load(Ordering::Relaxed))
-            .unwrap_or(config_policy);
-    info!(
-        ack_policy = %active_policy,
-        clauses = %active_policy.to_policy(),
-        "ack policy active"
-    );
-
-    metrics
+    has_replication.then(|| Arc::new(crate::replication::ReplicationMetrics::default()))
 }
 
+/// The response gate's policy on a new primary pipeline: it starts under
+/// the lineage's policy, or `requested` (the configured policy, or one an
+/// operator staged) while the lineage holds none or replication is
+/// disabled — see [`initial_gate_policy`](crate::durability_gate::initial_gate_policy).
+/// Seeds the health endpoint's "journaled" gauge with the lineage's
+/// policy, and wires the matching stage's forced changes to the gate.
+///
+/// `replication` is the halt gate's (`HaltGate::replication`), the one
+/// the producer's entries are decided on, so the gate's start and those
+/// entries agree on whether this node is standalone.
+fn primary_gate_policy<A: Application>(
+    lineage_ack_policy: Option<LineagePolicy>,
+    requested: crate::ack_policy::AckPolicy,
+    replication: crate::halt::Replication,
+    matching_stage: &melin_transport_core::pipeline::MatchingStage<A>,
+) -> Result<crate::durability_gate::GatePolicy, String> {
+    let start =
+        crate::durability_gate::initial_gate_policy(lineage_ack_policy, requested, replication)?;
+    matching_stage
+        .utilization()
+        .ack_policy_journaled
+        .store(lineage_ack_policy.map(|p| p.policy()));
+    info!(
+        ack_policy = %start.in_force,
+        clauses = %start.in_force.to_policy(),
+        pending = ?start.pending.map(|p| p.policy.as_str()),
+        requested = %requested,
+        from_lineage = lineage_ack_policy.is_some(),
+        "ack policy active"
+    );
+    Ok(crate::durability_gate::GatePolicy {
+        start,
+        forced: matching_stage.forced_policy(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)] // the stage's inputs, as `shadow::run`
 fn spawn_shadow_stage<A: Application + Send + 'static>(
     shadow_consumer: Option<Consumer<InputSlot<A::Event>>>,
     shadow_app: Option<A>,
@@ -3753,7 +3823,10 @@ fn spawn_shadow_stage<A: Application + Send + 'static>(
     config: &ServerConfig,
     cores: &PipelineCores,
     shutdown: &Arc<AtomicBool>,
-    initial_epoch: u64,
+    initial_lineage: Lineage,
+    // The wire sequence of the first entry the shadow will consume (see
+    // `shadow::run`).
+    starting_wire_seq: u64,
     // The lineage's genesis length, from the journal header — stamped
     // into every snapshot (see `shadow::run`).
     genesis_entries: Option<u64>,
@@ -3771,7 +3844,6 @@ where
     let shadow_ex = shadow_app.ok_or("shadow application must be Some when shadow is enabled")?;
     let s_shadow = Arc::clone(shutdown);
     let shadow = cores.shadow;
-    let shadow_initial_epoch = initial_epoch;
     let handle = melin_app::affinity::spawn_placed("shadow", shadow.core, move || {
         melin_transport_core::shadow::run(
             shadow_cons,
@@ -3781,7 +3853,8 @@ where
             chain_hash,
             &s_shadow,
             shadow.wait,
-            shadow_initial_epoch,
+            initial_lineage,
+            starting_wire_seq,
             genesis_entries,
         );
     })
@@ -3804,7 +3877,7 @@ fn spawn_health_endpoint(
     cursors: &melin_transport_core::PipelineCursors,
     input_cursor: Box<dyn melin_pipeline::ring::QueueCursor>,
     pipeline_healthy: &Arc<AtomicBool>,
-    replicas_connected: &Option<Arc<std::sync::atomic::AtomicU32>>,
+    replicas_connected: &Option<Arc<melin_transport_core::replica_presence::ReplicaPresence>>,
     fence_state: &Arc<melin_transport_core::fence::FenceState>,
     replication_metrics: &Option<Arc<crate::replication::ReplicationMetrics>>,
     replica_active: &Option<[Arc<AtomicBool>; 2]>,
@@ -4664,7 +4737,7 @@ mod genesis_tests {
 
     type Writer = BufferedWriter<CounterEvent>;
 
-    fn config(dir: &Path) -> ServerConfig {
+    pub(super) fn config(dir: &Path) -> ServerConfig {
         ServerConfig {
             journal: dir.join("counter.journal"),
             ..ServerConfig::default()
@@ -4790,13 +4863,13 @@ mod genesis_tests {
     }
 
     /// Save a snapshot of a booted engine as the shadow stage would:
-    /// its state, position, chain, epoch and lineage genesis length.
-    fn save_snapshot(engine: &super::InitializedEngine<Counter, Writer>, path: &Path) {
+    /// its state, position, chain, lineage and lineage genesis length.
+    pub(super) fn save_snapshot(engine: &super::InitializedEngine<Counter, Writer>, path: &Path) {
         melin_transport_core::snapshot::save::<Counter>(
             &engine.app,
             melin_transport_core::WireSeq::new(engine.writer.next_sequence() - 1),
             engine.writer.chain_hash().unwrap_or([0u8; 32]),
-            engine.recovered_epoch,
+            engine.recovered_lineage,
             engine
                 .writer
                 .read_header_info()
@@ -5203,6 +5276,222 @@ mod genesis_tests {
         check_recovered_history_holds_genesis(1, Some(0)).expect("no genesis");
         check_recovered_history_holds_genesis(1, None).expect("unknown: not checked");
         check_recovered_history_holds_genesis(3, None).expect("unknown: not checked");
+    }
+}
+
+/// How a new primary pipeline resolves the policy its response gate
+/// starts under, and what it seeds alongside.
+#[cfg(test)]
+mod primary_gate_policy_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+
+    use counter_server::{Counter, CounterEvent};
+    use melin_pipeline::ring::DisruptorBuilder;
+    use melin_pipeline::wait::WaitStrategy;
+    use melin_transport_core::fence::FenceState;
+    use melin_transport_core::lineage::ForcedPolicy;
+    use melin_transport_core::pipeline::{InputSlot, MatchingStage, OutputSlot};
+    use melin_transport_core::{DurableWireSeqCursor, WireSeq};
+
+    use super::primary_gate_policy;
+    use crate::ack_policy::AckPolicy;
+    use crate::halt::Replication::Enabled;
+
+    fn matching_stage() -> MatchingStage<Counter> {
+        let (_, mut inputs) = DisruptorBuilder::<InputSlot<CounterEvent>>::new(8)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
+        let (output, _) = DisruptorBuilder::<
+            OutputSlot<
+                <Counter as melin_app::Application>::Report,
+                <Counter as melin_app::Application>::QueryResponse,
+            >,
+        >::new(8)
+        .add_consumer()
+        .build(WaitStrategy::SpinThenYield);
+        MatchingStage::new(
+            Counter::default(),
+            inputs.pop().expect("one consumer"),
+            output,
+            Arc::new(AtomicU64::new(0)),
+            DurableWireSeqCursor::detached(WireSeq::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(FenceState::new(0)),
+            WaitStrategy::SpinThenYield,
+            1,
+        )
+    }
+
+    /// The lineage's policy wins over the requested one: the gate starts
+    /// under the policy before its newest change, with the change pending;
+    /// the newest seeds the "journaled" gauge, and the gate reads the
+    /// stage's forced cell. The rest of the resolution (no lineage policy,
+    /// the lineage's first change, standalone, an unknown byte) is
+    /// `initial_gate_policy`'s, pinned in `durability_gate.rs`.
+    #[test]
+    fn the_lineage_policy_wins_and_seeds_the_journaled_gauge() {
+        let stage = matching_stage();
+        let lineage = melin_transport_core::lineage::LineagePolicy {
+            change: melin_journal::AckPolicyChange {
+                policy: AckPolicy::TwoDisks.to_byte(),
+                unwitnessed: false,
+            },
+            wire_seq: WireSeq::new(7),
+            previous: Some(AckPolicy::Ram.to_byte()),
+        };
+        let policy = primary_gate_policy(Some(lineage), AckPolicy::Disk, Enabled, &stage)
+            .expect("a known policy");
+        assert_eq!(
+            policy.start,
+            crate::durability_gate::GateStart {
+                in_force: AckPolicy::Ram,
+                pending: Some(crate::durability_gate::PendingChange {
+                    wire_seq: WireSeq::new(7),
+                    policy: AckPolicy::TwoDisks,
+                    unwitnessed: false,
+                }),
+            }
+        );
+        assert_eq!(
+            stage.utilization().ack_policy_journaled.load(),
+            Some(AckPolicy::TwoDisks.to_byte())
+        );
+        assert_eq!(policy.forced.load(), None::<ForcedPolicy>);
+    }
+
+    /// A boot from a v4 snapshot whose history before it is gone restores
+    /// the whole transition, not just the policy: the policy before the
+    /// newest change, the change's own wire sequence and its unwitnessed
+    /// flag reach the gate, which starts under the policy before with the
+    /// change pending. Both boots `init_engine` takes on such a layout:
+    /// the snapshot alone (no segment left), and the snapshot with the
+    /// empty segment that boot began, holding nothing before it.
+    #[test]
+    fn a_boot_from_a_snapshot_alone_starts_the_gate_with_its_change_pending() {
+        use melin_journal::{AckPolicyChange, JournalEvent};
+        use melin_transport_core::lineage::{Lineage, LineagePolicy};
+
+        type Writer = melin_journal::BufferedWriter<CounterEvent>;
+        let boot = |cfg: &super::ServerConfig| {
+            super::init_engine::<Counter, Writer>(cfg, &(), Vec::new()).expect("boot")
+        };
+        let change = |policy: AckPolicy, unwitnessed| {
+            JournalEvent::AckPolicyChange(AckPolicyChange {
+                policy: policy.to_byte(),
+                unwitnessed,
+            })
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = super::genesis_tests::config(dir.path());
+
+        // The lineage's first policy at 1, a write, a forced weakening at
+        // 3, a write: the transition to restore is `disk+ram` → `disk` at
+        // 3, unwitnessed.
+        let mut engine = boot(&cfg);
+        for event in [
+            change(AckPolicy::DiskAndRam, false),
+            JournalEvent::App(CounterEvent::Increment { amount: 1 }),
+            change(AckPolicy::Disk, true),
+            JournalEvent::App(CounterEvent::Increment { amount: 2 }),
+        ] {
+            let seq = engine.writer.allocate_sequence();
+            engine
+                .writer
+                .encode_event(seq, 0, &event, 0)
+                .expect("encode");
+        }
+        engine.writer.flush_batch_sync().expect("flush");
+        drop(engine);
+        let expected = Lineage {
+            epoch: 0,
+            ack_policy: Some(LineagePolicy {
+                change: AckPolicyChange {
+                    policy: AckPolicy::Disk.to_byte(),
+                    unwitnessed: true,
+                },
+                wire_seq: WireSeq::new(3),
+                previous: Some(AckPolicy::DiskAndRam.to_byte()),
+            }),
+        };
+
+        // The shadow's snapshot of the recovered state, then the journal
+        // gone: every entry it held, the change's included, is the
+        // snapshot's alone.
+        let engine = boot(&cfg);
+        assert_eq!(
+            engine.recovered_lineage, expected,
+            "recovered from the journal"
+        );
+        super::genesis_tests::save_snapshot(&engine, &cfg.journal.with_extension("snapshot"));
+        drop(engine);
+        std::fs::remove_file(&cfg.journal).expect("prune the journal");
+        assert!(
+            melin_journal::segment::list_archives(&cfg.journal)
+                .expect("list archives")
+                .is_empty()
+        );
+
+        let pending = crate::durability_gate::GateStart {
+            in_force: AckPolicy::DiskAndRam,
+            pending: Some(crate::durability_gate::PendingChange {
+                wire_seq: WireSeq::new(3),
+                policy: AckPolicy::Disk,
+                unwitnessed: true,
+            }),
+        };
+        // The first boot opens a fresh, empty segment beside the snapshot,
+        // so the second recovers through the other arm.
+        for (layout, segment) in [
+            ("the snapshot alone", false),
+            ("the snapshot and an empty segment", true),
+        ] {
+            assert_eq!(cfg.journal.exists(), segment, "{layout}");
+            let engine = boot(&cfg);
+            assert_eq!(engine.writer.next_sequence(), 5, "{layout}");
+            assert_eq!(engine.recovered_lineage, expected, "{layout}");
+            let policy = primary_gate_policy(
+                engine.recovered_lineage.ack_policy,
+                AckPolicy::Disk,
+                Enabled,
+                &matching_stage(),
+            )
+            .expect("a known policy");
+            assert_eq!(policy.start, pending, "{layout}");
+        }
+    }
+
+    /// A promotion seeds its gate the same way, from the record the
+    /// replica's receive thread folded the stream's changes into
+    /// (`ReplicaControlPlane::lineage_ack_policy`): a weakening the
+    /// replica received is pending under the policy before it, and a
+    /// forced re-send of it makes it pending unwitnessed, applied once on
+    /// the promoted node's disk.
+    #[test]
+    fn a_promotion_seeds_its_gate_from_the_replicas_record() {
+        let streamed = |policy: AckPolicy, unwitnessed| melin_journal::AckPolicyChange {
+            policy: policy.to_byte(),
+            unwitnessed,
+        };
+        let record = melin_transport_core::lineage::SharedLineagePolicy::default();
+        record.observe(WireSeq::new(1), streamed(AckPolicy::DiskAndRam, false));
+        record.observe(WireSeq::new(6), streamed(AckPolicy::Disk, false));
+        let start = |record: &melin_transport_core::lineage::SharedLineagePolicy| {
+            primary_gate_policy(record.load(), AckPolicy::Disk, Enabled, &matching_stage())
+                .expect("a known policy")
+                .start
+        };
+        let pending = |unwitnessed| crate::durability_gate::GateStart {
+            in_force: AckPolicy::DiskAndRam,
+            pending: Some(crate::durability_gate::PendingChange {
+                wire_seq: WireSeq::new(6),
+                policy: AckPolicy::Disk,
+                unwitnessed,
+            }),
+        };
+        assert_eq!(start(&record), pending(false));
+        record.observe(WireSeq::new(9), streamed(AckPolicy::Disk, true));
+        assert_eq!(start(&record), pending(true));
     }
 }
 

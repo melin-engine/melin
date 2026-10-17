@@ -62,14 +62,20 @@
 //! | 0x01 | retired (`GenesisHash`, ≤ v13 — anchor now lives in the file header) |
 //! | 0x02 | retired (`Checkpoint`, ≤ v13 — chain is schedule-free, no in-stream seals) |
 //! | 0x03 | `Tick`               |
+//! | 0x04 | `EpochBump`          |
+//! | 0x05 | `AckPolicyChange`    |
 //! | 0x80 | `App(E)` (dispatches to [`AppEvent::encode`]) |
+//!
+//! [`decode_event`] turns a tag and its payload back into an event, for
+//! this module's entry decoder and for anything else that holds entry
+//! bytes (the replication wire), so a tag is decoded in one place.
 
 use melin_app::AppEvent;
 use zerocopy::little_endian::{U16, U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use super::error::JournalError;
-use super::event::JournalEvent;
+use super::event::{AckPolicyByte, AckPolicyChange, JournalEvent};
 use crate::le;
 
 /// File magic bytes: "JOUR" in ASCII (little-endian u32).
@@ -292,14 +298,23 @@ pub const ENTRY_FRAMING_SIZE: usize = ENTRY_HEADER_SIZE + ENTRY_META_SIZE + CRC_
 
 const _: () = assert!(ENTRY_FRAMING_SIZE == 33);
 
-/// Payload width of the transport-intrinsic variants — `Tick`'s `now_ns`
-/// and `EpochBump`'s `epoch`, both a `u64`.
+/// Payload width of the widest transport-intrinsic variants — `Tick`'s
+/// `now_ns` and `EpochBump`'s `epoch`, both a `u64`. (`AckPolicyChange`
+/// is narrower: two bytes.)
 ///
 /// The journal writes these whatever `E` is, so an entry's true ceiling is
 /// this *or* the app's declared bound, whichever is larger. An application
 /// narrower than 8 bytes that reserved only its own width would leave a
 /// tick a hole too small to land in — see [`crate::encoder::entry_size`].
 pub const TRANSPORT_PAYLOAD_SIZE: usize = 8;
+
+/// Payload width of [`JournalEvent::AckPolicyChange`]:
+/// `[policy: u8][flags: u8]`.
+const ACK_POLICY_CHANGE_PAYLOAD_SIZE: usize = 2;
+
+// Every reservation is sized from `TRANSPORT_PAYLOAD_SIZE`, so no
+// transport payload may be wider.
+const _: () = assert!(ACK_POLICY_CHANGE_PAYLOAD_SIZE <= TRANSPORT_PAYLOAD_SIZE);
 
 const _: () = assert!(FILE_HEADER_FIELDS_SIZE == 60);
 const _: () = assert!(FILE_HEADER_V15_FIELDS_SIZE == 52);
@@ -328,7 +343,20 @@ const TAG_TICK: u8 = 0x03;
 /// `docs/replication.md` (roll forward, or restart from a snapshot) —
 /// the journal itself is healthy.
 const TAG_EPOCH_BUMP: u8 = 0x04;
+/// Ack-policy change (see [`JournalEvent::AckPolicyChange`]). Payload is
+/// `[policy: u8][flags: u8]`, the policy byte opaque to the journal.
+///
+/// Added without a `FORMAT_VERSION` bump, for the reasons
+/// [`TAG_EPOCH_BUMP`] gives: an older binary reading a lineage that holds
+/// one refuses it as an unknown tag, it does not truncate.
+const TAG_ACK_POLICY_CHANGE: u8 = 0x05;
 const TAG_APP: u8 = 0x80;
+
+/// Flag bit of an [`AckPolicyChange`]: the change was not witnessed
+/// (see [`AckPolicyChange::unwitnessed`]). Every other bit is reserved
+/// and refused on decode, so an entry decodes only if it re-encodes to
+/// the same bytes.
+const ACK_POLICY_FLAG_UNWITNESSED: u8 = 0x01;
 
 /// Encode the file header into `buf`.
 ///
@@ -532,6 +560,16 @@ pub fn encode<E: AppEvent>(
             pos += 8;
             TAG_EPOCH_BUMP
         }
+        JournalEvent::AckPolicyChange(change) => {
+            buf[pos] = change.policy.0;
+            buf[pos + 1] = if change.unwitnessed {
+                ACK_POLICY_FLAG_UNWITNESSED
+            } else {
+                0
+            };
+            pos += ACK_POLICY_CHANGE_PAYLOAD_SIZE;
+            TAG_ACK_POLICY_CHANGE
+        }
         JournalEvent::App(e) => {
             let n = e.encoded_size();
             // One compare against a monomorphised constant, and it is the
@@ -693,45 +731,98 @@ pub fn decode<E: AppEvent>(buf: &[u8]) -> Result<DecodedEntry<E>, JournalError> 
 
     let event_payload = &buf[ENTRY_HEADER_SIZE + ENTRY_META_SIZE..data_end];
 
-    let event = match event_tag {
-        TAG_TICK => {
-            if event_payload.len() < 8 {
-                return Err(JournalError::CorruptEntry {
-                    sequence,
-                    reason: "Tick payload too short",
-                });
-            }
-            JournalEvent::Tick {
-                now_ns: le::get_u64(event_payload),
-            }
-        }
-        TAG_EPOCH_BUMP => {
-            if event_payload.len() < 8 {
-                return Err(JournalError::CorruptEntry {
-                    sequence,
-                    reason: "EpochBump payload too short",
-                });
-            }
-            JournalEvent::EpochBump {
-                epoch: le::get_u64(event_payload),
-            }
-        }
-        TAG_APP => {
-            let e = E::decode(event_payload).map_err(|codec_err| JournalError::CorruptEntry {
-                sequence,
-                reason: codec_err_reason(codec_err),
-            })?;
-            JournalEvent::App(e)
-        }
-        _ => {
-            return Err(JournalError::CorruptEntry {
-                sequence,
-                reason: "unknown event tag",
-            });
-        }
-    };
+    let event =
+        decode_event::<E>(event_tag, event_payload).map_err(|e| JournalError::CorruptEntry {
+            sequence,
+            reason: e.reason(),
+        })?;
 
     Ok((total_len, sequence, timestamp_ns, key_hash, event))
+}
+
+/// Why [`decode_event`] could not turn a tag and payload into an event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventDecodeError {
+    /// A tag this codec never writes.
+    UnknownTag(u8),
+    /// A transport event's payload does not hold its fields. The reason
+    /// is a fixed site in the decoder.
+    Malformed(&'static str),
+    /// The application codec refused an `App` payload.
+    App(melin_app::CodecError),
+}
+
+impl EventDecodeError {
+    /// A static description, for [`JournalError::CorruptEntry`], which
+    /// cannot carry the details.
+    fn reason(self) -> &'static str {
+        match self {
+            EventDecodeError::UnknownTag(_) => "unknown event tag",
+            EventDecodeError::Malformed(reason) => reason,
+            EventDecodeError::App(e) => codec_err_reason(e),
+        }
+    }
+}
+
+impl std::fmt::Display for EventDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EventDecodeError::UnknownTag(tag) => write!(f, "unknown event tag 0x{tag:02x}"),
+            EventDecodeError::Malformed(reason) => f.write_str(reason),
+            EventDecodeError::App(e) => write!(f, "app event decode failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for EventDecodeError {}
+
+/// Decode an entry's event from its tag and payload: the one decoder of
+/// the event tags, shared by [`decode`] and by everything else that holds
+/// entry bytes (the replication wire ships entries minus their magic).
+///
+/// Checks only what the payload must hold. A payload wider than its event
+/// is [`decode`]'s to refuse, before the CRC; on the wire it fails the
+/// re-encode check instead, which compares against the entry's own CRC.
+pub fn decode_event<E: AppEvent>(
+    tag: u8,
+    payload: &[u8],
+) -> Result<JournalEvent<E>, EventDecodeError> {
+    match tag {
+        TAG_TICK => Ok(JournalEvent::Tick {
+            now_ns: payload_u64(payload, "Tick payload too short")?,
+        }),
+        TAG_EPOCH_BUMP => Ok(JournalEvent::EpochBump {
+            epoch: payload_u64(payload, "EpochBump payload too short")?,
+        }),
+        TAG_ACK_POLICY_CHANGE => {
+            let &[policy, flags, ..] = payload else {
+                return Err(EventDecodeError::Malformed(
+                    "AckPolicyChange payload too short",
+                ));
+            };
+            if flags & !ACK_POLICY_FLAG_UNWITNESSED != 0 {
+                return Err(EventDecodeError::Malformed(
+                    "AckPolicyChange sets a reserved flag bit",
+                ));
+            }
+            Ok(JournalEvent::AckPolicyChange(AckPolicyChange {
+                policy: AckPolicyByte(policy),
+                unwitnessed: flags & ACK_POLICY_FLAG_UNWITNESSED != 0,
+            }))
+        }
+        TAG_APP => E::decode(payload)
+            .map(JournalEvent::App)
+            .map_err(EventDecodeError::App),
+        other => Err(EventDecodeError::UnknownTag(other)),
+    }
+}
+
+/// The little-endian `u64` a transport payload starts with.
+fn payload_u64(payload: &[u8], too_short: &'static str) -> Result<u64, EventDecodeError> {
+    if payload.len() < core::mem::size_of::<u64>() {
+        return Err(EventDecodeError::Malformed(too_short));
+    }
+    Ok(le::get_u64(payload))
 }
 
 /// Offset of the event tag within an entry: after the header and the
@@ -740,7 +831,8 @@ const EVENT_TAG_OFFSET: usize = ENTRY_HEADER_SIZE + core::mem::size_of::<u64>();
 
 /// The widest `length` (metadata plus payload) an entry can carry, given
 /// its event tag when it is known: the 8-byte transport payload for a
-/// tick or an epoch bump, the application's declared
+/// tick or an epoch bump, the 2-byte one for an ack-policy change, the
+/// application's declared
 /// [`AppEvent::MAX_ENCODED_SIZE`] for an application event — the encoder
 /// refuses anything wider — and the larger of the two when the tag is
 /// not yet buffered or not one this codec writes (that entry fails on its
@@ -748,6 +840,7 @@ const EVENT_TAG_OFFSET: usize = ENTRY_HEADER_SIZE + core::mem::size_of::<u64>();
 fn max_entry_length<E: AppEvent>(tag: Option<u8>) -> usize {
     let payload = match tag {
         Some(TAG_TICK | TAG_EPOCH_BUMP) => TRANSPORT_PAYLOAD_SIZE,
+        Some(TAG_ACK_POLICY_CHANGE) => ACK_POLICY_CHANGE_PAYLOAD_SIZE,
         Some(TAG_APP) => E::MAX_ENCODED_SIZE,
         _ => E::MAX_ENCODED_SIZE.max(TRANSPORT_PAYLOAD_SIZE),
     };
@@ -846,6 +939,160 @@ mod tests {
         round_trip(JournalEvent::EpochBump { epoch: 0 });
         round_trip(JournalEvent::EpochBump { epoch: 1 });
         round_trip(JournalEvent::EpochBump { epoch: u64::MAX });
+    }
+
+    fn ack_policy_change(policy: u8, unwitnessed: bool) -> JournalEvent<TestEvent> {
+        JournalEvent::AckPolicyChange(AckPolicyChange {
+            policy: AckPolicyByte(policy),
+            unwitnessed,
+        })
+    }
+
+    /// Every policy byte round-trips, known to the runtime or not: the
+    /// journal carries it opaquely, and the runtime is the one to refuse
+    /// a byte it does not know.
+    #[test]
+    fn round_trip_ack_policy_change() {
+        for policy in [0, 1, 2, 3, 0xff] {
+            for unwitnessed in [false, true] {
+                round_trip(ack_policy_change(policy, unwitnessed));
+            }
+        }
+    }
+
+    /// Pins the on-disk bytes of an ack-policy change: tag 0x05, then the
+    /// policy byte, then the flags with bit 0 for unwitnessed.
+    #[test]
+    fn ack_policy_change_layout_is_byte_pinned() {
+        for (unwitnessed, flags) in [(false, 0x00), (true, 0x01)] {
+            let mut buf = [0u8; 256];
+            let n = encode(
+                0x2827_2625_2423_2221,
+                0x3837_3635_3433_3231,
+                0x0807_0605_0403_0201,
+                &ack_policy_change(0x03, unwitnessed),
+                &mut buf,
+            )
+            .expect("encode");
+            // length = key_hash(8) + tag(1) + payload(2) = 11.
+            let mut expected: Vec<u8> = vec![
+                0x45, 0x4A, // ENTRY_MAGIC
+                0x0b, 0x00, // length = 11
+                0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, // sequence
+                0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, // timestamp_ns
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // key_hash
+                0x05, // TAG_ACK_POLICY_CHANGE
+                0x03, // policy
+                flags,
+            ];
+            let crc = crc32c::crc32c(&expected);
+            expected.extend_from_slice(&crc.to_le_bytes());
+            assert_eq!(n, 35);
+            assert_eq!(&buf[..n], expected.as_slice(), "unwitnessed={unwitnessed}");
+        }
+    }
+
+    /// A flag bit this codec never writes is corruption, not a value to
+    /// drop: the entry would re-encode to other bytes than the ones its
+    /// CRC (and a replica's re-encode check) covers.
+    #[test]
+    fn ack_policy_change_with_a_reserved_flag_bit_is_refused() {
+        for flags in [0x02u8, 0x80, 0xff] {
+            let mut buf = [0u8; 256];
+            let n = encode(6, 0, 0, &ack_policy_change(1, false), &mut buf).unwrap();
+            buf[EVENT_TAG_OFFSET + 2] = flags;
+            let n = with_length(&mut buf, n - ENTRY_HEADER_SIZE - CRC_SIZE);
+            let err = decode::<TestEvent>(&buf[..n]).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    JournalError::CorruptEntry {
+                        sequence: 6,
+                        reason: "AckPolicyChange sets a reserved flag bit"
+                    }
+                ),
+                "flags {flags:#04x}: {err:?}"
+            );
+        }
+    }
+
+    /// Each transport payload shorter than its fields is refused by name,
+    /// at every length from empty up to one byte short.
+    #[test]
+    fn short_transport_payloads_are_refused() {
+        for (tag, width, reason) in [
+            (TAG_TICK, 8, "Tick payload too short"),
+            (TAG_EPOCH_BUMP, 8, "EpochBump payload too short"),
+            (
+                TAG_ACK_POLICY_CHANGE,
+                ACK_POLICY_CHANGE_PAYLOAD_SIZE,
+                "AckPolicyChange payload too short",
+            ),
+        ] {
+            for len in 0..width {
+                assert_eq!(
+                    decode_event::<TestEvent>(tag, &[0u8; 8][..len]),
+                    Err(EventDecodeError::Malformed(reason)),
+                    "tag {tag:#04x} with {len} payload bytes"
+                );
+            }
+        }
+    }
+
+    /// An app codec's error is passed through whole: its static reason
+    /// for the journal's error, its description for the wire's. (The
+    /// transport branches' wording is pinned by the journal and wire
+    /// decode-error tests.)
+    #[test]
+    fn an_app_decode_error_keeps_the_app_codecs_own() {
+        let app = decode_event::<TestEvent>(TAG_APP, &[9]).unwrap_err();
+        assert_eq!(app, EventDecodeError::App(CodecError::UnknownTag(9)));
+        assert_eq!(app.reason(), "app codec: unknown event tag");
+        assert_eq!(
+            app.to_string(),
+            format!("app event decode failed: {}", CodecError::UnknownTag(9))
+        );
+    }
+
+    /// Every transport event is journaled: none is a query. The journal
+    /// stage's allocator and the matching stage's wire-sequence shadow
+    /// both decide through this predicate, which hands an application
+    /// event to the application's own.
+    #[test]
+    fn no_transport_event_is_a_query() {
+        for event in [
+            JournalEvent::Tick { now_ns: 1 },
+            JournalEvent::EpochBump { epoch: 1 },
+            ack_policy_change(0, false),
+            ack_policy_change(1, true),
+            JournalEvent::Shutdown,
+        ] {
+            assert!(!event.is_query(), "{event:?}");
+        }
+    }
+
+    /// Only an ack-policy change carries one, witnessed or not, and as
+    /// it was journaled; every other event, the epoch bump included,
+    /// carries none.
+    #[test]
+    fn only_an_ack_policy_change_carries_one() {
+        for unwitnessed in [false, true] {
+            assert_eq!(
+                ack_policy_change(2, unwitnessed).ack_policy_change(),
+                Some(AckPolicyChange {
+                    policy: AckPolicyByte(2),
+                    unwitnessed,
+                })
+            );
+        }
+        for other in [
+            JournalEvent::Tick { now_ns: 1 },
+            JournalEvent::EpochBump { epoch: 3 },
+            JournalEvent::Shutdown,
+            JournalEvent::App(TestEvent::Ping),
+        ] {
+            assert_eq!(other.ack_policy_change(), None, "{other:?}");
+        }
     }
 
     #[test]
@@ -1083,9 +1330,11 @@ mod tests {
     fn a_length_wider_than_the_event_type_allows_is_refused() {
         let widest_tick = ENTRY_META_SIZE + TRANSPORT_PAYLOAD_SIZE;
         let widest_app = ENTRY_META_SIZE + TestEvent::MAX_ENCODED_SIZE;
+        let widest_policy = ENTRY_META_SIZE + ACK_POLICY_CHANGE_PAYLOAD_SIZE;
         for (event, widest) in [
             (JournalEvent::Tick { now_ns: 7 }, widest_tick),
             (JournalEvent::EpochBump { epoch: 7 }, widest_tick),
+            (ack_policy_change(1, true), widest_policy),
             (JournalEvent::App(TestEvent::Payload(7)), widest_app),
         ] {
             let mut buf = [0u8; 256];

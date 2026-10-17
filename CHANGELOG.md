@@ -14,6 +14,18 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Added
 
+- **`melin_ack_policy_journaled` and `melin_ack_policy_in_force`**, two
+  `/metrics` gauges on a primary: the policy the newest journaled change
+  names, and the policy replies are held to, each as the policy's wire
+  value (`0` `disk`, `1` `disk+ram`, `2` `two-disks`, `3` `ram`). They
+  differ while a change waits for the nodes the old policy relied on.
+- **The pieces of journaled ack-policy changes, public for embedders and
+  tools.** In `melin-journal`: `AckPolicyChange` (with `AckPolicyByte`
+  and `JournalEvent::ack_policy_change`) and `codec::decode_event`, one
+  decoder for every entry tag. In `melin-transport-core`: the `lineage`
+  and `replica_presence` modules, `InputSlot::node_event` and
+  `MatchingStage::forced_policy`. In `melin-server-runtime`: the
+  `policy_control` module.
 - **`--dpdk-client-rx-buf-kib`, `--dpdk-client-tx-buf-kib`,
   `--dpdk-client-tx-queue-kib`**: the per-connection buffering of the
   client connections a DPDK node accepts, previously fixed at 64 KiB of
@@ -253,6 +265,159 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Changed
 
+- **The ack policy is journaled: replication protocol 8, snapshot
+  framing 4.** A change of policy is a journal entry (tag `0x05`,
+  `[policy: u8][flags: u8]`), sequenced and replicated in order with the
+  events it governs and never delivered to the application, like an
+  epoch bump. The response gate switches at the change's place in the
+  order, once the change's own entry is durable under the policy before
+  it, so a weakening waits for the nodes the old policy relied on, and
+  every reply after the change, the rest of an in-flight batch included,
+  is held to the new policy; two pending changes are applied one by
+  one, never merged.
+  Snapshots record the policy in force at their sequence (framing
+  version 4 adds, after `genesis_entries`, a flags byte, the policy, the
+  policy before the change that put it in force and that change's
+  sequence, so a primary starting from the snapshot can apply the change
+  again; versions 1 to 3 are still read, and a history that records neither
+  the genesis length nor a policy still writes version 2). Replicas
+  judge auto-promotion by the newest change their journal holds, falling
+  back to their own requested policy only while the history holds none.
+  `StreamStart` and `Heartbeat` no longer carry the policy. Not backward
+  compatible: nodes on protocol 7 and 8 refuse each other at the
+  handshake, so stop the cluster, upgrade every node, and restart on the
+  existing files; an older release refuses to start on a journal holding
+  a policy change or on a version-4 snapshot, rather than discard
+  anything. See "The policy is part of the journal" and "Upgrade and
+  rollback notes" in `docs/replication.md`.
+- **Operator-visible: how an ack-policy swap behaves.**
+  - `ACK-POLICY` on a serving primary replies `OK` once the change is
+    journaled, which can be before it is in force. It replies
+    `ERR ACK-POLICY not journaled: ...` if the change cannot be journaled,
+    naming why: the input ring stayed full for 2 s, the node stopped
+    serving as primary, or another `ACK-POLICY` request is still
+    waiting. On a replica,
+    or a primary still starting, it replies `OK staged`, and the policy
+    is journaled when the node serves as primary, unless its history
+    already holds it. Every command a serving primary takes is
+    journaled, repeats of the policy in force included.
+  - On a node without `--replication-bind` (a `--standalone` node, or a
+    replica that would be promoted without one), `ACK-POLICY` naming a
+    policy that needs a replica (`ram`, `disk+ram`, `two-disks`) is
+    refused in every role with `ERR ACK-POLICY not journaled: ...`
+    naming the cause, logged at `warn!`, and nothing is journaled or
+    staged. It used to be journaled and take effect, holding every reply
+    from then on, since no replica could ever attach to meet it.
+  - `ACK-POLICY disk` sent while no replica is connected is
+    *forced*: journaled as unwitnessed, in force once its own entry is on
+    the primary's disk (releasing replies held under the old policy),
+    lifting the write halt until a replica streaming live acknowledges
+    an entry or a policy that needs one is journaled, and logged at
+    `warn!`. A replica that connects and leaves before then (one
+    refusing the primary's history, retrying, or one leaving during its
+    catch-up, or a caught-up one that joins and leaves while no write
+    reaches it) leaves the halt lifted: set a policy that needs a
+    replica to end the override once replicas are back. The lifted halt
+    does not survive a restart: re-send `ACK-POLICY disk` once the node
+    serves. A forced swap is not witnessed by a replica that was
+    offline; `docs/replication.md` states the limitation and the
+    operational rule, and how to force a swap past a connected replica
+    that never acknowledges.
+  - A replica counts toward the write halt, the forced-swap rule and
+    `melin_replicas_connected` once the primary accepts its handshake,
+    no longer as soon as it authenticates: one the primary refuses after
+    authentication (a handshake it cannot validate, or one showing the
+    primary superseded) never lifts the halt.
+  - A policy staged on a replica before `PROMOTE` is journaled by the
+    promotion but never forced: it no longer resumes replies on a
+    promoted node with no replica. Send `ACK-POLICY disk` again once the
+    node serves.
+  - `--ack-policy` is the policy a primary *requests*. A history that
+    records another policy keeps serving under it until the change to
+    the requested one, journaled at startup or promotion, takes effect.
+    A node without `--replication-bind` serves under the requested
+    policy at once, and journals it unwitnessed when the history already
+    records it through a change that may still have been waiting for a
+    replica (any change after the first, journaled witnessed), so the
+    journal marks that it took effect without one; once, not on every
+    restart.
+  - A replicated primary's restart, and a promotion, confirm the
+    history's newest change again before acknowledging anything under
+    it: the node serves under the policy before that change until the
+    change's entry is held by the copies that policy demands (a forced
+    change: until it is on the node's disk), since whether it had taken
+    effect before the stop is not recorded. A `disk+ram` → `disk` swap
+    the replica never received therefore keeps a primary restarted
+    under `disk` on `disk+ram` until the replica holds it.
+    `melin_ack_policy_in_force` reports the policy before the change
+    until then. A repeat of the policy in force is not the change
+    confirmed; a forced repeat marks it forced.
+  - The info-level "ack policy changed by operator" log is replaced by
+    "ack policy change requested by operator" (or "staged"), "ack policy
+    change journaled", and "ack policy switched" (with `prev`, `next`
+    and the cause) when it takes effect; a change repeating the policy
+    in force switches nothing and logs no switch.
+- **Source-breaking API changes for journaled ack-policy changes.**
+  - `melin_journal::JournalEvent` has a new variant,
+    `AckPolicyChange(AckPolicyChange)`, and
+    `melin_transport_core::pipeline::OutputPayload` one of the same name,
+    emitted at the change's place in the output ring. Add an arm to an
+    exhaustive `match` on either: an event publisher sees the new output
+    slot and should skip it (it carries no reply).
+  - `melin_transport_core::snapshot::load` returns `(A, SnapshotHeader)`
+    (it returned a tuple of state, sequence, chain hash and epoch), and
+    `load_with_header` is gone; `SnapshotHeader::epoch` became
+    `lineage: Lineage`; `snapshot::save` and `shadow::run` take a
+    `Lineage` where they took an epoch, and `shadow::run` the wire
+    sequence of the first entry it will consume; `JournaledApp::from_parts`
+    takes a `Lineage`, and `recovered_epoch` became `recovered_lineage`.
+    `Lineage::ack_policy` is a `LineagePolicy` (the policy, and the
+    change that put it in force, at a `WireSeq`, with the policy before
+    it).
+  - `replication::protocol::PrimaryMessage::StreamStart` and `Heartbeat`
+    lost their `ack_policy` field, and `encode_stream_start`,
+    `encode_heartbeat` and `replication::catchup::snapshot_transfer_with`
+    their `ack_policy` argument.
+  - `melin_server_runtime::replication::ReplicaControlPlane` lost
+    `primary_ack_policy` and gained crate-private fields, so it can no
+    longer be built with a struct literal (use `ReplicaControlPlane::new()`
+    or `Default`); `replication::Sender` lost `ack_policy`.
+  - `melin_server_runtime::response::Response` and
+    `dpdk_response::run` take `policy: GatePolicy` (a `GateStart`, the
+    policy in force and the lineage's change still to apply, which
+    outside the runtime can only be built settled with
+    `GateStart::settled`, and the forced change reader) in place of the
+    `ack_policy` atomic, and
+    `admin::spawn` takes the `policy_control::AckPolicyControl` mailbox
+    in place of the atomic. `reader::spawn_reader` takes a
+    `policy_control::BootedClaim` (a `PublisherClaim` whose boot entry is
+    journaled: `PublisherClaim::journal_boot` consumes the claim and
+    returns it, and only it attaches a producer), and
+    `dpdk_transport::run_dpdk_poll` an `AckPolicyPublisher`: the input
+    ring's producer journals the `ACK-POLICY` requests. The mailbox, the
+    claims and the publisher are built only by the server's start-up
+    (`AckPolicyControl::new`, `claim` and `journal_boot` are
+    crate-private), so outside the crate `admin::spawn`
+    takes `None` and these two entry points are driven by the server
+    alone; there is no outside migration path.
+  - The replica count is a `melin_transport_core::replica_presence::ReplicaPresence`
+    (count and halt override in one type) where it was an
+    `Arc<AtomicU32>`: `Pipeline::replicas_connected`,
+    `health::HealthState::replicas_connected`, `halt::HaltGate::new` and
+    `replication::run_sender` change type. `ReplicaPresence::lift`
+    returns a `FirstAck`, through which a sender reports the replica's
+    acks (`FirstAck::acked`): the first one ends the halt override.
+    `ReplicaPresence::lower` returns a `Lowered`: whether the replica
+    was the last, and if so whether the node halts or a forced `disk`
+    keeps it taking writes, which its warning states. The override
+    changes only on evidence from `ReplicaPresence::observe`:
+    `latch_override` takes its `NoneSince`, and `clear_override` the
+    `Observed` itself (neither is `Copy` nor `Clone`).
+    `Observed::Connected` carries a `Seen` token that only `observe`
+    makes, as `NoneConnected` carries `NoneSince`; match it as
+    `Observed::Connected(_)`.
+  - `pipeline::StageUtilization` has two new public fields,
+    `ack_policy_in_force` and `ack_policy_journaled`.
 - **`melin_journal::replication::ReplicationConsumer` reads by
   `peek`.** `try_read`, `pending` and `commit` are replaced by `peek`,
   which lends the next batch as a `ReplicationBatch` without consuming
@@ -378,6 +543,12 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Removed
 
+- **`melin_server_runtime::ack_policy::ACK_POLICY_UNKNOWN`** and
+  **`melin_transport_core::replication_wire`'s `SLOT_TAG_TICK`,
+  `SLOT_TAG_EPOCH_BUMP` and `SLOT_TAG_APP`**. Replicas no longer hold
+  a policy byte that can be unknown, and a replicated slot is decoded by
+  the journal's own codec (`melin_journal::codec::decode_event`), so the
+  tags are defined once.
 - **`melin_app::affinity::take_context`, `prepare_child_context`,
   `restore_context` and `SchedContext`** are private. They were the
   steps of the handover that `spawn_placed` and `with_child_context` now
@@ -392,6 +563,24 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Fixed
 
+- **A runtime ack-policy swap now reaches replicas while data flows**
+  (finding 10 of the determinism audit). Replicas learned the primary's
+  policy only from `StreamStart` and idle heartbeats, and journaled ticks
+  kept the link busy, so after the documented `ACK-POLICY disk` lever
+  they kept believing the old policy: if the primary then died,
+  auto-promotion skipped its `disk` refusal and lost events acknowledged
+  on the primary's disk alone; after a swap back to `disk+ram`,
+  auto-failover refused indefinitely. A replica disconnected during a
+  swap could never be told at all. See Changed (the policy is
+  journaled); the audit's reproductions are regression tests, on kernel
+  TCP and DPDK.
+- **Tightening the ack policy no longer lags the in-flight batch**
+  (finding 29). The rest of a response batch was released against a
+  durable position cached under the old, weaker policy. See Changed.
+- **`ACK-POLICY disk` lifts the write halt, as the manual-promotion
+  playbook says.** The swap the playbook prescribed released replies
+  held at the gate but never lifted the halt, so a promoted node with no
+  replica had no way to resume writes. See Changed (the forced swap).
 - **A DPDK primary no longer skips a batch when a replica's socket is
   full.** A streaming replica whose socket had no room for the next batch
   left it read but unsent, and the next tick read past it: a release

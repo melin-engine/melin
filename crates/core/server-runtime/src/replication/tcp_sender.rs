@@ -7,15 +7,16 @@
 use std::io::{self, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::{debug, error, info, warn};
 
 use melin_journal::replication::ReplicationConsumer;
 use melin_pipeline::wait::WaitStrategy;
+use melin_transport_core::replica_presence::{FirstAck, ReplicaPresence};
 
 use super::auth::authenticate_replica;
-use super::{ReplicaCursors, ReplicaGate, ReplicationMetrics, SentHighWater};
+use super::{ReplicaCursors, ReplicationMetrics, SentHighWater};
 use crate::layout::Placement;
 use crate::uring_teardown::{DrainBackoff, wake_pending_ops};
 use melin_app::Application;
@@ -76,11 +77,6 @@ pub struct Sender {
     /// `StreamStart`, and to self-demote when a replica handshakes with a
     /// higher epoch (this primary has been superseded). See `crate::fence`.
     pub fence_state: Arc<melin_transport_core::fence::FenceState>,
-    /// The active ack policy, shared with the response gate and the
-    /// admin `ACK-POLICY` command. Stamped on every `StreamStart` and
-    /// `Heartbeat` so replicas judge auto-promotion against the policy
-    /// this primary actually acks under.
-    pub ack_policy: Arc<std::sync::atomic::AtomicU8>,
 }
 
 /// Run the replication sender. Listens for replica connections,
@@ -92,7 +88,7 @@ pub fn run_sender<A: Application>(
     config: Sender,
     shutdown: &AtomicBool,
     replica_ready: &AtomicBool,
-    replicas_connected: &AtomicU32,
+    replicas_connected: &ReplicaPresence,
 ) {
     let Sender {
         listener,
@@ -108,7 +104,6 @@ pub fn run_sender<A: Application>(
         batch_size,
         heartbeat_secs,
         fence_state,
-        ack_policy,
     } = config;
     // Unwrap the invariant-carrying newtype — from here `listener` is a
     // plain TcpListener, known non-blocking.
@@ -150,13 +145,14 @@ pub fn run_sender<A: Application>(
     // to the active flags.
     let cursors = Arc::new(ReplicaCursors::new(replica_slots, Arc::clone(&metrics)));
 
-    // Per-slot "this connection authenticated" latch. The halt gate
-    // (`replicas_connected`) is lifted by the handler thread only after auth
-    // succeeds, so the main loop must lower it on teardown only when the
-    // handler got that far — a connection that drops mid-auth never counted.
-    // Per-slot `Arc<AtomicBool>` mirrors `active_flags`/`evict_flags`; shared
-    // with the handler thread, which flips it true post-auth.
-    let authenticated_flags: [Arc<AtomicBool>; 2] = [
+    // Per-slot "this connection is counted" latch. The halt gate
+    // (`replicas_connected`) is lifted by the handler thread only once the
+    // replica's handshake is accepted and its join begins, so the main loop
+    // must lower it on teardown only when the handler got that far — a
+    // connection refused or dropped before then never counted. Per-slot
+    // `Arc<AtomicBool>` mirrors `active_flags`/`evict_flags`; shared with
+    // the handler thread, which flips it true as it lifts the gate.
+    let counted_flags: [Arc<AtomicBool>; 2] = [
         Arc::new(AtomicBool::new(false)),
         Arc::new(AtomicBool::new(false)),
     ];
@@ -204,12 +200,12 @@ pub fn run_sender<A: Application>(
         // surviving replica. Borrows only atomics (interior
         // mutability), so it coexists with the `&mut` iteration over `slots`.
         let disengage_slot = |slot_idx: usize| {
-            // Lower the gate only if this connection authenticated (and so
+            // Lower the gate only if this connection was counted (and so
             // lifted it); `swap` reads and resets the latch in one op, and the
-            // `join()` ordered the handler's post-auth writes before here.
-            // `lower` warns "halted" if this was the last replica.
-            if authenticated_flags[slot_idx].swap(false, Ordering::AcqRel) {
-                ReplicaGate::new(replicas_connected).lower();
+            // `join()` ordered the handler's writes before here.
+            // `lower` warns if this was the last replica.
+            if counted_flags[slot_idx].swap(false, Ordering::AcqRel) {
+                replicas_connected.lower();
             }
             // Disengage cursors BEFORE clearing the active flag — ordering
             // contract B2 (see `ReplicaCursors`).
@@ -292,8 +288,9 @@ pub fn run_sender<A: Application>(
                     }
 
                     // The halt gate is NOT lifted here — a bare connect
-                    // hasn't proven a Replication key. The handler lifts it after
-                    // auth succeeds (see `handle_replica_connection`).
+                    // hasn't proven a Replication key. The handler lifts it
+                    // once the replica's handshake is accepted (see
+                    // `handle_replica_connection`).
 
                     // Take the consumer out of the slot for the handler thread.
                     // The slot's consumer becomes None while the thread owns it.
@@ -309,12 +306,11 @@ pub fn run_sender<A: Application>(
                     let slot_active = Arc::clone(&active_flags[slot_idx]);
                     let slot_evict = Arc::clone(&evict_flags[slot_idx]);
                     let slot_fence = Arc::clone(&fence_state);
-                    let slot_ack_policy = Arc::clone(&ack_policy);
-                    let slot_authenticated = Arc::clone(&authenticated_flags[slot_idx]);
+                    let slot_counted = Arc::clone(&counted_flags[slot_idx]);
                     let handler = handlers[slot_idx];
                     let shutdown_flag = shutdown as *const AtomicBool as usize;
                     let ready_flag = replica_ready as *const AtomicBool as usize;
-                    let connected_flag = replicas_connected as *const AtomicU32 as usize;
+                    let connected_flag = replicas_connected as *const ReplicaPresence as usize;
                     // Pinned to a dedicated core if configured (> 0),
                     // otherwise on the home mask — created in that
                     // placement rather than inheriting the accept
@@ -333,7 +329,8 @@ pub fn run_sender<A: Application>(
                             // Safety: replicas_connected outlives this thread —
                             // same lifetime argument as shutdown/replica_ready
                             // above (the parent blocks on join during shutdown).
-                            let connected_ref = unsafe { &*(connected_flag as *const AtomicU32) };
+                            let connected_ref =
+                                unsafe { &*(connected_flag as *const ReplicaPresence) };
                             let ctx = SlotContext {
                                 cursors: &slot_cursors,
                                 journal_path: &jpath,
@@ -344,13 +341,12 @@ pub fn run_sender<A: Application>(
                                 evict_flag: &slot_evict,
                                 metrics: &slot_metrics,
                                 fence_state: &slot_fence,
-                                ack_policy: &slot_ack_policy,
                                 slot_idx,
                                 batch_size,
                                 heartbeat_secs,
                                 wait: handler.wait,
                                 replicas_connected: connected_ref,
-                                authenticated: &slot_authenticated,
+                                counted: &slot_counted,
                             };
                             run_replica_slot::<A>(stream, consumer, &ctx)
                         },
@@ -411,19 +407,17 @@ struct SlotContext<'a> {
     evict_flag: &'a AtomicBool,
     metrics: &'a ReplicationMetrics,
     fence_state: &'a melin_transport_core::fence::FenceState,
-    /// The primary's active ack policy — stamped on `StreamStart` and
-    /// `Heartbeat` (see `Sender::ack_policy`).
-    ack_policy: &'a std::sync::atomic::AtomicU8,
     slot_idx: usize,
     batch_size: usize,
     heartbeat_secs: u64,
     wait: WaitStrategy,
-    /// Halt gate. The handler lifts it (`fetch_add`) only after auth
-    /// succeeds; the main loop lowers it on teardown, gated by `authenticated`.
-    replicas_connected: &'a AtomicU32,
-    /// Per-slot latch the handler sets true once this connection passes auth,
-    /// so the main loop knows whether this slot lifted the gate.
-    authenticated: &'a AtomicBool,
+    /// Halt gate. The handler lifts it once the replica's handshake is
+    /// accepted, and reports its first ack to it; the main loop lowers it
+    /// on teardown, gated by `counted`.
+    replicas_connected: &'a ReplicaPresence,
+    /// Per-slot latch the handler sets true as it lifts the gate, so the
+    /// main loop knows whether this slot lifted it.
+    counted: &'a AtomicBool,
 }
 
 /// Handle a single replica connection on a dedicated thread.
@@ -455,13 +449,12 @@ fn handle_replica_connection<A: Application>(
         evict_flag: _,
         metrics,
         fence_state,
-        ack_policy,
         slot_idx,
         batch_size: _,
         heartbeat_secs,
         wait: _,
         replicas_connected,
-        authenticated,
+        counted,
     } = ctx;
     let slot_idx = *slot_idx;
     let heartbeat_secs = *heartbeat_secs;
@@ -478,13 +471,6 @@ fn handle_replica_connection<A: Application>(
     // read timeout set above.
     authenticate_replica(&mut reader, authorized_keys)?;
     info!("replica authenticated");
-
-    // Auth passed — only now lift the halt gate. The main loop lowers
-    // it on slot teardown, reading `authenticated` to know this connection
-    // lifted it. Set the latch after the increment so a post-join read of the
-    // latch implies the increment is visible too.
-    ReplicaGate::new(replicas_connected).lift();
-    authenticated.store(true, Ordering::Release);
 
     // Read handshake.
     let handshake_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
@@ -554,6 +540,14 @@ fn handle_replica_connection<A: Application>(
     let can_catch_up =
         !divergent && can_catch_up_from_journal(journal_path, handshake.last_sequence)?;
 
+    // Handshake accepted, join begins — only now lift the halt gate (see
+    // `ReplicaPresence`): a replica refused before here never counted. The
+    // main loop lowers it on slot teardown, reading `counted` to know this
+    // connection lifted it. Set the latch after the increment so a
+    // post-join read of the latch implies the increment is visible too.
+    let mut first_ack = replicas_connected.lift();
+    counted.store(true, Ordering::Release);
+
     let mut publish = |buf: &[u8]| -> io::Result<()> {
         writer.write_all(buf)?;
         writer.flush()
@@ -586,7 +580,6 @@ fn handle_replica_connection<A: Application>(
             origin.anchor_hash,
             origin.genesis_entries,
             fence_state.epoch(),
-            ack_policy.load(Ordering::Relaxed),
             &mut send_buf,
         );
         publish(&send_buf)?;
@@ -624,12 +617,7 @@ fn handle_replica_connection<A: Application>(
         }
         publish(&send_buf)?;
         send_buf.clear();
-        match snapshot_transfer_with::<A::Event>(
-            journal_path,
-            &mut publish,
-            shutdown,
-            ack_policy.load(Ordering::Relaxed),
-        )? {
+        match snapshot_transfer_with::<A::Event>(journal_path, &mut publish, shutdown)? {
             CatchUpResult::Ok(end) => end,
             CatchUpResult::NeedSnapshot => {
                 return Err(io::Error::other(
@@ -693,6 +681,7 @@ fn handle_replica_connection<A: Application>(
         &mut send_buf,
         &mut last_send,
         &mut sent,
+        &mut first_ack,
     )
 }
 
@@ -803,6 +792,7 @@ fn live_stream_uring(
     send_buf: &mut Vec<u8>,
     last_send: &mut std::time::Instant,
     sent: &mut SentHighWater,
+    first_ack: &mut FirstAck,
 ) -> io::Result<()> {
     let SlotContext {
         cursors,
@@ -812,7 +802,7 @@ fn live_stream_uring(
         slot_idx,
         batch_size,
         wait,
-        ack_policy,
+        replicas_connected,
         // Only used during handshake/catch-up (handle_replica_connection).
         journal_path: _,
         authorized_keys: _,
@@ -820,8 +810,7 @@ fn live_stream_uring(
         active_flag: _,
         heartbeat_secs: _,
         fence_state: _,
-        replicas_connected: _,
-        authenticated: _,
+        counted: _,
     } = ctx;
     let slot_idx = *slot_idx;
     let batch_size = *batch_size;
@@ -961,7 +950,7 @@ fn live_stream_uring(
                     .tick(heartbeat_interval, waiter.spinning())
                     .is_some()
                 {
-                    encode_heartbeat(sent.get(), ack_policy.load(Ordering::Relaxed), send_buf);
+                    encode_heartbeat(sent.get(), send_buf);
                     let sqe = opcode::Send::new(
                         types::Fixed(0),
                         send_buf.as_ptr(),
@@ -1046,6 +1035,9 @@ fn live_stream_uring(
                         cursors
                             .record_ack(slot_idx, &ack, sent.get())
                             .map_err(io::Error::other)?;
+                        // The replica took the stream: the first ack ends
+                        // any halt override (see `ReplicaPresence`).
+                        first_ack.acked(replicas_connected);
                         metrics.ack_latency_us[slot_idx]
                             .store(last_send.elapsed().as_micros() as u64, Ordering::Relaxed);
                         if let Some(event) = persist_watch.observe(&ack, received) {

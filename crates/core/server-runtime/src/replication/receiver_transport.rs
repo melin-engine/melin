@@ -17,6 +17,7 @@ use tracing::{debug, info};
 
 use melin_app::AppEvent;
 use melin_pipeline::wait::WaitStrategy;
+use melin_transport_core::lineage::SharedLineagePolicy;
 use melin_transport_core::pipeline::{AdoptedRotation, InputSlot, StreamMark, StreamMarkQueue};
 use melin_transport_core::replication::protocol::{
     Ack, InputBatchError, MAX_DATA_FRAME, PrimaryMessage, decode_primary_message,
@@ -383,10 +384,31 @@ pub(super) struct StreamingFrameOutcome {
     /// `SessionExit::Corrupted` (both reconnect), and a `Fatal` to
     /// `SessionExit::Fatal`.
     pub frame_err: Option<FrameError>,
-    /// The primary's ack policy as advertised by the last `Heartbeat`
-    /// in this cycle, if any — the caller folds it into the
-    /// control-plane gauge (`ReplicaControlPlane::primary_ack_policy`).
-    pub observed_ack_policy: Option<u8>,
+}
+
+/// Accept one contiguous slot from the primary: push it onto the input
+/// ring and, once it is there, fold it into the replica's lineage policy
+/// record when it is an ack-policy change, at the slot's sequence (the
+/// primary's, stamped by the receiver).
+///
+/// The one way the streaming and the promotion-drain paths publish a
+/// slot, so neither can accept a change without the record following it.
+/// The record moves before the caller advances the advertised journal tip
+/// past the slot, so a reader that sees the tip (Acquire) and then the
+/// record never pairs a tip holding a change with the policy before it.
+fn accept_slot<E: AppEvent>(
+    batch: &mut melin_pipeline::ring::Batch<'_, InputSlot<E>>,
+    slot: InputSlot<E>,
+    lineage_policy: &SharedLineagePolicy,
+    abort: impl FnMut() -> bool,
+) -> Result<u64, melin_pipeline::ring::Full> {
+    let change = slot.event.ack_policy_change();
+    let wire_seq = melin_transport_core::WireSeq::new(slot.sequence);
+    let index = batch.push_with_or_abort(|s| *s = slot, abort)?;
+    if let Some(change) = change {
+        lineage_policy.observe(wire_seq, change);
+    }
+    Ok(index)
 }
 
 /// Process complete frames from `recv_buf`, publishing decoded slots
@@ -443,12 +465,23 @@ pub(super) struct StreamingFrameOutcome {
 ///   a [`FrameError::Fatal`]: the same entry would fail on every reconnect,
 ///   and a replica that cannot journal what its primary journaled must
 ///   not keep following it.
+///
+/// # The lineage's ack policy
+///
+/// Each accepted `AckPolicyChange` moves `lineage_policy`
+/// (`ReplicaControlPlane::lineage_ack_policy`) as it is pushed — at
+/// receive time, the point the replica's advertised tip and in-memory ack
+/// move past it, so auto-promotion judges by exactly the changes this
+/// node holds. Nothing else tells the replica the primary's policy: no
+/// frame advertises it.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn process_streaming_frames<E: AppEvent>(
     recv_buf: &[u8],
     input_producer: &mut melin_pipeline::ring::Producer<InputSlot<E>>,
     accum_end_sequence: u64,
     slot_buf: &mut Vec<InputSlot<E>>,
     stream_marks: &StreamMarkQueue,
+    lineage_policy: &SharedLineagePolicy,
     journal_failed: &AtomicBool,
     pending_acks: &mut PendingAckQueue,
     // Run on every pass of a push waiting for ring space — see
@@ -461,7 +494,6 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
     let mut published_this_cycle = 0usize;
     let mut heard_from_primary = false;
     let mut frame_err: Option<FrameError> = None;
-    let mut observed_ack_policy: Option<u8> = None;
     let mut batch = input_producer.batch();
     let mut pending_accum = accum_end_sequence;
 
@@ -513,13 +545,10 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
                                 // teardown, no divergence repair). The
                                 // wait keeps the link answered: a slow
                                 // journal is not a gone replica.
-                                match batch.push_with_or_abort(
-                                    |s| *s = slot,
-                                    || {
-                                        keep_link_serviced();
-                                        journal_failed.load(Ordering::Relaxed)
-                                    },
-                                ) {
+                                match accept_slot(&mut batch, slot, lineage_policy, || {
+                                    keep_link_serviced();
+                                    journal_failed.load(Ordering::Relaxed)
+                                }) {
                                     // `push` returns the slot index; the
                                     // journal cursor is next-to-consume,
                                     // so the slot is durable once the
@@ -563,12 +592,8 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
                     }
                     Err(InputBatchError::NotInputBatch(_)) => match decode_primary_message(payload)
                     {
-                        Ok(PrimaryMessage::Heartbeat {
-                            sequence,
-                            ack_policy,
-                        }) => {
-                            debug!(sequence, ack_policy, "heartbeat from primary");
-                            observed_ack_policy = Some(ack_policy);
+                        Ok(PrimaryMessage::Heartbeat { sequence }) => {
+                            debug!(sequence, "heartbeat from primary");
                             // A heartbeat is the primary speaking — on a
                             // quiet system it is the only liveness
                             // evidence a session produces.
@@ -674,7 +699,6 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
         accum_end_sequence: pending_accum,
         heard_from_primary,
         frame_err,
-        observed_ack_policy,
     }
 }
 
@@ -701,11 +725,17 @@ pub(super) struct DrainFrameOutcome {
 /// drain path, the drain simply stops at the gap: everything before it
 /// is flushed, everything after is unreachable anyway (it could never
 /// be applied without the missing entries).
+///
+/// An ack-policy change drained here moves `lineage_policy` as on the
+/// streaming path: the promoted primary seeds its lineage, its promotion
+/// entry and its gate from that cell, so it must hold the last change the
+/// drain carried into the journal.
 pub(super) fn process_drain_frames<E: AppEvent>(
     recv_buf: &[u8],
     input_producer: &mut melin_pipeline::ring::Producer<InputSlot<E>>,
     accum_end_sequence: u64,
     slot_buf: &mut Vec<InputSlot<E>>,
+    lineage_policy: &SharedLineagePolicy,
     journal_failed: &AtomicBool,
 ) -> DrainFrameOutcome {
     let mut consumed = 0;
@@ -770,10 +800,9 @@ pub(super) fn process_drain_frames<E: AppEvent>(
                     // would wedge the drain forever. Stopping here
                     // matches the gap semantics — everything after
                     // the stall is unreachable anyway.
-                    match batch.push_with_or_abort(
-                        |s| *s = slot,
-                        || journal_failed.load(Ordering::Relaxed),
-                    ) {
+                    match accept_slot(&mut batch, slot, lineage_policy, || {
+                        journal_failed.load(Ordering::Relaxed)
+                    }) {
                         // Slot index → journal-cursor space (index + 1),
                         // as in `process_streaming_frames`.
                         Ok(index) => last_target = index + 1,
@@ -870,8 +899,8 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
     journal_cursor: &melin_pipeline::padding::Sequence,
     shutdown: &AtomicBool,
     // The replica's control-plane bundle: the promotion request this
-    // loop polls, the advertised journal tip it advances, and the
-    // primary-ack-policy gauge heartbeats refresh — see
+    // loop polls, the advertised journal tip it advances, and the lineage
+    // ack-policy cell each accepted change moves — see
     // [`super::ReplicaControlPlane`].
     control: &super::ReplicaControlPlane,
     pipeline_depth: usize,
@@ -899,10 +928,13 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
         // published, so raft vote filtering sees everything a promotion
         // would carry into the journal — not just the fsynced position.
         journal_tip,
-        primary_ack_policy,
+        // Moved by each change accepted, before the tip passes it.
+        lineage_ack_policy,
         // Recovery seeded it long before any streaming session.
         tip_ready: _,
         primary_link_up: _,
+        // Set by `accept_stream_start`, before this session streams.
+        primary_observed: _,
         // Latched by the journal thread's failure wrapper, not here.
         pipeline_healthy: _,
     } = control;
@@ -980,6 +1012,7 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
                     input_producer,
                     accum_end_sequence,
                     &mut slot_buf,
+                    lineage_ack_policy,
                     journal_failed,
                 );
                 accum_end_sequence = outcome.accum_end_sequence;
@@ -1063,18 +1096,16 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
             accum_end_sequence,
             &mut slot_buf,
             stream_marks,
+            lineage_ack_policy,
             journal_failed,
             &mut pending_acks,
             &mut || transport.keep_link_serviced(),
         );
         accum_end_sequence = outcome.accum_end_sequence;
         last_committed_primary_seq = accum_end_sequence;
+        // After the call, which moved the lineage policy cell for every
+        // change it accepted: the tip never runs ahead of the cell.
         journal_tip.advance(melin_transport_core::WireSeq::new(accum_end_sequence));
-        if let Some(policy) = outcome.observed_ack_policy {
-            // Heartbeats refresh the replica's view of the policy the
-            // primary acks under (runtime `ACK-POLICY` retunes).
-            primary_ack_policy.store(policy, Ordering::Release);
-        }
         heard_from_primary |= outcome.heard_from_primary;
 
         recv_offset += outcome.consumed;
@@ -1226,6 +1257,28 @@ mod tests {
         marks: &StreamMarkQueue,
         journal_failed: &AtomicBool,
     ) -> (StreamingFrameOutcome, PendingAckQueue) {
+        stream_frames_following(
+            buf,
+            producer,
+            accum_end_sequence,
+            slot_buf,
+            marks,
+            &SharedLineagePolicy::new(None),
+            journal_failed,
+        )
+    }
+
+    /// [`stream_frames`], with the lineage policy cell the accepted
+    /// changes move.
+    fn stream_frames_following(
+        buf: &[u8],
+        producer: &mut melin_pipeline::ring::Producer<InputSlot<TestEvent>>,
+        accum_end_sequence: u64,
+        slot_buf: &mut Vec<InputSlot<TestEvent>>,
+        marks: &StreamMarkQueue,
+        lineage_policy: &SharedLineagePolicy,
+        journal_failed: &AtomicBool,
+    ) -> (StreamingFrameOutcome, PendingAckQueue) {
         let mut acks = PendingAckQueue::new(16);
         let outcome = process_streaming_frames::<TestEvent>(
             buf,
@@ -1233,6 +1286,7 @@ mod tests {
             accum_end_sequence,
             slot_buf,
             marks,
+            lineage_policy,
             journal_failed,
             &mut acks,
             &mut || {},
@@ -1889,7 +1943,7 @@ mod tests {
 
         let mut buf = Vec::new();
         append_input_batch_frame(&mut buf, &[slot(6, 0xA0), slot(7, 0xA1), slot(8, 0xA2)]);
-        encode_heartbeat(99, 1, &mut buf);
+        encode_heartbeat(99, &mut buf);
         append_input_batch_frame(&mut buf, &[slot(9, 0xA3)]);
 
         let (outcome, _acks) = stream_frames(
@@ -1906,11 +1960,6 @@ mod tests {
         assert!(outcome.any_published);
         assert!(outcome.heard_from_primary);
         assert_eq!(outcome.accum_end_sequence, 9);
-        assert_eq!(
-            outcome.observed_ack_policy,
-            Some(1),
-            "the heartbeat's ack policy must surface for the control-plane gauge"
-        );
 
         let slots = drain(&mut consumer);
         assert_eq!(slots.len(), 4);
@@ -2047,6 +2096,7 @@ mod tests {
             &mut producer,
             0,
             &mut slot_buf,
+            &SharedLineagePolicy::new(None),
             &AtomicBool::new(false),
         );
         assert!(outcome.any_published);
@@ -2059,6 +2109,163 @@ mod tests {
             "slot index 0 is not durable at cursor 0"
         );
         assert_eq!(q.pop_ready(&journal_cursor(1)), Some(1));
+    }
+
+    // ---------------------------------------------------------------
+    // The lineage's ack policy, followed at receive time
+    // ---------------------------------------------------------------
+
+    /// A node event (a tick, an ack-policy change) at `primary_seq`.
+    fn node_slot(primary_seq: u64, event: JournalEvent<TestEvent>) -> InputSlot<TestEvent> {
+        InputSlot {
+            event,
+            ..slot(primary_seq, 0)
+        }
+    }
+
+    fn tick(primary_seq: u64) -> InputSlot<TestEvent> {
+        node_slot(
+            primary_seq,
+            JournalEvent::Tick {
+                now_ns: primary_seq,
+            },
+        )
+    }
+
+    fn change(primary_seq: u64, policy: crate::ack_policy::AckPolicy) -> InputSlot<TestEvent> {
+        node_slot(
+            primary_seq,
+            JournalEvent::AckPolicyChange(melin_journal::AckPolicyChange {
+                policy: policy.to_byte(),
+                unwitnessed: false,
+            }),
+        )
+    }
+
+    /// A lineage policy record: `policy`, since the transition at
+    /// `wire_seq` from `previous`.
+    fn record(
+        policy: crate::ack_policy::AckPolicy,
+        wire_seq: u64,
+        previous: Option<crate::ack_policy::AckPolicy>,
+    ) -> Option<melin_transport_core::lineage::LineagePolicy> {
+        crate::policy_control::test_support::lineage(
+            policy.to_byte(),
+            false,
+            wire_seq,
+            previous.map(|p| p.to_byte()),
+        )
+    }
+
+    /// Finding 10 of the determinism audit, at the receiver: with ticks
+    /// flowing the primary never sends a heartbeat, and a change in the
+    /// stream still reaches the lineage record, as the slot carrying it is
+    /// accepted, at the primary's sequence and with the policy before it.
+    #[test]
+    fn a_change_in_the_stream_moves_the_lineage_policy_without_a_heartbeat() {
+        use crate::ack_policy::AckPolicy;
+        let (mut producer, mut consumer) = ring(16);
+        let mut slot_buf = Vec::new();
+        let cell = SharedLineagePolicy::new(record(AckPolicy::DiskAndRam, 1, None));
+
+        let mut buf = Vec::new();
+        append_input_batch_frame(
+            &mut buf,
+            &[tick(1), tick(2), change(3, AckPolicy::Disk), tick(4)],
+        );
+        let (outcome, _acks) = stream_frames_following(
+            &buf,
+            &mut producer,
+            0,
+            &mut slot_buf,
+            &no_marks(),
+            &cell,
+            &AtomicBool::new(false),
+        );
+        assert!(outcome.frame_err.is_none());
+        assert_eq!(outcome.accum_end_sequence, 4);
+        assert_eq!(
+            cell.load(),
+            record(AckPolicy::Disk, 3, Some(AckPolicy::DiskAndRam)),
+            "weakened"
+        );
+        assert_eq!(drain(&mut consumer).len(), 4, "every entry published");
+    }
+
+    /// Only an accepted change moves the cell: one re-delivered at or
+    /// below the resume point (an older change, already applied) or one
+    /// past a gap (never published) leaves it as it was.
+    #[test]
+    fn a_change_not_accepted_leaves_the_lineage_policy() {
+        use crate::ack_policy::AckPolicy;
+        let (mut producer, mut consumer) = ring(16);
+        let mut slot_buf = Vec::new();
+        let held = record(AckPolicy::DiskAndRam, 1, None);
+        let cell = SharedLineagePolicy::new(held);
+
+        // Re-delivered: the handoff overlap carries an older change.
+        let mut buf = Vec::new();
+        append_input_batch_frame(&mut buf, &[change(5, AckPolicy::Disk), tick(6)]);
+        let (outcome, _acks) = stream_frames_following(
+            &buf,
+            &mut producer,
+            5,
+            &mut slot_buf,
+            &no_marks(),
+            &cell,
+            &AtomicBool::new(false),
+        );
+        assert!(outcome.frame_err.is_none());
+        assert_eq!(outcome.accum_end_sequence, 6);
+        assert_eq!(cell.load(), held, "a duplicate is skipped");
+
+        // Past a gap: the frame stops before it.
+        buf.clear();
+        append_input_batch_frame(&mut buf, &[tick(7), change(9, AckPolicy::Disk)]);
+        let (outcome, _acks) = stream_frames_following(
+            &buf,
+            &mut producer,
+            6,
+            &mut slot_buf,
+            &no_marks(),
+            &cell,
+            &AtomicBool::new(false),
+        );
+        assert!(matches!(
+            outcome.frame_err,
+            Some(FrameError::SequenceGap(_))
+        ));
+        assert_eq!(outcome.accum_end_sequence, 7);
+        assert_eq!(cell.load(), held, "nothing past the gap is accepted");
+        assert_eq!(drain(&mut consumer).len(), 2, "ticks 6 and 7 only");
+    }
+
+    /// The promotion drain follows changes too: the promoted primary seeds
+    /// its lineage, its promotion entry and its gate from the cell, so it
+    /// must hold the last change the drain carried into the journal.
+    #[test]
+    fn the_promotion_drain_moves_the_lineage_policy() {
+        use crate::ack_policy::AckPolicy;
+        let (mut producer, _consumer) = ring(16);
+        let mut slot_buf = Vec::new();
+        let cell = SharedLineagePolicy::new(record(AckPolicy::DiskAndRam, 1, None));
+        let mut buf = Vec::new();
+        append_input_batch_frame(&mut buf, &[tick(3), change(4, AckPolicy::Disk)]);
+        append_input_batch_frame(&mut buf, &[tick(5)]);
+
+        let outcome = process_drain_frames::<TestEvent>(
+            &buf,
+            &mut producer,
+            2,
+            &mut slot_buf,
+            &cell,
+            &AtomicBool::new(false),
+        );
+        assert_eq!(outcome.accum_end_sequence, 5);
+        assert_eq!(
+            cell.load(),
+            record(AckPolicy::Disk, 4, Some(AckPolicy::DiskAndRam))
+        );
     }
 
     /// A Rotate frame arriving exactly at the stream position is queued
@@ -2280,8 +2487,8 @@ mod tests {
         let mut slot_buf = Vec::new();
 
         let mut buf = Vec::new();
-        encode_heartbeat(42, 1, &mut buf);
-        encode_heartbeat(43, 1, &mut buf);
+        encode_heartbeat(42, &mut buf);
+        encode_heartbeat(43, &mut buf);
 
         let (outcome, _acks) = stream_frames(
             &buf,
@@ -2347,6 +2554,7 @@ mod tests {
             0,
             &mut slot_buf,
             &no_marks(),
+            &SharedLineagePolicy::new(None),
             &AtomicBool::new(false),
             &mut acks,
             &mut || {
@@ -2379,6 +2587,7 @@ mod tests {
             0,
             &mut slot_buf,
             &no_marks(),
+            &SharedLineagePolicy::new(None),
             &AtomicBool::new(false),
             &mut acks,
             &mut || serviced += 1,
@@ -2598,6 +2807,7 @@ mod tests {
             &mut producer,
             9,
             &mut slot_buf,
+            &SharedLineagePolicy::new(None),
             &AtomicBool::new(false),
         );
 
@@ -2836,6 +3046,7 @@ mod tests {
             &mut producer,
             9,
             &mut slot_buf,
+            &SharedLineagePolicy::new(None),
             &AtomicBool::new(false),
         );
 
@@ -2898,6 +3109,7 @@ mod tests {
             0,
             &mut slot_buf,
             &no_marks(),
+            &SharedLineagePolicy::new(None),
             &AtomicBool::new(false),
             &mut acks,
             &mut || {},
@@ -3039,7 +3251,7 @@ mod tests {
 
         let mut buf = Vec::new();
         append_input_batch_frame(&mut buf, &[slot(20, 0xE0), slot(21, 0xE1)]);
-        encode_heartbeat(999, 1, &mut buf);
+        encode_heartbeat(999, &mut buf);
         append_input_batch_frame(&mut buf, &[slot(22, 0xE2)]);
 
         let outcome = process_drain_frames::<TestEvent>(
@@ -3047,6 +3259,7 @@ mod tests {
             &mut producer,
             19,
             &mut slot_buf,
+            &SharedLineagePolicy::new(None),
             &AtomicBool::new(false),
         );
 
@@ -3073,6 +3286,7 @@ mod tests {
             &mut producer,
             49,
             &mut slot_buf,
+            &SharedLineagePolicy::new(None),
             &AtomicBool::new(false),
         );
 
@@ -3091,6 +3305,7 @@ mod tests {
             &mut producer,
             55,
             &mut slot_buf,
+            &SharedLineagePolicy::new(None),
             &AtomicBool::new(false),
         );
 
@@ -3210,7 +3425,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let tmp = dir.path().join("body.tmp");
             // A StreamStart where a chunk/end belongs.
-            let stray = payload(|b| encode_stream_start(0, 1, [0u8; 32], Some(0), 0, 1, b));
+            let stray = payload(|b| encode_stream_start(0, 1, [0u8; 32], Some(0), 0, b));
             let mut src = source(vec![stray]);
 
             let err = receive_chunked_body(&mut src, &tmp, 4, "snapshot").unwrap_err();

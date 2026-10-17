@@ -25,7 +25,6 @@
 use std::time::{Duration, Instant};
 
 use crate::pipeline::InputSlot;
-use crate::trace::mono_trace_ns;
 use melin_app::AppEvent;
 use melin_journal::JournalEvent;
 use melin_pipeline::ring;
@@ -44,13 +43,8 @@ pub fn clamp_monotonic(raw_now_ns: u64, last_now_ns: u64) -> u64 {
     }
 }
 
-/// Publish a `JournalEvent::Tick { now_ns }` onto the input ring.
-///
-/// Internal/server-originated: no client connection, no auth key.
-/// `key_hash = 0`, the identity of events no client submitted.
-///
-/// `sequence: 0` because the journal stage is the authoritative sequence
-/// allocator on the primary — see `InputSlot::sequence`.
+/// Publish a `JournalEvent::Tick { now_ns }` onto the input ring, as the
+/// node's own event (see [`InputSlot::node_event`]).
 ///
 /// On a full ring the publish drops; the next successful tick still
 /// carries the latest wall-clock time, so a missed tick only delays
@@ -58,15 +52,7 @@ pub fn clamp_monotonic(raw_now_ns: u64, last_now_ns: u64) -> u64 {
 pub fn publish_tick<E: AppEvent>(producer: &mut ring::Producer<InputSlot<E>>, now_ns: u64) {
     // try_publish drop is intentional: on a full ring we'd rather skip a
     // tick than block the ingress thread (see fn doc).
-    let _ = producer.try_publish(InputSlot {
-        connection_id: 0,
-        key_hash: 0,
-        sequence: 0,
-        timestamp_ns: now_ns,
-        event: JournalEvent::Tick { now_ns },
-        publish_ts: mono_trace_ns(),
-        recv_ts: mono_trace_ns(),
-    });
+    let _ = producer.try_publish(InputSlot::node_event(JournalEvent::Tick { now_ns }, now_ns));
 }
 
 /// When the next tick is due, and the timestamp the last one carried.

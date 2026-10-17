@@ -30,7 +30,7 @@
 use std::io::{Cursor, Read as _, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use melin_pipeline::padding::Sequence;
@@ -39,6 +39,7 @@ use tracing::{debug, error, info};
 
 use crate::cursors::{PipelineCursors, RingPos, WireSeq};
 use crate::pipeline::{INPUT_RING_CAPACITY, StageUtilization};
+use crate::replica_presence::ReplicaPresence;
 
 /// Shared monitoring state passed to the health loop.
 /// Bundles all the atomics/cursors into one struct to avoid parameter explosion.
@@ -62,7 +63,9 @@ pub struct HealthState {
     /// consumer position to compute input queue depth.
     pub input_cursor: Box<dyn QueueCursor>,
     pub pipeline_healthy: Arc<AtomicBool>,
-    pub replicas_connected: Option<Arc<AtomicU32>>,
+    /// Connected replicas and the halt override. `None` in standalone
+    /// mode, which never halts for want of a replica.
+    pub replicas_connected: Option<Arc<ReplicaPresence>>,
     /// Node fencing state. Folded into the `trading` flag so a fenced
     /// (superseded) ex-primary reports `halted` to probes and monitoring
     /// for the short window before the process finishes winding down —
@@ -114,7 +117,7 @@ impl HealthState {
     /// (the runtime feeds the replica pipeline's journal-failure latch)
     /// and drives `/health` OK/ERR plus the `melin_pipeline_healthy`
     /// gauge. The queue/journal/replication gauges are intentionally
-    /// unpopulated (0); `replicas_connected: Some(0)` makes the node
+    /// unpopulated (0); `replicas_connected` with none connected makes the node
     /// report `halted` (it is following, not serving writes), and the fence
     /// state still surfaces a superseded ex-primary. This reuses the one
     /// `/metrics` implementation and exposition format rather than
@@ -135,9 +138,9 @@ impl HealthState {
             ),
             input_cursor: Box::new(ZeroCursor),
             pipeline_healthy,
-            // `Some(0)` (not `None`) so the trading flag reports
+            // `Some` with none connected (not `None`) so the trading flag reports
             // `halted` — a replica is not accepting client writes.
-            replicas_connected: Some(Arc::new(AtomicU32::new(0))),
+            replicas_connected: Some(Arc::new(ReplicaPresence::new())),
             fence_state: Some(fence_state),
             replication_metrics: None,
             replica_active: None,
@@ -257,7 +260,7 @@ struct HealthSnapshot {
     /// Writes refused at ingress while halted — see
     /// [`HealthState::refused_writes`].
     refused_writes: u64,
-    /// Number of replicas currently connected. 0 in standalone mode.
+    /// Number of replicas currently streaming. 0 in standalone mode.
     replicas_connected: u32,
     /// Per-replica lag: journal_seq - acked_sequence (0 if no ack yet).
     /// Fixed-size array for up to 2 replica slots.
@@ -319,6 +322,14 @@ struct HealthSnapshot {
     /// can `rate()` time-in-degraded over a window — see
     /// `StageUtilization::policy_degraded_nanos`.
     response_policy_degraded_nanos: u64,
+    /// Wire byte of the ack policy the response gate enforces —
+    /// `StageUtilization::ack_policy_in_force`. `None` until a gate runs
+    /// (a replica), and then the series is omitted.
+    ack_policy_in_force: Option<u8>,
+    /// Wire byte of the policy the newest journaled change puts in force
+    /// — `StageUtilization::ack_policy_journaled`. `None` while the
+    /// lineage holds no change, and then the series is omitted.
+    ack_policy_journaled: Option<u8>,
     /// Journal rotations that adopted a pre-staged segment (fast path).
     journal_rotations_fast_path: u64,
     /// Journal rotations that fell back to the synchronous allocate
@@ -375,24 +386,26 @@ impl HealthSnapshot {
             None => 0,
         };
 
-        // Trading state: "trading" when standalone or at least one replica
-        // connected, "halted" when replication is enabled but all replicas
-        // are disconnected — or when the node has been fenced (superseded
-        // by a higher-epoch primary). Mirrors the readers' halt gate
-        // (`HaltGate` in the server runtime) so probes agree with what the
-        // node enforces.
+        // Trading state: "trading" when standalone, with at least one
+        // replica connected, or with the operator's halt override in
+        // force; "halted" when replication is enabled but all replicas are
+        // disconnected — or when the node has been fenced (superseded by a
+        // higher-epoch primary). The same rule as the readers' halt gate
+        // (`HaltGate` in the server runtime, through
+        // `ReplicaPresence::halted`) so probes agree with what the node
+        // enforces.
         let fenced = state.fence_state.as_ref().is_some_and(|f| f.is_fenced());
         let trading = !fenced
             && state
                 .replicas_connected
                 .as_ref()
-                .is_none_or(|count| count.load(Ordering::Relaxed) > 0);
+                .is_none_or(|presence| !presence.halted());
 
         // Per-replica metrics from the replication sender (if enabled).
         let replicas_connected_val = state
             .replicas_connected
             .as_ref()
-            .map_or(0, |c| c.load(Ordering::Relaxed));
+            .map_or(0, |presence| presence.connected());
 
         type ReplMetricsTuple = (
             [u64; 2],
@@ -557,6 +570,16 @@ impl HealthSnapshot {
                 .response_utilization
                 .policy_degraded_nanos
                 .load(Ordering::Relaxed),
+            ack_policy_in_force: state
+                .response_utilization
+                .ack_policy_in_force
+                .load()
+                .map(|p| p.0),
+            ack_policy_journaled: state
+                .matching_utilization
+                .ack_policy_journaled
+                .load()
+                .map(|p| p.0),
             journal_rotations_fast_path: state
                 .journal_utilization
                 .rotations_fast_path
@@ -640,7 +663,7 @@ impl HealthSnapshot {
              # HELP melin_writes_refused_total Client writes turned away at ingress while the node was halted (replication configured, no replica connected). A refused write is never journaled; the client is told ReplicaDisconnected, or ServerBusy when the refusal queue is full.\n\
              # TYPE melin_writes_refused_total counter\n\
              melin_writes_refused_total {}\n\
-             # HELP melin_replicas_connected Number of replicas currently connected.\n\
+             # HELP melin_replicas_connected Number of replicas currently streaming (authenticated and handshake accepted: catching up or live). The write halt counts these.\n\
              # TYPE melin_replicas_connected gauge\n\
              melin_replicas_connected {}\n\
              # HELP melin_replica_acked_sequence Last sequence acked by each replica slot (persisted to journal).\n\
@@ -767,6 +790,27 @@ impl HealthSnapshot {
             if self.response_policy_degraded { 1 } else { 0 },
             self.response_policy_degraded_nanos as f64 / 1e9,
         );
+        // The two policy gauges exist only while their value is known —
+        // a node with no response gate (a replica) has no policy in
+        // force, a lineage with no change has none journaled — rather
+        // than exporting a byte that names a real policy. Best-effort
+        // like the block above.
+        if let Some(byte) = self.ack_policy_in_force {
+            let _ = write!(
+                c,
+                "# HELP melin_ack_policy_in_force Ack policy the response gate enforces, as its wire byte. Differs from melin_ack_policy_journaled while a journaled change waits for the policy before it to clear its entry.\n\
+                 # TYPE melin_ack_policy_in_force gauge\n\
+                 melin_ack_policy_in_force {byte}\n",
+            );
+        }
+        if let Some(byte) = self.ack_policy_journaled {
+            let _ = write!(
+                c,
+                "# HELP melin_ack_policy_journaled Ack policy the newest journaled policy change puts in force, as its wire byte.\n\
+                 # TYPE melin_ack_policy_journaled gauge\n\
+                 melin_ack_policy_journaled {byte}\n",
+            );
+        }
         // Raft gauges only exist on raft-enabled nodes — omitting the
         // series entirely (rather than exporting zeros) keeps dashboards
         // from suggesting a one-node "cluster" on standalone deployments.
@@ -1228,6 +1272,16 @@ mod tests {
         cursors
     }
 
+    /// A replica presence with `connected` replicas streaming, none of
+    /// which has acked yet.
+    fn presence(connected: u32) -> Arc<ReplicaPresence> {
+        let presence = Arc::new(ReplicaPresence::new());
+        for _ in 0..connected {
+            drop(presence.lift());
+        }
+        presence
+    }
+
     /// Helper: create a non-blocking listener and spawn the health loop.
     /// Returns (addr, events_processed, pipeline_healthy, shutdown_flag, join_handle).
     /// `replicas_connected` is None (standalone mode) unless overridden.
@@ -1253,7 +1307,7 @@ mod tests {
         active: u64,
         journal_seq: u64,
         repl_acked: u64,
-        replicas_connected: Option<Arc<AtomicU32>>,
+        replicas_connected: Option<Arc<ReplicaPresence>>,
         fence_state: Option<Arc<crate::fence::FenceState>>,
     ) -> (
         SocketAddr,
@@ -1509,15 +1563,16 @@ mod tests {
 
     #[test]
     fn health_shows_halted_when_replica_disconnected() {
-        let replica_count = Arc::new(AtomicU32::new(0)); // no replicas connected
+        let presence = presence(0); // no replicas connected
         let (addr, _events, _healthy, shutdown, handle) =
-            start_health_with_replica(5, 100, u64::MAX, Some(Arc::clone(&replica_count)), None);
+            start_health_with_replica(5, 100, u64::MAX, Some(Arc::clone(&presence)), None);
 
         let buf = read_health(addr);
         assert_eq!(buf, "OK 5 100 0 halted\n");
 
-        // Connect a replica — should switch to trading.
-        replica_count.store(1, Ordering::Relaxed);
+        // A replica is counted — should switch to trading. Its acks are
+        // not this test's concern.
+        drop(presence.lift());
         let buf = read_health(addr);
         assert_eq!(buf, "OK 5 100 0 trading\n");
 
@@ -1531,13 +1586,12 @@ mod tests {
     /// off the fence latch, not just the count.
     #[test]
     fn health_shows_halted_when_fenced() {
-        let replica_count = Arc::new(AtomicU32::new(1)); // replica still connected
         let fence = Arc::new(crate::fence::FenceState::new(0));
         let (addr, _events, _healthy, shutdown, handle) = start_health_with_replica(
             5,
             100,
             u64::MAX,
-            Some(Arc::clone(&replica_count)),
+            Some(presence(1)), // replica still connected
             Some(Arc::clone(&fence)),
         );
 
@@ -1644,9 +1698,9 @@ mod tests {
     #[test]
     fn metrics_boolean_encoding() {
         // Verify that unhealthy + halted → 0 values.
-        let replica_count = Arc::new(AtomicU32::new(0)); // disconnected → halted
+        // Disconnected → halted.
         let (addr, _events, healthy, shutdown, handle) =
-            start_health_with_replica(0, 0, u64::MAX, Some(Arc::clone(&replica_count)), None);
+            start_health_with_replica(0, 0, u64::MAX, Some(presence(0)), None);
 
         healthy.store(false, Ordering::Relaxed);
 
@@ -2216,7 +2270,7 @@ mod tests {
             cursors: test_cursors(1000, 1000, 1000, 800),
             input_cursor: Box::new(MockCursor(AtomicU64::new(1000))),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
-            replicas_connected: Some(Arc::new(AtomicU32::new(2))),
+            replicas_connected: Some(presence(2)),
             fence_state: None,
             replication_metrics: Some(metrics),
             replica_active: Some([
@@ -2300,7 +2354,7 @@ mod tests {
             cursors: test_cursors(1_000, 1_000, 1_000, 0),
             input_cursor: Box::new(MockCursor(AtomicU64::new(1_000))),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
-            replicas_connected: Some(Arc::new(AtomicU32::new(1))),
+            replicas_connected: Some(presence(1)),
             fence_state: None,
             replication_metrics: Some(metrics),
             replica_active: Some([
@@ -2380,7 +2434,7 @@ mod tests {
             cursors: cursors.clone(),
             input_cursor: Box::new(MockCursor(AtomicU64::new(0))),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
-            replicas_connected: Some(Arc::new(AtomicU32::new(2))),
+            replicas_connected: Some(presence(2)),
             fence_state: None,
             replication_metrics: Some(Arc::clone(&metrics)),
             replica_active: Some([Arc::clone(&active[0]), Arc::clone(&active[1])]),
@@ -2537,6 +2591,14 @@ mod tests {
         response_util
             .policy_degraded_nanos
             .store(2_500_000_000, Ordering::Relaxed);
+        // A change journaled but not yet in force: the two gauges differ.
+        response_util
+            .ack_policy_in_force
+            .store(Some(melin_journal::AckPolicyByte(1)));
+        let matching_util = Arc::new(StageUtilization::new());
+        matching_util
+            .ack_policy_journaled
+            .store(Some(melin_journal::AckPolicyByte(0)));
 
         let state = HealthState {
             active_connections: Arc::new(AtomicU64::new(0)),
@@ -2552,7 +2614,7 @@ mod tests {
             replication_ring_producer_cursors: None,
             replication_ring_consumer_cursors: None,
             journal_utilization: Arc::new(StageUtilization::new()),
-            matching_utilization: Arc::new(StageUtilization::new()),
+            matching_utilization: matching_util,
             response_utilization: response_util,
             raft: None,
         };
@@ -2587,7 +2649,33 @@ mod tests {
             response.contains("melin_durability_policy_degraded_seconds_total 2.500000\n"),
             "deprecated policy_degraded_seconds_total alias: {response}"
         );
+        assert!(
+            response.contains("melin_ack_policy_in_force 1\n"),
+            "policy in force: {response}"
+        );
+        assert!(
+            response.contains("melin_ack_policy_journaled 0\n"),
+            "policy journaled: {response}"
+        );
 
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    /// With no gate running and no change journaled, the two policy
+    /// gauges are left out rather than exported as a byte that names a
+    /// real policy.
+    #[test]
+    fn metrics_omit_the_policy_gauges_while_unknown() {
+        let (body, shutdown, handle) = prometheus_with_full_replication_state();
+        assert!(
+            !body.contains("melin_ack_policy_in_force"),
+            "in force: {body}"
+        );
+        assert!(
+            !body.contains("melin_ack_policy_journaled"),
+            "journaled: {body}"
+        );
         shutdown.store(true, Ordering::Relaxed);
         handle.join().unwrap();
     }

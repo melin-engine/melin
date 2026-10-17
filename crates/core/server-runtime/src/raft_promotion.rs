@@ -10,14 +10,17 @@
 //! effectively immediately.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use melin_raft::recency::{JournalTip, PeerTips};
 use melin_transport_core::health::RaftStatus;
 use tracing::{info, warn};
 
+use melin_journal::AckPolicyByte;
+
 use crate::ack_policy::AckPolicy;
+use crate::policy_control::AckPolicyControl;
 use crate::replication::ReplicaControlPlane;
 
 /// Poll cadence for the promotion thread. Matches the codebase's
@@ -115,20 +118,35 @@ fn observe_peer(
     }
 }
 
-/// The ack policy the auto-promotion refusal judges: the policy
-/// the *primary* last advertised on the replication stream — that is
-/// the gate acked events actually passed through — falling back to
-/// this node's own configured policy while no primary has ever been
-/// observed (`ACK_POLICY_UNKNOWN`), which is exactly the
-/// pre-propagation behavior. `None` for an unrecognised byte (e.g. a
-/// newer node's policy) — the caller refuses on it.
-fn effective_ack_policy(observed: u8, local_fallback: u8) -> Option<AckPolicy> {
-    let byte = if observed == crate::ack_policy::ACK_POLICY_UNKNOWN {
-        local_fallback
-    } else {
-        observed
-    };
-    AckPolicy::from_u8(byte)
+/// The ack policy the auto-promotion refusal judges: the one in force in
+/// the lineage this replica holds, i.e. the newest journaled ack-policy
+/// change it has received (`ReplicaControlPlane::lineage_ack_policy`).
+/// That is the policy the primary's gate acked the events after it under,
+/// learned in order with them: a replica that lacks a change lacks every
+/// event acked under it too, so it judges by the older policy those
+/// events it does hold were acked under.
+///
+/// The newest change, not the policy before it, which a promoted gate
+/// starts under until the change is confirmed again (see the durability
+/// gate's "A new tenure"): that is about what the *new* primary acks. What
+/// this decision protects was acked by the old one, which admitted no
+/// event after a change before applying the change, so every event after
+/// it that this replica may be missing was acked under it.
+///
+/// Falls back to this node's own requested policy (configured, or staged
+/// by `ACK-POLICY`) only while the lineage holds no change: a lineage
+/// written before changes were journaled, until its primary's first boot
+/// under this release journals one; it is read only then. `None` for an
+/// unrecognised lineage byte (e.g. a newer node's policy) — the caller
+/// refuses on it.
+fn effective_ack_policy(
+    lineage: Option<AckPolicyByte>,
+    local_fallback: impl FnOnce() -> AckPolicy,
+) -> Option<AckPolicy> {
+    match lineage {
+        Some(byte) => AckPolicy::from_byte(byte),
+        None => Some(local_fallback()),
+    }
 }
 
 /// Everything the auto-promotion rule looks at, snapshotted from the
@@ -150,8 +168,9 @@ struct AutoPromotionInputs {
     /// failover; the link state is one-sided (this node's socket only).
     primary_link_down_for: Duration,
     /// A primary has been observed at least once since this process
-    /// booted (streaming started, i.e. the ack-policy gauge left
-    /// `ACK_POLICY_UNKNOWN`). Process-lifetime, not per-session.
+    /// booted (a `StreamStart` was accepted —
+    /// `ReplicaControlPlane::primary_observed`). Process-lifetime, not
+    /// per-session.
     primary_observed: bool,
     /// This node's own journal tip (fencing epoch + advertised
     /// sequence) — the local side of the peer-tip veto, and
@@ -295,7 +314,7 @@ fn consider_auto_promotion(
     status: &RaftStatus,
     control: &ReplicaControlPlane,
     fence_state: &melin_transport_core::fence::FenceState,
-    ack_policy: &AtomicU8,
+    ack_policy: &AckPolicyControl,
     peer_tips: &PeerTips,
     // Configured voter ids excluding this node.
     peer_ids: &[u64],
@@ -317,24 +336,25 @@ fn consider_auto_promotion(
         return;
     }
     let term = status.term.load(Ordering::Relaxed);
-    // Loaded once: both the effective policy and the observed-a-primary
-    // fact must come from the same snapshot of the gauge.
-    let observed_policy = control.primary_ack_policy.load(Ordering::Acquire);
-    // Loaded once for the same reason: `local_tip.epoch` and the
-    // `fence_epoch` input must not tear if a fencing event lands
-    // mid-poll.
+    // Loaded once: `local_tip.epoch` and the `fence_epoch` input must not
+    // tear if a fencing event lands mid-poll.
     let fence_epoch = fence_state.epoch();
+    // The tip before the lineage policy, both Acquire: the receive thread
+    // moves the policy for a change before the tip passes it, so a tip
+    // holding a change is never judged by the policy before it.
+    let last_sequence = control.journal_tip.load().get();
+    let lineage_policy = control.lineage_ack_policy.load().map(|p| p.policy());
     let now = Instant::now();
     let inputs = AutoPromotionInputs {
         tip_ready: control.tip_ready.load(Ordering::Acquire),
         fenced: fence_state.is_fenced(),
-        ack_policy: effective_ack_policy(observed_policy, ack_policy.load(Ordering::Relaxed)),
+        ack_policy: effective_ack_policy(lineage_policy, || ack_policy.requested()),
         primary_link_up: control.primary_link_up.load(Ordering::Acquire),
         primary_link_down_for,
-        primary_observed: observed_policy != crate::ack_policy::ACK_POLICY_UNKNOWN,
+        primary_observed: control.primary_observed.load(Ordering::Acquire),
         local_tip: JournalTip {
             epoch: fence_epoch,
-            last_sequence: control.journal_tip.load().get(),
+            last_sequence,
         },
         peers: peer_ids
             .iter()
@@ -651,7 +671,7 @@ pub(crate) fn spawn_auto_promotion(
     status: Arc<RaftStatus>,
     control: ReplicaControlPlane,
     fence_state: Arc<melin_transport_core::fence::FenceState>,
-    ack_policy: Arc<AtomicU8>,
+    ack_policy: Arc<AckPolicyControl>,
     peer_tips: Arc<PeerTips>,
     // Configured voter ids excluding this node — the peers the
     // journal-safety veto must account for.
@@ -753,7 +773,6 @@ pub(crate) fn spawn_auto_promotion(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ack_policy::ACK_POLICY_UNKNOWN;
 
     fn tip(epoch: u64, seq: u64) -> JournalTip {
         JournalTip {
@@ -1085,13 +1104,14 @@ mod tests {
         control
             .journal_tip
             .advance(melin_transport_core::WireSeq::new(100));
-        control
-            .primary_ack_policy
-            .store(AckPolicy::Ram.as_u8(), Ordering::Release);
+        control.lineage_ack_policy.observe(
+            melin_transport_core::WireSeq::new(90),
+            streamed_change(AckPolicy::Ram),
+        );
         // Epoch 0 so the peer comparison turns on the sequence, and the
         // term (7) clears the fence-epoch check.
         let fence = melin_transport_core::fence::FenceState::new(0);
-        let policy = AtomicU8::new(AckPolicy::Ram.as_u8());
+        let policy = crate::policy_control::test_support::replicated(AckPolicy::Ram);
         let peer_tips = PeerTips::new();
         // Peer 3 is a caught-up replica; peer 1 is the primary, unheard
         // — which digests to `Silent` rather than `Unknown` because this
@@ -1125,6 +1145,73 @@ mod tests {
         // A standing refusal still logs once, not once per poll.
         refuse(&mut last_refused, PRIMARY_DOWN_GRACE);
         assert_eq!(last_refused, Some((7, second)));
+    }
+
+    /// Finding 10 of the determinism audit, at the decision: the policy
+    /// judged is the one the replica's lineage holds — moved by the
+    /// changes it received in the stream, with or without a heartbeat —
+    /// never this node's own requested policy while the lineage holds one.
+    /// A weakening to `disk` refuses although this node asks for
+    /// `disk+ram`; `disk+ram` restored lets the failover proceed although
+    /// this node asks for `disk`.
+    #[test]
+    fn auto_promotion_judges_by_the_lineage_policy_not_the_nodes_own() {
+        let status = RaftStatus::new(2);
+        status
+            .role
+            .store(RaftStatus::ROLE_LEADER, Ordering::Relaxed);
+        status.term.store(7, Ordering::Relaxed);
+        let control = crate::replication::ReplicaControlPlane::new();
+        control.tip_ready.store(true, Ordering::Release);
+        control.primary_observed.store(true, Ordering::Release);
+        control
+            .journal_tip
+            .advance(melin_transport_core::WireSeq::new(100));
+        let fence = melin_transport_core::fence::FenceState::new(0);
+        let peer_tips = PeerTips::new();
+        let consider = |requested: AckPolicy, last: &mut Option<(u64, &'static str)>| {
+            consider_auto_promotion(
+                &status,
+                &control,
+                &fence,
+                &crate::policy_control::test_support::replicated(requested),
+                &peer_tips,
+                // No other voter: nothing for the peer-tip veto to weigh.
+                &[],
+                PRIMARY_DOWN_GRACE,
+                PEER_TIP_GRACE * 2,
+                last,
+            );
+        };
+
+        // Weakened in the stream: refused on `disk`, the newest change,
+        // though the record keeps `disk+ram` as the policy before it.
+        let observe = |wire_seq, policy| {
+            control.lineage_ack_policy.observe(
+                melin_transport_core::WireSeq::new(wire_seq),
+                streamed_change(policy),
+            );
+        };
+        observe(80, AckPolicy::DiskAndRam);
+        observe(90, AckPolicy::Disk);
+        let mut last_refused = None;
+        consider(AckPolicy::DiskAndRam, &mut last_refused);
+        let (_, reason) = last_refused.expect("refused");
+        assert!(reason.contains("`disk`"), "{reason}");
+        assert!(!control.promote.is_requested());
+
+        // Restored in the stream: the failover proceeds.
+        observe(95, AckPolicy::DiskAndRam);
+        consider(AckPolicy::Disk, &mut last_refused);
+        assert!(control.promote.is_requested(), "promotion filed");
+    }
+
+    /// A witnessed change to `policy`, as the stream carries it.
+    fn streamed_change(policy: AckPolicy) -> melin_journal::AckPolicyChange {
+        melin_journal::AckPolicyChange {
+            policy: policy.to_byte(),
+            unwitnessed: false,
+        }
     }
 
     #[test]
@@ -1296,21 +1383,21 @@ mod tests {
         assert!(unready.contains("recovery"), "{unready}");
     }
 
+    /// That the lineage's policy wins over the local one is
+    /// `auto_promotion_judges_by_the_lineage_policy_not_the_nodes_own`.
     #[test]
-    fn effective_ack_policy_prefers_the_observed_primary_policy() {
-        // Observed policy wins over the local fallback.
+    fn effective_ack_policy_falls_back_and_refuses_garbage() {
+        // A lineage holding no change falls back to this node's own policy.
         assert_eq!(
-            effective_ack_policy(AckPolicy::Disk.as_u8(), AckPolicy::DiskAndRam.as_u8()),
-            Some(AckPolicy::Disk)
-        );
-        // Unknown observed falls back to this node's own policy.
-        assert_eq!(
-            effective_ack_policy(ACK_POLICY_UNKNOWN, AckPolicy::DiskAndRam.as_u8()),
+            effective_ack_policy(None, || AckPolicy::DiskAndRam),
             Some(AckPolicy::DiskAndRam)
         );
-        // Garbage bytes are None (caller refuses).
+        // A garbage lineage byte is None (caller refuses), and the local
+        // policy is not even read.
         assert_eq!(
-            effective_ack_policy(0x7F, AckPolicy::DiskAndRam.as_u8()),
+            effective_ack_policy(Some(AckPolicyByte(0x7F)), || unreachable!(
+                "the lineage holds a change"
+            )),
             None
         );
     }

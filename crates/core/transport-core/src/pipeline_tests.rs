@@ -30,9 +30,13 @@ use crate::cursors::{DurableWireSeqCursor, WireSeq};
 // no-persist gates off — same reason as `JournalReader` above.
 #[cfg(not(feature = "no-persist"))]
 use crate::journaled_app::JournaledApp;
+#[cfg(not(feature = "no-persist"))]
+use crate::lineage::{Lineage, LineagePolicy};
 use crate::pipeline::StageWaits;
 #[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
 use crate::pipeline::build_replica_pipeline;
+#[cfg(not(feature = "no-persist"))]
+use melin_journal::{AckPolicyByte, AckPolicyChange};
 // Only the hash-chain mark tests touch these.
 #[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
 use crate::pipeline::{AdoptedRotation, StreamMark};
@@ -40,7 +44,7 @@ use crate::pipeline::{
     InputSlot, JournalStage, MAX_JOURNAL_BATCH, MatchingStage, OutputPayload, OutputSlot,
     build_pipeline_with_replication, max_journal_batch,
 };
-use crate::test_support::{TestApp, TestEvent, TestQuery, TestReport};
+use crate::test_support::{TestApp, TestEvent, TestQuery, TestReport, ack_policy_change};
 use crate::trace::mono_trace_ns;
 
 type Writer = BufferedWriter<TestEvent>;
@@ -306,14 +310,17 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
     //   4  | App(Add 3)           | yes → 12          | 12
     //   5  | Tick                 | yes → 13          | 13
     //   6  | EpochBump{7}         | yes → 14          | 14
+    //   7  | AckPolicyChange      | yes → 15          | 15
     //
     // All slots carry `connection_id = 1` so events that produce no
     // application reports (Tick, EpochBump) still emit a `BatchEnd`
-    // terminator on the output ring; that way every input event appears
-    // exactly once in the assertions below regardless of payload shape.
-    // `EpochBump` is the regression guard for the seq-allocation policy:
-    // it must follow the *same* allocate rule as App/Tick (it is not a
-    // query), so wire space and journal-allocator space stay in lockstep.
+    // terminator on the output ring, and the AckPolicyChange its own
+    // slot; that way every input event appears exactly once in the
+    // assertions below regardless of payload shape. `EpochBump` and
+    // `AckPolicyChange` are the regression guards for the seq-allocation
+    // policy: lineage metadata must follow the *same* allocate rule as
+    // App/Tick (it is not a query), so wire space and journal-allocator
+    // space stay in lockstep.
     let conn_id = 1u64;
     let mut publish = |event: JournalEvent<TestEvent>| {
         input_producer.publish(InputSlot {
@@ -332,13 +339,14 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
     publish(JournalEvent::App(TestEvent::Add(3)));
     publish(JournalEvent::Tick { now_ns: 1 });
     publish(JournalEvent::EpochBump { epoch: 7 });
+    publish(ack_policy_change(1, false));
 
-    // Drain six output slots — one per input event under the
+    // Drain seven output slots — one per input event under the
     // connection-id-1 invariant above.
-    let mut outputs: Vec<TestOutput> = Vec::with_capacity(6);
+    let mut outputs: Vec<TestOutput> = Vec::with_capacity(7);
     let mut spins = 0u32;
     let drain_start = std::time::Instant::now();
-    while outputs.len() < 6 {
+    while outputs.len() < 7 {
         if let Some((_, slot)) = output_consumer.try_consume() {
             outputs.push(slot);
         } else {
@@ -349,12 +357,13 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
     let actual: Vec<u64> = outputs.iter().map(|s| s.wire_seq).collect();
     assert_eq!(
         actual,
-        vec![10, 10, 11, 12, 13, 14],
+        vec![10, 10, 11, 12, 13, 14, 15],
         "wire_seq stamping diverged from the journal allocator's per-event rule"
     );
 
     // The EpochBump must have advanced the observed epoch without ever
-    // touching application state.
+    // touching application state, and the policy change after it must
+    // have left the epoch alone.
     assert_eq!(
         fence.epoch(),
         7,
@@ -372,6 +381,7 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
             OutputPayload::QueryResponse(_) => "QueryResponse",
             OutputPayload::BatchEnd => "BatchEnd",
             OutputPayload::EngineError => "EngineError",
+            OutputPayload::AckPolicyChange(_) => "AckPolicyChange",
         })
         .collect();
     assert_eq!(
@@ -382,12 +392,246 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
             "Report",
             "Report",
             "BatchEnd",
-            "BatchEnd"
+            "BatchEnd",
+            "AckPolicyChange"
         ],
     );
 
     shutdown.store(true, Ordering::Relaxed);
     let _app = handle.join().unwrap();
+}
+
+/// What a matching stage left behind: its output slots, the forced
+/// change it published for the response gate, and the policy it recorded
+/// as journaled last.
+struct MatchingRun {
+    outputs: Vec<TestOutput>,
+    forced: Option<crate::lineage::ForcedPolicy>,
+    journaled: Option<melin_journal::AckPolicyByte>,
+}
+
+/// The wire sequence the stages under [`run_matching_over`] start at:
+/// not 1, so a slot stamped from the input position instead would show.
+const POLICY_RUN_WIRE_SEQ: u64 = 10;
+
+/// Run a matching stage over `events` (connection, event, timestamp) and
+/// collect `expected` output slots. `on_shutdown` publishes everything
+/// with shutdown already requested, so the stage handles every event in
+/// its shutdown drain rather than its run loop.
+fn run_matching_over<A>(
+    app: A,
+    events: &[(u64, JournalEvent<TestEvent>, u64)],
+    expected: usize,
+    on_shutdown: bool,
+) -> MatchingRun
+where
+    A: melin_app::Application<Event = TestEvent, Report = TestReport, QueryResponse = TestQuery>
+        + Send
+        + 'static,
+{
+    let (mut input_producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
+        .add_consumer()
+        .build(WaitStrategy::SpinThenYield);
+    let (output_producer, mut output_consumers) = ring::DisruptorBuilder::<TestOutput>::new(64)
+        .add_consumer()
+        .build(WaitStrategy::SpinThenYield);
+    let mut output_consumer = output_consumers.pop().unwrap();
+    let stage = MatchingStage::new(
+        app,
+        consumers.pop().unwrap(),
+        output_producer,
+        Arc::new(AtomicU64::new(0)),
+        dummy_durable_cursor(),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(crate::fence::FenceState::new(0)),
+        WaitStrategy::SpinThenYield,
+        POLICY_RUN_WIRE_SEQ,
+    );
+    let forced = stage.forced_policy();
+    let utilization = stage.utilization();
+
+    let shutdown = Arc::new(AtomicBool::new(on_shutdown));
+    for &(connection_id, event, timestamp_ns) in events {
+        input_producer.publish(InputSlot {
+            connection_id,
+            key_hash: 0,
+            sequence: 0,
+            timestamp_ns,
+            event,
+            publish_ts: mono_trace_ns(),
+            recv_ts: mono_trace_ns(),
+        });
+    }
+    let shutdown2 = Arc::clone(&shutdown);
+    let handle = std::thread::spawn(move || stage.run(&shutdown2));
+
+    let mut outputs = Vec::with_capacity(expected);
+    let mut spins = 0u32;
+    let drain_start = std::time::Instant::now();
+    while outputs.len() < expected {
+        if let Some((_, slot)) = output_consumer.try_consume() {
+            outputs.push(slot);
+        } else {
+            drain_backoff(&mut spins, drain_start, "draining outputs");
+        }
+    }
+    shutdown.store(true, Ordering::Relaxed);
+    let _app = handle.join().unwrap();
+    assert!(
+        output_consumer.try_consume().is_none(),
+        "more output slots than expected"
+    );
+    MatchingRun {
+        outputs,
+        forced: forced.load(),
+        journaled: utilization.ack_policy_journaled.load(),
+    }
+}
+
+/// `(wire_seq, connection_id, is_last_in_request, change)` per slot, the
+/// change `None` for every payload but a policy change.
+fn policy_slot_shape(
+    outputs: &[TestOutput],
+) -> Vec<(u64, u64, bool, Option<melin_journal::AckPolicyChange>)> {
+    outputs
+        .iter()
+        .map(|s| {
+            let change = match s.payload {
+                OutputPayload::AckPolicyChange(change) => Some(change),
+                _ => None,
+            };
+            (s.wire_seq, s.connection_id, s.is_last_in_request, change)
+        })
+        .collect()
+}
+
+fn change_payload(policy: u8, unwitnessed: bool) -> Option<melin_journal::AckPolicyChange> {
+    Some(melin_journal::AckPolicyChange {
+        policy: melin_journal::AckPolicyByte(policy),
+        unwitnessed,
+    })
+}
+
+/// A policy change emits its own output slot at its exact position in
+/// the ring, stamped with the entry's wire sequence, even on connection
+/// 0, where a report-less event emits nothing: slot before, entry, slot
+/// after, in order. The slot is addressed to connection 0, whatever
+/// connection the entry came in on, so it can never reach a client. An
+/// unwitnessed change is also published to the forced cell, and the
+/// newest change is recorded as journaled — in the run loop and the
+/// shutdown drain alike.
+#[test]
+fn matching_stage_emits_each_policy_change_at_its_slot() {
+    for on_shutdown in [false, true] {
+        let run = run_matching_over(
+            TestApp::new(),
+            &[
+                (1, JournalEvent::App(TestEvent::Add(1)), 0),
+                // Never on a client connection in practice; addressed to
+                // connection 0 regardless.
+                (7, ack_policy_change(1, false), 0),
+                (1, JournalEvent::App(TestEvent::Add(2)), 0),
+                (0, ack_policy_change(0, true), 0),
+                (1, JournalEvent::App(TestEvent::Add(3)), 0),
+            ],
+            5,
+            on_shutdown,
+        );
+        assert_eq!(
+            policy_slot_shape(&run.outputs),
+            vec![
+                (10, 1, true, None),
+                (11, 0, true, change_payload(1, false)),
+                (12, 1, true, None),
+                (13, 0, true, change_payload(0, true)),
+                (14, 1, true, None),
+            ],
+            "on_shutdown = {on_shutdown}"
+        );
+        assert_eq!(
+            run.forced,
+            Some(crate::lineage::ForcedPolicy {
+                wire_seq: crate::cursors::WireSeq::new(13),
+                policy: melin_journal::AckPolicyByte(0),
+            }),
+            "on_shutdown = {on_shutdown}"
+        );
+        assert_eq!(
+            run.journaled,
+            Some(melin_journal::AckPolicyByte(0)),
+            "on_shutdown = {on_shutdown}"
+        );
+    }
+}
+
+/// [`TestApp`] whose clock step reports, so a policy change can carry
+/// reports from the scheduled work its timestamp fires.
+#[derive(Default)]
+struct TickReportingApp(TestApp);
+
+impl melin_app::Application for TickReportingApp {
+    type Event = TestEvent;
+    type Report = TestReport;
+    type QueryResponse = TestQuery;
+    type Sizing = ();
+
+    const APP_VERSION: u16 = TestApp::APP_VERSION;
+
+    fn apply(&mut self, event: TestEvent, ctx: &melin_app::ApplyCtx, out: &mut Vec<TestReport>) {
+        self.0.apply(event, ctx, out);
+    }
+
+    fn query(&self, event: TestEvent, ctx: &melin_app::QueryCtx) -> Option<TestQuery> {
+        self.0.query(event, ctx)
+    }
+
+    fn tick(&mut self, now_ns: u64, out: &mut Vec<TestReport>) {
+        self.0.tick(now_ns, out);
+        out.push(TestReport {
+            total_after: now_ns,
+        });
+    }
+
+    fn build_reject(event: &TestEvent, reason: melin_app::RejectReason) -> TestReport {
+        TestApp::build_reject(event, reason)
+    }
+
+    fn snapshot<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        self.0.snapshot(w)
+    }
+
+    fn restore<R: std::io::Read>(r: &mut R) -> std::io::Result<Self> {
+        TestApp::restore(r).map(Self)
+    }
+}
+
+/// The reports a change's clock step produces come first, and only the
+/// change slot closes the event — in the run loop and the shutdown drain
+/// alike. The change is witnessed, so it leaves the forced cell empty.
+#[test]
+fn a_policy_change_closes_the_reports_its_clock_step_produced() {
+    for on_shutdown in [false, true] {
+        let run = run_matching_over(
+            TickReportingApp(TestApp::new()),
+            &[(0, ack_policy_change(3, false), 7)],
+            2,
+            on_shutdown,
+        );
+        assert_eq!(
+            policy_slot_shape(&run.outputs),
+            vec![
+                (10, 0, false, None),
+                (10, 0, true, change_payload(3, false))
+            ],
+            "on_shutdown = {on_shutdown}"
+        );
+        assert!(matches!(
+            run.outputs[0].payload,
+            OutputPayload::Report(TestReport { total_after: 7 })
+        ));
+        assert_eq!(run.forced, None, "on_shutdown = {on_shutdown}");
+        assert_eq!(run.journaled, Some(melin_journal::AckPolicyByte(3)));
+    }
 }
 
 /// Regression tripwire for the pre-v14 durability-gate hole: the
@@ -473,24 +717,25 @@ fn allocator_wire_seq_and_gate_cursor_agree_across_rotation() {
     };
 
     // Pre-rotation phase: the allocator assigns 1, 2, holds flat for
-    // the query, then 3 for the tick.
+    // the query, then 3 for the tick and 4 for the ack-policy change.
     publish(JournalEvent::App(TestEvent::Add(100)));
     publish(JournalEvent::App(TestEvent::Add(200)));
     publish(JournalEvent::App(TestEvent::Query));
     publish(JournalEvent::Tick { now_ns: 1 });
+    publish(ack_policy_change(1, false));
 
     // Wait until the pre-rotation entries are durably in the live
     // segment (last_seq is published post-fsync) so the rotation
     // boundary genuinely splits the stream. Polled — fixed sleeps
     // flake on slow CI machines.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while last_seq.load().get() < 3 && std::time::Instant::now() < deadline {
+    while last_seq.load().get() < 4 && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
     rotate_flag.store(true, Ordering::Release);
 
     // Post-rotation phase. The rotation itself must consume no
-    // sequence: 4 and 5.
+    // sequence: 5 and 6.
     publish(JournalEvent::App(TestEvent::Add(50)));
     let archive_path = std::path::PathBuf::from(format!("{}.000001", path.display()));
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -503,10 +748,10 @@ fn allocator_wire_seq_and_gate_cursor_agree_across_rotation() {
     // Drain one output slot per input event and pin the stamped wire
     // seqs. A change here means the allocator/wire rule moved — update
     // only in lockstep with the journal stage's allocation rule.
-    let mut outputs: Vec<TestOutput> = Vec::with_capacity(6);
+    let mut outputs: Vec<TestOutput> = Vec::with_capacity(7);
     let mut spins = 0u32;
     let drain_start = std::time::Instant::now();
-    while outputs.len() < 6 {
+    while outputs.len() < 7 {
         if let Some((_, slot)) = output_consumer.try_consume() {
             outputs.push(slot);
         } else {
@@ -516,10 +761,10 @@ fn allocator_wire_seq_and_gate_cursor_agree_across_rotation() {
     let wire_seqs: Vec<u64> = outputs.iter().map(|s| s.wire_seq).collect();
     assert_eq!(
         wire_seqs,
-        vec![1, 2, 2, 3, 4, 5],
+        vec![1, 2, 2, 3, 4, 5, 6],
         "wire_seq stamping diverged from the journal allocator's rule"
     );
-    const MAX_WIRE_SEQ: u64 = 5;
+    const MAX_WIRE_SEQ: u64 = 6;
 
     // View 2: the gate's primary `persisted` cursor must converge on
     // exactly the wire high-water mark. Poll for catch-up (the fsync
@@ -554,8 +799,8 @@ fn allocator_wire_seq_and_gate_cursor_agree_across_rotation() {
          ahead of the response gate's wire_seq (the pre-v14 vacuous-gate bug)"
     );
     assert_eq!(
-        report.entries, 5,
-        "five allocated events expected (the query is not journaled)"
+        report.entries, 6,
+        "six allocated events expected (the query is not journaled)"
     );
 }
 
@@ -569,7 +814,8 @@ fn allocator_wire_seq_and_gate_cursor_agree_across_rotation() {
 /// `STARTING_WIRE_SEQ = 10` comment warns about, but only on restarted
 /// nodes, where no fresh-journal test can see it.
 ///
-/// Phase 1 journals four events across a rotation and shuts down.
+/// Phase 1 journals five events across a rotation, an ack-policy change
+/// among them, and shuts down.
 /// Phase 2 recovers through the production path (`recover` →
 /// `into_parts` → pipeline builder), then asserts:
 ///   - the gate cursor resumes at exactly the recovered high-water mark
@@ -599,7 +845,7 @@ fn recovery_resumes_allocator_wire_and_gate_agreement() {
         }
     };
 
-    // --- Phase 1: journal events 1..=4 across a rotation, shut down ---
+    // --- Phase 1: journal events 1..=5 across a rotation, shut down ---
     {
         let writer = Writer::create(&path).unwrap();
         let active_conns = Arc::new(AtomicU64::new(0));
@@ -641,13 +887,16 @@ fn recovery_resumes_allocator_wire_and_gate_agreement() {
             std::thread::sleep(Duration::from_millis(10));
         }
         rotate_flag.store(true, Ordering::Release);
+        // An ack-policy change in the segment recovery replays: it must
+        // take its sequence on both sides of the restart.
+        input_producer.publish(make_slot(ack_policy_change(1, false)));
         input_producer.publish(make_slot(JournalEvent::App(TestEvent::Add(4))));
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while last_seq.load().get() < 4 && std::time::Instant::now() < deadline {
+        while last_seq.load().get() < 5 && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(last_seq.load().get(), 4, "phase 1 fsync");
+        assert_eq!(last_seq.load().get(), 5, "phase 1 fsync");
 
         shutdown.store(true, Ordering::Relaxed);
         let _writer = t_journal.join().unwrap();
@@ -657,7 +906,7 @@ fn recovery_resumes_allocator_wire_and_gate_agreement() {
     // --- Phase 2: recover and continue ---
     let engine = JournaledApp::<TestApp, Writer>::recover(TestApp::new(), &path).unwrap();
     assert_eq!(engine.app().total, 1 + 2 + 3 + 4, "recovered state");
-    assert_eq!(engine.next_sequence(), 5, "recovered allocator position");
+    assert_eq!(engine.next_sequence(), 6, "recovered allocator position");
     let (app, writer) = engine.into_parts();
 
     let active_conns = Arc::new(AtomicU64::new(0));
@@ -685,7 +934,7 @@ fn recovery_resumes_allocator_wire_and_gate_agreement() {
     // entry consumed during recovery/reopen would overshoot here.
     assert_eq!(
         last_seq.load().get(),
-        4,
+        5,
         "gate persisted cursor must resume at the recovered high-water mark"
     );
 
@@ -696,16 +945,17 @@ fn recovery_resumes_allocator_wire_and_gate_agreement() {
     let t_matching = std::thread::spawn(move || matching_stage.run(&s2));
 
     // A query before any post-recovery allocation must stamp the
-    // recovered mark (4) — the gate satisfies it from recovered state.
-    // Then two allocations continue the space: 5 and 6.
+    // recovered mark (5) — the gate satisfies it from recovered state.
+    // Then three allocations continue the space: 6, 7 and 8.
     input_producer.publish(make_slot(JournalEvent::App(TestEvent::Query)));
     input_producer.publish(make_slot(JournalEvent::App(TestEvent::Add(5))));
+    input_producer.publish(make_slot(ack_policy_change(0, true)));
     input_producer.publish(make_slot(JournalEvent::Tick { now_ns: 1 }));
 
-    let mut outputs: Vec<TestOutput> = Vec::with_capacity(3);
+    let mut outputs: Vec<TestOutput> = Vec::with_capacity(4);
     let mut spins = 0u32;
     let drain_start = std::time::Instant::now();
-    while outputs.len() < 3 {
+    while outputs.len() < 4 {
         if let Some((_, slot)) = output_consumer.try_consume() {
             outputs.push(slot);
         } else {
@@ -715,18 +965,18 @@ fn recovery_resumes_allocator_wire_and_gate_agreement() {
     let wire_seqs: Vec<u64> = outputs.iter().map(|s| s.wire_seq).collect();
     assert_eq!(
         wire_seqs,
-        vec![4, 5, 6],
+        vec![5, 6, 7, 8],
         "post-recovery wire space must continue the recovered allocator \
          with no gap or overlap"
     );
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while last_seq.load().get() < 6 && std::time::Instant::now() < deadline {
+    while last_seq.load().get() < 8 && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(
         last_seq.load().get(),
-        6,
+        8,
         "gate persisted cursor diverged from wire space after recovery"
     );
 
@@ -737,10 +987,13 @@ fn recovery_resumes_allocator_wire_and_gate_agreement() {
     let report = melin_journal::segment::verify_lineage::<TestEvent>(&path).unwrap();
     assert_eq!(
         report.last_sequence,
-        Some(6),
+        Some(8),
         "on-disk lineage tail diverged from wire space after recovery"
     );
-    assert_eq!(report.entries, 6, "six allocated events across both phases");
+    assert_eq!(
+        report.entries, 8,
+        "eight allocated events across both phases"
+    );
 }
 
 /// A replica pipeline built over a journal that already holds entries
@@ -1000,7 +1253,7 @@ fn replica_ack_cursor_tracks_primary_sequences_across_local_rotation() {
     let t_matching = std::thread::spawn(move || matching_stage.run(&s2));
 
     // Primary-stamped stream, sequences 1..=3, then a local rotation,
-    // then 4..=5. The replica must consume the stamped values verbatim.
+    // then 4..=6. The replica must consume the stamped values verbatim.
     for seq in 1..=3u64 {
         input_producer.publish(add_slot_with_seq(seq * 10, seq, 1_000_000_000 + seq));
     }
@@ -1017,19 +1270,25 @@ fn replica_ack_cursor_tracks_primary_sequences_across_local_rotation() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(archive_path.exists(), "rotation did not produce an archive");
-    input_producer.publish(add_slot_with_seq(50, 5, 1_000_000_005));
+    // A primary-stamped ack-policy change, then one more event: the
+    // replica journals the change under the primary's sequence too.
+    input_producer.publish(InputSlot {
+        event: ack_policy_change(1, false),
+        ..add_slot_with_seq(0, 5, 1_000_000_005)
+    });
+    input_producer.publish(add_slot_with_seq(60, 6, 1_000_000_006));
 
     // The durable ack cursor must converge on exactly the last
     // primary-stamped sequence. Overshoot means a replica-local entry
     // consumed a sequence — the replica would ack events the primary
     // never sent.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while last_seq.load().get() < 5 && std::time::Instant::now() < deadline {
+    while last_seq.load().get() < 6 && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(
         last_seq.load().get(),
-        5,
+        6,
         "replica ack cursor diverged from primary-stamped sequences — a \
          replica-local writer entry is consuming sequences"
     );
@@ -1042,10 +1301,10 @@ fn replica_ack_cursor_tracks_primary_sequences_across_local_rotation() {
     assert_eq!(report.segments, 2, "expected archive + live after rotation");
     assert_eq!(
         report.last_sequence,
-        Some(5),
+        Some(6),
         "replica on-disk lineage diverged from the primary-stamped stream"
     );
-    assert_eq!(report.entries, 5, "exactly the five primary entries");
+    assert_eq!(report.entries, 6, "exactly the six primary entries");
 }
 
 /// Verify the JournalStage uses pre-assigned sequences and timestamps
@@ -2076,7 +2335,8 @@ fn barrier_fsync_state_pair_is_self_consistent_for_the_shadow() {
                 fsync_reader,
                 &shutdown2,
                 WaitStrategy::SpinThenYield,
-                0,
+                crate::lineage::Lineage::GENESIS,
+                1,
                 Some(0),
             );
         })
@@ -2086,12 +2346,12 @@ fn barrier_fsync_state_pair_is_self_consistent_for_the_shadow() {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(snap_path.exists(), "the aligned shadow must snapshot");
-    let (restored, journal_seq, _, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
+    let (restored, header) = snapshot::load::<TestApp>(&snap_path).unwrap();
     assert_eq!(
         restored.total, 3,
         "state = Add(1)+Add(2), exactly the prefix"
     );
-    assert_eq!(journal_seq, 2);
+    assert_eq!(header.sequence, 2);
 
     // Now the window: the disk thread, publishing the tail batch, stores
     // progress first and the seqlock second. Freeze it between the two.
@@ -2114,9 +2374,9 @@ fn barrier_fsync_state_pair_is_self_consistent_for_the_shadow() {
     shutdown.store(true, Ordering::Relaxed);
     handle.join().unwrap();
 
-    let (restored, journal_seq, _, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
+    let (restored, header) = snapshot::load::<TestApp>(&snap_path).unwrap();
     assert_eq!(
-        (restored.total, journal_seq),
+        (restored.total, header.sequence),
         (3, 2),
         "a stale-but-consistent pair must not let the shadow snapshot past its journal_seq"
     );
@@ -2256,7 +2516,8 @@ fn fsync_state_pairs_stay_consistent_across_adopted_rotations() {
                     fsync_reader,
                     &shutdown,
                     WaitStrategy::SpinThenYield,
-                    0,
+                    crate::lineage::Lineage::GENESIS,
+                    1,
                     Some(0),
                 );
             })
@@ -2269,10 +2530,12 @@ fn fsync_state_pairs_stay_consistent_across_adopted_rotations() {
     // NotFound here just means "try again next round".
     let mut snapshots: BTreeMap<u64, std::path::PathBuf> = BTreeMap::new();
     let collect = |snapshots: &mut BTreeMap<u64, std::path::PathBuf>| {
-        if let Ok((_, seq, _, _)) = snapshot::load::<TestApp>(&snap_path)
-            && !snapshots.contains_key(&seq)
+        if let Ok((_, header)) = snapshot::load::<TestApp>(&snap_path)
+            && !snapshots.contains_key(&header.sequence)
         {
-            let copy = dir.path().join(format!("snap-{seq}.snapshot"));
+            let copy = dir
+                .path()
+                .join(format!("snap-{}.snapshot", header.sequence));
             // The shadow may replace the file between our load and copy;
             // a copy of a *newer* complete snapshot is still a valid
             // sample, keyed by whatever it turns out to hold.
@@ -2281,8 +2544,8 @@ fn fsync_state_pairs_stay_consistent_across_adopted_rotations() {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
                 Err(e) => panic!("copying the shadow snapshot: {e}"),
             }
-            let (_, actual, _, _) = snapshot::load::<TestApp>(&copy).unwrap();
-            snapshots.insert(actual, copy);
+            let (_, actual) = snapshot::load::<TestApp>(&copy).unwrap();
+            snapshots.insert(actual.sequence, copy);
         }
     };
 
@@ -4392,9 +4655,30 @@ fn a_repeated_request_reaches_apply_on_live_replay_and_shadow() {
     );
 
     // The real shadow stage over the same slots, compared through the
-    // snapshot it writes — the state recovery would restore. The fsync
-    // pair claims all three slots, so the only snapshot it can write is
-    // the one taken after consuming them.
+    // snapshot it writes — the state recovery would restore.
+    let (shadow, _) = shadow_snapshot_from(dir.path(), Lineage::GENESIS, &slots);
+    assert_eq!(
+        shadow, live,
+        "the shadow's snapshot must apply every submission as live did"
+    );
+}
+
+/// The wire sequence [`shadow_snapshot_from`]'s shadow allocates to its
+/// first slot: past a recovered history, as a primary's is.
+#[cfg(not(feature = "no-persist"))]
+const SHADOW_FIRST_WIRE_SEQ: u64 = 40;
+
+/// Run the real shadow stage, from the lineage `initial`, over `slots`
+/// (the first at [`SHADOW_FIRST_WIRE_SEQ`]) and return the application
+/// state and lineage of the snapshot it writes. The fsync pair claims
+/// every slot, so the only snapshot it can write is the one taken after
+/// consuming them all.
+#[cfg(not(feature = "no-persist"))]
+fn shadow_snapshot_from(
+    dir: &std::path::Path,
+    initial: Lineage,
+    slots: &[TestInput],
+) -> (TestApp, Lineage) {
     let (mut shadow_producer, mut shadow_consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
         .build(WaitStrategy::SpinThenYield);
@@ -4405,7 +4689,7 @@ fn a_repeated_request_reaches_apply_on_live_replay_and_shadow() {
             chain_hash: [0; 32],
             input_ring_seq: crate::cursors::RingPos::new(slots.len() as u64),
         });
-    let snap_path = dir.path().join("duplicate.snapshot");
+    let snap_path = dir.join("shadow.snapshot");
     let shadow_shutdown = Arc::new(AtomicBool::new(false));
     let t_shadow = {
         let (snap_path, shutdown) = (snap_path.clone(), Arc::clone(&shadow_shutdown));
@@ -4418,13 +4702,14 @@ fn a_repeated_request_reaches_apply_on_live_replay_and_shadow() {
                 fsync_reader,
                 &shutdown,
                 WaitStrategy::SpinThenYield,
-                0,
+                initial,
+                SHADOW_FIRST_WIRE_SEQ,
                 Some(0),
             )
         })
     };
     for slot in slots {
-        shadow_producer.publish(slot);
+        shadow_producer.publish(*slot);
     }
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while !snap_path.exists() && std::time::Instant::now() < deadline {
@@ -4432,9 +4717,71 @@ fn a_repeated_request_reaches_apply_on_live_replay_and_shadow() {
     }
     shadow_shutdown.store(true, Ordering::Relaxed);
     t_shadow.join().unwrap();
-    let (shadow, _, _, _) = crate::snapshot::load::<TestApp>(&snap_path).unwrap();
+    let (app, header) = crate::snapshot::load::<TestApp>(&snap_path).unwrap();
+    (app, header.lineage)
+}
+
+/// The shadow starts from the lineage it is given — what the live
+/// pipeline recovered, which its ring never carries — and records it in
+/// its snapshots until a lineage event replaces it. Lineage metadata goes
+/// to its lineage sink, never to the application: an epoch bump advances
+/// the epoch its snapshot records, an ack-policy change the policy, and
+/// neither touches the state.
+#[cfg(not(feature = "no-persist"))]
+#[test]
+fn the_shadow_records_its_initial_lineage_until_a_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let initial = Lineage {
+        epoch: 2,
+        ack_policy: Some(LineagePolicy {
+            change: AckPolicyChange {
+                policy: AckPolicyByte(1),
+                unwitnessed: false,
+            },
+            wire_seq: WireSeq::new(7),
+            previous: Some(AckPolicyByte(2)),
+        }),
+    };
+    let (_, lineage) = shadow_snapshot_from(dir.path(), initial, &[add_slot(5, 1)]);
+    assert_eq!(lineage, initial, "no lineage event: the seed is recorded");
+
+    // A query between the first slot and the change: never journaled, so
+    // it takes no wire sequence and the change is the third entry.
+    let dir = tempfile::tempdir().unwrap();
+    let slots = [
+        add_slot(5, 1),
+        InputSlot {
+            event: JournalEvent::App(TestEvent::Query),
+            ..add_slot(0, 1)
+        },
+        InputSlot {
+            event: JournalEvent::EpochBump { epoch: 3 },
+            ..add_slot(0, 1)
+        },
+        InputSlot {
+            event: ack_policy_change(0, true),
+            ..add_slot(0, 1)
+        },
+        add_slot(7, 1),
+    ];
+    let (shadow, lineage) = shadow_snapshot_from(dir.path(), initial, &slots);
     assert_eq!(
-        shadow, live,
-        "the shadow's snapshot must apply every submission as live did"
+        lineage,
+        Lineage {
+            epoch: 3,
+            ack_policy: Some(LineagePolicy {
+                change: AckPolicyChange {
+                    policy: AckPolicyByte(0),
+                    unwitnessed: true,
+                },
+                wire_seq: WireSeq::new(SHADOW_FIRST_WIRE_SEQ + 2),
+                previous: Some(AckPolicyByte(1)),
+            }),
+        },
+        "both lineage events replaced the seed, the change at its own sequence"
+    );
+    assert_eq!(
+        shadow.total, 12,
+        "only the application events reached the application"
     );
 }

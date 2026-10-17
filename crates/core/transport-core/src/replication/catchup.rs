@@ -438,7 +438,8 @@ fn publish_chunked_body(
 ///
 /// Checks: snapshot file exists, its header parses, and an on-disk
 /// segment still contains the snapshot boundary. Reads at most the
-/// 64-byte snapshot header plus segment headers — never a body.
+/// largest snapshot header (`MAX_HEADER_SIZE`) plus segment headers —
+/// never a body.
 pub fn preflight_snapshot_transfer(journal_path: &std::path::Path) -> io::Result<()> {
     use std::io::Read as _;
 
@@ -492,9 +493,6 @@ pub fn snapshot_transfer_with<E: AppEvent>(
     journal_path: &std::path::Path,
     publisher: CatchUpPublisher<'_>,
     shutdown: &AtomicBool,
-    // The primary's current ack policy, stamped on the post-transfer
-    // `StreamStart` (see the protocol docs). Opaque byte at this layer.
-    ack_policy: u8,
 ) -> io::Result<CatchUpResult> {
     use super::protocol::{encode_segment_seed_begin, encode_snapshot_begin, encode_stream_start};
 
@@ -523,7 +521,7 @@ pub fn snapshot_transfer_with<E: AppEvent>(
     })?;
     let snap_sequence = header.sequence;
     let snap_chain_hash = header.chain_hash;
-    let snap_epoch = header.epoch;
+    let snap_epoch = header.lineage.epoch;
     let snap_len = snap_data.len() as u64;
 
     info!(
@@ -599,7 +597,6 @@ pub fn snapshot_transfer_with<E: AppEvent>(
         seed_info.anchor_hash,
         seed_info.genesis_entries,
         snap_epoch,
-        ack_policy,
         &mut send_buf,
     );
     publisher(&send_buf)?;
@@ -1206,7 +1203,10 @@ mod tests {
             &TestApp::new(),
             WireSeq::new(4),
             chain_at_4,
-            7,
+            crate::lineage::Lineage {
+                epoch: 7,
+                ack_policy: None,
+            },
             Some(2),
             &snap_path,
         )
@@ -1219,13 +1219,7 @@ mod tests {
             frames.push(buf.to_vec());
             Ok(())
         };
-        // Opaque at this layer (the policy enum lives in the server
-        // crate) — a distinctive non-default byte so the StreamStart
-        // assertion below proves it is carried through rather than
-        // defaulted.
-        const ACK_POLICY: u8 = 2;
-        let res = snapshot_transfer_with::<TestEvent>(&live, &mut publish, &shutdown, ACK_POLICY)
-            .unwrap();
+        let res = snapshot_transfer_with::<TestEvent>(&live, &mut publish, &shutdown).unwrap();
         assert_eq!(res, CatchUpResult::Ok(5), "catch-up must reach the tip");
 
         // Walk the frame sequence, reassembling the two chunked bodies.
@@ -1282,7 +1276,6 @@ mod tests {
                 anchor_hash,
                 genesis_entries,
                 epoch,
-                ack_policy,
             } => {
                 assert_eq!(start_sequence, 4);
                 assert_eq!(segment_start_sequence, live_info.starting_sequence);
@@ -1290,10 +1283,6 @@ mod tests {
                 assert_eq!(genesis_entries, Some(2), "the lineage's genesis length");
                 assert_eq!(live_info.genesis_entries, Some(2));
                 assert_eq!(epoch, 7, "snapshot's epoch rides StreamStart");
-                assert_eq!(
-                    ack_policy, ACK_POLICY,
-                    "primary's ack policy rides StreamStart"
-                );
             }
             other => panic!("expected StreamStart, got {other:?}"),
         }

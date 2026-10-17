@@ -15,7 +15,21 @@
 //! skips it. Replay never sees one.
 
 use melin_app::{Application, ApplyCtx};
-use melin_journal::JournalEvent;
+use melin_journal::{AckPolicyChange, JournalEvent};
+
+/// Lineage metadata a journaled event carries instead of application
+/// state: what [`dispatch`] hands its lineage sink.
+///
+/// One sink for every kind, rather than a callback per kind, so each
+/// consumer matches this enum and a new kind of lineage metadata fails
+/// to compile until every consumer has decided what it means there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LineageEvent {
+    /// A fencing epoch bump ([`JournalEvent::EpochBump`]).
+    Epoch(u64),
+    /// An ack-policy change ([`JournalEvent::AckPolicyChange`]).
+    AckPolicy(AckPolicyChange),
+}
 
 /// Hand one journaled event to the application.
 ///
@@ -34,10 +48,11 @@ use melin_journal::JournalEvent;
 ///    every-event resolution rather than only on `Tick`. The strict
 ///    greater-than tolerates the rare producer race that publishes a slot
 ///    with an earlier timestamp than its predecessor.
-/// 2. **The event itself.** `EpochBump` is lineage metadata, not
-///    application state, so it goes to `on_epoch` — the fencing state on
-///    the live stage (a replica following the stream, or a new primary's
-///    own promotion injection), a tracked epoch on replay and in the shadow.
+/// 2. **The event itself.** `EpochBump` and `AckPolicyChange` are lineage
+///    metadata, not application state, so they go to `on_lineage` as a
+///    [`LineageEvent`] — on the live stage the fencing state (a replica
+///    following the stream, or a new primary's own promotion injection),
+///    on replay and in the shadow the lineage they track.
 ///
 /// Reports are appended to `reports`, which the caller clears.
 #[inline]
@@ -46,7 +61,7 @@ pub(crate) fn dispatch<A: Application>(
     event: JournalEvent<A::Event>,
     ctx: &ApplyCtx,
     last_drain_ns: &mut u64,
-    on_epoch: impl FnOnce(u64),
+    on_lineage: impl FnOnce(LineageEvent),
     reports: &mut Vec<A::Report>,
 ) {
     debug_assert!(
@@ -68,7 +83,8 @@ pub(crate) fn dispatch<A: Application>(
             // timestamp is zero (hand-built ticks in tests).
             app.tick(now_ns, reports);
         }
-        JournalEvent::EpochBump { epoch } => on_epoch(epoch),
+        JournalEvent::EpochBump { epoch } => on_lineage(LineageEvent::Epoch(epoch)),
+        JournalEvent::AckPolicyChange(change) => on_lineage(LineageEvent::AckPolicy(change)),
         JournalEvent::Shutdown => {
             // Pipeline sentinel: the live stage exits on it before
             // dispatching, and it is never written to disk.
@@ -79,7 +95,7 @@ pub(crate) fn dispatch<A: Application>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TestApp, TestEvent};
+    use crate::test_support::{TestApp, TestEvent, ack_policy_change};
     use std::collections::HashMap;
 
     const KEY: u64 = 0xDEAD_BEEF;
@@ -178,25 +194,45 @@ mod tests {
         assert_eq!(app.ticks, 1, "Tick must call Application::tick");
     }
 
-    #[test]
-    fn epoch_bump_goes_to_the_epoch_sink_and_not_the_application() {
-        let mut app = TestApp::new();
+    /// Dispatch one event with a fresh clock, and return what reached the
+    /// lineage sink.
+    fn lineage_of(app: &mut TestApp, event: JournalEvent<TestEvent>) -> Option<LineageEvent> {
         let mut observed = None;
         dispatch(
-            &mut app,
-            JournalEvent::EpochBump { epoch: 7 },
+            app,
+            event,
             &ctx(0, 0),
             &mut 0,
-            |epoch| observed = Some(epoch),
+            |lineage| observed = Some(lineage),
             &mut Vec::new(),
         );
+        observed
+    }
 
-        assert_eq!(observed, Some(7));
-        assert_eq!(
-            app,
-            TestApp::new(),
-            "an epoch bump must not touch application state"
-        );
+    /// Lineage metadata, and only it, reaches the lineage sink — and not
+    /// the application, whose state it leaves untouched.
+    #[test]
+    fn only_lineage_metadata_reaches_the_lineage_sink() {
+        let policy_change = ack_policy_change(1, true);
+        let JournalEvent::AckPolicyChange(change) = policy_change else {
+            unreachable!("the helper builds an ack-policy change")
+        };
+        for (event, lineage) in [
+            (
+                JournalEvent::EpochBump { epoch: 7 },
+                Some(LineageEvent::Epoch(7)),
+            ),
+            (policy_change, Some(LineageEvent::AckPolicy(change))),
+            (JournalEvent::App(TestEvent::Add(1)), None),
+            (JournalEvent::Tick { now_ns: 5 }, None),
+            (JournalEvent::Shutdown, None),
+        ] {
+            let mut app = TestApp::new();
+            assert_eq!(lineage_of(&mut app, event), lineage, "{event:?}");
+            if lineage.is_some() {
+                assert_eq!(app, TestApp::new(), "{event:?} touched application state");
+            }
+        }
     }
 
     #[test]

@@ -57,9 +57,12 @@ Total entry size: `20 + length + 4` bytes. The first entry's `sequence` must equ
 |-------------|-------|---------|
 | `0x03` | Tick | `now_ns` (u64) — the clock reading the runtime journals so the application's time-driven work replays identically |
 | `0x04` | Epoch bump | `epoch` (u64) — the fencing epoch a newly promoted primary starts under (see [replication.md](replication.md)); never delivered to the application |
+| `0x05` | Ack-policy change | `policy` (u8: `0` `disk`, `1` `disk+ram`, `2` `two-disks`, `3` `ram`), `flags` (u8: bit 0 set when the change was journaled unwitnessed, by a forced swap or a node that accepts no replicas; every other bit zero) — the ack policy for the events after it (see "Runtime policy swap" in [replication.md](replication.md)); never delivered to the application |
 | `0x80` | Application event | the application's own encoding of one event, exactly as it wrote it |
 
 The runtime never reads inside an application event's payload: its layout, and how it changes between versions of the application, are the application's (see [Changing the Application's Encoding](#changing-the-applications-encoding)). Tags `0x01` and `0x02` are retired and never written.
+
+Epoch bumps and ack-policy changes are the history's own metadata: replayed on recovery, catch-up and replication like every entry, so every node that holds them agrees on the fencing epoch and the ack policy at each point of the history, and recorded in snapshots (below) so a recovery that skips the entries a snapshot covers still knows them. A release that predates ack-policy changes refuses a journal holding one, as it refuses any entry it cannot decode, rather than discard it.
 
 ## Durability
 
@@ -182,17 +185,23 @@ A journal written before the genesis length was recorded (format version 15) has
 ```
 Offset  Size  Field              Value
 0       4     file_magic         0x534E4150 ("SNAP")
-4       2     transport_version  3 — this framing's version
+4       2     transport_version  4 — this framing's version
 6       2     app_version        the application's snapshot version at save time
 8       8     sequence           journal sequence number at snapshot time
 16      32    chain_hash         BLAKE3 hash chain state at that sequence
 48      8     epoch              fencing epoch at snapshot time
 56      8     genesis_entries    the history's genesis length, from the journal header
-64      var   app_payload        the application's state, in its own encoding
+64      1     lineage_flags      bit 0: genesis_entries is known; bit 1: ack_policy and
+                                 policy_sequence are known; bit 2: previous_policy is known;
+                                 bit 3: the change to ack_policy was unwitnessed
+65      1     ack_policy         the ack policy in force at that sequence (the event-table encoding)
+66      1     previous_policy    the ack policy in force before the change to ack_policy
+67      8     policy_sequence    journal sequence of the change to ack_policy
+75      var   app_payload        the application's state, in its own encoding
 EOF-4   4     crc32c             CRC32C of everything from offset 0 through EOF-4
 ```
 
-`genesis_entries` lets a node that starts from a snapshot alone, with no journal segment left, record the genesis length in the journal it starts. A snapshot of a history with no recorded genesis length (see [Journals written by earlier releases](#journals-written-by-earlier-releases)) is written in the version-2 framing, which ends at `epoch`.
+`genesis_entries` lets a node that starts from a snapshot alone, with no journal segment left, record the genesis length in the journal it starts. `ack_policy` is the policy the newest ack-policy change at or before `sequence` put in force: recovery skips the entries the snapshot covers, and their segments may be gone, so the snapshot carries it. With it go the change that put it in force (`policy_sequence`; the first of any run of changes naming the same policy), the policy before that change, and whether it was unwitnessed: a primary starting from the snapshot applies that change again before it acknowledges anything (see [replication.md](replication.md#runtime-policy-swap)), and needs all three to do so. A field whose flag bit is clear holds zero and means "not recorded": a history with no recorded genesis length (see [Journals written by earlier releases](#journals-written-by-earlier-releases)), one that has journaled no ack-policy change yet, or, for `previous_policy`, one whose newest change is its first. Bits 2 and 3 are only set with bit 1. A snapshot with any other flag bit set, or a non-zero field its flags mark unrecorded, is refused. A history that records neither a genesis length nor an ack policy is written in the version-2 framing, which ends at `epoch`.
 
 Maximum file size enforced on load: 256 MiB (prevents OOM from corrupt/malicious files).
 
@@ -299,7 +308,7 @@ The journal participates in a 3-stage LMAX disruptor pipeline:
 
 ## Format Versioning
 
-Both the journal and snapshot have independent `format_version` fields. Current journal version: **16**. Current snapshot framing version: **3**.
+Both the journal and snapshot have independent `format_version` fields. Current journal version: **16**. Current snapshot framing version: **4**.
 
 ### Journal Version History
 
@@ -321,11 +330,12 @@ The framing's `transport_version` changes only with the runtime; the application
 | 1 | Initial framing |
 | 2 | Added the fencing `epoch` after `chain_hash` |
 | 3 | Added `genesis_entries` after `epoch` |
+| 4 | Added `lineage_flags`, `ack_policy`, `previous_policy` and `policy_sequence` after `genesis_entries`; the genesis length and the ack policy can each be unrecorded. Version 3 is read, no longer written |
 
 ### Compatibility Rules
 
 - **Pre-production policy:** the journal reader accepts the current format version and version 15, whose entries are identical; a version-15 journal needs no migration (see [Journals written by earlier releases](#journals-written-by-earlier-releases)). Older versions are rejected with `UnsupportedVersion`; migrate via the snapshot-boundary procedure below.
-- The snapshot reader accepts every framing version: a version-1 snapshot predates any promotion, so it loads with epoch 0; a version-1 or version-2 snapshot loads with no recorded genesis length.
+- The snapshot reader accepts every framing version: a version-1 snapshot predates any promotion, so it loads with epoch 0; a version-1 or version-2 snapshot loads with no recorded genesis length; a snapshot before version 4 loads with no recorded ack policy (the journal after it, or the node's `--ack-policy`, supplies one). Earlier releases do not read version 4.
 - A snapshot loads only into the application version that wrote it: an `app_version` other than the running application's is refused before the application sees the payload.
 - The journal records no application version. Entries written by one version of an application are decoded by whichever version replays them — see [Changing the Application's Encoding](#changing-the-applications-encoding).
 

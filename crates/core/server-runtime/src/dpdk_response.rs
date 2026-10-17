@@ -20,7 +20,7 @@ use melin_pipeline::ring;
 use melin_pipeline::spsc;
 use melin_pipeline::wait::WaitStrategy;
 
-use crate::durability_gate::{DurabilityGate, GateInputs, GateOutcome};
+use crate::durability_gate::{Admission, DurabilityGate, GateInputs, GatePolicy};
 use crate::halt::RefusalQueue;
 use melin_app::Application;
 use melin_app::amortized_timer::AmortizedTimer;
@@ -116,7 +116,7 @@ pub fn run<A: Application>(
     mut consumer: ring::Consumer<OutputSlot<A::Report, A::QueryResponse>>,
     control_rx: mpsc::Receiver<ControlEvent>,
     journal_persisted_wire_seq: DurableWireSeqCursor,
-    ack_policy: Arc<std::sync::atomic::AtomicU8>,
+    policy: GatePolicy,
     replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>>,
     replica_active: Option<[Arc<AtomicBool>; 2]>,
     shutdown: &AtomicBool,
@@ -135,12 +135,12 @@ pub fn run<A: Application>(
     let mut gate = DurabilityGate::new(
         GateInputs {
             journal_persisted_wire_seq,
-            ack_policy,
             replication_metrics,
             replica_active,
             utilization: Arc::clone(&utilization),
             wait,
         },
+        policy,
         "dpdk response",
     );
     // Track known connections (for heartbeat scheduling).
@@ -209,10 +209,6 @@ pub fn run<A: Application>(
     let mut last_stats_flush = Instant::now();
 
     'run: loop {
-        // Observe runtime policy swaps from the admin `ACK-POLICY`
-        // command — see `DurabilityGate::observe_policy_swap`.
-        gate.observe_policy_swap();
-
         // Fencing note: a superseded ex-primary exits through this same
         // shutdown branch (`FenceState::fence_if_superseded` co-sets
         // `shutdown`). Unlike the kernel response stage there is no
@@ -391,18 +387,25 @@ pub fn run<A: Application>(
             // (the old `+1` compensated for the input-seq
             // off-by-(starting-1), which is gone now).
             //
+            // A policy change slot is the switch point (see
+            // `DurabilityGate::admit`). Nothing to flush before a wait:
+            // every slot's frames are released as soon as it is encoded.
+            //
             // A gate that cannot open does not hold the shutdown sequence;
-            // the reply the policy never confirmed is not queued.
-            if gate.needs_wait(slot)
-                && let GateOutcome::Shutdown = gate.wait_durable(
-                    slot.wire_seq,
-                    shutdown,
-                    #[cfg(feature = "tick-to-trade")]
-                    &mut gate_tracker,
-                )
-            {
-                continue 'run;
-            }
+            // the reply the policy never confirmed is not queued. A policy
+            // change slot is the gate's own: its frames go to no
+            // connection, whatever it is addressed to.
+            let destination = match gate.admit(
+                slot,
+                shutdown,
+                #[cfg(feature = "tick-to-trade")]
+                &mut gate_tracker,
+                || {},
+            ) {
+                Admission::Reply { connection_id } => Some(connection_id),
+                Admission::GateOnly => None,
+                Admission::Shutdown => continue 'run,
+            };
 
             #[cfg(feature = "tick-to-trade")]
             if let Some(ts) = gate_tracker.journal_crossed() {
@@ -416,7 +419,9 @@ pub fn run<A: Application>(
             // One lookup, not two: the entry decides whether the
             // connection is still known, and the same borrow stamps its
             // heartbeat clock once the frame is queued.
-            let Some(conn_state) = connections.get_mut(&slot.connection_id) else {
+            let Some((conn_id, conn_state)) =
+                destination.and_then(|id| connections.get_mut(&id).map(|state| (id, state)))
+            else {
                 // A reply for a connection this stage does not hold: it
                 // is gone. The drain runs after the ring is read, so a
                 // connection that is merely new is never a miss. Logged
@@ -424,9 +429,9 @@ pub fn run<A: Application>(
                 // server-originated event — a seed, a tick — whose
                 // reports have no client to go to, and is skipped
                 // without a word.
-                if slot.connection_id != 0 {
+                if let Some(connection_id) = destination.filter(|&id| id != 0) {
                     tracing::debug!(
-                        connection_id = slot.connection_id,
+                        connection_id,
                         wire_seq = slot.wire_seq,
                         "reply dropped: connection not registered"
                     );
@@ -443,8 +448,7 @@ pub fn run<A: Application>(
             // encoded) while still letting the DPDK poll thread drain
             // Report + BatchEnd in a single consume cycle for low-rate
             // workloads (consumer-side win for single-request p99).
-            let tid = (slot.connection_id >> 56) as usize % tx_producers.len();
-            let conn_id = slot.connection_id;
+            let tid = (conn_id >> 56) as usize % tx_producers.len();
 
             // Frame 1: application payload (Report / Query via encoder;
             // EngineError via codec). BatchEnd payloads carry no body —
@@ -751,6 +755,119 @@ mod tests {
         assert_eq!(reads.get(), 1);
         assert_eq!(connections[&1].last_send, at_drain);
         assert_eq!(connections[&2].last_send, at_drain);
+    }
+
+    /// A journaled policy change addressed to a registered client's own
+    /// connection queues no frame for it, not even a batch end: the
+    /// replies on either side of it are the only frames on the TX ring.
+    /// The kernel stage's counterpart is `response.rs`'s
+    /// `a_change_slot_sends_nothing_and_a_forced_one_waits_for_its_entry`.
+    #[test]
+    fn a_change_slot_queues_no_frame_for_its_connection() {
+        use counter_server::{Counter, CounterQuery, CounterReport, ResponseEncoder};
+        use melin_journal::AckPolicyChange;
+        use melin_pipeline::padding::CachePadded;
+        use melin_pipeline::ring::DisruptorBuilder;
+        use melin_transport_core::WireSeq;
+        use melin_transport_core::lineage::forced_policy_cell;
+        use melin_transport_core::pipeline::OutputPayload;
+
+        use crate::ack_policy::AckPolicy;
+        use crate::durability_gate::GateStart;
+        use crate::halt::refusal_channel;
+
+        /// Bounds the wait for a frame that must arrive.
+        const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+        fn reply(wire_seq: u64) -> OutputSlot<CounterReport, CounterQuery> {
+            OutputSlot {
+                connection_id: 1,
+                input_seq: wire_seq - 1,
+                wire_seq,
+                payload: OutputPayload::Report(CounterReport::Ack {
+                    new_value: wire_seq,
+                }),
+                is_last_in_request: true,
+                ..Default::default()
+            }
+        }
+
+        let (mut producer, mut consumers) =
+            DisruptorBuilder::<OutputSlot<CounterReport, CounterQuery>>::new(64)
+                .add_consumer()
+                .build(WaitStrategy::SpinThenYield);
+        let consumer = consumers.pop().expect("one consumer was requested");
+        let (control_tx, control_rx) = mpsc::channel();
+        control_tx
+            .send(ControlEvent::Connected { connection_id: 1 })
+            .expect("channel open");
+        let (tx, mut rx) = spsc::channel::<TxFrame>(8, WaitStrategy::SpinThenYield);
+        let refusals = refusal_channel(Arc::new(CachePadded::new(AtomicU64::new(0)))).1;
+
+        producer.publish(reply(1));
+        producer.publish(OutputSlot {
+            // Addressed to the client's own connection, which the matching
+            // stage never does: the change still queues nothing for it.
+            connection_id: 1,
+            input_seq: 1,
+            wire_seq: 2,
+            payload: OutputPayload::AckPolicyChange(AckPolicyChange {
+                policy: AckPolicy::Disk.to_byte(),
+                unwitnessed: false,
+            }),
+            is_last_in_request: true,
+            ..Default::default()
+        });
+        producer.publish(reply(3));
+
+        let shutdown = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let stage = scope.spawn(|| {
+                run::<Counter>(
+                    consumer,
+                    control_rx,
+                    // Everything published is on disk: nothing is held.
+                    DurableWireSeqCursor::detached(WireSeq::new(3)),
+                    GatePolicy {
+                        start: GateStart::settled(AckPolicy::Disk),
+                        forced: forced_policy_cell().1,
+                    },
+                    None,
+                    None,
+                    &shutdown,
+                    None,
+                    Arc::new(AtomicU64::new(0)),
+                    vec![tx],
+                    Arc::new(StageUtilization::default()),
+                    WaitStrategy::SpinThenYield,
+                    Arc::new(ResponseEncoder),
+                    refusals,
+                )
+            });
+
+            // The replies on either side of the change: once the second
+            // is queued, the stage has taken the change.
+            let mut frames = Vec::new();
+            let deadline = Instant::now() + SETTLE_TIMEOUT;
+            while frames.len() < 2 && Instant::now() < deadline {
+                match rx.try_consume() {
+                    Some((_, frame)) => frames.push(frame.connection_id),
+                    None => std::thread::yield_now(),
+                }
+            }
+            shutdown.store(true, Ordering::Relaxed);
+            stage.join().expect("stage panicked");
+            // Anything the stage queued before it stopped.
+            while let Some((_, frame)) = rx.try_consume() {
+                frames.push(frame.connection_id);
+            }
+
+            assert_eq!(
+                frames,
+                [1, 1],
+                "one frame per reply, and none for the policy change"
+            );
+        });
     }
 
     mod push_frame {

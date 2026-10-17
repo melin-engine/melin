@@ -9,7 +9,7 @@
 use std::io;
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::{debug, error, info, warn};
 
@@ -30,13 +30,14 @@ use super::receiver_transport::{
 };
 use super::validation_worker::ValidationWorker;
 use super::{
-    ReceiverResult, ReplicaCursors, ReplicaGate, ReplicaPipelineHandles, ReplicationMetrics,
-    ResumePoint, ResyncDecision, SentHighWater, StreamStartVerdict,
-    build_replica_pipeline_with_threads, handle_resync_verdict, handle_session_exit,
-    journal_failed_while_disconnected, recover_replica_state, sleep_then_double_backoff,
-    take_pipeline_for_promotion, teardown_replica_pipeline,
+    ReceiverResult, ReplicaCursors, ReplicaPipelineHandles, ReplicationMetrics, ResumePoint,
+    ResyncDecision, SentHighWater, StreamStartVerdict, build_replica_pipeline_with_threads,
+    handle_resync_verdict, handle_session_exit, journal_failed_while_disconnected,
+    recover_replica_state, sleep_then_double_backoff, take_pipeline_for_promotion,
+    teardown_replica_pipeline,
 };
 use melin_app::auth::AuthorizedKeys;
+use melin_transport_core::replica_presence::{FirstAck, ReplicaPresence};
 use melin_transport_core::replication::PersistWatch;
 use melin_transport_core::replication::catchup::CatchUpPublisher;
 use melin_transport_core::replication::handoff::{
@@ -302,8 +303,11 @@ enum SlotState {
     /// time, then the handoff into the live ring, likewise a tick at a
     /// time (see [`PendingJoin`]).
     Joining(melin_dpdk::SocketHandle),
-    /// Streaming journal data to replica.
-    Streaming(melin_dpdk::SocketHandle),
+    /// Streaming journal data to replica. Like `Joining`, counted by the
+    /// halt gate: it carries the join's [`FirstAck`] (from
+    /// [`ReplicaPresence::lift`]), so the slot cannot stream uncounted, and
+    /// its first ack ends any halt override.
+    Streaming(melin_dpdk::SocketHandle, FirstAck),
 }
 
 /// Deadline for one side of the DPDK auth exchange to make progress. On the
@@ -348,6 +352,9 @@ struct PendingJoin {
     stream_base: u64,
     /// Whether the replica is draining the join, once it has acked.
     stall: JoinStallWatch,
+    /// The halt gate's count of this replica, raised as the join began,
+    /// carried into `Streaming`: a join cannot exist uncounted.
+    first_ack: FirstAck,
 }
 
 /// The two halves of a join.
@@ -537,11 +544,12 @@ impl DpdkReplicaSlot {
     ///   gate — ordering contract B2 (frozen replica-progress cursors would
     ///   otherwise stop the primary acking client requests even with a
     ///   healthy peer).
-    /// - Decrements the halt gate **only if the replica was past auth**
-    ///   (`Handshaking`/`Joining`/`Streaming`) — an `Authenticating` connection never
-    ///   lifted it (the gate is lifted on auth success, not on connect), so it
-    ///   must not lower it. Warns if the last authenticated replica just left
-    ///   (the node now halts).
+    /// - Decrements the halt gate **only if the replica was `Joining` or
+    ///   `Streaming`** — a connection still authenticating or handshaking
+    ///   never lifted it (the gate is lifted once the handshake is accepted
+    ///   and the join begins, not on connect or auth), so it must not lower
+    ///   it. Warns if the last streaming replica just left (the node now
+    ///   halts).
     /// - Clears per-connection scratch (recv buffer, in-flight challenge,
     ///   pending handshake validation, join in progress).
     ///
@@ -553,24 +561,26 @@ impl DpdkReplicaSlot {
         transport: &mut melin_dpdk::DpdkTransport,
         cursors: &ReplicaCursors,
         metrics: &ReplicationMetrics,
-        replicas_connected: &AtomicU32,
+        replicas_connected: &ReplicaPresence,
     ) {
         if let SlotState::Authenticating(h)
         | SlotState::Handshaking(h)
         | SlotState::Joining(h)
-        | SlotState::Streaming(h) = self.state
+        | SlotState::Streaming(h, _) = self.state
         {
-            // The gate is lifted only once a replica authenticates (see the
-            // `Authenticated` arm); an `Authenticating` connection that drops
-            // here never lifted it, so it must not lower it.
-            let was_authenticated = !matches!(self.state, SlotState::Authenticating(_));
+            // The gate is lifted only once the join begins (see the
+            // handshake verdict in the `Handshaking` arm); a connection
+            // that drops before then never lifted it, so it must not lower
+            // it.
+            let was_counted =
+                matches!(self.state, SlotState::Joining(_) | SlotState::Streaming(..));
             transport.reset(h);
             // Disengage cursors before the active_flag Release — contract B2.
             cursors.clear_on_disconnect(slot_idx);
             self.active_flag.store(false, Ordering::Release);
             metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
-            if was_authenticated {
-                ReplicaGate::new(replicas_connected).lower();
+            if was_counted {
+                replicas_connected.lower();
             }
         }
         self.state = SlotState::Idle;
@@ -605,7 +615,7 @@ pub struct DpdkReplicationDriver<A: Application> {
     /// acked positions and the gate's gauge pair).
     cursors: ReplicaCursors,
     replica_ready: Arc<AtomicBool>,
-    replicas_connected: Arc<AtomicU32>,
+    replicas_connected: Arc<ReplicaPresence>,
     metrics: Arc<ReplicationMetrics>,
     batch_size: usize,
     heartbeat_interval: std::time::Duration,
@@ -613,9 +623,6 @@ pub struct DpdkReplicationDriver<A: Application> {
     /// primary's epoch onto each `StreamStart` and to self-demote when a
     /// replica handshakes with a higher epoch.
     fence_state: Arc<melin_transport_core::fence::FenceState>,
-    /// The active ack policy — stamped on `StreamStart` and
-    /// `Heartbeat` (see the kernel-TCP `Sender::ack_policy`).
-    ack_policy: Arc<std::sync::atomic::AtomicU8>,
     /// Operator key table. `Arc` because it's shared, read-only, with the
     /// client-auth path and the kernel-TCP sender; the driver only ever
     /// `lookup`s during a replica's challenge/response. Held by the driver
@@ -637,14 +644,13 @@ impl<A: Application> DpdkReplicationDriver<A> {
         replica_slots: Arc<melin_transport_core::ReplicaSlotCursors>,
         journal_path: std::path::PathBuf,
         replica_ready: Arc<AtomicBool>,
-        replicas_connected: Arc<AtomicU32>,
+        replicas_connected: Arc<ReplicaPresence>,
         evict_flags: [Arc<AtomicBool>; 2],
         active_flags: [Arc<AtomicBool>; 2],
         metrics: Arc<ReplicationMetrics>,
         batch_size: usize,
         heartbeat_secs: u64,
         fence_state: Arc<melin_transport_core::fence::FenceState>,
-        ack_policy: Arc<std::sync::atomic::AtomicU8>,
         authorized_keys: Arc<AuthorizedKeys>,
     ) -> Result<Self, String> {
         let [consumer_0, consumer_1] = repl_consumers;
@@ -673,7 +679,6 @@ impl<A: Application> DpdkReplicationDriver<A> {
             let ctx = JoinContext {
                 journal_path: journal_path.clone(),
                 fence_state: Arc::clone(&fence_state),
-                ack_policy: Arc::clone(&ack_policy),
             };
             JoinWorker::spawn(
                 format!("repl-join-{idx}"),
@@ -731,7 +736,6 @@ impl<A: Application> DpdkReplicationDriver<A> {
             batch_size,
             heartbeat_interval: std::time::Duration::from_secs(heartbeat_secs),
             fence_state,
-            ack_policy,
             authorized_keys,
             _app: PhantomData,
         })
@@ -787,8 +791,9 @@ impl<A: Application> DpdkReplicationDriver<A> {
         }
         info!(peer = ?peer, slot = idx, "replica connected via DPDK — authenticating");
         // The halt gate is NOT lifted here: a bare connection hasn't
-        // proven a Replication key. It's lifted on auth success (the
-        // `Authenticated` arm) so an unauthenticated peer can't re-enable
+        // proven a Replication key. It's lifted once the handshake is
+        // accepted and the join begins (the `Handshaking` arm), so neither
+        // an unauthenticated peer nor one refused after auth can re-enable
         // client writes.
         slot.auth = Some(AuthChallenge {
             nonce,
@@ -815,7 +820,6 @@ impl<A: Application> DpdkReplicationDriver<A> {
         let replicas_connected = &self.replicas_connected;
         let metrics = &self.metrics;
         let fence_state = &self.fence_state;
-        let ack_policy = &self.ack_policy;
         let authorized_keys = &self.authorized_keys;
         let batch_size = self.batch_size;
         let heartbeat_interval = self.heartbeat_interval;
@@ -881,10 +885,8 @@ impl<A: Application> DpdkReplicationDriver<A> {
                         AuthOutcome::Pending => {}
                         AuthOutcome::Authenticated => {
                             slot.auth = None;
-                            // Proven a Replication key — only now does this
-                            // connection lift the halt gate (lowered by
-                            // `go_idle` on teardown).
-                            ReplicaGate::new(replicas_connected).lift();
+                            // Proven a Replication key. The halt gate waits
+                            // for the handshake to be accepted.
                             slot.state = SlotState::Handshaking(handle);
                         }
                         AuthOutcome::Rejected => {
@@ -990,10 +992,15 @@ impl<A: Application> DpdkReplicationDriver<A> {
                             divergent,
                         }) {
                             Ok(stream) => {
+                                // Handshake accepted, join begun — only now
+                                // does this connection lift the halt gate
+                                // (lowered by `go_idle` on teardown): a
+                                // replica refused before here never counted.
                                 slot.join = Some(PendingJoin {
                                     phase: JoinPhase::CatchUp(stream),
                                     stream_base,
                                     stall: JoinStallWatch::default(),
+                                    first_ack: replicas_connected.lift(),
                                 });
                                 slot.state = SlotState::Joining(handle);
                             }
@@ -1288,12 +1295,16 @@ impl<A: Application> DpdkReplicationDriver<A> {
                             // The sent high-water: heartbeats and the
                             // ack-sanity bound.
                             slot.sent = sent;
-                            slot.join = None;
+                            let first_ack = slot
+                                .join
+                                .take()
+                                .expect("join in progress while Joining")
+                                .first_ack;
                             slot.last_send = now;
                             slot.persist_watch = PersistWatch::default();
                             replica_ready.store(true, Ordering::Release);
                             metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
-                            slot.state = SlotState::Streaming(handle);
+                            slot.state = SlotState::Streaming(handle, first_ack);
                         }
                         JoinTick::Failed => {
                             slot.go_idle(slot_idx, transport, cursors, metrics, replicas_connected);
@@ -1301,7 +1312,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                     }
                 }
 
-                SlotState::Streaming(handle) => {
+                SlotState::Streaming(handle, _) => {
                     any_active = true;
 
                     // 1. Process acks (non-blocking).
@@ -1361,6 +1372,13 @@ impl<A: Application> DpdkReplicationDriver<A> {
                             slot.last_send.elapsed().as_micros() as u64,
                             Ordering::Relaxed,
                         );
+                        // The replica took the stream: its first ack ends
+                        // any halt override (see `ReplicaPresence`). Always
+                        // `Streaming` in this arm; the match only reaches
+                        // the token.
+                        if let SlotState::Streaming(_, first_ack) = &mut slot.state {
+                            first_ack.acked(replicas_connected);
+                        }
                     }
                     if ack_error {
                         slot.go_idle(slot_idx, transport, cursors, metrics, replicas_connected);
@@ -1467,11 +1485,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                     // 3. Heartbeat if idle.
                     if batches_sent == 0 && slot.last_send.elapsed() >= heartbeat_interval {
                         slot.send_buf.clear();
-                        encode_heartbeat(
-                            slot.sent.get(),
-                            ack_policy.load(std::sync::atomic::Ordering::Relaxed),
-                            &mut slot.send_buf,
-                        );
+                        encode_heartbeat(slot.sent.get(), &mut slot.send_buf);
                         transport.queue_send(handle, &slot.send_buf);
                         slot.last_send = std::time::Instant::now();
                     }
@@ -1516,7 +1530,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                 SlotState::Authenticating(h)
                 | SlotState::Handshaking(h)
                 | SlotState::Joining(h)
-                | SlotState::Streaming(h) => Some(h),
+                | SlotState::Streaming(h, _) => Some(h),
                 _ => None,
             })
             .collect();
@@ -1575,6 +1589,7 @@ where
             journal_path,
             &snapshot_path,
             &fence_state,
+            &control.lineage_ack_policy,
             sizing,
         )?;
     // Fence epoch now reflects the recovered journal; seed the advertised
@@ -1585,8 +1600,9 @@ where
         tip_ready,
         journal_tip,
         primary_link_up,
-        // Stored by `accept_stream_start`, which takes `control` whole.
-        primary_ack_policy: _,
+        // Set by `accept_stream_start`, which takes `control` whole.
+        primary_observed: _,
+        lineage_ack_policy,
         pipeline_healthy,
     } = control;
     journal_tip.advance(melin_transport_core::WireSeq::new(last_sequence));
@@ -1658,6 +1674,7 @@ where
                         journal_path,
                         &snapshot_path,
                         &fence_state,
+                        lineage_ack_policy,
                         shutdown,
                         promote,
                         // No session is open: the last one's socket was
@@ -1913,7 +1930,6 @@ where
                             anchor_hash,
                             genesis_entries,
                             epoch,
-                            ack_policy,
                         } => {
                             // (A resync rebase adopts the primary's epoch
                             // inside `handle_resync_verdict` instead.)
@@ -1922,7 +1938,6 @@ where
                                     start_sequence,
                                     lineage: (segment_start_sequence, anchor_hash, genesis_entries),
                                     epoch,
-                                    ack_policy,
                                 },
                                 "dpdk",
                                 &pipeline,
@@ -2089,6 +2104,7 @@ where
                 snapshot_path.clone(),
                 group_commit_delay,
                 Arc::clone(&fence_state),
+                lineage_ack_policy,
                 Arc::clone(pipeline_healthy),
                 sizing,
             ) {
@@ -2150,6 +2166,7 @@ where
             journal_path,
             &snapshot_path,
             &fence_state,
+            lineage_ack_policy,
             shutdown,
             promote,
             // End the smoltcp session on every exit, a stop or a promotion

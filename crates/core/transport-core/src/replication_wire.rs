@@ -58,7 +58,6 @@ use std::fmt;
 use std::io;
 
 use melin_app::AppEvent;
-use melin_journal::JournalEvent;
 use melin_journal::codec::{self, CRC_SIZE, ENTRY_MAGIC, ENTRY_MAGIC_SIZE, ENTRY_META_SIZE};
 use melin_journal::encoder::{MAX_ENTRY_SIZE, entry_size};
 use zerocopy::little_endian::{U16, U32, U64};
@@ -70,16 +69,8 @@ use crate::pipeline::InputSlot;
 
 pub const MSG_INPUT_BATCH: u8 = 0x21;
 
-// Slot tags 0x01 (`GenesisHash`) and 0x02 (`Checkpoint`) are retired —
-// chain metadata never rides in the entry stream; divergence checks use
-// dedicated chain frames instead. Do not reuse the values.
-pub const SLOT_TAG_TICK: u8 = 0x03;
-/// Replication fencing epoch bump (see [`JournalEvent::EpochBump`]).
-/// Payload is the 8-byte little-endian epoch — kept in lockstep with the
-/// journal codec's `TAG_EPOCH_BUMP` so the replica re-journals it
-/// identically to the primary.
-pub const SLOT_TAG_EPOCH_BUMP: u8 = 0x04;
-pub const SLOT_TAG_APP: u8 = 0x80;
+// A slot's event tag is the journal entry's own, decoded by the journal
+// codec (`codec::decode_event`): the wire has no tag space of its own.
 
 // --- Wire structs ---
 //
@@ -472,9 +463,9 @@ pub fn try_decode_input_batch_into<E: AppEvent>(
         let timestamp_ns = header.timestamp_ns.get();
         let key_hash = header.key_hash.get();
 
-        let event = match decode_slot_event::<E>(header.event_tag, event_payload) {
+        let event = match codec::decode_event::<E>(header.event_tag, event_payload) {
             Ok(event) => event,
-            Err(reason) => return Err(refused(sequence, slot_body, shipped_crc, reason)),
+            Err(e) => return Err(refused(sequence, slot_body, shipped_crc, e.to_string())),
         };
 
         // Re-encode exactly as the journal stage will, and compare CRCs.
@@ -529,34 +520,6 @@ pub fn try_decode_input_batch_into<E: AppEvent>(
     }
 
     Ok(())
-}
-
-/// The event a slot carries, or why it has none.
-fn decode_slot_event<E: AppEvent>(tag: u8, payload: &[u8]) -> Result<JournalEvent<E>, String> {
-    match tag {
-        SLOT_TAG_TICK => {
-            let now_ns = payload
-                .get(..8)
-                .ok_or("Tick payload too short")?
-                .try_into()
-                .map(u64::from_le_bytes)
-                .expect("8-byte slice into [u8; 8]");
-            Ok(JournalEvent::Tick { now_ns })
-        }
-        SLOT_TAG_EPOCH_BUMP => {
-            let epoch = payload
-                .get(..8)
-                .ok_or("EpochBump payload too short")?
-                .try_into()
-                .map(u64::from_le_bytes)
-                .expect("8-byte slice into [u8; 8]");
-            Ok(JournalEvent::EpochBump { epoch })
-        }
-        SLOT_TAG_APP => E::decode(payload)
-            .map(JournalEvent::App)
-            .map_err(|e| format!("app event decode failed: {e:?}")),
-        other => Err(format!("unknown slot tag: 0x{other:02x}")),
-    }
 }
 
 /// CRC32C of a slot's bytes as received, magic restored in front — what
@@ -639,6 +602,9 @@ pub fn peek_frame_tag(frame: &[u8]) -> io::Result<u8> {
 mod tests {
     use super::*;
     use melin_app::CodecError;
+    use melin_journal::JournalEvent;
+
+    use crate::test_support::ack_policy_change;
 
     /// Minimal AppEvent for round-trip tests. Encodes a single u32 payload.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -781,6 +747,38 @@ mod tests {
         match decoded[0].event {
             JournalEvent::EpochBump { epoch } => assert_eq!(epoch, 42),
             ref other => panic!("expected EpochBump, got {other:?}"),
+        }
+    }
+
+    /// Overwrite one byte of a one-slot frame's slot and re-seal its CRC
+    /// over the result, so the slot arrives intact and only decoding can
+    /// object.
+    fn reseal_with(buf: &mut [u8], at: usize, value: u8) {
+        buf[at] = value;
+        let crc_at = buf.len() - CRC_SIZE;
+        let crc = received_crc(&buf[FIRST_SLOT..crc_at]);
+        buf[crc_at..].copy_from_slice(&crc.to_le_bytes());
+    }
+
+    /// Intact slots that the journal codec's decoder refuses — a tag no
+    /// build writes, an ack-policy change with a reserved flag bit — are
+    /// malformed, not damage, and the reason is the decoder's own.
+    #[test]
+    fn intact_slots_the_journal_decoder_refuses_are_malformed() {
+        let tag_at = FIRST_SLOT + SLOT_HEADER_LEN - 1;
+        let event = ack_policy_change::<TestEvent>(1, false);
+        for (at, value, reason) in [
+            (tag_at, 0x7f, "unknown event tag 0x7f"),
+            (tag_at + 2, 0x02, "AckPolicyChange sets a reserved flag bit"),
+        ] {
+            let mut buf = frame(&[sample_slot(4, event)]);
+            reseal_with(&mut buf, at, value);
+            let err = try_decode_input_batch::<TestEvent>(&buf[4..]).unwrap_err();
+            assert!(
+                matches!(&err, InputBatchError::Malformed(m) if m == &format!("slot 4: {reason}")),
+                "{err:?}"
+            );
+            assert!(!err.is_transit_damage());
         }
     }
 
@@ -976,7 +974,7 @@ mod tests {
         assert!(corrupted.is_transit_damage());
         assert!(InputBatchError::Framing("slot truncated").is_transit_damage());
         assert!(!not_round_trip.is_transit_damage());
-        assert!(!InputBatchError::Malformed("unknown slot tag".into()).is_transit_damage());
+        assert!(!InputBatchError::Malformed("unknown event tag".into()).is_transit_damage());
         assert!(!InputBatchError::NotInputBatch(0x30).is_transit_damage());
     }
 
@@ -1121,19 +1119,24 @@ mod tests {
             sample_slot(1, JournalEvent::Tick { now_ns: 5 }),
             sample_slot(2, JournalEvent::App(TestEvent(77))),
             sample_slot(3, JournalEvent::EpochBump { epoch: 4 }),
+            sample_slot(4, ack_policy_change(1, true)),
         ];
         let mut from_journal = Vec::new();
         let count =
             encode_input_batch_from_journal::<TestEvent>(&journal_bytes(&slots), &mut from_journal)
                 .expect("encode");
-        assert_eq!(count, 3);
+        assert_eq!(count, 4);
         // Same bytes as the in-memory path, and they decode.
         assert_eq!(from_journal, frame(&slots));
         let decoded: Vec<InputSlot<TestEvent>> =
             try_decode_input_batch(&from_journal[4..]).expect("decode");
         assert_eq!(
+            decoded.iter().map(|s| s.event).collect::<Vec<_>>(),
+            slots.iter().map(|s| s.event).collect::<Vec<_>>()
+        );
+        assert_eq!(
             decoded.iter().map(|s| s.sequence).collect::<Vec<_>>(),
-            vec![1, 2, 3]
+            vec![1, 2, 3, 4]
         );
     }
 
@@ -1203,7 +1206,7 @@ mod tests {
             0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, // sequence
             0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, // timestamp_ns
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // key_hash
-            0x03, // SLOT_TAG_TICK
+            0x03, // the journal's Tick tag
             // Tick payload: now_ns(u64)
             0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48,
         ];

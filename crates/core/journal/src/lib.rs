@@ -39,7 +39,7 @@ pub use buffered_writer::BufferedWriter;
 pub use codec::FileHeaderInfo;
 pub use encoder::JournalEncoder;
 pub use error::JournalError;
-pub use event::JournalEvent;
+pub use event::{AckPolicyByte, AckPolicyChange, JournalEvent};
 pub use preparer::StagingMode;
 pub use reader::{JournalEntry, JournalReader, RawJournalScanner, SegmentKind, TornTail};
 pub use segment_file::SegmentFile;

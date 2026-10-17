@@ -40,11 +40,15 @@
 //! A test that wants its nodes' log in its report, when it fails, calls
 //! [`logs::capture`].
 //!
+//! A test reads a running node as an operator does, through its health
+//! gauges and admin commands, with [`probe`].
+//!
 //! See `docs/internal/dpdk-testing.md`.
 
 #[cfg(any(test, feature = "dpdk"))]
 mod layout;
 pub mod logs;
+pub mod probe;
 pub mod sched;
 
 use std::net::{IpAddr, SocketAddr};

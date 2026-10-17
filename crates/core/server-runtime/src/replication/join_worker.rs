@@ -50,7 +50,6 @@ use {
         encode_hash_mismatch, encode_need_snapshot, encode_stream_start,
     },
     std::path::PathBuf,
-    std::sync::atomic::AtomicU8,
 };
 
 use super::validation_worker::{WorkerGone, spawn_unpinned};
@@ -397,8 +396,6 @@ pub(crate) struct JoinContext {
     pub(crate) journal_path: PathBuf,
     /// Read when the `StreamStart` is encoded, as the inline join did.
     pub(crate) fence_state: Arc<FenceState>,
-    /// Read when the frame carrying it is encoded, as the inline join did.
-    pub(crate) ack_policy: Arc<AtomicU8>,
 }
 
 /// A replica's join, as the primary streams it: the probe, then either
@@ -447,7 +444,6 @@ pub(crate) fn stream_join<E: AppEvent>(
             origin.anchor_hash,
             origin.genesis_entries,
             ctx.fence_state.epoch(),
-            ctx.ack_policy.load(Ordering::Relaxed),
             &mut frame,
         );
         publish(&frame)?;
@@ -460,12 +456,7 @@ pub(crate) fn stream_join<E: AppEvent>(
         }
         preflight_snapshot_transfer(journal_path)?;
         publish(&frame)?;
-        snapshot_transfer_with::<E>(
-            journal_path,
-            publish,
-            cancel,
-            ctx.ack_policy.load(Ordering::Relaxed),
-        )?
+        snapshot_transfer_with::<E>(journal_path, publish, cancel)?
     };
     match result {
         CatchUpResult::Ok(end) => Ok(end),
@@ -820,7 +811,6 @@ mod tests {
             JoinContext {
                 journal_path,
                 fence_state: Arc::new(FenceState::new(3)),
-                ack_policy: Arc::new(AtomicU8::new(1)),
             }
         }
 
@@ -855,7 +845,7 @@ mod tests {
         }
 
         /// A replica the journal can serve gets `StreamStart` (with the
-        /// primary's epoch and ack policy), then the history it lacks.
+        /// primary's epoch), then the history it lacks.
         #[test]
         fn a_replica_within_the_journal_gets_stream_start_then_history() {
             let dir = tempfile::tempdir().unwrap();
@@ -872,10 +862,9 @@ mod tests {
                 PrimaryMessage::StreamStart {
                     start_sequence,
                     epoch,
-                    ack_policy,
                     ..
                 } => {
-                    assert_eq!((start_sequence, epoch, ack_policy), (2, 3, 1));
+                    assert_eq!((start_sequence, epoch), (2, 3));
                 }
                 other => panic!("expected StreamStart first, got {other:?}"),
             }

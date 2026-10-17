@@ -22,7 +22,8 @@ use melin_pipeline::ring;
 use melin_pipeline::wait::WaitStrategy;
 
 use crate::ack_policy::{Blocker, CursorView, EvalStatus, MAX_CLUSTER_SIZE, Policy};
-use crate::durability_gate::{DurabilityGate, GateInputs, GateOutcome};
+use crate::durability_gate::{Admission, DurabilityGate, GateInputs};
+pub use crate::durability_gate::{GatePolicy, GateStart};
 use crate::halt::{Refusal, RefusalQueue};
 use crate::replication::ReplicationMetrics;
 use melin_app::Application;
@@ -155,14 +156,9 @@ pub struct Response<A: Application> {
     /// ring-space counter — the pre-v14 bug class. Updated by the
     /// journal stage after every fsync batch via `set_last_seq_publisher`.
     pub journal_persisted_wire_seq: DurableWireSeqCursor,
-    /// Operator-selected ack policy, published through a shared
-    /// [`AtomicU8`](std::sync::atomic::AtomicU8) so the admin `ACK-POLICY` command can swap it at
-    /// runtime without restarting the node. The response stage reads
-    /// this once per gate iteration with a relaxed load (cheaper than a
-    /// `Mutex` or refcounted `Arc<Policy>` snapshot) and rebuilds its
-    /// local [`Policy`] when the byte changes. See
-    /// [`crate::ack_policy::AckPolicy::as_u8`] for the encoding.
-    pub ack_policy: Arc<std::sync::atomic::AtomicU8>,
+    /// The ack policy the gate starts under and the sources of its
+    /// changes — see [`GatePolicy`].
+    pub policy: GatePolicy,
     /// Per-slot replica cursors. `None` for standalone deployments
     /// (no replication wiring) — the policy then evaluates against the
     /// primary alone.
@@ -283,7 +279,7 @@ pub fn run<A: Application>(
 ) -> bool {
     let Response {
         journal_persisted_wire_seq,
-        ack_policy,
+        policy,
         replication_metrics,
         replica_active,
         heartbeat_interval,
@@ -326,21 +322,20 @@ pub fn run<A: Application>(
     {
         return false;
     }
-    // The ack policy in force and the durability gate. The atomic is the
-    // single source of truth across the process lifetime; the gate keeps
-    // a thread-local copy for cheap per-iteration use and rebuilds it
-    // when an admin `ACK-POLICY` command swaps the atomic. Built here —
-    // before the first batch — so a degraded startup shows on `/healthz`
-    // and in the journal immediately. See `DurabilityGate`.
+    // The ack policy in force and the durability gate. The gate owns the
+    // policy for the stage's lifetime and switches it at the slots of
+    // journaled changes. Built here — before the first batch — so a
+    // degraded startup shows on `/healthz` and in the journal
+    // immediately. See `DurabilityGate`.
     let mut gate = DurabilityGate::new(
         GateInputs {
             journal_persisted_wire_seq,
-            ack_policy,
             replication_metrics,
             replica_active,
             utilization: Arc::clone(&utilization),
             wait,
         },
+        policy,
         "response",
     );
 
@@ -520,10 +515,6 @@ pub fn run<A: Application>(
     let mut last_input_seq = u64::MAX;
 
     'run: loop {
-        // Observe runtime policy swaps from the admin `ACK-POLICY`
-        // command — see `DurabilityGate::observe_policy_swap`.
-        gate.observe_policy_swap();
-
         if shutdown.load(Ordering::Relaxed) {
             // Fence: a superseded ex-primary must not acknowledge any
             // further in-flight work — skip the best-effort flush so
@@ -916,72 +907,80 @@ pub fn run<A: Application>(
             #[cfg(feature = "tick-to-trade")]
             let mut gate_tracker = GateCrossTracker::new(slot.wire_seq);
 
-            if gate.needs_wait(slot) {
-                // Drain buffered sends before blocking, never after.
-                //
-                // The steady-state flush happens on the `count == 0`
-                // path — once the output ring is empty. That batches
-                // many responses behind one `io_uring_enter`, which is
-                // the right trade on the fast path. But it means a
-                // response that has already cleared its own durability
-                // gate stays in `send_buf` while the loop blocks on a
-                // later event's gate, so a client waits out an fsync +
-                // replica round-trip for an event whose durability was
-                // confirmed before that event was even sequenced.
-                //
-                // Flushing here costs nothing in latency terms: it only
-                // fires when we are about to spin on the gate anyway, so
-                // the syscall overlaps time that would otherwise be
-                // dead. Slots whose gate is already satisfied fall
-                // straight through and keep their batching.
-                //
-                // Traced builds only: this delays the tracker's first
-                // `observe` by the flush duration, so a cursor that
-                // crosses mid-flush is attributed late (or, if it
-                // crosses past `needed`, not attributed at all). Bounded
-                // by one flush and confined to the tick-to-trade
-                // breakdown — the gate's own behaviour is unchanged.
-                if !dirty_connections.is_empty() {
-                    #[cfg(feature = "tick-to-trade")]
-                    let egress_start = trace::mono_trace_ns();
-                    flush_sends(
-                        &mut ring,
-                        &mut connections,
-                        &mut dirty_connections,
-                        &mut to_remove,
-                        &mut cqes,
-                    );
-                    flush.on_flush();
-                    #[cfg(feature = "tick-to-trade")]
-                    egress_rec.record_elapsed(egress_start, trace::mono_trace_ns());
-                    #[cfg(feature = "latency-trace")]
-                    close_e2e_samples(&mut pending_e2e, &mut server_e2e_rec);
-                    // This slot and later ones addressed to a dropped
-                    // connection are skipped by the
-                    // `connections.get_mut` lookup below, so removing
-                    // here is safe.
-                    for conn_id in to_remove.drain(..) {
-                        if let Some(entry) = connections.remove(&conn_id) {
-                            teardown_dropped(entry, &active_connections);
+            // Admit the slot: held until its event is durable under the
+            // policy in force, and for a policy change, the switch point.
+            // `before_wait` runs only when it has to wait.
+            //
+            // Shutdown while the gate is closed: straight back to the
+            // top of the loop, where the shutdown branch decides what to
+            // flush. This slot's reply, which the policy never confirmed,
+            // is not appended, and the rest of the batch goes with it.
+            // Those clients see a reset, as after a crash, and reconcile
+            // on reconnect.
+            //
+            // A policy change slot is the gate's own: its frames go to no
+            // connection, whatever it is addressed to.
+            let destination = match gate.admit(
+                slot,
+                shutdown,
+                #[cfg(feature = "tick-to-trade")]
+                &mut gate_tracker,
+                || {
+                    // Drain buffered sends before blocking, never after.
+                    //
+                    // The steady-state flush happens on the `count == 0`
+                    // path — once the output ring is empty. That batches
+                    // many responses behind one `io_uring_enter`, which is
+                    // the right trade on the fast path. But it means a
+                    // response that has already cleared its own durability
+                    // gate stays in `send_buf` while the loop blocks on a
+                    // later event's gate, so a client waits out an fsync +
+                    // replica round-trip for an event whose durability was
+                    // confirmed before that event was even sequenced.
+                    //
+                    // Flushing here costs nothing in latency terms: it only
+                    // fires when we are about to spin on the gate anyway, so
+                    // the syscall overlaps time that would otherwise be
+                    // dead. Slots whose gate is already satisfied fall
+                    // straight through and keep their batching.
+                    //
+                    // Traced builds only: this delays the tracker's first
+                    // `observe` by the flush duration, so a cursor that
+                    // crosses mid-flush is attributed late (or, if it
+                    // crosses past `needed`, not attributed at all). Bounded
+                    // by one flush and confined to the tick-to-trade
+                    // breakdown — the gate's own behaviour is unchanged.
+                    if !dirty_connections.is_empty() {
+                        #[cfg(feature = "tick-to-trade")]
+                        let egress_start = trace::mono_trace_ns();
+                        flush_sends(
+                            &mut ring,
+                            &mut connections,
+                            &mut dirty_connections,
+                            &mut to_remove,
+                            &mut cqes,
+                        );
+                        flush.on_flush();
+                        #[cfg(feature = "tick-to-trade")]
+                        egress_rec.record_elapsed(egress_start, trace::mono_trace_ns());
+                        #[cfg(feature = "latency-trace")]
+                        close_e2e_samples(&mut pending_e2e, &mut server_e2e_rec);
+                        // This slot and later ones addressed to a dropped
+                        // connection are skipped by the
+                        // `connections.get_mut` lookup below, so removing
+                        // here is safe.
+                        for conn_id in to_remove.drain(..) {
+                            if let Some(entry) = connections.remove(&conn_id) {
+                                teardown_dropped(entry, &active_connections);
+                            }
                         }
                     }
-                }
-
-                // Shutdown while the gate is closed: straight back to the
-                // top of the loop, where the shutdown branch decides what
-                // to flush. This slot's reply, which the policy never
-                // confirmed, is not appended, and the rest of the batch
-                // goes with it. Those clients see a reset, as after a
-                // crash, and reconcile on reconnect.
-                if let GateOutcome::Shutdown = gate.wait_durable(
-                    slot.wire_seq,
-                    shutdown,
-                    #[cfg(feature = "tick-to-trade")]
-                    &mut gate_tracker,
-                ) {
-                    continue 'run;
-                }
-            }
+                },
+            ) {
+                Admission::Reply { connection_id } => Some(connection_id),
+                Admission::GateOnly => None,
+                Admission::Shutdown => continue 'run,
+            };
 
             // Per-slot durability-gate breakdown. Recorded only when the
             // gate actually held us up (the tracker captured a cross).
@@ -1006,7 +1005,9 @@ pub fn run<A: Application>(
             // payloads go through the encoder; transport-shaped
             // frames (EngineError, BatchEnd) are encoded by the
             // runtime directly.
-            if let Some(entry) = connections.get_mut(&slot.connection_id) {
+            if let Some((connection_id, entry)) =
+                destination.and_then(|id| connections.get_mut(&id).map(|entry| (id, entry)))
+            {
                 // Frame 1: application payload (if any). BatchEnd
                 // payloads carry no body — the terminator below
                 // handles them via `is_last_in_request`.
@@ -1031,7 +1032,7 @@ pub fn run<A: Application>(
                 let _outcome = append_frames(
                     payload_result,
                     trailer,
-                    slot.connection_id,
+                    connection_id,
                     entry,
                     &encode_buf,
                     batch_now,
@@ -1048,11 +1049,11 @@ pub fn run<A: Application>(
                 // whichever flush ships the bytes.
                 #[cfg(feature = "latency-trace")]
                 if slot.is_last_in_request && matches!(_outcome, AppendOutcome::Continue) {
-                    pending_e2e.push((slot.connection_id, slot.recv_ts));
+                    pending_e2e.push((connection_id, slot.recv_ts));
                 }
 
                 flush.on_append(entry.send_buf.len());
-            } else if slot.connection_id != 0 {
+            } else if let Some(connection_id) = destination.filter(|&id| id != 0) {
                 // A reply for a connection this stage does not hold: it
                 // was dropped earlier in this batch, or went away before
                 // its reply was encoded. The drain above runs after the
@@ -1062,7 +1063,7 @@ pub fn run<A: Application>(
                 // tick — whose reports have no client to go to, and is
                 // skipped without a word.
                 debug!(
-                    connection_id = slot.connection_id,
+                    connection_id,
                     wire_seq = slot.wire_seq,
                     "reply dropped: connection not registered"
                 );
@@ -3650,7 +3651,7 @@ mod tests {
         use std::io::{Read, Write};
         use std::os::unix::io::AsRawFd;
         use std::os::unix::net::UnixStream;
-        use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
         use std::sync::{Arc, mpsc};
         use std::thread;
         use std::time::Duration;
@@ -3712,7 +3713,10 @@ mod tests {
                 // The journal is already past the one event, so the gate
                 // is open and delivery hinges on registration alone.
                 journal_persisted_wire_seq: DurableWireSeqCursor::detached(WireSeq::new(1)),
-                ack_policy: Arc::new(AtomicU8::new(AckPolicy::Disk.as_u8())),
+                policy: crate::response::GatePolicy {
+                    start: crate::response::GateStart::settled(AckPolicy::Disk),
+                    forced: melin_transport_core::lineage::forced_policy_cell().1,
+                },
                 replication_metrics: None,
                 replica_active: None,
                 heartbeat_interval: None,
@@ -3788,7 +3792,7 @@ mod tests {
         use std::io::{ErrorKind, Read, Write};
         use std::os::unix::io::AsRawFd;
         use std::os::unix::net::UnixStream;
-        use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
         use std::sync::{Arc, mpsc};
         use std::thread;
         use std::time::Duration;
@@ -4065,7 +4069,10 @@ mod tests {
         ) -> Response<Counter> {
             Response::<Counter> {
                 journal_persisted_wire_seq: journal_cursor,
-                ack_policy: Arc::new(AtomicU8::new(AckPolicy::Disk.as_u8())),
+                policy: crate::response::GatePolicy {
+                    start: crate::response::GateStart::settled(AckPolicy::Disk),
+                    forced: melin_transport_core::lineage::forced_policy_cell().1,
+                },
                 replication_metrics: None,
                 replica_active: None,
                 heartbeat_interval: None,
@@ -4190,6 +4197,163 @@ mod tests {
         #[test]
         fn a_fenced_stage_leaves_the_gate_and_drops_the_held_reply() {
             stop_while_gated(true);
+        }
+    }
+
+    /// A journaled policy change reaches the running stage as a slot that
+    /// sends nothing, and a forced change frees a held reply only once its
+    /// own entry is on disk. The switch itself is pinned by the gate's
+    /// tests (`durability_gate.rs`), the in-force gauge by
+    /// `tests/ack_policy_changes.rs`.
+    mod policy_change {
+        use std::io::ErrorKind;
+        use std::os::unix::io::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::{Arc, mpsc};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        use counter_server::{Counter, CounterQuery, CounterReport, KIND_RESP_ACK};
+        use melin_journal::AckPolicyChange;
+        use melin_pipeline::padding::CachePadded;
+        use melin_pipeline::ring::DisruptorBuilder;
+        use melin_pipeline::wait::WaitStrategy;
+        use melin_transport_core::fence::FenceState;
+        use melin_transport_core::lineage::{ForcedPolicy, forced_policy_cell};
+        use melin_transport_core::pipeline::{OutputPayload, OutputSlot};
+        use melin_transport_core::{DurableWireSeqCursor, WireSeq};
+        use melin_wire_protocol::control_codec::TAG_BATCH_END;
+
+        use super::refusal_order::{Seen, config, connection, read_frame};
+        use crate::ack_policy::AckPolicy;
+        use crate::halt::refusal_channel;
+        use crate::response::run;
+
+        /// How long the test waits for the stage to reach a state.
+        const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+        /// How long a held reply is watched for: long enough that a stage
+        /// wrongly releasing it would have sent it.
+        const HOLD: Duration = Duration::from_millis(50);
+
+        fn reply(wire_seq: u64) -> OutputSlot<CounterReport, CounterQuery> {
+            OutputSlot {
+                connection_id: 1,
+                input_seq: wire_seq - 1,
+                wire_seq,
+                payload: OutputPayload::Report(CounterReport::Ack {
+                    new_value: wire_seq,
+                }),
+                is_last_in_request: true,
+                ..Default::default()
+            }
+        }
+
+        /// No frame waiting on the client's socket.
+        fn nothing_sent(client: &UnixStream) -> bool {
+            let mut byte = 0u8;
+            // Safety: a live socket fd and a one-byte buffer; MSG_PEEK
+            // leaves anything there for the reads that follow.
+            let n = unsafe {
+                libc::recv(
+                    client.as_raw_fd(),
+                    (&raw mut byte).cast(),
+                    1,
+                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                )
+            };
+            n < 0 && std::io::Error::last_os_error().kind() == ErrorKind::WouldBlock
+        }
+
+        #[test]
+        fn a_change_slot_sends_nothing_and_a_forced_one_waits_for_its_entry() {
+            let (mut producer, mut consumers) =
+                DisruptorBuilder::<OutputSlot<CounterReport, CounterQuery>>::new(64)
+                    .add_consumer()
+                    .build(WaitStrategy::SpinThenYield);
+            let consumer = consumers.pop().expect("one consumer was requested");
+            let (connected, mut client) = connection(1);
+            let (control_tx, control_rx) = mpsc::channel();
+            control_tx.send(connected).expect("channel open");
+
+            // Everything up to the reply after the change is on disk; a
+            // standalone stage cannot satisfy `two-disks` at all.
+            let journal_cursor = DurableWireSeqCursor::detached(WireSeq::new(3));
+            let refusals = refusal_channel(Arc::new(CachePadded::new(AtomicU64::new(0)))).1;
+            let mut config = config(
+                journal_cursor.clone(),
+                Arc::new(FenceState::new(0)),
+                refusals,
+                None,
+            );
+            let (mut forced_writer, forced) = forced_policy_cell();
+            config.policy.forced = forced;
+            let utilization = Arc::clone(&config.utilization);
+
+            producer.publish(reply(1));
+            producer.publish(OutputSlot {
+                // Addressed to the client's own connection, which the
+                // matching stage never does: the change still sends it
+                // nothing, not even a batch end.
+                connection_id: 1,
+                input_seq: 1,
+                wire_seq: 2,
+                payload: OutputPayload::AckPolicyChange(AckPolicyChange {
+                    policy: AckPolicy::TwoDisks.to_byte(),
+                    unwitnessed: false,
+                }),
+                is_last_in_request: true,
+                ..Default::default()
+            });
+            producer.publish(reply(3));
+
+            let shutdown = AtomicBool::new(false);
+            thread::scope(|scope| {
+                let stage = scope.spawn(|| run::<Counter>(consumer, control_rx, config, &shutdown));
+
+                // The reply before the change goes out; once the stage has
+                // taken the change, it has sent nothing for it (and the
+                // reply after it is held by `two-disks`).
+                let before = [read_frame(&mut client), read_frame(&mut client)];
+                let deadline = Instant::now() + SETTLE_TIMEOUT;
+                while utilization.ack_policy_in_force.load() != Some(AckPolicy::TwoDisks.to_byte())
+                    && Instant::now() < deadline
+                {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                thread::sleep(HOLD);
+                let the_change_sent_nothing = nothing_sent(&client);
+
+                // A forced swap back to `disk`, not yet on disk itself.
+                forced_writer.store(ForcedPolicy {
+                    wire_seq: WireSeq::new(4),
+                    policy: AckPolicy::Disk.to_byte(),
+                });
+                thread::sleep(HOLD);
+                let held_until_the_entry_is_on_disk = nothing_sent(&client);
+                journal_cursor.store(WireSeq::new(4));
+                let after = [read_frame(&mut client), read_frame(&mut client)];
+
+                shutdown.store(true, Ordering::Relaxed);
+                stage.join().expect("stage panicked");
+
+                for frames in [before, after] {
+                    let frames = frames.map(|frame| frame.expect("a reply arrived"));
+                    assert_eq!(
+                        frames,
+                        [Seen::App(KIND_RESP_ACK), Seen::Protocol(TAG_BATCH_END)]
+                    );
+                }
+                assert!(
+                    the_change_sent_nothing,
+                    "a frame went out for the change slot, or the reply it holds"
+                );
+                assert!(
+                    held_until_the_entry_is_on_disk,
+                    "the forced swap applied before its entry was on disk"
+                );
+            });
         }
     }
 

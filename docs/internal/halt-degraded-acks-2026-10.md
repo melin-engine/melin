@@ -1,6 +1,7 @@
 # Degraded acks on a halted node (plan)
 
-Status: **proposed** (2026-10). Covers the roadmap item "Degraded acks on
+Status: **step 0 done** (with journaled ack-policy changes, see below);
+the rest **proposed** (2026-10). Covers the roadmap item "Degraded acks on
 a halted node", which replaces the former items "Halt refusals behind a
 stalled ack gate" and "Answer queries on a halted node": both are
 symptoms of the same stall, and one change resolves both.
@@ -33,7 +34,8 @@ way, and refusals stop waiting behind either.
   the verdict never reads the policy, so the halt continues. As
   documented, the playbook does not work, and a promoted primary with no
   replica has no way to resume writes short of a replica joining. Step 0
-  below fixes it ahead of everything else.
+  below fixes it ahead of everything else (done: a `disk` swap sent with
+  no replica connected now lifts the halt).
 - **The response stage parks in the gate.** One thread per stage
   (`response.rs`, `dpdk_response.rs`) waits inside
   `DurabilityGate` on each slot in order. Under `ram`, `disk+ram` or
@@ -281,6 +283,10 @@ boot does not.
    back to a replica-backed policy with no replica halts again; a swap
    to `disk` made while a replica is connected does not stop the halt
    when it leaves. A bug fix on its own, landing first.
+
+   *Landed* with journaled ack-policy changes (step 6 of
+   [journaled-ack-policy-2026-10.md](journaled-ack-policy-2026-10.md),
+   which records how).
 1. **Root-cause the `disk` hang.** Write the failing test first: a
    primary and one replica started through `melin-test-node`, policy
    `disk`, replica killed, then a query that must answer within a

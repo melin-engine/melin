@@ -13,6 +13,7 @@ use std::time::Duration;
 use tracing::{error, info};
 
 use crate::dispatch::dispatch;
+use crate::lineage::Lineage;
 use crate::pipeline::{FsyncState, InputSlot};
 use crate::snapshot;
 use melin_app::amortized_timer::AmortizedTimer;
@@ -38,6 +39,13 @@ const SHADOW_BATCH_SIZE: usize = 4096;
 /// header, stamped into every snapshot so a boot from the snapshot alone
 /// still knows it. Constant for the stage's life: it is fixed when the
 /// lineage begins.
+///
+/// `starting_wire_seq` is the wire sequence the journal allocates to the
+/// first event the shadow will consume (the journal writer's next
+/// sequence when the pipeline is built). The shadow counts from it the
+/// way the journal allocates, so a lineage event it folds is recorded at
+/// its own entry's sequence (see
+/// [`LineagePolicy::after`](crate::lineage::LineagePolicy::after)).
 #[allow(clippy::too_many_arguments)]
 pub fn run<A: Application>(
     mut consumer: ring::Consumer<InputSlot<A::Event>>,
@@ -47,7 +55,8 @@ pub fn run<A: Application>(
     fsync_state: SeqLockReader<FsyncState>,
     shutdown: &AtomicBool,
     wait: WaitStrategy,
-    initial_epoch: u64,
+    initial_lineage: Lineage,
+    starting_wire_seq: u64,
     genesis_entries: Option<u64>,
 ) {
     // Scratch buffer for app methods that require a reports Vec.
@@ -75,13 +84,19 @@ pub fn run<A: Application>(
     // Highest event timestamp the shadow's scheduler has drained against.
     // See `dispatch::dispatch` for the per-event drain rationale.
     let mut last_drain_ns: u64 = 0;
-    // Fencing epoch as of the shadow's consumed position. Seeded from the
-    // recovered epoch (the live pipeline's starting epoch) because the
-    // shadow only sees events published *after* boot — any `EpochBump`
-    // already folded into the recovered app state never crosses the ring.
-    // Advanced by replaying `EpochBump` events and stamped into each
-    // snapshot so a snapshot-bootstrapped node restores the right epoch.
-    let mut shadow_epoch: u64 = initial_epoch;
+    // The lineage (fencing epoch and ack policy) as of the shadow's
+    // consumed position. Seeded from the lineage the live pipeline started
+    // at, because the shadow only sees events published *after* boot — a
+    // lineage event already folded into the recovered app state never
+    // crosses the ring. Advanced by replaying lineage events and stamped
+    // into each snapshot so a snapshot-bootstrapped node restores it.
+    let mut shadow_lineage = initial_lineage;
+    // The wire sequence of the next journaled event, shadowing the
+    // journal's allocator: one per event it journals, decided by the
+    // allocator's own rule (`JournalEvent::takes_wire_seq`). A primary's
+    // input slots carry no sequence (the journal stage allocates it), so
+    // the shadow counts.
+    let mut next_wire_seq = starting_wire_seq;
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -104,7 +119,7 @@ pub fn run<A: Application>(
                     &consumer,
                     &fsync_state,
                     &snapshot_path,
-                    shadow_epoch,
+                    shadow_lineage,
                     genesis_entries,
                 );
             }
@@ -127,6 +142,17 @@ pub fn run<A: Application>(
             if slot.event.is_query() {
                 continue;
             }
+            let wire_seq = next_wire_seq;
+            if slot.event.takes_wire_seq() {
+                next_wire_seq = next_wire_seq.saturating_add(1);
+                // A replica's slots carry the primary's sequence: the
+                // count must agree with it.
+                debug_assert!(
+                    slot.sequence == 0 || slot.sequence == wire_seq,
+                    "shadow wire seq {wire_seq} drifted from the slot's {}",
+                    slot.sequence
+                );
+            }
             // The shadow produces no output: the matching stage replies
             // for every event.
             dispatch(
@@ -137,7 +163,7 @@ pub fn run<A: Application>(
                     key_hash: slot.key_hash,
                 },
                 &mut last_drain_ns,
-                |epoch| crate::fence::observe_into(&mut shadow_epoch, epoch),
+                |event| shadow_lineage.observe(crate::cursors::WireSeq::new(wire_seq), event),
                 &mut reports,
             );
             reports.clear();
@@ -150,7 +176,7 @@ pub fn run<A: Application>(
                 &consumer,
                 &fsync_state,
                 &snapshot_path,
-                shadow_epoch,
+                shadow_lineage,
                 genesis_entries,
             );
         }
@@ -170,7 +196,7 @@ fn try_save_snapshot<A: Application>(
     consumer: &ring::Consumer<InputSlot<A::Event>>,
     fsync_state: &SeqLockReader<FsyncState>,
     path: &std::path::Path,
-    epoch: u64,
+    lineage: Lineage,
     genesis_entries: Option<u64>,
 ) {
     let state = fsync_state.load();
@@ -182,7 +208,7 @@ fn try_save_snapshot<A: Application>(
         app,
         state.journal_seq,
         state.chain_hash,
-        epoch,
+        lineage,
         genesis_entries,
         path,
     ) {
@@ -242,7 +268,8 @@ mod tests {
                     fsync_state,
                     &shutdown2,
                     WaitStrategy::SpinThenYield,
-                    0,       // initial_epoch
+                    Lineage::GENESIS,
+                    1,       // starting_wire_seq
                     Some(0), // genesis_entries
                 );
             })
@@ -290,7 +317,8 @@ mod tests {
                     fsync_state,
                     &shutdown2,
                     WaitStrategy::SpinThenYield,
-                    0,       // initial_epoch
+                    Lineage::GENESIS,
+                    1,       // starting_wire_seq
                     Some(0), // genesis_entries
                 );
             })
@@ -334,8 +362,8 @@ mod tests {
         // Verify the snapshot file was created and is loadable, and that
         // both adds are reflected in the restored app's running total.
         assert!(snap_path.exists(), "snapshot file should exist");
-        let (restored, _seq, chain, _epoch) = snapshot::load::<TestApp>(&snap_path).unwrap();
-        assert_eq!(chain, [0xAB; 32]); // chain hash from the seqlock
+        let (restored, header) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        assert_eq!(header.chain_hash, [0xAB; 32]); // chain hash from the seqlock
         assert_eq!(restored.total, 1500);
     }
 
@@ -378,7 +406,8 @@ mod tests {
                     fsync_state,
                     &shutdown2,
                     WaitStrategy::SpinThenYield,
-                    0,       // initial_epoch
+                    Lineage::GENESIS,
+                    1,       // starting_wire_seq
                     Some(0), // genesis_entries
                 );
             })
@@ -413,7 +442,7 @@ mod tests {
         shutdown.store(true, Ordering::Relaxed);
         handle.join().unwrap();
 
-        let (restored, _seq, _chain, _epoch) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let (restored, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
         assert_eq!(restored.total, 7, "the write after the query is applied");
         assert_eq!(restored.ticks, 0, "a query must not advance the clock");
         assert!(
@@ -455,7 +484,8 @@ mod tests {
                     fsync_state,
                     &shutdown2,
                     WaitStrategy::SpinThenYield,
-                    0,       // initial_epoch
+                    Lineage::GENESIS,
+                    1,       // starting_wire_seq
                     Some(0), // genesis_entries
                 );
             })
@@ -509,7 +539,8 @@ mod tests {
                     fsync_state,
                     &shutdown2,
                     WaitStrategy::SpinThenYield,
-                    0,       // initial_epoch
+                    Lineage::GENESIS,
+                    1,       // starting_wire_seq
                     Some(0), // genesis_entries
                 );
             })
@@ -531,8 +562,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(snap_path.exists(), "first snapshot must be written");
-        let (_, _, hash_initial, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
-        assert_eq!(hash_initial, [0x11; 32], "first snapshot has initial hash");
+        let (_, initial) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        assert_eq!(
+            initial.chain_hash, [0x11; 32],
+            "first snapshot has initial hash"
+        );
 
         // Phase 2: update FsyncState (new hash + advanced ring cursor),
         // drive another event, wait for the second snapshot.
@@ -553,8 +587,8 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if let Ok((_, _, hash, _)) = snapshot::load::<TestApp>(&snap_path)
-                && hash == [0x22; 32]
+            if let Ok((_, header)) = snapshot::load::<TestApp>(&snap_path)
+                && header.chain_hash == [0x22; 32]
             {
                 break;
             }
@@ -607,7 +641,8 @@ mod tests {
                     fsync_state,
                     &shutdown2,
                     WaitStrategy::SpinThenYield,
-                    0,       // initial_epoch
+                    Lineage::GENESIS,
+                    1,       // starting_wire_seq
                     Some(0), // genesis_entries
                 );
             })
@@ -636,14 +671,14 @@ mod tests {
         // between snapshot emission and the next event arriving.
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if let Ok((restored, _, _, _)) = snapshot::load::<TestApp>(&snap_path)
+            if let Ok((restored, _)) = snapshot::load::<TestApp>(&snap_path)
                 && restored.total == 150
             {
                 break;
             }
             if Instant::now() >= deadline {
                 let observed = snapshot::load::<TestApp>(&snap_path)
-                    .map(|(a, _, _, _)| a.total)
+                    .map(|(a, _)| a.total)
                     .unwrap_or(u64::MAX);
                 panic!("snapshot did not reach total=150 (observed={observed})");
             }

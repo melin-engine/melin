@@ -60,6 +60,7 @@ use tracing::{debug, warn};
 
 use crate::dpdk_response::{ControlEvent, TxFrame};
 use crate::halt::{HaltGate, RefusalSender};
+use crate::policy_control::AckPolicyPublisher;
 
 use crate::client_auth::MAX_AUTH_FRAME;
 use crate::client_frames::MAX_FRAME_SIZE;
@@ -144,6 +145,9 @@ pub fn run_dpdk_poll<A: Application>(
     // instead of published — see `crate::halt`.
     halt: HaltGate,
     mut refusals: RefusalSender<A::Report>,
+    // The admin `ACK-POLICY` command's requests, journaled by this thread
+    // as the ring's one producer — see `crate::policy_control`.
+    mut ack_policy: AckPolicyPublisher,
     control_tx: mpsc::Sender<ControlEvent>,
     mut tx_rx: melin_pipeline::spsc::Consumer<TxFrame>,
     shutdown: &AtomicBool,
@@ -228,6 +232,10 @@ pub fn run_dpdk_poll<A: Application>(
     // iterations: at typical ~5M iterations/sec, checking every 4096
     // iterations stays well within microseconds of the deadline while
     // making the per-iteration overhead unmeasurable.
+    //
+    // The same counter paces the check for an `ACK-POLICY` request: a
+    // request waits at most a few thousand polls, microseconds, and the
+    // poll thread never parks, so it needs no wakeup.
     let tick_enabled = tick_cadence.is_some();
     let cadence = tick_cadence.unwrap_or(Duration::ZERO);
     let mut tick_schedule = TickSchedule::new(cadence, Instant::now());
@@ -287,12 +295,14 @@ pub fn run_dpdk_poll<A: Application>(
         #[cfg(feature = "latency-trace")]
         let mut work_done_this_iter = false;
 
-        // Tick generator: compare wall clock to deadline once every
-        // TICK_CHECK_INTERVAL poll iterations, emit if due.
-        if tick_enabled {
-            tick_check_counter = tick_check_counter.wrapping_add(1);
-            if tick_check_counter >= TICK_CHECK_INTERVAL {
-                tick_check_counter = 0;
+        // Once every TICK_CHECK_INTERVAL poll iterations: journal a
+        // waiting `ACK-POLICY` request, and compare the wall clock to the
+        // tick deadline, emitting a tick if due.
+        tick_check_counter = tick_check_counter.wrapping_add(1);
+        if tick_check_counter >= TICK_CHECK_INTERVAL {
+            tick_check_counter = 0;
+            ack_policy.poll(&mut producer, &halt);
+            if tick_enabled {
                 // Nothing to re-arm on a published tick: the poll loop
                 // never sleeps, so the counter above is its only timer.
                 tick_schedule.publish_if_due(Instant::now(), unix_epoch_nanos, &mut producer);
