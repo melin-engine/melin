@@ -910,6 +910,56 @@ and is committed on its own. Tests land with the step they pin.
    recheck, the wait's forced-change check and `admit`, once after its
    wait (which leaves the change durable, as a debug assertion pins).
 
+   **Final review tests.** No production change. Three paths the unit
+   tests covered only in parts now have a test end to end:
+   - A manual `PROMOTE` of a real replica right after the primary
+     journaled a weakening it held:
+     `ack_policy_changes::a_promotion_right_after_a_weakening_waits_for_another_replica_to_hold_it`
+     (writes held until a scripted replica holds the change) and
+     `a_forced_disk_overtakes_a_promotions_pending_weakening` (with none
+     connected, `ACK-POLICY disk` is forced past it). The nearest before
+     were the promotion-seeding unit test and the gate's own forced
+     overtaking test; `replicated_failover` promotes on a first change
+     only. The real replica acks the change before the primary stops, so
+     the old primary has most likely applied `disk` by then rather than
+     still waiting on it: the promoted node's disk is the same either
+     way, and the case of an old primary stopped mid-wait is not run as
+     such.
+   - A boot from a v4 snapshot alone, then from it with the empty segment
+     that boot began, restoring the previous policy, the change's
+     sequence and its unwitnessed flag into a pending gate start
+     (`server::primary_gate_policy_tests::a_boot_from_a_snapshot_alone_starts_the_gate_with_its_change_pending`).
+     `journaled_app`'s pruned-segment test covered a first change only,
+     through `recover_from_snapshot`, not `init_engine`'s snapshot-only
+     arm.
+   - A replica's own shadow snapshot recording the streamed transition,
+     and its restart from that snapshot alone (archives pruned) seeding
+     its record, so that once promoted it starts with the change pending:
+     `ack_policy_changes::a_replica_restarted_from_its_own_snapshot_keeps_the_change_pending`.
+     Before, replica recovery was tested from a journal holding a first
+     change only, and the shadow's record on the primary's shape.
+
+   Each fails with the piece it pins broken (checked by hand in a scratch
+   copy) and passes on kernel TCP and under the netns runner with the
+   `dpdk` feature. Under plain `cargo test` the binary's tests share one
+   `free_addr` block, which the new tests' extra nodes would exhaust: the
+   tests now run one at a time (`#[serial]`, as nextest already ran them)
+   and reuse the ports a finished test hands back. Reuse alone was not
+   enough (review fix): run at once, from ten test threads up, the tests
+   held more ports than the block has, and the panic poisoned the pool
+   for every other test; the pool's lock is no longer held across the
+   fallback to `free_addr`. Its admin retries now come from
+   `melin_test_node::probe` (`admin_reply_when_up`, `admin_until_ok`),
+   which also replace the copies in `genesis_promotion`,
+   `replicated_failover` and the notary's round trip. The binary also
+   waits before every boot for the node's health and admin ports to be
+   released. A node's stop does not join its admin
+   listener, which sees the shutdown flag only on its next poll, so a
+   restart on the same port could fail to bind it and never come up (an
+   intermittent failure seen after `leave_the_change_waiting`'s restart).
+   That is older than this change and left as it is: a node restarted in
+   process on the same admin port is a test's pattern, not an operator's.
+
 ## Downstream impact (Exchange Core)
 
 Breaking: an `OutputPayload` arm in its event publisher and anything else

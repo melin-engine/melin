@@ -58,7 +58,7 @@ use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
 use melin_test_node::Addrs;
-use melin_test_node::probe::{admin_command, http_metrics, wait_for_gauge};
+use melin_test_node::probe::{admin_until_ok, http_metrics, wait_for_gauge};
 use melin_transport_core::test_ports::free_addr;
 use melin_wire_protocol::control_codec::{
     TAG_APP, TAG_BATCH_END, TAG_CHALLENGE, TAG_CHALLENGE_RESPONSE, TAG_LEN, TAG_SERVER_READY,
@@ -424,19 +424,7 @@ fn acked_events_survive_primary_death_under_ram_policy() {
     // operator swaps it to `disk` over the admin endpoint. Retried:
     // the admin listener is up from boot, but promotion may still be
     // settling when the first command lands.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        match admin_command(nodes[winner].admin_addr, &client_key, "ACK-POLICY disk") {
-            Some(reply) if reply == "OK" => break,
-            reply => {
-                assert!(
-                    Instant::now() < deadline,
-                    "ACK-POLICY disk never accepted by the promoted node; last reply: {reply:?}"
-                );
-                std::thread::sleep(Duration::from_millis(200));
-            }
-        }
-    }
+    admin_until_ok(nodes[winner].admin_addr, &client_key, "ACK-POLICY disk");
     // Journaled, and in force: the promoted node runs with replication
     // disabled, so nothing could witness the change.
     wait_for_gauge(

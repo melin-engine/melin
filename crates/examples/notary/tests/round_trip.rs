@@ -28,7 +28,7 @@ use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
 use melin_test_node::Node as Server;
-use melin_test_node::probe::admin_command;
+use melin_test_node::probe::admin_until_ok;
 use melin_transport_core::test_ports::free_addr;
 
 use notary_server::receipt::Receipt as SavedReceipt;
@@ -838,24 +838,6 @@ fn node_key() -> SigningKey {
 /// The operator: the only role the admin endpoint accepts.
 fn operator_key() -> SigningKey {
     SigningKey::from_bytes(&[0xEE; 32])
-}
-
-/// Retry `command` until the node answers `OK`. The admin listener is up
-/// from boot, but a promotion may still be settling when a command lands.
-fn admin_until_ok(addr: SocketAddr, key: &SigningKey, command: &str) {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        match admin_command(addr, key, command) {
-            Some(reply) if reply == "OK" => return,
-            reply => {
-                assert!(
-                    Instant::now() < deadline,
-                    "`{command}` never accepted; last reply: {reply:?}"
-                );
-                std::thread::sleep(Duration::from_millis(200));
-            }
-        }
-    }
 }
 
 /// The claim in the crate docs — two nodes that applied the same events

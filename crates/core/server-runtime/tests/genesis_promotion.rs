@@ -35,7 +35,7 @@ use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
-use melin_test_node::probe::admin_command;
+use melin_test_node::probe::admin_reply_when_up;
 use melin_test_node::{Addrs, Node};
 use melin_transport_core::pipeline::InputSlot;
 use melin_transport_core::replication::protocol::{
@@ -130,19 +130,6 @@ impl Cluster {
             replication_key: Some(self.tmp.path().join(format!("{name}.key"))),
             ..melin_test_node::config()
         }
-    }
-}
-
-/// Send `PROMOTE` to the admin endpoint at `addr`, retrying until the
-/// endpoint answers. Returns its reply line.
-fn promote(addr: SocketAddr, key: &SigningKey) -> String {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Some(reply) = admin_command(addr, key, "PROMOTE") {
-            return reply;
-        }
-        assert!(Instant::now() < deadline, "admin endpoint never answered");
-        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -241,7 +228,7 @@ fn a_replica_configured_without_genesis_refuses_promotion_mid_genesis() {
     drop(stream);
     drop(primary);
 
-    promote(replica_admin, &cluster.operator_key);
+    admin_reply_when_up(replica_admin, &cluster.operator_key, "PROMOTE");
     let deadline = Instant::now() + Duration::from_secs(30);
     while !replica.is_finished() {
         assert!(
@@ -305,7 +292,7 @@ fn a_replica_configured_with_a_larger_genesis_is_promoted() {
     }
     primary.stop();
 
-    promote(replica_admin, &cluster.operator_key);
+    admin_reply_when_up(replica_admin, &cluster.operator_key, "PROMOTE");
     assert_eq!(
         value_at(replica.addr(), &cluster.operator_key),
         GENESIS,

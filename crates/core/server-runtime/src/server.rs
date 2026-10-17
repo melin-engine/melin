@@ -4737,7 +4737,7 @@ mod genesis_tests {
 
     type Writer = BufferedWriter<CounterEvent>;
 
-    fn config(dir: &Path) -> ServerConfig {
+    pub(super) fn config(dir: &Path) -> ServerConfig {
         ServerConfig {
             journal: dir.join("counter.journal"),
             ..ServerConfig::default()
@@ -4864,7 +4864,7 @@ mod genesis_tests {
 
     /// Save a snapshot of a booted engine as the shadow stage would:
     /// its state, position, chain, lineage and lineage genesis length.
-    fn save_snapshot(engine: &super::InitializedEngine<Counter, Writer>, path: &Path) {
+    pub(super) fn save_snapshot(engine: &super::InitializedEngine<Counter, Writer>, path: &Path) {
         melin_transport_core::snapshot::save::<Counter>(
             &engine.app,
             melin_transport_core::WireSeq::new(engine.writer.next_sequence() - 1),
@@ -5358,6 +5358,107 @@ mod primary_gate_policy_tests {
             Some(AckPolicy::TwoDisks.to_byte())
         );
         assert_eq!(policy.forced.load(), None::<ForcedPolicy>);
+    }
+
+    /// A boot from a v4 snapshot whose history before it is gone restores
+    /// the whole transition, not just the policy: the policy before the
+    /// newest change, the change's own wire sequence and its unwitnessed
+    /// flag reach the gate, which starts under the policy before with the
+    /// change pending. Both boots `init_engine` takes on such a layout:
+    /// the snapshot alone (no segment left), and the snapshot with the
+    /// empty segment that boot began, holding nothing before it.
+    #[test]
+    fn a_boot_from_a_snapshot_alone_starts_the_gate_with_its_change_pending() {
+        use melin_journal::{AckPolicyChange, JournalEvent};
+        use melin_transport_core::lineage::{Lineage, LineagePolicy};
+
+        type Writer = melin_journal::BufferedWriter<CounterEvent>;
+        let boot = |cfg: &super::ServerConfig| {
+            super::init_engine::<Counter, Writer>(cfg, &(), Vec::new()).expect("boot")
+        };
+        let change = |policy: AckPolicy, unwitnessed| {
+            JournalEvent::AckPolicyChange(AckPolicyChange {
+                policy: policy.to_byte(),
+                unwitnessed,
+            })
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = super::genesis_tests::config(dir.path());
+
+        // The lineage's first policy at 1, a write, a forced weakening at
+        // 3, a write: the transition to restore is `disk+ram` → `disk` at
+        // 3, unwitnessed.
+        let mut engine = boot(&cfg);
+        for event in [
+            change(AckPolicy::DiskAndRam, false),
+            JournalEvent::App(CounterEvent::Increment { amount: 1 }),
+            change(AckPolicy::Disk, true),
+            JournalEvent::App(CounterEvent::Increment { amount: 2 }),
+        ] {
+            let seq = engine.writer.allocate_sequence();
+            engine
+                .writer
+                .encode_event(seq, 0, &event, 0)
+                .expect("encode");
+        }
+        engine.writer.flush_batch_sync().expect("flush");
+        drop(engine);
+        let expected = Lineage {
+            epoch: 0,
+            ack_policy: Some(LineagePolicy {
+                change: AckPolicyChange {
+                    policy: AckPolicy::Disk.to_byte(),
+                    unwitnessed: true,
+                },
+                wire_seq: WireSeq::new(3),
+                previous: Some(AckPolicy::DiskAndRam.to_byte()),
+            }),
+        };
+
+        // The shadow's snapshot of the recovered state, then the journal
+        // gone: every entry it held, the change's included, is the
+        // snapshot's alone.
+        let engine = boot(&cfg);
+        assert_eq!(
+            engine.recovered_lineage, expected,
+            "recovered from the journal"
+        );
+        super::genesis_tests::save_snapshot(&engine, &cfg.journal.with_extension("snapshot"));
+        drop(engine);
+        std::fs::remove_file(&cfg.journal).expect("prune the journal");
+        assert!(
+            melin_journal::segment::list_archives(&cfg.journal)
+                .expect("list archives")
+                .is_empty()
+        );
+
+        let pending = crate::durability_gate::GateStart {
+            in_force: AckPolicy::DiskAndRam,
+            pending: Some(crate::durability_gate::PendingChange {
+                wire_seq: WireSeq::new(3),
+                policy: AckPolicy::Disk,
+                unwitnessed: true,
+            }),
+        };
+        // The first boot opens a fresh, empty segment beside the snapshot,
+        // so the second recovers through the other arm.
+        for (layout, segment) in [
+            ("the snapshot alone", false),
+            ("the snapshot and an empty segment", true),
+        ] {
+            assert_eq!(cfg.journal.exists(), segment, "{layout}");
+            let engine = boot(&cfg);
+            assert_eq!(engine.writer.next_sequence(), 5, "{layout}");
+            assert_eq!(engine.recovered_lineage, expected, "{layout}");
+            let policy = primary_gate_policy(
+                engine.recovered_lineage.ack_policy,
+                AckPolicy::Disk,
+                Enabled,
+                &matching_stage(),
+            )
+            .expect("a known policy");
+            assert_eq!(policy.start, pending, "{layout}");
+        }
     }
 
     /// A promotion seeds its gate the same way, from the record the

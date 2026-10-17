@@ -8,6 +8,12 @@
 //!   scripted (`common/raw_replica.rs`), so what it holds is the test's to
 //!   say; one that holds nothing past the change is a frozen replica, and
 //!   the gate must stall on it.
+//! - A real replica promoted by hand right after the primary journaled
+//!   `ACK-POLICY disk` serves under the `disk+ram` before it: writes are
+//!   held until another replica holds the change, or the operator forces
+//!   `disk` with none connected. The same holds after the replica restarts
+//!   from its own shadow snapshot, the segments before it pruned: the
+//!   snapshot records the transition, and seeds the replica's record.
 //! - A restart under a different `--ack-policy` journals the change, which
 //!   waits for a replica like any other: a boot entry is never forced.
 //! - A lineage last run replicated under `disk+ram`, restarted
@@ -33,7 +39,7 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -48,9 +54,12 @@ use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::{JournalStagingMode, ServerConfig};
-use melin_test_node::probe::{admin_command, gauge, wait_for_gauge};
+use melin_test_node::probe::{
+    admin_command, admin_reply_when_up, admin_until_ok, gauge, wait_for_gauge,
+};
 use melin_test_node::{Addrs, Node};
 use melin_transport_core::test_ports::free_addr;
+use serial_test::serial;
 
 #[path = "common/raw_replica.rs"]
 mod raw_replica;
@@ -79,15 +88,77 @@ const JOURNALED: &str = "melin_ack_policy_journaled";
 /// The primary's durable journal sequence.
 const DURABLE: &str = "melin_journal_sequence";
 
-/// Node `slot`'s addresses, from this file's port range on kernel TCP.
-fn addrs(slot: usize) -> Addrs {
-    melin_test_node::addrs(slot, || free_addr(PORT_BASE))
+/// Ports a finished test handed back, for the next one to take. Under
+/// plain `cargo test` every test in this binary shares one process, and
+/// so one block of `free_addr` ports, which a fresh set per test would
+/// exhaust. Reuse bounds the block's use only because the tests run one
+/// at a time (`#[serial]`): run at once, they would hold more ports than
+/// the block has, whatever is handed back. A `Vec`: a handful of ports,
+/// scanned for one that binds and taken out in no particular order.
+static RETURNED_PORTS: Mutex<Vec<SocketAddr>> = Mutex::new(Vec::new());
+
+/// A loopback port no running test holds: one handed back that binds
+/// now, or a new one from this file's port range. A stopped node's
+/// endpoint threads may outlive it briefly, still bound: such a port
+/// stays in the pool, for a later test.
+fn port() -> SocketAddr {
+    let reused = {
+        // A test that panicked holding the lock left the pool whole: it
+        // only scans and takes out.
+        let mut pool = RETURNED_PORTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pool.iter()
+            .position(|addr| std::net::TcpListener::bind(addr).is_ok())
+            .map(|index| pool.swap_remove(index))
+    };
+    // Outside the lock: an exhausted block panics this test alone.
+    reused.unwrap_or_else(|| free_addr(PORT_BASE))
 }
 
-/// The keys of a test's cluster: the primary's replication key, the
-/// scripted replica's, and an operator's (client writes and admin).
+/// Hand a finished test's ports back: its node's addresses on kernel TCP
+/// (on DPDK they are the runner slot's, from no pool) and `endpoints`. A
+/// test that failed keeps them: it may have left a node bound to one.
+fn give_back(addrs: &Addrs, endpoints: [SocketAddr; 2]) {
+    if std::thread::panicking() {
+        return;
+    }
+    let mut pool = RETURNED_PORTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if cfg!(not(feature = "dpdk")) {
+        pool.extend([addrs.client(), addrs.replication()]);
+    }
+    pool.extend(endpoints);
+}
+
+/// Wait until a stopped node's health and admin endpoints are released.
+/// Both are reused on every boot, but `Node::stop` does not join their
+/// threads: the admin listener sees the shutdown flag only on its next
+/// 100ms poll, and a node restarted while it is still bound fails to bind
+/// it and never comes up. (Waiting here does not take the ports: each
+/// probe listener is dropped at once.)
+fn wait_released(endpoints: [SocketAddr; 2]) {
+    let deadline = Instant::now() + LIMIT;
+    for addr in endpoints {
+        while std::net::TcpListener::bind(addr).is_err() {
+            assert!(Instant::now() < deadline, "{addr} still bound");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+/// Node `slot`'s addresses, from [`port`] on kernel TCP.
+fn addrs(slot: usize) -> Addrs {
+    melin_test_node::addrs(slot, port)
+}
+
+/// The keys of a test's cluster: the primary's replication key, a real
+/// replica's, the scripted replica's, and an operator's (client writes
+/// and admin).
 struct Keys {
     primary: SigningKey,
+    replica: SigningKey,
     scripted: SigningKey,
     operator: SigningKey,
 }
@@ -96,12 +167,13 @@ impl Keys {
     fn new() -> Self {
         Keys {
             primary: SigningKey::from_bytes(&[0x91; 32]),
+            replica: SigningKey::from_bytes(&[0x94; 32]),
             scripted: SigningKey::from_bytes(&[0x92; 32]),
             operator: SigningKey::from_bytes(&[0x93; 32]),
         }
     }
 
-    /// Write the `authorized_keys` file admitting all three, into `dir`.
+    /// Write the `authorized_keys` file admitting all four, into `dir`.
     fn authorized_keys(&self, dir: &Path) -> PathBuf {
         let b64 = |k: &SigningKey| {
             base64::engine::general_purpose::STANDARD.encode(k.verifying_key().to_bytes())
@@ -110,14 +182,40 @@ impl Keys {
         std::fs::write(
             &path,
             format!(
-                "replication {} primary\nreplication {} scripted\noperator {} operator\n",
+                "replication {} primary\nreplication {} replica\nreplication {} scripted\n\
+                 operator {} operator\n",
                 b64(&self.primary),
+                b64(&self.replica),
                 b64(&self.scripted),
                 b64(&self.operator)
             ),
         )
         .expect("write authorized_keys");
         path
+    }
+}
+
+/// A real replica's endpoints, the same on every boot (see
+/// [`Cluster::health`]).
+struct ReplicaEndpoints {
+    addrs: Addrs,
+    health: SocketAddr,
+    admin: SocketAddr,
+}
+
+impl ReplicaEndpoints {
+    fn new() -> Self {
+        ReplicaEndpoints {
+            addrs: addrs(1),
+            health: port(),
+            admin: port(),
+        }
+    }
+}
+
+impl Drop for ReplicaEndpoints {
+    fn drop(&mut self) {
+        give_back(&self.addrs, [self.health, self.admin]);
     }
 }
 
@@ -129,9 +227,8 @@ struct Cluster {
     keys_file: PathBuf,
     addrs: Addrs,
     /// The primary's health and admin endpoints, the same on every boot
-    /// as its other addresses are: under plain `cargo test` every test in
-    /// this binary shares one process and its block of `free_addr` ports,
-    /// which fresh endpoints per restart would exhaust.
+    /// as its other addresses are, so that restarts take no more ports
+    /// (see [`port`]).
     health: SocketAddr,
     admin: SocketAddr,
 }
@@ -146,8 +243,8 @@ impl Cluster {
             keys,
             keys_file,
             addrs: addrs(0),
-            health: free_addr(PORT_BASE),
-            admin: free_addr(PORT_BASE),
+            health: port(),
+            admin: port(),
         }
     }
 
@@ -179,6 +276,7 @@ impl Cluster {
     }
 
     fn start(&self, config: ServerConfig) -> Node {
+        wait_released([self.health, self.admin]);
         melin_test_node::start_at::<Counter>(
             &self.addrs,
             config,
@@ -189,11 +287,56 @@ impl Cluster {
         )
     }
 
-    /// The scripted replica, joined and streaming.
+    /// A real replica of the primary at `endpoints`, under `ack_policy`
+    /// (the policy it requests once promoted). It accepts replicas of its
+    /// own once promoted when `replicating`, on its replication address.
+    /// The same journal on every boot, and no shadow snapshot.
+    fn replica_config(
+        &self,
+        endpoints: &ReplicaEndpoints,
+        ack_policy: AckPolicy,
+        replicating: bool,
+    ) -> ServerConfig {
+        let key_path = self.dir.path().join("replica.key");
+        std::fs::write(&key_path, self.keys.replica.to_bytes()).expect("write replica key");
+        ServerConfig {
+            journal: self.replica_journal(),
+            replica_of: Some(self.addrs.replication()),
+            replication_bind: replicating.then(|| endpoints.addrs.replication()),
+            replication_key: Some(key_path),
+            health_bind: Some(endpoints.health),
+            admin_bind: Some(endpoints.admin),
+            ..self.config(ack_policy, false)
+        }
+    }
+
+    fn replica_journal(&self) -> PathBuf {
+        self.dir.path().join("replica.journal")
+    }
+
+    fn start_replica(&self, endpoints: &ReplicaEndpoints, config: ServerConfig) -> Node {
+        wait_released([endpoints.health, endpoints.admin]);
+        melin_test_node::start_at::<Counter>(
+            &endpoints.addrs,
+            config,
+            StartupEvents::none(),
+            (),
+            RequestDecoder,
+            ResponseEncoder,
+        )
+    }
+
+    /// The scripted replica, joined to the primary and streaming.
     fn join_replica(&self, health: SocketAddr) -> RawReplica {
+        self.join_replica_of(self.addrs.replication(), health)
+    }
+
+    /// The scripted replica, joined to the node replicating on
+    /// `replication` (whose health endpoint is `health`) and streaming.
+    fn join_replica_of(&self, replication: SocketAddr, health: SocketAddr) -> RawReplica {
         // Up, so its replication endpoint is listening.
         wait_for_gauge(health, "melin_replicas_connected", 0);
-        let replica = RawReplica::join(self.addrs.replication(), &self.keys.scripted, FRAME_LIMIT);
+        let replica = RawReplica::join(replication, &self.keys.scripted, FRAME_LIMIT);
         wait_for_gauge(health, "melin_replicas_connected", 1);
         replica
     }
@@ -207,6 +350,12 @@ impl Cluster {
         conn.set_read_timeout(LIMIT)
             .expect("set the client's read timeout");
         conn
+    }
+}
+
+impl Drop for Cluster {
+    fn drop(&mut self) {
+        give_back(&self.addrs, [self.health, self.admin]);
     }
 }
 
@@ -297,6 +446,7 @@ fn wait_for_replica_ack(health: SocketAddr, sequence: u64) {
 /// on the primary's disk; once the replica holds the change (and nothing
 /// after it), the write is acked on the disk alone, and so is the next.
 #[test]
+#[serial]
 fn a_weakening_waits_for_the_replica_to_hold_the_change() {
     let cluster = Cluster::new();
     let config = cluster.config(AckPolicy::DiskAndRam, false);
@@ -404,6 +554,7 @@ fn leave_the_change_waiting(cluster: &Cluster) {
 /// is held, though on the primary's disk, until the replica holds the
 /// change, then acked under `disk`.
 #[test]
+#[serial]
 fn a_restart_reapplies_a_change_the_replica_never_held() {
     let cluster = Cluster::new();
     leave_the_change_waiting(&cluster);
@@ -444,6 +595,225 @@ fn a_restart_reapplies_a_change_the_replica_never_held() {
     primary.stop();
 }
 
+/// A primary under `disk+ram` whose replica (a real one, at `endpoints`)
+/// holds `ACK-POLICY disk`, journaled witnessed at 3 after a write at 2,
+/// then a manual `PROMOTE` of the replica as soon as the primary stops.
+/// The replica requests `disk`, the policy its lineage now names, so its
+/// promotion journals no policy entry: entry 4 is its `EpochBump`.
+///
+/// Whether the old primary had applied the change by then is not on the
+/// promoted node's disk, and does not matter: it serves under the policy
+/// before the change, `disk+ram`, with the change pending, so that a
+/// replica judging by `disk+ram` (one that never received the change)
+/// does not lose events acked under `disk`. Returns the promoted node.
+fn promote_right_after_a_weakening(cluster: &Cluster, endpoints: &ReplicaEndpoints) -> Node {
+    let config = cluster.config(AckPolicy::DiskAndRam, false);
+    let health = config.health_bind.expect("set");
+    let admin = config.admin_bind.expect("set");
+    let primary = cluster.start(config);
+    let replica = cluster.start_replica(
+        endpoints,
+        cluster.replica_config(endpoints, AckPolicy::Disk, true),
+    );
+    wait_for_gauge(health, "melin_replicas_connected", 1);
+    wait_for_gauge(health, IN_FORCE, AckPolicy::DiskAndRam.as_u8().into());
+
+    let mut conn = cluster.client(&primary);
+    assert_eq!(write_reply(&mut conn), KIND_RESP_ACK, "entry 2, acked");
+    drop(conn);
+    assert_eq!(
+        admin_command(admin, &cluster.keys.operator, "ACK-POLICY disk").as_deref(),
+        Some("OK")
+    );
+    // The replica holds the change on its disk.
+    wait_for_replica_ack(health, 3);
+    primary.stop();
+
+    assert_eq!(
+        admin_reply_when_up(endpoints.admin, &cluster.keys.operator, "PROMOTE"),
+        "OK"
+    );
+    // Its gate is up, and its journal holds the `EpochBump` and nothing
+    // more.
+    wait_for_gauge(endpoints.health, JOURNALED, AckPolicy::Disk.as_u8().into());
+    wait_durable(endpoints.health, 4);
+    std::thread::sleep(HOLD);
+    assert_eq!(
+        gauge(endpoints.health, DURABLE),
+        Some(4),
+        "no promotion entry"
+    );
+    assert_eq!(
+        gauge(endpoints.health, IN_FORCE),
+        Some(AckPolicy::DiskAndRam.as_u8().into()),
+        "the promoted node must not take the weakening as in force"
+    );
+    replica
+}
+
+/// A replica promoted right after a weakening serves under the policy
+/// before it: a write is held, though on the promoted node's disk, until
+/// another replica holds the change, and then acked under `disk`.
+#[test]
+#[serial]
+fn a_promotion_right_after_a_weakening_waits_for_another_replica_to_hold_it() {
+    let cluster = Cluster::new();
+    let endpoints = ReplicaEndpoints::new();
+    let promoted = promote_right_after_a_weakening(&cluster, &endpoints);
+    let health = endpoints.health;
+    let mut replica = cluster.join_replica_of(endpoints.addrs.replication(), health);
+
+    // A write, entry 5, on the promoted node's disk; the scripted replica
+    // holds everything before the change, and not the change.
+    let pending = Pending::send(cluster.client(&promoted));
+    wait_durable(health, 5);
+    replica.read_through(5);
+    replica.ack_tracks(0, 2);
+    assert!(
+        pending.held_for(HOLD),
+        "the write was acked on the promoted node's disk before a replica held the change"
+    );
+    assert_eq!(
+        gauge(health, IN_FORCE),
+        Some(AckPolicy::DiskAndRam.as_u8().into())
+    );
+
+    // The replica holds the change, and not the write: `disk` takes
+    // effect, and the write is acked on the disk alone.
+    replica.ack_tracks(0, 3);
+    let conn = pending.acked();
+    wait_for_gauge(health, IN_FORCE, AckPolicy::Disk.as_u8().into());
+
+    drop(conn);
+    drop(replica);
+    promoted.stop();
+}
+
+/// The same promotion with no replica to hold the change: the operator's
+/// `ACK-POLICY disk`, sent while none is connected, is forced, and takes
+/// effect over the pending change once its own entry is on disk, which
+/// no replica could ever witness.
+#[test]
+#[serial]
+fn a_forced_disk_overtakes_a_promotions_pending_weakening() {
+    let cluster = Cluster::new();
+    let endpoints = ReplicaEndpoints::new();
+    let promoted = promote_right_after_a_weakening(&cluster, &endpoints);
+    let health = endpoints.health;
+
+    // `OK staged` while the promoted node's producer is still attaching:
+    // re-sent, as the operator would, until it is journaled.
+    admin_until_ok(endpoints.admin, &cluster.keys.operator, "ACK-POLICY disk");
+    wait_for_gauge(health, IN_FORCE, AckPolicy::Disk.as_u8().into());
+    let mut conn = cluster.client(&promoted);
+    assert_eq!(
+        write_reply(&mut conn),
+        KIND_RESP_ACK,
+        "acked on the disk alone, with no replica"
+    );
+
+    drop(conn);
+    promoted.stop();
+}
+
+/// A replica's own shadow snapshot records the lineage policy its
+/// stream's changes fold into, transition included, and a restart from
+/// that snapshot alone (the segments before it pruned) seeds the
+/// replica's record from it: promoted, the replica starts its gate under
+/// the policy before the change, with the change pending.
+#[test]
+#[serial]
+fn a_replica_restarted_from_its_own_snapshot_keeps_the_change_pending() {
+    use melin_transport_core::lineage::LineagePolicy;
+
+    let cluster = Cluster::new();
+    let endpoints = ReplicaEndpoints::new();
+    let config = cluster.config(AckPolicy::DiskAndRam, false);
+    let health = config.health_bind.expect("set");
+    let admin = config.admin_bind.expect("set");
+    let primary = cluster.start(config);
+    let replica_config = || ServerConfig {
+        snapshot_interval_ms: 50,
+        ..cluster.replica_config(&endpoints, AckPolicy::Disk, true)
+    };
+    let replica = cluster.start_replica(&endpoints, replica_config());
+    wait_for_gauge(health, "melin_replicas_connected", 1);
+    wait_for_gauge(health, IN_FORCE, AckPolicy::DiskAndRam.as_u8().into());
+
+    // A write at 2, `ACK-POLICY disk` at 3, held by the replica; then a
+    // rotation, and a write at 4 for the rotation to land on.
+    let mut conn = cluster.client(&primary);
+    assert_eq!(write_reply(&mut conn), KIND_RESP_ACK);
+    assert_eq!(
+        admin_command(admin, &cluster.keys.operator, "ACK-POLICY disk").as_deref(),
+        Some("OK")
+    );
+    wait_for_replica_ack(health, 3);
+    assert_eq!(
+        admin_command(admin, &cluster.keys.operator, "ROTATE").as_deref(),
+        Some("OK")
+    );
+    assert_eq!(write_reply(&mut conn), KIND_RESP_ACK);
+    drop(conn);
+    wait_for_replica_ack(health, 4);
+
+    // The replica's archive, and a snapshot of its own covering it,
+    // recording the stream's transition at the change's sequence.
+    let journal = cluster.replica_journal();
+    let snapshot = journal.with_extension("snapshot");
+    let deadline = Instant::now() + LIMIT;
+    let lineage = loop {
+        let archived = !melin_journal::segment::list_archives(&journal)
+            .expect("list the replica's archives")
+            .is_empty();
+        if archived
+            && let Ok((_, header)) = melin_transport_core::snapshot::load::<Counter>(&snapshot)
+            && header.sequence >= 4
+        {
+            break header.lineage;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the replica never archived and snapshotted past the rotation"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        lineage.ack_policy,
+        Some(LineagePolicy {
+            change: melin_journal::AckPolicyChange {
+                policy: AckPolicyByte(AckPolicy::Disk.as_u8()),
+                unwitnessed: false,
+            },
+            wire_seq: melin_transport_core::WireSeq::new(3),
+            previous: Some(AckPolicyByte(AckPolicy::DiskAndRam.as_u8())),
+        }),
+        "the replica's snapshot records the transition it received"
+    );
+
+    // Both stop; every segment before the snapshot is pruned, so the
+    // change is the snapshot's alone.
+    replica.stop();
+    primary.stop();
+    for (_, archive) in melin_journal::segment::list_archives(&journal).expect("list archives") {
+        std::fs::remove_file(archive).expect("prune an archive");
+    }
+
+    let replica = cluster.start_replica(&endpoints, replica_config());
+    assert_eq!(
+        admin_reply_when_up(endpoints.admin, &cluster.keys.operator, "PROMOTE"),
+        "OK"
+    );
+    wait_for_gauge(endpoints.health, JOURNALED, AckPolicy::Disk.as_u8().into());
+    std::thread::sleep(HOLD);
+    assert_eq!(
+        gauge(endpoints.health, IN_FORCE),
+        Some(AckPolicy::DiskAndRam.as_u8().into()),
+        "the restarted replica's record lost the transition its snapshot holds"
+    );
+    replica.stop();
+}
+
 /// Halt-plan step 0, the manual-promotion playbook: a primary with no
 /// replica halts under every policy, `disk` included; the operator's
 /// `ACK-POLICY disk` sent while it has none lifts the halt; a policy that
@@ -452,6 +822,7 @@ fn a_restart_reapplies_a_change_the_replica_never_held() {
 /// that acks ends it, so its departure halts the node again; and a `disk`
 /// sent while a replica was connected is no consent once it leaves.
 #[test]
+#[serial]
 fn a_forced_disk_lifts_the_halt_until_a_replica_returns() {
     const TRADING: &str = "melin_trading_active";
     let cluster = Cluster::new();
@@ -542,6 +913,7 @@ fn a_forced_disk_lifts_the_halt_until_a_replica_returns() {
 /// authentication would have counted it before the client's write, which
 /// connects and authenticates after the replica's verdict.
 #[test]
+#[serial]
 fn a_replica_counts_once_its_handshake_is_accepted() {
     const TRADING: &str = "melin_trading_active";
     let cluster = Cluster::new();
@@ -589,6 +961,7 @@ fn a_replica_counts_once_its_handshake_is_accepted() {
 /// `OK`, and releases the held write once its own entry is on the
 /// primary's disk: `disk` is in force, journaled and applied.
 #[test]
+#[serial]
 fn a_forced_disk_releases_a_write_held_under_disk_and_ram() {
     let cluster = Cluster::new();
     let config = cluster.config(AckPolicy::DiskAndRam, false);
@@ -653,6 +1026,7 @@ fn assert_refused_for_want_of_a_replica(reply: Option<String>) {
 /// ever attach to meet it. Nothing is journaled (neither the policy gauge
 /// nor the journal moves), and writes keep being acked under `disk`.
 #[test]
+#[serial]
 fn a_standalone_primary_refuses_a_policy_that_needs_a_replica() {
     let cluster = Cluster::new();
     let config = cluster.config(AckPolicy::Disk, true);
@@ -697,6 +1071,7 @@ fn a_standalone_primary_refuses_a_policy_that_needs_a_replica() {
 /// than have its promotion serve under a policy no replica can meet:
 /// promoted, it serves under its own `disk` at once.
 #[test]
+#[serial]
 fn a_replica_without_replication_refuses_to_stage_a_policy_that_needs_a_replica() {
     let cluster = Cluster::new();
     let config = cluster.config(AckPolicy::Disk, false);
@@ -704,43 +1079,19 @@ fn a_replica_without_replication_refuses_to_stage_a_policy_that_needs_a_replica(
     let primary = cluster.start(config);
     wait_for_gauge(primary_health, "melin_replicas_connected", 0);
 
-    let key_path = cluster.dir.path().join("replica.key");
-    std::fs::write(&key_path, cluster.keys.scripted.to_bytes()).expect("write replica key");
-    let replica_config = ServerConfig {
-        journal: cluster.dir.path().join("replica.journal"),
-        replica_of: Some(cluster.addrs.replication()),
-        replication_bind: None,
-        replication_key: Some(key_path),
-        // Its own endpoints: the primary's are taken while both run.
-        health_bind: Some(free_addr(PORT_BASE)),
-        admin_bind: Some(free_addr(PORT_BASE)),
-        ..cluster.config(AckPolicy::Disk, false)
-    };
-    let health = replica_config.health_bind.expect("set");
-    let admin = replica_config.admin_bind.expect("set");
-    let replica = melin_test_node::start_at::<Counter>(
-        &addrs(1),
-        replica_config,
-        StartupEvents::none(),
-        (),
-        RequestDecoder,
-        ResponseEncoder,
+    let endpoints = ReplicaEndpoints::new();
+    let (health, admin) = (endpoints.health, endpoints.admin);
+    let replica = cluster.start_replica(
+        &endpoints,
+        cluster.replica_config(&endpoints, AckPolicy::Disk, false),
     );
     wait_for_gauge(primary_health, "melin_replicas_connected", 1);
 
-    // Retried until the replica's admin endpoint is up.
-    let deadline = Instant::now() + LIMIT;
-    let reply = loop {
-        if let Some(reply) = admin_command(admin, &cluster.keys.operator, "ACK-POLICY disk+ram") {
-            break reply;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the replica's admin never answered"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    };
-    assert_refused_for_want_of_a_replica(Some(reply));
+    assert_refused_for_want_of_a_replica(Some(admin_reply_when_up(
+        admin,
+        &cluster.keys.operator,
+        "ACK-POLICY disk+ram",
+    )));
 
     primary.stop();
     assert_eq!(
@@ -770,6 +1121,7 @@ fn begin_under_disk_and_ram(cluster: &Cluster) {
 /// change, and it waits for the replica the lineage's policy relies on:
 /// a boot entry is never forced. Once a replica holds it, it is in force.
 #[test]
+#[serial]
 fn a_restart_under_another_policy_journals_the_change_and_waits_for_a_replica() {
     let cluster = Cluster::new();
     begin_under_disk_and_ram(&cluster);
@@ -809,6 +1161,7 @@ fn a_restart_under_another_policy_journals_the_change_and_waits_for_a_replica() 
 /// under `disk`, serves at once: its gate starts at the configured policy,
 /// and the change is journaled unwitnessed, as the record of the switch.
 #[test]
+#[serial]
 fn a_standalone_restart_serves_under_the_configured_policy() {
     let cluster = Cluster::new();
     begin_under_disk_and_ram(&cluster);
@@ -858,6 +1211,7 @@ fn journaled_changes(cluster: &Cluster) -> (Vec<(u64, AckPolicyByte, bool)>, u64
 /// witness. The next standalone boot finds the transition marked and
 /// journals nothing more.
 #[test]
+#[serial]
 fn a_standalone_restart_marks_a_waiting_change_unwitnessed() {
     let byte = |policy: AckPolicy| AckPolicyByte(policy.as_u8());
     let cluster = Cluster::new();

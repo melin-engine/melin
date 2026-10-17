@@ -7,10 +7,11 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::{Mutex, OnceLock};
 
-/// Ports per pid-derived block. The hungriest test binary allocates ~9
-/// addresses per process; 50 leaves generous slack even under plain
-/// `cargo test`, where every test in a binary shares one process (and
-/// this allocator never reissues a port within a process).
+/// Ports per pid-derived block. Under plain `cargo test` every test in a
+/// binary shares one process, and so one block, and this allocator never
+/// reissues a port within a process: a binary whose tests together take
+/// more than a block must hand ports back and run its tests one at a time
+/// (as `ack_policy_changes.rs` in `melin-server-runtime` does).
 const BLOCK: u16 = 50;
 /// Blocks per range: each `base` owns `base..base + BLOCK * NBLOCKS`
 /// (5000 ports). Callers must space their bases accordingly.
