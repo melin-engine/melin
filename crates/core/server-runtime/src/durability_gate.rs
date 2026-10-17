@@ -365,34 +365,35 @@ impl DurabilityGate {
             last_policy_check: now,
             accrual_timer: AmortizedTimer::new(),
         };
-        gate.settle_pending_if_durable(journal_pos, status.durable_pos);
+        gate.settle_pending_if_durable(journal_pos);
         gate
     }
 
-    /// Apply the pending change if what the gate last read already makes
-    /// it durable: `durable_pos` under the policy in force, or, for an
-    /// unwitnessed one, `journal_pos` on this node's disk. Never waits.
-    fn settle_pending_if_durable(&mut self, journal_pos: WireSeq, durable_pos: u64) {
-        if let Some(pending) = self.pending
-            && (durable_pos >= pending.wire_seq.get()
-                || (pending.unwitnessed && journal_pos >= pending.wire_seq))
+    /// Apply the pending change, once, if it is durable: under the policy
+    /// in force (the cached durable position, which every caller has just
+    /// refreshed or knows to cover it), or, for an unwitnessed one, on
+    /// this node's disk (`journal_pos`). Never waits. The one place the
+    /// pending change is settled: at the start, in the idle recheck,
+    /// inside a wait (with the forced changes) and before the first slot
+    /// it admits. Applied in order before every slot after it, or skipped
+    /// by [`Self::apply_change`] if a forced change of this tenure has
+    /// overtaken it.
+    fn settle_pending_if_durable(&mut self, journal_pos: WireSeq) {
+        let Some(pending) = self.pending else {
+            return;
+        };
+        if self.cached_durable_pos < pending.wire_seq.get()
+            && !(pending.unwitnessed && journal_pos >= pending.wire_seq)
         {
-            self.settle_pending();
+            return;
         }
-    }
-
-    /// Apply the pending change, once: in order before every slot after
-    /// it, or skipped by [`Self::apply_change`] if a forced change of this
-    /// tenure has overtaken it.
-    fn settle_pending(&mut self) {
-        if let Some(pending) = self.pending.take() {
-            let cause = if pending.unwitnessed {
-                "lineage's unwitnessed change, on disk"
-            } else {
-                "lineage's change, durable under the policy before it"
-            };
-            self.apply_change(pending.wire_seq, pending.policy.to_byte(), cause);
-        }
+        let cause = if pending.unwitnessed {
+            "lineage's unwitnessed change, on disk"
+        } else {
+            "lineage's change, durable under the policy before it"
+        };
+        self.pending = None;
+        self.apply_change(pending.wire_seq, pending.policy.to_byte(), cause);
     }
 
     /// The one place the policy in force changes.
@@ -464,16 +465,12 @@ impl DurabilityGate {
     /// before any reply relies on it. One already applied is skipped by
     /// [`Self::apply_change`].
     ///
-    /// The lineage's pending change, if unwitnessed, is applied the same
-    /// way, first: it comes before any forced change of this tenure.
+    /// The lineage's pending change is settled first, if durable (an
+    /// unwitnessed one once on this node's disk, as a forced change is):
+    /// it comes before any forced change of this tenure.
     #[inline]
     fn observe_forced(&mut self, journal_pos: WireSeq) {
-        if let Some(pending) = self.pending
-            && pending.unwitnessed
-            && journal_pos >= pending.wire_seq
-        {
-            self.settle_pending();
-        }
+        self.settle_pending_if_durable(journal_pos);
         if let Some(forced) = self.forced.load()
             && journal_pos >= forced.wire_seq
         {
@@ -511,6 +508,9 @@ impl DurabilityGate {
         before_wait: impl FnOnce(),
     ) -> Admission {
         let mut before_wait = Some(before_wait);
+        // A wait returns only once the pending change's entry is durable
+        // under the policy in force (or has settled it, an unwitnessed
+        // change once on disk), so one pass settles it.
         if let Some(pending) = self.pending {
             if pending.wire_seq.get() > self.cached_durable_pos {
                 if let Some(before_wait) = before_wait.take() {
@@ -525,9 +525,11 @@ impl DurabilityGate {
                     return Admission::Shutdown;
                 }
             }
-            // Unless the wait applied it already (an unwitnessed change,
-            // once on disk).
-            self.settle_pending();
+            self.settle_pending_if_durable(self.inputs.journal_persisted_wire_seq.load());
+            debug_assert!(
+                self.pending.is_none(),
+                "an open wait leaves the pending change durable"
+            );
         }
         let change = match slot.payload {
             OutputPayload::AckPolicyChange(change) => Some(change),
@@ -717,7 +719,7 @@ impl DurabilityGate {
             DEGRADED_LOG_INTERVAL,
         );
         self.cached_durable_pos = status.durable_pos;
-        self.settle_pending_if_durable(journal_pos, status.durable_pos);
+        self.settle_pending_if_durable(journal_pos);
     }
 
     /// Log degradation transitions / re-emit the reminder after a batch.

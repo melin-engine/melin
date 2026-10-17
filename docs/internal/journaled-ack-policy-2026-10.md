@@ -891,6 +891,25 @@ and is committed on its own. Tests land with the step they pin.
    says the promoted node serves under the policy the old primary last
    journaled: it points at the new-tenure confirmation instead.
 
+   **Final review follow-up.** Behaviour unchanged. `is_unwitnessed`
+   takes the halt gate's `Option<&Observed>` directly, so `Witnesses` and
+   the mapping onto it are gone. `Decision` and `Journaled` hold the
+   typed policy and an `unwitnessed` flag, the entry derived from them,
+   not the policy twice. `HaltGate::journal`'s publish closure returns
+   the ring's publish index, carried in `Journaled` and logged, so
+   recording a change without an entry takes a made-up index rather than
+   a forgotten push. `ReplicaPresence::clear_override` consumes the
+   decision's `Observed` (now, like `NoneSince`, neither `Copy` nor
+   `Clone`, and its `Connected` variant carries a private-field `Seen`
+   token), so neither override mutator works without a look at the
+   presence. `LineagePolicy::wire_seq`, `LineagePolicy::after` and the
+   lineage folds take a `WireSeq`; the snapshot codec and the journal
+   readers convert. The gate's pending change is settled in one place,
+   `settle_pending_if_durable` (durable under the policy in force by the
+   cached position, or unwitnessed and on disk), from the start, the idle
+   recheck, the wait's forced-change check and `admit`, once after its
+   wait (which leaves the change durable, as a debug assertion pins).
+
 ## Downstream impact (Exchange Core)
 
 Breaking: an `OutputPayload` arm in its event publisher and anything else
