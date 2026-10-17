@@ -316,6 +316,86 @@ fn a_weakening_waits_for_the_replica_to_hold_the_change() {
     primary.stop();
 }
 
+/// The restart that change is unsafe across without its own rule: under
+/// `disk+ram`, `ACK-POLICY disk` is journaled (entry 3) while the replica
+/// holds nothing past entry 2, and the primary stops before the replica
+/// holds the change. Restarted with `--ack-policy disk`, the policy its
+/// lineage already names (so it journals no boot entry), it must not
+/// serve under `disk`: the replica never learnt of it, and would judge by
+/// `disk+ram` had the primary died again. The gate starts under the
+/// policy before the change, `disk+ram`, with the change pending; a write
+/// is held, though on the primary's disk, until the replica holds the
+/// change, then acked under `disk`.
+#[test]
+fn a_restart_reapplies_a_change_the_replica_never_held() {
+    let cluster = Cluster::new();
+    let config = cluster.config(AckPolicy::DiskAndRam, false);
+    let health = config.health_bind.expect("set");
+    let admin = config.admin_bind.expect("set");
+    let primary = cluster.start(config);
+    let mut replica = cluster.join_replica(health);
+    wait_for_gauge(health, IN_FORCE, AckPolicy::DiskAndRam.as_u8().into());
+
+    // Entry 2, acked once the replica holds it; then the change, entry 3,
+    // witnessed and waiting: the state the weakening test above holds.
+    let pending = Pending::send(cluster.client(&primary));
+    wait_durable(health, 2);
+    let taken = replica.read_through(2);
+    replica.ack_tracks(0, taken);
+    drop(pending.acked());
+    assert_eq!(
+        admin_command(admin, &cluster.keys.operator, "ACK-POLICY disk").as_deref(),
+        Some("OK")
+    );
+    wait_for_gauge(health, JOURNALED, AckPolicy::Disk.as_u8().into());
+    wait_durable(health, 3);
+    std::thread::sleep(HOLD);
+    assert_eq!(
+        gauge(health, IN_FORCE),
+        Some(AckPolicy::DiskAndRam.as_u8().into()),
+        "the change waits for the replica"
+    );
+
+    // The replica leaves without the change, and the primary stops.
+    drop(replica);
+    primary.stop();
+
+    let config = cluster.config(AckPolicy::Disk, false);
+    let health = config.health_bind.expect("set");
+    let primary = cluster.start(config);
+    wait_durable(health, 3);
+    wait_for_gauge(health, JOURNALED, AckPolicy::Disk.as_u8().into());
+    let mut replica = cluster.join_replica(health);
+    std::thread::sleep(HOLD);
+    assert_eq!(
+        gauge(health, IN_FORCE),
+        Some(AckPolicy::DiskAndRam.as_u8().into()),
+        "the restart must not take the unconfirmed change as in force"
+    );
+
+    // A write, entry 4: no boot entry came before it. On the primary's
+    // disk, and held while the replica holds only what it held before.
+    let pending = Pending::send(cluster.client(&primary));
+    wait_durable(health, 4);
+    assert_eq!(gauge(health, DURABLE), Some(4), "no boot entry journaled");
+    replica.read_through(4);
+    replica.ack_tracks(0, 2);
+    assert!(
+        pending.held_for(HOLD),
+        "the write was acked on the primary's disk before the replica held the change"
+    );
+
+    // The replica holds the change, and not the write: `disk` takes
+    // effect, and the write is acked on the disk alone.
+    replica.ack_tracks(0, 3);
+    let conn = pending.acked();
+    wait_for_gauge(health, IN_FORCE, AckPolicy::Disk.as_u8().into());
+
+    drop(conn);
+    drop(replica);
+    primary.stop();
+}
+
 /// Halt-plan step 0, the manual-promotion playbook: a primary with no
 /// replica halts under every policy, `disk` included; the operator's
 /// `ACK-POLICY disk` sent while it has none lifts the halt; a policy that

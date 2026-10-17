@@ -840,6 +840,8 @@ fn replay_segment<A: Application>(
                     // Replay produces no output: the client got its reply
                     // when the event was live. A query is never journaled,
                     // so every entry here is one `apply` handled live.
+                    // The entry's sequence is its wire sequence.
+                    let wire_seq = entry.sequence;
                     dispatch(
                         app,
                         entry.event,
@@ -848,7 +850,7 @@ fn replay_segment<A: Application>(
                             key_hash: entry.key_hash,
                         },
                         last_drain_ns,
-                        |event| recovered_lineage.observe(event),
+                        |event| recovered_lineage.observe(wire_seq, event),
                         reports,
                     );
                     reports.clear();
@@ -960,6 +962,7 @@ fn verify_boundary_snapshot_anchor<E: melin_app::AppEvent>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lineage::LineagePolicy;
     use crate::test_support::{TestApp, TestEvent, ack_policy_change};
     use melin_journal::{AckPolicyByte, BufferedWriter, JournalEvent, JournalReader};
     use std::collections::HashMap;
@@ -1313,10 +1316,29 @@ mod tests {
         );
     }
 
+    /// The lineage policy `policy`, in force since the transition at
+    /// `wire_seq` from `previous`.
+    fn lineage_policy(
+        policy: u8,
+        unwitnessed: bool,
+        wire_seq: u64,
+        previous: Option<u8>,
+    ) -> Option<LineagePolicy> {
+        Some(LineagePolicy {
+            change: melin_journal::AckPolicyChange {
+                policy: AckPolicyByte(policy),
+                unwitnessed,
+            },
+            wire_seq,
+            previous: previous.map(AckPolicyByte),
+        })
+    }
+
     /// Recovery returns the ack policy the newest journaled change put in
     /// force — newest, not highest: a weakening after a strengthening
-    /// wins — alongside the epoch, and the changes never touch
-    /// application state.
+    /// wins — with the policy before it and the change's own sequence,
+    /// alongside the epoch, and the changes never touch application
+    /// state.
     #[test]
     fn recovers_the_ack_policy_from_journaled_changes() {
         let dir = tempfile::tempdir().unwrap();
@@ -1338,7 +1360,7 @@ mod tests {
             recovered.recovered_lineage(),
             Lineage {
                 epoch: 2,
-                ack_policy: Some(AckPolicyByte(0)),
+                ack_policy: lineage_policy(0, true, 5, Some(1)),
             }
         );
         assert_eq!(recovered.app().total, 12);
@@ -1378,7 +1400,7 @@ mod tests {
         let mut recovered = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
         assert_eq!(
             recovered.recovered_lineage().ack_policy,
-            Some(AckPolicyByte(1))
+            lineage_policy(1, false, 2, None)
         );
         recovered.save_snapshot(&snap_path).unwrap();
         recovered.rotate_segment().unwrap();
@@ -1396,16 +1418,21 @@ mod tests {
             re.recovered_lineage(),
             Lineage {
                 epoch: 0,
-                ack_policy: Some(AckPolicyByte(1)),
+                ack_policy: lineage_policy(1, false, 2, None),
             },
-            "the snapshot must carry the policy its pruned segment journaled"
+            "the snapshot must carry the policy its pruned segment journaled, \
+             and the transition to it"
         );
         assert_eq!(re.app().total, 1 + 2 + 4);
 
-        // A newer change in the tail wins over the snapshot's.
+        // A newer change in the tail wins over the snapshot's, folded on
+        // top of it: the policy before it is the snapshot's.
         drop(append_journal_events(re, &[ack_policy_change(3, false)]));
         let re = TestApp_::recover_from_snapshot(&snap_path, &journal_path).unwrap();
-        assert_eq!(re.recovered_lineage().ack_policy, Some(AckPolicyByte(3)));
+        assert_eq!(
+            re.recovered_lineage().ack_policy,
+            lineage_policy(3, false, 5, Some(1))
+        );
     }
 
     /// An old-format journal must fail recovery with

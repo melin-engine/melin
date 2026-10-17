@@ -276,8 +276,10 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   is held to the new policy; two pending changes are applied one by
   one, never merged.
   Snapshots record the policy in force at their sequence (framing
-  version 4 adds a flags byte and the policy after `genesis_entries`;
-  versions 1 to 3 are still read, and a history that records neither
+  version 4 adds, after `genesis_entries`, a flags byte, the policy, the
+  policy before the change that put it in force and that change's
+  sequence, so a primary starting from the snapshot can apply the change
+  again; versions 1 to 3 are still read, and a history that records neither
   the genesis length nor a policy still writes version 2). Replicas
   judge auto-promotion by the newest change their journal holds, falling
   back to their own requested policy only while the history holds none.
@@ -313,6 +315,17 @@ Anything source-breaking is called out under **Removed** or **Changed**.
     the requested one, journaled at startup or promotion, takes effect.
     A node without `--replication-bind` serves under the requested
     policy at once.
+  - A replicated primary's restart, and a promotion, confirm the
+    history's newest change again before acknowledging anything under
+    it: the node serves under the policy before that change until the
+    change's entry is held by the copies that policy demands (a forced
+    change: until it is on the node's disk), since whether it had taken
+    effect before the stop is not recorded. A `disk+ram` → `disk` swap
+    the replica never received therefore keeps a primary restarted
+    under `disk` on `disk+ram` until the replica holds it.
+    `melin_ack_policy_in_force` reports the policy before the change
+    until then. A repeat of the policy in force is not the change
+    confirmed; a forced repeat marks it forced.
   - The info-level "ack policy changed by operator" log is replaced by
     "ack policy change requested by operator" (or "staged"), "ack policy
     change journaled", and "ack policy switched" (with `prev`, `next`
@@ -328,8 +341,11 @@ Anything source-breaking is called out under **Removed** or **Changed**.
     (it returned a tuple of state, sequence, chain hash and epoch), and
     `load_with_header` is gone; `SnapshotHeader::epoch` became
     `lineage: Lineage`; `snapshot::save` and `shadow::run` take a
-    `Lineage` where they took an epoch; `JournaledApp::from_parts` takes
-    a `Lineage`, and `recovered_epoch` became `recovered_lineage`.
+    `Lineage` where they took an epoch, and `shadow::run` the wire
+    sequence of the first entry it will consume; `JournaledApp::from_parts`
+    takes a `Lineage`, and `recovered_epoch` became `recovered_lineage`.
+    `Lineage::ack_policy` is a `LineagePolicy` (the policy, and the
+    change that put it in force with the policy before it).
   - `replication::protocol::PrimaryMessage::StreamStart` and `Heartbeat`
     lost their `ack_policy` field, and `encode_stream_start`,
     `encode_heartbeat` and `replication::catchup::snapshot_transfer_with`
@@ -339,8 +355,11 @@ Anything source-breaking is called out under **Removed** or **Changed**.
     longer be built with a struct literal (use `ReplicaControlPlane::new()`
     or `Default`); `replication::Sender` lost `ack_policy`.
   - `melin_server_runtime::response::Response` and
-    `dpdk_response::run` take `policy: GatePolicy` (the initial policy and the forced
-    change reader) in place of the `ack_policy` atomic, and
+    `dpdk_response::run` take `policy: GatePolicy` (a `GateStart`, the
+    policy in force and the lineage's change still to apply, which
+    outside the runtime can only be built settled with
+    `GateStart::settled`, and the forced change reader) in place of the
+    `ack_policy` atomic, and
     `admin::spawn` takes the `policy_control::AckPolicyControl` mailbox
     in place of the atomic. `reader::spawn_reader` takes a
     `policy_control::PublisherClaim`, and `dpdk_transport::run_dpdk_poll`

@@ -792,7 +792,12 @@ Regression tests: `raft_failover`'s
 `a_strengthening_streamed_between_ticks_lets_the_failover_proceed`, and
 `ack_policy_changes` on live nodes, on kernel TCP and the netns DPDK
 runner. Limitation: a forced `disk` with no replica connected is
-unwitnessed (documented in `docs/replication.md`).
+unwitnessed (documented in `docs/replication.md`). A review of the fix
+found a restart (or promotion) took a change still waiting for its
+witness as in force; a new tenure now applies the lineage's newest
+change again under the policy before it
+(`ack_policy_changes::a_restart_reapplies_a_change_the_replica_never_held`,
+and the plan's step-7 note).
 
 ### 12. A primary disk stall makes a truthful replica look divergent
 

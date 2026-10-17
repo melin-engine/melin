@@ -174,7 +174,7 @@ fn large_frame_batch_is_delivered_not_disconnected() {
     let config = Response::<PadApp> {
         journal_persisted_wire_seq: journal_cursor.clone(),
         policy: response::GatePolicy {
-            initial: AckPolicy::Disk,
+            start: response::GateStart::settled(AckPolicy::Disk),
             forced: melin_transport_core::lineage::forced_policy_cell().1,
         },
         replication_metrics: None,

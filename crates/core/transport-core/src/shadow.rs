@@ -39,6 +39,13 @@ const SHADOW_BATCH_SIZE: usize = 4096;
 /// header, stamped into every snapshot so a boot from the snapshot alone
 /// still knows it. Constant for the stage's life: it is fixed when the
 /// lineage begins.
+///
+/// `starting_wire_seq` is the wire sequence the journal allocates to the
+/// first event the shadow will consume (the journal writer's next
+/// sequence when the pipeline is built). The shadow counts from it the
+/// way the journal allocates, so a lineage event it folds is recorded at
+/// its own entry's sequence (see
+/// [`LineagePolicy::after`](crate::lineage::LineagePolicy::after)).
 #[allow(clippy::too_many_arguments)]
 pub fn run<A: Application>(
     mut consumer: ring::Consumer<InputSlot<A::Event>>,
@@ -49,6 +56,7 @@ pub fn run<A: Application>(
     shutdown: &AtomicBool,
     wait: WaitStrategy,
     initial_lineage: Lineage,
+    starting_wire_seq: u64,
     genesis_entries: Option<u64>,
 ) {
     // Scratch buffer for app methods that require a reports Vec.
@@ -83,6 +91,12 @@ pub fn run<A: Application>(
     // crosses the ring. Advanced by replaying lineage events and stamped
     // into each snapshot so a snapshot-bootstrapped node restores it.
     let mut shadow_lineage = initial_lineage;
+    // The wire sequence of the next journaled event, shadowing the
+    // journal's allocator: one per event it journals, decided by the
+    // allocator's own rule (`JournalEvent::takes_wire_seq`). A primary's
+    // input slots carry no sequence (the journal stage allocates it), so
+    // the shadow counts.
+    let mut next_wire_seq = starting_wire_seq;
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -128,6 +142,17 @@ pub fn run<A: Application>(
             if slot.event.is_query() {
                 continue;
             }
+            let wire_seq = next_wire_seq;
+            if slot.event.takes_wire_seq() {
+                next_wire_seq = next_wire_seq.saturating_add(1);
+                // A replica's slots carry the primary's sequence: the
+                // count must agree with it.
+                debug_assert!(
+                    slot.sequence == 0 || slot.sequence == wire_seq,
+                    "shadow wire seq {wire_seq} drifted from the slot's {}",
+                    slot.sequence
+                );
+            }
             // The shadow produces no output: the matching stage replies
             // for every event.
             dispatch(
@@ -138,7 +163,7 @@ pub fn run<A: Application>(
                     key_hash: slot.key_hash,
                 },
                 &mut last_drain_ns,
-                |event| shadow_lineage.observe(event),
+                |event| shadow_lineage.observe(wire_seq, event),
                 &mut reports,
             );
             reports.clear();
@@ -244,6 +269,7 @@ mod tests {
                     &shutdown2,
                     WaitStrategy::SpinThenYield,
                     Lineage::GENESIS,
+                    1,       // starting_wire_seq
                     Some(0), // genesis_entries
                 );
             })
@@ -292,6 +318,7 @@ mod tests {
                     &shutdown2,
                     WaitStrategy::SpinThenYield,
                     Lineage::GENESIS,
+                    1,       // starting_wire_seq
                     Some(0), // genesis_entries
                 );
             })
@@ -380,6 +407,7 @@ mod tests {
                     &shutdown2,
                     WaitStrategy::SpinThenYield,
                     Lineage::GENESIS,
+                    1,       // starting_wire_seq
                     Some(0), // genesis_entries
                 );
             })
@@ -457,6 +485,7 @@ mod tests {
                     &shutdown2,
                     WaitStrategy::SpinThenYield,
                     Lineage::GENESIS,
+                    1,       // starting_wire_seq
                     Some(0), // genesis_entries
                 );
             })
@@ -511,6 +540,7 @@ mod tests {
                     &shutdown2,
                     WaitStrategy::SpinThenYield,
                     Lineage::GENESIS,
+                    1,       // starting_wire_seq
                     Some(0), // genesis_entries
                 );
             })
@@ -612,6 +642,7 @@ mod tests {
                     &shutdown2,
                     WaitStrategy::SpinThenYield,
                     Lineage::GENESIS,
+                    1,       // starting_wire_seq
                     Some(0), // genesis_entries
                 );
             })

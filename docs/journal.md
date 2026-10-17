@@ -191,13 +191,17 @@ Offset  Size  Field              Value
 16      32    chain_hash         BLAKE3 hash chain state at that sequence
 48      8     epoch              fencing epoch at snapshot time
 56      8     genesis_entries    the history's genesis length, from the journal header
-64      1     lineage_flags      bit 0: genesis_entries is known; bit 1: ack_policy is known
+64      1     lineage_flags      bit 0: genesis_entries is known; bit 1: ack_policy and
+                                 policy_sequence are known; bit 2: previous_policy is known;
+                                 bit 3: the change to ack_policy was unwitnessed
 65      1     ack_policy         the ack policy in force at that sequence (the event-table encoding)
-66      var   app_payload        the application's state, in its own encoding
+66      1     previous_policy    the ack policy in force before the change to ack_policy
+67      8     policy_sequence    journal sequence of the change to ack_policy
+75      var   app_payload        the application's state, in its own encoding
 EOF-4   4     crc32c             CRC32C of everything from offset 0 through EOF-4
 ```
 
-`genesis_entries` lets a node that starts from a snapshot alone, with no journal segment left, record the genesis length in the journal it starts. `ack_policy` is the policy the newest ack-policy change at or before `sequence` put in force: recovery skips the entries the snapshot covers, and their segments may be gone, so the snapshot carries it. A field whose flag bit is clear holds zero and means "not recorded": a history with no recorded genesis length (see [Journals written by earlier releases](#journals-written-by-earlier-releases)), or one that has journaled no ack-policy change yet. A snapshot with any other flag bit set is refused. A history that records neither is written in the version-2 framing, which ends at `epoch`.
+`genesis_entries` lets a node that starts from a snapshot alone, with no journal segment left, record the genesis length in the journal it starts. `ack_policy` is the policy the newest ack-policy change at or before `sequence` put in force: recovery skips the entries the snapshot covers, and their segments may be gone, so the snapshot carries it. With it go the change that put it in force (`policy_sequence`; the first of any run of changes naming the same policy), the policy before that change, and whether it was unwitnessed: a primary starting from the snapshot applies that change again before it acknowledges anything (see [replication.md](replication.md#runtime-policy-swap)), and needs all three to do so. A field whose flag bit is clear holds zero and means "not recorded": a history with no recorded genesis length (see [Journals written by earlier releases](#journals-written-by-earlier-releases)), one that has journaled no ack-policy change yet, or, for `previous_policy`, one whose newest change is its first. Bits 2 and 3 are only set with bit 1. A snapshot with any other flag bit set, or a non-zero field its flags mark unrecorded, is refused. A history that records neither a genesis length nor an ack policy is written in the version-2 framing, which ends at `epoch`.
 
 Maximum file size enforced on load: 256 MiB (prevents OOM from corrupt/malicious files).
 
@@ -326,7 +330,7 @@ The framing's `transport_version` changes only with the runtime; the application
 | 1 | Initial framing |
 | 2 | Added the fencing `epoch` after `chain_hash` |
 | 3 | Added `genesis_entries` after `epoch` |
-| 4 | Added `lineage_flags` and `ack_policy` after `genesis_entries`; either lineage field can be unrecorded. Version 3 is read, no longer written |
+| 4 | Added `lineage_flags`, `ack_policy`, `previous_policy` and `policy_sequence` after `genesis_entries`; the genesis length and the ack policy can each be unrecorded. Version 3 is read, no longer written |
 
 ### Compatibility Rules
 

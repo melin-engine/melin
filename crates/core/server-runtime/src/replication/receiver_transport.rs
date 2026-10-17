@@ -17,7 +17,7 @@ use tracing::{debug, info};
 
 use melin_app::AppEvent;
 use melin_pipeline::wait::WaitStrategy;
-use melin_transport_core::lineage::LineagePolicyCell;
+use melin_transport_core::lineage::SharedLineagePolicy;
 use melin_transport_core::pipeline::{AdoptedRotation, InputSlot, StreamMark, StreamMarkQueue};
 use melin_transport_core::replication::protocol::{
     Ack, InputBatchError, MAX_DATA_FRAME, PrimaryMessage, decode_primary_message,
@@ -387,24 +387,26 @@ pub(super) struct StreamingFrameOutcome {
 }
 
 /// Accept one contiguous slot from the primary: push it onto the input
-/// ring and, once it is there, store the policy it puts in force in the
-/// replica's lineage cell when it is an ack-policy change.
+/// ring and, once it is there, fold it into the replica's lineage policy
+/// record when it is an ack-policy change, at the slot's sequence (the
+/// primary's, stamped by the receiver).
 ///
 /// The one way the streaming and the promotion-drain paths publish a
-/// slot, so neither can accept a change without the cell following it. The
-/// cell moves before the caller advances the advertised journal tip past
-/// the slot, so a reader that sees the tip (Acquire) and then the cell
-/// never pairs a tip holding a change with the policy before it.
+/// slot, so neither can accept a change without the record following it.
+/// The record moves before the caller advances the advertised journal tip
+/// past the slot, so a reader that sees the tip (Acquire) and then the
+/// record never pairs a tip holding a change with the policy before it.
 fn accept_slot<E: AppEvent>(
     batch: &mut melin_pipeline::ring::Batch<'_, InputSlot<E>>,
     slot: InputSlot<E>,
-    lineage_policy: &LineagePolicyCell,
+    lineage_policy: &SharedLineagePolicy,
     abort: impl FnMut() -> bool,
 ) -> Result<u64, melin_pipeline::ring::Full> {
     let change = slot.event.ack_policy_change();
+    let wire_seq = slot.sequence;
     let index = batch.push_with_or_abort(|s| *s = slot, abort)?;
     if let Some(change) = change {
-        lineage_policy.store(Some(change.policy));
+        lineage_policy.observe(wire_seq, change);
     }
     Ok(index)
 }
@@ -479,7 +481,7 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
     accum_end_sequence: u64,
     slot_buf: &mut Vec<InputSlot<E>>,
     stream_marks: &StreamMarkQueue,
-    lineage_policy: &LineagePolicyCell,
+    lineage_policy: &SharedLineagePolicy,
     journal_failed: &AtomicBool,
     pending_acks: &mut PendingAckQueue,
     // Run on every pass of a push waiting for ring space — see
@@ -733,7 +735,7 @@ pub(super) fn process_drain_frames<E: AppEvent>(
     input_producer: &mut melin_pipeline::ring::Producer<InputSlot<E>>,
     accum_end_sequence: u64,
     slot_buf: &mut Vec<InputSlot<E>>,
-    lineage_policy: &LineagePolicyCell,
+    lineage_policy: &SharedLineagePolicy,
     journal_failed: &AtomicBool,
 ) -> DrainFrameOutcome {
     let mut consumed = 0;
@@ -1261,7 +1263,7 @@ mod tests {
             accum_end_sequence,
             slot_buf,
             marks,
-            &LineagePolicyCell::new(None),
+            &SharedLineagePolicy::new(None),
             journal_failed,
         )
     }
@@ -1274,7 +1276,7 @@ mod tests {
         accum_end_sequence: u64,
         slot_buf: &mut Vec<InputSlot<TestEvent>>,
         marks: &StreamMarkQueue,
-        lineage_policy: &LineagePolicyCell,
+        lineage_policy: &SharedLineagePolicy,
         journal_failed: &AtomicBool,
     ) -> (StreamingFrameOutcome, PendingAckQueue) {
         let mut acks = PendingAckQueue::new(16);
@@ -2094,7 +2096,7 @@ mod tests {
             &mut producer,
             0,
             &mut slot_buf,
-            &LineagePolicyCell::new(None),
+            &SharedLineagePolicy::new(None),
             &AtomicBool::new(false),
         );
         assert!(outcome.any_published);
@@ -2140,16 +2142,33 @@ mod tests {
         )
     }
 
+    /// A lineage policy record: `policy`, since the transition at
+    /// `wire_seq` from `previous`.
+    fn record(
+        policy: crate::ack_policy::AckPolicy,
+        wire_seq: u64,
+        previous: Option<crate::ack_policy::AckPolicy>,
+    ) -> Option<melin_transport_core::lineage::LineagePolicy> {
+        Some(melin_transport_core::lineage::LineagePolicy {
+            change: melin_journal::AckPolicyChange {
+                policy: policy.to_byte(),
+                unwitnessed: false,
+            },
+            wire_seq,
+            previous: previous.map(|p| p.to_byte()),
+        })
+    }
+
     /// Finding 10 of the determinism audit, at the receiver: with ticks
     /// flowing the primary never sends a heartbeat, and a change in the
-    /// stream still reaches the lineage cell, as the slot carrying it is
-    /// accepted.
+    /// stream still reaches the lineage record, as the slot carrying it is
+    /// accepted, at the primary's sequence and with the policy before it.
     #[test]
     fn a_change_in_the_stream_moves_the_lineage_policy_without_a_heartbeat() {
         use crate::ack_policy::AckPolicy;
         let (mut producer, mut consumer) = ring(16);
         let mut slot_buf = Vec::new();
-        let cell = LineagePolicyCell::new(Some(AckPolicy::DiskAndRam.to_byte()));
+        let cell = SharedLineagePolicy::new(record(AckPolicy::DiskAndRam, 1, None));
 
         let mut buf = Vec::new();
         append_input_batch_frame(
@@ -2167,7 +2186,11 @@ mod tests {
         );
         assert!(outcome.frame_err.is_none());
         assert_eq!(outcome.accum_end_sequence, 4);
-        assert_eq!(cell.load(), Some(AckPolicy::Disk.to_byte()), "weakened");
+        assert_eq!(
+            cell.load(),
+            record(AckPolicy::Disk, 3, Some(AckPolicy::DiskAndRam)),
+            "weakened"
+        );
         assert_eq!(drain(&mut consumer).len(), 4, "every entry published");
     }
 
@@ -2179,8 +2202,8 @@ mod tests {
         use crate::ack_policy::AckPolicy;
         let (mut producer, mut consumer) = ring(16);
         let mut slot_buf = Vec::new();
-        let held = Some(AckPolicy::DiskAndRam.to_byte());
-        let cell = LineagePolicyCell::new(held);
+        let held = record(AckPolicy::DiskAndRam, 1, None);
+        let cell = SharedLineagePolicy::new(held);
 
         // Re-delivered: the handoff overlap carries an older change.
         let mut buf = Vec::new();
@@ -2227,7 +2250,7 @@ mod tests {
         use crate::ack_policy::AckPolicy;
         let (mut producer, _consumer) = ring(16);
         let mut slot_buf = Vec::new();
-        let cell = LineagePolicyCell::new(Some(AckPolicy::DiskAndRam.to_byte()));
+        let cell = SharedLineagePolicy::new(record(AckPolicy::DiskAndRam, 1, None));
         let mut buf = Vec::new();
         append_input_batch_frame(&mut buf, &[tick(3), change(4, AckPolicy::Disk)]);
         append_input_batch_frame(&mut buf, &[tick(5)]);
@@ -2241,7 +2264,10 @@ mod tests {
             &AtomicBool::new(false),
         );
         assert_eq!(outcome.accum_end_sequence, 5);
-        assert_eq!(cell.load(), Some(AckPolicy::Disk.to_byte()));
+        assert_eq!(
+            cell.load(),
+            record(AckPolicy::Disk, 4, Some(AckPolicy::DiskAndRam))
+        );
     }
 
     /// A Rotate frame arriving exactly at the stream position is queued
@@ -2530,7 +2556,7 @@ mod tests {
             0,
             &mut slot_buf,
             &no_marks(),
-            &LineagePolicyCell::new(None),
+            &SharedLineagePolicy::new(None),
             &AtomicBool::new(false),
             &mut acks,
             &mut || {
@@ -2563,7 +2589,7 @@ mod tests {
             0,
             &mut slot_buf,
             &no_marks(),
-            &LineagePolicyCell::new(None),
+            &SharedLineagePolicy::new(None),
             &AtomicBool::new(false),
             &mut acks,
             &mut || serviced += 1,
@@ -2783,7 +2809,7 @@ mod tests {
             &mut producer,
             9,
             &mut slot_buf,
-            &LineagePolicyCell::new(None),
+            &SharedLineagePolicy::new(None),
             &AtomicBool::new(false),
         );
 
@@ -3022,7 +3048,7 @@ mod tests {
             &mut producer,
             9,
             &mut slot_buf,
-            &LineagePolicyCell::new(None),
+            &SharedLineagePolicy::new(None),
             &AtomicBool::new(false),
         );
 
@@ -3085,7 +3111,7 @@ mod tests {
             0,
             &mut slot_buf,
             &no_marks(),
-            &LineagePolicyCell::new(None),
+            &SharedLineagePolicy::new(None),
             &AtomicBool::new(false),
             &mut acks,
             &mut || {},
@@ -3235,7 +3261,7 @@ mod tests {
             &mut producer,
             19,
             &mut slot_buf,
-            &LineagePolicyCell::new(None),
+            &SharedLineagePolicy::new(None),
             &AtomicBool::new(false),
         );
 
@@ -3262,7 +3288,7 @@ mod tests {
             &mut producer,
             49,
             &mut slot_buf,
-            &LineagePolicyCell::new(None),
+            &SharedLineagePolicy::new(None),
             &AtomicBool::new(false),
         );
 
@@ -3281,7 +3307,7 @@ mod tests {
             &mut producer,
             55,
             &mut slot_buf,
-            &LineagePolicyCell::new(None),
+            &SharedLineagePolicy::new(None),
             &AtomicBool::new(false),
         );
 

@@ -22,8 +22,8 @@ use melin_pipeline::ring;
 use melin_pipeline::wait::WaitStrategy;
 
 use crate::ack_policy::{Blocker, CursorView, EvalStatus, MAX_CLUSTER_SIZE, Policy};
-pub use crate::durability_gate::GatePolicy;
 use crate::durability_gate::{DurabilityGate, GateInputs, GateOutcome};
+pub use crate::durability_gate::{GatePolicy, GateStart};
 use crate::halt::{Refusal, RefusalQueue};
 use crate::replication::ReplicationMetrics;
 use melin_app::Application;
@@ -3707,7 +3707,7 @@ mod tests {
                 // is open and delivery hinges on registration alone.
                 journal_persisted_wire_seq: DurableWireSeqCursor::detached(WireSeq::new(1)),
                 policy: crate::response::GatePolicy {
-                    initial: AckPolicy::Disk,
+                    start: crate::response::GateStart::settled(AckPolicy::Disk),
                     forced: melin_transport_core::lineage::forced_policy_cell().1,
                 },
                 replication_metrics: None,
@@ -4063,7 +4063,7 @@ mod tests {
             Response::<Counter> {
                 journal_persisted_wire_seq: journal_cursor,
                 policy: crate::response::GatePolicy {
-                    initial: AckPolicy::Disk,
+                    start: crate::response::GateStart::settled(AckPolicy::Disk),
                     forced: melin_transport_core::lineage::forced_policy_cell().1,
                 },
                 replication_metrics: None,

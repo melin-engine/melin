@@ -1301,7 +1301,10 @@ impl<E: AppEvent> Sequencer<E> {
                             break;
                         }
                         span_consumed += 1;
-                        if slot.event.is_query() {
+                        // Only a query is left to skip (the sentinel
+                        // stopped the span above), through the rule the
+                        // shadow stage counts sequences by.
+                        if !slot.event.takes_wire_seq() {
                             continue;
                         }
                         let seq = if slot.sequence != 0 {
@@ -1532,8 +1535,8 @@ impl<E: AppEvent> Sequencer<E> {
             }
             let read_end = read_start + slots.len() as u64;
             for slot in slots {
-                if slot.event.is_query() || slot.event.is_shutdown() {
-                    // Sentinel is never persisted (codec rejects it).
+                if !slot.event.takes_wire_seq() {
+                    // A query, or the sentinel: it is never persisted (codec rejects it).
                     // Reaching this path means the shutdown flag fired
                     // before the sentinel was consumed — skip it.
                     continue;

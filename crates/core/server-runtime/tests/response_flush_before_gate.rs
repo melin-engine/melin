@@ -86,7 +86,7 @@ fn config_for(journal_cursor: DurableWireSeqCursor) -> Response<Counter> {
     Response::<Counter> {
         journal_persisted_wire_seq: journal_cursor,
         policy: response::GatePolicy {
-            initial: AckPolicy::Disk,
+            start: response::GateStart::settled(AckPolicy::Disk),
             forced: melin_transport_core::lineage::forced_policy_cell().1,
         },
         replication_metrics: None,

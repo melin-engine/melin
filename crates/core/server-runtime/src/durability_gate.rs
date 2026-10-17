@@ -26,6 +26,18 @@
 //! stage publishes such a change as it dispatches it, and the wait
 //! applies it as soon as its own entry is durable on this node's disk,
 //! then ignores every in-order change at or below it.
+//!
+//! # A new tenure
+//!
+//! Whether the lineage's newest change took effect before a crash, or
+//! before the primary a replica followed died, is not on disk: the node
+//! may have stopped between journaling it and the nodes the policy before
+//! it relied on holding it. So a primary's gate does not start under the
+//! newest change. It starts under the policy before it, with the change
+//! pending ([`GateStart`]), and applies it by the same rule as above: once
+//! the change's entry is durable under that policy, or, for an
+//! unwitnessed change, once it is on this node's disk. A change that had
+//! taken effect is re-confirmed as soon as the replica holding it is back.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,7 +47,7 @@ use melin_app::amortized_timer::AmortizedTimer;
 use melin_journal::AckPolicyByte;
 use melin_pipeline::wait::WaitStrategy;
 use melin_transport_core::DurableWireSeqCursor;
-use melin_transport_core::lineage::ForcedPolicyReader;
+use melin_transport_core::lineage::{ForcedPolicyReader, LineagePolicy};
 use melin_transport_core::pipeline::{OutputPayload, OutputSlot, StageUtilization};
 #[cfg(feature = "tick-to-trade")]
 use melin_transport_core::trace;
@@ -78,51 +90,123 @@ pub(crate) enum GateOutcome {
     Shutdown,
 }
 
-/// Where the gate's policy comes from: the one it starts under, and the
-/// forced changes that may overtake the in-order ones. Every other change
-/// reaches the gate as an output slot.
+/// Where the gate's policy comes from: the one it starts under, with the
+/// lineage's change it must still apply, and the forced changes that may
+/// overtake the in-order ones. Every other change reaches the gate as an
+/// output slot.
 pub struct GatePolicy {
-    /// The policy in force when the gate starts (a primary resolves it
-    /// with the crate's `initial_gate_policy`).
-    pub initial: AckPolicy,
+    /// How the gate starts (a primary resolves it with the crate's
+    /// `initial_gate_policy`).
+    pub start: GateStart,
     /// Forced changes the matching stage has dispatched — see
     /// [`ForcedPolicyReader`] and the module docs.
     pub forced: ForcedPolicyReader,
 }
 
-/// The policy a primary's gate starts under: the one the lineage has in
-/// force, or `requested` (the configured or staged one) while the lineage
-/// holds no change. A requested policy different from the lineage's takes
-/// effect through the change the primary journals as it starts, in order.
+/// The policy a gate starts under, and the change it must apply before
+/// it admits any slot, if there is one (see the module docs, "A new
+/// tenure").
 ///
-/// With replication disabled, `requested` regardless: no replica can ever
-/// witness the start's change, so a lineage last run under a policy that
-/// needs one (restarted standalone under `disk`) would hold every reply
-/// forever. The change is journaled unwitnessed all the same, as the
-/// record of the switch.
+/// The pending change is part of the start rather than something a
+/// caller may add: `initial_gate_policy` returns the two together and
+/// the gate takes the start whole and consumes the change, so the
+/// runtime cannot hand the gate the lineage's policy and drop the
+/// transition to it on the way. The fields are crate-private for the
+/// same reason: outside the crate a start can only be
+/// [`settled`](Self::settled), the start of a gate with no lineage
+/// change to apply (a harness driving the response stage by hand), so
+/// no caller can build one that names the lineage's newest policy as in
+/// force.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GateStart {
+    /// The policy in force from the start.
+    pub(crate) in_force: AckPolicy,
+    /// The lineage's newest change, not yet applied.
+    pub(crate) pending: Option<PendingChange>,
+}
+
+impl GateStart {
+    /// Start under `policy`, nothing pending: a gate whose lineage holds
+    /// no change, or one serving without replication (the standalone
+    /// rule, see `initial_gate_policy`).
+    pub fn settled(policy: AckPolicy) -> Self {
+        Self {
+            in_force: policy,
+            pending: None,
+        }
+    }
+}
+
+/// A journaled ack-policy change the gate applies before any slot it
+/// admits: the lineage's newest, from a previous tenure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PendingChange {
+    /// The change entry's wire sequence. `u64` because it is compared
+    /// against output slots' wire sequences.
+    pub(crate) wire_seq: u64,
+    /// The policy it puts in force.
+    pub(crate) policy: AckPolicy,
+    /// Journaled unwitnessed: applied once its entry is on this node's
+    /// disk, as a forced change is, rather than once it is durable under
+    /// the policy before it.
+    pub(crate) unwitnessed: bool,
+}
+
+/// How a primary's gate starts (see the module docs, "A new tenure").
+///
+/// With replication enabled: under the policy in force before the
+/// lineage's newest change, with that change pending; under the newest
+/// policy if it is the lineage's first change (journaled as the policy
+/// the gate then started under, so there is no transition to apply
+/// again); under `requested` (the configured or staged one) while the
+/// lineage holds no change. A requested policy different from the
+/// lineage's takes effect through the change the primary journals as it
+/// starts, in order, after the pending one.
+///
+/// With replication disabled, `requested` regardless, nothing pending: no
+/// replica can ever witness the start's change, so a lineage last run
+/// under a policy that needs one (restarted standalone under `disk`)
+/// would hold every reply forever. The change is journaled unwitnessed
+/// all the same, as the record of the switch.
 ///
 /// A lineage byte this build does not know is refused rather than
 /// replaced: the events it governs were acknowledged under a policy this
-/// node cannot evaluate, so it must neither start nor promote on it.
+/// node cannot evaluate, so it must neither start nor promote on it. The
+/// newest byte is checked in every case; the previous one only with
+/// replication enabled, since a standalone start never reads it.
 pub(crate) fn initial_gate_policy(
-    lineage: Option<AckPolicyByte>,
+    lineage: Option<LineagePolicy>,
     requested: AckPolicy,
     replication_enabled: bool,
-) -> Result<AckPolicy, String> {
-    let Some(byte) = lineage else {
-        return Ok(requested);
+) -> Result<GateStart, String> {
+    let Some(lineage) = lineage else {
+        return Ok(GateStart::settled(requested));
     };
-    let Some(in_force) = AckPolicy::from_byte(byte) else {
-        return Err(format!(
+    let newest = known_lineage_policy(lineage.policy())?;
+    if !replication_enabled {
+        return Ok(GateStart::settled(requested));
+    }
+    let Some(previous) = lineage.previous else {
+        return Ok(GateStart::settled(newest));
+    };
+    Ok(GateStart {
+        in_force: known_lineage_policy(previous)?,
+        pending: Some(PendingChange {
+            wire_seq: lineage.wire_seq,
+            policy: newest,
+            unwitnessed: lineage.change.unwitnessed,
+        }),
+    })
+}
+
+/// A lineage policy byte this build knows, or the refusal to serve on it.
+fn known_lineage_policy(byte: AckPolicyByte) -> Result<AckPolicy, String> {
+    AckPolicy::from_byte(byte).ok_or_else(|| {
+        format!(
             "the journal's ack policy (byte {}) is unknown to this build; \
              refusing to serve under it",
             byte.0
-        ));
-    };
-    Ok(if replication_enabled {
-        in_force
-    } else {
-        requested
+        )
     })
 }
 
@@ -167,6 +251,9 @@ pub(crate) struct DurabilityGate {
     /// at or below it is stale: a forced change already superseded it.
     /// `u64` because it is compared against `OutputSlot::wire_seq`.
     applied_through: u64,
+    /// The lineage's change still to apply (see [`GateStart`]); taken
+    /// once applied, before any slot after it is admitted.
+    pending: Option<PendingChange>,
     active_policy: AckPolicy,
     policy: Policy,
     /// Highest wire seq known durable under `policy`, cached so a slot
@@ -187,14 +274,19 @@ pub(crate) struct DurabilityGate {
 }
 
 impl DurabilityGate {
-    /// Start under `policy.initial` and evaluate it once, so the cached
+    /// Start under `policy.start` and evaluate it once, so the cached
     /// durable position and the `/healthz` gauge reflect the cluster's
     /// startup shape before the first batch — an unsatisfiable policy
     /// (e.g. a primary that just lost both replicas while running
-    /// `disk+ram`) is visible immediately.
+    /// `disk+ram`) is visible immediately. A pending change that the
+    /// evaluation already finds durable is applied here.
     pub(crate) fn new(inputs: GateInputs, policy: GatePolicy, stage: &'static str) -> Self {
         let GatePolicy {
-            initial: active_policy,
+            start:
+                GateStart {
+                    in_force: active_policy,
+                    pending,
+                },
             forced,
         } = policy;
         inputs
@@ -203,9 +295,10 @@ impl DurabilityGate {
             .store(Some(active_policy.to_byte()));
         let policy = active_policy.to_policy();
         let now = Instant::now();
+        let journal_pos = inputs.journal_persisted_wire_seq.load();
         let status = evaluate_durability(
             &policy,
-            inputs.journal_persisted_wire_seq.load(),
+            journal_pos,
             inputs.replication_metrics.as_deref(),
             inputs.replica_active.as_ref(),
         );
@@ -218,17 +311,56 @@ impl DurabilityGate {
         } else {
             DegradationLogger::new(now)
         };
-        Self {
+        if let Some(pending) = pending {
+            tracing::info!(
+                stage,
+                in_force = active_policy.as_str(),
+                pending = pending.policy.as_str(),
+                wire_seq = pending.wire_seq,
+                unwitnessed = pending.unwitnessed,
+                "the lineage's newest ack-policy change is applied again before any reply"
+            );
+        }
+        let mut gate = Self {
             inputs,
             stage,
             forced,
             applied_through: 0,
+            pending,
             active_policy,
             policy,
             cached_durable_pos: status.durable_pos,
             degraded_logger,
             last_policy_check: now,
             accrual_timer: AmortizedTimer::new(),
+        };
+        gate.settle_pending_if_durable(journal_pos.get(), status.durable_pos);
+        gate
+    }
+
+    /// Apply the pending change if what the gate last read already makes
+    /// it durable: `durable_pos` under the policy in force, or, for an
+    /// unwitnessed one, `journal_pos` on this node's disk. Never waits.
+    fn settle_pending_if_durable(&mut self, journal_pos: u64, durable_pos: u64) {
+        if let Some(pending) = self.pending
+            && (durable_pos >= pending.wire_seq
+                || (pending.unwitnessed && journal_pos >= pending.wire_seq))
+        {
+            self.settle_pending();
+        }
+    }
+
+    /// Apply the pending change, once: in order before every slot after
+    /// it, or skipped by [`Self::apply_change`] if a forced change of this
+    /// tenure has overtaken it.
+    fn settle_pending(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            let cause = if pending.unwitnessed {
+                "lineage's unwitnessed change, on disk"
+            } else {
+                "lineage's change, durable under the policy before it"
+            };
+            self.apply_change(pending.wire_seq, pending.policy.to_byte(), cause);
         }
     }
 
@@ -289,8 +421,17 @@ impl DurabilityGate {
     /// this node's disk (`journal_pos`), so the record of the swap exists
     /// before any reply relies on it. One already applied is skipped by
     /// [`Self::apply_change`].
+    ///
+    /// The lineage's pending change, if unwitnessed, is applied the same
+    /// way, first: it comes before any forced change of this tenure.
     #[inline]
     fn observe_forced(&mut self, journal_pos: u64) {
+        if let Some(pending) = self.pending
+            && pending.unwitnessed
+            && journal_pos >= pending.wire_seq
+        {
+            self.settle_pending();
+        }
         if let Some(forced) = self.forced.load()
             && journal_pos >= forced.wire_seq
         {
@@ -312,6 +453,10 @@ impl DurabilityGate {
     /// the stale one, was on this node's disk, so a forced `disk` finds the
     /// stale slot durable at once, and any other forced policy (a node
     /// without replication) holds the next reply as long.
+    ///
+    /// The first slot of a tenure whose lineage left a change pending
+    /// waits for that change first, as it would have waited for the
+    /// change's own slot (see [`GateStart`]).
     #[inline]
     pub(crate) fn admit<R: Copy, Q: Copy>(
         &mut self,
@@ -320,6 +465,25 @@ impl DurabilityGate {
         #[cfg(feature = "tick-to-trade")] tracker: &mut GateCrossTracker,
         before_wait: impl FnOnce(),
     ) -> GateOutcome {
+        let mut before_wait = Some(before_wait);
+        if let Some(pending) = self.pending {
+            if pending.wire_seq > self.cached_durable_pos {
+                if let Some(before_wait) = before_wait.take() {
+                    before_wait();
+                }
+                if let GateOutcome::Shutdown = self.wait_durable(
+                    pending.wire_seq,
+                    shutdown,
+                    #[cfg(feature = "tick-to-trade")]
+                    tracker,
+                ) {
+                    return GateOutcome::Shutdown;
+                }
+            }
+            // Unless the wait applied it already (an unwitnessed change,
+            // once on disk).
+            self.settle_pending();
+        }
         let change = match slot.payload {
             OutputPayload::AckPolicyChange(change) => Some(change),
             OutputPayload::Report(_)
@@ -328,7 +492,9 @@ impl DurabilityGate {
             | OutputPayload::EngineError => None,
         };
         if slot_needs_gate(slot, self.cached_durable_pos) {
-            before_wait();
+            if let Some(before_wait) = before_wait.take() {
+                before_wait();
+            }
             if let GateOutcome::Shutdown = self.wait_durable(
                 slot.wire_seq,
                 shutdown,
@@ -478,15 +644,20 @@ impl DurabilityGate {
     /// gate starts from a fresh cached position rather than spinning from
     /// a stale one. A no-op until [`POLICY_CHECK_INTERVAL`] has passed
     /// since the last check (or the last batch).
+    ///
+    /// A pending change the evaluation finds durable is applied here too,
+    /// so a quiet node reports the policy in force once the change is
+    /// re-confirmed rather than at its next write.
     #[inline]
     pub(crate) fn idle_recheck(&mut self, now: Instant) {
         if now.duration_since(self.last_policy_check) < POLICY_CHECK_INTERVAL {
             return;
         }
         self.last_policy_check = now;
+        let journal_pos = self.inputs.journal_persisted_wire_seq.load();
         let status = evaluate_durability(
             &self.policy,
-            self.inputs.journal_persisted_wire_seq.load(),
+            journal_pos,
             self.inputs.replication_metrics.as_deref(),
             self.inputs.replica_active.as_ref(),
         );
@@ -498,6 +669,7 @@ impl DurabilityGate {
             DEGRADED_LOG_INTERVAL,
         );
         self.cached_durable_pos = status.durable_pos;
+        self.settle_pending_if_durable(journal_pos.get(), status.durable_pos);
     }
 
     /// Log degradation transitions / re-emit the reminder after a batch.
@@ -543,9 +715,25 @@ mod tests {
     /// bug.
     const CORRUPT: u8 = 0xEE;
 
-    /// A gate starting under `initial`, and the writer of its forced cell.
+    /// A gate starting under `initial`, nothing pending, and the writer of
+    /// its forced cell.
     fn build(
         initial: AckPolicy,
+        journal_pos: u64,
+        replication_metrics: Option<Arc<ReplicationMetrics>>,
+        replica_active: Option<[Arc<AtomicBool>; 2]>,
+    ) -> (DurabilityGate, ForcedPolicyWriter) {
+        build_from(
+            GateStart::settled(initial),
+            journal_pos,
+            replication_metrics,
+            replica_active,
+        )
+    }
+
+    /// A gate starting as `start`, and the writer of its forced cell.
+    fn build_from(
+        start: GateStart,
         journal_pos: u64,
         replication_metrics: Option<Arc<ReplicationMetrics>>,
         replica_active: Option<[Arc<AtomicBool>; 2]>,
@@ -558,8 +746,26 @@ mod tests {
             utilization: Arc::new(StageUtilization::new()),
             wait: WaitStrategy::SpinThenYield,
         };
-        let policy = GatePolicy { initial, forced };
+        let policy = GatePolicy { start, forced };
         (DurabilityGate::new(inputs, policy, "test"), forced_writer)
+    }
+
+    /// A start under `in_force`, with the lineage's change to `policy` at
+    /// `wire_seq` pending.
+    fn pending_start(
+        in_force: AckPolicy,
+        wire_seq: u64,
+        policy: AckPolicy,
+        unwitnessed: bool,
+    ) -> GateStart {
+        GateStart {
+            in_force,
+            pending: Some(PendingChange {
+                wire_seq,
+                policy,
+                unwitnessed,
+            }),
+        }
     }
 
     /// A standalone node's gate (no replicas), so `disk` is satisfied by
@@ -597,9 +803,17 @@ mod tests {
         initial: AckPolicy,
         journal_pos: u64,
     ) -> (DurabilityGate, Arc<ReplicationMetrics>, ForcedPolicyWriter) {
+        gate_with_one_replica_from(GateStart::settled(initial), journal_pos)
+    }
+
+    /// [`gate_with_one_replica`], starting as `start`.
+    fn gate_with_one_replica_from(
+        start: GateStart,
+        journal_pos: u64,
+    ) -> (DurabilityGate, Arc<ReplicationMetrics>, ForcedPolicyWriter) {
         let metrics = Arc::new(ReplicationMetrics::default());
-        let (gate, forced) = build(
-            initial,
+        let (gate, forced) = build_from(
+            start,
             journal_pos,
             Some(Arc::clone(&metrics)),
             Some([
@@ -614,6 +828,13 @@ mod tests {
     /// to `pos` in memory.
     fn replica_holds(metrics: &ReplicationMetrics, pos: u64) {
         metrics.in_memory_sequence[0].store(pos, Ordering::Release);
+    }
+
+    /// The replica of [`gate_with_one_replica`] has journaled every event
+    /// up to `pos` (and so holds it in memory too).
+    fn replica_persists(metrics: &ReplicationMetrics, pos: u64) {
+        replica_holds(metrics, pos);
+        metrics.acked_sequence[0].store(pos, Ordering::Release);
     }
 
     /// An application slot (no policy change) for the event at `wire_seq`.
@@ -796,32 +1017,247 @@ mod tests {
         );
     }
 
-    /// The lineage's policy wins over the requested one while replication
-    /// is on; a lineage with none takes the requested one; with
-    /// replication disabled the requested one wins (the standalone rule);
-    /// an unknown lineage byte is refused either way.
+    /// A lineage policy: `policy` in force since the transition at
+    /// `wire_seq` from `previous`.
+    fn lineage(
+        policy: AckPolicyByte,
+        unwitnessed: bool,
+        wire_seq: u64,
+        previous: Option<AckPolicyByte>,
+    ) -> Option<LineagePolicy> {
+        Some(LineagePolicy {
+            change: melin_journal::AckPolicyChange {
+                policy,
+                unwitnessed,
+            },
+            wire_seq,
+            previous,
+        })
+    }
+
+    /// While replication is on, the gate starts under the policy before
+    /// the lineage's newest change, with the change pending (unwitnessed
+    /// as journaled); under the newest one when it is the lineage's first
+    /// change. A lineage with none takes the requested policy; with
+    /// replication disabled the requested one wins, nothing pending (the
+    /// standalone rule); an unknown lineage byte, newest or previous, is
+    /// refused.
     #[test]
-    fn the_initial_policy_is_the_lineages_when_it_has_one() {
-        let two_disks = Some(AckPolicy::TwoDisks.to_byte());
+    fn the_initial_policy_is_the_lineages_with_its_newest_change_pending() {
+        let disk = AckPolicy::Disk.to_byte();
+        let two_disks = AckPolicy::TwoDisks.to_byte();
+        let corrupt = AckPolicyByte(CORRUPT);
         for replication in [true, false] {
             assert_eq!(
                 initial_gate_policy(None, AckPolicy::Disk, replication),
-                Ok(AckPolicy::Disk)
+                Ok(GateStart::settled(AckPolicy::Disk))
             );
-            let refused =
-                initial_gate_policy(Some(AckPolicyByte(CORRUPT)), AckPolicy::Disk, replication)
-                    .expect_err("an unknown byte is refused");
+            let refused = initial_gate_policy(
+                lineage(corrupt, false, 3, None),
+                AckPolicy::Disk,
+                replication,
+            )
+            .expect_err("an unknown byte is refused");
             assert!(refused.contains("238"), "names the byte: {refused}");
+            assert_eq!(
+                initial_gate_policy(
+                    lineage(disk, true, 9, Some(two_disks)),
+                    AckPolicy::Ram,
+                    replication,
+                ),
+                Ok(if replication {
+                    pending_start(AckPolicy::TwoDisks, 9, AckPolicy::Disk, true)
+                } else {
+                    GateStart::settled(AckPolicy::Ram)
+                }),
+                "replication {replication}"
+            );
         }
         assert_eq!(
-            initial_gate_policy(two_disks, AckPolicy::Disk, true),
-            Ok(AckPolicy::TwoDisks)
+            initial_gate_policy(lineage(two_disks, false, 1, None), AckPolicy::Disk, true),
+            Ok(GateStart::settled(AckPolicy::TwoDisks)),
+            "the lineage's first change: nothing to apply again"
         );
         assert_eq!(
-            initial_gate_policy(two_disks, AckPolicy::Disk, false),
-            Ok(AckPolicy::Disk),
-            "standalone serves the requested policy"
+            initial_gate_policy(
+                lineage(disk, false, 4, Some(two_disks)),
+                AckPolicy::Disk,
+                true
+            ),
+            Ok(pending_start(
+                AckPolicy::TwoDisks,
+                4,
+                AckPolicy::Disk,
+                false
+            )),
+            "requested equal to the newest: still pending"
         );
+        let refused = initial_gate_policy(
+            lineage(disk, false, 4, Some(corrupt)),
+            AckPolicy::Disk,
+            true,
+        )
+        .expect_err("an unknown previous byte is refused");
+        assert!(refused.contains("238"), "names the byte: {refused}");
+    }
+
+    /// The restart the lineage's pending change exists for: under
+    /// `disk+ram`, the change to `disk` at 5 was journaled but the
+    /// replica may never have held it. The gate starts under `disk+ram`
+    /// (and says so), holds the first slot after the change, though it is
+    /// on disk, until the replica holds the change, then applies it in
+    /// order: that slot and the next open on the disk alone.
+    #[test]
+    fn a_pending_change_is_held_until_durable_under_the_policy_before_it() {
+        let (mut g, metrics, _forced) = gate_with_one_replica_from(
+            pending_start(AckPolicy::DiskAndRam, 5, AckPolicy::Disk, false),
+            10,
+        );
+        assert_eq!(in_force(&g), Some(AckPolicy::DiskAndRam));
+        replica_holds(&metrics, 4);
+        assert_held_until(&mut g, &reply(8), || replica_holds(&metrics, 5));
+        assert_eq!(g.active_policy, AckPolicy::Disk);
+        assert_eq!(in_force(&g), Some(AckPolicy::Disk));
+        assert_eq!(g.pending, None, "consumed");
+        assert_eq!(g.applied_through, 5);
+        admit_now(&mut g, &reply(9));
+    }
+
+    /// An unwitnessed pending change (a forced swap, or a standalone run)
+    /// is applied once its entry is on this node's disk, as it was when
+    /// journaled: at once on a restart, where it already is, and after
+    /// the local fsync on a promoted replica still writing it.
+    #[test]
+    fn an_unwitnessed_pending_change_is_applied_once_on_disk() {
+        // On disk already: applied as the gate starts.
+        let (g, _) = build_from(
+            pending_start(AckPolicy::DiskAndRam, 3, AckPolicy::Disk, true),
+            4,
+            None,
+            None,
+        );
+        assert_eq!(g.active_policy, AckPolicy::Disk);
+        assert_eq!(in_force(&g), Some(AckPolicy::Disk));
+        assert_eq!(g.pending, None);
+
+        // Not yet on disk, and no replica: `disk+ram` cannot open, so the
+        // slot is held until the change's entry is durable locally.
+        let (mut g, _) = build_from(
+            pending_start(AckPolicy::DiskAndRam, 6, AckPolicy::Disk, true),
+            4,
+            None,
+            None,
+        );
+        assert_eq!(in_force(&g), Some(AckPolicy::DiskAndRam));
+        let journal = g.inputs.journal_persisted_wire_seq.clone();
+        assert_held_until(&mut g, &reply(7), || journal.store(WireSeq::new(7)));
+        assert_eq!(g.active_policy, AckPolicy::Disk);
+        assert_eq!(g.applied_through, 6);
+    }
+
+    /// A pending change the cluster already confirms is applied as the
+    /// gate starts, before any slot: both replicas hold it.
+    #[test]
+    fn a_pending_change_already_durable_is_applied_at_the_start() {
+        let metrics = ReplicationMetrics::default();
+        for slot in 0..2 {
+            metrics.in_memory_sequence[slot].store(6, Ordering::Relaxed);
+        }
+        let (g, _) = build_from(
+            pending_start(AckPolicy::Ram, 3, AckPolicy::Disk, false),
+            6,
+            Some(Arc::new(metrics)),
+            Some([
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(true)),
+            ]),
+        );
+        assert_eq!(g.active_policy, AckPolicy::Disk);
+        assert_eq!(g.pending, None);
+    }
+
+    /// A restart under a different requested policy journals a boot entry
+    /// after the pending change: the pending change is applied first,
+    /// under the policy before it, then the boot entry in order under the
+    /// pending change's policy. Neither is merged into the other.
+    #[test]
+    fn a_boot_change_after_a_pending_one_is_applied_after_it() {
+        let (mut g, metrics, _forced) = gate_with_one_replica_from(
+            pending_start(AckPolicy::DiskAndRam, 3, AckPolicy::Disk, false),
+            10,
+        );
+        assert_held_until(&mut g, &change(4, AckPolicy::TwoDisks, false), || {
+            replica_holds(&metrics, 3)
+        });
+        assert_eq!(g.active_policy, AckPolicy::TwoDisks);
+        // `two-disks` wants the replica's journal, not its memory.
+        replica_holds(&metrics, 5);
+        assert_held_until(&mut g, &reply(5), || replica_persists(&metrics, 5));
+    }
+
+    /// The idle path applies a pending change the cluster has confirmed,
+    /// so a quiet node reports it in force; before that it keeps it
+    /// pending.
+    #[test]
+    fn the_idle_recheck_applies_a_confirmed_pending_change() {
+        let (mut g, metrics, _forced) = gate_with_one_replica_from(
+            pending_start(AckPolicy::DiskAndRam, 5, AckPolicy::Disk, false),
+            10,
+        );
+        let checked = g.last_policy_check;
+        replica_holds(&metrics, 4);
+        g.idle_recheck(checked + POLICY_CHECK_INTERVAL);
+        assert_eq!(in_force(&g), Some(AckPolicy::DiskAndRam), "not yet held");
+        assert!(g.pending.is_some());
+
+        replica_holds(&metrics, 5);
+        g.idle_recheck(checked + 2 * POLICY_CHECK_INTERVAL);
+        assert_eq!(in_force(&g), Some(AckPolicy::Disk));
+        assert_eq!(g.pending, None);
+    }
+
+    /// A forced change of this tenure overtakes a pending one the old
+    /// policy cannot confirm (no replica): the slot opens once the forced
+    /// entry is on disk, and the pending change, below it, is stale.
+    #[test]
+    fn a_forced_change_overtakes_a_pending_one() {
+        let (mut g, mut forced) = build_from(
+            pending_start(AckPolicy::DiskAndRam, 3, AckPolicy::Ram, false),
+            4,
+            None,
+            None,
+        );
+        let journal = g.inputs.journal_persisted_wire_seq.clone();
+        forced.store(ForcedPolicy {
+            wire_seq: 5,
+            policy: AckPolicy::Disk.to_byte(),
+        });
+        assert_held_until(&mut g, &reply(6), || journal.store(WireSeq::new(6)));
+        assert_eq!(
+            g.active_policy,
+            AckPolicy::Disk,
+            "not the stale pending `ram`"
+        );
+        assert_eq!(g.applied_through, 5);
+        assert_eq!(g.pending, None);
+    }
+
+    /// Shutdown stops a wait on the pending change, which stays pending.
+    #[test]
+    fn shutdown_releases_a_wait_on_the_pending_change() {
+        let (mut g, _) = build_from(
+            pending_start(AckPolicy::DiskAndRam, 3, AckPolicy::Disk, false),
+            4,
+            None,
+            None,
+        );
+        let shutdown = AtomicBool::new(true);
+        assert!(matches!(
+            admit(&mut g, &reply(4), &shutdown),
+            GateOutcome::Shutdown
+        ));
+        assert!(g.pending.is_some());
+        assert_eq!(g.active_policy, AckPolicy::DiskAndRam);
     }
 
     #[test]

@@ -132,4 +132,72 @@ impl<E: AppEvent> JournalEvent<E> {
     pub fn is_shutdown(&self) -> bool {
         matches!(self, JournalEvent::Shutdown)
     }
+
+    /// Returns `true` for an event the journal stage journals, and so
+    /// allocates the next wire sequence to: neither a query nor the
+    /// shutdown sentinel.
+    ///
+    /// The one rule for "consumes a sequence": the journal stage's
+    /// allocator and the shadow stage's count of it (which stamps the
+    /// lineage's policy transition with its sequence, in every snapshot)
+    /// both decide through it, so the two cannot drift apart.
+    #[inline]
+    pub fn takes_wire_seq(&self) -> bool {
+        !self.is_query() && !self.is_shutdown()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use melin_app::CodecError;
+
+    /// An app event that is a query or a write, as its flag says.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Event {
+        query: bool,
+    }
+
+    impl AppEvent for Event {
+        const MAX_ENCODED_SIZE: usize = 1;
+
+        fn encoded_size(&self) -> usize {
+            1
+        }
+
+        fn encode(&self, buf: &mut [u8]) -> usize {
+            buf[0] = u8::from(self.query);
+            1
+        }
+
+        fn decode(buf: &[u8]) -> Result<Self, CodecError> {
+            Ok(Self { query: buf[0] != 0 })
+        }
+
+        fn is_query(&self) -> bool {
+            self.query
+        }
+    }
+
+    /// Every journaled kind takes a sequence; a query and the sentinel,
+    /// which the journal never writes, do not.
+    #[test]
+    fn only_journaled_events_take_a_wire_seq() {
+        for (event, expected) in [
+            (JournalEvent::App(Event { query: false }), true),
+            (JournalEvent::App(Event { query: true }), false),
+            (JournalEvent::Tick { now_ns: 1 }, true),
+            (JournalEvent::EpochBump { epoch: 2 }, true),
+            (
+                JournalEvent::AckPolicyChange(AckPolicyChange {
+                    policy: AckPolicyByte(0),
+                    unwitnessed: false,
+                }),
+                true,
+            ),
+            (JournalEvent::Shutdown, false),
+        ] {
+            assert_eq!(event.takes_wire_seq(), expected, "{event:?}");
+        }
+    }
 }

@@ -306,7 +306,8 @@ swap is not witnessed by any replica (see [A forced swap is not
 witnessed](#a-forced-swap-is-not-witnessed)).
 
 **Restarts and promotions journal the requested policy.** A primary
-starts under the policy its journal records, not its `--ack-policy`. If
+starts under the policy its journal records, not its `--ack-policy`
+(once the newest swap recorded is confirmed again, below). If
 the two differ (or the journal records none yet: a new history, or one
 written by an earlier release, which starts under the requested policy
 directly), it journals the requested policy as it starts. A swap away
@@ -322,6 +323,26 @@ at once, and journals the swap as unwitnessed, as the record of it. Its
 runtime swaps are unwitnessed too, and take effect once on its disk, so
 do not send it a policy that needs a replica: it would hold every reply
 from then on, until the node is restarted under `disk`.
+
+**A new tenure confirms the newest swap again.** Whether the newest swap
+in a history had taken effect when its primary stopped is not recorded:
+the primary may have stopped while the swap still waited for the nodes
+the old policy relied on. So a primary that replicates starts under the
+policy before that swap and applies the swap by the same rule as when
+it was journaled, before it acknowledges anything: once the swap's entry
+is held by the copies the policy before it demands, or, for a forced
+swap, once it is on the node's disk. A primary restarted under `disk`
+after a `disk+ram` → `disk` swap its replica never received therefore
+serves under `disk+ram` until the replica, reconnected, holds the swap.
+A swap that had taken effect is confirmed again as soon as a replica
+that holds it reconnects, and a forced one at once. Until then
+`melin_ack_policy_in_force` reports the policy before the swap. A
+promoted replica does the same with the newest swap it received, so a
+promotion right after a weakening its primary was still waiting on is
+held until another replica holds the swap, or until the operator forces
+`disk` (step 3 below). A repeat of the policy already in force is not a
+swap here: the swap confirmed again is the one that moved the policy,
+and a forced repeat of it marks it forced.
 
 The intended workflow is failover:
 
@@ -1021,7 +1042,8 @@ normal-case post-recovery state.
   swap names, and the policy replies are being held to, each as the
   policy's wire value: `0` `disk`, `1` `disk+ram`, `2` `two-disks`,
   `3` `ram`. They differ while a swap waits for the nodes the old
-  policy relied on; one that stays different points at the replica
+  policy relied on, including after a restart or a promotion, until the
+  newest swap is confirmed again; one that stays different points at the replica
   that has not taken the swap (forcing `disk` is the remedy when none
   is connected, see "Runtime policy swap"). The journaled gauge is
   omitted while the history records no policy.

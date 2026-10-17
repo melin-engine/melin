@@ -9,11 +9,13 @@
 //! [`Lineage`] is that value, and its crate-private `observe` the one rule that
 //! folds an event into it: every replay path (recovery, the shadow stage)
 //! goes through it, so the two fields are never tracked in parallel by
-//! hand.
+//! hand. A replica's receive thread folds the changes it accepts with the
+//! same rule ([`LineagePolicy::after`], through [`SharedLineagePolicy`]).
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU16, Ordering};
 
-use melin_journal::AckPolicyByte;
+use melin_journal::{AckPolicyByte, AckPolicyChange};
 
 use crate::dispatch::LineageEvent;
 
@@ -23,12 +25,11 @@ pub struct Lineage {
     /// The highest fencing epoch journaled so far: a maximum, as the
     /// epoch only ever moves forward.
     pub epoch: u64,
-    /// The policy the newest journaled `AckPolicyChange` put in force,
-    /// or `None` when the lineage holds no such entry (a new history
-    /// before its first, or a lineage written before the entry existed).
-    /// Last writer wins: a change can weaken the policy as well as
-    /// strengthen it, so there is no order to take a maximum in.
-    pub ack_policy: Option<AckPolicyByte>,
+    /// The ack policy the journaled `AckPolicyChange`s put in force, with
+    /// what a node needs to apply the newest of them again ([`LineagePolicy`]);
+    /// `None` when the lineage holds no such entry (a new history before
+    /// its first, or a lineage written before the entry existed).
+    pub ack_policy: Option<LineagePolicy>,
 }
 
 impl Lineage {
@@ -38,24 +39,132 @@ impl Lineage {
         ack_policy: None,
     };
 
-    /// Fold one journaled lineage event into the value.
+    /// Fold one journaled lineage event, the entry at `wire_seq`, into
+    /// the value.
     #[inline]
-    pub(crate) fn observe(&mut self, event: LineageEvent) {
+    pub(crate) fn observe(&mut self, wire_seq: u64, event: LineageEvent) {
         match event {
             LineageEvent::Epoch(epoch) => crate::fence::observe_into(&mut self.epoch, epoch),
-            LineageEvent::AckPolicy(change) => self.ack_policy = Some(change.policy),
+            LineageEvent::AckPolicy(change) => {
+                self.ack_policy = Some(LineagePolicy::after(self.ack_policy, wire_seq, change));
+            }
         }
     }
 }
 
-/// A shared `Option<AckPolicyByte>`, read by threads other than the one
-/// that writes it: a replica's record of the lineage's ack policy, and on
-/// a primary the health gauges' view of the policy journaled last and of
-/// the one the response gate enforces.
+/// A lineage's ack policy: the policy its journaled changes put in force,
+/// and the transition that put it there, so that a node starting a
+/// primary tenure on the lineage (a restart, a promotion) applies that
+/// transition again rather than assuming it took effect. Whether it had
+/// is not on disk: a crash can come between the change being journaled
+/// and the nodes the policy before it relied on holding it.
 ///
-/// Stored, never merged (see [`Lineage::ack_policy`]): after a recovery or
-/// a snapshot resync the cell takes the recovered value whole, so a change
-/// in a divergent tail disappears with the tail.
+/// The transition is the newest change that *moved* the policy. A change
+/// naming the policy already in force (a re-sent `ACK-POLICY`, every
+/// command being journaled) moves nothing, and recording it as the
+/// transition would make the policy it repeats look like the one before
+/// it: `disk+ram`, then `disk` at `w1` (waiting for a replica), then
+/// `disk` again at `w2`, must still be applied as `disk+ram` → `disk` at
+/// `w1`. Last writer wins for the policy itself: a change can weaken the
+/// policy as well as strengthen it, so there is no order to take a
+/// maximum in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineagePolicy {
+    /// The policy in force, and whether the transition to it was
+    /// unwitnessed: set if any change naming it since it was last
+    /// different was journaled unwitnessed, so a forced re-send of a
+    /// waiting change (the documented way to force it) is applied, again,
+    /// once on disk rather than waiting for a witness.
+    pub change: AckPolicyChange,
+    /// The wire sequence of the transition: the first change of the run
+    /// naming `change.policy`. `u64` because it is compared against
+    /// output slots' wire sequences.
+    pub wire_seq: u64,
+    /// The policy in force before the transition; `None` when it was the
+    /// lineage's first change, which a primary journals as the policy its
+    /// gate already starts under, so there is nothing to apply again.
+    pub previous: Option<AckPolicyByte>,
+}
+
+impl LineagePolicy {
+    /// The policy in force.
+    #[inline]
+    pub fn policy(&self) -> AckPolicyByte {
+        self.change.policy
+    }
+
+    /// The lineage policy after the change at `wire_seq`, given the one
+    /// before it: the one fold, for replay and for a replica's receive
+    /// thread alike.
+    #[inline]
+    #[must_use]
+    pub fn after(current: Option<Self>, wire_seq: u64, change: AckPolicyChange) -> Self {
+        match current {
+            Some(current) if current.change.policy == change.policy => Self {
+                change: AckPolicyChange {
+                    policy: change.policy,
+                    unwitnessed: current.change.unwitnessed || change.unwitnessed,
+                },
+                ..current
+            },
+            current => Self {
+                change,
+                wire_seq,
+                previous: current.map(|p| p.policy()),
+            },
+        }
+    }
+}
+
+/// A shared [`LineagePolicy`]: a replica's record of its lineage's ack
+/// policy, folded by its receive thread as changes are accepted and
+/// stored whole after a recovery or a snapshot resync (so a change in a
+/// divergent tail disappears with the tail); read by auto-promotion and
+/// by a promotion, which seeds its gate from it.
+///
+/// A mutex rather than atomics: the record is wider than one word, and a
+/// reader must never pair one change's sequence with another's policy.
+/// It is taken only when a change is accepted (rare) or the record read
+/// off the stream's path, never per slot.
+#[derive(Debug, Default)]
+pub struct SharedLineagePolicy(Mutex<Option<LineagePolicy>>);
+
+impl SharedLineagePolicy {
+    /// A record holding `policy`.
+    pub fn new(policy: Option<LineagePolicy>) -> Self {
+        Self(Mutex::new(policy))
+    }
+
+    /// The record as last stored or folded.
+    pub fn load(&self) -> Option<LineagePolicy> {
+        *self.lock()
+    }
+
+    /// Replace the record, whatever it held.
+    pub fn store(&self, policy: Option<LineagePolicy>) {
+        *self.lock() = policy;
+    }
+
+    /// Fold the change at `wire_seq` into the record
+    /// ([`LineagePolicy::after`]).
+    pub fn observe(&self, wire_seq: u64, change: AckPolicyChange) {
+        let mut record = self.lock();
+        *record = Some(LineagePolicy::after(*record, wire_seq, change));
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<LineagePolicy>> {
+        // Poisoning cannot leave the record half-written: every write
+        // stores a whole `Copy` value. The value is still the last one
+        // stored, so it is used as is.
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// A shared `Option<AckPolicyByte>`, read by threads other than the one
+/// that writes it: on a primary, the health gauges' view of the policy
+/// journaled last and of the one the response gate enforces.
 #[derive(Debug)]
 pub struct LineagePolicyCell(AtomicU16);
 
@@ -162,41 +271,120 @@ impl ForcedPolicyReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use melin_journal::AckPolicyChange;
+
+    fn payload(policy: u8, unwitnessed: bool) -> AckPolicyChange {
+        AckPolicyChange {
+            policy: AckPolicyByte(policy),
+            unwitnessed,
+        }
+    }
 
     fn change(policy: u8) -> LineageEvent {
-        LineageEvent::AckPolicy(AckPolicyChange {
-            policy: AckPolicyByte(policy),
-            unwitnessed: false,
+        LineageEvent::AckPolicy(payload(policy, false))
+    }
+
+    fn record(
+        policy: u8,
+        unwitnessed: bool,
+        wire_seq: u64,
+        previous: Option<u8>,
+    ) -> Option<LineagePolicy> {
+        Some(LineagePolicy {
+            change: payload(policy, unwitnessed),
+            wire_seq,
+            previous: previous.map(AckPolicyByte),
         })
     }
 
     /// The epoch is a maximum; the policy is the newest change, whichever
-    /// direction it goes, and an epoch bump leaves it alone.
+    /// direction it goes, with the policy before it and its sequence, and
+    /// an epoch bump leaves it alone.
     #[test]
     fn the_epoch_is_a_maximum_and_the_policy_the_newest_change() {
         let mut lineage = Lineage::GENESIS;
-        lineage.observe(LineageEvent::Epoch(4));
-        lineage.observe(change(1));
-        lineage.observe(LineageEvent::Epoch(2));
+        lineage.observe(1, LineageEvent::Epoch(4));
+        lineage.observe(2, change(1));
+        lineage.observe(3, LineageEvent::Epoch(2));
         assert_eq!(
             lineage,
             Lineage {
                 epoch: 4,
-                ack_policy: Some(AckPolicyByte(1)),
-            }
+                ack_policy: record(1, false, 2, None),
+            },
+            "the lineage's first change has nothing before it"
         );
         // A lower byte after a higher one still wins: no ranking.
-        lineage.observe(change(0));
-        assert_eq!(lineage.ack_policy, Some(AckPolicyByte(0)));
-        lineage.observe(LineageEvent::Epoch(9));
+        lineage.observe(4, change(0));
+        assert_eq!(lineage.ack_policy, record(0, false, 4, Some(1)));
+        lineage.observe(5, LineageEvent::Epoch(9));
         assert_eq!(
             lineage,
             Lineage {
                 epoch: 9,
-                ack_policy: Some(AckPolicyByte(0)),
+                ack_policy: record(0, false, 4, Some(1)),
             }
         );
+    }
+
+    /// A change naming the policy in force moves nothing: the transition
+    /// stays the first change of the run, with the policy before the run,
+    /// so a re-sent weakening still waits for what the policy before it
+    /// relied on. An unwitnessed one in the run marks the transition
+    /// unwitnessed (a forced re-send), and a later witnessed one does not
+    /// clear it; a change that moves the policy starts afresh.
+    #[test]
+    fn a_repeated_change_keeps_the_transition_and_an_unwitnessed_one_marks_it() {
+        let disk_and_ram = 2;
+        let disk = 0;
+        let mut policy = Some(LineagePolicy::after(None, 3, payload(disk_and_ram, false)));
+        assert_eq!(policy, record(disk_and_ram, false, 3, None));
+        for (wire_seq, change, expected) in [
+            (
+                7,
+                payload(disk, false),
+                record(disk, false, 7, Some(disk_and_ram)),
+            ),
+            (
+                9,
+                payload(disk, false),
+                record(disk, false, 7, Some(disk_and_ram)),
+            ),
+            (
+                11,
+                payload(disk, true),
+                record(disk, true, 7, Some(disk_and_ram)),
+            ),
+            (
+                12,
+                payload(disk, false),
+                record(disk, true, 7, Some(disk_and_ram)),
+            ),
+            (
+                15,
+                payload(disk_and_ram, false),
+                record(disk_and_ram, false, 15, Some(disk)),
+            ),
+        ] {
+            policy = Some(LineagePolicy::after(policy, wire_seq, change));
+            assert_eq!(policy, expected, "after the change at {wire_seq}");
+        }
+    }
+
+    /// The shared record folds with the same rule, and a store replaces
+    /// it whole, `None` included.
+    #[test]
+    fn the_shared_record_folds_and_stores_whole() {
+        let shared = SharedLineagePolicy::new(None);
+        assert_eq!(shared.load(), None);
+        shared.observe(4, payload(2, false));
+        shared.observe(6, payload(0, false));
+        shared.observe(8, payload(0, true));
+        assert_eq!(shared.load(), record(0, true, 6, Some(2)));
+        shared.store(record(3, false, 1, None));
+        assert_eq!(shared.load(), record(3, false, 1, None));
+        shared.store(None);
+        assert_eq!(shared.load(), None);
+        assert_eq!(SharedLineagePolicy::default().load(), None);
     }
 
     /// Every byte, and its absence, round-trips through the cell, and a

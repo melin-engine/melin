@@ -125,6 +125,13 @@ fn observe_peer(
 /// event acked under it too, so it judges by the older policy those
 /// events it does hold were acked under.
 ///
+/// The newest change, not the policy before it, which a promoted gate
+/// starts under until the change is confirmed again (see the durability
+/// gate's "A new tenure"): that is about what the *new* primary acks. What
+/// this decision protects was acked by the old one, which admitted no
+/// event after a change before applying the change, so every event after
+/// it that this replica may be missing was acked under it.
+///
 /// Falls back to this node's own requested policy (configured, or staged
 /// by `ACK-POLICY`) only while the lineage holds no change: a lineage
 /// written before changes were journaled, until its primary's first boot
@@ -331,7 +338,7 @@ fn consider_auto_promotion(
     // moves the policy for a change before the tip passes it, so a tip
     // holding a change is never judged by the policy before it.
     let last_sequence = control.journal_tip.load().get();
-    let lineage_policy = control.lineage_ack_policy.load();
+    let lineage_policy = control.lineage_ack_policy.load().map(|p| p.policy());
     let now = Instant::now();
     let inputs = AutoPromotionInputs {
         tip_ready: control.tip_ready.load(Ordering::Acquire),
@@ -1094,7 +1101,7 @@ mod tests {
             .advance(melin_transport_core::WireSeq::new(100));
         control
             .lineage_ack_policy
-            .store(Some(AckPolicy::Ram.to_byte()));
+            .observe(90, streamed_change(AckPolicy::Ram));
         // Epoch 0 so the peer comparison turns on the sequence, and the
         // term (7) clears the fence-epoch check.
         let fence = melin_transport_core::fence::FenceState::new(0);
@@ -1171,10 +1178,14 @@ mod tests {
             );
         };
 
-        // Weakened in the stream: refused on `disk`.
+        // Weakened in the stream: refused on `disk`, the newest change,
+        // though the record keeps `disk+ram` as the policy before it.
         control
             .lineage_ack_policy
-            .store(Some(AckPolicy::Disk.to_byte()));
+            .observe(80, streamed_change(AckPolicy::DiskAndRam));
+        control
+            .lineage_ack_policy
+            .observe(90, streamed_change(AckPolicy::Disk));
         let mut last_refused = None;
         consider(
             &AtomicU8::new(AckPolicy::DiskAndRam.as_u8()),
@@ -1187,9 +1198,17 @@ mod tests {
         // Restored in the stream: the failover proceeds.
         control
             .lineage_ack_policy
-            .store(Some(AckPolicy::DiskAndRam.to_byte()));
+            .observe(95, streamed_change(AckPolicy::DiskAndRam));
         consider(&AtomicU8::new(AckPolicy::Disk.as_u8()), &mut last_refused);
         assert!(control.promote.is_requested(), "promotion filed");
+    }
+
+    /// A witnessed change to `policy`, as the stream carries it.
+    fn streamed_change(policy: AckPolicy) -> melin_journal::AckPolicyChange {
+        melin_journal::AckPolicyChange {
+            policy: policy.to_byte(),
+            unwitnessed: false,
+        }
     }
 
     #[test]

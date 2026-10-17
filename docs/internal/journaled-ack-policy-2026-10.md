@@ -595,6 +595,86 @@ and is committed on its own. Tests land with the step they pin.
      "unreleased format 15" premise is marked stale (0.19.0 released
      format 16 and protocol 7) and to be re-derived before it starts.
 
+   **A new tenure applies the newest change again (review fix).** An
+   independent review found that a restart took a change still waiting
+   for its witness as in force: recovery folded the policy
+   last-writer-wins, and `initial_gate_policy` started the gate under
+   it. Under `disk+ram` with a replica, `ACK-POLICY disk` journaled at
+   `w` and waiting, the replica dropping before it held `w`, and the
+   primary restarted with `--ack-policy disk` (equal to the lineage's,
+   so no boot entry), the gate opened on the primary's disk as soon as a
+   replica authenticated; had the primary died again before the replica
+   reached `w`, the replica, still believing `disk+ram`, could
+   auto-promote over events acked under `disk`, none of it marked
+   unwitnessed. (A restart under a different policy was safe: its boot
+   entry waits under the newest policy, and every policy but `disk`
+   needs a replica, which then receives `w` first.) Whether a change took
+   effect before a crash is not on disk, so the fix re-applies it:
+   - `Lineage::ack_policy` is a `LineagePolicy { change, wire_seq,
+     previous }`: the policy in force, the wire sequence of the change
+     that moved it there, the policy before that change, and whether the
+     transition was unwitnessed. One fold, `LineagePolicy::after`, for
+     recovery, the shadow and the replica's receive thread
+     (`SharedLineagePolicy`, a mutex taken only per accepted change,
+     replacing the replica's byte cell; `LineagePolicyCell` remains for
+     the two gauges). **Departure from the approved design:** the
+     transition is the newest change that *moved* the policy, not the
+     newest change. Every command is journaled, repeats included, so
+     with "the policy before the newest change" `disk+ram`, `disk` at
+     `w1` (waiting), `disk` again at `w2` would record `disk` → `disk`
+     and the restart would apply it at once, the same bug. A repeat
+     keeps the first change's sequence and the policy before the run,
+     and marks the transition unwitnessed if it is (a forced re-send, the
+     documented way to force a waiting change), so a forced change stays
+     applied once on disk after a restart instead of waiting again.
+   - The shadow counts wire sequences from the writer's next sequence
+     (`shadow::run` takes it), since a primary's input slots carry none;
+     a replica's slots carry the primary's, which a debug assertion
+     checks the count against. The journal stage's allocator and the
+     shadow's count decide "takes a sequence" through one predicate,
+     `JournalEvent::takes_wire_seq`, so they cannot drift on a primary,
+     where the assertion never fires.
+   - Snapshot v4 (unreleased) gained `previous_policy: u8` and
+     `policy_wire_seq: u64` after `ack_policy`, and two flag bits
+     (previous known, unwitnessed), each valid only with the policy bit;
+     no new framing version. v1 to v3 still read.
+   - `GatePolicy` is `{ start: GateStart, forced }`, `GateStart {
+     in_force, pending: Option<PendingChange> }`: `initial_gate_policy`
+     returns the start, so the pending change cannot be dropped on the
+     way to the gate, which consumes it. The fields and `PendingChange`
+     are crate-private: outside the runtime (a harness driving the
+     response stage) a start can only be `GateStart::settled`. A replicated primary starts
+     under `previous` with the newest change pending; the lineage's first
+     change (`previous` unknown) is the policy its gate started under
+     when journaled, so it starts under it settled; standalone is
+     unchanged (requested, settled). The gate applies the pending change
+     before admitting any slot: it waits for the change's sequence under
+     the policy in force (as for the change's own slot), or, unwitnessed,
+     until it is on this node's disk (in the forced path of the wait); a
+     forced change of the new tenure overtakes it like any in-order one.
+     It is also applied when already durable at the start and from the
+     idle recheck, so the gauge follows on a quiet node. The boot entry
+     then comes in order after it.
+   - A promotion seeds its gate the same way, from the replica's record,
+     so a node promoted right after a weakening its primary was waiting
+     on is held until another replica holds the change, or the operator
+     forces `disk`. Auto-promotion still judges by the newest change: the
+     old primary admitted no event after a change before applying it, so
+     every event after it that a replica may lack was acked under it.
+
+   Tests: the lineage fold (previous and sequence, repeats, unwitnessed),
+   the shared record, recovery and the shadow recording the transition at
+   the change's sequence (a query between, taking none), snapshot v4
+   round trip, golden bytes and malformed flags, the gate starting with a
+   pending change (held then applied in order; unwitnessed applied once
+   on disk, at once if already there; already durable at the start;
+   before a boot entry; from the idle recheck; overtaken by a forced
+   change; shutdown), the resolution, and promotion seeding from the
+   folded record; and
+   `ack_policy_changes::a_restart_reapplies_a_change_the_replica_never_held`,
+   which fails with the pending change dropped and passes on kernel TCP
+   and under the netns runner with the `dpdk` feature.
+
    **Not fixed here (pre-existing, documented):** a runtime
    `ACK-POLICY` naming a policy that needs a replica, sent to a primary
    that accepts none (no `--replication-bind`), is journaled
@@ -606,6 +686,16 @@ and is committed on its own. Tests land with the step they pin.
    warns against it meanwhile, and the roadmap tracks the refusal as
    its own item ("Refuse an ack policy that needs a replica on a node
    that accepts none").
+
+   **Not fixed here (standalone exception):** a lineage whose newest
+   change is still waiting for its witness (`disk` after `disk+ram`),
+   restarted standalone under that same policy, journals no boot entry
+   (requested equals the newest), so the standalone gate serves under it
+   at once with nothing in the journal marking those acknowledgements
+   unwitnessed. This is within the documented standalone exception (no
+   replica can witness anything), but the record is missing. Having the
+   boot journal an unwitnessed entry when the newest change is pending
+   and replication is disabled would close it.
 
 ## Downstream impact (Exchange Core)
 

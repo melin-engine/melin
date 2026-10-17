@@ -31,12 +31,12 @@ use crate::cursors::{DurableWireSeqCursor, WireSeq};
 #[cfg(not(feature = "no-persist"))]
 use crate::journaled_app::JournaledApp;
 #[cfg(not(feature = "no-persist"))]
-use crate::lineage::Lineage;
+use crate::lineage::{Lineage, LineagePolicy};
 use crate::pipeline::StageWaits;
 #[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
 use crate::pipeline::build_replica_pipeline;
 #[cfg(not(feature = "no-persist"))]
-use melin_journal::AckPolicyByte;
+use melin_journal::{AckPolicyByte, AckPolicyChange};
 // Only the hash-chain mark tests touch these.
 #[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
 use crate::pipeline::{AdoptedRotation, StreamMark};
@@ -2332,6 +2332,7 @@ fn barrier_fsync_state_pair_is_self_consistent_for_the_shadow() {
                 &shutdown2,
                 WaitStrategy::SpinThenYield,
                 crate::lineage::Lineage::GENESIS,
+                1,
                 Some(0),
             );
         })
@@ -2512,6 +2513,7 @@ fn fsync_state_pairs_stay_consistent_across_adopted_rotations() {
                     &shutdown,
                     WaitStrategy::SpinThenYield,
                     crate::lineage::Lineage::GENESIS,
+                    1,
                     Some(0),
                 );
             })
@@ -4657,10 +4659,16 @@ fn a_repeated_request_reaches_apply_on_live_replay_and_shadow() {
     );
 }
 
+/// The wire sequence [`shadow_snapshot_from`]'s shadow allocates to its
+/// first slot: past a recovered history, as a primary's is.
+#[cfg(not(feature = "no-persist"))]
+const SHADOW_FIRST_WIRE_SEQ: u64 = 40;
+
 /// Run the real shadow stage, from the lineage `initial`, over `slots`
-/// and return the application state and lineage of the snapshot it
-/// writes. The fsync pair claims every slot, so the only snapshot it can
-/// write is the one taken after consuming them all.
+/// (the first at [`SHADOW_FIRST_WIRE_SEQ`]) and return the application
+/// state and lineage of the snapshot it writes. The fsync pair claims
+/// every slot, so the only snapshot it can write is the one taken after
+/// consuming them all.
 #[cfg(not(feature = "no-persist"))]
 fn shadow_snapshot_from(
     dir: &std::path::Path,
@@ -4691,6 +4699,7 @@ fn shadow_snapshot_from(
                 &shutdown,
                 WaitStrategy::SpinThenYield,
                 initial,
+                SHADOW_FIRST_WIRE_SEQ,
                 Some(0),
             )
         })
@@ -4720,14 +4729,27 @@ fn the_shadow_records_its_initial_lineage_until_a_change() {
     let dir = tempfile::tempdir().unwrap();
     let initial = Lineage {
         epoch: 2,
-        ack_policy: Some(AckPolicyByte(1)),
+        ack_policy: Some(LineagePolicy {
+            change: AckPolicyChange {
+                policy: AckPolicyByte(1),
+                unwitnessed: false,
+            },
+            wire_seq: 7,
+            previous: Some(AckPolicyByte(2)),
+        }),
     };
     let (_, lineage) = shadow_snapshot_from(dir.path(), initial, &[add_slot(5, 1)]);
     assert_eq!(lineage, initial, "no lineage event: the seed is recorded");
 
+    // A query between the first slot and the change: never journaled, so
+    // it takes no wire sequence and the change is the third entry.
     let dir = tempfile::tempdir().unwrap();
     let slots = [
         add_slot(5, 1),
+        InputSlot {
+            event: JournalEvent::App(TestEvent::Query),
+            ..add_slot(0, 1)
+        },
         InputSlot {
             event: JournalEvent::EpochBump { epoch: 3 },
             ..add_slot(0, 1)
@@ -4743,9 +4765,16 @@ fn the_shadow_records_its_initial_lineage_until_a_change() {
         lineage,
         Lineage {
             epoch: 3,
-            ack_policy: Some(AckPolicyByte(0)),
+            ack_policy: Some(LineagePolicy {
+                change: AckPolicyChange {
+                    policy: AckPolicyByte(0),
+                    unwitnessed: true,
+                },
+                wire_seq: SHADOW_FIRST_WIRE_SEQ + 2,
+                previous: Some(AckPolicyByte(1)),
+            }),
         },
-        "both lineage events replaced the seed"
+        "both lineage events replaced the seed, the change at its own sequence"
     );
     assert_eq!(
         shadow.total, 12,

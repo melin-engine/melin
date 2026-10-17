@@ -1327,6 +1327,18 @@ mod tests {
         /// resync must rebase the replica onto.
         const PRIMARY_POLICY: AckPolicyByte = AckPolicyByte(0);
 
+        /// The primary's snapshot lineage policy, whole: every field set
+        /// apart from the forked record's, so adopting it whole shows.
+        const PRIMARY_LINEAGE_POLICY: melin_transport_core::lineage::LineagePolicy =
+            melin_transport_core::lineage::LineagePolicy {
+                change: AckPolicyChange {
+                    policy: PRIMARY_POLICY,
+                    unwitnessed: true,
+                },
+                wire_seq: 3,
+                previous: Some(AckPolicyByte(2)),
+            };
+
         /// A shadow snapshot interval short enough for a test to wait on.
         const SHADOW_INTERVAL_MS: u64 = 50;
 
@@ -1367,7 +1379,7 @@ mod tests {
                 chain_at_4,
                 melin_transport_core::lineage::Lineage {
                     epoch: 0,
-                    ack_policy: Some(PRIMARY_POLICY),
+                    ack_policy: Some(PRIMARY_LINEAGE_POLICY),
                 },
                 Some(0),
                 &primary_journal.with_extension("snapshot"),
@@ -1500,7 +1512,14 @@ mod tests {
             // policy this replica holds until the resync replaces it.
             assert_eq!(
                 control.lineage_ack_policy.load(),
-                Some(DIVERGENT_POLICY),
+                Some(melin_transport_core::lineage::LineagePolicy {
+                    change: AckPolicyChange {
+                        policy: DIVERGENT_POLICY,
+                        unwitnessed: false,
+                    },
+                    wire_seq: 1,
+                    previous: None,
+                }),
                 "recovery must store the forked journal's policy"
             );
             buf.clear();
@@ -1537,7 +1556,7 @@ mod tests {
             // as the newest value seen.
             assert_eq!(
                 control.lineage_ack_policy.load(),
-                Some(PRIMARY_POLICY),
+                Some(PRIMARY_LINEAGE_POLICY),
                 "the resync must adopt the primary snapshot's policy and drop the divergent tail's"
             );
             // The rebuilt pipeline's shadow starts from that cell: its
@@ -1560,7 +1579,7 @@ mod tests {
             };
             assert_eq!(
                 shadow_lineage.ack_policy,
-                Some(PRIMARY_POLICY),
+                Some(PRIMARY_LINEAGE_POLICY),
                 "the replica's shadow must seed its lineage from the adopted policy"
             );
 
@@ -1621,7 +1640,7 @@ mod tests {
                 chain_at_2,
                 melin_transport_core::lineage::Lineage {
                     epoch: 0,
-                    ack_policy: Some(PRIMARY_POLICY),
+                    ack_policy: Some(PRIMARY_LINEAGE_POLICY),
                 },
                 Some(0),
                 &primary_journal.with_extension("snapshot"),

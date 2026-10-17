@@ -13,6 +13,8 @@
 //! | genesis_entries  | u64      | 8     | Entries the lineage's genesis occupies (v3) |
 //! | lineage_flags    | u8       | 1     | Which lineage fields are known (v4) |
 //! | ack_policy       | u8       | 1     | Ack policy in force at snapshot (v4) |
+//! | previous_policy  | u8       | 1     | Policy before the transition to it (v4) |
+//! | policy_wire_seq  | u64      | 8     | Wire sequence of that transition (v4) |
 //! | app_payload      | var      | var   | Bytes from `A::snapshot`       |
 //! | crc32c           | u32      | 4     | CRC32C over everything above   |
 //!
@@ -29,20 +31,26 @@
 //! `ack_policy` is the policy the lineage's newest `AckPolicyChange` at or
 //! before the snapshot's sequence put in force (see [`Lineage`]). Replay
 //! skips the entries the snapshot covers, and their segments may be gone,
-//! so the snapshot is the only record of it a recovery may have.
-//! `lineage_flags` says which of the two optional fields hold a value
-//! (bit 0: `genesis_entries`, bit 1: `ack_policy`); an absent field is
-//! written as zero.
+//! so the snapshot is the only record of it a recovery may have. With it
+//! go the transition that put it in force (see [`LineagePolicy`]): the
+//! policy before it, its entry's wire sequence and whether it was
+//! unwitnessed, so a primary starting from the snapshot applies that
+//! transition again rather than assume it took effect.
+//!
+//! `lineage_flags` says which of the optional fields hold a value (bit 0:
+//! `genesis_entries`; bit 1: `ack_policy` and `policy_wire_seq`; bit 2:
+//! `previous_policy`; bit 3: the transition was unwitnessed). Bits 2 and 3
+//! need bit 1, and an absent field is written as zero.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use melin_app::Application;
-use melin_journal::AckPolicyByte;
+use melin_journal::{AckPolicyByte, AckPolicyChange};
 
 use crate::cursors::WireSeq;
-use crate::lineage::Lineage;
+use crate::lineage::{Lineage, LineagePolicy};
 use tracing::warn;
 
 const SNAP_MAGIC: u32 = 0x534E_4150;
@@ -66,7 +74,9 @@ const SNAP_MAGIC: u32 = 0x534E_4150;
 // without the other. Writes produce v4 whenever the lineage has
 // something v2 cannot hold, and v2 otherwise (both fields unknown: a
 // lineage from before either existed), keeping the rule that the layout
-// tracks the lineage. v3 is read only.
+// tracks the lineage. v3 is read only. The policy's transition (the
+// policy before it, its sequence, unwitnessed) is part of v4: no release
+// wrote v4 before it, so it needed no version of its own.
 const TRANSPORT_VERSION: u16 = 4;
 const TRANSPORT_VERSION_V3: u16 = 3;
 const TRANSPORT_VERSION_V2: u16 = 2;
@@ -74,12 +84,23 @@ const TRANSPORT_VERSION_V1: u16 = 1;
 const HEADER_SIZE_V1: usize = 4 + 2 + 2 + 8 + 32; // magic + t_ver + a_ver + seq + hash
 const HEADER_SIZE_V2: usize = HEADER_SIZE_V1 + 8; // v2 appends the epoch
 const HEADER_SIZE_V3: usize = HEADER_SIZE_V2 + 8; // v3 appends genesis_entries
-const HEADER_SIZE: usize = HEADER_SIZE_V3 + 2; // v4 appends lineage_flags + ack_policy
+// v4 appends lineage_flags + ack_policy + previous_policy + policy_wire_seq
+const HEADER_SIZE: usize = HEADER_SIZE_V3 + 1 + 1 + 1 + 8;
 
 /// `lineage_flags` bit: the `genesis_entries` field holds a value.
 const LINEAGE_GENESIS_KNOWN: u8 = 1 << 0;
-/// `lineage_flags` bit: the `ack_policy` field holds a value.
+/// `lineage_flags` bit: the `ack_policy` and `policy_wire_seq` fields
+/// hold a value.
 const LINEAGE_ACK_POLICY_KNOWN: u8 = 1 << 1;
+/// `lineage_flags` bit: the `previous_policy` field holds a value. Only
+/// with [`LINEAGE_ACK_POLICY_KNOWN`].
+const LINEAGE_PREVIOUS_KNOWN: u8 = 1 << 2;
+/// `lineage_flags` bit: the transition to `ack_policy` was unwitnessed.
+/// Only with [`LINEAGE_ACK_POLICY_KNOWN`].
+const LINEAGE_UNWITNESSED: u8 = 1 << 3;
+/// Every `lineage_flags` bit a save may set.
+const LINEAGE_FLAGS: u8 =
+    LINEAGE_GENESIS_KNOWN | LINEAGE_ACK_POLICY_KNOWN | LINEAGE_PREVIOUS_KNOWN | LINEAGE_UNWITNESSED;
 
 /// The largest header any version has — what a reader that wants the
 /// header alone must read.
@@ -282,16 +303,34 @@ impl SnapshotHeader {
             TRANSPORT_VERSION => {
                 let flags = bytes[64];
                 let policy = bytes[65];
+                let previous = bytes[66];
+                let policy_wire_seq = u64::from_le_bytes(
+                    bytes[67..75]
+                        .try_into()
+                        .expect("policy_wire_seq slice size fixed by header layout"),
+                );
                 let genesis = genesis_field.expect("v4 holds the genesis_entries field");
-                let malformed = flags & !(LINEAGE_GENESIS_KNOWN | LINEAGE_ACK_POLICY_KNOWN) != 0
-                    || (flags & LINEAGE_GENESIS_KNOWN == 0 && genesis != 0)
-                    || (flags & LINEAGE_ACK_POLICY_KNOWN == 0 && policy != 0);
+                let has = |bit: u8| flags & bit != 0;
+                let malformed = flags & !LINEAGE_FLAGS != 0
+                    || (!has(LINEAGE_GENESIS_KNOWN) && genesis != 0)
+                    || (!has(LINEAGE_ACK_POLICY_KNOWN)
+                        && (policy != 0
+                            || policy_wire_seq != 0
+                            || has(LINEAGE_PREVIOUS_KNOWN | LINEAGE_UNWITNESSED)))
+                    || (!has(LINEAGE_PREVIOUS_KNOWN) && previous != 0);
                 if malformed {
                     return Err(SnapshotError::MalformedLineage { flags });
                 }
                 (
-                    (flags & LINEAGE_GENESIS_KNOWN != 0).then_some(genesis),
-                    (flags & LINEAGE_ACK_POLICY_KNOWN != 0).then_some(AckPolicyByte(policy)),
+                    has(LINEAGE_GENESIS_KNOWN).then_some(genesis),
+                    has(LINEAGE_ACK_POLICY_KNOWN).then(|| LineagePolicy {
+                        change: AckPolicyChange {
+                            policy: AckPolicyByte(policy),
+                            unwitnessed: has(LINEAGE_UNWITNESSED),
+                        },
+                        wire_seq: policy_wire_seq,
+                        previous: has(LINEAGE_PREVIOUS_KNOWN).then_some(AckPolicyByte(previous)),
+                    }),
                 )
             }
             // v3 always knows the genesis length; v1 and v2 know neither.
@@ -372,13 +411,26 @@ fn save_with_limit<A: Application>(
         if genesis_entries.is_some() {
             flags |= LINEAGE_GENESIS_KNOWN;
         }
-        if lineage.ack_policy.is_some() {
+        if let Some(policy) = lineage.ack_policy {
             flags |= LINEAGE_ACK_POLICY_KNOWN;
+            if policy.previous.is_some() {
+                flags |= LINEAGE_PREVIOUS_KNOWN;
+            }
+            if policy.change.unwitnessed {
+                flags |= LINEAGE_UNWITNESSED;
+            }
         }
         // An absent field is written as zero (see `SnapshotHeader::parse`).
         buf.extend_from_slice(&genesis_entries.unwrap_or(0).to_le_bytes());
         buf.push(flags);
-        buf.push(lineage.ack_policy.map_or(0, |p| p.0));
+        buf.push(lineage.ack_policy.map_or(0, |p| p.policy().0));
+        buf.push(
+            lineage
+                .ack_policy
+                .and_then(|p| p.previous)
+                .map_or(0, |p| p.0),
+        );
+        buf.extend_from_slice(&lineage.ack_policy.map_or(0, |p| p.wire_seq).to_le_bytes());
     }
     // App payload.
     app.snapshot(&mut buf)?;
@@ -535,10 +587,10 @@ mod tests {
         epoch: u64,
         app_payload: &[u8],
     ) -> Vec<u8> {
-        let lineage_fields: &[u8] = match transport_version {
-            TRANSPORT_VERSION_V3 => &[0; 8],
-            TRANSPORT_VERSION => &[0, 0, 0, 0, 0, 0, 0, 0, LINEAGE_GENESIS_KNOWN, 0],
-            _ => &[],
+        let lineage_fields: Vec<u8> = match transport_version {
+            TRANSPORT_VERSION_V3 => vec![0; 8],
+            TRANSPORT_VERSION => v4_lineage_fields(0, LINEAGE_GENESIS_KNOWN, 0, 0, 0),
+            _ => Vec::new(),
         };
         craft_snapshot_with_lineage_fields(
             magic,
@@ -547,9 +599,23 @@ mod tests {
             sequence,
             chain_hash,
             epoch,
-            lineage_fields,
+            &lineage_fields,
             app_payload,
         )
+    }
+
+    /// A v4 header's bytes after the epoch, in layout order.
+    fn v4_lineage_fields(
+        genesis: u64,
+        flags: u8,
+        policy: u8,
+        previous: u8,
+        policy_wire_seq: u64,
+    ) -> Vec<u8> {
+        let mut fields = genesis.to_le_bytes().to_vec();
+        fields.extend_from_slice(&[flags, policy, previous]);
+        fields.extend_from_slice(&policy_wire_seq.to_le_bytes());
+        fields
     }
 
     /// [`craft_snapshot`] with the bytes after the epoch given verbatim.
@@ -586,6 +652,24 @@ mod tests {
         }
     }
 
+    /// A lineage policy: `policy` in force since the transition at
+    /// `wire_seq` from `previous`.
+    fn policy(
+        policy: u8,
+        unwitnessed: bool,
+        wire_seq: u64,
+        previous: Option<u8>,
+    ) -> Option<LineagePolicy> {
+        Some(LineagePolicy {
+            change: AckPolicyChange {
+                policy: AckPolicyByte(policy),
+                unwitnessed,
+            },
+            wire_seq,
+            previous: previous.map(AckPolicyByte),
+        })
+    }
+
     /// The application's snapshot payload bytes.
     fn payload_of(app: &TestApp) -> Vec<u8> {
         let mut payload = Vec::new();
@@ -616,7 +700,7 @@ mod tests {
             let path = dir.path().join(format!("snap.{label}"));
             let lineage = Lineage {
                 epoch: 7,
-                ack_policy: Some(AckPolicyByte(1)),
+                ack_policy: policy(1, false, 990, Some(2)),
             };
             save::<TestApp>(&app, WireSeq::new(999), chain, lineage, Some(4), &path).unwrap();
 
@@ -630,7 +714,8 @@ mod tests {
     }
 
     /// Every combination of a known or unknown genesis length and ack
-    /// policy round-trips: v4 for any that knows one of them, whose flags
+    /// policy (with or without a policy before its transition, witnessed
+    /// or not) round-trips: v4 for any that knows one of them, whose flags
     /// say which, and v2 (which has a field for neither) for the one that
     /// knows none. An unknown field reads back as unknown, never as a
     /// default value.
@@ -641,7 +726,13 @@ mod tests {
         for genesis_entries in [Some(0), Some(12), None] {
             // Byte 0 is `disk`, the value an absent field is written as:
             // the flags, not the byte, must tell them apart.
-            for ack_policy in [Some(AckPolicyByte(0)), Some(AckPolicyByte(3)), None] {
+            for ack_policy in [
+                policy(0, false, 1, None),
+                policy(3, false, 4, Some(0)),
+                policy(0, true, u64::MAX, Some(2)),
+                policy(1, true, 2, None),
+                None,
+            ] {
                 let label = format!("{genesis_entries:?} {ack_policy:?}");
                 let path = dir.path().join(format!("snap.{label}"));
                 let lineage = Lineage {
@@ -685,7 +776,7 @@ mod tests {
         let path = dir.path().join("snap");
         let lineage = Lineage {
             epoch: 0x0102,
-            ack_policy: Some(AckPolicyByte(3)),
+            ack_policy: policy(3, true, 0x0908, Some(2)),
         };
         save::<TestApp>(
             &TestApp::new(),
@@ -705,9 +796,33 @@ mod tests {
         expected.extend_from_slice(&[0xCC; 32]); // chain hash
         expected.extend_from_slice(&[0x02, 0x01, 0, 0, 0, 0, 0, 0]); // epoch
         expected.extend_from_slice(&[0x07, 0, 0, 0, 0, 0, 0, 0]); // genesis_entries
-        expected.push(0b11); // lineage_flags: both known
+        expected.push(0b1111); // lineage_flags: all known, unwitnessed
         expected.push(3); // ack_policy
+        expected.push(2); // previous_policy
+        expected.extend_from_slice(&[0x08, 0x09, 0, 0, 0, 0, 0, 0]); // policy_wire_seq
         assert_eq!(&bytes[..HEADER_SIZE], &expected[..]);
+        assert_eq!(HEADER_SIZE, 75);
+
+        // A lineage whose first change is its policy: no previous, and
+        // witnessed, so those flags and the previous byte stay clear.
+        let lineage = Lineage {
+            epoch: 0,
+            ack_policy: policy(1, false, 0x05, None),
+        };
+        save::<TestApp>(
+            &TestApp::new(),
+            WireSeq::new(9),
+            [0; 32],
+            lineage,
+            None,
+            &path,
+        )
+        .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            &bytes[HEADER_SIZE_V3..HEADER_SIZE],
+            &[0b10, 1, 0, 0x05, 0, 0, 0, 0, 0, 0, 0][..]
+        );
     }
 
     /// A v4 header whose lineage fields a save could not have written —
@@ -718,16 +833,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("snap");
         let payload = payload_of(&populated_app());
-        let genesis_zero = [0u8; 8];
-        let genesis_five = 5u64.to_le_bytes();
-        for (label, genesis, flags, policy) in [
-            ("reserved flag bit", genesis_zero, 0b100, 0),
-            ("high reserved bit", genesis_zero, 0b1000_0011, 0),
-            ("genesis behind a cleared flag", genesis_five, 0b10, 1),
-            ("policy behind a cleared flag", genesis_zero, 0b01, 2),
+        for (label, genesis, flags, policy, previous, policy_seq) in [
+            ("reserved flag bit", 0, 0b1_0000, 0, 0, 0),
+            ("high reserved bit", 0, 0b1000_0011, 0, 0, 1),
+            ("genesis behind a cleared flag", 5, 0b10, 1, 0, 1),
+            ("policy behind a cleared flag", 0, 0b01, 2, 0, 0),
+            ("policy seq behind a cleared flag", 0, 0b01, 0, 0, 3),
+            ("previous behind a cleared flag", 0, 0b11, 1, 2, 3),
+            ("previous without a policy", 0, 0b101, 0, 0, 0),
+            ("unwitnessed without a policy", 0, 0b1001, 0, 0, 0),
         ] {
-            let mut fields = genesis.to_vec();
-            fields.extend_from_slice(&[flags, policy]);
+            let fields = v4_lineage_fields(genesis, flags, policy, previous, policy_seq);
             let bytes = craft_snapshot_with_lineage_fields(
                 SNAP_MAGIC,
                 TRANSPORT_VERSION,
@@ -1031,14 +1147,14 @@ mod tests {
         }
 
         // A v2 header cut off before its epoch field, a v3 one before its
-        // genesis length, or a v4 one before its ack policy, must also
+        // genesis length, or a v4 one before its policy's sequence, must also
         // read as truncated, not as a short payload: the file passes the
         // v1-size gate, so the version-aware header parse is what must
         // catch it.
         for (version, cut) in [
             (TRANSPORT_VERSION_V2, HEADER_SIZE_V2 - 4), // mid-epoch
             (TRANSPORT_VERSION_V3, HEADER_SIZE_V3 - 4), // mid-genesis_entries
-            (TRANSPORT_VERSION, HEADER_SIZE - 1),       // before ack_policy
+            (TRANSPORT_VERSION, HEADER_SIZE - 1),       // mid-policy_wire_seq
         ] {
             let bytes = craft_snapshot(
                 SNAP_MAGIC,
