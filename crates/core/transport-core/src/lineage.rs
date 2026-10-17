@@ -43,7 +43,7 @@ impl Lineage {
     /// Fold one journaled lineage event, the entry at `wire_seq`, into
     /// the value.
     #[inline]
-    pub(crate) fn observe(&mut self, wire_seq: u64, event: LineageEvent) {
+    pub(crate) fn observe(&mut self, wire_seq: WireSeq, event: LineageEvent) {
         match event {
             LineageEvent::Epoch(epoch) => crate::fence::observe_into(&mut self.epoch, epoch),
             LineageEvent::AckPolicy(change) => {
@@ -78,9 +78,9 @@ pub struct LineagePolicy {
     /// once on disk rather than waiting for a witness.
     pub change: AckPolicyChange,
     /// The wire sequence of the transition: the first change of the run
-    /// naming `change.policy`. `u64` because it is compared against
-    /// output slots' wire sequences.
-    pub wire_seq: u64,
+    /// naming `change.policy`. A [`WireSeq`], never a bare `u64`: the
+    /// snapshot codec is the one place it leaves the type.
+    pub wire_seq: WireSeq,
     /// The policy in force before the transition; `None` when it was the
     /// lineage's first change, which a primary journals as the policy its
     /// gate already starts under, so there is nothing to apply again.
@@ -99,7 +99,7 @@ impl LineagePolicy {
     /// thread alike.
     #[inline]
     #[must_use]
-    pub fn after(current: Option<Self>, wire_seq: u64, change: AckPolicyChange) -> Self {
+    pub fn after(current: Option<Self>, wire_seq: WireSeq, change: AckPolicyChange) -> Self {
         match current {
             Some(current) if current.change.policy == change.policy => Self {
                 change: AckPolicyChange {
@@ -148,7 +148,7 @@ impl SharedLineagePolicy {
 
     /// Fold the change at `wire_seq` into the record
     /// ([`LineagePolicy::after`]).
-    pub fn observe(&self, wire_seq: u64, change: AckPolicyChange) {
+    pub fn observe(&self, wire_seq: WireSeq, change: AckPolicyChange) {
         let mut record = self.lock();
         *record = Some(LineagePolicy::after(*record, wire_seq, change));
     }
@@ -294,7 +294,7 @@ mod tests {
     ) -> Option<LineagePolicy> {
         Some(LineagePolicy {
             change: payload(policy, unwitnessed),
-            wire_seq,
+            wire_seq: WireSeq::new(wire_seq),
             previous: previous.map(AckPolicyByte),
         })
     }
@@ -305,9 +305,9 @@ mod tests {
     #[test]
     fn the_epoch_is_a_maximum_and_the_policy_the_newest_change() {
         let mut lineage = Lineage::GENESIS;
-        lineage.observe(1, LineageEvent::Epoch(4));
-        lineage.observe(2, change(1));
-        lineage.observe(3, LineageEvent::Epoch(2));
+        lineage.observe(WireSeq::new(1), LineageEvent::Epoch(4));
+        lineage.observe(WireSeq::new(2), change(1));
+        lineage.observe(WireSeq::new(3), LineageEvent::Epoch(2));
         assert_eq!(
             lineage,
             Lineage {
@@ -317,9 +317,9 @@ mod tests {
             "the lineage's first change has nothing before it"
         );
         // A lower byte after a higher one still wins: no ranking.
-        lineage.observe(4, change(0));
+        lineage.observe(WireSeq::new(4), change(0));
         assert_eq!(lineage.ack_policy, record(0, false, 4, Some(1)));
-        lineage.observe(5, LineageEvent::Epoch(9));
+        lineage.observe(WireSeq::new(5), LineageEvent::Epoch(9));
         assert_eq!(
             lineage,
             Lineage {
@@ -339,7 +339,11 @@ mod tests {
     fn a_repeated_change_keeps_the_transition_and_an_unwitnessed_one_marks_it() {
         let disk_and_ram = 2;
         let disk = 0;
-        let mut policy = Some(LineagePolicy::after(None, 3, payload(disk_and_ram, false)));
+        let mut policy = Some(LineagePolicy::after(
+            None,
+            WireSeq::new(3),
+            payload(disk_and_ram, false),
+        ));
         assert_eq!(policy, record(disk_and_ram, false, 3, None));
         for (wire_seq, change, expected) in [
             (
@@ -368,7 +372,7 @@ mod tests {
                 record(disk_and_ram, false, 15, Some(disk)),
             ),
         ] {
-            policy = Some(LineagePolicy::after(policy, wire_seq, change));
+            policy = Some(LineagePolicy::after(policy, WireSeq::new(wire_seq), change));
             assert_eq!(policy, expected, "after the change at {wire_seq}");
         }
     }
@@ -379,9 +383,9 @@ mod tests {
     fn the_shared_record_folds_and_stores_whole() {
         let shared = SharedLineagePolicy::new(None);
         assert_eq!(shared.load(), None);
-        shared.observe(4, payload(2, false));
-        shared.observe(6, payload(0, false));
-        shared.observe(8, payload(0, true));
+        shared.observe(WireSeq::new(4), payload(2, false));
+        shared.observe(WireSeq::new(6), payload(0, false));
+        shared.observe(WireSeq::new(8), payload(0, true));
         assert_eq!(shared.load(), record(0, true, 6, Some(2)));
         shared.store(record(3, false, 1, None));
         assert_eq!(shared.load(), record(3, false, 1, None));

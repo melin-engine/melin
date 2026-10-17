@@ -1104,9 +1104,10 @@ mod tests {
         control
             .journal_tip
             .advance(melin_transport_core::WireSeq::new(100));
-        control
-            .lineage_ack_policy
-            .observe(90, streamed_change(AckPolicy::Ram));
+        control.lineage_ack_policy.observe(
+            melin_transport_core::WireSeq::new(90),
+            streamed_change(AckPolicy::Ram),
+        );
         // Epoch 0 so the peer comparison turns on the sequence, and the
         // term (7) clears the fence-epoch check.
         let fence = melin_transport_core::fence::FenceState::new(0);
@@ -1185,12 +1186,14 @@ mod tests {
 
         // Weakened in the stream: refused on `disk`, the newest change,
         // though the record keeps `disk+ram` as the policy before it.
-        control
-            .lineage_ack_policy
-            .observe(80, streamed_change(AckPolicy::DiskAndRam));
-        control
-            .lineage_ack_policy
-            .observe(90, streamed_change(AckPolicy::Disk));
+        let observe = |wire_seq, policy| {
+            control.lineage_ack_policy.observe(
+                melin_transport_core::WireSeq::new(wire_seq),
+                streamed_change(policy),
+            );
+        };
+        observe(80, AckPolicy::DiskAndRam);
+        observe(90, AckPolicy::Disk);
         let mut last_refused = None;
         consider(AckPolicy::DiskAndRam, &mut last_refused);
         let (_, reason) = last_refused.expect("refused");
@@ -1198,9 +1201,7 @@ mod tests {
         assert!(!control.promote.is_requested());
 
         // Restored in the stream: the failover proceeds.
-        control
-            .lineage_ack_policy
-            .observe(95, streamed_change(AckPolicy::DiskAndRam));
+        observe(95, AckPolicy::DiskAndRam);
         consider(AckPolicy::Disk, &mut last_refused);
         assert!(control.promote.is_requested(), "promotion filed");
     }

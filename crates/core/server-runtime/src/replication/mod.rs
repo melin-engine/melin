@@ -1982,7 +1982,7 @@ mod tests {
                 policy: AckPolicyByte(2),
                 unwitnessed: true,
             },
-            wire_seq: 9,
+            wire_seq: melin_transport_core::WireSeq::new(9),
             previous: Some(AckPolicyByte(1)),
         });
         let cell = SharedLineagePolicy::new(stale);
@@ -2031,7 +2031,7 @@ mod tests {
                     policy: AckPolicyByte(0),
                     unwitnessed: false,
                 },
-                wire_seq: 3,
+                wire_seq: melin_transport_core::WireSeq::new(3),
                 previous: None,
             }),
             "the journal's own record, at the change's sequence"
@@ -2094,7 +2094,7 @@ mod tests {
         let control = ReplicaControlPlane::new();
         let held = Some(melin_transport_core::lineage::LineagePolicy::after(
             None,
-            1,
+            melin_transport_core::WireSeq::new(1),
             melin_journal::AckPolicyChange {
                 policy: crate::ack_policy::AckPolicy::DiskAndRam.to_byte(),
                 unwitnessed: false,

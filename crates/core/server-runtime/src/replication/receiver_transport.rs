@@ -403,7 +403,7 @@ fn accept_slot<E: AppEvent>(
     abort: impl FnMut() -> bool,
 ) -> Result<u64, melin_pipeline::ring::Full> {
     let change = slot.event.ack_policy_change();
-    let wire_seq = slot.sequence;
+    let wire_seq = melin_transport_core::WireSeq::new(slot.sequence);
     let index = batch.push_with_or_abort(|s| *s = slot, abort)?;
     if let Some(change) = change {
         lineage_policy.observe(wire_seq, change);
@@ -2149,14 +2149,12 @@ mod tests {
         wire_seq: u64,
         previous: Option<crate::ack_policy::AckPolicy>,
     ) -> Option<melin_transport_core::lineage::LineagePolicy> {
-        Some(melin_transport_core::lineage::LineagePolicy {
-            change: melin_journal::AckPolicyChange {
-                policy: policy.to_byte(),
-                unwitnessed: false,
-            },
+        crate::policy_control::test_support::lineage(
+            policy.to_byte(),
+            false,
             wire_seq,
-            previous: previous.map(|p| p.to_byte()),
-        })
+            previous.map(|p| p.to_byte()),
+        )
     }
 
     /// Finding 10 of the determinism audit, at the receiver: with ticks

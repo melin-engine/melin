@@ -224,7 +224,7 @@ pub(crate) fn initial_gate_policy(
     Ok(GateStart {
         in_force: known_lineage_policy(previous)?,
         pending: Some(PendingChange {
-            wire_seq: WireSeq::new(lineage.wire_seq),
+            wire_seq: lineage.wire_seq,
             policy: newest,
             unwitnessed: lineage.change.unwitnessed,
         }),

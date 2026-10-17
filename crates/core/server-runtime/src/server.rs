@@ -5337,7 +5337,7 @@ mod primary_gate_policy_tests {
                 policy: AckPolicy::TwoDisks.to_byte(),
                 unwitnessed: false,
             },
-            wire_seq: 7,
+            wire_seq: WireSeq::new(7),
             previous: Some(AckPolicy::Ram.to_byte()),
         };
         let policy = primary_gate_policy(Some(lineage), AckPolicy::Disk, Enabled, &stage)
@@ -5373,8 +5373,8 @@ mod primary_gate_policy_tests {
             unwitnessed,
         };
         let record = melin_transport_core::lineage::SharedLineagePolicy::default();
-        record.observe(1, streamed(AckPolicy::DiskAndRam, false));
-        record.observe(6, streamed(AckPolicy::Disk, false));
+        record.observe(WireSeq::new(1), streamed(AckPolicy::DiskAndRam, false));
+        record.observe(WireSeq::new(6), streamed(AckPolicy::Disk, false));
         let start = |record: &melin_transport_core::lineage::SharedLineagePolicy| {
             primary_gate_policy(record.load(), AckPolicy::Disk, Enabled, &matching_stage())
                 .expect("a known policy")
@@ -5389,7 +5389,7 @@ mod primary_gate_policy_tests {
             }),
         };
         assert_eq!(start(&record), pending(false));
-        record.observe(9, streamed(AckPolicy::Disk, true));
+        record.observe(WireSeq::new(9), streamed(AckPolicy::Disk, true));
         assert_eq!(start(&record), pending(true));
     }
 }

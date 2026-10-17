@@ -1335,7 +1335,7 @@ mod tests {
                     policy: PRIMARY_POLICY,
                     unwitnessed: true,
                 },
-                wire_seq: 3,
+                wire_seq: WireSeq::new(3),
                 previous: Some(AckPolicyByte(2)),
             };
 
@@ -1517,7 +1517,7 @@ mod tests {
                         policy: DIVERGENT_POLICY,
                         unwitnessed: false,
                     },
-                    wire_seq: 1,
+                    wire_seq: WireSeq::new(1),
                     previous: None,
                 }),
                 "recovery must store the forked journal's policy"

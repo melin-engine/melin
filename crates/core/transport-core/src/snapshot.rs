@@ -328,7 +328,7 @@ impl SnapshotHeader {
                             policy: AckPolicyByte(policy),
                             unwitnessed: has(LINEAGE_UNWITNESSED),
                         },
-                        wire_seq: policy_wire_seq,
+                        wire_seq: WireSeq::new(policy_wire_seq),
                         previous: has(LINEAGE_PREVIOUS_KNOWN).then_some(AckPolicyByte(previous)),
                     }),
                 )
@@ -430,7 +430,12 @@ fn save_with_limit<A: Application>(
                 .and_then(|p| p.previous)
                 .map_or(0, |p| p.0),
         );
-        buf.extend_from_slice(&lineage.ack_policy.map_or(0, |p| p.wire_seq).to_le_bytes());
+        buf.extend_from_slice(
+            &lineage
+                .ack_policy
+                .map_or(0, |p| p.wire_seq.get())
+                .to_le_bytes(),
+        );
     }
     // App payload.
     app.snapshot(&mut buf)?;
@@ -665,7 +670,7 @@ mod tests {
                 policy: AckPolicyByte(policy),
                 unwitnessed,
             },
-            wire_seq,
+            wire_seq: WireSeq::new(wire_seq),
             previous: previous.map(AckPolicyByte),
         })
     }

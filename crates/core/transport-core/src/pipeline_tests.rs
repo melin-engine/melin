@@ -4738,7 +4738,7 @@ fn the_shadow_records_its_initial_lineage_until_a_change() {
                 policy: AckPolicyByte(1),
                 unwitnessed: false,
             },
-            wire_seq: 7,
+            wire_seq: WireSeq::new(7),
             previous: Some(AckPolicyByte(2)),
         }),
     };
@@ -4774,7 +4774,7 @@ fn the_shadow_records_its_initial_lineage_until_a_change() {
                     policy: AckPolicyByte(0),
                     unwitnessed: true,
                 },
-                wire_seq: SHADOW_FIRST_WIRE_SEQ + 2,
+                wire_seq: WireSeq::new(SHADOW_FIRST_WIRE_SEQ + 2),
                 previous: Some(AckPolicyByte(1)),
             }),
         },

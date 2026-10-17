@@ -847,8 +847,8 @@ and is committed on its own. Tests land with the step they pin.
      (`Option<WireSeq>`, no more "0 means none") and `apply_change`'s
      argument are `WireSeq`; the gate's comparisons with output slots and
      the cached durable position stay `u64`, converted at that boundary.
-     `LineagePolicy::wire_seq` stays `u64`: it is public, snapshot-encoded
-     and folded on several paths, a wider change than this one.
+     `LineagePolicy::wire_seq` stayed `u64` here (it became a `WireSeq`
+     in the final review follow-up below).
    - *Standalone is one type.* `initial_gate_policy` takes a
      `halt::Replication` read from the halt gate itself
      (`HaltGate::replication`), so the gate's start and the producer's

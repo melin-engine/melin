@@ -372,7 +372,8 @@ Anything source-breaking is called out under **Removed** or **Changed**.
     sequence of the first entry it will consume; `JournaledApp::from_parts`
     takes a `Lineage`, and `recovered_epoch` became `recovered_lineage`.
     `Lineage::ack_policy` is a `LineagePolicy` (the policy, and the
-    change that put it in force with the policy before it).
+    change that put it in force, at a `WireSeq`, with the policy before
+    it).
   - `replication::protocol::PrimaryMessage::StreamStart` and `Heartbeat`
     lost their `ack_policy` field, and `encode_stream_start`,
     `encode_heartbeat` and `replication::catchup::snapshot_transfer_with`

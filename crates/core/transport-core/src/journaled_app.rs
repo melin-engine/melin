@@ -841,7 +841,7 @@ fn replay_segment<A: Application>(
                     // when the event was live. A query is never journaled,
                     // so every entry here is one `apply` handled live.
                     // The entry's sequence is its wire sequence.
-                    let wire_seq = entry.sequence;
+                    let wire_seq = crate::cursors::WireSeq::new(entry.sequence);
                     dispatch(
                         app,
                         entry.event,
@@ -1329,7 +1329,7 @@ mod tests {
                 policy: AckPolicyByte(policy),
                 unwitnessed,
             },
-            wire_seq,
+            wire_seq: crate::cursors::WireSeq::new(wire_seq),
             previous: previous.map(AckPolicyByte),
         })
     }

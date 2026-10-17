@@ -163,7 +163,7 @@ pub fn run<A: Application>(
                     key_hash: slot.key_hash,
                 },
                 &mut last_drain_ns,
-                |event| shadow_lineage.observe(wire_seq, event),
+                |event| shadow_lineage.observe(crate::cursors::WireSeq::new(wire_seq), event),
                 &mut reports,
             );
             reports.clear();

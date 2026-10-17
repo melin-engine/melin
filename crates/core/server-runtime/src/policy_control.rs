@@ -595,6 +595,7 @@ pub(crate) mod test_support {
     use melin_journal::AckPolicyByte;
     use melin_pipeline::ring::{Consumer, DisruptorBuilder};
     use melin_pipeline::wait::WaitStrategy;
+    use melin_transport_core::WireSeq;
 
     /// A replicating node's mailbox whose requests wait at most
     /// `publish_wait`.
@@ -633,7 +634,7 @@ pub(crate) mod test_support {
                 policy,
                 unwitnessed,
             },
-            wire_seq,
+            wire_seq: WireSeq::new(wire_seq),
             previous,
         })
     }
@@ -679,6 +680,7 @@ mod tests {
     use crate::halt::test_support::{gate_over, presence};
     use counter_server::CounterEvent as TestEvent;
     use melin_pipeline::ring::Consumer;
+    use melin_transport_core::WireSeq;
     use melin_transport_core::replica_presence::Lowered;
 
     const ALL: [AckPolicy; 4] = [
@@ -832,7 +834,8 @@ mod tests {
         );
         // A repeat of the policy keeps the transition, witnessed unless one
         // of the run was not: the fold the restart reads.
-        let repeated = LineagePolicy::after(waiting, 4, change(AckPolicy::Disk, false));
+        let repeated =
+            LineagePolicy::after(waiting, WireSeq::new(4), change(AckPolicy::Disk, false));
         assert_eq!(
             boot_entry(Some(repeated), AckPolicy::Disk, Disabled),
             Some(BootEntry::TakesEffectUnwitnessed)
@@ -861,10 +864,10 @@ mod tests {
         let journaled = changes(&mut consumer);
         assert_eq!(journaled, [change(AckPolicy::Disk, true)]);
 
-        let folded = LineagePolicy::after(waiting, 5, journaled[0]);
+        let folded = LineagePolicy::after(waiting, WireSeq::new(5), journaled[0]);
         assert_eq!(
             (folded.wire_seq, folded.change.unwitnessed),
-            (3, true),
+            (WireSeq::new(3), true),
             "the same transition, now marked"
         );
         drop(
