@@ -21,6 +21,8 @@ workspace = true
 
 [dependencies]
 melin-app = { workspace = true }
+# The admin endpoint's authenticated connection (`probe`).
+melin-client = { workspace = true }
 # Pulled without default features (see the root manifest): whether the
 # journal carries the hash chain is the test crate's choice, made through
 # its own dependency on the runtime, not this crate's.

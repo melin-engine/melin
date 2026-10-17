@@ -51,7 +51,7 @@
 
 use std::convert::Infallible;
 use std::os::fd::OwnedFd;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -206,8 +206,9 @@ enum Producer {
 }
 
 /// The mailbox's state. Behind one mutex: it is touched by the admin
-/// thread per command and by the producer only when a request waits, never
-/// on the producer's steady-state path (that reads [`AckPolicyControl::pending`]).
+/// thread per command, by the producer only when a request waits, never
+/// on the producer's steady-state path (that reads [`AckPolicyControl::pending`]),
+/// and by auto-promotion's fallback ([`AckPolicyControl::requested`]).
 struct State {
     /// Whether a producer is attached, and how to wake it.
     producer: Producer,
@@ -216,6 +217,9 @@ struct State {
     /// The last ticket handed out, and the last one published.
     issued: u64,
     published: u64,
+    /// The requested policy: the one the next boot or promotion requests,
+    /// i.e. the configured one, then each one staged or journaled.
+    requested: AckPolicy,
 }
 
 /// The mailbox between the admin `ACK-POLICY` command and the input ring's
@@ -229,13 +233,6 @@ pub struct AckPolicyControl {
     /// Set while a request waits for the producer: the one load the
     /// producer's loop pays.
     pending: AtomicBool,
-    /// The byte of the requested policy: the one the next boot or
-    /// promotion requests, i.e. the configured one, then each one staged
-    /// or journaled. Written only under the state's lock; also read without
-    /// it by auto-promotion's fallback, used only while a replica's lineage
-    /// holds no change. A `u8` atomic rather than a field of [`State`] for
-    /// that reader, and the only copy, so the two cannot disagree.
-    requested: Arc<AtomicU8>,
     publish_wait: Duration,
 }
 
@@ -253,29 +250,20 @@ impl AckPolicyControl {
                 request: None,
                 issued: 0,
                 published: 0,
+                requested: configured,
             }),
             changed: Condvar::new(),
             pending: AtomicBool::new(false),
-            requested: Arc::new(AtomicU8::new(configured.as_u8())),
             publish_wait,
         })
     }
 
-    /// The requested policy's byte, shared: see the field.
-    pub(crate) fn requested_byte(&self) -> Arc<AtomicU8> {
-        Arc::clone(&self.requested)
-    }
-
-    /// The requested policy. Read under the state's lock (the guard is the
-    /// proof), which every write holds too.
-    fn requested(&self, _locked: &MutexGuard<'_, State>) -> AckPolicy {
-        AckPolicy::from_u8(self.requested.load(Ordering::Relaxed))
-            .expect("only a policy's own byte is ever stored")
-    }
-
-    /// Record `policy` as the requested one, under the state's lock.
-    fn set_requested(&self, _locked: &MutexGuard<'_, State>, policy: AckPolicy) {
-        self.requested.store(policy.as_u8(), Ordering::Relaxed);
+    /// The requested policy ([`State::requested`]), for a reader off the
+    /// producer's path: auto-promotion's fallback, used only while a
+    /// replica's lineage holds no change. Takes the state's lock, which
+    /// only the admin thread and a producer publishing a request contend.
+    pub(crate) fn requested(&self) -> AckPolicy {
+        self.lock().requested
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -298,7 +286,7 @@ impl AckPolicyControl {
         let deadline = Instant::now() + self.publish_wait;
         let mut state = self.lock();
         let Producer::Attached { wake } = &state.producer else {
-            self.set_requested(&state, policy);
+            state.requested = policy;
             return RequestOutcome::Staged;
         };
         if state.request.is_some() {
@@ -349,10 +337,9 @@ impl AckPolicyControl {
     /// request as it starts, and the right to attach its producer. Called
     /// once, by the primary's main thread, before it journals that policy.
     pub(crate) fn claim(self: &Arc<Self>) -> PublisherClaim {
-        let state = self.lock();
         PublisherClaim {
             control: Arc::clone(self),
-            policy: self.requested(&state),
+            policy: self.requested(),
         }
     }
 }
@@ -435,7 +422,7 @@ impl BootedClaim {
         let staged = {
             let mut state = control.lock();
             state.producer = Producer::Attached { wake };
-            control.requested(&state)
+            state.requested
         };
         // Outside the lock: a full ring blocks this publish, and the admin
         // thread must not block on the lock behind it. Nothing else can
@@ -499,7 +486,7 @@ impl AckPolicyPublisher {
         };
         state.request = None;
         state.published = request.ticket;
-        control.set_requested(&state, request.policy);
+        state.requested = request.policy;
         control.pending.store(false, Ordering::Release);
         control.changed.notify_all();
         drop(state);
@@ -718,16 +705,13 @@ mod tests {
     }
 
     /// With no producer attached a request is staged: the next claim
-    /// requests it, and the shared byte follows.
+    /// requests it, and so does auto-promotion's fallback.
     #[test]
     fn a_request_with_no_producer_is_staged_for_the_next_claim() {
         let control = AckPolicyControl::new(AckPolicy::DiskAndRam);
         assert_eq!(control.claim().policy(), AckPolicy::DiskAndRam);
         assert_eq!(control.request(AckPolicy::Ram), RequestOutcome::Staged);
-        assert_eq!(
-            control.requested_byte().load(Ordering::Relaxed),
-            AckPolicy::Ram.as_u8()
-        );
+        assert_eq!(control.requested(), AckPolicy::Ram);
         assert_eq!(control.claim().policy(), AckPolicy::Ram);
     }
 
@@ -781,10 +765,6 @@ mod tests {
                 change(AckPolicy::TwoDisks, false),
             ]
         );
-        assert_eq!(
-            control.requested_byte().load(Ordering::Relaxed),
-            AckPolicy::TwoDisks.as_u8()
-        );
         assert_eq!(control.claim().policy(), AckPolicy::TwoDisks);
     }
 
@@ -826,10 +806,7 @@ mod tests {
         assert_eq!(changes(&mut consumer).len(), 2, "only what filled the ring");
         publisher.poll(&mut producer, &halt);
         assert!(changes(&mut consumer).is_empty(), "withdrawn");
-        assert_eq!(
-            control.requested_byte().load(Ordering::Relaxed),
-            AckPolicy::DiskAndRam.as_u8()
-        );
+        assert_eq!(control.requested(), AckPolicy::DiskAndRam);
         assert_ne!(halt.verdict(), Verdict::Take, "still halted");
     }
 

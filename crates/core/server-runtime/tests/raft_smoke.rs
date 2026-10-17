@@ -12,12 +12,9 @@ use counter_server::{Counter, RequestDecoder, ResponseEncoder};
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
+use melin_test_node::probe::http_metrics;
 use melin_transport_core::test_ports::free_addr;
 use serial_test::serial;
-
-#[path = "common/probe.rs"]
-mod probe;
-use probe::http_metrics;
 
 /// Port range this file owns for `free_addr` (25000..30000);
 /// `raft_failover.rs` owns 20000..25000.

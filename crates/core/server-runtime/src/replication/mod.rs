@@ -946,8 +946,9 @@ impl<A, W> AfterSession<A, W> {
 /// frees the local socket-set entry; the kernel-TCP receiver passes a
 /// no-op (its `TcpStream` is dropped by the caller, and the kernel tells
 /// the primary).
-// Thirteen arguments is a lot, but each is a distinct piece of the
-// receiver loop's state; bundling them would only move the noise.
+// A long argument list, but each is a distinct piece of the receiver
+// loop's state, borrowed from its locals; bundling them would only move
+// the noise.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::replication) fn handle_session_exit<A, W>(
     result: StreamingResult,
@@ -1159,17 +1160,21 @@ where
     }
 }
 
-/// The facts a successful snapshot + segment-seed transfer yields:
-/// `(snapshot App, snapshot sequence, snapshot chain hash, seed length,
-/// snapshot lineage)`. The lineage is adopted by the caller once the
-/// whole transfer has succeeded, so a failed one leaves none behind.
-type ResyncTransfer<A> = (
-    A,
-    u64,
-    [u8; 32],
-    u64,
-    melin_transport_core::lineage::Lineage,
-);
+/// The facts a successful snapshot + segment-seed transfer yields.
+struct ResyncTransfer<A> {
+    /// The application loaded from the transferred snapshot.
+    app: A,
+    /// The snapshot's sequence: where the seeded segment is opened.
+    snap_sequence: u64,
+    /// The snapshot's chain hash, as the primary announced and the loaded
+    /// snapshot confirmed.
+    snap_chain_hash: [u8; 32],
+    /// The seed's length: the seeded journal's `valid_end`.
+    seed_len: u64,
+    /// The snapshot's lineage. Adopted by the caller once the whole
+    /// transfer has succeeded, so a failed one leaves none behind.
+    lineage: melin_transport_core::lineage::Lineage,
+}
 
 /// What [`handle_resync_verdict`] resolved a `NeedSnapshot` /
 /// `HashMismatch` verdict to.
@@ -1194,9 +1199,8 @@ pub(in crate::replication) enum ResyncDecision {
 
 /// Receive the snapshot + segment-seed transfer that follows a resync
 /// verdict, installing both (snapshot → `snapshot_path`, seed →
-/// `journal_path`). Returns the snapshot App, its sequence + chain hash,
-/// the seed length (the journal's `valid_end`) and the snapshot's
-/// lineage. Shared by both receivers via [`ControlFrameSource`].
+/// `journal_path`), and returns what they yield ([`ResyncTransfer`]).
+/// Shared by both receivers via [`ControlFrameSource`].
 ///
 /// Errors here are network-shaped — the caller retries (see
 /// [`ResyncDecision::Retry`]); the post-transfer install in
@@ -1267,13 +1271,13 @@ where
         melin_journal::segment::fsync_parent_dir(journal_path)?;
         Ok(())
     })?;
-    Ok((
-        snap_app,
+    Ok(ResyncTransfer {
+        app: snap_app,
         snap_sequence,
         snap_chain_hash,
         seed_len,
-        snap_header.lineage,
-    ))
+        lineage: snap_header.lineage,
+    })
 }
 
 /// Handle a `NeedSnapshot` / `HashMismatch` resync verdict — shared by
@@ -1375,18 +1379,23 @@ where
         .journal_tip
         .reset(melin_transport_core::WireSeq::new(0));
 
-    let (snap_app, snap_sequence, snap_chain_hash, seed_len, snap_lineage) =
-        match receive_resync_transfer::<A, S>(source, snapshot_path, journal_path) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(error = %e, "snapshot transfer failed — retrying");
-                // Half-applied resync state, not audit material — drop it
-                // so the retry starts clean (the pre-resync lineage is
-                // already archived; this is not it).
-                let _ = std::fs::remove_file(snapshot_path);
-                return Ok(ResyncDecision::Retry);
-            }
-        };
+    let ResyncTransfer {
+        app: snap_app,
+        snap_sequence,
+        snap_chain_hash,
+        seed_len,
+        lineage: snap_lineage,
+    } = match receive_resync_transfer::<A, S>(source, snapshot_path, journal_path) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "snapshot transfer failed — retrying");
+            // Half-applied resync state, not audit material — drop it
+            // so the retry starts clean (the pre-resync lineage is
+            // already archived; this is not it).
+            let _ = std::fs::remove_file(snapshot_path);
+            return Ok(ResyncDecision::Retry);
+        }
+    };
     // Adopt the primary's snapshot lineage — the resync rebases this
     // replica onto the primary's lineage, its epoch and ack policy
     // included. Only now: a transfer that failed part-way adopts nothing.

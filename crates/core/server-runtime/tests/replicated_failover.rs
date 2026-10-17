@@ -58,15 +58,12 @@ use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
 use melin_test_node::Addrs;
+use melin_test_node::probe::{admin_command, http_metrics, wait_for_gauge};
 use melin_transport_core::test_ports::free_addr;
 use melin_wire_protocol::control_codec::{
     TAG_APP, TAG_BATCH_END, TAG_CHALLENGE, TAG_CHALLENGE_RESPONSE, TAG_LEN, TAG_SERVER_READY,
 };
 use serial_test::serial;
-
-#[path = "common/probe.rs"]
-mod probe;
-use probe::{admin_command, http_metrics, wait_for_gauge};
 
 /// Port range this file owns for `free_addr` (10000..15000);
 /// `melin-raft`'s election tests own 15000..20000, `raft_failover.rs`

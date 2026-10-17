@@ -344,7 +344,8 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   - The info-level "ack policy changed by operator" log is replaced by
     "ack policy change requested by operator" (or "staged"), "ack policy
     change journaled", and "ack policy switched" (with `prev`, `next`
-    and the cause) when it takes effect.
+    and the cause) when it takes effect; a change repeating the policy
+    in force switches nothing and logs no switch.
 - **Source-breaking API changes for journaled ack-policy changes.**
   - `melin_journal::JournalEvent` has a new variant,
     `AckPolicyChange(AckPolicyChange)`, and

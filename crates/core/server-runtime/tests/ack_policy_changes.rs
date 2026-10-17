@@ -41,16 +41,13 @@ use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::{JournalStagingMode, ServerConfig};
+use melin_test_node::probe::{admin_command, gauge, wait_for_gauge};
 use melin_test_node::{Addrs, Node};
 use melin_transport_core::test_ports::free_addr;
 
 #[path = "common/raw_replica.rs"]
 mod raw_replica;
 use raw_replica::RawReplica;
-
-#[path = "common/probe.rs"]
-mod probe;
-use probe::{admin_command, gauge, wait_for_gauge};
 
 /// Port range for `free_addr`, shared with the other cluster tests: every
 /// other range below the ephemeral floor is taken. Sharing is safe only

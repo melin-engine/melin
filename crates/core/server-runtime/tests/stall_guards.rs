@@ -28,6 +28,7 @@ use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::layout::{PipelineCores, Placement};
 use melin_server_runtime::server::{JournalStagingMode, ServerConfig};
+use melin_test_node::probe::{gauge, wait_for_gauge};
 use melin_test_node::sched::{first_pinnable_cpu, set_batch_policy, threads_named};
 use melin_test_node::{Addrs, Node};
 use melin_transport_core::test_ports::free_addr;
@@ -35,10 +36,6 @@ use melin_transport_core::test_ports::free_addr;
 #[path = "common/raw_replica.rs"]
 mod raw_replica;
 use raw_replica::RawReplica;
-
-#[path = "common/probe.rs"]
-mod probe;
-use probe::{gauge, wait_for_gauge};
 
 /// Port range for `free_addr`, shared with the other cluster tests: every
 /// other range below the ephemeral floor is taken. Sharing is safe only
@@ -476,13 +473,14 @@ fn a_replica_that_takes_entries_but_persists_none_is_reported() {
     }
     assert!(!logged(RESUMED), "no recovery before the replica persists");
 
-    // Persists again: everything it has taken in.
+    // Persists again: everything it has taken in, both tracks level, as a
+    // replica streaming acks.
     while !logged(RESUMED) {
         assert!(
             Instant::now() < deadline,
             "the primary never said the replica persists again"
         );
-        replica.ack_tracks(taken, taken);
+        replica.ack(taken);
         std::thread::sleep(ACK_INTERVAL);
     }
 

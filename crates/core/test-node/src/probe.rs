@@ -1,12 +1,8 @@
 //! Reading a running node from the outside, as an operator does: its
 //! health endpoint's gauges and its admin endpoint's replies.
 //!
-//! Each test binary that uses it includes this file as a module (`#[path]`),
-//! and compiles its own copy.
-
-// Each test binary compiles its own copy of this module and uses a subset
-// of it; what one binary leaves unused is another's.
-#![allow(dead_code)]
+//! Both endpoints are kernel TCP on either transport (see the crate docs),
+//! so the same calls read a node on DPDK.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -40,11 +36,16 @@ pub fn gauge(health: SocketAddr, name: &str) -> Option<u64> {
 
 /// Wait, at most [`GAUGE_LIMIT`], until `name` reads `value`.
 pub fn wait_for_gauge(health: SocketAddr, name: &str, value: u64) {
-    let deadline = Instant::now() + GAUGE_LIMIT;
+    wait_for_gauge_within(health, name, value, GAUGE_LIMIT);
+}
+
+/// Wait, at most `limit`, until `name` reads `value`.
+pub fn wait_for_gauge_within(health: SocketAddr, name: &str, value: u64, limit: Duration) {
+    let deadline = Instant::now() + limit;
     while gauge(health, name) != Some(value) {
         assert!(
             Instant::now() < deadline,
-            "{name} never reached {value} (last: {:?})",
+            "{name} did not reach {value} within {limit:?} (last: {:?})",
             gauge(health, name)
         );
         std::thread::sleep(Duration::from_millis(100));

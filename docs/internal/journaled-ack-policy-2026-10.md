@@ -394,7 +394,8 @@ and is committed on its own. Tests land with the step they pin.
    rule (requested policy when replication is disabled). The atomic's
    other readers (the senders' `StreamStart`/`Heartbeat` byte and
    auto-promotion's fallback, both step 5's) read the mailbox's
-   `requested_byte`, updated when a request is staged or journaled.
+   `requested_byte`, updated when a request is staged or journaled
+   (later a field of its locked state, see **Review cleanups**).
 
    Three things the plan did not settle. First, **a request with no
    producer attached is staged, and the reply says so**: `OK staged`, not
@@ -466,7 +467,8 @@ and is committed on its own. Tests land with the step they pin.
    `encode_stream_start`, `encode_heartbeat` and `snapshot_transfer_with`
    signatures that lost the byte. The
    auto-promotion fallback, used only while the lineage holds no change,
-   is the mailbox's `requested_byte`, its last reader.
+   is the mailbox's `requested_byte`, its last reader (later a field of
+   the mailbox's locked state, see **Review cleanups**).
 
    Two things the plan did not say. First, **the promotion drain follows
    changes too**: it publishes slots on the same `accept_slot`, so a
@@ -813,6 +815,20 @@ and is committed on its own. Tests land with the step they pin.
      drop is now told apart by its ticket, so a producer replaced while
      a request waits refuses it as stopped at once rather than at the
      bound.
+
+   **Review cleanups.** The mailbox's requested policy is a field of its
+   locked state, no longer the shared `requested_byte` atomic: its one
+   lock-free reader, auto-promotion's fallback, now takes the cold lock
+   through `AckPolicyControl::requested`, and only while the lineage holds
+   no change. The gate's `switch_to` does nothing for a change repeating
+   the policy in force (a boot or standalone entry, a re-sent request):
+   no "ack policy switched" log, no reset of the cached durable position
+   or re-seed of the logger; the change still counts as applied. The
+   resync transfer's result is a named struct. The integration tests'
+   health and admin helpers moved from a `#[path]` module carrying
+   `allow(dead_code)` into `melin_test_node::probe`, which the DPDK veth
+   suite and the notary example's tests now share instead of their own
+   copies; the scripted replica module needs no allowance.
 
 ## Downstream impact (Exchange Core)
 

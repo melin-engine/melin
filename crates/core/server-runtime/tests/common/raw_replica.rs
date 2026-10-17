@@ -3,11 +3,9 @@
 //! stream and acks only when, and what, its test tells it to.
 //!
 //! Each test binary that uses it includes this file as a module (`#[path]`),
-//! and compiles its own copy.
-
-// Each test binary compiles its own copy of this module and uses a subset
-// of it; what one binary leaves unused is another's.
-#![allow(dead_code)]
+//! and compiles its own copy. It carries no dead-code allowance: an item
+//! one includer leaves unused warns there, and is moved or dropped rather
+//! than hidden.
 
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};

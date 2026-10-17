@@ -35,14 +35,11 @@ use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
+use melin_test_node::probe::{admin_command, gauge, http_metrics, wait_for_gauge};
 use melin_test_node::{Addrs, Node};
 use melin_transport_core::test_ports::free_addr;
 use melin_wire_protocol::control_codec::TAG_CHALLENGE;
 use serial_test::serial;
-
-#[path = "common/probe.rs"]
-mod probe;
-use probe::{admin_command, gauge, http_metrics, wait_for_gauge};
 
 /// Port range this file owns for `free_addr` (20000..25000);
 /// `raft_smoke.rs` owns 25000..30000, `melin-raft`'s election tests

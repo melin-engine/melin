@@ -790,12 +790,11 @@ mod tests {
     /// with no producer attached (a replica, or a primary still
     /// starting), send the supplied command, and return `(response,
     /// policy_after)`: the policy the next promotion would request.
-    fn run_ack_policy(initial: AckPolicy, cmd: &[u8]) -> (String, Option<AckPolicy>) {
+    fn run_ack_policy(initial: AckPolicy, cmd: &[u8]) -> (String, AckPolicy) {
         let control = AckPolicyControl::new(initial);
         let (key, addr, shutdown) = spawn_with_policy(&control);
         let resp = send_command(addr, &key, cmd);
-        let after = AckPolicy::from_u8(control.requested_byte().load(Ordering::Relaxed));
-        assert_eq!(after, Some(control.claim().policy()));
+        let after = control.claim().policy();
         shutdown.store(true, Ordering::Release);
         (resp, after)
     }
@@ -804,7 +803,7 @@ mod tests {
     fn ack_policy_command_stages_the_policy_with_no_producer() {
         let (resp, after) = run_ack_policy(AckPolicy::DiskAndRam, b"ACK-POLICY disk\n");
         assert_eq!(resp, "OK staged");
-        assert_eq!(after, Some(AckPolicy::Disk));
+        assert_eq!(after, AckPolicy::Disk);
     }
 
     /// On a serving primary the command replies `OK` once its producer has
@@ -867,10 +866,7 @@ mod tests {
             ack_policy_reply(RequestOutcome::Refused(Refused::RingFull)),
             "{resp}"
         );
-        assert_eq!(
-            control.requested_byte().load(Ordering::Relaxed),
-            AckPolicy::DiskAndRam.as_u8()
-        );
+        assert_eq!(control.requested(), AckPolicy::DiskAndRam);
         shutdown.store(true, Ordering::Release);
     }
 
@@ -903,19 +899,19 @@ mod tests {
         // land on the policy the old name meant.
         let (resp, after) = run_ack_policy(AckPolicy::DiskAndRam, b"DURABILITY local\n");
         assert_eq!(resp, "OK staged");
-        assert_eq!(after, Some(AckPolicy::Disk));
+        assert_eq!(after, AckPolicy::Disk);
 
         let (resp, after) = run_ack_policy(AckPolicy::Disk, b"DURABILITY durably-replicated\n");
         assert_eq!(resp, "OK staged");
-        assert_eq!(after, Some(AckPolicy::TwoDisks));
+        assert_eq!(after, AckPolicy::TwoDisks);
 
         // The alias also takes the new names, and still rejects junk.
         let (resp, after) = run_ack_policy(AckPolicy::Disk, b"DURABILITY ram\n");
         assert_eq!(resp, "OK staged");
-        assert_eq!(after, Some(AckPolicy::Ram));
+        assert_eq!(after, AckPolicy::Ram);
         let (resp, after) = run_ack_policy(AckPolicy::Disk, b"DURABILITY fast\n");
         assert!(resp.starts_with("ERR ACK-POLICY unknown policy"), "{resp}");
-        assert_eq!(after, Some(AckPolicy::Disk));
+        assert_eq!(after, AckPolicy::Disk);
     }
 
     #[test]
@@ -929,7 +925,7 @@ mod tests {
             let cmd = format!("ACK-POLICY {}\n", target.as_str());
             let (resp, after) = run_ack_policy(AckPolicy::Disk, cmd.as_bytes());
             assert_eq!(resp, "OK staged", "policy {target}");
-            assert_eq!(after, Some(target));
+            assert_eq!(after, target);
         }
     }
 
@@ -940,8 +936,8 @@ mod tests {
             resp.starts_with("ERR ACK-POLICY unknown policy"),
             "expected unknown-policy ERR, got {resp}"
         );
-        // Atomic must NOT have been clobbered on a bad command.
-        assert_eq!(after, Some(AckPolicy::DiskAndRam));
+        // The requested policy must NOT have been clobbered on a bad command.
+        assert_eq!(after, AckPolicy::DiskAndRam);
     }
 
     #[test]
@@ -951,7 +947,7 @@ mod tests {
             resp.starts_with("ERR ACK-POLICY requires a policy"),
             "expected missing-arg ERR, got {resp}"
         );
-        assert_eq!(after, Some(AckPolicy::DiskAndRam));
+        assert_eq!(after, AckPolicy::DiskAndRam);
     }
 
     #[test]

@@ -35,6 +35,7 @@ use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
+use melin_test_node::probe::admin_command;
 use melin_test_node::{Addrs, Node};
 use melin_transport_core::pipeline::InputSlot;
 use melin_transport_core::replication::protocol::{
@@ -43,10 +44,6 @@ use melin_transport_core::replication::protocol::{
 };
 use melin_transport_core::replication_wire::encode_input_batch;
 use melin_transport_core::test_ports::free_addr;
-
-#[path = "common/probe.rs"]
-mod probe;
-use probe::admin_command;
 
 /// Port range for `free_addr`, shared with the other cluster binaries:
 /// safe because they are all in nextest's `cluster-serial` group.

@@ -10,7 +10,7 @@
 //! effectively immediately.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use melin_raft::recency::{JournalTip, PeerTips};
@@ -20,6 +20,7 @@ use tracing::{info, warn};
 use melin_journal::AckPolicyByte;
 
 use crate::ack_policy::AckPolicy;
+use crate::policy_control::AckPolicyControl;
 use crate::replication::ReplicaControlPlane;
 
 /// Poll cadence for the promotion thread. Matches the codebase's
@@ -135,12 +136,16 @@ fn observe_peer(
 /// Falls back to this node's own requested policy (configured, or staged
 /// by `ACK-POLICY`) only while the lineage holds no change: a lineage
 /// written before changes were journaled, until its primary's first boot
-/// under this release journals one. `None` for an unrecognised byte
-/// (e.g. a newer node's policy) — the caller refuses on it.
-fn effective_ack_policy(lineage: Option<AckPolicyByte>, local_fallback: u8) -> Option<AckPolicy> {
+/// under this release journals one; it is read only then. `None` for an
+/// unrecognised lineage byte (e.g. a newer node's policy) — the caller
+/// refuses on it.
+fn effective_ack_policy(
+    lineage: Option<AckPolicyByte>,
+    local_fallback: impl FnOnce() -> AckPolicy,
+) -> Option<AckPolicy> {
     match lineage {
         Some(byte) => AckPolicy::from_byte(byte),
-        None => AckPolicy::from_u8(local_fallback),
+        None => Some(local_fallback()),
     }
 }
 
@@ -309,7 +314,7 @@ fn consider_auto_promotion(
     status: &RaftStatus,
     control: &ReplicaControlPlane,
     fence_state: &melin_transport_core::fence::FenceState,
-    ack_policy: &AtomicU8,
+    ack_policy: &AckPolicyControl,
     peer_tips: &PeerTips,
     // Configured voter ids excluding this node.
     peer_ids: &[u64],
@@ -343,7 +348,7 @@ fn consider_auto_promotion(
     let inputs = AutoPromotionInputs {
         tip_ready: control.tip_ready.load(Ordering::Acquire),
         fenced: fence_state.is_fenced(),
-        ack_policy: effective_ack_policy(lineage_policy, ack_policy.load(Ordering::Relaxed)),
+        ack_policy: effective_ack_policy(lineage_policy, || ack_policy.requested()),
         primary_link_up: control.primary_link_up.load(Ordering::Acquire),
         primary_link_down_for,
         primary_observed: control.primary_observed.load(Ordering::Acquire),
@@ -666,7 +671,7 @@ pub(crate) fn spawn_auto_promotion(
     status: Arc<RaftStatus>,
     control: ReplicaControlPlane,
     fence_state: Arc<melin_transport_core::fence::FenceState>,
-    ack_policy: Arc<AtomicU8>,
+    ack_policy: Arc<AckPolicyControl>,
     peer_tips: Arc<PeerTips>,
     // Configured voter ids excluding this node — the peers the
     // journal-safety veto must account for.
@@ -1105,7 +1110,7 @@ mod tests {
         // Epoch 0 so the peer comparison turns on the sequence, and the
         // term (7) clears the fence-epoch check.
         let fence = melin_transport_core::fence::FenceState::new(0);
-        let policy = AtomicU8::new(AckPolicy::Ram.as_u8());
+        let policy = AckPolicyControl::new(AckPolicy::Ram);
         let peer_tips = PeerTips::new();
         // Peer 3 is a caught-up replica; peer 1 is the primary, unheard
         // — which digests to `Silent` rather than `Unknown` because this
@@ -1163,12 +1168,12 @@ mod tests {
             .advance(melin_transport_core::WireSeq::new(100));
         let fence = melin_transport_core::fence::FenceState::new(0);
         let peer_tips = PeerTips::new();
-        let consider = |requested: &AtomicU8, last: &mut Option<(u64, &'static str)>| {
+        let consider = |requested: AckPolicy, last: &mut Option<(u64, &'static str)>| {
             consider_auto_promotion(
                 &status,
                 &control,
                 &fence,
-                requested,
+                &AckPolicyControl::new(requested),
                 &peer_tips,
                 // No other voter: nothing for the peer-tip veto to weigh.
                 &[],
@@ -1187,10 +1192,7 @@ mod tests {
             .lineage_ack_policy
             .observe(90, streamed_change(AckPolicy::Disk));
         let mut last_refused = None;
-        consider(
-            &AtomicU8::new(AckPolicy::DiskAndRam.as_u8()),
-            &mut last_refused,
-        );
+        consider(AckPolicy::DiskAndRam, &mut last_refused);
         let (_, reason) = last_refused.expect("refused");
         assert!(reason.contains("`disk`"), "{reason}");
         assert!(!control.promote.is_requested());
@@ -1199,7 +1201,7 @@ mod tests {
         control
             .lineage_ack_policy
             .observe(95, streamed_change(AckPolicy::DiskAndRam));
-        consider(&AtomicU8::new(AckPolicy::Disk.as_u8()), &mut last_refused);
+        consider(AckPolicy::Disk, &mut last_refused);
         assert!(control.promote.is_requested(), "promotion filed");
     }
 
@@ -1386,14 +1388,16 @@ mod tests {
     fn effective_ack_policy_falls_back_and_refuses_garbage() {
         // A lineage holding no change falls back to this node's own policy.
         assert_eq!(
-            effective_ack_policy(None, AckPolicy::DiskAndRam.as_u8()),
+            effective_ack_policy(None, || AckPolicy::DiskAndRam),
             Some(AckPolicy::DiskAndRam)
         );
-        // Garbage bytes are None (caller refuses), on either side.
+        // A garbage lineage byte is None (caller refuses), and the local
+        // policy is not even read.
         assert_eq!(
-            effective_ack_policy(Some(AckPolicyByte(0x7F)), AckPolicy::DiskAndRam.as_u8()),
+            effective_ack_policy(Some(AckPolicyByte(0x7F)), || unreachable!(
+                "the lineage holds a change"
+            )),
             None
         );
-        assert_eq!(effective_ack_policy(None, 0x7F), None);
     }
 }

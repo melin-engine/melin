@@ -17,7 +17,6 @@
 //! `docs/internal/dpdk-testing.md`). Replication runs on the
 //! nodes' transport; the admin listener stays on kernel TCP either way.
 
-use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -29,6 +28,7 @@ use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
 use melin_test_node::Node as Server;
+use melin_test_node::probe::admin_command;
 use melin_transport_core::test_ports::free_addr;
 
 use notary_server::receipt::Receipt as SavedReceipt;
@@ -838,25 +838,6 @@ fn node_key() -> SigningKey {
 /// The operator: the only role the admin endpoint accepts.
 fn operator_key() -> SigningKey {
     SigningKey::from_bytes(&[0xEE; 32])
-}
-
-/// Send one admin command over a fresh authenticated connection and
-/// return the reply line, or `None` if the connection or handshake
-/// failed (the node is not up yet — callers retry).
-fn admin_command(addr: SocketAddr, key: &SigningKey, command: &str) -> Option<String> {
-    // The admin listener authenticates like the client one, then speaks
-    // text lines: the client crate does the handshake and hands over the
-    // socket.
-    let mut stream = Connection::connect_timeout(addr, key, Duration::from_millis(300))
-        .ok()?
-        .into_stream();
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-    stream.write_all(command.as_bytes()).ok()?;
-    stream.write_all(b"\n").ok()?;
-    stream.flush().ok()?;
-    let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line).ok()?;
-    Some(line.trim_end().to_owned())
 }
 
 /// Retry `command` until the node answers `OK`. The admin listener is up

@@ -396,7 +396,15 @@ impl DurabilityGate {
     /// the new policy surfaces immediately rather than waiting out the
     /// sustained-state hold; accrual is flushed first so degraded time
     /// before the switch is not dropped.
+    ///
+    /// A change naming the policy already in force (a boot or standalone
+    /// entry repeating it, an operator re-sending it) changes nothing, so
+    /// it neither logs nor resets anything; the caller still records it
+    /// as applied.
     fn switch_to(&mut self, next: AckPolicy, cause: &'static str) {
+        if next == self.active_policy {
+            return;
+        }
         tracing::info!(
             stage = self.stage,
             prev = self.active_policy.as_str(),
@@ -1061,6 +1069,25 @@ mod tests {
             degraded_nanos(&g) > 0,
             "the re-seed flushes the degraded interval before the switch"
         );
+    }
+
+    /// A change repeating the policy in force is applied (a later change at
+    /// or below it is stale) but switches nothing: the cached position is
+    /// kept and the logger is not re-seeded.
+    #[test]
+    fn a_change_to_the_policy_in_force_is_applied_without_a_switch() {
+        let mut g = gate(AckPolicy::Disk, 5);
+        g.apply_change(WireSeq::new(3), AckPolicy::Disk.to_byte(), "test");
+        assert_eq!(g.active_policy, AckPolicy::Disk);
+        assert_eq!(g.cached_durable_pos, 5, "no switch: cached position kept");
+        assert_applied_through(&g, 3);
+        g.apply_change(WireSeq::new(2), AckPolicy::TwoDisks.to_byte(), "test");
+        assert_eq!(g.active_policy, AckPolicy::Disk, "stale behind it");
+
+        let mut g = gate(AckPolicy::DiskAndRam, 5);
+        let_time_pass();
+        g.apply_change(WireSeq::new(1), AckPolicy::DiskAndRam.to_byte(), "test");
+        assert_eq!(degraded_nanos(&g), 0, "no re-seed, so nothing flushed");
     }
 
     /// A lineage policy: `policy` in force since the transition at

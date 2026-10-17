@@ -33,12 +33,9 @@ use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
+use melin_test_node::probe::wait_for_gauge;
 use melin_test_node::{Addrs, Node};
 use melin_transport_core::test_ports::free_addr;
-
-#[path = "common/probe.rs"]
-mod probe;
-use probe::wait_for_gauge;
 
 /// Port range for `free_addr`, shared with `replicated_failover.rs`: every
 /// other range below the ephemeral floor is taken. Sharing is safe only
