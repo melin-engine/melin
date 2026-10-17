@@ -409,7 +409,13 @@ Anything source-breaking is called out under **Removed** or **Changed**.
     acks (`FirstAck::acked`): the first one ends the halt override.
     `ReplicaPresence::lower` returns a `Lowered`: whether the replica
     was the last, and if so whether the node halts or a forced `disk`
-    keeps it taking writes, which its warning states.
+    keeps it taking writes, which its warning states. The override
+    changes only on evidence from `ReplicaPresence::observe`:
+    `latch_override` takes its `NoneSince`, and `clear_override` the
+    `Observed` itself (neither is `Copy` nor `Clone`).
+    `Observed::Connected` carries a `Seen` token that only `observe`
+    makes, as `NoneConnected` carries `NoneSince`; match it as
+    `Observed::Connected(_)`.
   - `pipeline::StageUtilization` has two new public fields,
     `ack_policy_in_force` and `ack_policy_journaled`.
 - **`melin_journal::replication::ReplicationConsumer` reads by

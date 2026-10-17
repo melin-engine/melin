@@ -73,20 +73,39 @@ pub struct ReplicaPresence {
     override_at: AtomicU64,
 }
 
-/// What the input ring's producer saw when it looked: needed to latch the
-/// override, so that only a decision made on an observed absence of
-/// replicas can lift the halt.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What the input ring's producer saw when it looked: the evidence every
+/// change to the override is made on. Latching it needs an observed
+/// absence of replicas ([`NoneSince`]), so that only a decision made on
+/// one can lift the halt; clearing it consumes the observation the
+/// decision was made on ([`ReplicaPresence::clear_override`]), so the
+/// override is dropped only by a producer that looked, never by a stray
+/// call. Neither `Copy` nor `Clone`: one look settles at most one change.
+/// Both variants carry a token with a private field ([`Seen`],
+/// [`NoneSince`]), so only [`ReplicaPresence::observe`] makes either.
+#[derive(Debug, PartialEq, Eq)]
 pub enum Observed {
     /// At least one replica is streaming.
-    Connected,
+    Connected(Seen),
     /// None is, as of this generation.
     NoneConnected(NoneSince),
 }
 
+/// Proof that [`ReplicaPresence::observe`] saw a replica streaming. Only it
+/// makes one (the private field), so an [`Observed::Connected`] handed to
+/// [`ReplicaPresence::clear_override`] cannot be written out of thin air.
+/// Neither `Copy` nor `Clone`, like the observation it comes from.
+///
+/// ```compile_fail,E0423
+/// use melin_transport_core::replica_presence::{Observed, ReplicaPresence, Seen};
+/// ReplicaPresence::new().clear_override(Observed::Connected(Seen(())));
+/// ```
+#[derive(Debug, PartialEq, Eq)]
+pub struct Seen(());
+
 /// The first-ack generation at which no replica was streaming. Only
-/// [`ReplicaPresence::observe`] makes one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// [`ReplicaPresence::observe`] makes one; neither `Copy` nor `Clone`,
+/// like the observation it comes from.
+#[derive(Debug, PartialEq, Eq)]
 pub struct NoneSince(u64);
 
 /// What a replica's departure left behind ([`ReplicaPresence::lower`]).
@@ -198,7 +217,7 @@ impl ReplicaPresence {
         if self.connected.load(Ordering::Relaxed) == 0 {
             Observed::NoneConnected(NoneSince(generation))
         } else {
-            Observed::Connected
+            Observed::Connected(Seen(()))
         }
     }
 
@@ -209,7 +228,10 @@ impl ReplicaPresence {
     }
 
     /// Drop any override: the next time no replica streams, the node halts.
-    pub fn clear_override(&self) {
+    /// Takes the observation the decision to drop it was made on (a policy
+    /// that needs a replica being journaled), whatever it saw: without one
+    /// in hand, nothing can drop the operator's consent.
+    pub fn clear_override(&self, _decided_on: Observed) {
         self.override_at.store(0, Ordering::Relaxed);
     }
 }
@@ -221,7 +243,7 @@ mod tests {
     fn none_since(presence: &ReplicaPresence) -> NoneSince {
         match presence.observe() {
             Observed::NoneConnected(since) => since,
-            Observed::Connected => panic!("a replica is connected"),
+            Observed::Connected(_) => panic!("a replica is connected"),
         }
     }
 
@@ -234,7 +256,7 @@ mod tests {
         let mut second = presence.lift();
         assert!(!presence.halted());
         assert_eq!(presence.connected(), 2);
-        assert_eq!(presence.observe(), Observed::Connected);
+        assert_eq!(presence.observe(), Observed::Connected(Seen(())));
         first.acked(&presence);
         first.acked(&presence);
         second.acked(&presence);

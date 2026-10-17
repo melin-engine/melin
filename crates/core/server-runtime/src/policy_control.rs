@@ -71,6 +71,7 @@ use melin_journal::{AckPolicyChange, JournalEvent};
 use melin_pipeline::ring;
 use melin_transport_core::lineage::LineagePolicy;
 use melin_transport_core::pipeline::InputSlot;
+use melin_transport_core::replica_presence::Observed;
 use tracing::{info, warn};
 
 use crate::ack_policy::AckPolicy;
@@ -82,19 +83,6 @@ use crate::halt::{HaltGate, Journaled, Replication};
 /// request this long; the admin connection's own timeout is longer, so the
 /// operator reads the refusal.
 const PUBLISH_WAIT: Duration = Duration::from_secs(2);
-
-/// Who could witness a change right now: the replicas a primary streams
-/// to, as the ring's producer sees them (`HaltGate::decide`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Witnesses {
-    /// Replication is disabled on this node: no change can ever be
-    /// witnessed.
-    Disabled,
-    /// Replication is on, and no replica is streaming.
-    NoneConnected,
-    /// At least one replica is streaming.
-    Connected,
-}
 
 /// Where a request comes from, which decides whether it may be forced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,14 +100,16 @@ pub(crate) enum Origin {
 /// entry is on this node's disk, rather than once the nodes the previous
 /// policy relied on hold it.
 ///
-/// With replication disabled, every change (nothing can witness one). With
-/// no replica connected, an explicit runtime `disk` only: the operator's
-/// consent to serve on this node's disk alone. Any other change waits.
-pub(crate) fn is_unwitnessed(policy: AckPolicy, origin: Origin, witnesses: Witnesses) -> bool {
-    match witnesses {
-        Witnesses::Disabled => true,
-        Witnesses::NoneConnected => origin == Origin::Runtime && policy == AckPolicy::Disk,
-        Witnesses::Connected => false,
+/// `seen` is who could witness it: the halt gate's look at the replicas
+/// streaming (`HaltGate::decide`), `None` with replication disabled. Then
+/// every change (nothing can witness one). With no replica streaming, an
+/// explicit runtime `disk` only: the operator's consent to serve on this
+/// node's disk alone. Any other change waits.
+pub(crate) fn is_unwitnessed(policy: AckPolicy, origin: Origin, seen: Option<&Observed>) -> bool {
+    match seen {
+        None => true,
+        Some(Observed::NoneConnected(_)) => origin == Origin::Runtime && policy == AckPolicy::Disk,
+        Some(Observed::Connected(_)) => false,
     }
 }
 
@@ -192,8 +182,7 @@ fn publish_staged<E: AppEvent>(
 ) -> Journaled {
     // A blocking publish: it waits for room rather than failing.
     let Ok(journaled) = halt.journal(policy, Origin::Staged, |change| {
-        producer.publish(change_slot(change));
-        Ok::<_, Infallible>(())
+        Ok::<_, Infallible>(producer.publish(change_slot(change)))
     });
     journaled
 }
@@ -204,6 +193,7 @@ fn log_journaled(journaled: Journaled, origin: Origin) {
     if journaled.is_forced() {
         warn!(
             policy = %policy,
+            input_seq = journaled.input_seq(),
             "ack policy change forced with no replica connected: client writes are taken again \
              until a replica streaming live acknowledges an entry, the change takes effect once on this node's disk, and a \
              replica that was offline does not hold it — if this node fails before that replica \
@@ -212,8 +202,9 @@ fn log_journaled(journaled: Journaled, origin: Origin) {
     } else {
         info!(
             policy = %policy,
-            unwitnessed = journaled.change().unwitnessed,
+            unwitnessed = journaled.unwitnessed(),
             origin = ?origin,
+            input_seq = journaled.input_seq(),
             "ack policy change journaled"
         );
     }
@@ -462,7 +453,8 @@ impl PublisherClaim {
             let journaled = publish_staged(producer, halt, self.policy);
             info!(
                 policy = %self.policy,
-                unwitnessed = journaled.change().unwitnessed,
+                unwitnessed = journaled.unwitnessed(),
+                input_seq = journaled.input_seq(),
                 lineage = ?lineage.map(|p| p.policy().0),
                 reason = ?reason,
                 "journaling the requested ack policy"
@@ -561,7 +553,7 @@ impl AckPolicyPublisher {
         // requester is released, so a write it sends once told `OK` meets
         // the halt the change leaves.
         let Ok(journaled) = halt.journal(request.policy, Origin::Runtime, |change| {
-            producer.try_publish(change_slot(change)).map(drop)
+            producer.try_publish(change_slot(change))
         }) else {
             // Full: the requester's bounded wait decides when to give up.
             return;
@@ -723,12 +715,14 @@ mod tests {
     /// a replica connected none is.
     #[test]
     fn the_forced_rule() {
+        let none_connected = presence(0).observe();
+        let connected = presence(1).observe();
         for policy in ALL {
             for origin in [Origin::Runtime, Origin::Staged] {
-                assert!(is_unwitnessed(policy, origin, Witnesses::Disabled));
-                assert!(!is_unwitnessed(policy, origin, Witnesses::Connected));
+                assert!(is_unwitnessed(policy, origin, None));
+                assert!(!is_unwitnessed(policy, origin, Some(&connected)));
                 assert_eq!(
-                    is_unwitnessed(policy, origin, Witnesses::NoneConnected),
+                    is_unwitnessed(policy, origin, Some(&none_connected)),
                     origin == Origin::Runtime && policy == AckPolicy::Disk,
                     "{policy} from {origin:?}"
                 );
