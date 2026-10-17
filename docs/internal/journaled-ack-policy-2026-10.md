@@ -714,15 +714,40 @@ and is committed on its own. Tests land with the step they pin.
    Both fail with the refusal removed and pass on kernel TCP and under
    the netns runner with the `dpdk` feature.
 
-   **Not fixed here (standalone exception):** a lineage whose newest
-   change is still waiting for its witness (`disk` after `disk+ram`),
-   restarted standalone under that same policy, journals no boot entry
-   (requested equals the newest), so the standalone gate serves under it
-   at once with nothing in the journal marking those acknowledgements
-   unwitnessed. This is within the documented standalone exception (no
-   replica can witness anything), but the record is missing. Having the
-   boot journal an unwitnessed entry when the newest change is pending
-   and replication is disabled would close it.
+   **A standalone restart marks a waiting change unwitnessed (follow-up
+   fix).** A lineage whose newest change was still waiting for its
+   witness (`disk` after `disk+ram`), restarted standalone under that
+   same policy, journaled no boot entry (requested equalled the newest),
+   so the standalone gate served under it at once with nothing in the
+   journal marking those acknowledgements unwitnessed. The boot decision
+   is now one pure function, `policy_control::boot_entry`, which
+   `journal_boot` calls with the whole `LineagePolicy` and the halt
+   gate's `Replication`: besides a lineage naming another policy or
+   none, it journals the requested policy (unwitnessed, as every
+   standalone entry is) when replication is disabled and the lineage's
+   transition to it is `previous.is_some() && !unwitnessed`. Whether that
+   transition was witnessed before the stop is not on disk, so the
+   reading is conservative: every transition journaled witnessed counts
+   as pending, including one that had taken effect. Not pending: one
+   journaled unwitnessed (already marked), and the lineage's first
+   change (the policy its gate started under). The entry folds into the
+   same transition as a repeat, marking it unwitnessed, so a later
+   standalone restart journals nothing, and a later replicated one
+   applies it once on disk, which is what happened. The replicated path
+   is unchanged (the gate re-applies the pending change in order), and
+   so is the gate's start. A replica promoted without
+   `--replication-bind` takes the same path. Tests: the decision per
+   lineage shape and replication mode (repeats included), the boot entry
+   journaled once and not after the fold, nothing on the replicated
+   path; and
+   `ack_policy_changes::a_standalone_restart_marks_a_waiting_change_unwitnessed`
+   (the journal, read back after each restart, holds the entry at 4
+   and nothing more after a second restart), which fails with the new
+   arm removed and passes on kernel TCP and under the netns runner with
+   the `dpdk` feature. The test file's primary now keeps its health and
+   admin ports across restarts: under plain `cargo test` the binary's
+   tests share one `free_addr` block, which the extra restarts would
+   have exhausted.
 
    **The override ends on a first ack, not on authentication (review
    fix).** An independent review found that `ReplicaPresence::lift`

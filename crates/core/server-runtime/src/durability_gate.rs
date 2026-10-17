@@ -186,13 +186,15 @@ pub(crate) struct PendingChange {
 /// replica can ever witness the start's change, so a lineage last run
 /// under a policy that needs one (restarted standalone under `disk`)
 /// would hold every reply forever. The change is journaled unwitnessed
-/// all the same, as the record of the switch. A requested policy that
-/// needs a replica can only be the configured one there (the mailbox
-/// refuses to stage one, `AckPolicyControl::request`): a replica promoted
-/// without `--replication-bind` under its `--ack-policy disk+ram`, say. Its
-/// gate holds every reply until the operator's `ACK-POLICY disk`, which,
-/// unwitnessed, takes effect once on disk: the documented failover
-/// workflow, so it is served rather than refused.
+/// all the same, as the record of the switch, and so is `requested` when
+/// the lineage already names it through a change that may still be
+/// waiting for its witness (`policy_control::boot_entry`). A requested
+/// policy that needs a replica can only be the configured one there (the
+/// mailbox refuses to stage one, `AckPolicyControl::request`): a replica
+/// promoted without `--replication-bind` under its `--ack-policy
+/// disk+ram`, say. Its gate holds every reply until the operator's
+/// `ACK-POLICY disk`, which, unwitnessed, takes effect once on disk: the
+/// documented failover workflow, so it is served rather than refused.
 ///
 /// A lineage byte this build does not know is refused rather than
 /// replaced: the events it governs were acknowledged under a policy this
@@ -756,6 +758,7 @@ mod tests {
     use melin_transport_core::lineage::{ForcedPolicy, ForcedPolicyWriter, forced_policy_cell};
 
     use super::*;
+    use crate::policy_control::test_support::lineage;
 
     /// A byte no `AckPolicy` maps to: a policy from a newer build, or a
     /// bug.
@@ -1094,24 +1097,6 @@ mod tests {
         let_time_pass();
         g.apply_change(WireSeq::new(1), AckPolicy::DiskAndRam.to_byte(), "test");
         assert_eq!(degraded_nanos(&g), 0, "no re-seed, so nothing flushed");
-    }
-
-    /// A lineage policy: `policy` in force since the transition at
-    /// `wire_seq` from `previous`.
-    fn lineage(
-        policy: AckPolicyByte,
-        unwitnessed: bool,
-        wire_seq: u64,
-        previous: Option<AckPolicyByte>,
-    ) -> Option<LineagePolicy> {
-        Some(LineagePolicy {
-            change: melin_journal::AckPolicyChange {
-                policy,
-                unwitnessed,
-            },
-            wire_seq,
-            previous,
-        })
     }
 
     /// While replication is on, the gate starts under the policy before

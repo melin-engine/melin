@@ -2118,11 +2118,8 @@ where
     // The policy this tenure requests, after the bump; see
     // `PublisherClaim::journal_boot`. Only the booted claim attaches the
     // reader.
-    let ack_policy_claim = ack_policy_claim.journal_boot(
-        lineage_ack_policy.map(|p| p.policy()),
-        &mut input_producer,
-        &halt_gate,
-    );
+    let ack_policy_claim =
+        ack_policy_claim.journal_boot(lineage_ack_policy, &mut input_producer, &halt_gate);
 
     // Bring-up gate: a primary that began the history with replication
     // on serves no client until its first replica is streaming live. A
@@ -3216,11 +3213,8 @@ where
     }
     // As on kernel TCP: the policy this tenure requests, after the bump,
     // and the booted claim the poll thread attaches.
-    let ack_policy_claim = ack_policy_claim.journal_boot(
-        lineage_ack_policy.map(|p| p.policy()),
-        &mut input_producer,
-        &halt_gate,
-    );
+    let ack_policy_claim =
+        ack_policy_claim.journal_boot(lineage_ack_policy, &mut input_producer, &halt_gate);
 
     // Journal `on_primary` through the pipeline. Genesis is already in
     // the journal (`init_engine` creates the journal with it); replicas

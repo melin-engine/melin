@@ -358,8 +358,17 @@ its own `--ack-policy`, or one an operator staged on it. The exception is
 a primary that accepts no replicas (no `--replication-bind`: a
 `--standalone` node, or a replica promoted without one), where no
 replica can ever witness a swap: it serves under the policy it requests
-at once, and journals the swap as unwitnessed, as the record of it. Its
-runtime swaps are unwitnessed too, and take effect once on its disk; a
+at once, and journals the swap as unwitnessed, as the record of it. It
+does so too when the journal already records the requested policy but
+the swap to it may not have taken effect (it may still have been waiting
+for a replica when the node last stopped, and whether it was is not
+recorded, so every swap journaled as witnessed counts): the unwitnessed
+entry marks that the policy took effect with no replica holding the
+swap. Once that entry is journaled, later restarts journal nothing more,
+and a later start that replicates confirms the swap as soon as its entry
+is on the node's disk, as a forced one, rather than waiting for a
+replica to hold it.
+Its runtime swaps are unwitnessed too, and take effect once on its disk; a
 policy that needs a replica is refused there, staged or not (see "The
 reply" above). So a replica promoted without `--replication-bind` serves
 under a staged `disk` at once. Under its own `--ack-policy`, if that
@@ -987,7 +996,16 @@ The recovery procedure is the same under every policy:
 2. Determine each node's journal end sequence. Today this means
    starting each node briefly in `--standalone` mode and reading
    `journal_sequence` from `/healthz`. (A one-shot offline inspector
-   is on the wishlist; see Limitations.)
+   is on the wishlist; see Limitations.) The inspection boot can
+   itself append runtime entries: an unwitnessed `disk` ack-policy
+   entry whenever the lineage last named another policy, or `disk`
+   through a change still waiting for its witness, and ticks if they
+   are enabled. Each appended entry carries its own timestamp, so
+   nodes that tie below "have the same entries" up to their pre-boot
+   end, not byte for byte after it. The ack-policy entry marks the
+   swap to `disk` unwitnessed, so a later replicated start confirms
+   that swap as soon as its entry is on the node's disk, instead of
+   waiting for a replica to hold it.
 3. Start the node with the longest journal as primary. If two nodes
    tie they have the same entries; either is valid.
 4. Connect the others as replicas. Replicas that are behind catch up

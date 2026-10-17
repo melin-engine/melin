@@ -1794,7 +1794,7 @@ mod tests {
     ) {
         use crate::ack_policy::AckPolicy;
         use crate::policy_control::RequestOutcome;
-        use crate::policy_control::test_support::control_with_publish_wait;
+        use crate::policy_control::test_support::{control_with_publish_wait, first_change};
 
         let (mut producer, mut consumers) = DisruptorBuilder::<InputSlot<TestEvent>>::new(64)
             .add_consumer()
@@ -1805,11 +1805,10 @@ mod tests {
         // Long enough that a reader that is never woken fails the request.
         let control = control_with_publish_wait(AckPolicy::DiskAndRam, Duration::from_secs(30));
         // Booted on a lineage already under the claim's policy: no entry.
-        let claim = control.claim().journal_boot(
-            Some(AckPolicy::DiskAndRam.to_byte()),
-            &mut producer,
-            &halt,
-        );
+        let claim =
+            control
+                .claim()
+                .journal_boot(first_change(AckPolicy::DiskAndRam), &mut producer, &halt);
         if let Some(policy) = staged {
             assert_eq!(control.request(policy), RequestOutcome::Staged);
         }

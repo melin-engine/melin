@@ -15,8 +15,10 @@
 //! - **At boot and at promotion**, the main thread takes a
 //!   [`PublisherClaim`] before the pipeline serves anyone, and journals the
 //!   requested policy (the configured one, or one an operator staged) when
-//!   the lineage holds a different one or none
-//!   (`PublisherClaim::journal_boot`, which consumes the claim).
+//!   the lineage holds a different one or none, or, standalone, when the
+//!   change that put it there may never have been witnessed
+//!   (`PublisherClaim::journal_boot`, which consumes the claim; the rule
+//!   is `boot_entry`).
 //! - **While the node serves**, the booted claim is attached to the
 //!   producer (`BootedClaim::attach`), which checks the mailbox on its loop
 //!   (`AckPolicyPublisher::poll`) and journals each request. The admin
@@ -65,8 +67,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use melin_app::{AppEvent, unix_epoch_nanos};
-use melin_journal::{AckPolicyByte, AckPolicyChange, JournalEvent};
+use melin_journal::{AckPolicyChange, JournalEvent};
 use melin_pipeline::ring;
+use melin_transport_core::lineage::LineagePolicy;
 use melin_transport_core::pipeline::InputSlot;
 use tracing::{info, warn};
 
@@ -117,6 +120,54 @@ pub(crate) fn is_unwitnessed(policy: AckPolicy, origin: Origin, witnesses: Witne
         Witnesses::Disabled => true,
         Witnesses::NoneConnected => origin == Origin::Runtime && policy == AckPolicy::Disk,
         Witnesses::Connected => false,
+    }
+}
+
+/// Why a primary journals the policy it requests as its tenure starts
+/// ([`boot_entry`]), for the log line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BootEntry {
+    /// The lineage holds another policy, or none (a new history, or a
+    /// lineage written before policy changes were journaled).
+    Differs,
+    /// The lineage already names the requested policy, but the change
+    /// that put it there may still be waiting for its witness, and this
+    /// node, standalone, starts serving under it at once: the entry,
+    /// unwitnessed, records that the policy took effect without one.
+    TakesEffectUnwitnessed,
+}
+
+/// Whether a primary starting a tenure on `lineage` journals `requested`,
+/// and why; `None` when the lineage already holds it.
+///
+/// With replication enabled, only when the lineage names another policy
+/// or none: a newest change still waiting for its witness is re-applied
+/// in order by the gate (see `durability_gate::initial_gate_policy`).
+///
+/// With replication disabled, also when the lineage names `requested`
+/// through a change that may never have been witnessed: the standalone
+/// gate serves under `requested` at once, so without an entry nothing in
+/// the journal would mark those acknowledgements unwitnessed. Whether the
+/// change was witnessed before the restart is not on disk (the lineage
+/// records the transition, not its outcome), so this reads it
+/// conservatively: every transition journaled witnessed counts as still
+/// waiting. One journaled unwitnessed does not (the journal already marks
+/// it), nor does the lineage's first change (a primary journals it as the
+/// policy its gate starts under, so it had nothing to wait for); and once
+/// this entry is folded the transition is unwitnessed, so a later
+/// standalone restart journals nothing more.
+fn boot_entry(
+    lineage: Option<LineagePolicy>,
+    requested: AckPolicy,
+    replication: Replication,
+) -> Option<BootEntry> {
+    let Some(lineage) = lineage.filter(|l| l.policy() == requested.to_byte()) else {
+        return Some(BootEntry::Differs);
+    };
+    let may_await_witness = lineage.previous.is_some() && !lineage.change.unwitnessed;
+    match replication {
+        Replication::Disabled if may_await_witness => Some(BootEntry::TakesEffectUnwitnessed),
+        Replication::Disabled | Replication::Enabled => None,
     }
 }
 
@@ -392,24 +443,28 @@ impl PublisherClaim {
         self.policy
     }
 
-    /// Journal the policy this tenure requests, if the lineage holds
-    /// another or none (a new history, or a lineage written before policy
-    /// changes were journaled) — see [`publish_staged`]. After a
-    /// promotion's epoch bump, ahead of `on_primary` and of any client.
-    /// Returns the claim its producer attaches with.
+    /// Journal the policy this tenure requests when [`boot_entry`] says
+    /// the lineage needs it — see [`publish_staged`]. After a promotion's
+    /// epoch bump, ahead of `on_primary` and of any client. Returns the
+    /// claim its producer attaches with.
+    ///
+    /// Whether this node replicates is read from `halt`, the gate the
+    /// entry is journaled through, so the decision and the entry's
+    /// witnessing agree on "standalone?".
     #[must_use = "the booted claim is what attaches the producer"]
     pub(crate) fn journal_boot<E: AppEvent>(
         self,
-        lineage: Option<AckPolicyByte>,
+        lineage: Option<LineagePolicy>,
         producer: &mut ring::Producer<InputSlot<E>>,
         halt: &HaltGate,
     ) -> BootedClaim {
-        if lineage != Some(self.policy.to_byte()) {
+        if let Some(reason) = boot_entry(lineage, self.policy, halt.replication()) {
             let journaled = publish_staged(producer, halt, self.policy);
             info!(
                 policy = %self.policy,
                 unwitnessed = journaled.change().unwitnessed,
-                lineage = ?lineage.map(|byte| byte.0),
+                lineage = ?lineage.map(|p| p.policy().0),
+                reason = ?reason,
                 "journaling the requested ack policy"
             );
         }
@@ -537,6 +592,7 @@ impl Drop for AckPolicyPublisher {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
+    use melin_journal::AckPolicyByte;
     use melin_pipeline::ring::{Consumer, DisruptorBuilder};
     use melin_pipeline::wait::WaitStrategy;
 
@@ -564,12 +620,36 @@ pub(crate) mod test_support {
         (producer, consumers.pop().expect("one consumer"))
     }
 
+    /// A lineage policy: `policy` in force since the transition at
+    /// `wire_seq` from `previous`.
+    pub(crate) fn lineage(
+        policy: AckPolicyByte,
+        unwitnessed: bool,
+        wire_seq: u64,
+        previous: Option<AckPolicyByte>,
+    ) -> Option<LineagePolicy> {
+        Some(LineagePolicy {
+            change: AckPolicyChange {
+                policy,
+                unwitnessed,
+            },
+            wire_seq,
+            previous,
+        })
+    }
+
+    /// A lineage whose only change, its first entry, put `policy` in
+    /// force: nothing waits for a witness.
+    pub(crate) fn first_change(policy: AckPolicy) -> Option<LineagePolicy> {
+        lineage(policy.to_byte(), false, 1, None)
+    }
+
     /// A claim on `control` booted on a lineage that already holds its
     /// policy, so it journals nothing: for a test that only needs a
     /// producer to attach.
     pub(crate) fn booted(control: &Arc<AckPolicyControl>) -> BootedClaim {
         let claim = control.claim();
-        let lineage = Some(claim.policy().to_byte());
+        let lineage = first_change(claim.policy());
         // The smallest ring there is: nothing is published on it.
         let (mut producer, _consumer) = ring::<counter_server::CounterEvent>(2);
         claim.journal_boot(
@@ -591,7 +671,9 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{attach, booted, control_with_publish_wait, replicated, ring};
+    use super::test_support::{
+        attach, booted, control_with_publish_wait, first_change, lineage, replicated, ring,
+    };
     use super::*;
     use crate::halt::Verdict;
     use crate::halt::test_support::{gate_over, presence};
@@ -657,13 +739,15 @@ mod tests {
         gate_over(Some(presence(0)))
     }
 
-    /// The boot entry: none when the lineage already holds the requested
-    /// policy; otherwise the requested policy, as the node's own event,
-    /// witnessed unless replication is disabled (a boot entry is never
-    /// forced, so a `disk` lifts no halt).
+    /// The boot entry journaled when the lineage differs: the requested
+    /// policy, as the node's own event, witnessed unless replication is
+    /// disabled (a boot entry is never forced, so a `disk` lifts no halt).
+    /// A replicating node whose lineage already holds the requested policy
+    /// journals none; the standalone exception (a waiting change) is pinned
+    /// by `the_boot_decision`.
     #[test]
-    fn the_boot_entry_is_journaled_only_when_the_lineage_differs() {
-        let disk = Some(AckPolicy::Disk.to_byte());
+    fn the_boot_entry_when_the_lineage_differs() {
+        let disk = first_change(AckPolicy::Disk);
         let (mut producer, mut consumer) = ring::<TestEvent>(8);
         let halt = halted_gate();
         let boot = |requested, lineage, producer: &mut ring::Producer<Slot>, halt: &HaltGate| {
@@ -692,7 +776,7 @@ mod tests {
         let standalone = gate_over(None);
         boot(
             AckPolicy::Disk,
-            Some(AckPolicy::DiskAndRam.to_byte()),
+            first_change(AckPolicy::DiskAndRam),
             &mut producer,
             &standalone,
         );
@@ -701,6 +785,101 @@ mod tests {
             [change(AckPolicy::Disk, true)],
             "standalone: unwitnessed"
         );
+    }
+
+    /// The decision alone: a lineage naming another policy, or none, always
+    /// gets the requested one. One naming it gets nothing while
+    /// replicating (the gate re-applies a waiting change in order); with
+    /// replication disabled it gets an entry when the transition to it was
+    /// journaled witnessed (it may never have been witnessed: the
+    /// conservative reading), and none when that transition is already
+    /// marked unwitnessed, or is the lineage's first change.
+    #[test]
+    fn the_boot_decision() {
+        use Replication::{Disabled, Enabled};
+        let disk = AckPolicy::Disk.to_byte();
+        let disk_and_ram = Some(AckPolicy::DiskAndRam.to_byte());
+        let waiting = lineage(disk, false, 3, disk_and_ram);
+        let marked = lineage(disk, true, 3, disk_and_ram);
+        for replication in [Enabled, Disabled] {
+            for lineage in [None, first_change(AckPolicy::DiskAndRam), waiting, marked] {
+                assert_eq!(
+                    boot_entry(lineage, AckPolicy::Ram, replication),
+                    Some(BootEntry::Differs),
+                    "{lineage:?} under {replication:?}"
+                );
+            }
+            assert_eq!(
+                boot_entry(first_change(AckPolicy::Disk), AckPolicy::Disk, replication),
+                None,
+                "the first change under {replication:?}"
+            );
+            assert_eq!(
+                boot_entry(marked, AckPolicy::Disk, replication),
+                None,
+                "already unwitnessed under {replication:?}"
+            );
+        }
+        assert_eq!(
+            boot_entry(waiting, AckPolicy::Disk, Enabled),
+            None,
+            "replicated: the gate re-applies it"
+        );
+        assert_eq!(
+            boot_entry(waiting, AckPolicy::Disk, Disabled),
+            Some(BootEntry::TakesEffectUnwitnessed)
+        );
+        // A repeat of the policy keeps the transition, witnessed unless one
+        // of the run was not: the fold the restart reads.
+        let repeated = LineagePolicy::after(waiting, 4, change(AckPolicy::Disk, false));
+        assert_eq!(
+            boot_entry(Some(repeated), AckPolicy::Disk, Disabled),
+            Some(BootEntry::TakesEffectUnwitnessed)
+        );
+    }
+
+    /// Standalone, on a lineage whose newest change is still waiting for
+    /// its witness under the requested policy, the boot journals that
+    /// policy unwitnessed; folded into the lineage, it marks the
+    /// transition, so the next standalone boot journals nothing.
+    #[test]
+    fn a_standalone_boot_marks_a_waiting_change_unwitnessed_once() {
+        let (mut producer, mut consumer) = ring::<TestEvent>(8);
+        let standalone = gate_over(None);
+        let waiting = lineage(
+            AckPolicy::Disk.to_byte(),
+            false,
+            3,
+            Some(AckPolicy::DiskAndRam.to_byte()),
+        );
+        drop(
+            AckPolicyControl::new(AckPolicy::Disk, Replication::Disabled)
+                .claim()
+                .journal_boot(waiting, &mut producer, &standalone),
+        );
+        let journaled = changes(&mut consumer);
+        assert_eq!(journaled, [change(AckPolicy::Disk, true)]);
+
+        let folded = LineagePolicy::after(waiting, 5, journaled[0]);
+        assert_eq!(
+            (folded.wire_seq, folded.change.unwitnessed),
+            (3, true),
+            "the same transition, now marked"
+        );
+        drop(
+            AckPolicyControl::new(AckPolicy::Disk, Replication::Disabled)
+                .claim()
+                .journal_boot(Some(folded), &mut producer, &standalone),
+        );
+        assert!(changes(&mut consumer).is_empty(), "nothing more");
+
+        // Replicated, the same waiting lineage journals nothing.
+        drop(replicated(AckPolicy::Disk).claim().journal_boot(
+            waiting,
+            &mut producer,
+            &halted_gate(),
+        ));
+        assert!(changes(&mut consumer).is_empty(), "the gate re-applies it");
     }
 
     /// A boot entry for a policy that needs a replica restores a halt an
@@ -723,7 +902,7 @@ mod tests {
         drop(publisher);
 
         drop(replicated(AckPolicy::TwoDisks).claim().journal_boot(
-            Some(AckPolicy::Disk.to_byte()),
+            first_change(AckPolicy::Disk),
             &mut producer,
             &halt,
         ));
@@ -961,8 +1140,7 @@ mod tests {
         let claim = control.claim();
         let (mut producer, mut consumer) = ring(8);
         let halt = halted_gate();
-        let booted =
-            claim.journal_boot(Some(AckPolicy::DiskAndRam.to_byte()), &mut producer, &halt);
+        let booted = claim.journal_boot(first_change(AckPolicy::DiskAndRam), &mut producer, &halt);
         assert_eq!(control.request(AckPolicy::Disk), RequestOutcome::Staged);
         let mut publisher = booted.attach(&mut producer, &halt, None);
         assert_ne!(
@@ -1004,7 +1182,7 @@ mod tests {
         let (mut producer, mut consumer) = ring::<TestEvent>(8);
         let halt = halted_gate();
         let _publisher = claim
-            .journal_boot(Some(AckPolicy::DiskAndRam.to_byte()), &mut producer, &halt)
+            .journal_boot(first_change(AckPolicy::DiskAndRam), &mut producer, &halt)
             .attach(&mut producer, &halt, None);
         assert!(changes(&mut consumer).is_empty());
     }

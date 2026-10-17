@@ -336,7 +336,11 @@ Anything source-breaking is called out under **Removed** or **Changed**.
     records another policy keeps serving under it until the change to
     the requested one, journaled at startup or promotion, takes effect.
     A node without `--replication-bind` serves under the requested
-    policy at once.
+    policy at once, and journals it unwitnessed when the history already
+    records it through a change that may still have been waiting for a
+    replica (any change after the first, journaled witnessed), so the
+    journal marks that it took effect without one; once, not on every
+    restart.
   - A replicated primary's restart, and a promotion, confirm the
     history's newest change again before acknowledging anything under
     it: the node serves under the policy before that change until the

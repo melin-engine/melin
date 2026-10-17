@@ -11,7 +11,9 @@
 //! - A restart under a different `--ack-policy` journals the change, which
 //!   waits for a replica like any other: a boot entry is never forced.
 //! - A lineage last run replicated under `disk+ram`, restarted
-//!   `--standalone --ack-policy disk`, serves at once.
+//!   `--standalone --ack-policy disk`, serves at once; so does one whose
+//!   change to `disk` was still waiting for its witness, and its boot
+//!   journals `disk` unwitnessed, once.
 //! - A forced `ACK-POLICY disk` (no replica connected) lifts the halt on
 //!   client writes until a streaming replica acks an entry or a policy that
 //!   needs one is journaled; a replica that streams and leaves without
@@ -36,10 +38,12 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use counter_server::{
-    Counter, KIND_RESP_ACK, KIND_RESP_REJECTED, RequestDecoder, ResponseEncoder, increment_request,
+    Counter, CounterEvent, KIND_RESP_ACK, KIND_RESP_REJECTED, RequestDecoder, ResponseEncoder,
+    increment_request,
 };
 use ed25519_dalek::SigningKey;
 use melin_client::Connection;
+use melin_journal::{AckPolicyByte, JournalEvent, JournalReader};
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::layout::PipelineCores;
@@ -124,6 +128,12 @@ struct Cluster {
     keys: Keys,
     keys_file: PathBuf,
     addrs: Addrs,
+    /// The primary's health and admin endpoints, the same on every boot
+    /// as its other addresses are: under plain `cargo test` every test in
+    /// this binary shares one process and its block of `free_addr` ports,
+    /// which fresh endpoints per restart would exhaust.
+    health: SocketAddr,
+    admin: SocketAddr,
 }
 
 impl Cluster {
@@ -136,12 +146,14 @@ impl Cluster {
             keys,
             keys_file,
             addrs: addrs(0),
+            health: free_addr(PORT_BASE),
+            admin: free_addr(PORT_BASE),
         }
     }
 
     /// The primary's configuration under `ack_policy`: replicating on its
     /// replication address, with health and admin endpoints, unless
-    /// `standalone`. The same journal on every boot.
+    /// `standalone`. The same journal and addresses on every boot.
     fn config(&self, ack_policy: AckPolicy, standalone: bool) -> ServerConfig {
         let key_path = self.dir.path().join("primary.key");
         std::fs::write(&key_path, self.keys.primary.to_bytes()).expect("write node key");
@@ -152,8 +164,8 @@ impl Cluster {
             standalone,
             replication_bind: (!standalone).then(|| self.addrs.replication()),
             replication_key: Some(key_path),
-            health_bind: Some(free_addr(PORT_BASE)),
-            admin_bind: Some(free_addr(PORT_BASE)),
+            health_bind: Some(self.health),
+            admin_bind: Some(self.admin),
             // Unpinned, and therefore yielding: the node shares this
             // process with the test's own client and replica.
             cores: PipelineCores::unpinned(),
@@ -344,19 +356,11 @@ fn a_weakening_waits_for_the_replica_to_hold_the_change() {
     primary.stop();
 }
 
-/// The restart that change is unsafe across without its own rule: under
-/// `disk+ram`, `ACK-POLICY disk` is journaled (entry 3) while the replica
-/// holds nothing past entry 2, and the primary stops before the replica
-/// holds the change. Restarted with `--ack-policy disk`, the policy its
-/// lineage already names (so it journals no boot entry), it must not
-/// serve under `disk`: the replica never learnt of it, and would judge by
-/// `disk+ram` had the primary died again. The gate starts under the
-/// policy before the change, `disk+ram`, with the change pending; a write
-/// is held, though on the primary's disk, until the replica holds the
-/// change, then acked under `disk`.
-#[test]
-fn a_restart_reapplies_a_change_the_replica_never_held() {
-    let cluster = Cluster::new();
+/// Under `disk+ram`, a first boot whose replica holds entry 2, then
+/// `ACK-POLICY disk` journaled witnessed (entry 3) and still waiting when
+/// the replica leaves without it and the primary stops: the lineage's
+/// newest change is `disk+ram` → `disk` at 3, never witnessed.
+fn leave_the_change_waiting(cluster: &Cluster) {
     let config = cluster.config(AckPolicy::DiskAndRam, false);
     let health = config.health_bind.expect("set");
     let admin = config.admin_bind.expect("set");
@@ -387,6 +391,22 @@ fn a_restart_reapplies_a_change_the_replica_never_held() {
     // The replica leaves without the change, and the primary stops.
     drop(replica);
     primary.stop();
+}
+
+/// The restart that change is unsafe across without its own rule: under
+/// `disk+ram`, `ACK-POLICY disk` is journaled (entry 3) while the replica
+/// holds nothing past entry 2, and the primary stops before the replica
+/// holds the change. Restarted with `--ack-policy disk`, the policy its
+/// lineage already names (so it journals no boot entry), it must not
+/// serve under `disk`: the replica never learnt of it, and would judge by
+/// `disk+ram` had the primary died again. The gate starts under the
+/// policy before the change, `disk+ram`, with the change pending; a write
+/// is held, though on the primary's disk, until the replica holds the
+/// change, then acked under `disk`.
+#[test]
+fn a_restart_reapplies_a_change_the_replica_never_held() {
+    let cluster = Cluster::new();
+    leave_the_change_waiting(&cluster);
 
     let config = cluster.config(AckPolicy::Disk, false);
     let health = config.health_bind.expect("set");
@@ -691,6 +711,9 @@ fn a_replica_without_replication_refuses_to_stage_a_policy_that_needs_a_replica(
         replica_of: Some(cluster.addrs.replication()),
         replication_bind: None,
         replication_key: Some(key_path),
+        // Its own endpoints: the primary's are taken while both run.
+        health_bind: Some(free_addr(PORT_BASE)),
+        admin_bind: Some(free_addr(PORT_BASE)),
         ..cluster.config(AckPolicy::Disk, false)
     };
     let health = replica_config.health_bind.expect("set");
@@ -811,4 +834,61 @@ fn a_standalone_restart_serves_under_the_configured_policy() {
     std::thread::sleep(HOLD);
     assert_eq!(gauge(health, DURABLE), Some(3), "no second change");
     primary.stop();
+}
+
+/// The ack-policy changes in `cluster`'s journal, by sequence, as
+/// `(sequence, policy, unwitnessed)`; and how many entries it holds.
+fn journaled_changes(cluster: &Cluster) -> (Vec<(u64, AckPolicyByte, bool)>, u64) {
+    let path = cluster.dir.path().join("primary.journal");
+    let mut reader = JournalReader::<CounterEvent>::open(&path).expect("open the journal");
+    let (mut changes, mut entries) = (Vec::new(), 0);
+    while let Some(entry) = reader.next_entry().expect("a valid journal") {
+        entries += 1;
+        if let JournalEvent::AckPolicyChange(change) = entry.event {
+            changes.push((entry.sequence, change.policy, change.unwitnessed));
+        }
+    }
+    (changes, entries)
+}
+
+/// A lineage whose newest change (`disk+ram` → `disk`, entry 3) is still
+/// waiting for its witness, restarted standalone under that same `disk`:
+/// the gate serves under it at once, so the boot journals `disk`
+/// unwitnessed (entry 4), the record that it took effect without a
+/// witness. The next standalone boot finds the transition marked and
+/// journals nothing more.
+#[test]
+fn a_standalone_restart_marks_a_waiting_change_unwitnessed() {
+    let byte = |policy: AckPolicy| AckPolicyByte(policy.as_u8());
+    let cluster = Cluster::new();
+    leave_the_change_waiting(&cluster);
+
+    let config = cluster.config(AckPolicy::Disk, true);
+    let health = config.health_bind.expect("set");
+    let primary = cluster.start(config);
+    wait_for_gauge(health, IN_FORCE, AckPolicy::Disk.as_u8().into());
+    let mut conn = cluster.client(&primary);
+    // Acked under `disk`, so on disk: the boot entry, then the write.
+    assert_eq!(write_reply(&mut conn), KIND_RESP_ACK, "served at once");
+    drop(conn);
+    primary.stop();
+    let expected = [
+        (1, byte(AckPolicy::DiskAndRam), false),
+        (3, byte(AckPolicy::Disk), false),
+        (4, byte(AckPolicy::Disk), true),
+    ];
+    assert_eq!(journaled_changes(&cluster), (expected.to_vec(), 5));
+
+    let config = cluster.config(AckPolicy::Disk, true);
+    let health = config.health_bind.expect("set");
+    let primary = cluster.start(config);
+    wait_for_gauge(health, IN_FORCE, AckPolicy::Disk.as_u8().into());
+    wait_for_gauge(health, DURABLE, 5);
+    std::thread::sleep(HOLD);
+    primary.stop();
+    assert_eq!(
+        journaled_changes(&cluster),
+        (expected.to_vec(), 5),
+        "the second standalone boot journals nothing"
+    );
 }
