@@ -515,9 +515,11 @@ fn change_payload(policy: u8, unwitnessed: bool) -> Option<melin_journal::AckPol
 /// A policy change emits its own output slot at its exact position in
 /// the ring, stamped with the entry's wire sequence, even on connection
 /// 0, where a report-less event emits nothing: slot before, entry, slot
-/// after, in order. An unwitnessed change is also published to the
-/// forced cell, and the newest change is recorded as journaled — in the
-/// run loop and the shutdown drain alike.
+/// after, in order. The slot is addressed to connection 0, whatever
+/// connection the entry came in on, so it can never reach a client. An
+/// unwitnessed change is also published to the forced cell, and the
+/// newest change is recorded as journaled — in the run loop and the
+/// shutdown drain alike.
 #[test]
 fn matching_stage_emits_each_policy_change_at_its_slot() {
     for on_shutdown in [false, true] {
@@ -525,7 +527,9 @@ fn matching_stage_emits_each_policy_change_at_its_slot() {
             TestApp::new(),
             &[
                 (1, JournalEvent::App(TestEvent::Add(1)), 0),
-                (0, ack_policy_change(1, false), 0),
+                // Never on a client connection in practice; addressed to
+                // connection 0 regardless.
+                (7, ack_policy_change(1, false), 0),
                 (1, JournalEvent::App(TestEvent::Add(2)), 0),
                 (0, ack_policy_change(0, true), 0),
                 (1, JournalEvent::App(TestEvent::Add(3)), 0),
@@ -547,7 +551,7 @@ fn matching_stage_emits_each_policy_change_at_its_slot() {
         assert_eq!(
             run.forced,
             Some(crate::lineage::ForcedPolicy {
-                wire_seq: 13,
+                wire_seq: crate::cursors::WireSeq::new(13),
                 policy: melin_journal::AckPolicyByte(0),
             }),
             "on_shutdown = {on_shutdown}"

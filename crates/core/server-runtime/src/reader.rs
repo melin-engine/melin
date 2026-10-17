@@ -30,7 +30,7 @@ use tracing::{debug, error};
 use crate::ControlEvent;
 use crate::buf_ring::BufRing;
 use crate::halt::{HaltGate, RefusalSender};
-use crate::policy_control::{AckPolicyPublisher, PublisherClaim};
+use crate::policy_control::{AckPolicyPublisher, BootedClaim};
 use melin_app::Application;
 use melin_app::auth::{ClientRole, RoleId};
 use melin_app::decoder::ErasedDecoder;
@@ -222,7 +222,7 @@ pub fn spawn_reader<A: Application, R: AsRawFd + Send + 'static>(
     decoder: RequestDecoderArc<A>,
     halt: HaltGate,
     refusals: RefusalSender<A::Report>,
-    ack_policy: PublisherClaim,
+    ack_policy: BootedClaim,
     control_tx: mpsc::Sender<ControlEvent>,
     core: usize,
     connection_timeout: Option<Duration>,
@@ -1707,8 +1707,10 @@ mod tests {
 
     /// The ack-policy mailbox's producer side, for a reader no test sends
     /// a request to.
-    fn policy_claim() -> crate::policy_control::PublisherClaim {
-        crate::policy_control::AckPolicyControl::new(crate::ack_policy::AckPolicy::Disk).claim()
+    fn policy_claim() -> crate::policy_control::BootedClaim {
+        crate::policy_control::test_support::booted(&crate::policy_control::AckPolicyControl::new(
+            crate::ack_policy::AckPolicy::Disk,
+        ))
     }
 
     /// A reader parked with nothing to do (no connection, no tick) is
@@ -1794,7 +1796,7 @@ mod tests {
         use crate::policy_control::RequestOutcome;
         use crate::policy_control::test_support::control_with_publish_wait;
 
-        let (producer, mut consumers) = DisruptorBuilder::<InputSlot<TestEvent>>::new(64)
+        let (mut producer, mut consumers) = DisruptorBuilder::<InputSlot<TestEvent>>::new(64)
             .add_consumer()
             .build(melin_pipeline::wait::WaitStrategy::SpinThenYield);
         let consumer = consumers.pop().expect("consumer");
@@ -1802,7 +1804,12 @@ mod tests {
         let (control_tx, _) = mpsc::channel();
         // Long enough that a reader that is never woken fails the request.
         let control = control_with_publish_wait(AckPolicy::DiskAndRam, Duration::from_secs(30));
-        let claim = control.claim();
+        // Booted on a lineage already under the claim's policy: no entry.
+        let claim = control.claim().journal_boot(
+            Some(AckPolicy::DiskAndRam.to_byte()),
+            &mut producer,
+            &halt,
+        );
         if let Some(policy) = staged {
             assert_eq!(control.request(policy), RequestOutcome::Staged);
         }

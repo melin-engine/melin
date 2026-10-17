@@ -2517,7 +2517,7 @@ fn observe_live_lineage(
             // slot ahead of it.
             if change.unwitnessed {
                 forced_policy.store(ForcedPolicy {
-                    wire_seq,
+                    wire_seq: WireSeq::new(wire_seq),
                     policy: change.policy,
                 });
             }
@@ -2527,6 +2527,13 @@ fn observe_live_lineage(
 
 /// The output slot an `AckPolicyChange` entry emits — see
 /// [`OutputPayload::AckPolicyChange`]. Always the event's last slot.
+///
+/// Addressed to connection 0, the node's own, whatever connection the
+/// entry came in on (a node event is always on 0): the slot is the
+/// response gate's, and its `is_last_in_request` must never close a
+/// client's reply batch. The response stages also never look a
+/// connection up for it (`DurabilityGate::admit` reports it as the
+/// gate's own).
 #[inline]
 fn ack_policy_change_slot<R: Copy, Q: Copy>(
     input: &InputSlot<impl AppEvent>,
@@ -2536,7 +2543,7 @@ fn ack_policy_change_slot<R: Copy, Q: Copy>(
     match_complete_ts: MonoTraceInstant,
 ) -> OutputSlot<R, Q> {
     OutputSlot {
-        connection_id: input.connection_id,
+        connection_id: 0,
         input_seq,
         wire_seq,
         payload: OutputPayload::AckPolicyChange(change),

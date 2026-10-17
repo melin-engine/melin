@@ -126,14 +126,28 @@ pub struct HaltGate {
     refused: Arc<AtomicU64>,
 }
 
+/// Whether a node replicates: the one shape of "standalone or replicated"
+/// every ack-policy decision reads, taken from the halt gate's own replica
+/// presence ([`HaltGate::replication`]) so the gate's start and the
+/// producer's entries cannot disagree on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Replication {
+    /// Replication is configured: replicas may stream, and witness changes.
+    Enabled,
+    /// Standalone: nothing can witness a change.
+    Disabled,
+}
+
 /// An ack-policy change decided on one look at who was streaming, taken
 /// just before the input ring's producer journals it: the policy, the
 /// entry that journals it, and what was seen. Built only by
-/// [`HaltGate::decide`], so the entry the producer publishes and the
-/// policy and replica count [`HaltGate::record_journaled`] acts on cannot
-/// disagree.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Decision {
+/// [`HaltGate::decide`] and consumed only by [`HaltGate::record_journaled`],
+/// both private to [`HaltGate::journal`], so the entry the producer
+/// publishes and the policy and replica count the halt acts on cannot
+/// disagree, and a published entry is recorded exactly once. Neither
+/// `Copy` nor `Clone`, for the same reason.
+#[derive(Debug)]
+struct Decision {
     policy: AckPolicy,
     change: AckPolicyChange,
     /// Who was streaming; `None` in standalone mode.
@@ -141,23 +155,40 @@ pub(crate) struct Decision {
 }
 
 impl Decision {
-    /// The policy changed to.
-    pub(crate) fn policy(self) -> AckPolicy {
-        self.policy
-    }
-
-    /// The entry to journal.
-    pub(crate) fn change(self) -> AckPolicyChange {
-        self.change
-    }
-
     /// Whether the change is a forced swap: unwitnessed for want of a
     /// connected replica, rather than because replication is disabled.
     /// Only an explicit runtime `disk` is (see
     /// [`crate::policy_control::is_unwitnessed`]). It warns, and lifts the
     /// halt ([`HaltGate::record_journaled`]).
-    pub(crate) fn is_forced(self) -> bool {
+    fn is_forced(&self) -> bool {
         self.change.unwitnessed && matches!(self.seen, Some(Observed::NoneConnected(_)))
+    }
+}
+
+/// An ack-policy change the input ring's producer has journaled, and the
+/// halt has recorded ([`HaltGate::journal`]): what the caller logs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Journaled {
+    policy: AckPolicy,
+    change: AckPolicyChange,
+    forced: bool,
+}
+
+impl Journaled {
+    /// The policy changed to.
+    pub(crate) fn policy(self) -> AckPolicy {
+        self.policy
+    }
+
+    /// The entry journaled.
+    pub(crate) fn change(self) -> AckPolicyChange {
+        self.change
+    }
+
+    /// Whether it was a forced swap, which lifted the halt (see
+    /// [`HaltGate::record_journaled`]).
+    pub(crate) fn is_forced(self) -> bool {
+        self.forced
     }
 }
 
@@ -177,10 +208,39 @@ impl HaltGate {
         }
     }
 
+    /// Whether this node replicates: whether the gate watches a replica
+    /// presence at all.
+    pub(crate) fn replication(&self) -> Replication {
+        match self.replicas_connected {
+            Some(_) => Replication::Enabled,
+            None => Replication::Disabled,
+        }
+    }
+
+    /// Journal a change to `policy` from `origin`: decide its entry on who
+    /// is streaming now, hand the entry to `publish` (the input ring's
+    /// producer putting it on the ring), and, once it is published, record
+    /// it against the halt ([`Self::record_journaled`]). An entry
+    /// `publish` refuses is recorded nowhere, and its error returned.
+    ///
+    /// The one way to journal a change, so a published entry is always
+    /// recorded, once, from the very look at who was streaming that
+    /// decided it.
+    pub(crate) fn journal<E>(
+        &self,
+        policy: AckPolicy,
+        origin: Origin,
+        publish: impl FnOnce(AckPolicyChange) -> Result<(), E>,
+    ) -> Result<Journaled, E> {
+        let decision = self.decide(policy, origin);
+        publish(decision.change)?;
+        Ok(self.record_journaled(decision))
+    }
+
     /// Decide the entry that journals a change to `policy` from `origin`,
     /// on who is streaming now (two loads) — see
     /// [`crate::policy_control::is_unwitnessed`].
-    pub(crate) fn decide(&self, policy: AckPolicy, origin: Origin) -> Decision {
+    fn decide(&self, policy: AckPolicy, origin: Origin) -> Decision {
         let seen = self.replicas_connected.as_ref().map(|p| p.observe());
         let witnesses = match seen {
             None => Witnesses::Disabled,
@@ -207,17 +267,23 @@ impl HaltGate {
     /// one); if it leaves without acking anything, the operator's earlier
     /// consent stands. Standalone never halts, so there is nothing to
     /// record.
-    pub(crate) fn record_journaled(&self, decision: Decision) {
+    fn record_journaled(&self, decision: Decision) -> Journaled {
+        let journaled = Journaled {
+            policy: decision.policy,
+            change: decision.change,
+            forced: decision.is_forced(),
+        };
         let (Some(presence), Some(observed)) = (&self.replicas_connected, decision.seen) else {
-            return;
+            return journaled;
         };
         if decision.policy.needs_replica() {
             presence.clear_override();
         } else if let Observed::NoneConnected(since) = observed
-            && decision.is_forced()
+            && journaled.forced
         {
             presence.latch_override(since);
         }
+        journaled
     }
 
     /// Count `count` refused writes. Meant for one call per receive with
@@ -467,36 +533,75 @@ mod tests {
     fn a_decision_follows_the_replica_count() {
         let standalone =
             gate(None, Arc::new(FenceState::new(0))).decide(AckPolicy::Disk, Origin::Runtime);
-        assert!(standalone.change().unwitnessed && !standalone.is_forced());
+        assert!(standalone.change.unwitnessed && !standalone.is_forced());
         let replicas = test_support::presence(0);
         let gate = gate(Some(Arc::clone(&replicas)), Arc::new(FenceState::new(0)));
         let none = gate.decide(AckPolicy::Disk, Origin::Runtime);
-        assert!(none.change().unwitnessed && none.is_forced());
+        assert!(none.change.unwitnessed && none.is_forced());
         drop(replicas.lift());
         drop(replicas.lift());
         let connected = gate.decide(AckPolicy::Disk, Origin::Runtime);
-        assert!(!connected.change().unwitnessed && !connected.is_forced());
+        assert!(!connected.change.unwitnessed && !connected.is_forced());
     }
 
-    /// Journal `policy` as the producer would: decide the entry, record
-    /// it.
-    fn journal(gate: &HaltGate, policy: AckPolicy, origin: Origin) {
-        gate.record_journaled(gate.decide(policy, origin));
+    /// Journal `policy` as the producer would, onto a ring that always
+    /// takes the entry.
+    fn journal(gate: &HaltGate, policy: AckPolicy, origin: Origin) -> Journaled {
+        let Ok(journaled) = gate.journal(policy, origin, |_| Ok::<_, std::convert::Infallible>(()));
+        journaled
     }
 
-    /// The entry a decision carries is the policy's byte; standalone, it is
-    /// unwitnessed (nothing can witness it) but not forced, whatever the
-    /// policy and origin. The rule with replication on is
-    /// `policy_control`'s `the_forced_rule`, and the count it reads is
+    /// The entry a journaled change carries is the policy's byte, and it
+    /// is the one handed to the producer; standalone, it is unwitnessed
+    /// (nothing can witness it) but not forced, whatever the policy and
+    /// origin. The rule with replication on is `policy_control`'s
+    /// `the_forced_rule`, and the count it reads is
     /// `a_decision_follows_the_replica_count`.
     #[test]
-    fn a_decision_journals_its_policy_as_the_observation_rules() {
+    fn a_journaled_change_carries_its_policy_as_the_observation_rules() {
         let standalone = gate(None, Arc::new(FenceState::new(0)));
-        let decision = standalone.decide(AckPolicy::Ram, Origin::Staged);
-        assert_eq!(decision.policy(), AckPolicy::Ram);
-        assert_eq!(decision.change().policy, AckPolicy::Ram.to_byte());
-        assert!(decision.change().unwitnessed, "nothing can witness it");
-        assert!(!decision.is_forced(), "unwitnessed for want of replication");
+        let mut published = None;
+        let Ok(journaled) = standalone.journal(AckPolicy::Ram, Origin::Staged, |change| {
+            published = Some(change);
+            Ok::<_, std::convert::Infallible>(())
+        });
+        assert_eq!(journaled.policy(), AckPolicy::Ram);
+        assert_eq!(journaled.change().policy, AckPolicy::Ram.to_byte());
+        assert_eq!(published, Some(journaled.change()), "the entry published");
+        assert!(journaled.change().unwitnessed, "nothing can witness it");
+        assert!(
+            !journaled.is_forced(),
+            "unwitnessed for want of replication"
+        );
+    }
+
+    /// An entry the producer could not publish (a full ring) is recorded
+    /// nowhere: a forced `disk` refused that way lifts no halt, and the
+    /// error comes back.
+    #[test]
+    fn an_entry_not_published_is_not_recorded() {
+        let gate = gate(
+            Some(test_support::presence(0)),
+            Arc::new(FenceState::new(0)),
+        );
+        assert_eq!(
+            gate.journal(AckPolicy::Disk, Origin::Runtime, |_| Err("full")),
+            Err("full")
+        );
+        assert_eq!(gate.verdict(), HALTED, "still halted");
+        assert!(journal(&gate, AckPolicy::Disk, Origin::Runtime).is_forced());
+        assert_eq!(gate.verdict(), Verdict::Take, "published: lifted");
+    }
+
+    /// The replication shape is the presence's: watched or not.
+    #[test]
+    fn the_replication_shape_is_the_presence() {
+        let fence = || Arc::new(FenceState::new(0));
+        assert_eq!(gate(None, fence()).replication(), Replication::Disabled);
+        assert_eq!(
+            gate(Some(test_support::presence(0)), fence()).replication(),
+            Replication::Enabled
+        );
     }
 
     /// Halt-plan step 0. A node under `disk` that loses its replica halts

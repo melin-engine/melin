@@ -293,8 +293,10 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 - **Operator-visible: how an ack-policy swap behaves.**
   - `ACK-POLICY` on a serving primary replies `OK` once the change is
     journaled, which can be before it is in force. It replies
-    `ERR ACK-POLICY not journaled: ...` if the change cannot be journaled
-    within 2 s (input ring full) or the node is stopping. On a replica,
+    `ERR ACK-POLICY not journaled: ...` if the change cannot be journaled,
+    naming why: the input ring stayed full for 2 s, the node stopped
+    serving as primary, or another `ACK-POLICY` request is still
+    waiting. On a replica,
     or a primary still starting, it replies `OK staged`, and the policy
     is journaled when the node serves as primary, unless its history
     already holds it. Every command a serving primary takes is
@@ -375,11 +377,14 @@ Anything source-breaking is called out under **Removed** or **Changed**.
     `ack_policy` atomic, and
     `admin::spawn` takes the `policy_control::AckPolicyControl` mailbox
     in place of the atomic. `reader::spawn_reader` takes a
-    `policy_control::PublisherClaim`, and `dpdk_transport::run_dpdk_poll`
-    an `AckPolicyPublisher`: the input ring's producer journals the
-    `ACK-POLICY` requests. The mailbox, the claim and the publisher are
-    built only by the server's start-up (`AckPolicyControl::new` and
-    `claim` are crate-private), so outside the crate `admin::spawn`
+    `policy_control::BootedClaim` (a `PublisherClaim` whose boot entry is
+    journaled: `PublisherClaim::journal_boot` consumes the claim and
+    returns it, and only it attaches a producer), and
+    `dpdk_transport::run_dpdk_poll` an `AckPolicyPublisher`: the input
+    ring's producer journals the `ACK-POLICY` requests. The mailbox, the
+    claims and the publisher are built only by the server's start-up
+    (`AckPolicyControl::new`, `claim` and `journal_boot` are
+    crate-private), so outside the crate `admin::spawn`
     takes `None` and these two entry points are driven by the server
     alone; there is no outside migration path.
   - The replica count is a `melin_transport_core::replica_presence::ReplicaPresence`

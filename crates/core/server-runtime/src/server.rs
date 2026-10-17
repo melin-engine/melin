@@ -1810,7 +1810,7 @@ where
     let gate_policy = primary_gate_policy(
         lineage_ack_policy,
         ack_policy_claim.policy(),
-        enable_replication,
+        halt_gate.replication(),
         &matching_stage,
     )?;
 
@@ -2103,8 +2103,9 @@ where
         );
     }
     // The policy this tenure requests, after the bump; see
-    // `PublisherClaim::journal_boot`.
-    ack_policy_claim.journal_boot(
+    // `PublisherClaim::journal_boot`. Only the booted claim attaches the
+    // reader.
+    let ack_policy_claim = ack_policy_claim.journal_boot(
         lineage_ack_policy.map(|p| p.policy()),
         &mut input_producer,
         &halt_gate,
@@ -2999,7 +3000,7 @@ where
     let gate_policy = primary_gate_policy(
         lineage_ack_policy,
         ack_policy_claim.policy(),
-        enable_replication,
+        halt_gate.replication(),
         &matching_stage,
     )?;
 
@@ -3199,8 +3200,9 @@ where
             &shutdown,
         );
     }
-    // As on kernel TCP: the policy this tenure requests, after the bump.
-    ack_policy_claim.journal_boot(
+    // As on kernel TCP: the policy this tenure requests, after the bump,
+    // and the booted claim the poll thread attaches.
+    let ack_policy_claim = ack_policy_claim.journal_boot(
         lineage_ack_policy.map(|p| p.policy()),
         &mut input_producer,
         &halt_gate,
@@ -3773,17 +3775,18 @@ fn build_replication_metrics(
 /// disabled — see [`initial_gate_policy`](crate::durability_gate::initial_gate_policy).
 /// Seeds the health endpoint's "journaled" gauge with the lineage's
 /// policy, and wires the matching stage's forced changes to the gate.
+///
+/// `replication` is the halt gate's (`HaltGate::replication`), the one
+/// the producer's entries are decided on, so the gate's start and those
+/// entries agree on whether this node is standalone.
 fn primary_gate_policy<A: Application>(
     lineage_ack_policy: Option<LineagePolicy>,
     requested: crate::ack_policy::AckPolicy,
-    replication_enabled: bool,
+    replication: crate::halt::Replication,
     matching_stage: &melin_transport_core::pipeline::MatchingStage<A>,
 ) -> Result<crate::durability_gate::GatePolicy, String> {
-    let start = crate::durability_gate::initial_gate_policy(
-        lineage_ack_policy,
-        requested,
-        replication_enabled,
-    )?;
+    let start =
+        crate::durability_gate::initial_gate_policy(lineage_ack_policy, requested, replication)?;
     matching_stage
         .utilization()
         .ack_policy_journaled
@@ -5285,6 +5288,7 @@ mod primary_gate_policy_tests {
 
     use super::primary_gate_policy;
     use crate::ack_policy::AckPolicy;
+    use crate::halt::Replication::Enabled;
 
     fn matching_stage() -> MatchingStage<Counter> {
         let (_, mut inputs) = DisruptorBuilder::<InputSlot<CounterEvent>>::new(8)
@@ -5328,14 +5332,14 @@ mod primary_gate_policy_tests {
             wire_seq: 7,
             previous: Some(AckPolicy::Ram.to_byte()),
         };
-        let policy = primary_gate_policy(Some(lineage), AckPolicy::Disk, true, &stage)
+        let policy = primary_gate_policy(Some(lineage), AckPolicy::Disk, Enabled, &stage)
             .expect("a known policy");
         assert_eq!(
             policy.start,
             crate::durability_gate::GateStart {
                 in_force: AckPolicy::Ram,
                 pending: Some(crate::durability_gate::PendingChange {
-                    wire_seq: 7,
+                    wire_seq: WireSeq::new(7),
                     policy: AckPolicy::TwoDisks,
                     unwitnessed: false,
                 }),
@@ -5364,14 +5368,14 @@ mod primary_gate_policy_tests {
         record.observe(1, streamed(AckPolicy::DiskAndRam, false));
         record.observe(6, streamed(AckPolicy::Disk, false));
         let start = |record: &melin_transport_core::lineage::SharedLineagePolicy| {
-            primary_gate_policy(record.load(), AckPolicy::Disk, true, &matching_stage())
+            primary_gate_policy(record.load(), AckPolicy::Disk, Enabled, &matching_stage())
                 .expect("a known policy")
                 .start
         };
         let pending = |unwitnessed| crate::durability_gate::GateStart {
             in_force: AckPolicy::DiskAndRam,
             pending: Some(crate::durability_gate::PendingChange {
-                wire_seq: 6,
+                wire_seq: WireSeq::new(6),
                 policy: AckPolicy::Disk,
                 unwitnessed,
             }),

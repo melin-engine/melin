@@ -49,7 +49,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::ack_policy::AckPolicy;
-use crate::policy_control::{AckPolicyControl, RequestOutcome};
+use crate::policy_control::{AckPolicyControl, Refused, RequestOutcome};
 use crate::promotion::PromotionRequest;
 
 use ed25519_dalek::{Verifier, VerifyingKey};
@@ -408,32 +408,62 @@ fn handle_ack_policy(stream: &mut TcpStream, ack_policy: Option<&AckPolicyContro
         debug!(received = %arg, "rejected ACK-POLICY — unknown policy");
         return;
     };
-    match control.request(next) {
+    let outcome = control.request(next);
+    send_best_effort(stream, ack_policy_reply(outcome));
+    match outcome {
         RequestOutcome::Published => {
-            send_best_effort(stream, b"OK\n");
             info!(
                 policy = next.as_str(),
                 "ack policy change requested by operator"
             );
         }
         RequestOutcome::Staged => {
-            send_best_effort(stream, b"OK staged\n");
             info!(
                 policy = next.as_str(),
                 "ack policy staged by operator: journaled when this node serves as primary"
             );
         }
-        RequestOutcome::Refused => {
-            send_best_effort(
-                stream,
-                b"ERR ACK-POLICY not journaled: the input ring stayed full, or the node is stopping\n",
-            );
+        RequestOutcome::Refused(Refused::RingFull) => {
             // A full input ring is the pipeline stalled behind its gate:
             // degraded operation, not an operator mistake.
             warn!(
                 policy = next.as_str(),
-                "ack policy change refused: it could not be journaled in time"
+                "ack policy change refused: the input ring stayed full, so it could not be journaled in time"
             );
+        }
+        RequestOutcome::Refused(Refused::ProducerStopped) => {
+            info!(
+                policy = next.as_str(),
+                "ack policy change refused: the node stopped serving as primary (stepping down or shutting down) before journaling it"
+            );
+        }
+        RequestOutcome::Refused(Refused::AnotherWaiting) => {
+            // The admin listener serves one command at a time, so a
+            // second requester is unexpected: handled, but worth a look.
+            warn!(
+                policy = next.as_str(),
+                "ack policy change refused: another request was still waiting to be journaled"
+            );
+        }
+    }
+}
+
+/// The admin reply to an `ACK-POLICY` request's outcome. Each refusal
+/// names its cause, since each calls for something different: retry once
+/// the pipeline drains, find the new primary, or wait for the request
+/// already in flight.
+fn ack_policy_reply(outcome: RequestOutcome) -> &'static [u8] {
+    match outcome {
+        RequestOutcome::Published => b"OK\n",
+        RequestOutcome::Staged => b"OK staged\n",
+        RequestOutcome::Refused(Refused::RingFull) => {
+            b"ERR ACK-POLICY not journaled: the input ring stayed full; retry once the pipeline drains\n"
+        }
+        RequestOutcome::Refused(Refused::ProducerStopped) => {
+            b"ERR ACK-POLICY not journaled: the node stopped serving as primary (stepping down or shutting down)\n"
+        }
+        RequestOutcome::Refused(Refused::AnotherWaiting) => {
+            b"ERR ACK-POLICY not journaled: another ACK-POLICY request is still waiting\n"
         }
     }
 }
@@ -787,7 +817,11 @@ mod tests {
         // No replica connected: a runtime `disk` is forced.
         let replicas = crate::halt::test_support::presence(0);
         let halt = crate::halt::test_support::gate_over(Some(replicas));
-        let mut publisher = control.claim().attach(&mut producer, &halt, None);
+        let mut publisher = crate::policy_control::test_support::booted(&control).attach(
+            &mut producer,
+            &halt,
+            None,
+        );
         let (key, addr, shutdown) = spawn_with_policy(&control);
         let polling = Arc::new(AtomicBool::new(true));
         let poller = {
@@ -828,12 +862,39 @@ mod tests {
         let _publisher = attach(&control, &mut producer);
         let (key, addr, shutdown) = spawn_with_policy(&control);
         let resp = send_command(addr, &key, b"ACK-POLICY disk\n");
-        assert!(resp.starts_with("ERR ACK-POLICY not journaled"), "{resp}");
+        assert_eq!(
+            format!("{resp}\n").as_bytes(),
+            ack_policy_reply(RequestOutcome::Refused(Refused::RingFull)),
+            "{resp}"
+        );
         assert_eq!(
             control.requested_byte().load(Ordering::Relaxed),
             AckPolicy::DiskAndRam.as_u8()
         );
         shutdown.store(true, Ordering::Release);
+    }
+
+    /// Each outcome has its own reply, and each refusal names its cause.
+    #[test]
+    fn the_ack_policy_reply_names_each_outcome() {
+        let reply = |outcome| std::str::from_utf8(ack_policy_reply(outcome)).expect("ASCII");
+        assert_eq!(reply(RequestOutcome::Published), "OK\n");
+        assert_eq!(reply(RequestOutcome::Staged), "OK staged\n");
+        for (cause, names) in [
+            (Refused::RingFull, "the input ring stayed full"),
+            (
+                Refused::ProducerStopped,
+                "stopped serving as primary (stepping down or shutting down)",
+            ),
+            (Refused::AnotherWaiting, "another ACK-POLICY request"),
+        ] {
+            let text = reply(RequestOutcome::Refused(cause));
+            assert!(
+                text.starts_with("ERR ACK-POLICY not journaled: ") && text.contains(names),
+                "{cause:?}: {text}"
+            );
+            assert!(text.ends_with('\n') && !text[..text.len() - 1].contains('\n'));
+        }
     }
 
     #[test]

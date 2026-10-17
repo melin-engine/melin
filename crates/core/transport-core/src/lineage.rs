@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU16, Ordering};
 
 use melin_journal::{AckPolicyByte, AckPolicyChange};
 
+use crate::cursors::WireSeq;
 use crate::dispatch::LineageEvent;
 
 /// The lineage metadata in force at one journal position.
@@ -212,7 +213,7 @@ fn decode(raw: u16) -> Option<AckPolicyByte> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ForcedPolicy {
     /// The change entry's wire sequence.
-    pub wire_seq: u64,
+    pub wire_seq: WireSeq,
     /// The policy it puts in force.
     pub policy: AckPolicyByte,
 }
@@ -245,8 +246,10 @@ impl ForcedPolicyWriter {
     /// applied yet.
     #[inline]
     pub fn store(&mut self, forced: ForcedPolicy) {
-        self.0
-            .store([forced.wire_seq, FORCED_PRESENT | u64::from(forced.policy.0)]);
+        self.0.store([
+            forced.wire_seq.get(),
+            FORCED_PRESENT | u64::from(forced.policy.0),
+        ]);
     }
 }
 
@@ -260,7 +263,7 @@ impl ForcedPolicyReader {
     pub fn load(&self) -> Option<ForcedPolicy> {
         let [wire_seq, policy] = self.0.load();
         (policy & FORCED_PRESENT != 0).then_some(ForcedPolicy {
-            wire_seq,
+            wire_seq: WireSeq::new(wire_seq),
             // Truncation intended: the low byte is the policy, the bit
             // above it the presence flag.
             policy: AckPolicyByte(policy as u8),
@@ -414,7 +417,7 @@ mod tests {
         assert_eq!(reader.load(), None);
         for (wire_seq, byte) in [(1, 0), (7, u8::MAX), (u64::MAX, 3)] {
             let forced = ForcedPolicy {
-                wire_seq,
+                wire_seq: WireSeq::new(wire_seq),
                 policy: AckPolicyByte(byte),
             };
             writer.store(forced);

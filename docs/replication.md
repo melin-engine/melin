@@ -278,10 +278,13 @@ succession are applied one after the other, never merged.
 **The reply.** On a serving primary the command answers `OK` once the
 swap is journaled, which can be before it is in force (the
 `melin_ack_policy_journaled` and `melin_ack_policy_in_force` gauges tell
-the two apart, see "Observability"). If the node cannot journal it
-within 2 seconds (its pipeline is stalled and its input is full) or is
-stopping, it answers `ERR ACK-POLICY not journaled: ...` and nothing
-changes. On a replica, or on a primary still starting, it answers
+the two apart, see "Observability"). If the node cannot journal it, it
+answers `ERR ACK-POLICY not journaled: ...` with the reason, and nothing
+changes: its input stayed full for 2 seconds (its pipeline is stalled;
+retry once it drains), it stopped serving as primary meanwhile
+(stepping down or shutting down), or
+another `ACK-POLICY` request is still waiting. On a replica, or on a
+primary still starting, it answers
 `OK staged`: the policy is kept and journaled when the node serves as
 primary (below), unless its history already holds it. Every command a
 serving primary takes is journaled, a repeat of the policy already in

@@ -22,7 +22,7 @@ use melin_pipeline::ring;
 use melin_pipeline::wait::WaitStrategy;
 
 use crate::ack_policy::{Blocker, CursorView, EvalStatus, MAX_CLUSTER_SIZE, Policy};
-use crate::durability_gate::{DurabilityGate, GateInputs, GateOutcome};
+use crate::durability_gate::{Admission, DurabilityGate, GateInputs};
 pub use crate::durability_gate::{GatePolicy, GateStart};
 use crate::halt::{Refusal, RefusalQueue};
 use crate::replication::ReplicationMetrics;
@@ -917,7 +917,10 @@ pub fn run<A: Application>(
             // is not appended, and the rest of the batch goes with it.
             // Those clients see a reset, as after a crash, and reconcile
             // on reconnect.
-            if let GateOutcome::Shutdown = gate.admit(
+            //
+            // A policy change slot is the gate's own: its frames go to no
+            // connection, whatever it is addressed to.
+            let destination = match gate.admit(
                 slot,
                 shutdown,
                 #[cfg(feature = "tick-to-trade")]
@@ -974,8 +977,10 @@ pub fn run<A: Application>(
                     }
                 },
             ) {
-                continue 'run;
-            }
+                Admission::Reply { connection_id } => Some(connection_id),
+                Admission::GateOnly => None,
+                Admission::Shutdown => continue 'run,
+            };
 
             // Per-slot durability-gate breakdown. Recorded only when the
             // gate actually held us up (the tracker captured a cross).
@@ -1000,7 +1005,9 @@ pub fn run<A: Application>(
             // payloads go through the encoder; transport-shaped
             // frames (EngineError, BatchEnd) are encoded by the
             // runtime directly.
-            if let Some(entry) = connections.get_mut(&slot.connection_id) {
+            if let Some((connection_id, entry)) =
+                destination.and_then(|id| connections.get_mut(&id).map(|entry| (id, entry)))
+            {
                 // Frame 1: application payload (if any). BatchEnd
                 // payloads carry no body — the terminator below
                 // handles them via `is_last_in_request`.
@@ -1025,7 +1032,7 @@ pub fn run<A: Application>(
                 let _outcome = append_frames(
                     payload_result,
                     trailer,
-                    slot.connection_id,
+                    connection_id,
                     entry,
                     &encode_buf,
                     batch_now,
@@ -1042,11 +1049,11 @@ pub fn run<A: Application>(
                 // whichever flush ships the bytes.
                 #[cfg(feature = "latency-trace")]
                 if slot.is_last_in_request && matches!(_outcome, AppendOutcome::Continue) {
-                    pending_e2e.push((slot.connection_id, slot.recv_ts));
+                    pending_e2e.push((connection_id, slot.recv_ts));
                 }
 
                 flush.on_append(entry.send_buf.len());
-            } else if slot.connection_id != 0 {
+            } else if let Some(connection_id) = destination.filter(|&id| id != 0) {
                 // A reply for a connection this stage does not hold: it
                 // was dropped earlier in this batch, or went away before
                 // its reply was encoded. The drain above runs after the
@@ -1056,7 +1063,7 @@ pub fn run<A: Application>(
                 // tick — whose reports have no client to go to, and is
                 // skipped without a word.
                 debug!(
-                    connection_id = slot.connection_id,
+                    connection_id,
                     wire_seq = slot.wire_seq,
                     "reply dropped: connection not registered"
                 );
@@ -4286,7 +4293,10 @@ mod tests {
 
             producer.publish(reply(1));
             producer.publish(OutputSlot {
-                connection_id: 0,
+                // Addressed to the client's own connection, which the
+                // matching stage never does: the change still sends it
+                // nothing, not even a batch end.
+                connection_id: 1,
                 input_seq: 1,
                 wire_seq: 2,
                 payload: OutputPayload::AckPolicyChange(AckPolicyChange {
@@ -4317,7 +4327,7 @@ mod tests {
 
                 // A forced swap back to `disk`, not yet on disk itself.
                 forced_writer.store(ForcedPolicy {
-                    wire_seq: 4,
+                    wire_seq: WireSeq::new(4),
                     policy: AckPolicy::Disk.to_byte(),
                 });
                 thread::sleep(HOLD);

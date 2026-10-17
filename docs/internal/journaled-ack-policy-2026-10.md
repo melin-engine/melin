@@ -777,6 +777,43 @@ and is committed on its own. Tests land with the step they pin.
    of its retries lifts the halt for that moment, as authentication did
    before.
 
+   **Compile-time hardening (review follow-up).** A later review asked
+   for the conventions above to be types; behaviour is unchanged except
+   for the admin reply text:
+   - *A tenure's two steps are a typestate.* `PublisherClaim::journal_boot`
+     consumes the claim and returns a `BootedClaim`, the only thing that
+     attaches a producer (`spawn_reader` takes one; the DPDK path attaches
+     it on the main thread), so neither transport can attach without
+     having decided its boot entry, nor journal it twice or after.
+   - *Journaling and recording are one call.* `HaltGate::journal` decides
+     the entry, hands it to a publish closure and, if it is published,
+     records it, returning a `Journaled` for the log line; `decide`,
+     `record_journaled` and the now non-`Copy` `Decision` are private to
+     `halt`. A publish the ring refuses records nothing (tested).
+   - *`WireSeq` and `Option`.* `ForcedPolicy::wire_seq`,
+     `PendingChange::wire_seq`, the gate's `applied_through`
+     (`Option<WireSeq>`, no more "0 means none") and `apply_change`'s
+     argument are `WireSeq`; the gate's comparisons with output slots and
+     the cached durable position stay `u64`, converted at that boundary.
+     `LineagePolicy::wire_seq` stays `u64`: it is public, snapshot-encoded
+     and folded on several paths, a wider change than this one.
+   - *Standalone is one type.* `initial_gate_policy` takes a
+     `halt::Replication` read from the halt gate itself
+     (`HaltGate::replication`), so the gate's start and the producer's
+     entries decide "standalone?" from the same replica presence.
+   - *A change slot cannot reach a client.* The matching stage addresses
+     it to connection 0 whatever its input's, and `DurabilityGate::admit`
+     returns an `Admission` (`Reply { connection_id }`, `GateOnly`,
+     `Shutdown`): both response stages look a connection up only for
+     `Reply`. The kernel stage's test now addresses its change slot to
+     the client and checks nothing is sent.
+   - *Refusals name their cause.* `RequestOutcome::Refused(Refused)`
+     with `RingFull`, `ProducerStopped` and `AnotherWaiting`, each its
+     own admin reply and log line. A request withdrawn by the producer's
+     drop is now told apart by its ticket, so a producer replaced while
+     a request waits refuses it as stopped at once rather than at the
+     bound.
+
 ## Downstream impact (Exchange Core)
 
 Breaking: an `OutputPayload` arm in its event publisher and anything else
