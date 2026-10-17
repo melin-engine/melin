@@ -45,8 +45,9 @@
 //!
 //! Journaling a forced change is also the operator's consent to serve on
 //! this node's disk alone, so it lifts the halt on client writes until a
-//! replica connects; journaling a policy that needs a replica restores it
-//! (see `halt`). The producer records both as it journals the entry.
+//! replica streaming live acknowledges an entry; journaling a policy that
+//! needs a replica restores it (see `halt`). The producer records both as
+//! it journals the entry.
 
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -141,7 +142,7 @@ fn log_journaled(decision: Decision, origin: Origin) {
         warn!(
             policy = %policy,
             "ack policy change forced with no replica connected: client writes are taken again \
-             until a replica connects, the change takes effect once on this node's disk, and a \
+             until a replica streaming live acknowledges an entry, the change takes effect once on this node's disk, and a \
              replica that was offline does not hold it — if this node fails before that replica \
              rejoins, it may auto-promote over events acknowledged under the new policy"
         );

@@ -302,10 +302,23 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   - `ACK-POLICY disk` sent while no replica is connected is
     *forced*: journaled as unwitnessed, in force once its own entry is on
     the primary's disk (releasing replies held under the old policy),
-    lifting the write halt until a replica connects or a policy that
-    needs one is journaled, and logged at `warn!`. A forced swap is not
-    witnessed by a replica that was offline; `docs/replication.md`
-    states the limitation and the operational rule.
+    lifting the write halt until a replica streaming live acknowledges
+    an entry or a policy that needs one is journaled, and logged at
+    `warn!`. A replica that connects and leaves before then (one
+    refusing the primary's history, retrying, or one leaving during its
+    catch-up, or a caught-up one that joins and leaves while no write
+    reaches it) leaves the halt lifted: set a policy that needs a
+    replica to end the override once replicas are back. The lifted halt
+    does not survive a restart: re-send `ACK-POLICY disk` once the node
+    serves. A forced swap is not witnessed by a replica that was
+    offline; `docs/replication.md` states the limitation and the
+    operational rule, and how to force a swap past a connected replica
+    that never acknowledges.
+  - A replica counts toward the write halt, the forced-swap rule and
+    `melin_replicas_connected` once the primary accepts its handshake,
+    no longer as soon as it authenticates: one the primary refuses after
+    authentication (a handshake it cannot validate, or one showing the
+    primary superseded) never lifts the halt.
   - A policy staged on a replica before `PROMOTE` is journaled by the
     promotion but never forced: it no longer resumes replies on a
     promoted node with no replica. Send `ACK-POLICY disk` again once the
@@ -373,7 +386,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
     (count and halt override in one type) where it was an
     `Arc<AtomicU32>`: `Pipeline::replicas_connected`,
     `health::HealthState::replicas_connected`, `halt::HaltGate::new` and
-    `replication::run_sender` change type.
+    `replication::run_sender` change type. `ReplicaPresence::lift`
+    returns a `FirstAck`, through which a sender reports the replica's
+    acks (`FirstAck::acked`): the first one ends the halt override.
   - `pipeline::StageUtilization` has two new public fields,
     `ack_policy_in_force` and `ack_policy_journaled`.
 - **`melin_journal::replication::ReplicationConsumer` reads by

@@ -797,6 +797,11 @@ found a restart (or promotion) took a change still waiting for its
 witness as in force; a new tenure now applies the lineage's newest
 change again under the policy before it
 (`ack_policy_changes::a_restart_reapplies_a_change_the_replica_never_held`,
+and the plan's step-7 note). The same review found that a replica
+refused after authenticating voided the forced swap's halt override; the
+override now ends only on a counted replica's first ack, and a replica
+counts from its handshake's acceptance
+(`ack_policy_changes::a_forced_disk_lifts_the_halt_until_a_replica_returns`,
 and the plan's step-7 note).
 
 ### 12. A primary disk stall makes a truthful replica look divergent

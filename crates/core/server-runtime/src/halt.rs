@@ -1,7 +1,8 @@
 //! Refusing client writes while a node cannot honour durability.
 //!
 //! A node halts when replication is configured and no replica is
-//! connected: it can no longer promise what the ack policy promises, so it
+//! streaming (authenticated and its handshake accepted: catching up or
+//! live): it can no longer promise what the ack policy promises, so it
 //! takes no new writes. Each is answered with the application's rejection
 //! for [`RejectReason::ReplicaDisconnected`]; queries still run. A node a
 //! newer primary has fenced is stopping and answers nothing: a connection
@@ -14,12 +15,14 @@
 //! stops a primary a partition has cut off from its replicas, which
 //! fencing reaches only on contact. An operator who knows the node has no
 //! replica can consent to serving on its disk alone with `ACK-POLICY
-//! disk`: sent while no replica is connected, the change is journaled as
+//! disk`: sent while no replica is streaming, the change is journaled as
 //! forced, and journaling it lifts the halt
 //! (`HaltGate::record_journaled`). The override lasts until a replica
-//! connects or a policy that needs one is journaled; the next loss of the
-//! last replica then halts the node again. A swap to `disk` made while a
-//! replica is still connected lifts nothing when it leaves: consent counts
+//! streams and acknowledges an entry, or a policy that needs one is
+//! journaled; the next loss of the last replica then halts the node again.
+//! A replica streamed to that leaves without acking (one refusing the
+//! stream, retrying) leaves it standing. A swap to `disk` made while a
+//! replica is still streaming lifts nothing when it leaves: consent counts
 //! only once the operator knows the node has none. The input ring's
 //! producer, which journals the change, is also the reader that enforces
 //! the halt, so the first write after the change's entry is taken. The
@@ -196,12 +199,14 @@ impl HaltGate {
 
     /// The input ring's producer journaled `decision`'s change: a forced
     /// change (the operator's explicit `disk` with no
-    /// replica connected) lifts the halt; a change to a policy that needs
+    /// replica streaming) lifts the halt; a change to a policy that needs
     /// a replica drops any such override, so the node halts again while
-    /// none is connected. Any other change leaves the override as it is:
-    /// a witnessed `disk` was decided with a replica connected, whose
-    /// connect has voided any override already. Standalone never halts,
-    /// so there is nothing to record.
+    /// none is streaming. Any other change leaves the override as it is:
+    /// a witnessed `disk` was decided with a replica streaming, which ends
+    /// any override with its first ack (this change's entry, if no earlier
+    /// one); if it leaves without acking anything, the operator's earlier
+    /// consent stands. Standalone never halts, so there is nothing to
+    /// record.
     pub(crate) fn record_journaled(&self, decision: Decision) {
         let (Some(presence), Some(observed)) = (&self.replicas_connected, decision.seen) else {
             return;
@@ -388,13 +393,14 @@ impl<R: Copy> RefusalQueue<R> {
 pub(crate) mod test_support {
     use super::*;
 
-    /// A replica presence with `connected` replicas streaming. (The
-    /// health endpoint's tests in `melin-transport-core` keep their own:
-    /// a test helper cannot cross the crate boundary.)
+    /// A replica presence with `connected` replicas streaming, none of
+    /// which has acked yet. (The health endpoint's tests in
+    /// `melin-transport-core` keep their own: a test helper cannot cross
+    /// the crate boundary.)
     pub(crate) fn presence(connected: u32) -> Arc<ReplicaPresence> {
         let presence = Arc::new(ReplicaPresence::new());
         for _ in 0..connected {
-            presence.lift();
+            drop(presence.lift());
         }
         presence
     }
@@ -450,7 +456,7 @@ mod tests {
         let replicas = test_support::presence(0);
         let gate = gate(Some(Arc::clone(&replicas)), Arc::new(FenceState::new(0)));
         assert_eq!(gate.verdict(), HALTED);
-        replicas.lift();
+        drop(replicas.lift());
         assert_eq!(gate.verdict(), Verdict::Take);
     }
 
@@ -466,8 +472,8 @@ mod tests {
         let gate = gate(Some(Arc::clone(&replicas)), Arc::new(FenceState::new(0)));
         let none = gate.decide(AckPolicy::Disk, Origin::Runtime);
         assert!(none.change().unwitnessed && none.is_forced());
-        replicas.lift();
-        replicas.lift();
+        drop(replicas.lift());
+        drop(replicas.lift());
         let connected = gate.decide(AckPolicy::Disk, Origin::Runtime);
         assert!(!connected.change().unwitnessed && !connected.is_forced());
     }
@@ -495,8 +501,8 @@ mod tests {
 
     /// Halt-plan step 0. A node under `disk` that loses its replica halts
     /// like any other; the operator's `disk` during the halt lifts it; a
-    /// returning replica voids the override, so its next departure halts
-    /// the node again.
+    /// returning replica that acks voids the override, so its next
+    /// departure halts the node again.
     #[test]
     fn a_forced_disk_lifts_the_halt_until_a_replica_returns() {
         let replicas = test_support::presence(1);
@@ -514,14 +520,42 @@ mod tests {
         journal(&gate, AckPolicy::Disk, Origin::Runtime);
         assert_eq!(gate.verdict(), Verdict::Take, "re-sent, it stays lifted");
 
-        replicas.lift();
+        let mut first_ack = replicas.lift();
         assert_eq!(gate.verdict(), Verdict::Take);
+        first_ack.acked(&replicas);
         assert!(replicas.lower());
         assert_eq!(
             gate.verdict(),
             HALTED,
             "the override did not outlive the replica"
         );
+    }
+
+    /// A replica that authenticates and is then refused (a lineage it will
+    /// not follow, a primary it takes for stale) never acks: counted once
+    /// its handshake is accepted, then leaving, however often it retries,
+    /// it leaves the operator's override standing, and a decision while it
+    /// is counted is witnessed. One that acks ends it.
+    #[test]
+    fn a_replica_refused_after_authenticating_leaves_the_override() {
+        let replicas = test_support::presence(0);
+        let gate = gate(Some(Arc::clone(&replicas)), Arc::new(FenceState::new(0)));
+        journal(&gate, AckPolicy::Disk, Origin::Runtime);
+        assert_eq!(gate.verdict(), Verdict::Take);
+        for _ in 0..3 {
+            let refused = replicas.lift();
+            assert!(
+                !gate.decide(AckPolicy::Disk, Origin::Runtime).is_forced(),
+                "streaming, so witnessed"
+            );
+            drop(refused);
+            assert!(replicas.lower());
+            assert_eq!(gate.verdict(), Verdict::Take, "the override held");
+        }
+
+        replicas.lift().acked(&replicas);
+        assert!(replicas.lower());
+        assert_eq!(gate.verdict(), HALTED, "a replica that acked ended it");
     }
 
     /// A swap back to a policy that needs a replica, with none connected,

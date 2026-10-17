@@ -13,7 +13,7 @@ use tracing::{debug, error, info, warn};
 
 use melin_journal::replication::ReplicationConsumer;
 use melin_pipeline::wait::WaitStrategy;
-use melin_transport_core::replica_presence::ReplicaPresence;
+use melin_transport_core::replica_presence::{FirstAck, ReplicaPresence};
 
 use super::auth::authenticate_replica;
 use super::{ReplicaCursors, ReplicationMetrics, SentHighWater};
@@ -145,13 +145,14 @@ pub fn run_sender<A: Application>(
     // to the active flags.
     let cursors = Arc::new(ReplicaCursors::new(replica_slots, Arc::clone(&metrics)));
 
-    // Per-slot "this connection authenticated" latch. The halt gate
-    // (`replicas_connected`) is lifted by the handler thread only after auth
-    // succeeds, so the main loop must lower it on teardown only when the
-    // handler got that far — a connection that drops mid-auth never counted.
-    // Per-slot `Arc<AtomicBool>` mirrors `active_flags`/`evict_flags`; shared
-    // with the handler thread, which flips it true post-auth.
-    let authenticated_flags: [Arc<AtomicBool>; 2] = [
+    // Per-slot "this connection is counted" latch. The halt gate
+    // (`replicas_connected`) is lifted by the handler thread only once the
+    // replica's handshake is accepted and its join begins, so the main loop
+    // must lower it on teardown only when the handler got that far — a
+    // connection refused or dropped before then never counted. Per-slot
+    // `Arc<AtomicBool>` mirrors `active_flags`/`evict_flags`; shared with
+    // the handler thread, which flips it true as it lifts the gate.
+    let counted_flags: [Arc<AtomicBool>; 2] = [
         Arc::new(AtomicBool::new(false)),
         Arc::new(AtomicBool::new(false)),
     ];
@@ -199,11 +200,11 @@ pub fn run_sender<A: Application>(
         // surviving replica. Borrows only atomics (interior
         // mutability), so it coexists with the `&mut` iteration over `slots`.
         let disengage_slot = |slot_idx: usize| {
-            // Lower the gate only if this connection authenticated (and so
+            // Lower the gate only if this connection was counted (and so
             // lifted it); `swap` reads and resets the latch in one op, and the
-            // `join()` ordered the handler's post-auth writes before here.
+            // `join()` ordered the handler's writes before here.
             // `lower` warns "halted" if this was the last replica.
-            if authenticated_flags[slot_idx].swap(false, Ordering::AcqRel) {
+            if counted_flags[slot_idx].swap(false, Ordering::AcqRel) {
                 replicas_connected.lower();
             }
             // Disengage cursors BEFORE clearing the active flag — ordering
@@ -287,8 +288,9 @@ pub fn run_sender<A: Application>(
                     }
 
                     // The halt gate is NOT lifted here — a bare connect
-                    // hasn't proven a Replication key. The handler lifts it after
-                    // auth succeeds (see `handle_replica_connection`).
+                    // hasn't proven a Replication key. The handler lifts it
+                    // once the replica's handshake is accepted (see
+                    // `handle_replica_connection`).
 
                     // Take the consumer out of the slot for the handler thread.
                     // The slot's consumer becomes None while the thread owns it.
@@ -304,7 +306,7 @@ pub fn run_sender<A: Application>(
                     let slot_active = Arc::clone(&active_flags[slot_idx]);
                     let slot_evict = Arc::clone(&evict_flags[slot_idx]);
                     let slot_fence = Arc::clone(&fence_state);
-                    let slot_authenticated = Arc::clone(&authenticated_flags[slot_idx]);
+                    let slot_counted = Arc::clone(&counted_flags[slot_idx]);
                     let handler = handlers[slot_idx];
                     let shutdown_flag = shutdown as *const AtomicBool as usize;
                     let ready_flag = replica_ready as *const AtomicBool as usize;
@@ -344,7 +346,7 @@ pub fn run_sender<A: Application>(
                                 heartbeat_secs,
                                 wait: handler.wait,
                                 replicas_connected: connected_ref,
-                                authenticated: &slot_authenticated,
+                                counted: &slot_counted,
                             };
                             run_replica_slot::<A>(stream, consumer, &ctx)
                         },
@@ -409,12 +411,13 @@ struct SlotContext<'a> {
     batch_size: usize,
     heartbeat_secs: u64,
     wait: WaitStrategy,
-    /// Halt gate. The handler lifts it only after auth succeeds; the main
-    /// loop lowers it on teardown, gated by `authenticated`.
+    /// Halt gate. The handler lifts it once the replica's handshake is
+    /// accepted, and reports its first ack to it; the main loop lowers it
+    /// on teardown, gated by `counted`.
     replicas_connected: &'a ReplicaPresence,
-    /// Per-slot latch the handler sets true once this connection passes auth,
-    /// so the main loop knows whether this slot lifted the gate.
-    authenticated: &'a AtomicBool,
+    /// Per-slot latch the handler sets true as it lifts the gate, so the
+    /// main loop knows whether this slot lifted it.
+    counted: &'a AtomicBool,
 }
 
 /// Handle a single replica connection on a dedicated thread.
@@ -451,7 +454,7 @@ fn handle_replica_connection<A: Application>(
         heartbeat_secs,
         wait: _,
         replicas_connected,
-        authenticated,
+        counted,
     } = ctx;
     let slot_idx = *slot_idx;
     let heartbeat_secs = *heartbeat_secs;
@@ -468,13 +471,6 @@ fn handle_replica_connection<A: Application>(
     // read timeout set above.
     authenticate_replica(&mut reader, authorized_keys)?;
     info!("replica authenticated");
-
-    // Auth passed — only now lift the halt gate. The main loop lowers
-    // it on slot teardown, reading `authenticated` to know this connection
-    // lifted it. Set the latch after the increment so a post-join read of the
-    // latch implies the increment is visible too.
-    replicas_connected.lift();
-    authenticated.store(true, Ordering::Release);
 
     // Read handshake.
     let handshake_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
@@ -543,6 +539,14 @@ fn handle_replica_connection<A: Application>(
     // the journals are too old.
     let can_catch_up =
         !divergent && can_catch_up_from_journal(journal_path, handshake.last_sequence)?;
+
+    // Handshake accepted, join begins — only now lift the halt gate (see
+    // `ReplicaPresence`): a replica refused before here never counted. The
+    // main loop lowers it on slot teardown, reading `counted` to know this
+    // connection lifted it. Set the latch after the increment so a
+    // post-join read of the latch implies the increment is visible too.
+    let mut first_ack = replicas_connected.lift();
+    counted.store(true, Ordering::Release);
 
     let mut publish = |buf: &[u8]| -> io::Result<()> {
         writer.write_all(buf)?;
@@ -677,6 +681,7 @@ fn handle_replica_connection<A: Application>(
         &mut send_buf,
         &mut last_send,
         &mut sent,
+        &mut first_ack,
     )
 }
 
@@ -787,6 +792,7 @@ fn live_stream_uring(
     send_buf: &mut Vec<u8>,
     last_send: &mut std::time::Instant,
     sent: &mut SentHighWater,
+    first_ack: &mut FirstAck,
 ) -> io::Result<()> {
     let SlotContext {
         cursors,
@@ -796,6 +802,7 @@ fn live_stream_uring(
         slot_idx,
         batch_size,
         wait,
+        replicas_connected,
         // Only used during handshake/catch-up (handle_replica_connection).
         journal_path: _,
         authorized_keys: _,
@@ -803,8 +810,7 @@ fn live_stream_uring(
         active_flag: _,
         heartbeat_secs: _,
         fence_state: _,
-        replicas_connected: _,
-        authenticated: _,
+        counted: _,
     } = ctx;
     let slot_idx = *slot_idx;
     let batch_size = *batch_size;
@@ -1029,6 +1035,9 @@ fn live_stream_uring(
                         cursors
                             .record_ack(slot_idx, &ack, sent.get())
                             .map_err(io::Error::other)?;
+                        // The replica took the stream: the first ack ends
+                        // any halt override (see `ReplicaPresence`).
+                        first_ack.acked(replicas_connected);
                         metrics.ack_latency_us[slot_idx]
                             .store(last_send.elapsed().as_micros() as u64, Ordering::Relaxed);
                         if let Some(event) = persist_watch.observe(&ack, received) {

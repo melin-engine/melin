@@ -260,7 +260,7 @@ struct HealthSnapshot {
     /// Writes refused at ingress while halted — see
     /// [`HealthState::refused_writes`].
     refused_writes: u64,
-    /// Number of replicas currently connected. 0 in standalone mode.
+    /// Number of replicas currently streaming. 0 in standalone mode.
     replicas_connected: u32,
     /// Per-replica lag: journal_seq - acked_sequence (0 if no ack yet).
     /// Fixed-size array for up to 2 replica slots.
@@ -663,7 +663,7 @@ impl HealthSnapshot {
              # HELP melin_writes_refused_total Client writes turned away at ingress while the node was halted (replication configured, no replica connected). A refused write is never journaled; the client is told ReplicaDisconnected, or ServerBusy when the refusal queue is full.\n\
              # TYPE melin_writes_refused_total counter\n\
              melin_writes_refused_total {}\n\
-             # HELP melin_replicas_connected Number of replicas currently connected.\n\
+             # HELP melin_replicas_connected Number of replicas currently streaming (authenticated and handshake accepted: catching up or live). The write halt counts these.\n\
              # TYPE melin_replicas_connected gauge\n\
              melin_replicas_connected {}\n\
              # HELP melin_replica_acked_sequence Last sequence acked by each replica slot (persisted to journal).\n\
@@ -1272,11 +1272,12 @@ mod tests {
         cursors
     }
 
-    /// A replica presence with `connected` replicas streaming.
+    /// A replica presence with `connected` replicas streaming, none of
+    /// which has acked yet.
     fn presence(connected: u32) -> Arc<ReplicaPresence> {
         let presence = Arc::new(ReplicaPresence::new());
         for _ in 0..connected {
-            presence.lift();
+            drop(presence.lift());
         }
         presence
     }
@@ -1569,8 +1570,9 @@ mod tests {
         let buf = read_health(addr);
         assert_eq!(buf, "OK 5 100 0 halted\n");
 
-        // Connect a replica — should switch to trading.
-        presence.lift();
+        // A replica is counted — should switch to trading. Its acks are
+        // not this test's concern.
+        drop(presence.lift());
         let buf = read_health(addr);
         assert_eq!(buf, "OK 5 100 0 trading\n");
 

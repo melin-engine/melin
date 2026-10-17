@@ -13,8 +13,11 @@
 //! - A lineage last run replicated under `disk+ram`, restarted
 //!   `--standalone --ack-policy disk`, serves at once.
 //! - A forced `ACK-POLICY disk` (no replica connected) lifts the halt on
-//!   client writes until a replica connects or a policy that needs one is
-//!   journaled.
+//!   client writes until a streaming replica acks an entry or a policy that
+//!   needs one is journaled; a replica that streams and leaves without
+//!   acking leaves it standing.
+//! - A replica counts toward the halt once its handshake is accepted: one
+//!   that has only authenticated leaves the node halted.
 //! - The same forced `disk` releases a write held under `disk+ram` by a
 //!   replica that left without acking it: the change overtakes the write
 //!   once its own entry is on the primary's disk.
@@ -252,6 +255,31 @@ fn wait_durable(health: SocketAddr, sequence: u64) {
     }
 }
 
+/// Wait until the primary has recorded a replica's ack of `sequence`, on
+/// whichever slot it took.
+fn wait_for_replica_ack(health: SocketAddr, sequence: u64) {
+    let deadline = Instant::now() + LIMIT;
+    let acked = || {
+        ["0", "1"]
+            .iter()
+            .filter_map(|slot| {
+                gauge(
+                    health,
+                    &format!("melin_replica_acked_sequence{{slot=\"{slot}\"}}"),
+                )
+            })
+            .max()
+    };
+    while acked().is_none_or(|acked| acked < sequence) {
+        assert!(
+            Instant::now() < deadline,
+            "the primary never recorded the ack of {sequence} (last: {:?})",
+            acked()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Under `disk+ram`, `ACK-POLICY disk` takes effect only once the replica
 /// holds the change: a write after it waits on the replica, though it is
 /// on the primary's disk; once the replica holds the change (and nothing
@@ -399,9 +427,10 @@ fn a_restart_reapplies_a_change_the_replica_never_held() {
 /// Halt-plan step 0, the manual-promotion playbook: a primary with no
 /// replica halts under every policy, `disk` included; the operator's
 /// `ACK-POLICY disk` sent while it has none lifts the halt; a policy that
-/// needs a replica restores it; a replica connecting ends the override,
-/// so its departure halts the node again; and a `disk` sent while a
-/// replica was connected is no consent once it leaves.
+/// needs a replica restores it; a replica that streams and leaves without
+/// acking (one refusing the stream) leaves the override standing, and one
+/// that acks ends it, so its departure halts the node again; and a `disk`
+/// sent while a replica was connected is no consent once it leaves.
 #[test]
 fn a_forced_disk_lifts_the_halt_until_a_replica_returns() {
     const TRADING: &str = "melin_trading_active";
@@ -451,8 +480,24 @@ fn a_forced_disk_lifts_the_halt_until_a_replica_returns() {
     ack_policy("disk");
     assert_eq!(write_reply(&mut conn), KIND_RESP_ACK, "lifted again");
 
-    // A replica connecting ends the override: its departure halts the node.
+    // A replica that streams and leaves without acking anything, as one
+    // refusing the primary's history on the stream's first frame does,
+    // leaves the override standing.
     let replica = cluster.join_replica(health);
+    drop(replica);
+    wait_for_gauge(health, "melin_replicas_connected", 0);
+    assert_eq!(
+        write_reply(&mut conn),
+        KIND_RESP_ACK,
+        "a replica that never acked ended the override"
+    );
+    assert_eq!(gauge(health, TRADING), Some(1));
+
+    // A replica that acks ends the override: its departure halts the node.
+    let mut replica = cluster.join_replica(health);
+    let taken = replica.read_through(1);
+    replica.ack(taken);
+    wait_for_replica_ack(health, taken);
     drop(replica);
     wait_for_gauge(health, "melin_replicas_connected", 0);
     assert_eq!(
@@ -462,6 +507,57 @@ fn a_forced_disk_lifts_the_halt_until_a_replica_returns() {
     );
     wait_for_gauge(health, TRADING, 0);
 
+    drop(conn);
+    primary.stop();
+}
+
+/// A replica counts toward the halt and `melin_replicas_connected` once
+/// the primary accepts its handshake, not once it authenticates: one
+/// admitted and not yet handshaken leaves a halted node halted, and the
+/// same replica handshaking lifts the halt.
+///
+/// The authenticated replica holds its handshake back for as long as the
+/// test needs (well inside the primary's handshake timeout), so the halted
+/// reads are no race on this side; a primary counting the replica at
+/// authentication would have counted it before the client's write, which
+/// connects and authenticates after the replica's verdict.
+#[test]
+fn a_replica_counts_once_its_handshake_is_accepted() {
+    const TRADING: &str = "melin_trading_active";
+    let cluster = Cluster::new();
+    let config = cluster.config(AckPolicy::Disk, false);
+    let health = config.health_bind.expect("set");
+    let primary = cluster.start(config);
+    // A new history serves no client before its first replica streams: one
+    // comes and goes, leaving the node serving, and halted.
+    let replica = cluster.join_replica(health);
+    wait_for_gauge(health, TRADING, 1);
+    drop(replica);
+    wait_for_gauge(health, "melin_replicas_connected", 0);
+    wait_for_gauge(health, TRADING, 0);
+
+    // Authenticated, no handshake: not counted, and the node stays halted.
+    let admitted = RawReplica::authenticate(
+        cluster.addrs.replication(),
+        &cluster.keys.scripted,
+        FRAME_LIMIT,
+    );
+    let mut conn = cluster.client(&primary);
+    assert_eq!(
+        write_reply(&mut conn),
+        KIND_RESP_REJECTED,
+        "an authenticated replica that never handshook lifted the halt"
+    );
+    assert_eq!(gauge(health, "melin_replicas_connected"), Some(0));
+    assert_eq!(gauge(health, TRADING), Some(0));
+
+    // Its handshake accepted, it counts, and the halt lifts.
+    let replica = admitted.handshake();
+    wait_for_gauge(health, "melin_replicas_connected", 1);
+    wait_for_gauge(health, TRADING, 1);
+    assert_eq!(write_reply(&mut conn), KIND_RESP_ACK, "the halt is lifted");
+
+    drop(replica);
     drop(conn);
     primary.stop();
 }

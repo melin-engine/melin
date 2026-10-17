@@ -175,6 +175,11 @@ the journal never sees a refused write, the node counts them: the
 `melin_writes_refused_total` counter on `/metrics` says how many writes a
 halt cost.
 
+A replica counts as connected from the moment the primary accepts its
+handshake (while it catches up, and then while it streams) until it
+leaves; `melin_replicas_connected` on `/metrics` counts these. One that
+authenticates and is then refused by the primary never counts.
+
 An operator lifts the halt with a *forced* `ACK-POLICY disk`, sent while
 the node has no replica connected (see [the forced
 swap](#runtime-policy-swap)). The health endpoint reports `trading`
@@ -294,9 +299,17 @@ policy and lifting the [write
 halt](#writes-halt-when-all-replicas-disconnect) by the time the
 operator reads `OK`: it is the explicit consent to keep taking writes on
 the primary's disk alone. The node logs a warning naming the risk. The
-halt stays lifted until a replica connects, or until a policy that
-needs a replica is set; after that,
-losing the last replica halts the node again. Only that case is forced:
+halt stays lifted until a replica, streaming live, acknowledges an
+entry, or until a policy that needs a replica is set; after that, losing
+the last replica halts the node again. A replica that connects and
+leaves before then (one that refuses this primary's history, say, and
+keeps retrying, or one that leaves during its catch-up or snapshot)
+leaves the halt lifted. So does a healthy replica that joins already
+caught up while the node takes no writes: a replica acknowledges only
+entries it receives, so one that leaves before any write reaches it
+never ended the override, and the node keeps taking writes on its disk
+alone. To end the override once replicas are back, set a policy that
+needs one (step 5 of the failover workflow). Only that case is forced:
 any other policy, or `disk` sent while a replica is connected, waits,
 and such a `disk` lifts nothing when that replica later leaves: send it
 again once it has. If the
@@ -304,6 +317,23 @@ last replica leaves while a swap to `disk` still waits for it, re-send
 the swap: the second one is forced, and overtakes the first. A forced
 swap is not witnessed by any replica (see [A forced swap is not
 witnessed](#a-forced-swap-is-not-witnessed)).
+
+*No replica connected* means none at all. A replica that is connected
+but never acknowledges the swap (one that never persists it, or one
+that connects, refuses the stream and retries) still counts while it is
+connected, so an `ACK-POLICY disk` sent then is witnessed: under a
+policy that needs a replica it waits for that one, possibly forever, and
+it lifts no halt when the replica leaves. To force the swap past it,
+disconnect that replica (stop it, or cut it off at the network) until
+`melin_replicas_connected` reads 0, then send `ACK-POLICY disk` again.
+
+The lifted halt does not survive a restart. The swap itself does: when
+it is the newest in the history, a restarted primary applies it again as
+soon as its entry is on the node's disk (see "A new tenure confirms the
+newest swap again" below). But the node starts halted, like any
+replicated primary, until a replica connects. If none will, send
+`ACK-POLICY disk` again once it serves: with no replica connected it is
+forced again, and lifts the halt.
 
 **Restarts and promotions journal the requested policy.** A primary
 starts under the policy its journal records, not its `--ack-policy`
@@ -353,8 +383,8 @@ The intended workflow is failover:
 3. Once it serves, the operator sends `ACK-POLICY disk` → forced (see
    "The forced swap" above; a staged one is not, see below): writes and
    held replies resume, no restart, no dropped client connections.
-4. New replicas are spun up and connect. The first one to connect ends
-   the halt override.
+4. New replicas are spun up and connect. The first one to acknowledge
+   an entry ends the halt override.
 5. Operator sends `ACK-POLICY disk+ram` → in force once the old policy
    has cleared it, and service continues at the full contract.
 

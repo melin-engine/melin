@@ -697,6 +697,86 @@ and is committed on its own. Tests land with the step they pin.
    boot journal an unwitnessed entry when the newest change is pending
    and replication is disabled would close it.
 
+   **The override ends on a first ack, not on authentication (review
+   fix).** An independent review found that `ReplicaPresence::lift`
+   bumped the connect generation when a replica *authenticated*, before
+   its handshake was accepted, so a replica that authenticated and was
+   then refused voided a forced `disk` override on its first retry and
+   flapped the node back to halted. Two changes, on both transports:
+   - The count (`lift`/`lower`) moves from authentication to the
+     handshake's acceptance: the TCP sender lifts after the fence check,
+     the chain validation and the catch-up probe, the DPDK driver as the
+     join begins (`Handshaking` → `Joining`), and each lowers only a
+     connection it counted (`counted` latch; `Joining`/`Streaming`). The
+     halt, the forced-swap rule (`observe`) and `melin_replicas_connected`
+     keep reading this one count, so they cannot disagree on "connected".
+     Counting only from live was considered and rejected: it would halt
+     the node through a long catch-up or snapshot transfer that kept it
+     serving before, and the `dpdk_veth` joiner tests pin that a joining
+     replica stays counted.
+   - The generation (renamed `acked`) is bumped by a counted connection's
+     *first ack*, not by the count: `lift` returns a `FirstAck` token
+     (`#[must_use]`), and only `FirstAck::acked` bumps it, once per
+     connection (one branch per ack after that). Accepting the handshake
+     is not proof enough: a replica refuses a lineage (genesis mismatch,
+     `StalePrimary`) on `StreamStart` and closes, which the primary learns
+     only from the closed socket, possibly after it has gone live. TCP
+     reports the acks its live loop records; DPDK carries the token in
+     `PendingJoin` and then in `SlotState::Streaming`, so a slot cannot
+     stream uncounted, and reports the acks the streaming arm records
+     (an ack read during the join is kept for that arm). So only an ack
+     on the live stream ends the override: a replica that acks part of a
+     long catch-up or snapshot and leaves before going live leaves it
+     standing. Kept deliberately, and documented as "streaming live":
+     DPDK could report the `Joining` arm's acks, but TCP does not read
+     catch-up acks until its live loop, and the two transports should
+     agree. The race stays
+     closed: an override decided before a first ack is void, and one
+     latched before a counted replica that leaves unacked holds. A
+     witnessed `disk` leaves any earlier override in place; the replica
+     it was witnessed by ends it with its first ack.
+     One consequence, documented in `docs/replication.md`: replicas ack
+     only entries they publish, never heartbeats, so a replica that joins
+     at the primary's tip during an idle period and leaves before any
+     write reaches it never ends the override (with authentication-time
+     presence its connect would have). The remedy is the failover
+     workflow's step 5, a policy that needs a replica. An ack on
+     accepting `StreamStart` would close it at the protocol level; left
+     to a separate change, tracked in the roadmap's "Degraded acks on a
+     halted node" row.
+
+   Tests: `halt.rs`'s
+   `a_replica_refused_after_authenticating_leaves_the_override` (counted,
+   unacked, departed three times: the override holds and a decision
+   meanwhile is witnessed; a replica that acks ends it), the existing
+   gate and presence tests moved to first acks
+   (`an_override_decided_before_a_first_ack_is_void`), and
+   `ack_policy_changes::a_forced_disk_lifts_the_halt_until_a_replica_returns`,
+   which now has a scripted replica stream and leave without acking (the
+   override holds) before one that acks ends it. Both fail with the
+   generation bumped at `lift`. The count's move is pinned by
+   `ack_policy_changes::a_replica_counts_once_its_handshake_is_accepted`:
+   a scripted replica authenticates and holds its handshake back, and a
+   write from a client connected after its verdict is refused and the
+   gauge reads 0; the handshake then lifts the halt. It fails with TCP's
+   `lift` moved back to just after authentication, and under the netns
+   runner with the DPDK driver's moved to the `Authenticated` arm (the
+   `Handshaking` slot then counted by `go_idle`), each checked by hand; on
+   a regression the primary's count races the client's own connect and
+   write, which it wins by a wide margin, but a pass on fixed code is
+   no race. The integration tests pass on kernel TCP and under the
+   netns runner with the `dpdk` feature, as does the `dpdk_veth` suite.
+   `docs/replication.md` now says what "connected" means, that the
+   lifted halt does not survive a restart (re-send `ACK-POLICY disk`),
+   and that a connected replica that never acks makes every `disk`
+   witnessed (disconnect it, then re-send).
+
+   **Not fixed here (pre-existing):** a replica that refuses the stream
+   is still counted from its handshake's acceptance until the primary
+   sees the socket close, so on a halted node without an override each
+   of its retries lifts the halt for that moment, as authentication did
+   before.
+
 ## Downstream impact (Exchange Core)
 
 Breaking: an `OutputPayload` arm in its event publisher and anything else

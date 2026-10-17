@@ -4,27 +4,50 @@
 //! A primary with replication configured halts (refuses client writes)
 //! while no replica is streaming. The one exception is an operator's
 //! explicit consent to serve on this node's disk alone: a runtime
-//! `ACK-POLICY disk` sent while no replica is connected latches an
-//! *override* that lifts the halt. The override lasts until a replica
-//! connects, or a policy that needs a replica is journaled; after that the
-//! next loss of the last replica halts the node again. A swap made while a
-//! replica is still connected sets none: consent counts only once the
-//! operator knows the node has none.
+//! `ACK-POLICY disk` sent while no replica is streaming latches an
+//! *override* that lifts the halt. The override lasts until a streaming
+//! replica acknowledges an entry, or a policy that needs a replica is
+//! journaled; after that the next loss of the last replica halts the node
+//! again. A swap made while a replica is still streaming sets none:
+//! consent counts only once the operator knows the node has none.
 //!
 //! [`ReplicaPresence`] holds the count, the override and the one rule over
-//! both ([`ReplicaPresence::halted`]), so the readers that refuse writes and
-//! the health endpoint that reports `trading`/`halted` cannot disagree.
+//! both ([`ReplicaPresence::halted`]), so the readers that refuse writes,
+//! the rule that tells a forced swap from a witnessed one and the health
+//! endpoint that reports `trading`/`halted` cannot disagree.
 //!
-//! # Cleared by a connect, without a race
+//! # Counted once its handshake is accepted, override ended by its first ack
 //!
-//! The override is not a flag a connecting replica clears: the producer
-//! that sets it decides on a replica count it read earlier, so a replica
-//! connecting in between would clear a flag not yet set, and the override
-//! would then outlive a connect. Instead every connect bumps a generation,
-//! and the override records the generation its decision observed
-//! ([`NoneSince`]). It holds only while the generation is unchanged, so any
-//! connect after the observation voids it, however the two threads
-//! interleave.
+//! A replica counts from the moment the primary accepts its handshake and
+//! begins streaming to it: its catch-up (or snapshot), then the live
+//! stream. Not from authentication: the primary can still refuse a
+//! replica after it authenticates (its own epoch superseded, a handshake
+//! it cannot validate), and one that retries would lift the halt for a
+//! moment on every attempt. One count serves the halt, the forced-swap
+//! rule ([`ReplicaPresence::observe`]) and the health endpoint's gauge,
+//! so the three agree on what "a replica is connected" means.
+//!
+//! A replica ends the override only once it acknowledges an entry on that
+//! connection ([`FirstAck`]). Being streamed to is not proof enough: a
+//! replica that refuses the primary's history (a different genesis, a
+//! stale primary by its own reckoning) does so on the stream's first frame
+//! and closes, which the primary learns only from the closed connection.
+//! Such a replica, retrying, would otherwise void the operator's consent
+//! on its first attempt and flap the node back to halted. An ack is the
+//! first sign that a replica took the stream, and every replica streaming
+//! acknowledges what it receives.
+//!
+//! # Ended by a first ack, without a race
+//!
+//! The override is not a flag a replica's ack clears: the producer that
+//! sets it decides on a replica count it read earlier, so a replica going
+//! live and acking in between would clear a flag not yet set, and the
+//! override would then outlive it. Instead every first ack bumps a
+//! generation, and the override records the generation its decision
+//! observed ([`NoneSince`]). It holds only while the generation is
+//! unchanged, so any first ack after the observation voids it, however
+//! the threads interleave. A replica counted after the observation that
+//! leaves without acking leaves it standing: it never took the stream.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -33,17 +56,18 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 /// the input ring's producer (which reads the verdict and sets or clears
 /// the override) and the health endpoint.
 ///
-/// Plain atomics, not cache-padded: the senders write only on a connect or
-/// a departure, and the readers' steady-state cost is one relaxed load of
-/// the count.
+/// Plain atomics, not cache-padded: the senders write only when a
+/// replica's handshake is accepted, it first acks, or it leaves, and the
+/// readers' steady-state cost is one relaxed load of the count.
 #[derive(Debug, Default)]
 pub struct ReplicaPresence {
-    /// Replicas currently streaming (authenticated, not merely
-    /// connected). `u32`: at most a handful of replication slots.
+    /// Replicas currently streaming: handshake accepted, catching up or
+    /// live, not merely authenticated. `u32`: at most a handful of
+    /// replication slots.
     connected: AtomicU32,
-    /// Connects ever made. `u64`, so it never wraps: the generation an
-    /// override is bound to.
-    connects: AtomicU64,
+    /// First acks ever received, one per live connection. `u64`, so it
+    /// never wraps: the generation an override is bound to.
+    acked: AtomicU64,
     /// `0` when no override is latched, otherwise the generation it was
     /// latched at plus one (so a latch at generation zero is not `0`).
     override_at: AtomicU64,
@@ -60,10 +84,36 @@ pub enum Observed {
     NoneConnected(NoneSince),
 }
 
-/// The connect generation at which no replica was streaming. Only
+/// The first-ack generation at which no replica was streaming. Only
 /// [`ReplicaPresence::observe`] makes one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NoneSince(u64);
+
+/// A counted connection's first ack, still to come. Only
+/// [`ReplicaPresence::lift`] makes one, so a sender can report an ack only
+/// for a replica it counted, and once per connection however many acks
+/// follow: one branch per ack, no atomic after the first.
+#[derive(Debug)]
+#[must_use = "a live replica's first ack ends the halt override: report every ack with `FirstAck::acked`"]
+pub struct FirstAck {
+    /// Whether this connection has acked. `bool`: once, then nothing.
+    acked: bool,
+}
+
+impl FirstAck {
+    /// The connection's replica acknowledged an entry: on the first ack,
+    /// void any override (bump the generation). `Release`, pairing with
+    /// [`ReplicaPresence::observe`]: the count was raised before this, on
+    /// the same thread, so an observation that sees the new generation sees
+    /// the count too.
+    #[inline]
+    pub fn acked(&mut self, presence: &ReplicaPresence) {
+        if !self.acked {
+            self.acked = true;
+            presence.acked.fetch_add(1, Ordering::Release);
+        }
+    }
+}
 
 impl ReplicaPresence {
     /// No replica connected, no override: halted.
@@ -77,22 +127,23 @@ impl ReplicaPresence {
         self.connected.load(Ordering::Relaxed)
     }
 
-    /// A replica has authenticated: lift the halt by one, and void any
-    /// override. The count goes up before the generation (both `Release`),
-    /// so an observation that sees the new generation sees the count too.
-    pub fn lift(&self) {
+    /// A replica's handshake was accepted, and the primary streams to it:
+    /// lift the halt by one. The override stands until the replica
+    /// acknowledges an entry, through the returned [`FirstAck`].
+    pub fn lift(&self) -> FirstAck {
         self.connected.fetch_add(1, Ordering::Release);
-        self.connects.fetch_add(1, Ordering::Release);
+        FirstAck { acked: false }
     }
 
-    /// A replica left: lower the halt by one. Returns `true` if it was the
-    /// last one (the node now halts), emitting the halt warning here so
+    /// A counted replica left: lower the halt by one. Returns `true` if it was
+    /// the last one (the node now halts), emitting the halt warning here so
     /// every sender shares the wording. `fetch_sub` returns the *prior*
     /// count, so `== 1` means this call took it to zero; deriving "last one"
     /// from the returned value rather than a follow-up load avoids a TOCTOU
     /// race with a concurrent reconnect's `lift`. The override needs no
-    /// clearing here: the departing replica's own connect came after any
-    /// observation an override could have been decided on, and voided it.
+    /// clearing here: a departing replica that acked voided any override
+    /// decided before its ack, and one that never acked never took the
+    /// stream, so the operator's consent stands.
     pub fn lower(&self) -> bool {
         let was_last = self.connected.fetch_sub(1, Ordering::Release) == 1;
         if was_last {
@@ -109,18 +160,19 @@ impl ReplicaPresence {
         self.connected.load(Ordering::Relaxed) == 0 && !self.overridden()
     }
 
-    /// Whether an override latched since the last connect is in force.
+    /// Whether an override latched since the last first ack is in force.
     fn overridden(&self) -> bool {
         let at = self.override_at.load(Ordering::Relaxed);
-        at != 0 && at == self.connects.load(Ordering::Relaxed) + 1
+        at != 0 && at == self.acked.load(Ordering::Relaxed) + 1
     }
 
-    /// Who is streaming, and as of which connect generation. The
-    /// generation is loaded first (`Acquire`, pairing with [`Self::lift`]),
-    /// so a connect it counts is reflected in the count read after it.
+    /// Who is streaming, and as of which first-ack generation. The
+    /// generation is loaded first (`Acquire`, pairing with
+    /// [`FirstAck::acked`]), so a first ack it counts is reflected in the
+    /// count read after it.
     #[inline]
     pub fn observe(&self) -> Observed {
-        let generation = self.connects.load(Ordering::Acquire);
+        let generation = self.acked.load(Ordering::Acquire);
         if self.connected.load(Ordering::Relaxed) == 0 {
             Observed::NoneConnected(NoneSince(generation))
         } else {
@@ -129,7 +181,7 @@ impl ReplicaPresence {
     }
 
     /// Lift the halt on the operator's consent, given while no replica was
-    /// streaming as of `since`. Void if a replica has connected since.
+    /// streaming as of `since`. Void if a replica has first acked since.
     pub fn latch_override(&self, since: NoneSince) {
         self.override_at.store(since.0 + 1, Ordering::Relaxed);
     }
@@ -156,39 +208,46 @@ mod tests {
         let presence = ReplicaPresence::new();
         assert!(presence.halted());
         assert_eq!(presence.observe(), Observed::NoneConnected(NoneSince(0)));
-        presence.lift();
-        presence.lift();
+        let mut first = presence.lift();
+        let mut second = presence.lift();
         assert!(!presence.halted());
         assert_eq!(presence.connected(), 2);
         assert_eq!(presence.observe(), Observed::Connected);
+        first.acked(&presence);
+        first.acked(&presence);
+        second.acked(&presence);
         assert!(!presence.lower(), "one left");
         assert!(presence.lower(), "the last one");
         assert!(presence.halted());
-        assert_eq!(presence.observe(), Observed::NoneConnected(NoneSince(2)));
+        assert_eq!(
+            presence.observe(),
+            Observed::NoneConnected(NoneSince(2)),
+            "one generation per connection's first ack, not per ack"
+        );
     }
 
-    // Latching, clearing and a connect voiding the override are pinned
+    // Latching, clearing and a first ack voiding the override are pinned
     // through the halt gate, in `melin-server-runtime`'s `halt.rs` tests.
 
-    /// The race the generation exists for: a replica connects between the
-    /// observation and the latch. The latch lands after the connect and
-    /// must still be void.
+    /// The race the generation exists for: a replica is counted and acks
+    /// between the observation and the latch. The latch lands after the
+    /// ack and must still be void.
     #[test]
-    fn an_override_decided_before_a_connect_is_void() {
+    fn an_override_decided_before_a_first_ack_is_void() {
         let presence = ReplicaPresence::new();
         let since = none_since(&presence);
-        presence.lift();
+        presence.lift().acked(&presence);
         presence.latch_override(since);
         presence.lower();
         assert!(presence.halted());
     }
 
-    /// An override latched after earlier connects holds at its own
+    /// An override latched after earlier first acks holds at its own
     /// generation.
     #[test]
-    fn an_override_after_earlier_connects_holds() {
+    fn an_override_after_earlier_first_acks_holds() {
         let presence = ReplicaPresence::new();
-        presence.lift();
+        presence.lift().acked(&presence);
         presence.lower();
         presence.latch_override(none_since(&presence));
         assert!(!presence.halted());
