@@ -376,8 +376,16 @@ pub(crate) struct DurabilityGate {
     forced: ForcedPolicyReader,
     /// Wire seq of the newest journaled change the gate has applied, in
     /// order or forced; `None` before any. A change at or below it is
-    /// stale: a forced change already superseded it.
+    /// stale: a forced change already superseded it. A change naming an
+    /// unknown policy is not recorded here (see [`Self::refuse_unknown`]).
     applied_through: Option<WireSeq>,
+    /// Wire seq of the change last refused for naming an unknown policy,
+    /// so one seen again (a forced change is re-read on every spin of a
+    /// wait, then reaches the gate as its own slot) is logged once. An
+    /// `Option<WireSeq>` rather than a set: the repeats come one after the
+    /// other, and a bug that slips one more log line past it is still
+    /// logged rather than hidden.
+    last_refused: Option<WireSeq>,
     /// Changes still to apply, oldest first, each once durable under the
     /// policy before it: the lineage's newest (see [`GateStart`]), and
     /// any change slot a degraded release let through (see the module
@@ -469,6 +477,7 @@ impl DurabilityGate {
             stage,
             forced,
             applied_through: None,
+            last_refused: None,
             pending: pending.into_iter().collect(),
             active_policy,
             needs_replica: active_policy.needs_replica(),
@@ -503,14 +512,23 @@ impl DurabilityGate {
             {
                 return;
             }
-            let cause = if pending.unwitnessed {
-                "pending unwitnessed change, on disk"
-            } else {
-                "pending change, durable under the policy before it"
-            };
-            self.pending.pop_front();
-            self.apply_change(pending.wire_seq, pending.policy.to_byte(), cause);
+            self.apply_front_pending();
         }
+    }
+
+    /// Pop the front pending change and apply it: its caller has found it
+    /// durable under the policy before it (or, unwitnessed, on disk), or
+    /// overtaken by a forced change, which [`Self::apply_change`] skips.
+    fn apply_front_pending(&mut self) {
+        let Some(pending) = self.pending.pop_front() else {
+            return;
+        };
+        let cause = if pending.unwitnessed {
+            "pending unwitnessed change, on disk"
+        } else {
+            "pending change, durable under the policy before it"
+        };
+        self.apply_change(pending.wire_seq, pending.policy.to_byte(), cause);
     }
 
     /// The terminator for the request `backing` closes, from `ends`.
@@ -628,35 +646,53 @@ impl DurabilityGate {
     /// Apply the journaled change at `wire_seq`, unless a change at or
     /// after it has been applied already (a forced one overtook it).
     ///
-    /// A byte this build does not know keeps the prior policy, loudly:
-    /// this node journaled the entry itself, from a policy it named, so
-    /// it is a bug, and refusing every later reply would turn it into an
-    /// outage.
+    /// A byte this build does not know is refused ([`Self::refuse_unknown`]).
     fn apply_change(&mut self, wire_seq: WireSeq, policy: AckPolicyByte, cause: &'static str) {
-        if self
-            .applied_through
-            .is_some_and(|through| wire_seq <= through)
-        {
+        if self.is_stale(wire_seq) {
             return;
         }
+        let Some(next) = AckPolicy::from_byte(policy) else {
+            self.refuse_unknown(wire_seq, policy);
+            return;
+        };
         self.applied_through = Some(wire_seq);
-        match AckPolicy::from_byte(policy) {
-            Some(next) => self.switch_to(next, cause),
-            None => {
-                tracing::error!(
-                    stage = self.stage,
-                    byte = policy.0,
-                    wire_seq = wire_seq.get(),
-                    "journaled ack-policy change names an unknown policy; retaining prior policy"
-                );
-            }
+        self.switch_to(next, cause);
+    }
+
+    /// A change at `wire_seq` is stale: one at or after it has been
+    /// applied already (a forced one overtook it).
+    fn is_stale(&self, wire_seq: WireSeq) -> bool {
+        self.applied_through
+            .is_some_and(|through| wire_seq <= through)
+    }
+
+    /// Refuse the change at `wire_seq`, which names a policy this build
+    /// does not know: the prior policy stays, loudly. This node journaled
+    /// the entry itself, from a policy it named, so it is a bug, and
+    /// refusing every later reply would turn it into an outage.
+    ///
+    /// Not recorded as applied, whether it came in order, forced or
+    /// released degraded: that would make a valid change before it, still
+    /// pending, stale, and skip it.
+    #[cold]
+    fn refuse_unknown(&mut self, wire_seq: WireSeq, policy: AckPolicyByte) {
+        if self.last_refused == Some(wire_seq) {
+            return;
         }
+        self.last_refused = Some(wire_seq);
+        tracing::error!(
+            stage = self.stage,
+            byte = policy.0,
+            wire_seq = wire_seq.get(),
+            "journaled ack-policy change names an unknown policy; retaining prior policy"
+        );
     }
 
     /// Apply the newest forced change once its own entry is durable on
     /// this node's disk (`journal_pos`), so the record of the swap exists
     /// before any reply relies on it. One already applied is skipped by
-    /// [`Self::apply_change`].
+    /// [`Self::apply_change`]; one naming an unknown policy is refused on
+    /// every spin, and logged once.
     ///
     /// The lineage's pending change is settled first, if durable (an
     /// unwitnessed one once on this node's disk, as a forced change is):
@@ -707,11 +743,37 @@ impl DurabilityGate {
         before_wait: impl FnOnce(),
     ) -> Admission {
         let mut before_wait = Some(before_wait);
-        let mut backing = Backing::Policy;
-        // A full wait returns only once the front change's entry is
-        // durable under the policy in force (or has settled it, an
-        // unwitnessed change once on disk), so each pass settles one. A
-        // degraded one leaves it pending, and every change behind it.
+        match self.admit_pending(
+            shutdown,
+            #[cfg(feature = "tick-to-trade")]
+            tracker,
+            &mut before_wait,
+        ) {
+            GateOutcome::Shutdown => Admission::Shutdown,
+            GateOutcome::Open(backing) => self.admit_slot(
+                slot,
+                backing,
+                shutdown,
+                #[cfg(feature = "tick-to-trade")]
+                tracker,
+                &mut before_wait,
+            ),
+        }
+    }
+
+    /// The first half of [`Self::admit`]: wait for the pending changes,
+    /// applying each, oldest first, once durable under the policy before
+    /// it. Returns how the slot behind them is backed so far: by the
+    /// policy once every one is applied, by the primary alone if a wait
+    /// let one through degraded, which leaves it pending, and every change
+    /// behind it.
+    #[inline]
+    fn admit_pending(
+        &mut self,
+        shutdown: &AtomicBool,
+        #[cfg(feature = "tick-to-trade")] tracker: &mut GateCrossTracker,
+        before_wait: &mut Option<impl FnOnce()>,
+    ) -> GateOutcome {
         while let Some(&pending) = self.pending.front() {
             if pending.wire_seq.get() > self.cached_durable_pos {
                 if let Some(before_wait) = before_wait.take() {
@@ -723,21 +785,41 @@ impl DurabilityGate {
                     #[cfg(feature = "tick-to-trade")]
                     tracker,
                 ) {
-                    GateOutcome::Shutdown => return Admission::Shutdown,
-                    GateOutcome::Open(Backing::Policy) => {}
+                    GateOutcome::Shutdown => return GateOutcome::Shutdown,
                     GateOutcome::Open(Backing::PrimaryOnly) => {
-                        backing = Backing::PrimaryOnly;
-                        break;
+                        return GateOutcome::Open(Backing::PrimaryOnly);
                     }
+                    GateOutcome::Open(Backing::Policy) => {}
+                }
+                // The wait settled it already (an unwitnessed change once
+                // on disk), and maybe more: judge the new front afresh.
+                if self.pending.front() != Some(&pending) {
+                    continue;
                 }
             }
-            self.settle_pending_if_durable(self.inputs.journal_persisted_wire_seq.load());
-            let settled = self.pending.front() != Some(&pending);
-            debug_assert!(settled, "a full wait leaves the pending change durable");
-            if !settled {
-                break;
-            }
+            // The policy in force covers the front change: the cached
+            // position already did, or a full wait on it returned, which
+            // it does only once that position reaches it. That policy is
+            // the one before the change, every change ahead of it applied,
+            // unless a forced change overtook it, which makes it stale.
+            self.apply_front_pending();
         }
+        GateOutcome::Open(Backing::Policy)
+    }
+
+    /// The second half of [`Self::admit`]: hold `slot` until durable
+    /// under the policy in force, its backing no stronger than `backing`
+    /// (how the pending changes ahead of it were let through), then apply
+    /// or defer it if it is a change.
+    #[inline]
+    fn admit_slot<R: Copy, Q: Copy>(
+        &mut self,
+        slot: &OutputSlot<R, Q>,
+        mut backing: Backing,
+        shutdown: &AtomicBool,
+        #[cfg(feature = "tick-to-trade")] tracker: &mut GateCrossTracker,
+        before_wait: &mut Option<impl FnOnce()>,
+    ) -> Admission {
         let change = match slot.payload {
             OutputPayload::AckPolicyChange(change) => Some(change),
             OutputPayload::Report(_)
@@ -786,22 +868,11 @@ impl DurabilityGate {
     /// (an unwitnessed one once on disk, which it already is). One a
     /// forced change has overtaken is stale, as in [`Self::apply_change`].
     fn defer_change(&mut self, wire_seq: WireSeq, change: AckPolicyChange) {
-        if self
-            .applied_through
-            .is_some_and(|through| wire_seq <= through)
-        {
+        if self.is_stale(wire_seq) {
             return;
         }
         let Some(policy) = AckPolicy::from_byte(change.policy) else {
-            // As `apply_change` does with an unknown byte: the prior
-            // policy stays. Not recorded as applied, which would make the
-            // changes pending before it stale.
-            tracing::error!(
-                stage = self.stage,
-                byte = change.policy.0,
-                wire_seq = wire_seq.get(),
-                "journaled ack-policy change names an unknown policy; retaining prior policy"
-            );
+            self.refuse_unknown(wire_seq, change.policy);
             return;
         };
         tracing::info!(
@@ -1724,13 +1795,15 @@ mod tests {
 
     /// A replicated primary's gate with degraded release, and the levers a
     /// test pulls on it: the journal cursor, one replica slot's cursors and
-    /// active flag, and the replica presence the halt is judged on.
+    /// active flag, the replica presence the halt is judged on, and the
+    /// forced cell's writer.
     struct Primary {
         gate: DurabilityGate,
         journal: DurableWireSeqCursor,
         metrics: Arc<ReplicationMetrics>,
         active: Arc<AtomicBool>,
         presence: Arc<ReplicaPresence>,
+        forced: ForcedPolicyWriter,
     }
 
     impl Primary {
@@ -1747,7 +1820,7 @@ mod tests {
             let active = Arc::new(AtomicBool::new(false));
             let presence = Arc::new(ReplicaPresence::new());
             let journal = DurableWireSeqCursor::detached(WireSeq::new(pos));
-            let (_, forced) = forced_policy_cell();
+            let (forced_writer, forced) = forced_policy_cell();
             let inputs = GateInputs {
                 journal_persisted_wire_seq: journal.clone(),
                 replication_metrics: Some(Arc::clone(&metrics)),
@@ -1765,6 +1838,7 @@ mod tests {
                 metrics,
                 active,
                 presence,
+                forced: forced_writer,
             };
             if connected {
                 p.replica_streams(pos);
@@ -2144,6 +2218,141 @@ mod tests {
         assert_eq!(p.gate.active_policy, AckPolicy::Disk);
     }
 
+    /// A pending change let through degraded marks the slot behind it
+    /// even when a replica returns before the slot's own wait, which then
+    /// opens under the policy: the change stays pending until the next
+    /// admit applies it. The two halves of `admit` are driven one by one
+    /// so the replica can return between them.
+    #[test]
+    fn a_pending_change_released_degraded_marks_a_slot_the_policy_then_confirms() {
+        let mut p = Primary::starting(
+            pending_start(AckPolicy::DiskAndRam, 3, AckPolicy::Ram, false),
+            5,
+            false,
+            NO_GRACE,
+        );
+        let shutdown = AtomicBool::new(false);
+        let mut waits = 0;
+        let mut before_wait = Some(|| waits += 1);
+        #[cfg(feature = "tick-to-trade")]
+        let mut tracker = GateCrossTracker::new(5);
+        let backing = match p.gate.admit_pending(
+            &shutdown,
+            #[cfg(feature = "tick-to-trade")]
+            &mut tracker,
+            &mut before_wait,
+        ) {
+            GateOutcome::Open(backing) => backing,
+            GateOutcome::Shutdown => panic!("no shutdown was requested"),
+        };
+        assert_eq!(backing, Backing::PrimaryOnly);
+        assert_eq!(p.gate.pending.len(), 1, "left pending");
+
+        p.replica_streams(5);
+        let admitted = p.gate.admit_slot(
+            &reply(5),
+            backing,
+            &shutdown,
+            #[cfg(feature = "tick-to-trade")]
+            &mut tracker,
+            &mut before_wait,
+        );
+        assert_eq!(
+            admitted,
+            Admission::Reply {
+                connection_id: 0,
+                backing: Backing::PrimaryOnly
+            },
+            "never a full BatchEnd behind an unapplied change"
+        );
+        assert_eq!(
+            p.gate.cached_durable_pos, 5,
+            "the slot's wait opened in full"
+        );
+        assert_eq!(p.gate.active_policy, AckPolicy::DiskAndRam, "not applied");
+        assert_eq!(p.gate.pending.len(), 1);
+        assert_eq!(waits, 1, "the flush hook ran once, before the first wait");
+
+        p.journal_at(6);
+        p.replica_streams(6);
+        assert_eq!(p.release(6, PATIENCE), Some(Backing::Policy));
+        assert_eq!(p.gate.active_policy, AckPolicy::Ram, "applied in order");
+        assert_applied_through(&p.gate, 3);
+        assert!(p.gate.pending.is_empty());
+    }
+
+    /// A change slot let through degraded after a forced change of this
+    /// tenure overtook it is stale: not deferred, so never applied.
+    #[test]
+    fn a_change_released_degraded_behind_a_forced_one_is_stale() {
+        let mut p = Primary::new(AckPolicy::DiskAndRam, 6, false, NO_GRACE);
+        // `ram` needs a replica too, so the halt still releases degraded.
+        p.forced.store(forced_change(5, AckPolicy::Ram.to_byte()));
+        assert_eq!(p.release(6, PATIENCE), Some(Backing::PrimaryOnly));
+        assert_eq!(p.gate.active_policy, AckPolicy::Ram);
+        assert_eq!(
+            p.admit_within(&change(4, AckPolicy::TwoDisks, false), PATIENCE),
+            Some(Admission::GateOnly)
+        );
+        assert!(p.gate.pending.is_empty(), "stale, not deferred");
+        assert_applied_through(&p.gate, 5);
+        assert_eq!(p.gate.active_policy, AckPolicy::Ram);
+    }
+
+    /// A change naming an unknown policy, released degraded or forced,
+    /// keeps the policy in force and is not recorded as applied, so a
+    /// valid change deferred before it still applies in order.
+    #[test]
+    fn an_unknown_policy_leaves_an_earlier_deferred_change_pending() {
+        let mut p = Primary::new(AckPolicy::DiskAndRam, 8, false, NO_GRACE);
+        assert_eq!(
+            p.admit_within(&change(3, AckPolicy::TwoDisks, false), PATIENCE),
+            Some(Admission::GateOnly)
+        );
+        // Released degraded: through `defer_change`.
+        assert_eq!(
+            p.admit_within(&change_byte(5, AckPolicyByte(CORRUPT), false), PATIENCE),
+            Some(Admission::GateOnly)
+        );
+        assert_eq!(p.gate.pending.len(), 1, "the unknown one is not deferred");
+        assert_eq!(p.gate.last_refused, Some(WireSeq::new(5)));
+        // Forced: through `apply_change`, inside the pending change's wait.
+        p.forced.store(forced_change(6, AckPolicyByte(CORRUPT)));
+        assert_eq!(p.release(7, PATIENCE), Some(Backing::PrimaryOnly));
+        assert_eq!(p.gate.last_refused, Some(WireSeq::new(6)));
+        assert_eq!(p.gate.active_policy, AckPolicy::DiskAndRam);
+        assert_eq!(p.gate.applied_through, None, "neither recorded as applied");
+        assert_eq!(p.gate.pending.len(), 1);
+
+        p.replica_streams(8);
+        assert_eq!(p.release(8, PATIENCE), Some(Backing::Policy));
+        assert_eq!(p.gate.active_policy, AckPolicy::TwoDisks, "not made stale");
+        assert_applied_through(&p.gate, 3);
+        assert!(p.gate.pending.is_empty());
+    }
+
+    /// A forced change of this tenure overtakes a change a degraded
+    /// release deferred: the slot opens under the forced policy, and the
+    /// deferred change, below it, is skipped as stale.
+    #[test]
+    fn a_forced_change_overtakes_a_deferred_one() {
+        let mut p = Primary::new(AckPolicy::DiskAndRam, 6, false, NO_GRACE);
+        assert_eq!(
+            p.admit_within(&change(4, AckPolicy::Ram, false), PATIENCE),
+            Some(Admission::GateOnly)
+        );
+        assert_eq!(p.gate.pending.len(), 1, "deferred");
+        p.forced.store(forced_change(5, AckPolicy::Disk.to_byte()));
+        assert_eq!(p.release(6, PATIENCE), Some(Backing::Policy));
+        assert_eq!(
+            p.gate.active_policy,
+            AckPolicy::Disk,
+            "not the stale deferred `ram`"
+        );
+        assert_applied_through(&p.gate, 5);
+        assert!(p.gate.pending.is_empty());
+    }
+
     /// The terminator follows the backing, and only degraded ones count.
     #[test]
     fn the_terminator_follows_the_backing_and_counts_degraded_acks() {
@@ -2218,7 +2427,8 @@ mod tests {
 
     /// A change naming a policy this build does not know keeps the prior
     /// policy untouched, in order and forced alike: no switch, so no
-    /// re-seed and the cached durable position kept.
+    /// re-seed and the cached durable position kept. Neither is recorded
+    /// as applied; each is logged once.
     #[test]
     fn an_unknown_policy_in_a_change_keeps_the_prior_policy() {
         let (mut g, mut forced) = build(AckPolicy::Disk, 4, None, None);
@@ -2228,14 +2438,17 @@ mod tests {
         assert_eq!(g.policy, AckPolicy::Disk.to_policy());
         assert_eq!(in_force(&g), Some(AckPolicy::Disk));
         assert_eq!(g.cached_durable_pos, 4, "no switch: cached position kept");
+        assert_eq!(g.applied_through, None, "not recorded as applied");
+        assert_eq!(g.last_refused, Some(WireSeq::new(4)));
 
         // The next slot waits; once the forced entry is on disk the wait
         // reads it, keeps the prior policy, and opens.
         forced.store(forced_change(6, AckPolicyByte(CORRUPT)));
         assert_held_until(&mut g, &reply(5), || journal.store(WireSeq::new(6)));
         assert_eq!(g.active_policy, AckPolicy::Disk);
-        // The forced entry is consumed once.
-        assert_applied_through(&g, 6);
+        assert_eq!(g.applied_through, None, "not recorded as applied");
+        // Refused on every spin, logged on the first.
+        assert_eq!(g.last_refused, Some(WireSeq::new(6)));
 
         // A re-seed would flush the degraded time accrued under `disk+ram`.
         let mut g = gate(AckPolicy::DiskAndRam, 5);
