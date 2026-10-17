@@ -3130,6 +3130,10 @@ pub struct Pipeline<A: Application> {
     pub input_producer: ring::Producer<InputSlot<A::Event>>,
     pub journal_stage: JournalStage<A::Event>,
     pub matching_stage: MatchingStage<A>,
+    /// The output ring's consumers: the response stage's first, then, when
+    /// the event publisher is enabled, the publisher's, gated on the
+    /// response stage's progress (it only ever reads slots that have
+    /// cleared the durability gate).
     pub output_consumers: Vec<ring::Consumer<OutputSlot<A::Report, A::QueryResponse>>>,
     pub events_processed: Arc<AtomicU64>,
     pub input_cursor: Box<dyn ring::QueueCursor>,
@@ -3357,16 +3361,30 @@ where
         matching_cursor,
     } = build_input_disruptor::<A::Event>(enable_shadow, waits.ingress);
 
-    // Output disruptor ring: matching → response (+ optional event publisher).
-    // Single producer, N consumers (1 = response only, 2 = response + event publisher).
-    // Uses the same ring::Producer/Consumer API as the input disruptor.
+    // Output disruptor ring: matching → response (→ optional event publisher).
+    // Single producer; consumer 0 is the response stage, consumer 1 (when
+    // enabled) the event publisher. Uses the same ring::Producer/Consumer
+    // API as the input disruptor.
+    //
+    // The publisher is chained behind the response stage, not gated on the
+    // producer: it may read only slots whose events hold the copies the ack
+    // policy demands. It relies on the response stage's invariant that its
+    // progress counter never passes a slot that has not cleared the
+    // durability gate (both response stages commit only after every slot
+    // of a batch has, and never on the shutdown path out of a gate wait).
+    // Gated on the producer, it broadcast reports a crash could still
+    // unwind (finding 9 of `docs/internal/determinism-audit-2026-09.md`).
+    // The producer's backpressure gate is then the publisher alone (the
+    // only terminal consumer), whose progress never exceeds the response
+    // stage's, so the matching stage still waits for both.
     let mut output_builder =
         ring::DisruptorBuilder::<OutputSlot<A::Report, A::QueryResponse>>::new(
             OUTPUT_RING_CAPACITY,
         )
-        .add_consumer(); // consumer 0: response stage
+        .add_consumer(); // consumer 0: response stage, gated on the producer
     if enable_event_publisher {
-        output_builder = output_builder.add_consumer(); // consumer 1: event publisher
+        // consumer 1: event publisher, gated on the response stage
+        output_builder = output_builder.add_consumer_after(0);
     }
     let (output_producer, output_consumers) = output_builder.build(waits.matching);
 

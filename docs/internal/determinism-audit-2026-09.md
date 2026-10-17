@@ -59,7 +59,7 @@ Severity is a judgement from code reading.
 | 6 | A zeroed range in the live segment reads as end of data | Medium | Reproduced (fixed, bounded) |
 | 7 | A flipped bit in an entry's length field bypasses the CRC | Medium | Reproduced (fixed) |
 | 8 | Replicated entries have no end-to-end integrity; DPDK verifies no checksum on receive | High | Confirmed (fixed) |
-| 9 | The event publisher broadcasts reports before they are durable | High | Confirmed |
+| 9 | The event publisher broadcasts reports before they are durable | High | Confirmed (fixed) |
 | 10 | A runtime ack-policy change never reaches replicas while data flows | High | Confirmed (fixed) |
 | 11 | The DPDK replication sender skips a batch that does not fit its transmit queue | High | Reproduced (fixed) |
 | 12 | A primary disk stall makes a truthful replica look divergent | Medium | Confirmed |
@@ -717,6 +717,33 @@ runtime releases only gated slots to it, or at least pass it the gate
 inputs and document the choice. Stamp publisher frames with the wire
 sequence so subscribers can reconcile after a failover.
 
+**Status: fixed** in the runtime, by the first direction above; the
+stamping is the application's half.
+
+- The publisher's output-ring consumer is chained behind the response
+  stage's (`add_consumer_after(0)` in `build_pipeline_with_replication`)
+  instead of the producer, so it reads only slots the response stage has
+  committed. Both response stages (`response.rs`, `dpdk_response.rs`)
+  commit only after every slot of a batch has cleared the durability
+  gate, and leave a gate wait on shutdown without committing; nothing
+  else advances their consumer. The invariant is stated at both commits
+  and at the wiring. The publisher's API is unchanged: no gate inputs
+  are passed, because none are needed. The producer's backpressure gate
+  is now the publisher alone (the only terminal consumer), which never
+  passes the response stage, so matching still waits for both.
+- `EventPublisherFn`'s rustdoc says what the consumer yields, that the
+  publisher must observe shutdown itself while the gate holds it, and to
+  stamp frames with `OutputSlot::wire_seq` rather than the ring
+  position. Stamping is the application's half: the Exchange Core's
+  publisher, maintained separately, still stamps the ring position.
+- `docs/pipeline-architecture.md` says the feed trails the replies, and
+  that subscribers key on the journal sequence.
+- Pinned by `event_publisher_reads_only_what_the_response_stage_committed`
+  (`pipeline_tests.rs`) and, end to end,
+  `the_publisher_sees_an_event_only_once_the_ack_policy_holds`
+  (`server-runtime/tests/event_publisher_gate.rs`, kernel TCP: DPDK
+  never runs the publisher); both fail with the old wiring.
+
 ### 11. The DPDK replication sender skips a batch that does not fit its transmit queue
 
 **High for DPDK replication. Reproduced** for the consumer semantics,
@@ -1261,7 +1288,8 @@ Not determinism, but each one defeats failover or stalls a node.
 - `docs/pipeline-architecture.md` describes a CAS-based multi-producer
   input ring with per-slot generation flags; the input ring is
   single-producer. It calls the output queue an SPSC; it is the
-  multi-consumer disruptor. Its durability sentence contradicts finding 9.
+  multi-consumer disruptor. Its durability sentence contradicted finding 9
+  (now true: the publisher reads behind the response stage).
 - `docs/replication.md` says "a process crash loses nothing" under `disk`,
   `disk+ram` and `two-disks`, which ignores batches still in the journal's
   write ring. (Its claim that the ack policy "is advertised to replicas
@@ -1386,6 +1414,8 @@ real sockets, ticks and snapshots as noted):
 4. Findings 8 and 11: wire integrity and the DPDK sender.
 5. Findings 10, 12, 13, 14 and 15: failover correctness.
 6. Finding 9: an API decision, gating the publisher or documenting it.
+   **Done**, by gating it: the publisher reads behind the response stage
+   (see finding 9).
 7. The rest, then the documentation.
 
 Each fix lands with its reproduction as a regression test.
