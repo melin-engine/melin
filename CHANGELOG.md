@@ -559,14 +559,17 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   unless those are all the process was given, and `capture_home_mask`
   now also narrows the calling thread to it, so the threads it spawns
   start off the isolated CPUs too. It only ever narrows, never widens.
-- **Degraded acks change the response stages' and the config's shape.**
-  `ServerConfig` gains `no_degraded_acks` and `degraded_ack_grace_ms`,
-  `response::Response` gains `degraded_release`, `dpdk_response::run`
-  takes it, and `StageUtilization` gains `degraded_acks`: code that
-  builds any of these by hand has to supply them (`None` keeps the
-  previous stall). `ReplicaPresence` records when its count last dropped
-  to zero, and `ReplicaPresence::last_loss` reads it (a `LastLoss`: the
-  instant, or `Unknown` when the stamp was cleared).
+- **Degraded acks change the response stages' and the config's shape**
+  (see Added). `ServerConfig` gains `no_degraded_acks` and
+  `degraded_ack_grace_ms`, `StageUtilization` gains `degraded_acks`,
+  and `response::Response` gains `degraded_release`, a
+  `halt::DegradedRelease` that `dpdk_response::run` takes too (`None`
+  keeps the previous stall). Source-breaking for code that builds a
+  `Response`, or a `ServerConfig` or `StageUtilization` without
+  `..Default::default()`. `ReplicaPresence` records when its count last
+  dropped to zero, and `ReplicaPresence::last_loss` reads it:
+  `Some(LastLoss)` while none streams (the instant, or `Unknown` when
+  the stamp was cleared), `None` otherwise.
 - **A reply batch says what backs it: a new `BatchEndDegraded` frame,
   and `melin_client`'s `Frame::BatchEnd(Ack)` / `Reply::BatchEnd(Ack)`.**
   The wire protocol gains `TAG_BATCH_END_DEGRADED` (`0x0A`) and
@@ -584,13 +587,6 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   client built against an older `melin-client` gets `Error::Protocol` on
   the first degraded reply rather than reading it as a full ack, so
   upgrade clients before nodes.
-- **Degraded acks' configuration and plumbing** (see Added).
-  `ServerConfig` gains `no_degraded_acks` and `degraded_ack_grace_ms`;
-  `response::Response` gains `degraded_release` (a
-  `halt::DegradedRelease`, `None` for off), which `dpdk_response::run`
-  takes too; and `StageUtilization` gains `degraded_acks`.
-  Source-breaking for code that builds any of these without
-  `..Default::default()`.
 
 ### Removed
 

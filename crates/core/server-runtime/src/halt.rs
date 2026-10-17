@@ -81,6 +81,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use melin_app::RejectReason;
 use melin_journal::AckPolicyChange;
@@ -119,7 +120,7 @@ pub struct DegradedRelease {
     pub presence: Arc<ReplicaPresence>,
     /// How long the halt must last before the release starts
     /// (`--degraded-ack-grace-ms`).
-    pub grace: std::time::Duration,
+    pub grace: Duration,
 }
 
 /// What a reader does with a client write right now.

@@ -28,6 +28,7 @@ use melin_transport_core::pipeline::{
     InputSlot, OutputSlot as GenericOutputSlot, Pipeline as GenericPipeline,
     build_pipeline_with_replication,
 };
+use melin_transport_core::replica_presence::ReplicaPresence;
 /// Internal alias for the disruptor-built pipeline, used only by
 /// destructuring `let Pipeline { … }` patterns inside the boot path.
 /// Not part of the public API — callers reach the underlying type
@@ -647,7 +648,7 @@ impl ServerConfig {
     /// presence), which never halts.
     fn degraded_release(
         &self,
-        replicas_connected: Option<&Arc<melin_transport_core::replica_presence::ReplicaPresence>>,
+        replicas_connected: Option<&Arc<ReplicaPresence>>,
     ) -> Option<crate::halt::DegradedRelease> {
         if self.no_degraded_acks {
             return None;
@@ -3947,7 +3948,7 @@ fn spawn_health_endpoint(
     cursors: &melin_transport_core::PipelineCursors,
     input_cursor: Box<dyn melin_pipeline::ring::QueueCursor>,
     pipeline_healthy: &Arc<AtomicBool>,
-    replicas_connected: &Option<Arc<melin_transport_core::replica_presence::ReplicaPresence>>,
+    replicas_connected: &Option<Arc<ReplicaPresence>>,
     fence_state: &Arc<melin_transport_core::fence::FenceState>,
     replication_metrics: &Option<Arc<crate::replication::ReplicationMetrics>>,
     replica_active: &Option<[Arc<AtomicBool>; 2]>,

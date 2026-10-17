@@ -134,8 +134,8 @@ pub(crate) enum Backing {
 }
 
 impl Backing {
-    /// The weaker of two backings: a reply is only as backed as the
-    /// weakest wait that let it through.
+    /// The weaker of two backings, `PrimaryOnly` being the weaker: a
+    /// reply is only as backed as the weakest wait that let it through.
     fn min(self, other: Self) -> Self {
         match (self, other) {
             (Self::Policy, Self::Policy) => Self::Policy,

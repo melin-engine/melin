@@ -743,7 +743,7 @@ impl HealthSnapshot {
              # HELP melin_ack_policy_degraded_seconds_total Cumulative seconds the ack policy has spent unsatisfiable by the connected cluster shape.\n\
              # TYPE melin_ack_policy_degraded_seconds_total counter\n\
              melin_ack_policy_degraded_seconds_total {:.6}\n\
-             # HELP melin_degraded_acks_total Replies a node halted for want of a replica released on its own journal's fsync, terminated by BatchEndDegraded: weaker than the ack policy, and marked so. One per request.\n\
+             # HELP melin_degraded_acks_total Replies a node halted for want of a replica released on its own journal's fsync, terminated by BatchEndDegraded: weaker than the ack policy, and marked so. One per request; queries count too, even one over state every replica had confirmed, except until the node first re-evaluates the ack policy after the loss (see docs/replication.md).\n\
              # TYPE melin_degraded_acks_total counter\n\
              melin_degraded_acks_total {}\n\
              # HELP melin_durability_policy_degraded DEPRECATED: renamed melin_ack_policy_degraded in 0.15; this alias is removed in the next minor release.\n\

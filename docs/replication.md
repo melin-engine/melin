@@ -230,8 +230,14 @@ to confirm what it holds. Each held reply, to a write accepted before
 the halt or to a query, is sent as soon as the primary's own journal has
 the event fsynced, and its batch ends in **`BatchEndDegraded`** instead
 of `BatchEnd`. The rejections queued behind those replies then go out
-too, in their place. A query answered this way is marked the same way:
-its answer may reflect writes that only the primary's disk holds.
+too, in their place. A query's answer may reflect writes that only the
+primary's disk holds, so it is marked too, even when it reads only state
+that every replica had confirmed before it left. The one exception
+comes right after the last replica leaves: a reply covering only what
+the replicas had already confirmed (a query over that state, say) can
+still go out with a full `BatchEnd`, until about a second without
+traffic passes or a reply goes past that confirmed state. From then on,
+every reply released while the node is halted is marked.
 
 The grace period starts when the last replica leaves, as the node sees
 it (see "How a node notices that its peer has gone"). A replica that
@@ -240,8 +246,11 @@ and nothing is marked. Once a replica connects again, every reply waits
 for the policy as before, including while that replica is still catching
 up: the replies held then are confirmed once it has caught up. A replica
 that the primary accepts and that drops out again restarts the grace
-period when it leaves. Replies already sent as degraded acks are not
-followed by a second, full acknowledgement when a replica returns.
+period when it leaves. A primary that starts, or is promoted, with no
+replica connected is halted from the start, so its grace period runs
+from then and may already have passed when it first serves. Replies
+already sent as degraded acks are not followed by a second, full
+acknowledgement when a replica returns.
 
 A policy change sent while the node is halted (other than a forced
 `disk`, which needs no witness) is journaled as usual, and takes effect
@@ -273,9 +282,9 @@ Under `disk` nothing is ever degraded: the primary's own fsync is what
 the policy asks for, so every reply is a full one. The policy itself
 never changes: `/healthz` reports the policy the operator set, and
 `melin_ack_policy_degraded` stays `1` for as long as it cannot be met.
-`melin_degraded_acks_total` counts the degraded acks sent, and a
-warn-level log line marks the start and the end of each degraded
-stretch.
+`melin_degraded_acks_total` counts the degraded acks sent, queries
+included, and a warn-level log line marks the start and the end of each
+degraded stretch.
 
 Degraded acks widen the split-brain exposure only to the writes the
 node had already accepted when the halt began: new writes are refused.
@@ -1164,9 +1173,14 @@ normal-case post-recovery state.
   process restart, like every counter here.
 - `melin_degraded_acks_total` (Prometheus counter) — replies a halted
   primary sent as degraded acks, backed by its own disk alone (see
-  "Degraded acks"), one per request. Every increase is a client told its
-  request is unconfirmed by any replica: alert on it. A warn-level log
-  line marks the start and the end of each stretch of degraded acks.
+  "Degraded acks"), one per request. Queries count too, including one
+  over state every replica had confirmed before it left, except in the
+  window right after the loss (see "Degraded acks"). Every
+  increase is a client told its reply is not confirmed by any replica:
+  alert on it. A flat counter does not prove that no client was served
+  while halted; `melin_ack_policy_degraded` and the warn-level log lines
+  that mark the start and the end of each stretch of degraded acks say
+  when the node was halted.
 - `melin_ack_policy_degraded` (Prometheus gauge on the health
   endpoint) — `1` while the active policy can't be satisfied by the
   current cluster shape, `0` otherwise. Alert on sustained `1`.
