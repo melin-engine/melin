@@ -89,6 +89,18 @@ pub enum Observed {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NoneSince(u64);
 
+/// What a replica's departure left behind ([`ReplicaPresence::lower`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lowered {
+    /// Other replicas still stream.
+    OthersRemain,
+    /// That was the last one: the node halts.
+    LastHalted,
+    /// That was the last one, but the operator's forced `disk` override
+    /// keeps the node taking writes.
+    LastOverridden,
+}
+
 /// A counted connection's first ack, still to come. Only
 /// [`ReplicaPresence::lift`] makes one, so a sender can report an ack only
 /// for a replica it counted, and once per connection however many acks
@@ -135,21 +147,31 @@ impl ReplicaPresence {
         FirstAck { acked: false }
     }
 
-    /// A counted replica left: lower the halt by one. Returns `true` if it was
-    /// the last one (the node now halts), emitting the halt warning here so
-    /// every sender shares the wording. `fetch_sub` returns the *prior*
-    /// count, so `== 1` means this call took it to zero; deriving "last one"
-    /// from the returned value rather than a follow-up load avoids a TOCTOU
-    /// race with a concurrent reconnect's `lift`. The override needs no
-    /// clearing here: a departing replica that acked voided any override
-    /// decided before its ack, and one that never acked never took the
-    /// stream, so the operator's consent stands.
-    pub fn lower(&self) -> bool {
-        let was_last = self.connected.fetch_sub(1, Ordering::Release) == 1;
-        if was_last {
-            tracing::warn!("all replicas disconnected — halted, refusing client writes");
+    /// A counted replica left: lower the halt by one. Returns whether it
+    /// was the last one and, if so, whether the node now halts or an
+    /// override keeps it taking writes, logging that here so every sender
+    /// shares the wording. `fetch_sub` returns the *prior* count, so `== 1`
+    /// means this call took it to zero; deriving "last one" from the
+    /// returned value rather than a follow-up load avoids a TOCTOU race
+    /// with a concurrent reconnect's `lift`. With the count at zero,
+    /// [`halted`](Self::halted) is exactly "no override", so the override
+    /// alone decides which. The override needs no clearing here: a
+    /// departing replica that acked voided any override decided before its
+    /// ack, and one that never acked never took the stream, so the
+    /// operator's consent stands.
+    pub fn lower(&self) -> Lowered {
+        if self.connected.fetch_sub(1, Ordering::Release) != 1 {
+            return Lowered::OthersRemain;
         }
-        was_last
+        if self.overridden() {
+            tracing::warn!(
+                "all replicas disconnected — still taking client writes under the forced `disk` override"
+            );
+            Lowered::LastOverridden
+        } else {
+            tracing::warn!("all replicas disconnected — halted, refusing client writes");
+            Lowered::LastHalted
+        }
     }
 
     /// Whether the node halts now: no replica streaming, and no override
@@ -216,8 +238,8 @@ mod tests {
         first.acked(&presence);
         first.acked(&presence);
         second.acked(&presence);
-        assert!(!presence.lower(), "one left");
-        assert!(presence.lower(), "the last one");
+        assert_eq!(presence.lower(), Lowered::OthersRemain, "one left");
+        assert_eq!(presence.lower(), Lowered::LastHalted, "the last one");
         assert!(presence.halted());
         assert_eq!(
             presence.observe(),
@@ -238,7 +260,30 @@ mod tests {
         let since = none_since(&presence);
         presence.lift().acked(&presence);
         presence.latch_override(since);
-        presence.lower();
+        assert_eq!(presence.lower(), Lowered::LastHalted);
+        assert!(presence.halted());
+    }
+
+    /// The last replica leaving reports the truth the halt rule tells:
+    /// halted without an override, still taking writes under one, and
+    /// halted again once a first ack voided it.
+    #[test]
+    fn the_last_departure_reports_whether_an_override_holds() {
+        let presence = ReplicaPresence::new();
+        presence.latch_override(none_since(&presence));
+        drop(presence.lift());
+        assert_eq!(
+            presence.lower(),
+            Lowered::LastOverridden,
+            "one that never acked leaves the override"
+        );
+        assert!(!presence.halted());
+
+        let mut first = presence.lift();
+        drop(presence.lift());
+        first.acked(&presence);
+        assert_eq!(presence.lower(), Lowered::OthersRemain);
+        assert_eq!(presence.lower(), Lowered::LastHalted, "the ack voided it");
         assert!(presence.halted());
     }
 
@@ -248,7 +293,7 @@ mod tests {
     fn an_override_after_earlier_first_acks_holds() {
         let presence = ReplicaPresence::new();
         presence.lift().acked(&presence);
-        presence.lower();
+        assert_eq!(presence.lower(), Lowered::LastHalted);
         presence.latch_override(none_since(&presence));
         assert!(!presence.halted());
     }

@@ -406,6 +406,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
     `replication::run_sender` change type. `ReplicaPresence::lift`
     returns a `FirstAck`, through which a sender reports the replica's
     acks (`FirstAck::acked`): the first one ends the halt override.
+    `ReplicaPresence::lower` returns a `Lowered`: whether the replica
+    was the last, and if so whether the node halts or a forced `disk`
+    keeps it taking writes, which its warning states.
   - `pipeline::StageUtilization` has two new public fields,
     `ack_policy_in_force` and `ack_policy_journaled`.
 - **`melin_journal::replication::ReplicationConsumer` reads by

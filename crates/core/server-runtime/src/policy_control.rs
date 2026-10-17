@@ -679,6 +679,7 @@ mod tests {
     use crate::halt::test_support::{gate_over, presence};
     use counter_server::CounterEvent as TestEvent;
     use melin_pipeline::ring::Consumer;
+    use melin_transport_core::replica_presence::Lowered;
 
     const ALL: [AckPolicy; 4] = [
         AckPolicy::Disk,
@@ -1002,7 +1003,7 @@ mod tests {
 
         journal(AckPolicy::Disk);
         journal(AckPolicy::Disk);
-        assert!(replicas.lower());
+        assert_eq!(replicas.lower(), Lowered::LastHalted);
         journal(AckPolicy::Disk);
         journal(AckPolicy::TwoDisks);
         assert_eq!(

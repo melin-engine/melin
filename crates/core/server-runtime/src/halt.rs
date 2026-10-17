@@ -504,6 +504,7 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use melin_pipeline::padding::CachePadded;
+    use melin_transport_core::replica_presence::Lowered;
     use std::sync::atomic::AtomicBool;
 
     fn progress(value: u64) -> Arc<Sequence> {
@@ -650,7 +651,7 @@ mod tests {
         let replicas = test_support::presence(1);
         let gate = gate(Some(Arc::clone(&replicas)), Arc::new(FenceState::new(0)));
         assert_eq!(gate.verdict(), Verdict::Take);
-        assert!(replicas.lower());
+        assert_eq!(replicas.lower(), Lowered::LastHalted);
         assert_eq!(gate.verdict(), HALTED, "the halt ignores the policy");
 
         journal(&gate, AckPolicy::Disk, Origin::Runtime);
@@ -665,7 +666,7 @@ mod tests {
         let mut first_ack = replicas.lift();
         assert_eq!(gate.verdict(), Verdict::Take);
         first_ack.acked(&replicas);
-        assert!(replicas.lower());
+        assert_eq!(replicas.lower(), Lowered::LastHalted);
         assert_eq!(
             gate.verdict(),
             HALTED,
@@ -691,12 +692,12 @@ mod tests {
                 "streaming, so witnessed"
             );
             drop(refused);
-            assert!(replicas.lower());
+            assert_eq!(replicas.lower(), Lowered::LastOverridden);
             assert_eq!(gate.verdict(), Verdict::Take, "the override held");
         }
 
         replicas.lift().acked(&replicas);
-        assert!(replicas.lower());
+        assert_eq!(replicas.lower(), Lowered::LastHalted);
         assert_eq!(gate.verdict(), HALTED, "a replica that acked ended it");
     }
 
@@ -731,7 +732,7 @@ mod tests {
         let replicas = test_support::presence(1);
         let gate = gate(Some(Arc::clone(&replicas)), Arc::new(FenceState::new(0)));
         journal(&gate, AckPolicy::Disk, Origin::Runtime);
-        assert!(replicas.lower());
+        assert_eq!(replicas.lower(), Lowered::LastHalted);
         assert_eq!(gate.verdict(), HALTED, "witnessed: no consent");
 
         journal(&gate, AckPolicy::Disk, Origin::Staged);

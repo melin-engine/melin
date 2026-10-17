@@ -517,10 +517,12 @@ replicas connected (see above) — the operator's playbook is to either
 spin up new replicas immediately or send `ACK-POLICY disk` to resume
 writes under the single-copy policy. Send it once the promoted node
 serves, so that it is [forced](#runtime-policy-swap); one staged before
-`PROMOTE` is not. The promoted node serves under the policy the old
-primary last journaled, not its own `--ack-policy`, until the policy it
-requests takes effect (see "Restarts and promotions journal the
-requested policy" under "Runtime policy swap").
+`PROMOTE` is not. Unless it accepts no replicas, the promoted node serves
+under the policy in force before the newest swap it received from the
+old primary until it confirms that swap again, not under its own
+`--ack-policy` at once (see "A new tenure confirms
+the newest swap again" and "Restarts and promotions journal the
+requested policy" under [Runtime policy swap](#runtime-policy-swap)).
 
 The old primary should still be stopped promptly, but epoch fencing
 (below) now closes the split-brain window if it isn't: the moment the

@@ -880,6 +880,17 @@ and is committed on its own. Tests land with the step they pin.
    suite and the notary example's tests now share instead of their own
    copies; the scripted replica module needs no allowance.
 
+   **Final review nits.** `ReplicaPresence::lower` warned "halted,
+   refusing client writes" whenever the last replica left, even while an
+   override kept the node `trading`. It now returns a `Lowered`
+   (`OthersRemain`, `LastHalted`, `LastOverridden`), decided by the
+   override with the count at zero (exactly `halted()` then, without a
+   second count load a concurrent `lift` could race), and warns
+   accordingly; the presence unit test and the halt gate's tests pin the
+   case. `docs/replication.md`'s manual-promotion paragraph no longer
+   says the promoted node serves under the policy the old primary last
+   journaled: it points at the new-tenure confirmation instead.
+
 ## Downstream impact (Exchange Core)
 
 Breaking: an `OutputPayload` arm in its event publisher and anything else

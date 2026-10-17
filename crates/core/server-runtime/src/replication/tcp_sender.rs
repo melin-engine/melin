@@ -203,7 +203,7 @@ pub fn run_sender<A: Application>(
             // Lower the gate only if this connection was counted (and so
             // lifted it); `swap` reads and resets the latch in one op, and the
             // `join()` ordered the handler's writes before here.
-            // `lower` warns "halted" if this was the last replica.
+            // `lower` warns if this was the last replica.
             if counted_flags[slot_idx].swap(false, Ordering::AcqRel) {
                 replicas_connected.lower();
             }
