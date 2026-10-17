@@ -1708,9 +1708,9 @@ mod tests {
     /// The ack-policy mailbox's producer side, for a reader no test sends
     /// a request to.
     fn policy_claim() -> crate::policy_control::BootedClaim {
-        crate::policy_control::test_support::booted(&crate::policy_control::AckPolicyControl::new(
-            crate::ack_policy::AckPolicy::Disk,
-        ))
+        crate::policy_control::test_support::booted(
+            &crate::policy_control::test_support::replicated(crate::ack_policy::AckPolicy::Disk),
+        )
     }
 
     /// A reader parked with nothing to do (no connection, no tick) is

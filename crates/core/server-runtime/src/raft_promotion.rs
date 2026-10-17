@@ -1110,7 +1110,7 @@ mod tests {
         // Epoch 0 so the peer comparison turns on the sequence, and the
         // term (7) clears the fence-epoch check.
         let fence = melin_transport_core::fence::FenceState::new(0);
-        let policy = AckPolicyControl::new(AckPolicy::Ram);
+        let policy = crate::policy_control::test_support::replicated(AckPolicy::Ram);
         let peer_tips = PeerTips::new();
         // Peer 3 is a caught-up replica; peer 1 is the primary, unheard
         // — which digests to `Silent` rather than `Unknown` because this
@@ -1173,7 +1173,7 @@ mod tests {
                 &status,
                 &control,
                 &fence,
-                &AckPolicyControl::new(requested),
+                &crate::policy_control::test_support::replicated(requested),
                 &peer_tips,
                 // No other voter: nothing for the peer-tip veto to weigh.
                 &[],

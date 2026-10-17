@@ -445,13 +445,21 @@ fn handle_ack_policy(stream: &mut TcpStream, ack_policy: Option<&AckPolicyContro
                 "ack policy change refused: another request was still waiting to be journaled"
             );
         }
+        RequestOutcome::Refused(Refused::NoReplicaCanAttach) => {
+            // Journaled, it would have held every reply: worth a look at
+            // whoever sent it.
+            warn!(
+                policy = next.as_str(),
+                "ack policy change refused: the policy needs a replica and this node accepts none (no --replication-bind), so it could never be met"
+            );
+        }
     }
 }
 
 /// The admin reply to an `ACK-POLICY` request's outcome. Each refusal
 /// names its cause, since each calls for something different: retry once
-/// the pipeline drains, find the new primary, or wait for the request
-/// already in flight.
+/// the pipeline drains, find the new primary, wait for the request
+/// already in flight, or pick a policy this node can meet.
 fn ack_policy_reply(outcome: RequestOutcome) -> &'static [u8] {
     match outcome {
         RequestOutcome::Published => b"OK\n",
@@ -464,6 +472,9 @@ fn ack_policy_reply(outcome: RequestOutcome) -> &'static [u8] {
         }
         RequestOutcome::Refused(Refused::AnotherWaiting) => {
             b"ERR ACK-POLICY not journaled: another ACK-POLICY request is still waiting\n"
+        }
+        RequestOutcome::Refused(Refused::NoReplicaCanAttach) => {
+            b"ERR ACK-POLICY not journaled: this policy needs a replica and this node accepts none (no --replication-bind), so it could never be met\n"
         }
     }
 }
@@ -791,7 +802,14 @@ mod tests {
     /// starting), send the supplied command, and return `(response,
     /// policy_after)`: the policy the next promotion would request.
     fn run_ack_policy(initial: AckPolicy, cmd: &[u8]) -> (String, AckPolicy) {
-        let control = AckPolicyControl::new(initial);
+        run_ack_policy_on(
+            crate::policy_control::test_support::replicated(initial),
+            cmd,
+        )
+    }
+
+    /// As [`run_ack_policy`], on `control`.
+    fn run_ack_policy_on(control: Arc<AckPolicyControl>, cmd: &[u8]) -> (String, AckPolicy) {
         let (key, addr, shutdown) = spawn_with_policy(&control);
         let resp = send_command(addr, &key, cmd);
         let after = control.claim().policy();
@@ -806,11 +824,28 @@ mod tests {
         assert_eq!(after, AckPolicy::Disk);
     }
 
+    /// On a node that accepts no replica, a policy that needs one is
+    /// refused with the reason, and nothing is staged.
+    #[test]
+    fn ack_policy_command_refuses_a_policy_no_replica_can_meet() {
+        let standalone =
+            || AckPolicyControl::new(AckPolicy::Disk, crate::halt::Replication::Disabled);
+        let (resp, after) = run_ack_policy_on(standalone(), b"ACK-POLICY disk+ram\n");
+        assert_eq!(
+            format!("{resp}\n").as_bytes(),
+            ack_policy_reply(RequestOutcome::Refused(Refused::NoReplicaCanAttach)),
+            "{resp}"
+        );
+        assert_eq!(after, AckPolicy::Disk, "nothing staged");
+        let (resp, _) = run_ack_policy_on(standalone(), b"ACK-POLICY disk\n");
+        assert_eq!(resp, "OK staged", "`disk` is still taken");
+    }
+
     /// On a serving primary the command replies `OK` once its producer has
     /// journaled the change: the entry is on the input ring.
     #[test]
     fn ack_policy_command_is_journaled_by_the_producer() {
-        let control = AckPolicyControl::new(AckPolicy::DiskAndRam);
+        let control = crate::policy_control::test_support::replicated(AckPolicy::DiskAndRam);
         let (mut producer, mut consumer) =
             crate::policy_control::test_support::ring::<counter_server::CounterEvent>(8);
         // No replica connected: a runtime `disk` is forced.
@@ -883,6 +918,10 @@ mod tests {
                 "stopped serving as primary (stepping down or shutting down)",
             ),
             (Refused::AnotherWaiting, "another ACK-POLICY request"),
+            (
+                Refused::NoReplicaCanAttach,
+                "needs a replica and this node accepts none (no --replication-bind), so it could never be met",
+            ),
         ] {
             let text = reply(RequestOutcome::Refused(cause));
             assert!(

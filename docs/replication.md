@@ -286,7 +286,13 @@ retry once it drains), it stopped serving as primary meanwhile
 another `ACK-POLICY` request is still waiting. On a replica, or on a
 primary still starting, it answers
 `OK staged`: the policy is kept and journaled when the node serves as
-primary (below), unless its history already holds it. Every command a
+primary (below), unless its history already holds it. On a node that
+accepts no replicas (no `--replication-bind`: a `--standalone` node, or
+a replica that would be promoted without one), a policy that needs a
+replica (`ram`, `disk+ram`, `two-disks`) is refused in every role with
+an `ERR ACK-POLICY not journaled: ...` naming the cause, and nothing is
+journaled or staged: no replica could ever attach to meet it, so it
+would hold every reply. Only `disk` is taken there. Every command a
 serving primary takes is journaled, a repeat of the policy already in
 force included: the entries are the audit trail of what operators asked
 for, and re-sending is how a waiting swap is forced.
@@ -353,9 +359,13 @@ a primary that accepts no replicas (no `--replication-bind`: a
 `--standalone` node, or a replica promoted without one), where no
 replica can ever witness a swap: it serves under the policy it requests
 at once, and journals the swap as unwitnessed, as the record of it. Its
-runtime swaps are unwitnessed too, and take effect once on its disk, so
-do not send it a policy that needs a replica: it would hold every reply
-from then on, until the node is restarted under `disk`.
+runtime swaps are unwitnessed too, and take effect once on its disk; a
+policy that needs a replica is refused there, staged or not (see "The
+reply" above). So a replica promoted without `--replication-bind` serves
+under a staged `disk` at once. Under its own `--ack-policy`, if that
+needs a replica (`disk+ram`, the default, say), it holds every reply
+until the operator sends `ACK-POLICY disk`, which takes effect as soon
+as it is on the node's disk (step 3 of the failover workflow below).
 
 **A new tenure confirms the newest swap again.** Whether the newest swap
 in a history had taken effect when its primary stopped is not recorded:
@@ -397,7 +407,9 @@ journals it. A staged policy is never forced, since nobody knew at the
 time whether a replica would be connected after the promotion. A
 `disk` staged before `PROMOTE` therefore waits for a replica like any
 other swap; if none is connected once the node serves, send
-`ACK-POLICY disk` again to force it.
+`ACK-POLICY disk` again to force it. A replica without
+`--replication-bind` stages only `disk`: it would accept no replica
+once promoted, so it refuses a policy that needs one.
 
 ## Replica configuration
 

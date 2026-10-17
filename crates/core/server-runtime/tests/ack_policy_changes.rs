@@ -21,6 +21,9 @@
 //! - The same forced `disk` releases a write held under `disk+ram` by a
 //!   replica that left without acking it: the change overtakes the write
 //!   once its own entry is on the primary's disk.
+//! - A node that accepts no replica refuses a policy that needs one: a
+//!   standalone primary journals nothing and keeps acking, and a replica
+//!   without `--replication-bind` stages nothing, so its promotion serves.
 //!
 //! Nodes are started through `melin-test-node`: on kernel TCP by default,
 //! on DPDK with this crate's `dpdk` feature, under
@@ -613,6 +616,120 @@ fn a_forced_disk_releases_a_write_held_under_disk_and_ram() {
 
     drop(conn);
     primary.stop();
+}
+
+/// Assert `reply` is the refusal of a policy no replica can meet (the
+/// admin crate pins its whole text).
+fn assert_refused_for_want_of_a_replica(reply: Option<String>) {
+    let reply = reply.expect("the admin endpoint answered");
+    assert!(
+        reply.starts_with("ERR ACK-POLICY not journaled: ")
+            && reply.contains("needs a replica and this node accepts none"),
+        "{reply}"
+    );
+}
+
+/// A standalone primary refuses `ACK-POLICY disk+ram`: no replica can
+/// ever attach to meet it. Nothing is journaled (neither the policy gauge
+/// nor the journal moves), and writes keep being acked under `disk`.
+#[test]
+fn a_standalone_primary_refuses_a_policy_that_needs_a_replica() {
+    let cluster = Cluster::new();
+    let config = cluster.config(AckPolicy::Disk, true);
+    let health = config.health_bind.expect("set");
+    let admin = config.admin_bind.expect("set");
+    let primary = cluster.start(config);
+    wait_for_gauge(health, JOURNALED, AckPolicy::Disk.as_u8().into());
+
+    // The lineage's policy (entry 1), then a write (entry 2).
+    let mut conn = cluster.client(&primary);
+    assert_eq!(write_reply(&mut conn), KIND_RESP_ACK);
+    wait_durable(health, 2);
+
+    assert_refused_for_want_of_a_replica(admin_command(
+        admin,
+        &cluster.keys.operator,
+        "ACK-POLICY disk+ram",
+    ));
+    assert_eq!(
+        gauge(health, JOURNALED),
+        Some(AckPolicy::Disk.as_u8().into()),
+        "the refused policy was journaled"
+    );
+    assert_eq!(
+        write_reply(&mut conn),
+        KIND_RESP_ACK,
+        "writes keep being acked"
+    );
+    wait_durable(health, 3);
+    assert_eq!(gauge(health, DURABLE), Some(3), "only the write journaled");
+    assert_eq!(
+        gauge(health, IN_FORCE),
+        Some(AckPolicy::Disk.as_u8().into())
+    );
+
+    drop(conn);
+    primary.stop();
+}
+
+/// A replica that will accept no replica once promoted (no
+/// `--replication-bind`) refuses to stage a policy that needs one, rather
+/// than have its promotion serve under a policy no replica can meet:
+/// promoted, it serves under its own `disk` at once.
+#[test]
+fn a_replica_without_replication_refuses_to_stage_a_policy_that_needs_a_replica() {
+    let cluster = Cluster::new();
+    let config = cluster.config(AckPolicy::Disk, false);
+    let primary_health = config.health_bind.expect("set");
+    let primary = cluster.start(config);
+    wait_for_gauge(primary_health, "melin_replicas_connected", 0);
+
+    let key_path = cluster.dir.path().join("replica.key");
+    std::fs::write(&key_path, cluster.keys.scripted.to_bytes()).expect("write replica key");
+    let replica_config = ServerConfig {
+        journal: cluster.dir.path().join("replica.journal"),
+        replica_of: Some(cluster.addrs.replication()),
+        replication_bind: None,
+        replication_key: Some(key_path),
+        ..cluster.config(AckPolicy::Disk, false)
+    };
+    let health = replica_config.health_bind.expect("set");
+    let admin = replica_config.admin_bind.expect("set");
+    let replica = melin_test_node::start_at::<Counter>(
+        &addrs(1),
+        replica_config,
+        StartupEvents::none(),
+        (),
+        RequestDecoder,
+        ResponseEncoder,
+    );
+    wait_for_gauge(primary_health, "melin_replicas_connected", 1);
+
+    // Retried until the replica's admin endpoint is up.
+    let deadline = Instant::now() + LIMIT;
+    let reply = loop {
+        if let Some(reply) = admin_command(admin, &cluster.keys.operator, "ACK-POLICY disk+ram") {
+            break reply;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the replica's admin never answered"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_refused_for_want_of_a_replica(Some(reply));
+
+    primary.stop();
+    assert_eq!(
+        admin_command(admin, &cluster.keys.operator, "PROMOTE").as_deref(),
+        Some("OK")
+    );
+    wait_for_gauge(health, IN_FORCE, AckPolicy::Disk.as_u8().into());
+    let mut conn = cluster.client(&replica);
+    assert_eq!(write_reply(&mut conn), KIND_RESP_ACK, "served under `disk`");
+
+    drop(conn);
+    replica.stop();
 }
 
 /// A first boot under `disk+ram`, replicated, with no replica ever

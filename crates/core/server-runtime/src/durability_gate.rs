@@ -186,7 +186,13 @@ pub(crate) struct PendingChange {
 /// replica can ever witness the start's change, so a lineage last run
 /// under a policy that needs one (restarted standalone under `disk`)
 /// would hold every reply forever. The change is journaled unwitnessed
-/// all the same, as the record of the switch.
+/// all the same, as the record of the switch. A requested policy that
+/// needs a replica can only be the configured one there (the mailbox
+/// refuses to stage one, `AckPolicyControl::request`): a replica promoted
+/// without `--replication-bind` under its `--ack-policy disk+ram`, say. Its
+/// gate holds every reply until the operator's `ACK-POLICY disk`, which,
+/// unwitnessed, takes effect once on disk: the documented failover
+/// workflow, so it is served rather than refused.
 ///
 /// A lineage byte this build does not know is refused rather than
 /// replaced: the events it governs were acknowledged under a policy this

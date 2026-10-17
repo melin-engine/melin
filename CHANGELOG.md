@@ -301,6 +301,13 @@ Anything source-breaking is called out under **Removed** or **Changed**.
     is journaled when the node serves as primary, unless its history
     already holds it. Every command a serving primary takes is
     journaled, repeats of the policy in force included.
+  - On a node without `--replication-bind` (a `--standalone` node, or a
+    replica that would be promoted without one), `ACK-POLICY` naming a
+    policy that needs a replica (`ram`, `disk+ram`, `two-disks`) is
+    refused in every role with `ERR ACK-POLICY not journaled: ...`
+    naming the cause, logged at `warn!`, and nothing is journaled or
+    staged. It used to be journaled and take effect, holding every reply
+    from then on, since no replica could ever attach to meet it.
   - `ACK-POLICY disk` sent while no replica is connected is
     *forced*: journaled as unwitnessed, in force once its own entry is on
     the primary's disk (releasing replies held under the old policy),

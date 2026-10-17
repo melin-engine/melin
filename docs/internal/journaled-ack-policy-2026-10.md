@@ -677,17 +677,42 @@ and is committed on its own. Tests land with the step they pin.
    which fails with the pending change dropped and passes on kernel TCP
    and under the netns runner with the `dpdk` feature.
 
-   **Not fixed here (pre-existing, documented):** a runtime
-   `ACK-POLICY` naming a policy that needs a replica, sent to a primary
-   that accepts none (no `--replication-bind`), is journaled
-   unwitnessed and applied once on disk, so the gate holds every reply
-   until a restart under `disk` (the standalone rule then serves at
-   once). The admin atomic did the same before this plan. Refusing such
-   a request at the mailbox (`Witnesses::Disabled` with
-   `AckPolicy::needs_replica`) would prevent it; `docs/replication.md`
-   warns against it meanwhile, and the roadmap tracks the refusal as
-   its own item ("Refuse an ack policy that needs a replica on a node
-   that accepts none").
+   **A policy no replica can meet is refused (follow-up fix).** A
+   runtime `ACK-POLICY` naming a policy that needs a replica, sent to a
+   node that accepts none (no `--replication-bind`), used to be journaled
+   unwitnessed and applied once on disk, holding every reply until the
+   operator sent `disk` or restarted under it (the admin atomic did the
+   same before this plan). The mailbox now refuses it before anything is
+   journaled or staged: `AckPolicyControl::request` checks
+   `Replication::can_meet` (an exhaustive match, so a new shape has to
+   decide) and answers `Refused::NoReplicaCanAttach`, which the admin
+   command replies as `ERR ACK-POLICY not journaled: ...` naming the
+   cause, logged at `warn`. The mailbox takes the node's shape at
+   construction from `ServerConfig::replication`, the same answer the
+   primary pipeline's replica presence (hence `HaltGate::replication`)
+   is built on; the configuration fixes it for the process, so a replica
+   *can* know at staging time whether its promotion will accept
+   replicas, and refuses a needs-replica policy as it would be staged.
+   The boot and promotion entry path therefore never requests a staged
+   needs-replica policy on such a node. The one way it still starts a
+   gate under one is the configured `--ack-policy` (a replica promoted
+   without `--replication-bind` under the default `disk+ram`): left as
+   it is deliberately, since that is the documented failover workflow
+   (promote, then `ACK-POLICY disk`, which is unwitnessed and so takes
+   effect once on disk), pinned by `replicated_failover` and the notary's
+   promotion test; refusing that promotion, or serving it under `disk`
+   unasked, would break the workflow or weaken durability without the
+   operator's consent. Tests: `can_meet` per policy, the mailbox refusal
+   staged and attached (nothing staged, nothing on the ring, nothing
+   waiting; `disk` still taken), the admin reply text and the command
+   end to end, and
+   `ack_policy_changes::a_standalone_primary_refuses_a_policy_that_needs_a_replica`
+   (error reply, the journaled gauge and the journal unchanged, writes
+   still acked) and
+   `a_replica_without_replication_refuses_to_stage_a_policy_that_needs_a_replica`
+   (refused on the replica, which then promotes and serves under `disk`).
+   Both fail with the refusal removed and pass on kernel TCP and under
+   the netns runner with the `dpdk` feature.
 
    **Not fixed here (standalone exception):** a lineage whose newest
    change is still waiting for its witness (`disk` after `disk+ram`),

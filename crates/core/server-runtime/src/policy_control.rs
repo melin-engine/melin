@@ -32,6 +32,15 @@
 //! is how an operator forces a swap a departed replica would otherwise
 //! hold up.
 //!
+//! The one request refused up front, whatever the producer's state, is a
+//! policy that needs a replica on a node that accepts none (no
+//! `--replication-bind`: a `--standalone` node, or a replica that will be
+//! promoted without one): no replica could ever attach to meet it, so,
+//! journaled, it would hold every reply (`Replication::can_meet`). The
+//! mailbox knows the node's shape from its configuration, which fixes it
+//! for the process: a replica refuses such a policy as it would be staged,
+//! not at promotion.
+//!
 //! # Witnessed and forced changes
 //!
 //! A change normally takes effect once its entry is durable under the
@@ -62,7 +71,7 @@ use melin_transport_core::pipeline::InputSlot;
 use tracing::{info, warn};
 
 use crate::ack_policy::AckPolicy;
-use crate::halt::{HaltGate, Journaled};
+use crate::halt::{HaltGate, Journaled, Replication};
 
 /// How long an `ACK-POLICY` command waits for its entry to be published
 /// before it is refused. The producer checks the mailbox on every loop, so
@@ -184,6 +193,9 @@ pub(crate) enum Refused {
     /// Another request was already waiting for the producer: two are
     /// never merged.
     AnotherWaiting,
+    /// The policy needs a replica, and this node accepts none
+    /// ([`Replication::can_meet`]): it could never be met.
+    NoReplicaCanAttach,
 }
 
 /// A runtime request waiting for the producer.
@@ -234,16 +246,25 @@ pub struct AckPolicyControl {
     /// producer's loop pays.
     pending: AtomicBool,
     publish_wait: Duration,
+    /// Whether this node accepts replicas, in either role: the shape
+    /// [`Self::request`] refuses a policy it could never meet on.
+    replication: Replication,
 }
 
 impl AckPolicyControl {
-    /// A mailbox starting from the configured policy.
-    pub(crate) fn new(configured: AckPolicy) -> Arc<Self> {
-        Self::with_publish_wait(configured, PUBLISH_WAIT)
+    /// A mailbox starting from the configured policy, on a node of the
+    /// configured shape (`ServerConfig::replication`, the one its primary
+    /// pipeline's halt gate is built on).
+    pub(crate) fn new(configured: AckPolicy, replication: Replication) -> Arc<Self> {
+        Self::with_publish_wait(configured, replication, PUBLISH_WAIT)
     }
 
     /// As [`Self::new`], with the bound a request waits for its entry.
-    fn with_publish_wait(configured: AckPolicy, publish_wait: Duration) -> Arc<Self> {
+    fn with_publish_wait(
+        configured: AckPolicy,
+        replication: Replication,
+        publish_wait: Duration,
+    ) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(State {
                 producer: Producer::Detached,
@@ -255,6 +276,7 @@ impl AckPolicyControl {
             changed: Condvar::new(),
             pending: AtomicBool::new(false),
             publish_wait,
+            replication,
         })
     }
 
@@ -278,11 +300,16 @@ impl AckPolicyControl {
     /// Journal `policy` (the admin `ACK-POLICY` command): post it to the
     /// attached producer and wait, at most the publish bound, until its
     /// entry is on the input ring; or stage it while no producer runs.
+    /// Refused first, in either case, if this node could never meet it
+    /// ([`Refused::NoReplicaCanAttach`]): nothing is journaled or staged.
     ///
     /// Called by one thread, the admin listener's, which serves one
     /// command at a time, so no other request is waiting: a request is
     /// published or withdrawn before this returns.
     pub(crate) fn request(&self, policy: AckPolicy) -> RequestOutcome {
+        if !self.replication.can_meet(policy) {
+            return RequestOutcome::Refused(Refused::NoReplicaCanAttach);
+        }
         let deadline = Instant::now() + self.publish_wait;
         let mut state = self.lock();
         let Producer::Attached { wake } = &state.producer else {
@@ -513,12 +540,18 @@ pub(crate) mod test_support {
     use melin_pipeline::ring::{Consumer, DisruptorBuilder};
     use melin_pipeline::wait::WaitStrategy;
 
-    /// A mailbox whose requests wait at most `publish_wait`.
+    /// A replicating node's mailbox whose requests wait at most
+    /// `publish_wait`.
     pub(crate) fn control_with_publish_wait(
         configured: AckPolicy,
         publish_wait: Duration,
     ) -> Arc<AckPolicyControl> {
-        AckPolicyControl::with_publish_wait(configured, publish_wait)
+        AckPolicyControl::with_publish_wait(configured, Replication::Enabled, publish_wait)
+    }
+
+    /// A replicating node's mailbox: every policy can be requested.
+    pub(crate) fn replicated(configured: AckPolicy) -> Arc<AckPolicyControl> {
+        AckPolicyControl::new(configured, Replication::Enabled)
     }
 
     /// An input ring of `capacity` slots with its one consumer.
@@ -558,7 +591,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{attach, booted, control_with_publish_wait, ring};
+    use super::test_support::{attach, booted, control_with_publish_wait, replicated, ring};
     use super::*;
     use crate::halt::Verdict;
     use crate::halt::test_support::{gate_over, presence};
@@ -635,7 +668,7 @@ mod tests {
         let halt = halted_gate();
         let boot = |requested, lineage, producer: &mut ring::Producer<Slot>, halt: &HaltGate| {
             drop(
-                AckPolicyControl::new(requested)
+                replicated(requested)
                     .claim()
                     .journal_boot(lineage, producer, halt),
             );
@@ -674,7 +707,7 @@ mod tests {
     /// earlier forced swap lifted, as a runtime one does.
     #[test]
     fn a_boot_entry_that_needs_a_replica_restores_the_halt() {
-        let control = AckPolicyControl::new(AckPolicy::Disk);
+        let control = replicated(AckPolicy::Disk);
         let (mut producer, mut consumer) = ring::<TestEvent>(8);
         let halt = halted_gate();
         let mut publisher = booted(&control).attach(&mut producer, &halt, None);
@@ -689,11 +722,11 @@ mod tests {
         assert_eq!(halt.verdict(), Verdict::Take, "forced: lifted");
         drop(publisher);
 
-        drop(
-            AckPolicyControl::new(AckPolicy::TwoDisks)
-                .claim()
-                .journal_boot(Some(AckPolicy::Disk.to_byte()), &mut producer, &halt),
-        );
+        drop(replicated(AckPolicy::TwoDisks).claim().journal_boot(
+            Some(AckPolicy::Disk.to_byte()),
+            &mut producer,
+            &halt,
+        ));
         assert_ne!(halt.verdict(), Verdict::Take, "restored");
         assert_eq!(
             changes(&mut consumer),
@@ -708,11 +741,48 @@ mod tests {
     /// requests it, and so does auto-promotion's fallback.
     #[test]
     fn a_request_with_no_producer_is_staged_for_the_next_claim() {
-        let control = AckPolicyControl::new(AckPolicy::DiskAndRam);
+        let control = replicated(AckPolicy::DiskAndRam);
         assert_eq!(control.claim().policy(), AckPolicy::DiskAndRam);
         assert_eq!(control.request(AckPolicy::Ram), RequestOutcome::Staged);
         assert_eq!(control.requested(), AckPolicy::Ram);
         assert_eq!(control.claim().policy(), AckPolicy::Ram);
+    }
+
+    /// On a node that accepts no replica, a policy that needs one is
+    /// refused whether a producer runs or not: nothing is staged, nothing
+    /// is put on the ring, the requested policy is unchanged and no
+    /// request is left waiting. `disk` is still taken, staged or
+    /// journaled (unwitnessed: nothing can witness it).
+    #[test]
+    fn a_node_without_replication_refuses_a_policy_that_needs_a_replica() {
+        const REFUSED: RequestOutcome = RequestOutcome::Refused(Refused::NoReplicaCanAttach);
+        let control = AckPolicyControl::new(AckPolicy::Disk, Replication::Disabled);
+        for policy in [AckPolicy::Ram, AckPolicy::DiskAndRam, AckPolicy::TwoDisks] {
+            assert_eq!(control.request(policy), REFUSED, "staging {policy}");
+        }
+        assert_eq!(control.requested(), AckPolicy::Disk, "nothing staged");
+        assert_eq!(control.request(AckPolicy::Disk), RequestOutcome::Staged);
+
+        let (mut producer, mut consumer) = ring::<TestEvent>(8);
+        let standalone = gate_over(None);
+        let mut publisher = booted(&control).attach(&mut producer, &standalone, None);
+        for policy in [AckPolicy::Ram, AckPolicy::DiskAndRam, AckPolicy::TwoDisks] {
+            let outcome =
+                request_while_polling(&control, &mut publisher, &mut producer, policy, &standalone);
+            assert_eq!(outcome, REFUSED, "journaling {policy}");
+            assert!(!control.pending.load(Ordering::Acquire), "nothing waits");
+        }
+        assert!(changes(&mut consumer).is_empty(), "nothing journaled");
+        assert_eq!(control.requested(), AckPolicy::Disk);
+        let outcome = request_while_polling(
+            &control,
+            &mut publisher,
+            &mut producer,
+            AckPolicy::Disk,
+            &standalone,
+        );
+        assert_eq!(outcome, RequestOutcome::Published);
+        assert_eq!(changes(&mut consumer), [change(AckPolicy::Disk, true)]);
     }
 
     /// Run `request` on a helper thread while this one plays the producer:
@@ -740,7 +810,7 @@ mod tests {
     /// forced swap lifts is the gate's: `halt.rs`.)
     #[test]
     fn an_attached_producer_journals_every_request() {
-        let control = AckPolicyControl::new(AckPolicy::DiskAndRam);
+        let control = replicated(AckPolicy::DiskAndRam);
         let (mut producer, mut consumer) = ring(8);
         let replicas = presence(1);
         let halt = gate_over(Some(Arc::clone(&replicas)));
@@ -771,7 +841,7 @@ mod tests {
     /// Nothing waits: polling publishes nothing and leaves the halt alone.
     #[test]
     fn polling_with_nothing_requested_publishes_nothing() {
-        let control = AckPolicyControl::new(AckPolicy::Disk);
+        let control = replicated(AckPolicy::Disk);
         let (mut producer, mut consumer) = ring(8);
         let halt = halted_gate();
         let mut publisher = booted(&control).attach(&mut producer, &halt, None);
@@ -886,7 +956,7 @@ mod tests {
     /// forced, so it lifts no halt; a runtime `disk` after it is forced.
     #[test]
     fn a_request_staged_during_bring_up_is_journaled_at_attach_in_order() {
-        let control = AckPolicyControl::new(AckPolicy::DiskAndRam);
+        let control = replicated(AckPolicy::DiskAndRam);
         assert_eq!(control.request(AckPolicy::TwoDisks), RequestOutcome::Staged);
         let claim = control.claim();
         let (mut producer, mut consumer) = ring(8);
@@ -924,7 +994,7 @@ mod tests {
     /// lineage) already holds it.
     #[test]
     fn a_staged_policy_equal_to_the_claims_is_not_journaled_at_attach() {
-        let control = AckPolicyControl::new(AckPolicy::DiskAndRam);
+        let control = replicated(AckPolicy::DiskAndRam);
         let claim = control.claim();
         assert_eq!(control.request(AckPolicy::TwoDisks), RequestOutcome::Staged);
         assert_eq!(

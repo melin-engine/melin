@@ -127,15 +127,33 @@ pub struct HaltGate {
 }
 
 /// Whether a node replicates: the one shape of "standalone or replicated"
-/// every ack-policy decision reads, taken from the halt gate's own replica
-/// presence ([`HaltGate::replication`]) so the gate's start and the
-/// producer's entries cannot disagree on it.
+/// every ack-policy decision reads. Its source is
+/// `ServerConfig::replication` (whether `--replication-bind` is set): the
+/// ack-policy mailbox is built from it directly, and a primary pipeline
+/// gives its halt gate a replica presence exactly when it is `Enabled`, so
+/// the gate's start and the producer's entries, which read it back through
+/// [`HaltGate::replication`], cannot disagree with the mailbox's refusal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Replication {
     /// Replication is configured: replicas may stream, and witness changes.
     Enabled,
     /// Standalone: nothing can witness a change.
     Disabled,
+}
+
+impl Replication {
+    /// Whether `policy` can ever be met on a node of this shape. A policy
+    /// that needs a replica cannot on a node that accepts none: no replica
+    /// will ever attach to supply the second copy, so its gate would hold
+    /// every reply. The admin `ACK-POLICY` command refuses such a request
+    /// (`AckPolicyControl::request`). An exhaustive match, so a new shape
+    /// has to decide.
+    pub(crate) fn can_meet(self, policy: AckPolicy) -> bool {
+        match self {
+            Replication::Enabled => true,
+            Replication::Disabled => !policy.needs_replica(),
+        }
+    }
 }
 
 /// An ack-policy change decided on one look at who was streaming, taken
@@ -602,6 +620,25 @@ mod tests {
             gate(Some(test_support::presence(0)), fence()).replication(),
             Replication::Enabled
         );
+    }
+
+    /// A replicating node can meet every policy; one that accepts no
+    /// replica only those that need none.
+    #[test]
+    fn a_node_without_replication_meets_only_policies_that_need_no_replica() {
+        for policy in [
+            AckPolicy::Disk,
+            AckPolicy::Ram,
+            AckPolicy::DiskAndRam,
+            AckPolicy::TwoDisks,
+        ] {
+            assert!(Replication::Enabled.can_meet(policy), "{policy}");
+            assert_eq!(
+                Replication::Disabled.can_meet(policy),
+                policy == AckPolicy::Disk,
+                "{policy}"
+            );
+        }
     }
 
     /// Halt-plan step 0. A node under `disk` that loses its replica halts

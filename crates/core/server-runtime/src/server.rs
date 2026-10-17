@@ -552,6 +552,18 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
+    /// Whether this node accepts replicas: whether `--replication-bind`
+    /// is set, in either role (a replica holds the port from boot, and
+    /// serves replicas on it once promoted). The one answer the
+    /// ack-policy mailbox and a primary pipeline (its replica presence,
+    /// hence its halt gate) are both built on.
+    pub(crate) fn replication(&self) -> crate::halt::Replication {
+        match self.replication_bind {
+            Some(_) => crate::halt::Replication::Enabled,
+            None => crate::halt::Replication::Disabled,
+        }
+    }
+
     /// Group commit delay as a Duration.
     pub fn group_commit_delay(&self) -> std::time::Duration {
         std::time::Duration::from_micros(self.group_commit_us)
@@ -945,7 +957,8 @@ where
     // replica → primary transition the same mailbox feeds the new
     // primary's producer, which journals each change. See
     // `crate::policy_control`.
-    let ack_policy = crate::policy_control::AckPolicyControl::new(config.ack_policy);
+    let ack_policy =
+        crate::policy_control::AckPolicyControl::new(config.ack_policy, config.replication());
 
     // Validate before the bind below and before anything touches the
     // journal directory, so a refused boot has no side effects and leaves
@@ -1670,7 +1683,7 @@ where
     // Determine replication mode. Every application's binary ships the
     // full durable transport (journal + replication + shadow), so the
     // same config knob drives any of them.
-    let enable_replication = config.replication_bind.is_some();
+    let enable_replication = config.replication() == crate::halt::Replication::Enabled;
     // Re-checked: a promotion reaches here without the boot-time check.
     validate_primary_config(config)?;
     // The reader's and the response stage's io_uring sizes, from the
@@ -2456,7 +2469,8 @@ where
     // Mirrors the kernel-TCP `run` path: one ack-policy mailbox per
     // process, threaded into both replica (staging for promotion) and
     // primary admin listeners.
-    let ack_policy = crate::policy_control::AckPolicyControl::new(config.ack_policy);
+    let ack_policy =
+        crate::policy_control::AckPolicyControl::new(config.ack_policy, config.replication());
     // As on the kernel-TCP path: refuse a configuration no primary can run
     // under before EAL init and before anything touches the journal, in
     // every role — a replica's configuration is the one it serves under
@@ -2882,7 +2896,7 @@ where
 
     // Replication setup (same as TCP path). The configuration was
     // validated before `init_engine`.
-    let enable_replication = config.replication_bind.is_some();
+    let enable_replication = config.replication() == crate::halt::Replication::Enabled;
 
     // Build disruptor pipeline (same flags as the kernel TCP path).
     // DPDK doesn't currently spawn the publisher thread (see
