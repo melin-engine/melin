@@ -1899,7 +1899,17 @@ mod tests {
         /// How a reply slot at `wire_seq` is released within `patience`,
         /// or `None` if it is still held.
         fn release(&mut self, wire_seq: u64, patience: Duration) -> Option<Backing> {
-            match self.admit_within(&reply(wire_seq), patience)? {
+            self.release_slot(&reply(wire_seq), patience)
+        }
+
+        /// How `slot`, which answers a client, is released within
+        /// `patience`, or `None` if it is still held.
+        fn release_slot(
+            &mut self,
+            slot: &OutputSlot<u8, u8>,
+            patience: Duration,
+        ) -> Option<Backing> {
+            match self.admit_within(slot, patience)? {
                 Admission::Reply { backing, .. } => Some(backing),
                 other => panic!("a reply slot admitted as {other:?}"),
             }
@@ -2105,6 +2115,60 @@ mod tests {
         p.journal_at(9);
         assert_eq!(p.release(9, PATIENCE), None);
         assert!(!p.gate.releasing_degraded);
+    }
+
+    /// Chosen behaviour, pinned: a query answered during a halt over state
+    /// every replica had confirmed before it left is marked `PrimaryOnly`
+    /// (it ends in `BatchEndDegraded`) and counted in
+    /// `melin_degraded_acks_total`, like any other reply the halted node
+    /// releases on its own disk.
+    ///
+    /// The gate keeps no record of what the policy confirmed before the
+    /// loss. Once it evaluates the policy with no replica streaming — on
+    /// the idle timer here, as on a quiet halted node whose writes are
+    /// refused at ingress, or in any held slot's wait — the durable
+    /// position is pinned to 0, so a slot at a position the policy
+    /// confirmed long ago is judged unconfirmed, and past the grace goes
+    /// out on the primary's own fsync, marked. A change here changes what
+    /// clients and the metric are told; it is a decision, not a fix.
+    #[test]
+    fn a_query_over_state_confirmed_before_the_loss_is_answered_primary_only() {
+        let grace = Duration::from_millis(100);
+        let mut p = Primary::new(AckPolicy::DiskAndRam, 5, true, Some(grace));
+        assert_eq!(
+            p.release(5, PATIENCE),
+            Some(Backing::Policy),
+            "before the loss the policy confirms everything through 5"
+        );
+        assert_eq!(p.gate.cached_durable_pos, 5);
+
+        p.replica_leaves();
+        std::thread::sleep(grace);
+        let due = p.gate.last_policy_check + POLICY_CHECK_INTERVAL;
+        p.gate.idle_recheck(due);
+        assert_eq!(
+            p.gate.cached_durable_pos, 0,
+            "with no replica streaming the evaluation pins the durable position to 0"
+        );
+
+        let query = OutputSlot {
+            wire_seq: 5,
+            payload: OutputPayload::QueryResponse(0),
+            is_last_in_request: true,
+            ..OutputSlot::default()
+        };
+        let backing = p.release_slot(&query, PATIENCE);
+        assert_eq!(
+            backing,
+            Some(Backing::PrimaryOnly),
+            "marked, though every replica confirmed position 5 before it left"
+        );
+        let ends = BatchEnds::new();
+        assert_eq!(
+            p.gate.batch_end(Backing::PrimaryOnly, &ends),
+            ends.primary_only
+        );
+        assert_eq!(p.degraded_acks(), 1, "counted in melin_degraded_acks_total");
     }
 
     /// The cache trap: a degraded release must not advance the position

@@ -2009,7 +2009,7 @@ fn print_utilization(stage: &str, busy: u64, idle: u64) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #[cfg(feature = "tick-to-trade")]
     use super::GateCrossTracker;
     use super::{
@@ -3805,7 +3805,10 @@ mod tests {
     /// those is held by the durability gate — and before anything
     /// published after it. Replies carry no request id, so a refusal sent
     /// early would be paired with the wrong request.
-    mod refusal_order {
+    ///
+    /// Its frame classifier and refusal builder are shared with the DPDK
+    /// stage's tests (`dpdk_response.rs`).
+    pub(crate) mod refusal_order {
         use std::io::{ErrorKind, Read, Write};
         use std::os::unix::io::AsRawFd;
         use std::os::unix::net::UnixStream;
@@ -3841,9 +3844,23 @@ mod tests {
         /// kind its body starts with, or one of the protocol's own frames,
         /// by its tag.
         #[derive(Debug, PartialEq, Eq)]
-        pub(super) enum Seen {
+        pub(crate) enum Seen {
             App(u8),
             Protocol(u8),
+        }
+
+        impl Seen {
+            /// What a frame with this payload (its length prefix stripped)
+            /// is.
+            pub(crate) fn of(payload: &[u8]) -> Self {
+                match *payload {
+                    [TAG_APP, kind, ..] => Seen::App(kind),
+                    // Every counter response carries a kind.
+                    [TAG_APP] => panic!("a counter response with an empty body"),
+                    [tag, ..] => Seen::Protocol(tag),
+                    [] => panic!("an empty frame on the wire"),
+                }
+            }
         }
 
         /// Read one frame and say what it was.
@@ -3852,13 +3869,7 @@ mod tests {
             sock.read_exact(&mut len)?;
             let mut payload = vec![0u8; u32::from_le_bytes(len) as usize];
             sock.read_exact(&mut payload)?;
-            Ok(match payload[..] {
-                [TAG_APP, kind, ..] => Seen::App(kind),
-                // Every counter response carries a kind.
-                [TAG_APP] => panic!("a counter response with an empty body"),
-                [tag, ..] => Seen::Protocol(tag),
-                [] => panic!("an empty frame on the wire"),
-            })
+            Ok(Seen::of(&payload))
         }
 
         /// Read one frame into `seen`; false if none arrived.
@@ -4069,7 +4080,7 @@ mod tests {
             (event, client_sock)
         }
 
-        pub(super) fn refusal(connection_id: u64, input_seq: u64) -> Refusal<CounterReport> {
+        pub(crate) fn refusal(connection_id: u64, input_seq: u64) -> Refusal<CounterReport> {
             Refusal {
                 connection_id,
                 input_seq,
