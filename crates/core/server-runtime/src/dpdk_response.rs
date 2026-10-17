@@ -20,7 +20,9 @@ use melin_pipeline::ring;
 use melin_pipeline::spsc;
 use melin_pipeline::wait::WaitStrategy;
 
-use crate::durability_gate::{Admission, DurabilityGate, GateInputs, GatePolicy};
+use crate::durability_gate::{
+    Admission, Backing, BatchEnds, DurabilityGate, GateInputs, GatePolicy,
+};
 use crate::halt::RefusalQueue;
 use melin_app::Application;
 use melin_app::amortized_timer::AmortizedTimer;
@@ -129,6 +131,9 @@ pub fn run<A: Application>(
     // Writes the poll thread refused while halted, each sent once
     // everything published before it is answered — see `crate::halt`.
     mut refusals: RefusalQueue<A::Report>,
+    // Release of held replies on this node's own fsync while halted;
+    // `None` when off. See `crate::halt::DegradedRelease`.
+    degraded_release: Option<crate::halt::DegradedRelease>,
 ) {
     // The ack policy in force and the durability gate — the same state
     // machine the kernel response stage runs. See `DurabilityGate`.
@@ -139,6 +144,7 @@ pub fn run<A: Application>(
             replica_active,
             utilization: Arc::clone(&utilization),
             wait,
+            degraded_release,
         },
         policy,
         "dpdk response",
@@ -152,15 +158,15 @@ pub fn run<A: Application>(
 
     let mut encode_buf: EncodeBuf = [0u8; MAX_APP_FRAME];
 
-    // The BatchEnd terminator is the same bytes on every request, so it is
-    // encoded once here instead of per slot.
-    let batch_end_wire_frame = {
-        let mut buf = [0u8; MAX_BATCH_END_FRAME];
-        let written =
-            control_codec::encode_transport_response(&TransportResponse::BatchEnd, &mut buf)
-                .expect("BatchEnd encodes");
-        buf[..written].to_vec()
-    };
+    // The two request terminators are the same bytes on every request, so
+    // they are encoded once here instead of per slot. A refusal always
+    // ends in the plain one — see `response::run`.
+    let batch_ends = BatchEnds::new();
+    debug_assert!(
+        batch_ends.policy.len() <= MAX_BATCH_END_FRAME
+            && batch_ends.primary_only.len() <= MAX_BATCH_END_FRAME,
+        "a terminator outgrew the room a TX frame keeps for it"
+    );
 
     // Pre-encode heartbeat frame (fixed-size, no heap allocation).
     let mut heartbeat_frame = [0u8; 8];
@@ -257,7 +263,7 @@ pub fn run<A: Application>(
                         &mut connections,
                         &mut tx_producers,
                         &mut encode_buf,
-                        &batch_end_wire_frame,
+                        &batch_ends.policy,
                         now,
                     );
                 });
@@ -367,7 +373,7 @@ pub fn run<A: Application>(
                         &mut connections,
                         &mut tx_producers,
                         &mut encode_buf,
-                        &batch_end_wire_frame,
+                        &batch_ends.policy,
                         batch_now,
                     );
                 });
@@ -394,16 +400,21 @@ pub fn run<A: Application>(
             // A gate that cannot open does not hold the shutdown sequence;
             // the reply the policy never confirmed is not queued. A policy
             // change slot is the gate's own: its frames go to no
-            // connection, whatever it is addressed to.
-            let destination = match gate.admit(
+            // connection, whatever it is addressed to. What backs a reply
+            // decides its terminator: the policy, unless the gate released
+            // it on this node's own fsync while halted.
+            let (destination, backing) = match gate.admit(
                 slot,
                 shutdown,
                 #[cfg(feature = "tick-to-trade")]
                 &mut gate_tracker,
                 || {},
             ) {
-                Admission::Reply { connection_id } => Some(connection_id),
-                Admission::GateOnly => None,
+                Admission::Reply {
+                    connection_id,
+                    backing,
+                } => (Some(connection_id), backing),
+                Admission::GateOnly => (None, Backing::Policy),
                 Admission::Shutdown => continue 'run,
             };
 
@@ -455,11 +466,12 @@ pub fn run<A: Application>(
             // the terminator below handles them via is_last_in_request.
             let payload_result = encode_slot_payload(&slot.payload, &*encoder, &mut encode_buf);
 
-            // The BatchEnd terminator rides in the same frame. It is
-            // transport-shaped and byte-identical every time, so it is
+            // The terminator rides in the same frame: `BatchEnd`, or
+            // `BatchEndDegraded` as the slot is backed. Both are
+            // transport-shaped and byte-identical every time, so they are
             // encoded once at startup rather than per slot.
             let trailer: &[u8] = if slot.is_last_in_request {
-                &batch_end_wire_frame
+                gate.batch_end(backing, &batch_ends)
             } else {
                 &[]
             };
@@ -847,6 +859,7 @@ mod tests {
                     WaitStrategy::SpinThenYield,
                     Arc::new(ResponseEncoder),
                     refusals,
+                    None,
                 )
             });
 
