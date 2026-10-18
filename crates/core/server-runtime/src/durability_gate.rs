@@ -201,6 +201,53 @@ enum GateOutcome {
     Shutdown,
 }
 
+/// What a response stage does while the gate holds one of its slots: the
+/// work that must not wait for the slot's event to become durable.
+///
+/// The kernel stage flushes the replies it has buffered before it waits
+/// (they have cleared their own gates already), and both stages send early
+/// replies during the wait if the held slot is the first of its event (see
+/// [`crate::batch_boundary`]): a refusal must not wait for a write the ack
+/// policy holds.
+pub(crate) trait GateWait {
+    /// Called once per [`DurabilityGate::admit`], and only if the slot has
+    /// to wait, before the wait begins.
+    fn before_wait(&mut self);
+
+    /// Called on each idle turn of the gate's waiter while the slot waits,
+    /// after [`before_wait`](Self::before_wait), never on a slot that does
+    /// not wait. Runs while the stage spins on the gate, so it should cost
+    /// little when there is nothing to do.
+    fn while_waiting(&mut self);
+}
+
+/// A [`GateWait`] hook for one admit, and whether its `before_wait` has
+/// run: the one place that guarantees it runs at most once however many
+/// waits the admit takes (pending changes, then the slot).
+struct Hook<'h, H: GateWait> {
+    hook: &'h mut H,
+    started: bool,
+}
+
+impl<'h, H: GateWait> Hook<'h, H> {
+    fn new(hook: &'h mut H) -> Self {
+        Self {
+            hook,
+            started: false,
+        }
+    }
+
+    /// The slot is about to wait: run `before_wait` if no earlier wait of
+    /// this admit has.
+    #[inline]
+    fn starting(&mut self) {
+        if !self.started {
+            self.started = true;
+            self.hook.before_wait();
+        }
+    }
+}
+
 /// How [`DurabilityGate::admit`] left a slot: where its frames go, if
 /// anywhere.
 #[must_use]
@@ -737,8 +784,9 @@ impl DurabilityGate {
     /// policy it names for every slot after it. Both response stages call
     /// this for every slot, in ring order.
     ///
-    /// `before_wait` runs once, only when the slot has to wait — the
-    /// kernel stage flushes its buffered replies there.
+    /// `hook`'s `before_wait` runs once, only when the slot has to wait —
+    /// the kernel stage flushes its buffered replies there — and its
+    /// `while_waiting` on every idle turn of the wait (see [`GateWait`]).
     ///
     /// A change a forced one has overtaken is stale, and not applied
     /// ([`Self::apply_change`]). Waiting on it holds nothing back: the
@@ -765,14 +813,14 @@ impl DurabilityGate {
         slot: &OutputSlot<R, Q>,
         shutdown: &AtomicBool,
         #[cfg(feature = "tick-to-trade")] tracker: &mut GateCrossTracker,
-        before_wait: impl FnOnce(),
+        hook: &mut impl GateWait,
     ) -> Admission {
-        let mut before_wait = Some(before_wait);
+        let mut hook = Hook::new(hook);
         match self.admit_pending(
             shutdown,
             #[cfg(feature = "tick-to-trade")]
             tracker,
-            &mut before_wait,
+            &mut hook,
         ) {
             GateOutcome::Shutdown => Admission::Shutdown,
             GateOutcome::Open(backing) => self.admit_slot(
@@ -781,7 +829,7 @@ impl DurabilityGate {
                 shutdown,
                 #[cfg(feature = "tick-to-trade")]
                 tracker,
-                &mut before_wait,
+                &mut hook,
             ),
         }
     }
@@ -797,18 +845,17 @@ impl DurabilityGate {
         &mut self,
         shutdown: &AtomicBool,
         #[cfg(feature = "tick-to-trade")] tracker: &mut GateCrossTracker,
-        before_wait: &mut Option<impl FnOnce()>,
+        hook: &mut Hook<'_, impl GateWait>,
     ) -> GateOutcome {
         while let Some(&pending) = self.pending.front() {
             if pending.wire_seq.get() > self.cached_durable_pos {
-                if let Some(before_wait) = before_wait.take() {
-                    before_wait();
-                }
+                hook.starting();
                 match self.wait_durable(
                     pending.wire_seq.get(),
                     shutdown,
                     #[cfg(feature = "tick-to-trade")]
                     tracker,
+                    hook.hook,
                 ) {
                     GateOutcome::Shutdown => return GateOutcome::Shutdown,
                     GateOutcome::Open(Backing::PrimaryOnly) => {
@@ -843,7 +890,7 @@ impl DurabilityGate {
         mut backing: Backing,
         shutdown: &AtomicBool,
         #[cfg(feature = "tick-to-trade")] tracker: &mut GateCrossTracker,
-        before_wait: &mut Option<impl FnOnce()>,
+        hook: &mut Hook<'_, impl GateWait>,
     ) -> Admission {
         let change = match slot.payload {
             OutputPayload::AckPolicyChange(change) => Some(change),
@@ -852,14 +899,13 @@ impl DurabilityGate {
             | OutputPayload::BatchEnd => None,
         };
         if slot_needs_gate(slot, self.cached_durable_pos) {
-            if let Some(before_wait) = before_wait.take() {
-                before_wait();
-            }
+            hook.starting();
             match self.wait_durable(
                 slot.wire_seq,
                 shutdown,
                 #[cfg(feature = "tick-to-trade")]
                 tracker,
+                hook.hook,
             ) {
                 GateOutcome::Shutdown => return Admission::Shutdown,
                 GateOutcome::Open(released) => backing = backing.min(released),
@@ -933,12 +979,16 @@ impl DurabilityGate {
     /// shutdown sequence joins it without a timeout — an operator
     /// restarting the degraded node, or a fence (which co-sets
     /// `shutdown`), would hang the process.
+    ///
+    /// `hook`'s `while_waiting` runs on each idle turn, just before the
+    /// waiter idles.
     #[inline]
     fn wait_durable(
         &mut self,
         needed: u64,
         shutdown: &AtomicBool,
         #[cfg(feature = "tick-to-trade")] tracker: &mut GateCrossTracker,
+        hook: &mut impl GateWait,
     ) -> GateOutcome {
         let mut gate_waiter = self.inputs.wait.waiter();
         loop {
@@ -1041,6 +1091,7 @@ impl DurabilityGate {
             if journal_pos.get() >= needed && self.degraded_release_open() {
                 return GateOutcome::Open(Backing::PrimaryOnly);
             }
+            hook.while_waiting();
             gate_waiter.idle();
         }
     }
@@ -1306,6 +1357,40 @@ mod tests {
         }
     }
 
+    /// A gate hook that does nothing.
+    struct NoHook;
+
+    impl GateWait for NoHook {
+        fn before_wait(&mut self) {}
+        fn while_waiting(&mut self) {}
+    }
+
+    /// A gate hook that records its calls, in order, and runs `during` on
+    /// each turn of a wait.
+    struct Recording<F: FnMut()> {
+        calls: Vec<&'static str>,
+        during: F,
+    }
+
+    impl<F: FnMut()> Recording<F> {
+        fn new(during: F) -> Self {
+            Self {
+                calls: Vec::new(),
+                during,
+            }
+        }
+    }
+
+    impl<F: FnMut()> GateWait for Recording<F> {
+        fn before_wait(&mut self) {
+            self.calls.push("before");
+        }
+        fn while_waiting(&mut self) {
+            self.calls.push("during");
+            (self.during)();
+        }
+    }
+
     fn admit(
         gate: &mut DurabilityGate,
         slot: &OutputSlot<u8, u8>,
@@ -1318,7 +1403,7 @@ mod tests {
             shutdown,
             #[cfg(feature = "tick-to-trade")]
             &mut tracker,
-            || {},
+            &mut NoHook,
         )
     }
 
@@ -1403,6 +1488,7 @@ mod tests {
             shutdown,
             #[cfg(feature = "tick-to-trade")]
             &mut tracker,
+            &mut NoHook,
         )
     }
 
@@ -2328,15 +2414,15 @@ mod tests {
             NO_GRACE,
         );
         let shutdown = AtomicBool::new(false);
-        let mut waits = 0;
-        let mut before_wait = Some(|| waits += 1);
+        let mut recording = Recording::new(|| {});
+        let mut hook = Hook::new(&mut recording);
         #[cfg(feature = "tick-to-trade")]
         let mut tracker = GateCrossTracker::new(5);
         let backing = match p.gate.admit_pending(
             &shutdown,
             #[cfg(feature = "tick-to-trade")]
             &mut tracker,
-            &mut before_wait,
+            &mut hook,
         ) {
             GateOutcome::Open(backing) => backing,
             GateOutcome::Shutdown => panic!("no shutdown was requested"),
@@ -2351,7 +2437,7 @@ mod tests {
             &shutdown,
             #[cfg(feature = "tick-to-trade")]
             &mut tracker,
-            &mut before_wait,
+            &mut hook,
         );
         assert_eq!(
             admitted,
@@ -2367,7 +2453,12 @@ mod tests {
         );
         assert_eq!(p.gate.active_policy, AckPolicy::DiskAndRam, "not applied");
         assert_eq!(p.gate.pending.len(), 1);
-        assert_eq!(waits, 1, "the flush hook ran once, before the first wait");
+        assert_eq!(
+            recording.calls.iter().filter(|&&c| c == "before").count(),
+            1,
+            "the flush hook ran once, before the first wait"
+        );
+        assert_eq!(recording.calls.first(), Some(&"before"));
 
         p.journal_at(6);
         p.replica_streams(6);
@@ -2558,36 +2649,69 @@ mod tests {
         assert_eq!(degraded_nanos(&g), 0, "no re-seed on an unknown byte");
     }
 
-    /// The flush hook runs only for a slot that has to wait.
+    /// Admit `reply(wire_seq)` through a [`Recording`] hook whose
+    /// `while_waiting` runs `during`, and return the hook's calls.
+    fn admit_recorded(
+        g: &mut DurabilityGate,
+        wire_seq: u64,
+        during: impl FnMut(),
+    ) -> Vec<&'static str> {
+        let shutdown = AtomicBool::new(false);
+        let mut hook = Recording::new(during);
+        #[cfg(feature = "tick-to-trade")]
+        let mut tracker = GateCrossTracker::new(wire_seq);
+        let outcome = g.admit(
+            &reply(wire_seq),
+            &shutdown,
+            #[cfg(feature = "tick-to-trade")]
+            &mut tracker,
+            &mut hook,
+        );
+        assert_eq!(
+            outcome,
+            Admission::Reply {
+                connection_id: 0,
+                backing: Backing::Policy
+            }
+        );
+        hook.calls
+    }
+
+    /// The flush hook runs only for a slot that has to wait, once, and
+    /// before anything else the hook is asked to do.
     #[test]
     fn before_wait_runs_only_when_the_slot_waits() {
         let mut g = gate(AckPolicy::Disk, 5);
-        let shutdown = AtomicBool::new(false);
-        for (wire_seq, waits) in [(5, false), (6, true)] {
-            let mut ran = false;
-            if waits {
-                // Durable while the hook runs, so the wait opens at once.
-                let journal = g.inputs.journal_persisted_wire_seq.clone();
-                journal.store(WireSeq::new(wire_seq));
+        assert!(
+            admit_recorded(&mut g, 5, || {}).is_empty(),
+            "slot 5 is durable: no hook at all"
+        );
+        // Durable while the hook runs, so the wait opens at once, before
+        // any idle turn.
+        g.inputs.journal_persisted_wire_seq.store(WireSeq::new(6));
+        assert_eq!(admit_recorded(&mut g, 6, || {}), ["before"]);
+    }
+
+    /// `while_waiting` runs on the wait's idle turns, after `before_wait`,
+    /// until the slot is durable, and never for a slot that does not wait.
+    #[test]
+    fn while_waiting_runs_during_a_wait_and_never_on_a_slot_that_does_not_wait() {
+        let mut g = gate(AckPolicy::Disk, 5);
+        let journal = g.inputs.journal_persisted_wire_seq.clone();
+        let mut turns = 0;
+        // The journal reaches the slot on the third turn of the wait.
+        let calls = admit_recorded(&mut g, 6, || {
+            turns += 1;
+            if turns == 3 {
+                journal.store(WireSeq::new(6));
             }
-            #[cfg(feature = "tick-to-trade")]
-            let mut tracker = GateCrossTracker::new(wire_seq);
-            let outcome = g.admit(
-                &reply(wire_seq),
-                &shutdown,
-                #[cfg(feature = "tick-to-trade")]
-                &mut tracker,
-                || ran = true,
-            );
-            assert_eq!(
-                outcome,
-                Admission::Reply {
-                    connection_id: 0,
-                    backing: Backing::Policy
-                }
-            );
-            assert_eq!(ran, waits, "slot {wire_seq}");
-        }
+        });
+        assert_eq!(calls, ["before", "during", "during", "during"]);
+
+        assert!(
+            admit_recorded(&mut g, 6, || panic!("slot 6 is durable now")).is_empty(),
+            "a slot that does not wait runs no hook"
+        );
     }
 
     #[test]

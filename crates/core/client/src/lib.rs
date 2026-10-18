@@ -1261,6 +1261,11 @@ mod tests {
         /// End every request's batch under an ID one past the request's:
         /// an answer for a request the client never sent.
         WrongId,
+        /// Take requests in pairs and answer the second first, with the
+        /// answer [`early_answer`] gives its body, then the first as by
+        /// `Echo`: a node answering a request it did not accept ahead of
+        /// one the ack policy holds (determinism-audit finding 18).
+        Overtaking,
         /// Close the connection once authenticated.
         Hangup,
         /// The admin listener's shape: one text line in, `OK` out.
@@ -1273,6 +1278,36 @@ mod tests {
     pub(crate) const REFUSE: &[u8] = b"refuse me";
     /// The reason [`Behaviour::Judging`] refuses with.
     pub(crate) const REASON: &str = "auditor role may not notarize";
+    /// The body [`early_answer`] answers as a filtered request: an empty
+    /// batch.
+    pub(crate) const FILTER: &[u8] = b"filter me";
+    /// The body [`early_answer`] answers as a halt rejection: the
+    /// application's report, [`REJECTION`], then the batch end.
+    pub(crate) const REJECT: &[u8] = b"reject me";
+    /// The report a halt rejection carries.
+    pub(crate) const REJECTION: &[u8] = b"rejected: no replica";
+
+    /// What a node sends for request `id` it does not accept, by its
+    /// body: [`SHED`] is answered `ServerBusy`, [`REFUSE`] is refused with
+    /// [`REASON`], [`FILTER`] gets an empty batch and [`REJECT`] the
+    /// rejection's report and batch end. `None` for any other body.
+    pub(crate) fn early_answer(id: RequestId, body: &[u8]) -> Option<Vec<u8>> {
+        Some(match body {
+            SHED => control(TransportResponse::ServerBusy { id }),
+            REFUSE => control(TransportResponse::Refused {
+                id,
+                kind: RefusalKind::PermissionDenied,
+                reason: REASON,
+            }),
+            FILTER => control(TransportResponse::BatchEnd { id }),
+            REJECT => [
+                app_frame(REJECTION),
+                control(TransportResponse::BatchEnd { id }),
+            ]
+            .concat(),
+            _ => return None,
+        })
+    }
 
     pub(crate) fn control(response: TransportResponse) -> Vec<u8> {
         let mut buf = [0u8; MAX_CONTROL_FRAME_LEN];
@@ -1381,17 +1416,25 @@ mod tests {
                     control(TransportResponse::BatchEnd { id }),
                 ]
                 .concat(),
-                Behaviour::Judging if body == SHED => control(TransportResponse::ServerBusy { id }),
-                Behaviour::Judging if body == REFUSE => control(TransportResponse::Refused {
-                    id,
-                    kind: RefusalKind::PermissionDenied,
-                    reason: REASON,
+                Behaviour::Judging => early_answer(id, &body).unwrap_or_else(|| {
+                    [
+                        app_frame(&body),
+                        control(TransportResponse::BatchEnd { id }),
+                    ]
+                    .concat()
                 }),
-                Behaviour::Judging => [
-                    app_frame(&body),
-                    control(TransportResponse::BatchEnd { id }),
-                ]
-                .concat(),
+                Behaviour::Overtaking => {
+                    let Ok(Some(second)) = reader.read_frame() else {
+                        return;
+                    };
+                    let (second_id, second_body) = split_request(second).expect("a request frame");
+                    [
+                        early_answer(second_id, second_body).expect("an early answer's body"),
+                        app_frame(&body),
+                        control(TransportResponse::BatchEnd { id }),
+                    ]
+                    .concat()
+                }
                 Behaviour::WrongId => [
                     app_frame(&body),
                     control(TransportResponse::BatchEnd {
@@ -1689,6 +1732,85 @@ mod tests {
             session.request_one(b"after a refusal").unwrap(),
             b"after a refusal"
         );
+    }
+
+    /// Finding 18 at the client, against a [`Behaviour::Overtaking`] node:
+    /// each kind of answer a node gives a request it did not accept — a
+    /// busy, a refusal, a filtered request's empty batch, a halt
+    /// rejection's report and batch end — arriving for W2 ahead of the
+    /// reply to W1, sent before it, is paired with W2 and leaves W1 owed;
+    /// W1's own batch then settles W1 (were W1 already settled, its batch
+    /// end would be an answer for a request not outstanding). `owed` is
+    /// how many requests `session` counts outstanding.
+    pub(crate) fn assert_an_early_answer_is_paired_with_its_own_request<S: polled::Session>(
+        session: &mut S,
+        owed: impl Fn(&S) -> usize,
+    ) {
+        for body in [SHED, REFUSE, FILTER, REJECT] {
+            let w1 = session.send(b"held write").unwrap();
+            let w2 = session.send(body).unwrap();
+            let early: Vec<String> = match body {
+                REJECT => vec![
+                    format!("{:?}", session.next_frame().unwrap()),
+                    format!("{:?}", session.next_frame().unwrap()),
+                ],
+                _ => vec![format!("{:?}", session.next_frame().unwrap())],
+            };
+            let expected: Vec<String> = match body {
+                SHED => vec![format!("{:?}", Frame::ServerBusy { id: w2 })],
+                REFUSE => vec![format!(
+                    "{:?}",
+                    Frame::Refused {
+                        id: w2,
+                        kind: RefusalKind::PermissionDenied,
+                        reason: REASON
+                    }
+                )],
+                FILTER => vec![format!(
+                    "{:?}",
+                    Frame::BatchEnd {
+                        id: w2,
+                        ack: Ack::Policy
+                    }
+                )],
+                _ => vec![
+                    format!("{:?}", Frame::Response(REJECTION)),
+                    format!(
+                        "{:?}",
+                        Frame::BatchEnd {
+                            id: w2,
+                            ack: Ack::Policy
+                        }
+                    ),
+                ],
+            };
+            assert_eq!(early, expected, "{}", String::from_utf8_lossy(body));
+            assert_eq!(owed(session), 1, "W1 still owed");
+            assert_eq!(
+                session.next_frame().unwrap(),
+                Frame::Response(b"held write")
+            );
+            assert_eq!(
+                session.next_frame().unwrap(),
+                Frame::BatchEnd {
+                    id: w1,
+                    ack: Ack::Policy
+                },
+                "{}: W1's own batch settles W1",
+                String::from_utf8_lossy(body)
+            );
+            assert_eq!(owed(session), 0, "every request settled once");
+        }
+    }
+
+    #[test]
+    fn an_early_answer_is_paired_with_its_own_request() {
+        let key = client_key();
+        let addr = fake_node(key.verifying_key(), Behaviour::Overtaking);
+        let mut node = Connection::connect(addr, &key).unwrap();
+        assert_an_early_answer_is_paired_with_its_own_request(&mut node, |node| {
+            node.outstanding.len()
+        });
     }
 
     /// An answer for another request is a protocol error from the

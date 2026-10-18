@@ -65,16 +65,21 @@ pub(crate) enum FrameAction {
 /// Compacts `parse_buf` on return.
 ///
 /// Every request the reader does not publish is answered through
-/// `early_replies`, stamped with the input sequence it would have taken
-/// and its ID (see [`crate::halt`]): a filtered request with an empty
-/// batch, a refused one with the decoder's reason, a write refused while
-/// `halt` refuses writes with the application's rejection (queries are
-/// published either way), and the request that finds the input ring full
-/// with `ServerBusy`, after which processing stops for this call. The halt
-/// is sampled once per call, so one receive is judged as a whole, and the
-/// writes it refused are counted into `halt` once, at the end. On a
-/// superseded node nothing is read: the call returns
+/// `early_replies`, under its ID (see [`crate::halt`]): a filtered request
+/// with an empty batch, a refused one with the decoder's reason, a write
+/// refused while `halt` refuses writes with the application's rejection
+/// (queries are published either way), and the request that finds the
+/// input ring full with `ServerBusy`, after which processing stops for
+/// this call. The halt is sampled once per call, so one receive is judged
+/// as a whole, and the writes it refused are counted into `halt` once, at
+/// the end. On a superseded node nothing is read: the call returns
 /// [`FrameAction::Disconnect`] before the first frame.
+///
+/// Every early reply the call queues is visible to the response stage by
+/// the time it returns, whatever it returns: the queue is flushed once on
+/// the way out, around every return path. An early reply waits for
+/// nothing published, so where that flush falls relative to the input
+/// ring's commits does not matter.
 ///
 /// A full early-reply queue closes the connection whose answer has
 /// nowhere to go ([`FrameAction::Disconnect`]).
@@ -89,6 +94,47 @@ pub(crate) enum FrameAction {
 /// when `latency-trace` is disabled.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn process_client_frames<A: Application>(
+    parse_buf: &mut Vec<u8>,
+    connection_id: u64,
+    key_hash: u64,
+    role: ClientRole<RoleId>,
+    producer: &mut ring::Producer<InputSlot<A::Event>>,
+    decoder: &dyn ErasedDecoder<A::Event>,
+    halt: &HaltGate,
+    early_replies: &mut EarlyReplySender<A::Report>,
+    batch_wall_ns: u64,
+    recv_ts: MonoTraceInstant,
+    #[cfg(feature = "latency-trace")] publish_rec: &mut melin_transport_core::trace::StageRecorder,
+    #[cfg(feature = "tick-to-trade")] ingest_rec: &mut melin_transport_core::trace::StageRecorder,
+) -> FrameAction {
+    let action = process_frames_unflushed::<A>(
+        parse_buf,
+        connection_id,
+        key_hash,
+        role,
+        producer,
+        decoder,
+        halt,
+        early_replies,
+        batch_wall_ns,
+        recv_ts,
+        #[cfg(feature = "latency-trace")]
+        publish_rec,
+        #[cfg(feature = "tick-to-trade")]
+        ingest_rec,
+    );
+    // The one flush of the early replies the call staged, whatever the
+    // outcome: here, outside the body, so no return path inside it can
+    // leave a reply staged and unseen.
+    early_replies.flush();
+    action
+}
+
+/// [`process_client_frames`] without its closing flush of the early-reply
+/// queue: every reply it queues is only staged.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn process_frames_unflushed<A: Application>(
     parse_buf: &mut Vec<u8>,
     connection_id: u64,
     key_hash: u64,
@@ -196,7 +242,6 @@ pub(crate) fn process_client_frames<A: Application>(
                         ingest_rec,
                     ) {
                         if batch.len() >= COMMIT_EVERY {
-                            early_replies.flush();
                             batch.commit();
                             batch = producer.batch();
                         }
@@ -206,22 +251,14 @@ pub(crate) fn process_client_frames<A: Application>(
                     // parsing stops; the frames behind it wait in
                     // `parse_buf` for the next receive.
                     debug!(connection_id, "input ring full, shedding request");
-                    let input_seq = batch.next_sequence();
-                    if !queue_early(
-                        early_replies,
-                        connection_id,
-                        request_id,
-                        input_seq,
-                        EarlyKind::Busy,
-                    ) {
+                    if !queue_early(early_replies, connection_id, request_id, EarlyKind::Busy) {
                         result = FrameAction::Disconnect;
                     }
                     break;
                 }
             },
         };
-        let input_seq = batch.next_sequence();
-        if !queue_early(early_replies, connection_id, request_id, input_seq, early) {
+        if !queue_early(early_replies, connection_id, request_id, early) {
             result = FrameAction::Disconnect;
             break;
         }
@@ -233,11 +270,6 @@ pub(crate) fn process_client_frames<A: Application>(
         }
     }
 
-    // Early replies become visible before the events published after
-    // them, at every commit. The other way round, the response stage
-    // could answer such an event before it sees the early reply that came
-    // first, and send the two replies out of order.
-    early_replies.flush();
     batch.commit();
 
     if refused > 0 {
@@ -254,22 +286,19 @@ pub(crate) fn process_client_frames<A: Application>(
     result
 }
 
-/// Queue the early reply `kind` for request `request_id`, stamped with
-/// `input_seq`, the input sequence it would have taken. `false` when the
+/// Stage the early reply `kind` for request `request_id`. `false` when the
 /// queue is full: the caller closes the connection, since the answer has
 /// nowhere to go.
 fn queue_early<R: Copy>(
     early_replies: &mut EarlyReplySender<R>,
     connection_id: u64,
     request_id: RequestId,
-    input_seq: u64,
     kind: EarlyKind<R>,
 ) -> bool {
     let queued = early_replies
         .try_send(EarlyReply {
             connection_id,
             request_id,
-            input_seq,
             kind,
         })
         .is_ok();

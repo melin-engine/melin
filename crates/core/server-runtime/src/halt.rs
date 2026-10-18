@@ -62,23 +62,27 @@
 //! DPDK poll thread) that decided them, and every one names its request's
 //! ID.
 //!
-//! # Delivered in order
+//! # Released between replies, in no order
 //!
-//! An early reply waits for the replies to the requests published before
-//! it. The reader stamps it with the input-ring sequence the request would
-//! have taken, and the response stage sends it once every event published
-//! before that sequence has been answered ([`EarlyReplyQueue::release`]).
-//! The reader makes each early reply visible before it commits anything
-//! published after it, so the response stage cannot reach a later event
-//! without seeing the early reply first.
+//! Every final frame names its request, so an early reply does not wait
+//! for the replies to requests sent before it: a refusal goes out while
+//! a write ahead of it is still held by the ack policy. The one rule left
+//! is that it never splits another request's reply, so the response stage
+//! sends early replies only between two events' replies, which a
+//! `BatchBoundary` tracker vouches for with an `AtBoundary` token (both
+//! crate-internal, in `batch_boundary.rs`).
 //!
-//! The response stage works from a snapshot of the queue, taken once per
-//! iteration between reading the output ring and draining its control
-//! channel ([`EarlyReplyQueue::sync`]). Before the drain, because an
-//! early reply must never reach the stage ahead of its connection's
-//! registration; after the read, because that is when every early reply
-//! due before an event in the batch is already visible. One snapshot per
-//! iteration is also all the steady state pays: no poll per event.
+//! The response stage works from a snapshot of the queue: it takes one,
+//! then drains its control channel, and only then sends what the snapshot
+//! holds (`EarlyReplyQueue::register`). In that order because an early
+//! reply must never reach the stage ahead of its connection's
+//! registration: the reader answers a connection only once its
+//! `Connected` is queued, so a snapshot taken before the drain holds no
+//! reply for a connection the drain does not register. The stage takes a
+//! snapshot once per iteration, after reading the output ring, and again
+//! on each turn of a wait on the durability gate that holds an event's
+//! first slot. One per iteration is all the steady state pays: no poll per
+//! event.
 //!
 //! # Counted
 //!
@@ -92,7 +96,6 @@ use std::time::Duration;
 
 use melin_app::RejectReason;
 use melin_journal::AckPolicyChange;
-use melin_pipeline::padding::Sequence;
 use melin_pipeline::spsc;
 use melin_pipeline::wait::WaitStrategy;
 use melin_transport_core::fence::FenceState;
@@ -101,17 +104,19 @@ use melin_transport_core::replica_presence::{Observed, ReplicaPresence};
 use melin_wire_protocol::control::RefusalKind;
 
 use crate::ack_policy::AckPolicy;
+use crate::batch_boundary::AtBoundary;
 use crate::policy_control::{Origin, is_unwitnessed};
 
-/// Early replies the response stage can hold before a reader can queue no
-/// more.
+/// Early replies in flight from a reader to the response stage before the
+/// reader can queue no more.
 ///
-/// Early replies queue while the response stage is held up behind a reply
-/// the ack policy has not released, so this bounds memory then rather than
-/// sizing a steady-state flow. Past it the reader closes the connection
-/// whose answer has nowhere to go. A power of two, as the ring requires;
-/// each entry is the application's rejection, or a refusal's reason, plus
-/// a few words.
+/// The response stage drains the queue between every two events' replies,
+/// and while the ack policy holds an event's first slot, so it fills only
+/// if the stage stops draining (an event whose slots it is waiting on, or
+/// a stage that is not running), not because a write is held. Past it the
+/// reader closes the connection whose answer has nowhere to go. A power of
+/// two, as the ring requires; each entry is the application's rejection,
+/// or a refusal's reason, plus a few words.
 pub(crate) const EARLY_REPLY_QUEUE_CAPACITY: usize = 4096;
 
 /// What the response stage needs to answer a halted node's held replies
@@ -121,8 +126,9 @@ pub(crate) const EARLY_REPLY_QUEUE_CAPACITY: usize = 4096;
 /// tells the client only the primary's disk backs it.
 ///
 /// `None` where a stage takes one is the operator switch off
-/// (`--no-degraded-acks`): every held reply, and every refusal and query
-/// queued behind one, waits for a replica or a policy swap. A standalone
+/// (`--no-degraded-acks`): every held reply, and every reply queued behind
+/// one, waits for a replica or a policy swap (a refusal does not: it is an
+/// early reply, see the module docs). A standalone
 /// node never halts and takes `None` too.
 pub struct DegradedRelease {
     /// The node's replica presence: whether a replica is streaming, and
@@ -396,9 +402,6 @@ pub struct EarlyReply<R> {
     pub connection_id: u64,
     /// The client's ID for the request, echoed on the reply's final frame.
     pub request_id: RequestId,
-    /// Input-ring sequence the request would have taken: every event
-    /// published before it has a lower one.
-    pub input_seq: u64,
     /// What the answer is.
     pub kind: EarlyKind<R>,
 }
@@ -424,13 +427,7 @@ pub enum EarlyKind<R> {
 
 /// Creates the queue a reader hands early replies to the response stage
 /// through.
-///
-/// `matching_progress` is the matching stage's consumer progress on the
-/// input ring, which tells an idle response stage that everything
-/// published before an early reply has been answered.
-pub fn early_reply_channel<R: Copy>(
-    matching_progress: Arc<Sequence>,
-) -> (EarlyReplySender<R>, EarlyReplyQueue<R>) {
+pub fn early_reply_channel<R: Copy>() -> (EarlyReplySender<R>, EarlyReplyQueue<R>) {
     // `Option` because the ring wants `Default` slots and an application's
     // report need not have one. The wait strategy is unused: the reader
     // never blocks on this queue (see `EarlyReplySender::try_send`).
@@ -438,14 +435,7 @@ pub fn early_reply_channel<R: Copy>(
         EARLY_REPLY_QUEUE_CAPACITY,
         WaitStrategy::SpinThenYield,
     );
-    (
-        EarlyReplySender { tx },
-        EarlyReplyQueue {
-            rx,
-            head: None,
-            matching_progress,
-        },
-    )
+    (EarlyReplySender { tx }, EarlyReplyQueue { rx })
 }
 
 /// The reader's end of the early-reply queue.
@@ -463,10 +453,11 @@ impl<R: Copy> EarlyReplySender<R> {
             .map(|_| ())
     }
 
-    /// Make every queued early reply visible to the response stage. Call
-    /// before committing the input-ring entries published after them: the
-    /// response stage relies on an early reply being visible by the time
-    /// it handles any event that came later.
+    /// Make every queued early reply visible to the response stage. The
+    /// reader calls it once on every way out of processing a receive
+    /// (`process_client_frames`), so no reply it decided is left unseen;
+    /// where that falls relative to the input ring's commit does not
+    /// matter, since an early reply waits for nothing published.
     pub(crate) fn flush(&mut self) {
         self.tx.flush();
     }
@@ -474,77 +465,74 @@ impl<R: Copy> EarlyReplySender<R> {
 
 /// The response stage's end of the early-reply queue.
 ///
-/// Everything here works on the early replies taken in by the last
-/// [`sync`](Self::sync); those made visible since wait for the next one.
-/// A stage iteration goes:
-///
-/// 1. [`idle_bound`](Self::idle_bound), then read the output ring;
-/// 2. [`sync`](Self::sync), then drain the control channel;
-/// 3. [`release`](Self::release) — with the idle bound if the read came
-///    back empty, else before the first slot of each event in the batch.
+/// Public only so it can be handed to a response stage: it has no method
+/// outside the crate, so nothing else can read it. Read only through the
+/// crate's `register`, which takes a snapshot of
+/// what the reader has made visible and then drains the stage's control
+/// channel, and hands back the token that sends the snapshot's replies.
+/// Those made visible since wait for the next snapshot.
 pub struct EarlyReplyQueue<R> {
     rx: spsc::Consumer<Option<EarlyReply<R>>>,
-    /// The oldest synced early reply, taken off the ring but not yet
-    /// released.
-    head: Option<EarlyReply<R>>,
-    matching_progress: Arc<Sequence>,
 }
 
 impl<R: Copy> EarlyReplyQueue<R> {
-    /// The release bound for an iteration whose output read comes back
-    /// empty: the matching stage's progress on the input ring. `None` when
-    /// no synced early reply waits, so the steady state leaves the
-    /// matching stage's counter alone.
+    /// Take a snapshot of the early replies the reader has made visible,
+    /// then run `drain_control`, the stage's drain of its control channel,
+    /// and return the token that sends the snapshot's replies. One load of
+    /// the queue's cursor.
     ///
-    /// Must be taken *before* the read. Every event below the progress had
-    /// all its output slots published before the progress moved, so a read
-    /// that finds the ring empty afterwards has seen all of them.
-    #[inline]
-    pub fn idle_bound(&mut self) -> Option<u64> {
-        self.peek()?;
-        Some(self.matching_progress.get().load(Ordering::Acquire))
-    }
-
-    /// Take in the early replies the reader has made visible so far, and
-    /// report whether any waits. One load of the queue's cursor.
-    ///
-    /// Call after reading the output ring, so that every early reply due
-    /// before an event in that batch is taken in, and before draining the
-    /// control channel, so that every early reply taken in belongs to a
+    /// The one place the two happen, in that order, so a reply sent
+    /// through the token always finds its connection registered: the
+    /// reader answers a connection only once its `Connected` is queued,
+    /// so every reply in a snapshot taken before the drain belongs to a
     /// connection the drain registers.
     #[inline]
-    pub fn sync(&mut self) -> bool {
-        self.rx.refresh();
-        self.peek().is_some()
+    pub(crate) fn register(&mut self, drain_control: impl FnOnce()) -> Registered<'_, R> {
+        let mut registered = Registered { queue: self };
+        registered.reregister(drain_control);
+        registered
     }
+}
 
-    /// Hand `emit` every synced early reply whose request came before
-    /// `bound`, oldest first.
-    ///
-    /// Call with the input sequence of an output slot before handling the
-    /// first slot of that event — everything published before it has been
-    /// answered — or with [`idle_bound`](Self::idle_bound) when the output
-    /// ring is empty. Never between two slots of one event: the early
-    /// reply would split that event's reply.
+/// A snapshot of the early-reply queue taken before the response stage's
+/// control channel was drained (see [`EarlyReplyQueue::register`]), and so
+/// the right to send what it holds. Borrows the queue: nothing reads it
+/// past the token's back.
+pub(crate) struct Registered<'q, R> {
+    queue: &'q mut EarlyReplyQueue<R>,
+}
+
+impl<R: Copy> Registered<'_, R> {
+    /// Take a fresh snapshot, then run `drain_control`, as
+    /// [`EarlyReplyQueue::register`] does: for a stage that keeps the token
+    /// across a wait (on the durability gate) and wants what the reader
+    /// decided meanwhile.
     #[inline]
-    pub fn release(&mut self, bound: u64, mut emit: impl FnMut(EarlyReply<R>)) {
-        while let Some(reply) = self.peek() {
-            if reply.input_seq > bound {
-                return;
-            }
-            self.head = None;
-            emit(reply);
-        }
+    pub(crate) fn reregister(&mut self, drain_control: impl FnOnce()) {
+        self.queue.rx.refresh();
+        drain_control();
     }
 
-    /// The oldest synced early reply. Never reads the queue's cursor, so
-    /// it cannot see past the last [`sync`](Self::sync).
-    fn peek(&mut self) -> Option<EarlyReply<R>> {
-        if self.head.is_none() {
-            // Only `try_send` writes the ring, and it never writes `None`.
-            self.head = self.rx.try_consume_visible().and_then(|(_, reply)| reply);
+    /// Hand `emit` every early reply in the snapshot, oldest first, and
+    /// return how many.
+    ///
+    /// `AtBoundary` is the stage's word that it is between two events'
+    /// replies: an early reply sent anywhere else would split one.
+    #[inline]
+    pub(crate) fn drain(
+        &mut self,
+        _between_events: &AtBoundary<'_>,
+        mut emit: impl FnMut(EarlyReply<R>),
+    ) -> usize {
+        let mut sent = 0;
+        // Only `try_send` writes the ring, and it never writes `None`.
+        // `try_consume_visible` never reads the queue's cursor, so this
+        // cannot see past the snapshot.
+        while let Some((_, Some(reply))) = self.queue.rx.try_consume_visible() {
+            emit(reply);
+            sent += 1;
         }
-        self.head
+        sent
     }
 }
 
@@ -579,21 +567,29 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use melin_pipeline::padding::CachePadded;
+    use crate::batch_boundary::BatchBoundary;
     use melin_transport_core::replica_presence::Lowered;
     use std::sync::atomic::AtomicBool;
 
-    fn progress(value: u64) -> Arc<Sequence> {
-        Arc::new(CachePadded::new(AtomicU64::new(value)))
-    }
-
-    fn refusal(connection_id: u64, input_seq: u64) -> EarlyReply<u64> {
+    fn refusal(connection_id: u64) -> EarlyReply<u64> {
         EarlyReply {
             connection_id,
             request_id: RequestId(connection_id * 10),
-            input_seq,
             kind: EarlyKind::Rejected(connection_id * 100),
         }
+    }
+
+    /// Every early reply `registered` holds, by connection, drained
+    /// between two events.
+    fn drained(registered: &mut Registered<'_, u64>) -> Vec<u64> {
+        let boundary = BatchBoundary::new();
+        let at = boundary
+            .at_boundary()
+            .expect("a fresh tracker is between events");
+        let mut out = Vec::new();
+        let count = registered.drain(&at, |reply| out.push(reply.connection_id));
+        assert_eq!(count, out.len(), "the count is of what was handed over");
+        out
     }
 
     fn gate(replicas_connected: Option<Arc<ReplicaPresence>>, fence: Arc<FenceState>) -> HaltGate {
@@ -854,87 +850,92 @@ mod tests {
         assert_eq!(refused.load(Ordering::Relaxed), 5);
     }
 
+    /// A reply is seen only once the reader has flushed it and a snapshot
+    /// has been taken since; a snapshot drained is not drained twice.
     #[test]
-    fn a_refusal_waits_for_both_the_flush_and_a_sync() {
-        let (mut tx, mut rx) = early_reply_channel::<u64>(progress(10));
-        tx.try_send(refusal(1, 0)).unwrap();
-        assert!(!rx.sync(), "not flushed");
+    fn a_refusal_waits_for_both_the_flush_and_a_snapshot() {
+        let (mut tx, mut rx) = early_reply_channel::<u64>();
+        tx.try_send(refusal(1)).unwrap();
+        let mut registered = rx.register(|| {});
+        assert!(drained(&mut registered).is_empty(), "not flushed");
 
         tx.flush();
-        assert_eq!(rx.idle_bound(), None, "flushed, not yet synced");
-        let mut released = Vec::new();
-        rx.release(u64::MAX, |r| released.push(r.connection_id));
-        assert!(released.is_empty(), "release sees only synced refusals");
-
-        assert!(rx.sync());
-        assert_eq!(rx.idle_bound(), Some(10));
-    }
-
-    /// The snapshot is what keeps a refusal behind its connection's
-    /// registration: one made visible after the sync — after the stage has
-    /// drained its control channel — waits for the next iteration.
-    #[test]
-    fn release_does_not_reach_past_the_sync() {
-        let (mut tx, mut rx) = early_reply_channel::<u64>(progress(0));
-        tx.try_send(refusal(1, 0)).unwrap();
-        tx.flush();
-        assert!(rx.sync());
-        tx.try_send(refusal(2, 0)).unwrap();
-        tx.flush();
-
-        let mut released = Vec::new();
-        rx.release(u64::MAX, |r| released.push(r.connection_id));
-        assert_eq!(released, [1]);
-
-        assert!(rx.sync());
-        rx.release(u64::MAX, |r| released.push(r.connection_id));
-        assert_eq!(released, [1, 2]);
-        assert!(!rx.sync(), "queue drained");
-    }
-
-    #[test]
-    fn release_stops_at_the_first_refusal_past_the_bound() {
-        let (mut tx, mut rx) = early_reply_channel::<u64>(progress(0));
-        for (conn, seq) in [(1, 3), (2, 3), (3, 5), (4, 9)] {
-            tx.try_send(refusal(conn, seq)).unwrap();
-        }
-        tx.flush();
-        assert!(rx.sync());
-
-        let mut released = Vec::new();
-        rx.release(2, |r| released.push(r.connection_id));
-        assert!(released.is_empty(), "no event before seq 3 is answered yet");
-
-        rx.release(5, |r| released.push(r.connection_id));
-        assert_eq!(
-            released,
-            [1, 2, 3],
-            "in order, up to and including the bound"
+        assert!(
+            drained(&mut registered).is_empty(),
+            "flushed, but after the snapshot"
         );
 
-        rx.release(8, |r| released.push(r.connection_id));
-        assert_eq!(released, [1, 2, 3], "the held head is not re-emitted");
+        registered.reregister(|| {});
+        assert_eq!(drained(&mut registered), [1]);
+        assert!(drained(&mut registered).is_empty(), "drained once");
+        registered.reregister(|| {});
+        assert!(drained(&mut registered).is_empty(), "the queue is empty");
+    }
 
-        rx.release(9, |r| released.push(r.connection_id));
-        assert_eq!(released, [1, 2, 3, 4]);
-        assert!(!rx.sync(), "queue drained");
-        assert_eq!(rx.idle_bound(), None);
+    /// The snapshot is taken before the control channel is drained, so a
+    /// reply made visible during the drain (a reply for a connection whose
+    /// `Connected` the drain may already be past) waits for the next
+    /// snapshot, which a drain follows again. On both ways to take one.
+    #[test]
+    fn a_snapshot_is_taken_before_the_control_drain() {
+        let (mut tx, mut rx) = early_reply_channel::<u64>();
+        tx.try_send(refusal(1)).unwrap();
+        tx.flush();
+        let mut drains = 0;
+        let mut registered = rx.register(|| {
+            drains += 1;
+            tx.try_send(refusal(2)).unwrap();
+            tx.flush();
+        });
+        assert_eq!(drains, 1, "registering drains the control channel once");
+        assert_eq!(drained(&mut registered), [1], "the snapshot predates 2");
+
+        registered.reregister(|| {
+            drains += 1;
+            tx.try_send(refusal(3)).unwrap();
+            tx.flush();
+        });
+        assert_eq!(drains, 2);
+        assert_eq!(drained(&mut registered), [2], "the snapshot predates 3");
+
+        let mut registered = rx.register(|| drains += 1);
+        assert_eq!(drained(&mut registered), [3]);
+        assert_eq!(drains, 3);
     }
 
     #[test]
     fn a_full_queue_is_an_error_not_a_wait() {
-        let (mut tx, _rx) = early_reply_channel::<u64>(progress(0));
-        for seq in 0..EARLY_REPLY_QUEUE_CAPACITY as u64 {
-            tx.try_send(refusal(1, seq)).unwrap();
+        let (mut tx, _rx) = early_reply_channel::<u64>();
+        for _ in 0..EARLY_REPLY_QUEUE_CAPACITY {
+            tx.try_send(refusal(1)).unwrap();
         }
-        assert!(tx.try_send(refusal(1, 0)).is_err());
+        assert!(tx.try_send(refusal(1)).is_err());
+    }
+
+    /// A drained queue has room again: capacity bounds replies in flight,
+    /// not replies over the queue's life.
+    #[test]
+    fn a_drained_queue_takes_more() {
+        let (mut tx, mut rx) = early_reply_channel::<u64>();
+        for round in 0..3u64 {
+            for _ in 0..EARLY_REPLY_QUEUE_CAPACITY {
+                tx.try_send(refusal(round)).unwrap();
+            }
+            tx.flush();
+            let mut registered = rx.register(|| {});
+            assert_eq!(
+                drained(&mut registered).len(),
+                EARLY_REPLY_QUEUE_CAPACITY,
+                "round {round}"
+            );
+        }
     }
 
     /// Every kind of early reply goes through the queue as it was sent,
     /// with its request's ID, in order among the others.
     #[test]
     fn every_kind_travels_with_its_request_id() {
-        let (mut tx, mut rx) = early_reply_channel::<u64>(progress(0));
+        let (mut tx, mut rx) = early_reply_channel::<u64>();
         let kinds = [
             EarlyKind::Rejected(7),
             EarlyKind::Filtered,
@@ -948,15 +949,16 @@ mod tests {
             tx.try_send(EarlyReply {
                 connection_id: 1,
                 request_id: RequestId(100 + n),
-                input_seq: n,
                 kind,
             })
             .unwrap();
         }
         tx.flush();
-        assert!(rx.sync());
+        let boundary = BatchBoundary::new();
+        let at = boundary.at_boundary().expect("between events");
         let mut released = Vec::new();
-        rx.release(u64::MAX, |r| released.push((r.request_id, r.kind)));
+        rx.register(|| {})
+            .drain(&at, |r| released.push((r.request_id, r.kind)));
         assert_eq!(
             released,
             (100..).map(RequestId).zip(kinds).collect::<Vec<_>>()

@@ -1628,6 +1628,17 @@ mod tests {
         assert_judged_by_the_convenience_calls(&mut node);
     }
 
+    /// Twin of `an_early_answer_is_paired_with_its_own_request`.
+    #[test]
+    fn an_early_answer_is_paired_with_its_own_request() {
+        let key = client_key();
+        let addr = fake_node(key.verifying_key(), Behaviour::Overtaking);
+        let mut node = Polled::connect(addr, &key).unwrap();
+        crate::tests::assert_an_early_answer_is_paired_with_its_own_request(&mut node, |node| {
+            node.connection.outstanding.len()
+        });
+    }
+
     /// Twin of `an_answer_for_another_request_is_refused`.
     #[test]
     fn an_answer_for_another_request_is_refused() {

@@ -14,6 +14,7 @@
 
 pub mod ack_policy;
 pub mod admin;
+mod batch_boundary;
 mod buf_ring;
 pub mod client_auth;
 mod client_frames;

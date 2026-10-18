@@ -22,9 +22,10 @@ use melin_pipeline::ring;
 use melin_pipeline::wait::WaitStrategy;
 
 use crate::ack_policy::{Blocker, CursorView, EvalStatus, MAX_CLUSTER_SIZE, Policy};
-use crate::durability_gate::{Admission, Backing, BatchEnds, DurabilityGate, GateInputs};
+use crate::batch_boundary::{AtBoundary, BatchBoundary};
+use crate::durability_gate::{Admission, Backing, BatchEnds, DurabilityGate, GateInputs, GateWait};
 pub use crate::durability_gate::{GatePolicy, GateStart};
-use crate::halt::{EarlyReply, EarlyReplyQueue};
+use crate::halt::{EarlyReply, EarlyReplyQueue, Registered};
 use crate::replication::ReplicationMetrics;
 use melin_app::Application;
 use melin_app::amortized_timer::AmortizedTimer;
@@ -198,9 +199,8 @@ pub struct Response<A: Application> {
     /// The answers the reader decided on without publishing the request:
     /// writes refused while the node was halted, requests the decoder
     /// filtered or refused, requests shed on a full input ring. Each is
-    /// sent once everything published before its request has been
-    /// answered, so a client sees its replies in request order — see
-    /// [`crate::halt`].
+    /// sent at the first point between two events' replies, without
+    /// waiting for replies to earlier requests — see [`crate::halt`].
     pub early_replies: EarlyReplyQueue<A::Report>,
     /// Sizes the stage's io_uring instance. A flush submits at most one
     /// SEND per dirty connection, and the connection table never holds
@@ -262,8 +262,367 @@ struct ConnectionEntry {
     /// rather than set membership: the append path already holds the
     /// entry (and just wrote its `send_buf`), so the dedup test is a
     /// byte in a cache line that is hot, instead of a hash + probe on
-    /// every one of the ~2 frames per request. See `dirty_connections`.
+    /// every one of the ~2 frames per request. See `Egress::dirty`.
     dirty: bool,
+}
+
+/// The stage's connections and everything that sends to them: the
+/// io_uring instance, the connection table, the dirty and drop lists, the
+/// flush cadence, and (traced builds) the samples a flush closes.
+///
+/// One struct because every place that sends needs all of it: the slot
+/// loop, the idle path, the flush before a gate wait, and the early
+/// replies sent during one ([`GateWaitHook`]), which runs inside the gate
+/// while the loop's own locals are borrowed.
+struct Egress {
+    ring: IoUring,
+    /// Connection table: maps connection IDs to their state.
+    ///
+    /// `FxHashMap` rather than std's SipHash-1-3 map: this is looked up
+    /// once per output slot on the hot path, and the keys are
+    /// server-generated monotonic connection ids — a client cannot choose
+    /// them, so the HashDoS resistance SipHash buys is worth nothing here
+    /// while its ~20 ns/lookup is not. Pre-sized for a reasonable number
+    /// of concurrent clients.
+    connections: FxHashMap<u64, ConnectionEntry>,
+    /// Connections with buffered (unflushed) writes, carried across
+    /// batches.
+    ///
+    /// `Vec<u64>` paired with `ConnectionEntry::dirty` rather than a
+    /// `HashSet`: membership is never *queried*, only iterated and
+    /// rebuilt, so the set's only contribution on the hot path was
+    /// deduplicating repeat appends — which the entry flag does with a
+    /// branch instead of a hash. Pre-sized to the connection table.
+    dirty: Vec<u64>,
+    /// Connections to remove: an append that would overflow
+    /// `MAX_SEND_BUF`, or a send error in a flush.
+    to_remove: Vec<u64>,
+    /// Pre-allocated CQE collection buffer. Must collect CQEs before
+    /// processing because the CQ borrow must end before mutating
+    /// connections. Pre-sized to the ring's depth (a flush's most SENDs)
+    /// to avoid per-iteration heap allocation.
+    cqes: Vec<(u64, i32)>,
+    /// Flush triggers for the consumed path, and for a drain of early
+    /// replies. Lives across batches because the regime the age bound
+    /// exists for is a ring that never empties: the byte threshold is per
+    /// connection, so with many low-rate clients no single `send_buf`
+    /// reaches an MSS for milliseconds while the stage encodes
+    /// continuously.
+    cadence: FlushCadence,
+    /// See [`Response::active_connections`]: decremented here, as each
+    /// entry leaves the table.
+    active_connections: Arc<AtomicU64>,
+    /// Server-side end-to-end samples awaiting a flush, tagged with the
+    /// connection whose bytes they measure.
+    ///
+    /// The stage encodes into `send_buf` and hands the bytes to the
+    /// kernel later, so closing the sample at encode time would omit
+    /// every microsecond a response spends buffered — the interval this
+    /// stage most needs to be honest about, since that is exactly where a
+    /// deferred flush hides. Holding each frame's `recv_ts` until the
+    /// flush completes measures reader-recv → kernel, which is what the
+    /// stage name claims and what the DPDK path already records (it
+    /// samples after `tx_producers.flush()`).
+    ///
+    /// The connection id is what lets a connection dropped without a
+    /// flush have its samples thrown away rather than closed — see
+    /// `discard_e2e_samples`. Two rules keep the queue honest, and every
+    /// mutation of `dirty` obeys one of them:
+    ///
+    /// - a clear-by-flush closes the queue (`close_e2e_samples`),
+    /// - a removal-by-drop discards that connection's entries
+    ///   (`discard_e2e_samples`).
+    ///
+    /// Together they give the invariant "queue non-empty implies some
+    /// connection is dirty", which is what makes the flush sites
+    /// sufficient drain points.
+    ///
+    /// `Vec` rather than a per-connection map: entries are appended and
+    /// then walked wholesale, order is irrelevant, and the dropped-
+    /// connection lists they are matched against are almost always empty.
+    /// A flat append is the cheapest thing that does that. Capacity is a
+    /// starting point, not a bound — under saturation the output ring
+    /// never empties, so the queue grows until something forces a flush.
+    ///
+    /// Only compiled under `latency-trace`; production builds carry
+    /// neither the buffer nor the pushes.
+    #[cfg(feature = "latency-trace")]
+    pending_e2e: Vec<(u64, trace::MonoTraceInstant)>,
+    #[cfg(feature = "latency-trace")]
+    server_e2e_rec: trace::StageRecorder,
+    /// One sample per io_uring flush that ships responses, batching many
+    /// slots.
+    #[cfg(feature = "tick-to-trade")]
+    egress_rec: trace::StageRecorder,
+}
+
+impl Egress {
+    /// An empty table over `ring`, whose depth sizes the CQE buffer.
+    fn new(
+        ring: IoUring,
+        ring_entries: u32,
+        active_connections: Arc<AtomicU64>,
+        #[cfg(feature = "latency-trace")] server_e2e_rec: trace::StageRecorder,
+        #[cfg(feature = "tick-to-trade")] egress_rec: trace::StageRecorder,
+    ) -> Self {
+        Self {
+            ring,
+            connections: FxHashMap::with_capacity_and_hasher(256, Default::default()),
+            dirty: Vec::with_capacity(256),
+            to_remove: Vec::new(),
+            cqes: Vec::with_capacity(ring_entries as usize),
+            cadence: FlushCadence::default(),
+            active_connections,
+            #[cfg(feature = "latency-trace")]
+            pending_e2e: Vec::with_capacity(MAX_BATCH),
+            #[cfg(feature = "latency-trace")]
+            server_e2e_rec,
+            #[cfg(feature = "tick-to-trade")]
+            egress_rec,
+        }
+    }
+
+    /// Submit every dirty connection's buffer ([`flush_sends`]) and
+    /// restart the flush cadence. Leaves the flush's failures in
+    /// `to_remove`.
+    fn send_dirty(&mut self) {
+        flush_sends(
+            &mut self.ring,
+            &mut self.connections,
+            &mut self.dirty,
+            &mut self.to_remove,
+            &mut self.cqes,
+        );
+        self.cadence.on_flush();
+    }
+
+    /// Flush every dirty connection now, if any is, closing the queued
+    /// samples against it, and tear down the connections the flush
+    /// failed. The idle path's flush, and the one before a gate wait.
+    ///
+    /// Restarts the cadence even with nothing dirty: the appends it
+    /// counted may all have been to connections dropped since, and a
+    /// cadence left due would make every later slot's
+    /// [`Self::flush_if_due`] run again for nothing.
+    fn flush(&mut self) {
+        if self.dirty.is_empty() {
+            self.cadence.on_flush();
+            return;
+        }
+        #[cfg(feature = "tick-to-trade")]
+        let egress_start = trace::mono_trace_ns();
+        self.send_dirty();
+        #[cfg(feature = "tick-to-trade")]
+        self.egress_rec
+            .record_elapsed(egress_start, trace::mono_trace_ns());
+        #[cfg(feature = "latency-trace")]
+        close_e2e_samples(&mut self.pending_e2e, &mut self.server_e2e_rec);
+        self.teardown_flush_failures();
+    }
+
+    /// Tear down the connections a flush failed. They are off the dirty
+    /// list already (see [`flush_sends`]).
+    fn teardown_flush_failures(&mut self) {
+        for conn_id in self.to_remove.drain(..) {
+            if let Some(entry) = self.connections.remove(&conn_id) {
+                teardown_dropped(entry, &self.active_connections);
+            }
+        }
+    }
+
+    /// Tear down the connections an append overflowed, before anything
+    /// flushes them. This un-dirties a connection without flushing it, so
+    /// its queued samples go too: they measure bytes that will never be
+    /// sent, and would otherwise land on some later, unrelated flush.
+    /// Later slots addressed to them are skipped by the table miss.
+    fn drop_overflowed(&mut self) {
+        #[cfg(feature = "latency-trace")]
+        discard_e2e_samples(&mut self.pending_e2e, &self.to_remove);
+        for conn_id in self.to_remove.drain(..) {
+            if let Some(entry) = self.connections.remove(&conn_id) {
+                teardown_dropped(entry, &self.active_connections);
+            }
+            unmark_dirty(conn_id, &mut self.dirty);
+        }
+    }
+
+    /// The consumed path's flush, run between slots and between released
+    /// early replies alike: when the cadence says one is due, drop the
+    /// overflowed connections, so the flush skips them, and flush.
+    ///
+    /// The still-open half of July-audit finding 4, plus its age bound
+    /// (August audit finding 3). Under sustained load with an open gate
+    /// this is the ONLY flush that runs: the idle path needs an empty
+    /// SPSC, the gate path needs a durability wait, and heartbeats need
+    /// idleness. Without it, delivery on a busy stretch degenerates to
+    /// `MAX_SEND_BUF` evicting the very clients being served — and so
+    /// would a drain of early replies, which can release thousands to one
+    /// connection at once. Trigger-gated so light traffic keeps full
+    /// batching; once a connection holds ~an MSS — or the stage has
+    /// appended `FLUSH_SLOT_INTERVAL` times since the last flush,
+    /// whichever comes first — the extra submit no longer costs wire
+    /// efficiency. MSG_DONTWAIT flushes cannot block, so this adds no
+    /// head-of-line exposure (the hazard that deferred this trigger in
+    /// July). A blocked peer re-arms the flag on its later appends, but
+    /// its paced retry inside `flush_sends` keeps that cheap.
+    #[inline]
+    fn flush_if_due(&mut self) {
+        if !self.cadence.is_due() {
+            return;
+        }
+        self.drop_overflowed();
+        self.flush();
+    }
+
+    /// Drain the control channel: register each new connection, forget
+    /// each closed one.
+    fn drain_control(&mut self, control_rx: &mpsc::Receiver<ControlEvent>) {
+        while let Ok(event) = control_rx.try_recv() {
+            match event {
+                ControlEvent::Connected {
+                    connection_id,
+                    fd,
+                    writer,
+                } => {
+                    // The writer keeps the fd alive — store it as the owner.
+                    let owner: Box<dyn Send> = Box::new(writer);
+                    self.connections.insert(
+                        connection_id,
+                        ConnectionEntry {
+                            fd,
+                            _owner: owner,
+                            send_buf: Vec::with_capacity(4096),
+                            last_send: Instant::now(),
+                            blocked_since: None,
+                            last_send_attempt: Instant::now(),
+                            dirty: false,
+                        },
+                    );
+                }
+                ControlEvent::Disconnected { connection_id } => {
+                    // Reader-initiated teardown: the reader already
+                    // closed its half. Decrement only if the entry was
+                    // actually present — a response-initiated drop
+                    // already removed it (and paid the decrement), and
+                    // this event is its echo.
+                    if self.connections.remove(&connection_id).is_some() {
+                        self.active_connections.fetch_sub(1, Ordering::Relaxed);
+                    }
+                    unmark_dirty(connection_id, &mut self.dirty);
+                    // Anything this connection had buffered goes with
+                    // it, so its queued samples measure bytes that will
+                    // never be sent.
+                    #[cfg(feature = "latency-trace")]
+                    discard_e2e_samples(&mut self.pending_e2e, &[connection_id]);
+                }
+            }
+        }
+    }
+
+    /// Send every early reply `registered` holds, between two events'
+    /// replies (`at`), each appended to its connection's buffer
+    /// ([`append_early_reply`]) with the consumed path's flush cadence
+    /// applied after each one ([`Self::flush_if_due`]): a drain can
+    /// release thousands of replies to one connection, and appending them
+    /// all before a flush would take a client that reads its replies past
+    /// `MAX_SEND_BUF`. Flushing here is allowed because the drain holds
+    /// `at`: no event's reply is half-buffered. Returns how many were
+    /// sent; `now` is read once, and only if there is one.
+    fn release_early_replies<R: Copy, Q: Copy>(
+        &mut self,
+        registered: &mut Registered<'_, R>,
+        at: &AtBoundary<'_>,
+        encoder: &dyn melin_app::encoder::ResponseEncoder<Report = R, Query = Q>,
+        early_buf: &mut EarlyReplyBuf,
+        now: impl Fn() -> Instant,
+    ) -> usize {
+        let mut stamp = None;
+        registered.drain(at, |reply| {
+            let now = *stamp.get_or_insert_with(&now);
+            append_early_reply(
+                reply,
+                encoder,
+                &mut self.connections,
+                early_buf,
+                now,
+                &mut self.dirty,
+                &mut self.to_remove,
+                &mut self.cadence,
+            );
+            self.flush_if_due();
+        })
+    }
+}
+
+/// The io_uring stage's [`GateWait`] hook, built for one slot's admit:
+/// flush what is buffered before the wait, and, if the held slot is the
+/// first of its event (`at_boundary`), send early replies during it —
+/// registering new connections first ([`Registered::reregister`]) — and
+/// flush them. A slot held in the middle of an event sends nothing: an
+/// early reply there would split that event's reply.
+struct GateWaitHook<'a, 'q, R: Copy, Q: Copy> {
+    egress: &'a mut Egress,
+    at_boundary: Option<AtBoundary<'a>>,
+    registered: &'a mut Registered<'q, R>,
+    control_rx: &'a mpsc::Receiver<ControlEvent>,
+    encoder: &'a dyn melin_app::encoder::ResponseEncoder<Report = R, Query = Q>,
+    early_buf: &'a mut EarlyReplyBuf,
+}
+
+impl<R: Copy, Q: Copy> GateWait for GateWaitHook<'_, '_, R, Q> {
+    /// Drain buffered sends before blocking, never after.
+    ///
+    /// The steady-state flush happens on the `count == 0` path — once the
+    /// output ring is empty. That batches many responses behind one
+    /// `io_uring_enter`, which is the right trade on the fast path. But it
+    /// means a response that has already cleared its own durability gate
+    /// stays in `send_buf` while the loop blocks on a later event's gate,
+    /// so a client waits out an fsync + replica round-trip for an event
+    /// whose durability was confirmed before that event was even
+    /// sequenced.
+    ///
+    /// Flushing here costs nothing in latency terms: it only fires when we
+    /// are about to spin on the gate anyway, so the syscall overlaps time
+    /// that would otherwise be dead. Slots whose gate is already satisfied
+    /// fall straight through and keep their batching.
+    ///
+    /// Traced builds only: this delays the tracker's first `observe` by
+    /// the flush duration, so a cursor that crosses mid-flush is
+    /// attributed late (or, if it crosses past `needed`, not attributed at
+    /// all). Bounded by one flush and confined to the tick-to-trade
+    /// breakdown — the gate's own behaviour is unchanged.
+    ///
+    /// The held slot and later ones addressed to a connection the flush
+    /// drops are skipped by the table lookup after the admit, so removing
+    /// here is safe.
+    fn before_wait(&mut self) {
+        self.egress.flush();
+    }
+
+    /// Early replies decided while the gate holds a write — a refusal, a
+    /// busy — go out now rather than behind it. Nothing to do, and no
+    /// clock read, on a turn with none; one cursor load and a control
+    /// channel poll is the cost of a turn.
+    fn while_waiting(&mut self) {
+        let Some(at) = &self.at_boundary else {
+            return;
+        };
+        let egress = &mut *self.egress;
+        let control_rx = self.control_rx;
+        self.registered
+            .reregister(|| egress.drain_control(control_rx));
+        if egress.release_early_replies(
+            self.registered,
+            at,
+            self.encoder,
+            self.early_buf,
+            Instant::now,
+        ) > 0
+        {
+            egress.drop_overflowed();
+            egress.flush();
+        }
+    }
 }
 
 /// Run the io_uring response stage loop. Blocks the calling thread until shutdown.
@@ -310,7 +669,7 @@ pub fn run<A: Application>(
     // Created first, before anything else the stage builds, so a node
     // that cannot have it learns so before the stage touches anything.
     let ring_entries = ring_sizing.ring_entries();
-    let mut ring: IoUring = match IoUring::builder().setup_single_issuer().build(ring_entries) {
+    let ring: IoUring = match IoUring::builder().setup_single_issuer().build(ring_entries) {
         Ok(ring) => ring,
         Err(e) => {
             let err = ring_setup_error("response", ring_entries, e);
@@ -350,17 +709,6 @@ pub fn run<A: Application>(
         "response",
     );
 
-    // Connection table: maps connection IDs to their state.
-    //
-    // `FxHashMap` rather than std's SipHash-1-3 map: this is looked up
-    // once per output slot on the hot path, and the keys are
-    // server-generated monotonic connection ids — a client cannot choose
-    // them, so the HashDoS resistance SipHash buys is worth nothing here
-    // while its ~20 ns/lookup is not. Pre-sized for a reasonable number
-    // of concurrent clients.
-    let mut connections: FxHashMap<u64, ConnectionEntry> =
-        FxHashMap::with_capacity_and_hasher(256, Default::default());
-
     let mut encode_buf: EncodeBuf = [0u8; MAX_APP_FRAME];
     // An early reply's frames, encoded together: off the hot path, but on
     // the stack all the same.
@@ -384,7 +732,7 @@ pub fn run<A: Application>(
     #[cfg(feature = "latency-trace")]
     let mut dispatch_rec = trace::register_stage("response: dispatch (consume → socket write)");
     #[cfg(feature = "latency-trace")]
-    let mut server_e2e_rec = trace::register_stage("server e2e (reader recv → response flush)");
+    let server_e2e_rec = trace::register_stage("server e2e (reader recv → response flush)");
     // Tick-to-trade breakdown: per-slot wait observed for each
     // durability path (recorded only when the gate actually held us
     // up — cache-hit paths skip to avoid inflating the metric with
@@ -404,75 +752,22 @@ pub fn run<A: Application>(
     #[cfg(feature = "tick-to-trade")]
     let mut encode_rec = trace::register_stage("response: encode (per-kind wire encoding)");
     #[cfg(feature = "tick-to-trade")]
-    let mut egress_rec = trace::register_stage("response: egress (flush_sends elapsed)");
+    let egress_rec = trace::register_stage("response: egress (flush_sends elapsed)");
     // Paces the idle-path recorder flush. Without it, every sample this
     // thread recorded stays in its thread-local buffer once traffic
     // stops — which is exactly when the bench scrapes /stats-dump.
     #[cfg(feature = "latency-trace")]
     let mut last_stats_flush = Instant::now();
 
-    // Server-side end-to-end samples awaiting a flush, tagged with the
-    // connection whose bytes they measure.
-    //
-    // The stage encodes into `send_buf` and hands the bytes to the
-    // kernel later, so closing the sample at encode time would omit
-    // every microsecond a response spends buffered — the interval this
-    // stage most needs to be honest about, since that is exactly where a
-    // deferred flush hides. Holding each frame's `recv_ts` until the
-    // flush completes measures reader-recv → kernel, which is what the
-    // stage name claims and what the DPDK path already records (it
-    // samples after `tx_producers.flush()`).
-    //
-    // The connection id is what lets a connection dropped without a
-    // flush have its samples thrown away rather than closed — see
-    // `discard_e2e_samples`. Two rules keep the queue honest, and every
-    // mutation of `dirty_connections` obeys one of them:
-    //
-    // - a clear-by-flush closes the queue (`close_e2e_samples`),
-    // - a removal-by-drop discards that connection's entries
-    //   (`discard_e2e_samples`).
-    //
-    // Together they give the invariant "queue non-empty implies some
-    // connection is dirty", which is what makes the flush sites
-    // sufficient drain points.
-    //
-    // `Vec` rather than a per-connection map: entries are appended and
-    // then walked wholesale, order is irrelevant, and the dropped-
-    // connection lists they are matched against are almost always empty.
-    // A flat append is the cheapest thing that does that. Capacity is a
-    // starting point, not a bound — under saturation the output ring
-    // never empties, so the queue grows until something forces a flush.
-    //
-    // Only compiled under `latency-trace`; production builds carry
-    // neither the buffer nor the pushes.
-    #[cfg(feature = "latency-trace")]
-    let mut pending_e2e: Vec<(u64, trace::MonoTraceInstant)> = Vec::with_capacity(MAX_BATCH);
-
-    // Connections with buffered (unflushed) writes, carried across
-    // batches.
-    //
-    // `Vec<u64>` paired with `ConnectionEntry::dirty` rather than a
-    // `HashSet`: membership is never *queried*, only iterated and
-    // rebuilt, so the set's only contribution on the hot path was
-    // deduplicating repeat appends — which the entry flag does with a
-    // branch instead of a hash. Pre-sized to the connection table.
-    let mut dirty_connections: Vec<u64> = Vec::with_capacity(256);
-
-    // Flush triggers for the consumed path. Lives across batches because
-    // the regime the age bound exists for is a ring that never empties:
-    // the byte threshold is per connection, so with many low-rate
-    // clients no single `send_buf` reaches an MSS for milliseconds while
-    // the stage encodes continuously.
-    let mut flush = FlushCadence::default();
-
-    // Connections to remove after flush (send errors).
-    let mut to_remove: Vec<u64> = Vec::new();
-
-    // Pre-allocated CQE collection buffer. Must collect CQEs before
-    // processing because the CQ borrow must end before mutating connections.
-    // Pre-sized to the ring's depth (a flush's most SENDs) to avoid
-    // per-iteration heap allocation.
-    let mut cqes: Vec<(u64, i32)> = Vec::with_capacity(ring_entries as usize);
+    let mut egress = Egress::new(
+        ring,
+        ring_entries,
+        active_connections,
+        #[cfg(feature = "latency-trace")]
+        server_e2e_rec,
+        #[cfg(feature = "tick-to-trade")]
+        egress_rec,
+    );
 
     // Pre-encode the heartbeat response frame once. Full wire frame
     // (length prefix + tag) for direct append to send_buf.
@@ -507,10 +802,9 @@ pub fn run<A: Application>(
     let mut busy_count: u64 = 0;
     let mut idle_count: u64 = 0;
 
-    // Input sequence of the last output slot handled. Early replies are
-    // released only where it changes — between two events' replies, never
-    // inside one. `u64::MAX` is no event's sequence.
-    let mut last_input_seq = u64::MAX;
+    // Whether the stage stands between two events' replies, the only
+    // place early replies may go: told about every slot handled.
+    let mut boundary = BatchBoundary::new();
 
     'run: loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -525,16 +819,10 @@ pub fn run<A: Application>(
             // reaches and the steady-state loop pays nothing.
             let flush = !fence_state.is_fenced();
             // Best-effort flush before shutdown.
-            if flush && !dirty_connections.is_empty() {
-                flush_sends(
-                    &mut ring,
-                    &mut connections,
-                    &mut dirty_connections,
-                    &mut to_remove,
-                    &mut cqes,
-                );
+            if flush && !egress.dirty.is_empty() {
+                egress.send_dirty();
                 #[cfg(feature = "latency-trace")]
-                close_e2e_samples(&mut pending_e2e, &mut server_e2e_rec);
+                close_e2e_samples(&mut egress.pending_e2e, &mut egress.server_e2e_rec);
             }
             utilization.busy.store(busy_count, Ordering::Relaxed);
             utilization.idle.store(idle_count, Ordering::Relaxed);
@@ -559,66 +847,23 @@ pub fn run<A: Application>(
         // durability gate waits included — is done with them. That is
         // at most `MAX_BATCH` of a 1 M-slot ring, and the ring fills at
         // the same rate either way.
-        //
-        // Early replies follow the order `EarlyReplyQueue` documents: the
-        // idle bound before the read, the sync between the read and the
-        // control drain.
-        let idle_early_bound = early_replies.idle_bound();
         let slots = consumer.read_contiguous(MAX_BATCH);
-        let early_waiting = early_replies.sync();
 
-        // Poll the control channel (non-blocking) for connect and
-        // disconnect — after the ring is read, never before. A reply
-        // always trails its connection's `Connected`: the accept loop
-        // queues that event before it registers the socket with the
-        // reader, so no request can be read, let alone answered, until
-        // the event is in the channel. Every slot in `slots` was
-        // published before the read above, so its `Connected` was queued
-        // before that, and this drain sees it. Drained first, the stage
-        // could read the ring after a `Connected` it had not seen and
-        // drop the reply — which it did, now and then, on a fresh node
-        // under load. `registration_race` in the tests holds the stage
-        // right after this drain to pin the order.
-        while let Ok(event) = control_rx.try_recv() {
-            match event {
-                ControlEvent::Connected {
-                    connection_id,
-                    fd,
-                    writer,
-                } => {
-                    // The writer keeps the fd alive — store it as the owner.
-                    let owner: Box<dyn Send> = Box::new(writer);
-                    connections.insert(
-                        connection_id,
-                        ConnectionEntry {
-                            fd,
-                            _owner: owner,
-                            send_buf: Vec::with_capacity(4096),
-                            last_send: Instant::now(),
-                            blocked_since: None,
-                            last_send_attempt: Instant::now(),
-                            dirty: false,
-                        },
-                    );
-                }
-                ControlEvent::Disconnected { connection_id } => {
-                    // Reader-initiated teardown: the reader already
-                    // closed its half. Decrement only if the entry was
-                    // actually present — a response-initiated drop
-                    // already removed it (and paid the decrement), and
-                    // this event is its echo.
-                    if connections.remove(&connection_id).is_some() {
-                        active_connections.fetch_sub(1, Ordering::Relaxed);
-                    }
-                    unmark_dirty(connection_id, &mut dirty_connections);
-                    // Anything this connection had buffered goes with
-                    // it, so its queued samples measure bytes that will
-                    // never be sent.
-                    #[cfg(feature = "latency-trace")]
-                    discard_e2e_samples(&mut pending_e2e, &[connection_id]);
-                }
-            }
-        }
+        // Take a snapshot of the early replies, then poll the control
+        // channel (non-blocking) for connect and disconnect — after the
+        // ring is read, never before. A reply always trails its
+        // connection's `Connected`: the accept loop queues that event
+        // before it registers the socket with the reader, so no request
+        // can be read, let alone answered, until the event is in the
+        // channel. Every slot in `slots` was published before the read
+        // above, and every early reply in the snapshot before the drain,
+        // so their `Connected` was queued before that, and this drain sees
+        // it. Drained first, the stage could read the ring after a
+        // `Connected` it had not seen and drop the reply — which it did,
+        // now and then, on a fresh node under load. `registration_race`
+        // in the tests holds the stage right after this drain to pin the
+        // order.
+        let mut registered = early_replies.register(|| egress.drain_control(&control_rx));
 
         // Test seam: hold the stage right after the drain — see
         // `Response::pause_after_control_drain`.
@@ -628,59 +873,27 @@ pub fn run<A: Application>(
         }
 
         if slots.is_empty() {
-            // Every event published before an early reply up to the bound
-            // has been answered: send those early replies with this flush.
-            if let Some(bound) = idle_early_bound {
-                let now = Instant::now();
-                early_replies.release(bound, |reply| {
-                    append_early_reply(
-                        reply,
-                        &*encoder,
-                        &mut connections,
-                        &mut early_buf,
-                        now,
-                        &mut dirty_connections,
-                        &mut to_remove,
-                        &mut flush,
-                    );
-                });
+            // Between two events, the snapshot's early replies go with
+            // this flush. An empty read is not a boundary in itself: the
+            // matching stage may have published only part of an event.
+            if let Some(at) = boundary.at_boundary() {
+                egress.release_early_replies(
+                    &mut registered,
+                    &at,
+                    &*encoder,
+                    &mut early_buf,
+                    Instant::now,
+                );
                 // An early reply can overflow its connection's buffer;
                 // drop those before the flush, as the batch end does.
-                #[cfg(feature = "latency-trace")]
-                discard_e2e_samples(&mut pending_e2e, &to_remove);
-                for conn_id in to_remove.drain(..) {
-                    if let Some(entry) = connections.remove(&conn_id) {
-                        teardown_dropped(entry, &active_connections);
-                    }
-                    unmark_dirty(conn_id, &mut dirty_connections);
-                }
+                egress.drop_overflowed();
             }
 
             // SPSC is empty — flush all dirty connections via io_uring.
             // This is the response-data egress path; heartbeat flushes
             // below aren't sampled because they're admin traffic, not
             // on the client RTT path.
-            if !dirty_connections.is_empty() {
-                #[cfg(feature = "tick-to-trade")]
-                let egress_start = trace::mono_trace_ns();
-                flush_sends(
-                    &mut ring,
-                    &mut connections,
-                    &mut dirty_connections,
-                    &mut to_remove,
-                    &mut cqes,
-                );
-                flush.on_flush();
-                #[cfg(feature = "tick-to-trade")]
-                egress_rec.record_elapsed(egress_start, trace::mono_trace_ns());
-                #[cfg(feature = "latency-trace")]
-                close_e2e_samples(&mut pending_e2e, &mut server_e2e_rec);
-                for conn_id in to_remove.drain(..) {
-                    if let Some(entry) = connections.remove(&conn_id) {
-                        teardown_dropped(entry, &active_connections);
-                    }
-                }
-            }
+            egress.flush();
 
             // Everything below is periodic housekeeping on
             // sub-second-to-second cadences, and each check needs the
@@ -729,28 +942,18 @@ pub fn run<A: Application>(
                     && now.duration_since(last_heartbeat_scan) >= Duration::from_secs(1)
                 {
                     last_heartbeat_scan = now;
-                    for (&conn_id, entry) in connections.iter_mut() {
+                    for (&conn_id, entry) in egress.connections.iter_mut() {
                         if heartbeat_due(entry, now, interval, heartbeat_wire_frame.len()) {
                             entry.send_buf.extend_from_slice(&heartbeat_wire_frame);
                             entry.last_send = now;
-                            mark_dirty(entry, conn_id, &mut dirty_connections);
+                            mark_dirty(entry, conn_id, &mut egress.dirty);
                         }
                     }
-                    // Flush the heartbeat sends immediately.
-                    if !dirty_connections.is_empty() {
-                        flush_sends(
-                            &mut ring,
-                            &mut connections,
-                            &mut dirty_connections,
-                            &mut to_remove,
-                            &mut cqes,
-                        );
-                        flush.on_flush();
-                        for conn_id in to_remove.drain(..) {
-                            if let Some(entry) = connections.remove(&conn_id) {
-                                teardown_dropped(entry, &active_connections);
-                            }
-                        }
+                    // Flush the heartbeat sends immediately. Unsampled:
+                    // admin traffic, and no sample is queued (see above).
+                    if !egress.dirty.is_empty() {
+                        egress.send_dirty();
+                        egress.teardown_flush_failures();
                     }
                 }
 
@@ -769,13 +972,13 @@ pub fn run<A: Application>(
                     last_stats_flush = now;
                     spsc_rec.flush();
                     dispatch_rec.flush();
-                    server_e2e_rec.flush();
+                    egress.server_e2e_rec.flush();
                     #[cfg(feature = "tick-to-trade")]
                     {
                         journal_wait_rec.flush();
                         replica_wait_rec.flush();
                         encode_rec.flush();
-                        egress_rec.flush();
+                        egress.egress_rec.flush();
                     }
                 }
             }
@@ -854,26 +1057,20 @@ pub fn run<A: Application>(
             #[cfg(feature = "latency-trace")]
             spsc_rec.record_elapsed(slot.match_complete_ts, consume_ts);
 
-            // First slot of an event: every event before it has been
-            // answered, so early replies stamped up to its sequence go
-            // first. Ahead of the gate, which holds this event, not them.
-            // An early reply due here was visible before the read, so the
-            // iteration's sync decides for the whole batch.
-            let first_of_event = slot.input_seq != last_input_seq;
-            last_input_seq = slot.input_seq;
-            if early_waiting && first_of_event {
-                early_replies.release(slot.input_seq, |reply| {
-                    append_early_reply(
-                        reply,
-                        &*encoder,
-                        &mut connections,
-                        &mut early_buf,
-                        batch_now,
-                        &mut dirty_connections,
-                        &mut to_remove,
-                        &mut flush,
-                    );
-                });
+            // The first slot of an event: the last one handled ended its
+            // event, so the snapshot's early replies go here, ahead of the
+            // gate, which holds this event, not them. The iteration's
+            // snapshot decides for the whole batch; the gate's hook takes
+            // fresh ones if this slot waits.
+            let at_boundary = boundary.at_boundary();
+            if let Some(at) = &at_boundary {
+                egress.release_early_replies(
+                    &mut registered,
+                    at,
+                    &*encoder,
+                    &mut early_buf,
+                    || batch_now,
+                );
             }
 
             // Per-slot journal-wait / replica-wait tracker. See
@@ -891,9 +1088,11 @@ pub fn run<A: Application>(
 
             // Admit the slot: held until its event is durable under the
             // policy in force, and for a policy change, the switch point.
-            // `before_wait` runs only when it has to wait. What backs a
-            // reply decides its terminator: the policy, unless the gate
-            // released it on this node's own fsync while halted.
+            // The hook flushes what is buffered if the slot has to wait,
+            // and sends early replies during the wait if the slot is the
+            // first of its event (`GateWaitHook`). What backs a reply
+            // decides its terminator: the policy, unless the gate released
+            // it on this node's own fsync while halted.
             //
             // Shutdown while the gate is closed: straight back to the
             // top of the loop, where the shutdown branch decides what to
@@ -904,63 +1103,21 @@ pub fn run<A: Application>(
             //
             // A policy change slot is the gate's own: its frames go to no
             // connection, whatever it is addressed to.
-            let (destination, backing) = match gate.admit(
+            let admission = gate.admit(
                 slot,
                 shutdown,
                 #[cfg(feature = "tick-to-trade")]
                 &mut gate_tracker,
-                || {
-                    // Drain buffered sends before blocking, never after.
-                    //
-                    // The steady-state flush happens on the `count == 0`
-                    // path — once the output ring is empty. That batches
-                    // many responses behind one `io_uring_enter`, which is
-                    // the right trade on the fast path. But it means a
-                    // response that has already cleared its own durability
-                    // gate stays in `send_buf` while the loop blocks on a
-                    // later event's gate, so a client waits out an fsync +
-                    // replica round-trip for an event whose durability was
-                    // confirmed before that event was even sequenced.
-                    //
-                    // Flushing here costs nothing in latency terms: it only
-                    // fires when we are about to spin on the gate anyway, so
-                    // the syscall overlaps time that would otherwise be
-                    // dead. Slots whose gate is already satisfied fall
-                    // straight through and keep their batching.
-                    //
-                    // Traced builds only: this delays the tracker's first
-                    // `observe` by the flush duration, so a cursor that
-                    // crosses mid-flush is attributed late (or, if it
-                    // crosses past `needed`, not attributed at all). Bounded
-                    // by one flush and confined to the tick-to-trade
-                    // breakdown — the gate's own behaviour is unchanged.
-                    if !dirty_connections.is_empty() {
-                        #[cfg(feature = "tick-to-trade")]
-                        let egress_start = trace::mono_trace_ns();
-                        flush_sends(
-                            &mut ring,
-                            &mut connections,
-                            &mut dirty_connections,
-                            &mut to_remove,
-                            &mut cqes,
-                        );
-                        flush.on_flush();
-                        #[cfg(feature = "tick-to-trade")]
-                        egress_rec.record_elapsed(egress_start, trace::mono_trace_ns());
-                        #[cfg(feature = "latency-trace")]
-                        close_e2e_samples(&mut pending_e2e, &mut server_e2e_rec);
-                        // This slot and later ones addressed to a dropped
-                        // connection are skipped by the
-                        // `connections.get_mut` lookup below, so removing
-                        // here is safe.
-                        for conn_id in to_remove.drain(..) {
-                            if let Some(entry) = connections.remove(&conn_id) {
-                                teardown_dropped(entry, &active_connections);
-                            }
-                        }
-                    }
+                &mut GateWaitHook {
+                    egress: &mut egress,
+                    at_boundary,
+                    registered: &mut registered,
+                    control_rx: &control_rx,
+                    encoder: &*encoder,
+                    early_buf: &mut early_buf,
                 },
-            ) {
+            );
+            let (destination, backing) = match admission {
                 Admission::Reply {
                     connection_id,
                     backing,
@@ -968,6 +1125,10 @@ pub fn run<A: Application>(
                 Admission::GateOnly => (None, Backing::Policy),
                 Admission::Shutdown => continue 'run,
             };
+            // Handled from here on, whether or not its frames go
+            // anywhere: nothing between here and the next slot sends an
+            // early reply.
+            boundary.handled(slot.is_last_in_request);
 
             // Per-slot durability-gate breakdown. Recorded only when the
             // gate actually held us up (the tracker captured a cross).
@@ -992,7 +1153,7 @@ pub fn run<A: Application>(
             // payloads go through the encoder; the transport-shaped
             // `BatchEnd` is the runtime's own.
             if let Some((connection_id, entry)) =
-                destination.and_then(|id| connections.get_mut(&id).map(|entry| (id, entry)))
+                destination.and_then(|id| egress.connections.get_mut(&id).map(|entry| (id, entry)))
             {
                 // Frame 1: application payload (if any). BatchEnd
                 // payloads carry no body — the terminator below
@@ -1024,8 +1185,8 @@ pub fn run<A: Application>(
                     entry,
                     &encode_buf,
                     batch_now,
-                    &mut dirty_connections,
-                    &mut to_remove,
+                    &mut egress.dirty,
+                    &mut egress.to_remove,
                 );
                 #[cfg(feature = "tick-to-trade")]
                 encode_rec.record_elapsed(encode_start, trace::mono_trace_ns());
@@ -1037,10 +1198,10 @@ pub fn run<A: Application>(
                 // whichever flush ships the bytes.
                 #[cfg(feature = "latency-trace")]
                 if slot.is_last_in_request && matches!(_outcome, AppendOutcome::Continue) {
-                    pending_e2e.push((connection_id, slot.recv_ts));
+                    egress.pending_e2e.push((connection_id, slot.recv_ts));
                 }
 
-                flush.on_append(entry.send_buf.len());
+                egress.cadence.on_append(entry.send_buf.len());
             } else if let Some(connection_id) = destination.filter(|&id| id != 0) {
                 // A reply for a connection this stage does not hold: it
                 // was dropped earlier in this batch, or went away before
@@ -1057,59 +1218,10 @@ pub fn run<A: Application>(
                 );
             }
 
-            // Consumed-path flush — the still-open half of July-audit
-            // finding 4, plus its age bound (August audit finding 3).
-            // Under sustained load with an open gate this is the ONLY
-            // flush that runs: the idle path needs an empty SPSC, the
-            // gate path needs a durability wait, and heartbeats need
-            // idleness. Without it, delivery on a busy stretch
-            // degenerates to `MAX_SEND_BUF` evicting the very clients
-            // being served. Trigger-gated so light traffic keeps full
-            // batching; once a connection holds ~an MSS — or the stage
-            // has encoded `FLUSH_SLOT_INTERVAL` responses since the last
-            // flush, whichever comes first — the extra submit no longer
-            // costs wire efficiency. MSG_DONTWAIT flushes cannot block,
-            // so this adds no head-of-line exposure (the hazard that
-            // deferred this trigger in July). Runs between slots, not
-            // after the batch, so `MAX_SEND_BUF` can never trip on a
-            // healthy connection within a single batch — a blocked peer
-            // re-arms the flag on its later slots, but its paced retry
-            // inside `flush_sends` keeps that cheap.
-            if flush.is_due() {
-                flush.on_flush();
-                // Overflow-dropped connections leave first so the flush
-                // skips them — same order as the batch-end cleanup, and
-                // their queued samples go with them (they measure bytes
-                // that will never be flushed). Later slots addressed to
-                // them are skipped by the `connections.get_mut` miss
-                // above.
-                #[cfg(feature = "latency-trace")]
-                discard_e2e_samples(&mut pending_e2e, &to_remove);
-                for conn_id in to_remove.drain(..) {
-                    if let Some(entry) = connections.remove(&conn_id) {
-                        teardown_dropped(entry, &active_connections);
-                    }
-                    unmark_dirty(conn_id, &mut dirty_connections);
-                }
-                #[cfg(feature = "tick-to-trade")]
-                let egress_start = trace::mono_trace_ns();
-                flush_sends(
-                    &mut ring,
-                    &mut connections,
-                    &mut dirty_connections,
-                    &mut to_remove,
-                    &mut cqes,
-                );
-                #[cfg(feature = "tick-to-trade")]
-                egress_rec.record_elapsed(egress_start, trace::mono_trace_ns());
-                #[cfg(feature = "latency-trace")]
-                close_e2e_samples(&mut pending_e2e, &mut server_e2e_rec);
-                for conn_id in to_remove.drain(..) {
-                    if let Some(entry) = connections.remove(&conn_id) {
-                        teardown_dropped(entry, &active_connections);
-                    }
-                }
-            }
+            // Consumed-path flush (see `Egress::flush_if_due`). Runs
+            // between slots, not after the batch, so `MAX_SEND_BUF` can
+            // never trip on a healthy connection within a single batch.
+            egress.flush_if_due();
         }
 
         // The borrowed slots are dead here, so the batch can be handed
@@ -1127,19 +1239,8 @@ pub fn run<A: Application>(
         // policy has not confirmed. The DPDK stage keeps the same one.
         consumer.commit();
 
-        // Remove connections that exceeded the send buffer limit. Like
-        // the disconnect handler, this un-dirties a connection without
-        // flushing it, so it has to discard that connection's queued
-        // samples too — otherwise they outlive the bytes they measure
-        // and land on some later, unrelated flush.
-        #[cfg(feature = "latency-trace")]
-        discard_e2e_samples(&mut pending_e2e, &to_remove);
-        for conn_id in to_remove.drain(..) {
-            if let Some(entry) = connections.remove(&conn_id) {
-                teardown_dropped(entry, &active_connections);
-            }
-            unmark_dirty(conn_id, &mut dirty_connections);
-        }
+        // Remove connections that exceeded the send buffer limit.
+        egress.drop_overflowed();
 
         // Log degradation transitions / re-emit the reminder — after
         // dispatch, not before it. See `DurabilityGate::after_batch`.
@@ -1362,8 +1463,8 @@ fn append_frames(
 /// away loses nothing it can still receive.
 ///
 /// No durability gate: nothing was published, so there is nothing to wait
-/// for. The caller has already waited for what comes before it on the
-/// connection (see [`crate::halt`]).
+/// for. The caller stands between two events' replies, so it splits none
+/// (see [`crate::halt`]).
 #[allow(clippy::too_many_arguments)]
 fn append_early_reply<R: Copy, Q: Copy>(
     reply: EarlyReply<R>,
@@ -3367,7 +3468,7 @@ pub(crate) mod tests {
         /// Fill `fd`'s socket send buffer with non-blocking writes until
         /// the kernel refuses more — the state a zero-window / non-reading
         /// client leaves a connection in.
-        fn fill_socket(fd: RawFd) {
+        pub(super) fn fill_socket(fd: RawFd) {
             let junk = [0u8; 4096];
             loop {
                 let n =
@@ -3626,6 +3727,290 @@ pub(crate) mod tests {
         }
     }
 
+    /// One drain of early replies can release thousands to one connection
+    /// (a burst of refused or shed requests). The drain applies the
+    /// consumed path's flush cadence between replies, so a client that
+    /// reads its replies keeps its connection however many there are,
+    /// and `MAX_SEND_BUF` still drops one that does not read.
+    mod early_drain {
+        use std::os::unix::io::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        use counter_server::{CounterReport, ResponseEncoder};
+        use io_uring::IoUring;
+        use melin_wire_protocol::control::RefusalKind;
+
+        use super::early_release::widest_reason;
+        use super::flush_sends::{entry_for, fill_socket};
+        use super::refusal_order::{Seen, early, early_id, frames_of, read_frame};
+        use crate::batch_boundary::BatchBoundary;
+        use crate::halt::{EARLY_REPLY_QUEUE_CAPACITY, EarlyKind, early_reply_channel};
+        use crate::response::{Egress, MAX_SEND_BUF};
+        use crate::response_frame::{EarlyReplyBuf, MAX_EARLY_REPLY};
+
+        /// Replies in the burst: alternately a busy and a refusal with the
+        /// widest reason, together well past `MAX_SEND_BUF`, within the
+        /// queue's capacity.
+        const BURST: u64 = 800;
+
+        /// The kind of the burst's reply number `n`.
+        fn kind(n: u64) -> EarlyKind<CounterReport> {
+            if n.is_multiple_of(2) {
+                EarlyKind::Busy
+            } else {
+                EarlyKind::Refused {
+                    kind: RefusalKind::PermissionDenied,
+                    reason: widest_reason(),
+                }
+            }
+        }
+
+        /// A stage's egress holding one connection, 1, on `stream`, and
+        /// the count of live connections it decrements.
+        fn egress_over(stream: UnixStream) -> (Egress, Arc<AtomicU64>) {
+            let active = Arc::new(AtomicU64::new(1));
+            let mut egress = Egress::new(
+                IoUring::new(64).expect("an io_uring"),
+                64,
+                Arc::clone(&active),
+                #[cfg(feature = "latency-trace")]
+                melin_transport_core::trace::register_stage("test: server e2e"),
+                #[cfg(feature = "tick-to-trade")]
+                melin_transport_core::trace::register_stage("test: egress"),
+            );
+            let mut entry = entry_for(stream, &[]);
+            entry.dirty = false;
+            egress.connections.insert(1, entry);
+            (egress, active)
+        }
+
+        /// Queue the burst for connection 1 and release it in one drain,
+        /// then flush as the idle path does.
+        fn drain_burst(egress: &mut Egress) -> usize {
+            assert!(BURST as usize <= EARLY_REPLY_QUEUE_CAPACITY);
+            let (mut tx, mut rx) = early_reply_channel();
+            for n in 0..BURST {
+                tx.try_send(early(1, n, kind(n))).expect("queue has room");
+            }
+            tx.flush();
+            let boundary = BatchBoundary::new();
+            let at = boundary.at_boundary().expect("between events");
+            let mut early_buf: EarlyReplyBuf = [0u8; MAX_EARLY_REPLY];
+            let released = egress.release_early_replies(
+                &mut rx.register(|| {}),
+                &at,
+                &ResponseEncoder,
+                &mut early_buf,
+                Instant::now,
+            );
+            egress.drop_overflowed();
+            egress.flush();
+            released
+        }
+
+        #[test]
+        fn a_drain_past_the_send_buffer_flushes_as_it_goes_and_keeps_a_reading_client() {
+            let expected: Vec<Seen> = (0..BURST)
+                .flat_map(|n| frames_of(kind(n), early_id(n)))
+                .collect();
+            // On the wire: a busy is its length prefix, tag and ID; a
+            // refusal adds its kind, the reason's length, and the reason.
+            let wire_bytes: usize = (0..BURST)
+                .map(|n| match kind(n) {
+                    EarlyKind::Busy => 13,
+                    _ => 15 + widest_reason().len(),
+                })
+                .sum();
+            assert!(wire_bytes > MAX_SEND_BUF, "the burst outgrows the buffer");
+
+            let (server, mut client) = UnixStream::pair().expect("socketpair");
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set read timeout");
+            let count = expected.len();
+            let reader = thread::spawn(move || {
+                (0..count)
+                    .map_while(|_| read_frame(&mut client).ok())
+                    .collect::<Vec<_>>()
+            });
+
+            let (mut egress, active) = egress_over(server);
+            assert_eq!(drain_burst(&mut egress), BURST as usize);
+            // What a flush left behind on a socket the reader had not
+            // emptied yet goes out on the paced retries.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !egress.dirty.is_empty() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+                egress.flush();
+            }
+
+            assert!(
+                egress.connections.contains_key(&1),
+                "a client reading its replies was dropped"
+            );
+            assert_eq!(active.load(Ordering::Relaxed), 1);
+            assert_eq!(reader.join().expect("reader"), expected, "in queue order");
+        }
+
+        #[test]
+        fn a_drain_to_a_client_that_does_not_read_drops_it_at_the_cap() {
+            let (server, _client) = UnixStream::pair().expect("socketpair");
+            fill_socket(server.as_raw_fd());
+            let (mut egress, active) = egress_over(server);
+
+            assert_eq!(drain_burst(&mut egress), BURST as usize);
+
+            assert!(
+                !egress.connections.contains_key(&1),
+                "a client that reads nothing kept its connection"
+            );
+            assert!(!egress.dirty.contains(&1));
+            assert_eq!(
+                active.load(Ordering::Relaxed),
+                0,
+                "its permit released once"
+            );
+        }
+
+        /// A flush inside the drain that fails (the client has hung up)
+        /// tears the connection down there, once, and the rest of the
+        /// drain's replies to it are dropped as for any connection gone.
+        #[test]
+        fn a_drain_to_a_client_that_has_hung_up_tears_it_down_once() {
+            let (server, client) = UnixStream::pair().expect("socketpair");
+            drop(client);
+            let (mut egress, active) = egress_over(server);
+
+            assert_eq!(drain_burst(&mut egress), BURST as usize);
+
+            assert!(!egress.connections.contains_key(&1));
+            assert!(egress.to_remove.is_empty(), "nothing left to tear down");
+            assert_eq!(
+                active.load(Ordering::Relaxed),
+                0,
+                "its permit released once"
+            );
+        }
+
+        /// A cadence made due by appends to a connection gone since (so
+        /// nothing is dirty) is restarted by the flush that finds nothing
+        /// to send, rather than left due for every later slot.
+        #[test]
+        fn a_due_cadence_with_nothing_dirty_is_restarted() {
+            let (server, _client) = UnixStream::pair().expect("socketpair");
+            let (mut egress, _active) = egress_over(server);
+            for _ in 0..super::super::FLUSH_SLOT_INTERVAL {
+                egress.cadence.on_append(1);
+            }
+            assert!(egress.cadence.is_due());
+            assert!(egress.dirty.is_empty());
+
+            egress.flush_if_due();
+
+            assert!(!egress.cadence.is_due());
+        }
+    }
+
+    /// The io_uring stage's gate-wait hook, called directly: the stage
+    /// tests drive it through a running stage, where whether a reply
+    /// queued during a wait goes out from the hook or from the boundary
+    /// drain after the admit is up to the scheduler.
+    mod gate_wait_hook {
+        use std::os::unix::net::UnixStream;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        use counter_server::{CounterReport, ResponseEncoder};
+        use io_uring::IoUring;
+
+        use super::refusal_order::{Seen, connection, early, early_id, frames_of, read_frame};
+        use crate::batch_boundary::BatchBoundary;
+        use crate::durability_gate::GateWait;
+        use crate::halt::{EarlyKind, early_reply_channel};
+        use crate::response::{Egress, GateWaitHook};
+        use crate::response_frame::{EarlyReplyBuf, MAX_EARLY_REPLY};
+
+        const BUSY: EarlyKind<CounterReport> = EarlyKind::Busy;
+
+        /// Register nothing, then — as if during a wait — queue
+        /// connection 1's `Connected` and a busy for it, and call the
+        /// hook's `while_waiting` once, between events or not. Returns the
+        /// egress after the call and the client's end of the socket.
+        fn one_turn(between_events: bool) -> (Egress, UnixStream) {
+            let mut egress = Egress::new(
+                IoUring::new(64).expect("an io_uring"),
+                64,
+                Arc::new(AtomicU64::new(1)),
+                #[cfg(feature = "latency-trace")]
+                melin_transport_core::trace::register_stage("test: server e2e"),
+                #[cfg(feature = "tick-to-trade")]
+                melin_transport_core::trace::register_stage("test: egress"),
+            );
+            let (control_tx, control_rx) = mpsc::channel();
+            let (mut tx, mut rx) = early_reply_channel();
+            let mut registered = rx.register(|| {});
+
+            let (event, client) = connection(1);
+            control_tx.send(event).expect("the receiver is held");
+            tx.try_send(early(1, 0, BUSY)).expect("queue has room");
+            tx.flush();
+
+            let boundary = BatchBoundary::new();
+            let mut early_buf: EarlyReplyBuf = [0u8; MAX_EARLY_REPLY];
+            GateWaitHook {
+                egress: &mut egress,
+                at_boundary: if between_events {
+                    Some(boundary.at_boundary().expect("between events"))
+                } else {
+                    None
+                },
+                registered: &mut registered,
+                control_rx: &control_rx,
+                encoder: &ResponseEncoder,
+                early_buf: &mut early_buf,
+            }
+            .while_waiting();
+            (egress, client)
+        }
+
+        #[test]
+        fn between_events_it_registers_sends_and_flushes() {
+            let (egress, mut client) = one_turn(true);
+
+            assert!(egress.connections.contains_key(&1), "not registered");
+            assert!(egress.dirty.is_empty(), "sent but left buffered");
+            // A reply that never reached the socket fails the read
+            // rather than hanging the test.
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set read timeout");
+            let expected = frames_of(BUSY, early_id(0));
+            let seen: Vec<Seen> = expected
+                .iter()
+                .map(|_| read_frame(&mut client).expect("the busy's frames"))
+                .collect();
+            assert_eq!(seen, expected);
+        }
+
+        #[test]
+        fn inside_an_event_it_does_nothing() {
+            let (egress, mut client) = one_turn(false);
+
+            assert!(egress.connections.is_empty(), "control drained");
+            assert!(egress.dirty.is_empty());
+            client
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("set read timeout");
+            assert!(read_frame(&mut client).is_err(), "a reply went out");
+        }
+    }
+
     /// The stage learns of a connection from its control channel and of
     /// that connection's replies from the output ring. A reply always
     /// trails its `Connected`, so reading the ring before draining the
@@ -3720,10 +4105,7 @@ pub(crate) mod tests {
                 fence_state: Arc::new(FenceState::new(0)),
                 active_connections: Arc::new(AtomicU64::new(0)),
                 // No reader: nothing is ever answered early.
-                early_replies: crate::halt::early_reply_channel(Arc::new(
-                    melin_pipeline::padding::CachePadded::new(AtomicU64::new(0)),
-                ))
-                .1,
+                early_replies: crate::halt::early_reply_channel().1,
                 ring_sizing: crate::connection_limit::RingSizing::for_max_connections(1)
                     .expect("a supported cap"),
                 ready: None,
@@ -3778,17 +4160,15 @@ pub(crate) mod tests {
         }
     }
 
-    /// A request answered at ingress (a write refused while halted, a
-    /// request filtered or refused by the decoder, one shed on a full
-    /// ring) is answered in request order: after the replies to everything
-    /// published before it — even while one of those is held by the
-    /// durability gate — and before anything published after it, each
-    /// final frame naming its request.
+    /// An early reply (a write refused while halted, a request filtered or
+    /// refused by the decoder, one shed on a full ring) reaches the stage
+    /// only with its connection registered.
     ///
     /// Its frame classifier and early-reply builders are shared with the
-    /// DPDK stage's tests (`dpdk_response.rs`).
+    /// other early-reply tests here and the DPDK stage's
+    /// (`dpdk_response.rs`).
     pub(crate) mod refusal_order {
-        use std::io::{ErrorKind, Read, Write};
+        use std::io::{Read, Write};
         use std::os::unix::io::AsRawFd;
         use std::os::unix::net::UnixStream;
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -3797,19 +4177,14 @@ pub(crate) mod tests {
         use std::time::Duration;
 
         use counter_server::{
-            Counter, CounterQuery, CounterReport, KIND_RESP_ACK, KIND_RESP_REJECTED,
-            ResponseEncoder,
+            Counter, CounterQuery, CounterReport, KIND_RESP_REJECTED, ResponseEncoder,
         };
-        use melin_pipeline::padding::CachePadded;
         use melin_pipeline::ring::DisruptorBuilder;
         use melin_pipeline::wait::WaitStrategy;
         use melin_transport_core::fence::FenceState;
-        use melin_transport_core::pipeline::{
-            OutputPayload, OutputSlot, RequestId, StageUtilization,
-        };
+        use melin_transport_core::pipeline::{OutputSlot, RequestId, StageUtilization};
         use melin_transport_core::{DurableWireSeqCursor, WireSeq};
         use melin_wire_protocol::blocking::BlockingFrameWriter;
-        use melin_wire_protocol::control::RefusalKind;
         use melin_wire_protocol::control_codec::{
             TAG_APP, TAG_BATCH_END, TAG_REFUSED, TAG_SERVER_BUSY, terminal_request_id,
         };
@@ -3820,9 +4195,7 @@ pub(crate) mod tests {
         use crate::response::{Response, run};
 
         /// Bounds a read that must succeed; generous for a loaded box.
-        const READ_TIMEOUT: Duration = Duration::from_secs(5);
-        /// How long the test watches for a frame that must not arrive yet.
-        const QUIET: Duration = Duration::from_millis(100);
+        pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
         /// What one frame on the wire was: a counter response, by the
         /// kind its body starts with; a frame that ends a request's reply,
@@ -3852,23 +4225,22 @@ pub(crate) mod tests {
             }
         }
 
-        /// The ID the early reply stamped `input_seq` carries in these
-        /// tests: distinct per reply, and from the events' own.
-        pub(crate) fn early_id(input_seq: u64) -> RequestId {
-            RequestId(1000 + input_seq)
+        /// The ID early reply number `n` carries in these tests: distinct
+        /// per reply, and from the events' own.
+        pub(crate) fn early_id(n: u64) -> RequestId {
+            RequestId(1000 + n)
         }
 
-        /// An early reply of `kind` for `connection_id`, stamped
-        /// `input_seq`, its request [`early_id`].
+        /// Early reply number `n`, of `kind`, for `connection_id`: its
+        /// request is [`early_id`]`(n)`.
         pub(crate) fn early(
             connection_id: u64,
-            input_seq: u64,
+            n: u64,
             kind: EarlyKind<CounterReport>,
         ) -> EarlyReply<CounterReport> {
             EarlyReply {
                 connection_id,
-                request_id: early_id(input_seq),
-                input_seq,
+                request_id: early_id(n),
                 kind,
             }
         }
@@ -3909,139 +4281,6 @@ pub(crate) mod tests {
             }
         }
 
-        #[test]
-        fn a_refusal_waits_for_earlier_replies_and_precedes_later_ones() {
-            early_replies_keep_request_order(EarlyKind::Rejected(CounterReport::Rejected));
-        }
-
-        #[test]
-        fn a_busy_waits_for_earlier_replies_and_precedes_later_ones() {
-            early_replies_keep_request_order(EarlyKind::Busy);
-        }
-
-        #[test]
-        fn a_decoder_refusal_waits_for_earlier_replies_and_precedes_later_ones() {
-            early_replies_keep_request_order(EarlyKind::Refused {
-                kind: RefusalKind::Malformed,
-                reason: "unknown message kind",
-            });
-        }
-
-        #[test]
-        fn a_filtered_requests_empty_batch_waits_for_earlier_replies_and_precedes_later_ones() {
-            early_replies_keep_request_order(EarlyKind::Filtered);
-        }
-
-        /// Early replies of `kind` around a write the gate holds: the one
-        /// stamped before the write goes out while the gate is shut, the
-        /// one after waits for the write's reply; each names its request,
-        /// and the write's batch end names the write.
-        fn early_replies_keep_request_order(kind: EarlyKind<CounterReport>) {
-            let (mut producer, mut consumers) =
-                DisruptorBuilder::<OutputSlot<CounterReport, CounterQuery>>::new(64)
-                    .add_consumer()
-                    .build(WaitStrategy::SpinThenYield);
-            let consumer = consumers.pop().expect("one consumer was requested");
-
-            let (connected, mut client_sock) = connection(1);
-
-            // The test plays the matching stage: it publishes the one
-            // event's reply, then moves the progress past it.
-            let matching_progress = Arc::new(CachePadded::new(AtomicU64::new(0)));
-            let (mut early_tx, early_rx) = early_reply_channel(Arc::clone(&matching_progress));
-            // The event's gate is shut until the test opens it.
-            let journal_cursor = DurableWireSeqCursor::detached(WireSeq::new(0));
-
-            let (control_tx, control_rx) = mpsc::channel();
-            control_tx.send(connected).expect("channel open");
-            let shutdown = AtomicBool::new(false);
-            let config = config(
-                journal_cursor.clone(),
-                Arc::new(FenceState::new(0)),
-                early_rx,
-                None,
-            );
-
-            // What a reader does for: answered request, accepted write,
-            // answered request — early replies visible before the event
-            // published after them. All in place before the stage starts,
-            // so its first iteration reads the event with both early
-            // replies behind it: the first goes out ahead of the event
-            // (the batch path), the second once the ring is empty (the
-            // idle path).
-            early_tx
-                .try_send(early(1, 0, kind))
-                .expect("queue has room");
-            early_tx
-                .try_send(early(1, 1, kind))
-                .expect("queue has room");
-            early_tx.flush();
-            let write = RequestId(7);
-            producer.publish(OutputSlot {
-                connection_id: 1,
-                request_id: write,
-                input_seq: 0,
-                wire_seq: 1,
-                payload: OutputPayload::Report(CounterReport::Ack { new_value: 7 }),
-                is_last_in_request: true,
-                ..Default::default()
-            });
-            matching_progress.get().store(1, Ordering::Release);
-
-            let before = frames_of(kind, early_id(0));
-            let after = frames_of(kind, early_id(1));
-            thread::scope(|scope| {
-                let stage = scope.spawn(|| run::<Counter>(consumer, control_rx, config, &shutdown));
-
-                let mut seen = Vec::new();
-
-                // The first early reply came before the held event: it
-                // goes out while the gate is shut.
-                let first = (0..before.len()).all(|_| read_into(&mut client_sock, &mut seen));
-
-                // The second came after it: nothing more until the gate
-                // opens.
-                client_sock
-                    .set_read_timeout(Some(QUIET))
-                    .expect("set read timeout");
-                let mut probe = [0u8; 1];
-                // Anything but a timeout — bytes, or the stage closing the
-                // socket — means something went out early.
-                let overtook = !matches!(
-                    client_sock.read(&mut probe),
-                    Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
-                );
-                client_sock
-                    .set_read_timeout(Some(READ_TIMEOUT))
-                    .expect("set read timeout");
-
-                journal_cursor.store(WireSeq::new(1));
-                let rest = !overtook
-                    && (0..2 + after.len()).all(|_| read_into(&mut client_sock, &mut seen));
-
-                // Stop the stage before asserting, so a failure cannot
-                // leave the scope waiting on a spinning thread.
-                shutdown.store(true, Ordering::Relaxed);
-                stage.join().expect("stage panicked");
-
-                assert!(
-                    first,
-                    "the early reply ahead of the held event never arrived"
-                );
-                assert!(
-                    !overtook,
-                    "the later early reply overtook the reply the gate was holding"
-                );
-                assert!(rest, "replies missing after the gate opened: {seen:x?}");
-                let expected: Vec<Seen> = before
-                    .into_iter()
-                    .chain([Seen::App(KIND_RESP_ACK), Seen::Final(TAG_BATCH_END, write)])
-                    .chain(after)
-                    .collect();
-                assert_eq!(seen, expected, "replies out of request order");
-            });
-        }
-
         /// A refusal reaches the stage only with its connection registered.
         /// The reader refuses a new connection's first request as soon as
         /// that connection's `Connected` is queued, so a refusal made
@@ -4054,6 +4293,8 @@ pub(crate) mod tests {
         /// lands connection 1's refusal, which the next iteration's idle
         /// path is then due to release; the second hold, in that iteration,
         /// lands connection 2 and its refusal just ahead of the release.
+        /// The same inside a gate wait is `early_release`'s
+        /// `connection_first_seen_inside_a_gate_wait`.
         #[test]
         fn a_refusal_is_not_released_ahead_of_its_connection() {
             let (_producer, mut consumers) =
@@ -4064,9 +4305,7 @@ pub(crate) mod tests {
             let (connected_1, mut client_1) = connection(1);
             let (connected_2, mut client_2) = connection(2);
 
-            // Nothing is ever published, so no refusal waits on an event.
-            let progress = Arc::new(CachePadded::new(AtomicU64::new(0)));
-            let (mut refusals, refusal_rx) = early_reply_channel(progress);
+            let (mut refusals, refusal_rx) = early_reply_channel();
             let (control_tx, control_rx) = mpsc::channel();
             control_tx.send(connected_1).expect("channel open");
 
@@ -4141,11 +4380,11 @@ pub(crate) mod tests {
             (event, client_sock)
         }
 
-        /// A halt refusal for `connection_id`, stamped `input_seq`.
-        pub(crate) fn refusal(connection_id: u64, input_seq: u64) -> EarlyReply<CounterReport> {
+        /// Halt refusal number `n`, for `connection_id`.
+        pub(crate) fn refusal(connection_id: u64, n: u64) -> EarlyReply<CounterReport> {
             early(
                 connection_id,
-                input_seq,
+                n,
                 EarlyKind::Rejected(CounterReport::Rejected),
             )
         }
@@ -4182,12 +4421,646 @@ pub(crate) mod tests {
         }
     }
 
+    /// Early replies go out at the first point between two events'
+    /// replies, without waiting for replies to earlier requests, and never
+    /// inside an event's reply. The scenarios and their rig are shared
+    /// with the DPDK stage, whose tests run each against its own harness
+    /// (`dpdk_response.rs`); the kernel stage's harness is here.
+    pub(crate) mod early_release {
+        use std::collections::{BTreeMap, HashMap};
+        use std::os::unix::net::UnixStream;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, OnceLock, mpsc};
+        use std::thread::{self, JoinHandle};
+        use std::time::{Duration, Instant};
+
+        use counter_server::{
+            Counter, CounterQuery, CounterReport, KIND_RESP_ACK, KIND_RESP_REJECTED,
+        };
+        use melin_pipeline::ring::{self, DisruptorBuilder};
+        use melin_pipeline::wait::WaitStrategy;
+        use melin_transport_core::fence::FenceState;
+        use melin_transport_core::pipeline::{
+            OutputPayload, OutputSlot, RequestId, StageUtilization,
+        };
+        use melin_transport_core::{DurableWireSeqCursor, WireSeq};
+        use melin_wire_protocol::control::{MAX_REFUSAL_REASON, RefusalKind};
+        use melin_wire_protocol::control_codec::TAG_BATCH_END;
+        use proptest::prelude::*;
+
+        use super::refusal_order::{
+            READ_TIMEOUT, Seen, config, connection, early, early_id, frames_of, read_frame,
+        };
+        use crate::ControlEvent;
+        use crate::ack_policy::AckPolicy;
+        use crate::halt::{EarlyKind, EarlyReplyQueue, EarlyReplySender, early_reply_channel};
+        use crate::replication::ReplicationMetrics;
+        use crate::response::run;
+
+        /// How long a test watches for a frame that must not arrive yet:
+        /// long enough that a stage wrongly sending it would have.
+        pub(crate) const QUIET: Duration = Duration::from_millis(100);
+
+        /// An output slot of the counter.
+        pub(crate) type Slot = OutputSlot<CounterReport, CounterQuery>;
+
+        /// Every kind of early reply, a decoder refusal with the widest
+        /// reason a frame carries.
+        pub(crate) fn every_kind() -> [EarlyKind<CounterReport>; 4] {
+            [
+                EarlyKind::Rejected(CounterReport::Rejected),
+                EarlyKind::Filtered,
+                EarlyKind::Refused {
+                    kind: RefusalKind::Malformed,
+                    reason: widest_reason(),
+                },
+                EarlyKind::Busy,
+            ]
+        }
+
+        /// A refusal reason as wide as a `Refused` frame carries.
+        pub(crate) fn widest_reason() -> &'static str {
+            static REASON: OnceLock<&'static str> = OnceLock::new();
+            REASON.get_or_init(|| "r".repeat(MAX_REFUSAL_REASON).leak())
+        }
+
+        /// What a stage under test starts with: the output ring, the
+        /// early-reply queue, and a gate under `disk+ram` over the journal
+        /// cursor and one replica, whose in-memory cursor is far ahead,
+        /// so the journal decides what is held until the replica is
+        /// marked gone.
+        pub(crate) struct StageInputs {
+            pub(crate) consumer: ring::Consumer<Slot>,
+            pub(crate) early_replies: EarlyReplyQueue<CounterReport>,
+            pub(crate) journal: DurableWireSeqCursor,
+            pub(crate) replication_metrics: Arc<ReplicationMetrics>,
+            pub(crate) replica_active: [Arc<AtomicBool>; 2],
+            pub(crate) utilization: Arc<StageUtilization>,
+            pub(crate) shutdown: Arc<AtomicBool>,
+        }
+
+        /// A running response stage, seen from its clients. Stops the
+        /// stage when dropped, so a failed assertion does not leave it
+        /// spinning.
+        pub(crate) trait StageHarness {
+            /// Register `connection_id` with the stage: its `Connected`
+            /// on the control channel.
+            fn connect(&mut self, connection_id: u64);
+            /// The next frame the stage sent `connection_id`, waiting up
+            /// to `within`; `None` if none came.
+            fn next_frame(&mut self, connection_id: u64, within: Duration) -> Option<Seen>;
+        }
+
+        /// The test's side of a stage under test: it plays the matching
+        /// stage, the reader, the journal and the replica.
+        pub(crate) struct Rig<H> {
+            pub(crate) producer: ring::Producer<Slot>,
+            pub(crate) early: EarlyReplySender<CounterReport>,
+            pub(crate) journal: DurableWireSeqCursor,
+            pub(crate) replica_active: Arc<AtomicBool>,
+            pub(crate) utilization: Arc<StageUtilization>,
+            pub(crate) stage: H,
+        }
+
+        /// Start a stage with `start`, the journal at `journal_at`, and
+        /// `connections` registered.
+        pub(crate) fn rig<H: StageHarness>(
+            start: fn(StageInputs) -> H,
+            journal_at: u64,
+            connections: &[u64],
+        ) -> Rig<H> {
+            let (producer, mut consumers) = DisruptorBuilder::<Slot>::new(128)
+                .add_consumer()
+                .build(WaitStrategy::SpinThenYield);
+            let consumer = consumers.pop().expect("one consumer was requested");
+            let (early, early_replies) = early_reply_channel();
+            let journal = DurableWireSeqCursor::detached(WireSeq::new(journal_at));
+            let replication_metrics = Arc::new(ReplicationMetrics::default());
+            replication_metrics.in_memory_sequence[0].store(1_000_000, Ordering::Relaxed);
+            let replica_active = Arc::new(AtomicBool::new(true));
+            let utilization = Arc::new(StageUtilization::default());
+            let mut stage = start(StageInputs {
+                consumer,
+                early_replies,
+                journal: journal.clone(),
+                replication_metrics,
+                replica_active: [
+                    Arc::clone(&replica_active),
+                    Arc::new(AtomicBool::new(false)),
+                ],
+                utilization: Arc::clone(&utilization),
+                shutdown: Arc::new(AtomicBool::new(false)),
+            });
+            for &id in connections {
+                stage.connect(id);
+            }
+            Rig {
+                producer,
+                early,
+                journal,
+                replica_active,
+                utilization,
+                stage,
+            }
+        }
+
+        impl<H: StageHarness> Rig<H> {
+            /// Queue an early reply, flushed, as a reader does.
+            pub(crate) fn answer_early(
+                &mut self,
+                connection_id: u64,
+                n: u64,
+                kind: EarlyKind<CounterReport>,
+            ) {
+                self.early
+                    .try_send(early(connection_id, n, kind))
+                    .expect("queue has room");
+                self.early.flush();
+            }
+
+            /// Publish one output slot: a counter ack for `request_id` on
+            /// `connection_id`, its event at `wire_seq`.
+            pub(crate) fn publish(
+                &mut self,
+                connection_id: u64,
+                request_id: u64,
+                wire_seq: u64,
+                is_last_in_request: bool,
+            ) {
+                self.producer.publish(Slot {
+                    connection_id,
+                    request_id: RequestId(request_id),
+                    input_seq: wire_seq - 1,
+                    wire_seq,
+                    payload: OutputPayload::Report(CounterReport::Ack {
+                        new_value: wire_seq,
+                    }),
+                    is_last_in_request,
+                    ..Default::default()
+                });
+            }
+
+            /// The next `count` frames for `connection_id`, each waited
+            /// for up to [`READ_TIMEOUT`]; fewer if they stop coming.
+            pub(crate) fn frames(&mut self, connection_id: u64, count: usize) -> Vec<Seen> {
+                (0..count)
+                    .map_while(|_| self.stage.next_frame(connection_id, READ_TIMEOUT))
+                    .collect()
+            }
+
+            /// Whether nothing reaches `connection_id` for [`QUIET`].
+            pub(crate) fn quiet(&mut self, connection_id: u64) -> Option<Seen> {
+                self.stage.next_frame(connection_id, QUIET)
+            }
+        }
+
+        /// The frames of a one-slot write's reply: the ack, then its batch
+        /// end.
+        fn write_reply(id: u64) -> Vec<Seen> {
+            vec![
+                Seen::App(KIND_RESP_ACK),
+                Seen::Final(TAG_BATCH_END, RequestId(id)),
+            ]
+        }
+
+        /// An early reply for a connection whose event straddles two reads
+        /// of the output ring (the matching stage has published only its
+        /// first slot) waits for the event's terminator, and goes out
+        /// right after it, never between its frames.
+        pub(crate) fn an_early_reply_waits_out_an_event_split_across_reads<H: StageHarness>(
+            start: fn(StageInputs) -> H,
+        ) {
+            let mut rig = rig(start, 10, &[1]);
+            rig.publish(1, 7, 1, false);
+            assert_eq!(
+                rig.frames(1, 1),
+                [Seen::App(KIND_RESP_ACK)],
+                "the first slot"
+            );
+
+            rig.answer_early(1, 0, EarlyKind::Busy);
+            assert_eq!(
+                rig.quiet(1),
+                None,
+                "an early reply inside the event's reply"
+            );
+
+            rig.publish(1, 7, 1, true);
+            let expected: Vec<Seen> = write_reply(7)
+                .into_iter()
+                .chain(frames_of(EarlyKind::Busy, early_id(0)))
+                .collect();
+            assert_eq!(rig.frames(1, 3), expected);
+        }
+
+        /// Finding 18's shape: early replies of `kind` go out while the
+        /// gate holds an earlier write of the same connection — one queued
+        /// before the stage reached the write, and one decided while it
+        /// waits — and so does one for another connection; the write's
+        /// reply follows once its event is durable.
+        pub(crate) fn early_replies_overtake_a_held_write<H: StageHarness>(
+            start: fn(StageInputs) -> H,
+            kind: EarlyKind<CounterReport>,
+        ) {
+            let mut rig = rig(start, 0, &[1, 2]);
+            rig.answer_early(1, 0, kind);
+            rig.publish(1, 7, 1, true);
+            let before = frames_of(kind, early_id(0));
+            assert_eq!(
+                rig.frames(1, before.len()),
+                before,
+                "{kind:?} queued before"
+            );
+
+            rig.answer_early(1, 1, kind);
+            rig.answer_early(2, 2, kind);
+            let during = frames_of(kind, early_id(1));
+            assert_eq!(
+                rig.frames(1, during.len()),
+                during,
+                "{kind:?} during the wait"
+            );
+            let other = frames_of(kind, early_id(2));
+            assert_eq!(
+                rig.frames(2, other.len()),
+                other,
+                "{kind:?} for another connection"
+            );
+            assert_eq!(rig.quiet(1), None, "the write is still held");
+
+            rig.journal.store(WireSeq::new(1));
+            assert_eq!(rig.frames(1, 2), write_reply(7), "{kind:?}");
+        }
+
+        /// A gate that blocks on a slot in the middle of an event — the
+        /// cached durable position dropped to 0 by the idle re-check of a
+        /// degraded policy, after the event's first slot went out — sends
+        /// no early reply until the event's terminator has gone.
+        pub(crate) fn a_gate_held_inside_an_event_sends_no_early_reply<H: StageHarness>(
+            start: fn(StageInputs) -> H,
+        ) {
+            let mut rig = rig(start, 1, &[1]);
+            rig.publish(1, 7, 1, false);
+            assert_eq!(
+                rig.frames(1, 1),
+                [Seen::App(KIND_RESP_ACK)],
+                "the first slot"
+            );
+
+            // The replica leaves: the idle re-check finds the policy
+            // degraded and pins the cached position to 0.
+            rig.replica_active.store(false, Ordering::Relaxed);
+            let deadline = Instant::now() + READ_TIMEOUT;
+            while !rig.utilization.policy_degraded.load(Ordering::Relaxed) {
+                assert!(Instant::now() < deadline, "the idle re-check never ran");
+                thread::sleep(Duration::from_millis(5));
+            }
+
+            // The event's last slot is held, and an early reply comes in.
+            rig.publish(1, 7, 1, true);
+            rig.answer_early(1, 0, EarlyKind::Busy);
+            assert_eq!(rig.quiet(1), None, "an early reply inside the held event");
+
+            rig.replica_active.store(true, Ordering::Relaxed);
+            let expected: Vec<Seen> = write_reply(7)
+                .into_iter()
+                .chain(frames_of(EarlyKind::Busy, early_id(0)))
+                .collect();
+            assert_eq!(rig.frames(1, 3), expected);
+        }
+
+        /// A connection the stage first hears of while the gate holds a
+        /// write — its `Connected` and an early reply for it both land
+        /// during the wait — is registered before the reply is sent,
+        /// which is therefore delivered, not dropped as unknown.
+        pub(crate) fn connection_first_seen_inside_a_gate_wait<H: StageHarness>(
+            start: fn(StageInputs) -> H,
+        ) {
+            let mut rig = rig(start, 0, &[1]);
+            rig.publish(1, 7, 1, true);
+            // Proof the stage has reached the held write: an early reply
+            // for connection 1 queued after it is out.
+            rig.answer_early(1, 0, EarlyKind::Busy);
+            assert_eq!(rig.frames(1, 1), frames_of(EarlyKind::Busy, early_id(0)));
+
+            rig.stage.connect(2);
+            let kind = EarlyKind::Rejected(CounterReport::Rejected);
+            rig.answer_early(2, 1, kind);
+            assert_eq!(
+                rig.frames(2, 2),
+                [
+                    Seen::App(KIND_RESP_REJECTED),
+                    Seen::Final(TAG_BATCH_END, early_id(1))
+                ],
+                "dropped: sent before its connection registered"
+            );
+            assert_eq!(rig.quiet(1), None, "the write is still held");
+
+            rig.journal.store(WireSeq::new(1));
+            assert_eq!(rig.frames(1, 2), write_reply(7));
+        }
+
+        /// One step of a [`Script`].
+        #[derive(Clone, Debug)]
+        pub(crate) enum Step {
+            /// An event on `connection` with `slots` reports, its slots
+            /// published one by one. With `straddle`, and more than one
+            /// slot, the test pauses after the first, so the stage may
+            /// read the event in two parts, and queues a busy for the same
+            /// connection in the pause: the reply a stage that sent early
+            /// replies mid-event would split the event with.
+            Event {
+                connection: u64,
+                slots: u8,
+                straddle: bool,
+            },
+            /// An early reply of kind `kind` (an index into
+            /// [`every_kind`]) for `connection`.
+            Early { connection: u64, kind: u8 },
+            /// The journal catches up with every event published so far,
+            /// and the next one: they are released, and the next event's
+            /// slots pass the gate as they come.
+            Open,
+        }
+
+        /// The connections a script's steps are spread over.
+        const SCRIPT_CONNECTIONS: [u64; 3] = [1, 2, 3];
+
+        pub(crate) fn step() -> impl Strategy<Value = Step> {
+            prop_oneof![
+                (1..=3u64, 1..=3u8, any::<bool>()).prop_map(|(connection, slots, straddle)| {
+                    Step::Event {
+                        connection,
+                        slots,
+                        straddle,
+                    }
+                }),
+                (1..=3u64, 0..4u8).prop_map(|(connection, kind)| Step::Early { connection, kind }),
+                Just(Step::Open),
+            ]
+        }
+
+        /// A script: events, early replies and gate releases interleaved
+        /// across connections. Short enough that its slots fit the rig's
+        /// ring while the gate holds all of them.
+        pub(crate) fn script() -> impl Strategy<Value = Vec<Step>> {
+            proptest::collection::vec(step(), 1..24)
+        }
+
+        /// What a request's reply must be, as the client sees it: how many
+        /// `Response` frames come right before its final frame, and which
+        /// final frame.
+        #[derive(Debug, PartialEq, Eq)]
+        struct Owed {
+            responses: usize,
+            final_tag: u8,
+        }
+
+        /// Run `script` against a stage, then release everything, and
+        /// check what each connection received: every request has exactly
+        /// one final frame naming it; its `Response` frames, and only
+        /// them, come right before it (none of another request's frames
+        /// between them); and the replies to published events come in
+        /// the order the events were published.
+        pub(crate) fn every_request_is_answered_once_and_whole<H: StageHarness>(
+            start: fn(StageInputs) -> H,
+            script: &[Step],
+        ) -> Result<(), TestCaseError> {
+            let mut rig = rig(start, 0, &SCRIPT_CONNECTIONS);
+            // Per connection: what each request is owed, and the order
+            // of its published events.
+            let mut owed: HashMap<RequestId, Owed> = HashMap::new();
+            let mut events: BTreeMap<u64, Vec<RequestId>> = BTreeMap::new();
+            let mut expected_frames: BTreeMap<u64, usize> = BTreeMap::new();
+            let mut wire_seq = 0;
+            let mut early_n = 0;
+            // Queue early reply number `early_n` of `kind` for
+            // `connection`, and record what it is owed.
+            let mut answer = |rig: &mut Rig<H>,
+                              owed: &mut HashMap<RequestId, Owed>,
+                              expected_frames: &mut BTreeMap<u64, usize>,
+                              connection: u64,
+                              kind: EarlyKind<CounterReport>| {
+                let frames = frames_of(kind, early_id(early_n));
+                let Some(&Seen::Final(final_tag, _)) = frames.last() else {
+                    unreachable!("every early reply ends in a final frame");
+                };
+                owed.insert(
+                    early_id(early_n),
+                    Owed {
+                        responses: frames.len() - 1,
+                        final_tag,
+                    },
+                );
+                *expected_frames.entry(connection).or_default() += frames.len();
+                rig.answer_early(connection, early_n, kind);
+                early_n += 1;
+            };
+            for step in script {
+                match *step {
+                    Step::Event {
+                        connection,
+                        slots,
+                        straddle,
+                    } => {
+                        wire_seq += 1;
+                        let id = RequestId(wire_seq);
+                        for n in 1..=slots {
+                            rig.publish(connection, id.0, wire_seq, n == slots);
+                            if straddle && n == 1 && slots > 1 {
+                                thread::sleep(Duration::from_millis(2));
+                                answer(
+                                    &mut rig,
+                                    &mut owed,
+                                    &mut expected_frames,
+                                    connection,
+                                    EarlyKind::Busy,
+                                );
+                            }
+                        }
+                        owed.insert(
+                            id,
+                            Owed {
+                                responses: usize::from(slots),
+                                final_tag: TAG_BATCH_END,
+                            },
+                        );
+                        events.entry(connection).or_default().push(id);
+                        *expected_frames.entry(connection).or_default() += usize::from(slots) + 1;
+                    }
+                    Step::Early { connection, kind } => answer(
+                        &mut rig,
+                        &mut owed,
+                        &mut expected_frames,
+                        connection,
+                        every_kind()[usize::from(kind)],
+                    ),
+                    Step::Open => rig.journal.store(WireSeq::new(wire_seq + 1)),
+                }
+            }
+            rig.journal.store(WireSeq::new(wire_seq + 1));
+
+            for connection in SCRIPT_CONNECTIONS {
+                let count = expected_frames.get(&connection).copied().unwrap_or(0);
+                let frames = rig.frames(connection, count);
+                prop_assert_eq!(
+                    frames.len(),
+                    count,
+                    "connection {} got {:?}",
+                    connection,
+                    frames
+                );
+                prop_assert_eq!(
+                    rig.quiet(connection),
+                    None,
+                    "more than owed on {}",
+                    connection
+                );
+
+                let mut responses = 0;
+                let mut answered = Vec::new();
+                for frame in &frames {
+                    match *frame {
+                        Seen::App(_) => responses += 1,
+                        Seen::Final(tag, id) => {
+                            let owed = owed.remove(&id);
+                            prop_assert_eq!(
+                                owed,
+                                Some(Owed {
+                                    responses,
+                                    final_tag: tag
+                                }),
+                                "request {:?} on {}: {:?}",
+                                id,
+                                connection,
+                                frames
+                            );
+                            answered.push(id);
+                            responses = 0;
+                        }
+                        Seen::Protocol(tag) => {
+                            prop_assert!(false, "an unexpected frame {tag:#x} on {connection}")
+                        }
+                    }
+                }
+                prop_assert_eq!(
+                    responses,
+                    0,
+                    "responses with no final frame on {}",
+                    connection
+                );
+                let published: Vec<RequestId> =
+                    answered.into_iter().filter(|id| id.0 <= wire_seq).collect();
+                prop_assert_eq!(
+                    published,
+                    events.remove(&connection).unwrap_or_default(),
+                    "replies to published events out of order on {}",
+                    connection
+                );
+            }
+            prop_assert!(owed.is_empty(), "never answered: {owed:?}");
+            Ok(())
+        }
+
+        /// The kernel stage under test, read through a socket per client.
+        pub(crate) struct UringStage {
+            control: mpsc::Sender<ControlEvent>,
+            clients: HashMap<u64, UnixStream>,
+            shutdown: Arc<AtomicBool>,
+            handle: Option<JoinHandle<bool>>,
+        }
+
+        pub(crate) fn start_uring(inputs: StageInputs) -> UringStage {
+            let (control, control_rx) = mpsc::channel();
+            let mut config = config(
+                inputs.journal,
+                Arc::new(FenceState::new(0)),
+                inputs.early_replies,
+                None,
+            );
+            config.policy.start = crate::response::GateStart::settled(AckPolicy::DiskAndRam);
+            config.replication_metrics = Some(inputs.replication_metrics);
+            config.replica_active = Some(inputs.replica_active);
+            config.utilization = inputs.utilization;
+            let shutdown = Arc::clone(&inputs.shutdown);
+            let consumer = inputs.consumer;
+            let handle =
+                thread::spawn(move || run::<Counter>(consumer, control_rx, config, &shutdown));
+            UringStage {
+                control,
+                clients: HashMap::new(),
+                shutdown: inputs.shutdown,
+                handle: Some(handle),
+            }
+        }
+
+        impl StageHarness for UringStage {
+            fn connect(&mut self, connection_id: u64) {
+                let (event, client) = connection(connection_id);
+                self.control.send(event).expect("the stage is running");
+                self.clients.insert(connection_id, client);
+            }
+
+            fn next_frame(&mut self, connection_id: u64, within: Duration) -> Option<Seen> {
+                let client = self.clients.get_mut(&connection_id)?;
+                client
+                    .set_read_timeout(Some(within))
+                    .expect("set read timeout");
+                read_frame(client).ok()
+            }
+        }
+
+        impl Drop for UringStage {
+            fn drop(&mut self) {
+                self.shutdown.store(true, Ordering::Relaxed);
+                if let Some(handle) = self.handle.take() {
+                    // Joined only to surface a panic; while unwinding
+                    // from a failed assertion, another panic would abort.
+                    if handle.join().is_err() && !thread::panicking() {
+                        panic!("the stage panicked");
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn an_early_reply_waits_out_an_event_split_across_reads_uring() {
+            an_early_reply_waits_out_an_event_split_across_reads(start_uring);
+        }
+
+        #[test]
+        fn early_replies_overtake_a_held_write_uring() {
+            for kind in every_kind() {
+                early_replies_overtake_a_held_write(start_uring, kind);
+            }
+        }
+
+        #[test]
+        fn a_gate_held_inside_an_event_sends_no_early_reply_uring() {
+            a_gate_held_inside_an_event_sends_no_early_reply(start_uring);
+        }
+
+        #[test]
+        fn connection_first_seen_inside_a_gate_wait_uring() {
+            connection_first_seen_inside_a_gate_wait(start_uring);
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(24))]
+            #[test]
+            fn every_request_is_answered_once_and_whole_uring(script in script()) {
+                every_request_is_answered_once_and_whole(start_uring, &script)?;
+            }
+        }
+    }
+
     /// A halted node past the grace period answers a held write once its
     /// own journal holds it, ending in `BatchEndDegraded`, and the
-    /// refusals around it keep their place and end in a plain `BatchEnd`.
-    /// With the switch off the held write, and the refusal behind it, wait.
+    /// refusals around it, which wait for nothing, end in a plain
+    /// `BatchEnd`. With the switch off the held write waits; the refusals
+    /// still do not.
     mod degraded_release {
-        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::{Arc, mpsc};
         use std::thread;
         use std::time::Duration;
@@ -4195,7 +5068,6 @@ pub(crate) mod tests {
         use counter_server::{
             Counter, CounterQuery, CounterReport, KIND_RESP_ACK, KIND_RESP_REJECTED,
         };
-        use melin_pipeline::padding::CachePadded;
         use melin_pipeline::ring::DisruptorBuilder;
         use melin_pipeline::wait::WaitStrategy;
         use melin_transport_core::fence::FenceState;
@@ -4212,9 +5084,9 @@ pub(crate) mod tests {
 
         /// Run a stage under `disk+ram` on a primary whose one replica is
         /// gone, with degraded release `on` (no grace) or off, holding one
-        /// write the primary's journal already holds between two
-        /// refusals. Returns what the client read before `quiet` passed
-        /// with nothing more.
+        /// write the primary's journal already holds, with two refusals
+        /// queued. Returns what the client read before `quiet` passed with
+        /// nothing more.
         fn run_halted(on: bool, quiet: Duration) -> Vec<Seen> {
             let (mut producer, mut consumers) =
                 DisruptorBuilder::<OutputSlot<CounterReport, CounterQuery>>::new(64)
@@ -4222,8 +5094,7 @@ pub(crate) mod tests {
                     .build(WaitStrategy::SpinThenYield);
             let consumer = consumers.pop().expect("one consumer was requested");
             let (connected, mut client) = connection(1);
-            let matching_progress = Arc::new(CachePadded::new(AtomicU64::new(0)));
-            let (mut refusals, refusal_rx) = early_reply_channel(Arc::clone(&matching_progress));
+            let (mut refusals, refusal_rx) = early_reply_channel();
 
             let journal_cursor = DurableWireSeqCursor::detached(WireSeq::new(1));
             let mut config = config(
@@ -4261,7 +5132,6 @@ pub(crate) mod tests {
                 is_last_in_request: true,
                 ..Default::default()
             });
-            matching_progress.get().store(1, Ordering::Release);
 
             let shutdown = AtomicBool::new(false);
             let mut seen = Vec::new();
@@ -4290,25 +5160,27 @@ pub(crate) mod tests {
                 [
                     Seen::App(KIND_RESP_REJECTED),
                     Seen::Final(TAG_BATCH_END, early_id(0)),
-                    Seen::App(KIND_RESP_ACK),
-                    Seen::Final(TAG_BATCH_END_DEGRADED, HELD),
                     Seen::App(KIND_RESP_REJECTED),
                     Seen::Final(TAG_BATCH_END, early_id(1)),
+                    Seen::App(KIND_RESP_ACK),
+                    Seen::Final(TAG_BATCH_END_DEGRADED, HELD),
                 ],
-                "in request order, only the held write marked"
+                "the refusals first, waiting for nothing; only the held write marked"
             );
         }
 
         #[test]
-        fn with_the_switch_off_the_held_write_and_the_refusal_behind_it_wait() {
+        fn with_the_switch_off_the_held_write_waits_and_the_refusals_do_not() {
             let seen = run_halted(false, Duration::from_millis(300));
             assert_eq!(
                 seen,
                 [
                     Seen::App(KIND_RESP_REJECTED),
-                    Seen::Final(TAG_BATCH_END, early_id(0))
+                    Seen::Final(TAG_BATCH_END, early_id(0)),
+                    Seen::App(KIND_RESP_REJECTED),
+                    Seen::Final(TAG_BATCH_END, early_id(1)),
                 ],
-                "only the refusal ahead of the held write goes out"
+                "both refusals go out; the held write does not"
             );
         }
     }
@@ -4320,13 +5192,12 @@ pub(crate) mod tests {
     /// the held reply, which the policy never confirmed. A fence co-sets
     /// shutdown and takes the same exit.
     mod stop_while_gated {
-        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::{Arc, mpsc};
         use std::thread;
         use std::time::{Duration, Instant};
 
         use counter_server::{Counter, CounterQuery, CounterReport, KIND_RESP_ACK};
-        use melin_pipeline::padding::CachePadded;
         use melin_pipeline::ring::DisruptorBuilder;
         use melin_pipeline::wait::WaitStrategy;
         use melin_transport_core::fence::FenceState;
@@ -4355,8 +5226,7 @@ pub(crate) mod tests {
             // The journal confirms the first event and never the second.
             let journal_cursor = DurableWireSeqCursor::detached(WireSeq::new(1));
             let fence = Arc::new(FenceState::new(0));
-            let early_replies =
-                early_reply_channel(Arc::new(CachePadded::new(AtomicU64::new(0)))).1;
+            let early_replies = early_reply_channel().1;
             let config = config(journal_cursor, Arc::clone(&fence), early_replies, None);
             for wire_seq in [1, 2] {
                 producer.publish(OutputSlot {
@@ -4437,14 +5307,13 @@ pub(crate) mod tests {
         use std::io::ErrorKind;
         use std::os::unix::io::AsRawFd;
         use std::os::unix::net::UnixStream;
-        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::{Arc, mpsc};
         use std::thread;
         use std::time::{Duration, Instant};
 
         use counter_server::{Counter, CounterQuery, CounterReport, KIND_RESP_ACK};
         use melin_journal::AckPolicyChange;
-        use melin_pipeline::padding::CachePadded;
         use melin_pipeline::ring::DisruptorBuilder;
         use melin_pipeline::wait::WaitStrategy;
         use melin_transport_core::fence::FenceState;
@@ -4509,8 +5378,7 @@ pub(crate) mod tests {
             // Everything up to the reply after the change is on disk; a
             // standalone stage cannot satisfy `two-disks` at all.
             let journal_cursor = DurableWireSeqCursor::detached(WireSeq::new(3));
-            let early_replies =
-                early_reply_channel(Arc::new(CachePadded::new(AtomicU64::new(0)))).1;
+            let early_replies = early_reply_channel().1;
             let mut config = config(
                 journal_cursor.clone(),
                 Arc::new(FenceState::new(0)),
@@ -4594,11 +5462,10 @@ pub(crate) mod tests {
     /// runs, so the node can refuse to start instead of losing the stage
     /// to a panic on a thread nobody is watching.
     mod startup_report {
-        use std::sync::atomic::{AtomicBool, AtomicU64};
+        use std::sync::atomic::AtomicBool;
         use std::sync::{Arc, mpsc};
 
         use counter_server::{Counter, CounterQuery, CounterReport};
-        use melin_pipeline::padding::CachePadded;
         use melin_pipeline::ring::DisruptorBuilder;
         use melin_pipeline::wait::WaitStrategy;
         use melin_transport_core::fence::FenceState;
@@ -4622,8 +5489,7 @@ pub(crate) mod tests {
                     .build(WaitStrategy::SpinThenYield);
             let consumer = consumers.pop().expect("one consumer was requested");
             let (_control_tx, control_rx) = mpsc::channel();
-            let early_replies =
-                early_reply_channel(Arc::new(CachePadded::new(AtomicU64::new(0)))).1;
+            let early_replies = early_reply_channel().1;
             let (ready_tx, ready_rx) = mpsc::sync_channel(1);
             let mut config = config(
                 DurableWireSeqCursor::detached(WireSeq::new(0)),

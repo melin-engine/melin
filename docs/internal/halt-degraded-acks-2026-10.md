@@ -235,14 +235,16 @@ shadow stage's state) that the former item listed. That path gives a
 fully confirmed but stale answer at the cost of a second read path. The
 degraded answer is current, marked, and needs no new path.
 
-### 4. Refusals stop waiting as a consequence
+### 4. Refusals stop waiting
 
-Refusals keep their place in each connection's order. They no longer
-wait for the halt because the slots ahead of them now drain after one
-primary fsync instead of waiting for a replica. The per-connection
-release designs listed in the former item (a refusal released from inside
-the gate wait, or a stage that parks gated replies per connection) are
-then unnecessary.
+*Superseded by decision 6 of the [request-ID plan](request-ids-2026-10.md)
+(its step 3).* This decision kept refusals in each connection's order and
+argued they stopped waiting for the halt because the slots ahead of them
+now drained after one primary fsync. Since every final frame names its
+request, a refusal no longer keeps any place: it is an early reply, sent
+at the first point between two events' replies, including from inside a
+gate wait, so it never waits for a write the ack policy holds, with
+degraded release on or off.
 
 A refusal always ends in a plain `BatchEnd`, never `BatchEndDegraded`.
 It never enters the output ring and is never gated: it is a definite

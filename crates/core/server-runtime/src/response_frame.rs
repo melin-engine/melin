@@ -211,7 +211,6 @@ mod tests {
         let reply = EarlyReply {
             connection_id: 7,
             request_id: RequestId(42),
-            input_seq: 0,
             kind,
         };
         let n = encode_early_reply(&reply, encoder, &mut buf);

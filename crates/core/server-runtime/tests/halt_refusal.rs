@@ -23,6 +23,8 @@
 
 #[path = "common/halt_cluster.rs"]
 mod halt_cluster;
+#[path = "common/raw_replica.rs"]
+mod raw_replica;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,13 +33,14 @@ use std::time::{Duration, Instant};
 use counter_server::{
     GET_VALUE_REQUEST, KIND_RESP_ACK, KIND_RESP_REJECTED, KIND_RESP_VALUE, increment_request,
 };
-use melin_client::{Ack, Connection, Frame};
+use melin_client::{Ack, Connection, Error, Frame};
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
-use melin_test_node::probe::{gauge, wait_for_gauge};
+use melin_test_node::probe::{gauge, wait_for_gauge, wait_for_gauge_where};
 
 use halt_cluster::{Fixture, addrs, spawn_node};
+use raw_replica::RawReplica;
 
 /// Send one request and return the single frame of its reply.
 fn one_reply(conn: &mut Connection, body: &[u8]) -> Vec<u8> {
@@ -141,6 +144,93 @@ fn a_write_refused_while_halted_is_not_replayed() {
     assert_eq!(
         replayed, 6,
         "replay applied a write the halted primary refused"
+    );
+}
+
+/// A refusal waits for nothing: a write the ack policy holds does not hold
+/// back the refusal of a later write on the same connection (finding 18
+/// of the determinism audit, end to end).
+///
+/// A primary under `disk+ram`, with degraded acks off, and a replica
+/// written by hand that streams, acks the catch-up, and then acks nothing
+/// more: the client's write W1 is applied and held by the gate. The
+/// replica leaves, halting the node; a write W2 on the same connection is
+/// refused, and its refusal arrives while W1 is still held.
+#[test]
+fn a_refusal_overtakes_a_held_write() {
+    /// How long the scripted replica waits for a frame its primary owes.
+    const FRAME_LIMIT: Duration = Duration::from_secs(10);
+    /// How long W1 is watched for once W2 is answered: long enough that a
+    /// gate wrongly opened would have released it.
+    const HELD: Duration = Duration::from_millis(500);
+
+    let fx = Fixture::new(0xA1);
+    let primary_addrs = addrs(0);
+    let mut primary_config = fx.primary_config(&primary_addrs, AckPolicy::DiskAndRam);
+    // A halted primary would otherwise release W1 on its own disk once
+    // the grace period passed.
+    primary_config.no_degraded_acks = true;
+    let health = primary_config.health_bind.expect("set by the fixture");
+    let primary = spawn_node(&primary_addrs, primary_config);
+
+    // Up, so its replication endpoint is listening; then the replica,
+    // caught up and acked, so the node takes writes and holds only W1.
+    wait_for_gauge(health, "melin_replicas_connected", 0);
+    let mut replica = RawReplica::join(primary_addrs.replication(), &fx.replica_key, FRAME_LIMIT);
+    wait_for_gauge(health, "melin_replicas_connected", 1);
+    let head = gauge(health, "melin_journal_sequence").expect("the primary's sequence");
+    let caught_up = replica.read_through(head);
+    replica.ack(caught_up);
+
+    let mut conn = fx.client(&primary);
+    conn.set_read_timeout(FRAME_LIMIT)
+        .expect("set the read timeout");
+    let processed = gauge(health, "melin_events_processed").expect("the events processed");
+    let w1 = conn.send(&increment_request(1)).expect("send W1");
+    wait_for_gauge_where(health, "melin_events_processed", "applied W1", |v| {
+        v > processed
+    });
+    let written = wait_for_gauge_where(health, "melin_journal_sequence", "journaled W1", |v| {
+        v > caught_up
+    });
+    replica.read_through(written);
+
+    // The replica leaves without acking W1: the node halts.
+    drop(replica);
+    wait_for_gauge(health, "melin_replicas_connected", 0);
+
+    let w2 = conn.send(&increment_request(5)).expect("send W2");
+    let first = match conn.next_frame() {
+        Ok(Frame::Response(body)) => Ok(body[0]),
+        other => Err(format!("{other:?}")),
+    };
+    let second = conn.next_frame().map_err(|e| e.to_string());
+    let refusal = (first, second.map(|frame| format!("{frame:?}")));
+    conn.set_read_timeout(HELD).expect("set the read timeout");
+    let w1_meanwhile = match conn.next_frame() {
+        Err(Error::NoReply { .. }) => None,
+        other => Some(format!("{other:?}")),
+    };
+    drop(conn);
+    primary.stop();
+
+    assert_eq!(
+        refusal,
+        (
+            Ok(KIND_RESP_REJECTED),
+            Ok(format!(
+                "{:?}",
+                Frame::BatchEnd {
+                    id: w2,
+                    ack: Ack::Policy
+                }
+            ))
+        ),
+        "W2's refusal, ending in a batch end naming W2, ahead of W1's reply"
+    );
+    assert_eq!(
+        w1_meanwhile, None,
+        "W1 ({w1:?}) was answered though no replica holds it"
     );
 }
 

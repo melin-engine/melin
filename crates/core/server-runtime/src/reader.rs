@@ -1686,27 +1686,25 @@ mod tests {
         (disconnect, released(&mut queue))
     }
 
-    /// Every early reply visible on `queue`, oldest first.
+    /// Every early reply visible on `queue`, oldest first: what the
+    /// response stage would send, with no flush on the reader's side
+    /// after the call that queued them.
     fn released(
         queue: &mut crate::halt::EarlyReplyQueue<TestReport>,
     ) -> Vec<EarlyReply<TestReport>> {
+        let boundary = crate::batch_boundary::BatchBoundary::new();
+        let at = boundary.at_boundary().expect("between events");
         let mut out = Vec::new();
-        queue.sync();
-        queue.release(u64::MAX, |reply| out.push(reply));
+        queue.register(|| {}).drain(&at, |reply| out.push(reply));
         out
     }
 
     /// The early reply the fixture connection (id 7) gets for request
-    /// `id`, stamped `input_seq`.
-    fn early_reply(
-        id: RequestId,
-        input_seq: u64,
-        kind: EarlyKind<TestReport>,
-    ) -> EarlyReply<TestReport> {
+    /// `id`.
+    fn early_reply(id: RequestId, kind: EarlyKind<TestReport>) -> EarlyReply<TestReport> {
         EarlyReply {
             connection_id: 7,
             request_id: id,
-            input_seq,
             kind,
         }
     }
@@ -1863,15 +1861,12 @@ mod tests {
         (handle, consumer, control)
     }
 
-    /// An early-reply queue whose idle bound is never consulted by these
-    /// tests.
+    /// An early-reply queue.
     fn early_channel() -> (
         EarlyReplySender<TestReport>,
         crate::halt::EarlyReplyQueue<TestReport>,
     ) {
-        crate::halt::early_reply_channel(Arc::new(melin_pipeline::padding::CachePadded::new(
-            std::sync::atomic::AtomicU64::new(0),
-        )))
+        crate::halt::early_reply_channel()
     }
 
     /// [`run_process_frames`] against a given halt gate and early-reply
@@ -2016,9 +2011,8 @@ mod tests {
         }
     }
 
-    /// A halted reader publishes no write: each is refused, stamped with
-    /// the input sequence it would have taken, while queries still go
-    /// through. Nothing refused can reach the journal, so replay cannot
+    /// A halted reader publishes no write: each is refused under its ID,
+    /// while queries still go through. Nothing refused can reach the journal, so replay cannot
     /// apply a write the client was told failed.
     #[test]
     fn a_halted_reader_refuses_writes_before_publishing_and_still_publishes_queries() {
@@ -2062,17 +2056,16 @@ mod tests {
             "only the queries enter the pipeline"
         );
 
-        let expect = |input_seq, byte| {
+        let expect = |byte| {
             early_reply(
                 id_of(byte),
-                input_seq,
                 EarlyKind::Rejected((TestEvent::Cmd(byte), RejectReason::ReplicaDisconnected)),
             )
         };
         assert_eq!(
             released(&mut queue),
-            [expect(0, 0x01), expect(1, 0x02)],
-            "each write is stamped with its ID and the sequence of the query that followed it"
+            [expect(0x01), expect(0x02)],
+            "each write is answered under its ID"
         );
     }
 
@@ -2104,7 +2097,7 @@ mod tests {
             drain(&mut consumer).is_empty(),
             "not even the query is published"
         );
-        assert!(!queue.sync(), "no early reply is queued");
+        assert!(released(&mut queue).is_empty(), "no early reply is queued");
         assert_eq!(refused_count(&counted), 0);
     }
 
@@ -2141,7 +2134,7 @@ mod tests {
             conn.parse_buf.extend_from_slice(&frame(byte));
             conn.parse_buf.extend_from_slice(&frame(0x03));
             let (mut early, mut queue) = early_channel();
-            let filler = early_reply(RequestId(0), 0, EarlyKind::Busy);
+            let filler = early_reply(RequestId(0), EarlyKind::Busy);
             let mut filled = 0;
             while early.try_send(filler).is_ok() {
                 filled += 1;
@@ -2178,6 +2171,76 @@ mod tests {
                 "byte {byte:#04x}: nothing more was queued"
             );
             assert!(queued.iter().all(|reply| *reply == filler));
+        }
+    }
+
+    /// Whatever the call returns, every early reply it staged is visible
+    /// to the response stage by then: the queue is flushed on every way
+    /// out, and nothing here flushes it after the call (`released` reads
+    /// it as the stage does). One case per way out: every frame
+    /// processed, a stop at a full ring, and a close on a frame that is
+    /// not a request and on an oversized prefix, each after an answer was
+    /// staged. A close on a full queue is
+    /// `a_full_early_reply_queue_is_disconnect`, whose unflushed filler is
+    /// visible after it; a fenced node stages nothing.
+    #[test]
+    fn every_way_out_leaves_the_early_replies_it_staged_visible() {
+        let refused = |byte: u8| {
+            early_reply(
+                id_of(byte),
+                EarlyKind::Refused {
+                    kind: if byte == 0xFD {
+                        RefusalKind::PermissionDenied
+                    } else {
+                        RefusalKind::Malformed
+                    },
+                    reason: if byte == 0xFD { "denied" } else { "bad" },
+                },
+            )
+        };
+        // (case, ring capacity, frames, whether it closes, what it stages)
+        let cases = [
+            (
+                "every frame processed",
+                16,
+                vec![frame(0xFC), frame(0x01)],
+                false,
+                vec![early_reply(id_of(0xFC), EarlyKind::Filtered)],
+            ),
+            (
+                "a full ring",
+                2,
+                vec![frame(0xFD), frame(0x01), frame(0x02), frame(0x03)],
+                false,
+                vec![refused(0xFD), early_reply(id_of(0x03), EarlyKind::Busy)],
+            ),
+            (
+                "a frame that is not a request",
+                16,
+                vec![frame(0xFE), tagged_frame(0x00, &[0x03; 9])],
+                true,
+                vec![refused(0xFE)],
+            ),
+            (
+                "an oversized prefix",
+                16,
+                vec![frame(0xFC), oversize_prefix().to_vec()],
+                true,
+                vec![early_reply(id_of(0xFC), EarlyKind::Filtered)],
+            ),
+        ];
+        for (case, capacity, frames, closes, expected) in cases {
+            let Fixture {
+                mut conn,
+                mut producer,
+                ..
+            } = make_fixture(capacity);
+            for frame in frames {
+                conn.parse_buf.extend_from_slice(&frame);
+            }
+            let (disconnect, early) = run_process_frames(&mut conn, &mut producer);
+            assert_eq!(disconnect, closes, "{case}");
+            assert_eq!(early, expected, "{case}");
         }
     }
 
@@ -2304,9 +2367,8 @@ mod tests {
         // 6th is never reached because the loop breaks on Full. Validates:
         //   * `Err(Full)` does not roll back the prior 4.
         //   * The frame that triggered Full is answered `Busy`, with its
-        //     ID, stamped with the sequence it would have taken — its
-        //     bytes are compacted out of `parse_buf` along with every
-        //     earlier frame — and the connection is kept.
+        //     ID — its bytes are compacted out of `parse_buf` along with
+        //     every earlier frame — and the connection is kept.
         //   * The busy goes to the response stage through the early-reply
         //     queue, and nothing is written to the socket from here.
         let Fixture {
@@ -2338,7 +2400,7 @@ mod tests {
         // (audit review F3).
         assert_eq!(
             early,
-            [early_reply(id_of(0x05), 4, EarlyKind::Busy)],
+            [early_reply(id_of(0x05), EarlyKind::Busy)],
             "exactly one busy, for the frame that met the full ring"
         );
         assert!(
@@ -2420,7 +2482,7 @@ mod tests {
         );
         assert_eq!(
             early,
-            [early_reply(id_of(0x03), 2, EarlyKind::Busy)],
+            [early_reply(id_of(0x03), EarlyKind::Busy)],
             "busy notice routed to response stage"
         );
         // Nothing beyond the pre-fill junk arrives: drain it, then the
@@ -2476,8 +2538,8 @@ mod tests {
     }
 
     /// Each decoder outcome that publishes nothing yields its early reply,
-    /// with the frame's ID and the sequence it would have taken, in order
-    /// among the published frames around them; all bytes are consumed.
+    /// with the frame's ID, in order among the other early replies; all
+    /// bytes are consumed.
     #[test]
     fn each_decoder_outcome_yields_its_early_reply_with_the_frames_id() {
         // Mixed batch: Permitted, Filter, PermissionDenied, DecodeError,
@@ -2503,10 +2565,9 @@ mod tests {
         assert_eq!(
             early,
             [
-                early_reply(id_of(0xFC), 1, EarlyKind::Filtered),
+                early_reply(id_of(0xFC), EarlyKind::Filtered),
                 early_reply(
                     id_of(0xFD),
-                    1,
                     EarlyKind::Refused {
                         kind: RefusalKind::PermissionDenied,
                         reason: "denied"
@@ -2514,7 +2575,6 @@ mod tests {
                 ),
                 early_reply(
                     id_of(0xFE),
-                    1,
                     EarlyKind::Refused {
                         kind: RefusalKind::Malformed,
                         reason: "bad"
@@ -2522,7 +2582,6 @@ mod tests {
                 ),
                 early_reply(
                     RequestId(99),
-                    2,
                     EarlyKind::Refused {
                         kind: RefusalKind::Malformed,
                         reason: "empty body"
@@ -2584,7 +2643,7 @@ mod tests {
             assert_eq!(events.len(), 1, "{bad:?}");
             assert_eq!(events[0].1.event, JournalEvent::App(TestEvent::Cmd(0x01)));
             // The answer decided before it is still sent.
-            assert_eq!(early, [early_reply(id_of(0xFC), 1, EarlyKind::Filtered)]);
+            assert_eq!(early, [early_reply(id_of(0xFC), EarlyKind::Filtered)]);
         }
     }
 

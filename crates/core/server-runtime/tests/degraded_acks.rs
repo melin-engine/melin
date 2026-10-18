@@ -11,13 +11,14 @@
 //! - the writes in flight are answered once the grace period has passed,
 //!   ending in `BatchEndDegraded`, never before it and never in full;
 //! - later writes are refused (`ReplicaDisconnected`), in a plain
-//!   `BatchEnd`, and keep their place behind the held writes;
+//!   `BatchEnd`, at once: a refusal waits for no held write;
 //! - a query answers, marked degraded, since the state it reads holds
 //!   writes no replica confirmed;
 //! - a replica that returns within the grace period confirms everything
 //!   in full, and nothing is marked;
 //! - with degraded acks switched off, nothing held is answered until the
-//!   replica returns, as before degraded acks existed.
+//!   replica returns, as before degraded acks existed; a refusal still
+//!   is.
 //!
 //! Nodes are started through `melin-test-node`: on kernel TCP by default,
 //! on DPDK with this crate's `dpdk` feature, under
@@ -219,8 +220,7 @@ fn run(policy: AckPolicy, scenario: Scenario) {
 
     let restore_at = match scenario {
         Scenario::Degraded => {
-            // A later write is refused, behind the held writes, in a
-            // plain BatchEnd.
+            // A later write is refused, in a plain BatchEnd.
             let refused = ask(&fx, &primary, &increment_request(1), READ_TIMEOUT)
                 .expect("the refusal is answered");
             assert_eq!(refused.kind, KIND_RESP_REJECTED);
@@ -241,24 +241,15 @@ fn run(policy: AckPolicy, scenario: Scenario) {
             Instant::now()
         }
         Scenario::ReturnsWithinGrace => {
-            // Refused while the replica is gone, and answered — behind the
-            // held writes — once it is back.
+            // Refused while the replica is gone, and answered then: the
+            // held writes do not hold the refusal back.
             let mut refused = fx.client(&primary);
             refused
                 .set_read_timeout(READ_TIMEOUT)
                 .expect("set the read timeout");
-            // The writers are all waiting on held replies by now, so
-            // nothing else is refused meanwhile.
-            let refused_before = gauge(health, "melin_writes_refused_total").expect("health is up");
             let refused_id = refused
                 .send(&increment_request(1))
                 .expect("send the write the halt refuses");
-            // The refusal is decided on arrival: wait for the reader to
-            // count it before the replica may come back.
-            wait_for_gauge(health, "melin_writes_refused_total", refused_before + 1);
-            let restore_at = Instant::now();
-            proxy.restore();
-            wait_for_gauge(health, "melin_replicas_connected", 1);
             match refused.next_frame() {
                 Ok(Frame::Response(body)) => assert_eq!(body[0], KIND_RESP_REJECTED),
                 other => panic!("expected the refusal, got {other:?}"),
@@ -270,20 +261,31 @@ fn run(policy: AckPolicy, scenario: Scenario) {
                     ack: Ack::Policy
                 }
             );
+            assert_eq!(
+                gauge(health, "melin_replicas_connected"),
+                Some(0),
+                "the refusal was answered while the replica was gone"
+            );
+            let restore_at = Instant::now();
+            proxy.restore();
+            wait_for_gauge(health, "melin_replicas_connected", 1);
             let query = ask(&fx, &primary, &GET_VALUE_REQUEST, READ_TIMEOUT)
                 .expect("the query is answered");
             assert_eq!(query.ack, Ack::Policy, "confirmed in full");
             restore_at
         }
         Scenario::SwitchedOff => {
-            // Past the grace degraded acks would have used, the refusal
-            // and the query still wait behind the held writes.
+            // A refusal waits for no held write, the switch off or on.
+            let refused = ask(&fx, &primary, &increment_request(1), READ_TIMEOUT)
+                .expect("the refusal is answered while halted");
+            assert_eq!(refused.kind, KIND_RESP_REJECTED);
+            assert_eq!(refused.ack, Ack::Policy, "a refusal is never marked");
+            // Past the grace degraded acks would have used, the query
+            // still waits behind the held writes.
             let silence = DEFAULT_GRACE + Duration::from_secs(1);
-            for body in [&increment_request(1)[..], &GET_VALUE_REQUEST] {
-                match ask(&fx, &primary, body, silence) {
-                    Err(Error::NoReply { .. }) => {}
-                    other => panic!("answered while halted with the switch off: {other:?}"),
-                }
+            match ask(&fx, &primary, &GET_VALUE_REQUEST, silence) {
+                Err(Error::NoReply { .. }) => {}
+                other => panic!("answered while halted with the switch off: {other:?}"),
             }
             let restore_at = Instant::now();
             proxy.restore();
@@ -418,16 +420,16 @@ fn two_disks_a_replica_back_within_the_grace_confirms_in_full() {
 }
 
 #[test]
-fn ram_switched_off_holds_everything_until_the_replica_returns() {
+fn ram_switched_off_holds_the_held_writes_until_the_replica_returns() {
     run(AckPolicy::Ram, Scenario::SwitchedOff);
 }
 
 #[test]
-fn disk_and_ram_switched_off_holds_everything_until_the_replica_returns() {
+fn disk_and_ram_switched_off_holds_the_held_writes_until_the_replica_returns() {
     run(AckPolicy::DiskAndRam, Scenario::SwitchedOff);
 }
 
 #[test]
-fn two_disks_switched_off_holds_everything_until_the_replica_returns() {
+fn two_disks_switched_off_holds_the_held_writes_until_the_replica_returns() {
     run(AckPolicy::TwoDisks, Scenario::SwitchedOff);
 }

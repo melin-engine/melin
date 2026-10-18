@@ -119,6 +119,19 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   longer rides the control channel. A full early-reply queue now closes
   the connection whose answer has nowhere to go, where a full refusal
   queue answered `ServerBusy`.
+- **An early reply no longer waits for the replies to earlier
+  requests.** A request the node answers without applying it (a write
+  refused while halted, a request the decoder refuses or filters, one
+  shed on a full input ring) is answered at the first point between two
+  requests' replies, even while the ack policy holds a write the same
+  client sent before it: its final frame names it, so the client pairs it
+  by ID. Replies to requests the node accepted still arrive in request
+  order, and nothing falls inside another request's reply. In
+  `melin-server-runtime`'s `halt` module, `early_reply_channel` takes no
+  argument (it took the matching stage's progress), `EarlyReply` loses
+  its `input_seq`, and `EarlyReplyQueue`'s `idle_bound`, `sync` and
+  `release` are gone: the response stages read the queue through the
+  crate's own types, which only send it between two requests' replies.
 
 ### Removed
 
@@ -139,7 +152,14 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   lands inside another request's reply** (finding 18 of the determinism
   audit). It went out of band, on the response stage's control channel,
   ahead of replies still in the output ring; it is now an early reply
-  like a halt refusal, released in request order.
+  like a halt refusal, naming its request, sent only between two
+  requests' replies.
+- **A refusal no longer waits behind a write the ack policy holds**
+  (finding 18 of the determinism audit). A halt refusal, and with request
+  IDs every other answer a node gives without applying a request, waited
+  for the replies to everything the client had sent before it; with
+  degraded acks off, behind a write held for a replica that had gone, it
+  waited until a replica came back or the operator swapped the policy.
 - **A DPDK node keeps a connection whose request finds the input ring
   full**, answering it `ServerBusy` as the kernel transport does. It used
   to close the connection, throwing away the replies to writes already

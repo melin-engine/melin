@@ -20,10 +20,11 @@ use melin_pipeline::ring;
 use melin_pipeline::spsc;
 use melin_pipeline::wait::WaitStrategy;
 
+use crate::batch_boundary::{AtBoundary, BatchBoundary};
 use crate::durability_gate::{
-    Admission, Backing, BatchEnds, DurabilityGate, GateInputs, GatePolicy,
+    Admission, Backing, BatchEnds, DurabilityGate, GateInputs, GatePolicy, GateWait,
 };
-use crate::halt::EarlyReplyQueue;
+use crate::halt::{EarlyReplyQueue, Registered};
 use melin_app::Application;
 use melin_app::amortized_timer::AmortizedTimer;
 use melin_transport_core::DurableWireSeqCursor;
@@ -134,7 +135,7 @@ pub fn run<A: Application>(
     encoder: crate::response::ResponseEncoderArc<A>,
     // The answers the poll thread decided on without publishing the
     // request (halt rejections, filtered, refused and shed requests),
-    // each sent once everything published before it is answered — see
+    // each sent at the first point between two events' replies — see
     // `crate::halt`.
     mut early_replies: EarlyReplyQueue<A::Report>,
     // Release of held replies on this node's own fsync while halted;
@@ -187,9 +188,9 @@ pub fn run<A: Application>(
     let mut waiter = wait.waiter();
     let mut busy_count: u64 = 0;
     let mut idle_count: u64 = 0;
-    // Input sequence of the last output slot handled — early replies are
-    // released only where it changes. See `response::run`.
-    let mut last_input_seq = u64::MAX;
+    // Whether the stage stands between two events' replies, the only
+    // place early replies may go. See `response::run`.
+    let mut boundary = BatchBoundary::new();
 
     // Stage histograms — mirror the TCP response stage but without
     // an `egress` histogram. DPDK egress lives in the poll thread
@@ -233,42 +234,41 @@ pub fn run<A: Application>(
         // Borrow output slots from the matching stage in place — see
         // `response::run` for why this is a borrow and not a copy, and
         // for the consequence of publishing progress after the batch
-        // instead of before it. Early replies follow the order
-        // `EarlyReplyQueue` documents: the idle bound before the read, the
-        // sync between the read and the control drain.
-        let idle_early_bound = early_replies.idle_bound();
+        // instead of before it.
         let slots = consumer.read_contiguous(MAX_BATCH);
-        let early_waiting = early_replies.sync();
 
-        // Poll control channel for connect/disconnect — after the ring
-        // is read, never before: the poll thread queues `Connected` on
-        // authentication and parses that connection's requests only
-        // afterwards, so every slot read above has its `Connected`
-        // already queued, and this drain sees it. See `response::run`
-        // for the reply this order protects.
+        // Take a snapshot of the early replies, then poll the control
+        // channel for connect/disconnect — after the ring is read, never
+        // before: the poll thread queues `Connected` on authentication and
+        // parses that connection's requests only afterwards, so every slot
+        // read above, and every early reply in the snapshot, has its
+        // `Connected` already queued, and this drain sees it. See
+        // `response::run` for the reply this order protects.
         // Counter accounting: the response stage is the sole owner of
         // active_connections decrements. The poll thread increments on
         // auth success and sends ControlEvent::Disconnected on close.
-        process_control_events(
-            &control_rx,
-            &mut connections,
-            &active_connections,
-            Instant::now,
-        );
+        let mut registered = early_replies.register(|| {
+            process_control_events(
+                &control_rx,
+                &mut connections,
+                &active_connections,
+                Instant::now,
+            )
+        });
 
         if slots.is_empty() {
-            if let Some(bound) = idle_early_bound {
-                let now = Instant::now();
-                early_replies.release(bound, |reply| {
-                    push_early_reply(
-                        reply,
-                        &*encoder,
-                        &mut connections,
-                        &mut tx_producers,
-                        &mut early_buf,
-                        now,
-                    );
-                });
+            // Between two events only: an empty read is not a boundary in
+            // itself. See `response::run`.
+            if let Some(at) = boundary.at_boundary() {
+                release_early_replies(
+                    &mut registered,
+                    &at,
+                    &*encoder,
+                    &mut connections,
+                    &mut tx_producers,
+                    &mut early_buf,
+                    Instant::now,
+                );
             }
 
             idle_count += 1;
@@ -364,21 +364,19 @@ pub fn run<A: Application>(
             #[cfg(feature = "latency-trace")]
             spsc_rec.record_elapsed(slot.match_complete_ts, consume_ts);
 
-            // First slot of an event: early replies stamped up to its
-            // sequence go first, ahead of the gate. See `response::run`.
-            let first_of_event = slot.input_seq != last_input_seq;
-            last_input_seq = slot.input_seq;
-            if early_waiting && first_of_event {
-                early_replies.release(slot.input_seq, |reply| {
-                    push_early_reply(
-                        reply,
-                        &*encoder,
-                        &mut connections,
-                        &mut tx_producers,
-                        &mut early_buf,
-                        batch_now,
-                    );
-                });
+            // The first slot of an event: the snapshot's early replies go
+            // first, ahead of the gate. See `response::run`.
+            let at_boundary = boundary.at_boundary();
+            if let Some(at) = &at_boundary {
+                release_early_replies(
+                    &mut registered,
+                    at,
+                    &*encoder,
+                    &mut connections,
+                    &mut tx_producers,
+                    &mut early_buf,
+                    || batch_now,
+                );
             }
 
             // Per-slot journal-wait / replica-wait tracker. Same shape as
@@ -398,6 +396,8 @@ pub fn run<A: Application>(
             // A policy change slot is the switch point (see
             // `DurabilityGate::admit`). Nothing to flush before a wait:
             // every slot's frames are released as soon as it is encoded.
+            // Early replies go out during the wait if the slot is the first
+            // of its event (`GateWaitHook`).
             //
             // A gate that cannot open does not hold the shutdown sequence;
             // the reply the policy never confirmed is not queued. A policy
@@ -405,13 +405,23 @@ pub fn run<A: Application>(
             // connection, whatever it is addressed to. What backs a reply
             // decides its terminator: the policy, unless the gate released
             // it on this node's own fsync while halted.
-            let (destination, backing) = match gate.admit(
+            let admission = gate.admit(
                 slot,
                 shutdown,
                 #[cfg(feature = "tick-to-trade")]
                 &mut gate_tracker,
-                || {},
-            ) {
+                &mut GateWaitHook {
+                    at_boundary,
+                    registered: &mut registered,
+                    control_rx: &control_rx,
+                    connections: &mut connections,
+                    active_connections: &active_connections,
+                    tx_producers: &mut tx_producers,
+                    encoder: &*encoder,
+                    early_buf: &mut early_buf,
+                },
+            );
+            let (destination, backing) = match admission {
                 Admission::Reply {
                     connection_id,
                     backing,
@@ -419,6 +429,9 @@ pub fn run<A: Application>(
                 Admission::GateOnly => (None, Backing::Policy),
                 Admission::Shutdown => continue 'run,
             };
+            // Handled from here on, whether or not its frames go anywhere
+            // (the miss below skips the rest of the loop body).
+            boundary.handled(slot.is_last_in_request);
 
             #[cfg(feature = "tick-to-trade")]
             if let Some(ts) = gate_tracker.journal_crossed() {
@@ -606,6 +619,71 @@ fn push_early_reply<R: Copy, Q: Copy>(
     );
     tx_producers[tid].flush();
     conn_state.last_send = now;
+}
+
+/// Send every early reply `registered` holds, between two events' replies
+/// (`at`), each as its own TX frame ([`push_early_reply`]). Returns how
+/// many; `now` is read once, and only if there is one. No send buffer to
+/// overflow: each reply is handed to the poll thread as it is encoded.
+#[allow(clippy::too_many_arguments)]
+fn release_early_replies<R: Copy, Q: Copy>(
+    registered: &mut Registered<'_, R>,
+    at: &AtBoundary<'_>,
+    encoder: &dyn melin_app::encoder::ResponseEncoder<Report = R, Query = Q>,
+    connections: &mut FxHashMap<u64, ConnectionHeartbeat>,
+    tx_producers: &mut [spsc::Producer<TxFrame>],
+    early_buf: &mut EarlyReplyBuf,
+    now: impl Fn() -> Instant,
+) -> usize {
+    let mut stamp = None;
+    registered.drain(at, |reply| {
+        let now = *stamp.get_or_insert_with(&now);
+        push_early_reply(reply, encoder, connections, tx_producers, early_buf, now);
+    })
+}
+
+/// The DPDK stage's [`GateWait`] hook, built for one slot's admit: if the
+/// held slot is the first of its event (`at_boundary`), send early replies
+/// during the wait, registering new connections first
+/// ([`Registered::reregister`]). A slot held in the middle of an event
+/// sends nothing: an early reply there would split that event's reply.
+struct GateWaitHook<'a, 'q, R: Copy, Q: Copy> {
+    at_boundary: Option<AtBoundary<'a>>,
+    registered: &'a mut Registered<'q, R>,
+    control_rx: &'a mpsc::Receiver<ControlEvent>,
+    connections: &'a mut FxHashMap<u64, ConnectionHeartbeat>,
+    active_connections: &'a AtomicU64,
+    tx_producers: &'a mut [spsc::Producer<TxFrame>],
+    encoder: &'a dyn melin_app::encoder::ResponseEncoder<Report = R, Query = Q>,
+    early_buf: &'a mut EarlyReplyBuf,
+}
+
+impl<R: Copy, Q: Copy> GateWait for GateWaitHook<'_, '_, R, Q> {
+    /// Nothing to flush: every slot's frames went to the poll thread as
+    /// soon as they were encoded.
+    fn before_wait(&mut self) {}
+
+    /// Early replies decided while the gate holds a write go out now
+    /// rather than behind it. No clock read on a turn with none.
+    fn while_waiting(&mut self) {
+        let Some(at) = &self.at_boundary else {
+            return;
+        };
+        let connections = &mut *self.connections;
+        let (control_rx, active_connections) = (self.control_rx, self.active_connections);
+        self.registered.reregister(|| {
+            process_control_events(control_rx, connections, active_connections, Instant::now)
+        });
+        release_early_replies(
+            self.registered,
+            at,
+            self.encoder,
+            self.connections,
+            self.tx_producers,
+            self.early_buf,
+            Instant::now,
+        );
+    }
 }
 
 /// Per-connection heartbeat state. No socket writer — the DPDK poll
@@ -796,7 +874,6 @@ mod tests {
     fn a_change_slot_queues_no_frame_for_its_connection() {
         use counter_server::{Counter, CounterQuery, CounterReport, ResponseEncoder};
         use melin_journal::AckPolicyChange;
-        use melin_pipeline::padding::CachePadded;
         use melin_pipeline::ring::DisruptorBuilder;
         use melin_transport_core::WireSeq;
         use melin_transport_core::lineage::forced_policy_cell;
@@ -832,7 +909,7 @@ mod tests {
             .send(ControlEvent::Connected { connection_id: 1 })
             .expect("channel open");
         let (tx, mut rx) = spsc::channel::<TxFrame>(8, WaitStrategy::SpinThenYield);
-        let early_replies = early_reply_channel(Arc::new(CachePadded::new(AtomicU64::new(0)))).1;
+        let early_replies = early_reply_channel().1;
 
         producer.publish(reply(1));
         producer.publish(OutputSlot {
@@ -903,9 +980,9 @@ mod tests {
 
     /// A halted node past the grace period answers a held write once its
     /// own journal holds it, ending in `BatchEndDegraded`, and the
-    /// refusals around it keep their place and end in a plain `BatchEnd`.
-    /// With the switch off the held write, and the refusal behind it, wait.
-    /// The kernel stage's counterpart is `response.rs`'s
+    /// refusals around it, which wait for nothing, end in a plain
+    /// `BatchEnd`. With the switch off the held write waits; the refusals
+    /// still do not. The kernel stage's counterpart is `response.rs`'s
     /// `tests::degraded_release`.
     mod degraded_release {
         use super::*;
@@ -914,7 +991,6 @@ mod tests {
             Counter, CounterQuery, CounterReport, KIND_RESP_ACK, KIND_RESP_REJECTED,
             ResponseEncoder,
         };
-        use melin_pipeline::padding::CachePadded;
         use melin_pipeline::ring::DisruptorBuilder;
         use melin_transport_core::WireSeq;
         use melin_transport_core::lineage::forced_policy_cell;
@@ -937,7 +1013,7 @@ mod tests {
 
         /// Every wire frame a TX frame carries — a response, then its
         /// terminator when it closes a request — in order.
-        fn wire_frames(bytes: &[u8], seen: &mut Vec<Seen>) {
+        pub(super) fn wire_frames(bytes: &[u8], seen: &mut Vec<Seen>) {
             let mut rest = bytes;
             while !rest.is_empty() {
                 let (len, tail) = rest.split_first_chunk::<4>().expect("a length prefix");
@@ -949,9 +1025,9 @@ mod tests {
 
         /// Run a stage under `disk+ram` on a primary whose one replica is
         /// gone, with degraded release `on` (no grace) or off, holding one
-        /// write the primary's journal already holds between two early
-        /// replies of `kind`. Returns what the poll thread was handed
-        /// before `quiet` passed with nothing more.
+        /// write the primary's journal already holds, with two early
+        /// replies of `kind` queued. Returns what the poll thread was
+        /// handed before `quiet` passed with nothing more.
         fn run_halted(on: bool, quiet: Duration, kind: EarlyKind<CounterReport>) -> Vec<Seen> {
             let (mut producer, mut consumers) =
                 DisruptorBuilder::<OutputSlot<CounterReport, CounterQuery>>::new(64)
@@ -963,8 +1039,7 @@ mod tests {
                 .send(ControlEvent::Connected { connection_id: 1 })
                 .expect("channel open");
             let (tx, mut rx) = spsc::channel::<TxFrame>(8, WaitStrategy::SpinThenYield);
-            let matching_progress = Arc::new(CachePadded::new(AtomicU64::new(0)));
-            let (mut early_tx, early_rx) = early_reply_channel(Arc::clone(&matching_progress));
+            let (mut early_tx, early_rx) = early_reply_channel();
 
             early_tx
                 .try_send(early(1, 0, kind))
@@ -982,7 +1057,6 @@ mod tests {
                 is_last_in_request: true,
                 ..Default::default()
             });
-            matching_progress.get().store(1, Ordering::Release);
 
             let shutdown = AtomicBool::new(false);
             let mut seen = Vec::new();
@@ -1047,33 +1121,35 @@ mod tests {
                 [
                     Seen::App(KIND_RESP_REJECTED),
                     Seen::Final(TAG_BATCH_END, early_id(0)),
-                    Seen::App(KIND_RESP_ACK),
-                    Seen::Final(TAG_BATCH_END_DEGRADED, HELD),
                     Seen::App(KIND_RESP_REJECTED),
                     Seen::Final(TAG_BATCH_END, early_id(1)),
+                    Seen::App(KIND_RESP_ACK),
+                    Seen::Final(TAG_BATCH_END_DEGRADED, HELD),
                 ],
-                "in request order, only the held write marked"
+                "the refusals first, waiting for nothing; only the held write marked"
             );
         }
 
         #[test]
-        fn with_the_switch_off_the_held_write_and_the_refusal_behind_it_wait() {
+        fn with_the_switch_off_the_held_write_waits_and_the_refusals_do_not() {
             let seen = run_halted(false, Duration::from_millis(300), REJECTED);
             assert_eq!(
                 seen,
                 [
                     Seen::App(KIND_RESP_REJECTED),
-                    Seen::Final(TAG_BATCH_END, early_id(0))
+                    Seen::Final(TAG_BATCH_END, early_id(0)),
+                    Seen::App(KIND_RESP_REJECTED),
+                    Seen::Final(TAG_BATCH_END, early_id(1)),
                 ],
-                "only the refusal ahead of the held write goes out"
+                "both refusals go out; the held write does not"
             );
         }
 
         /// Every kind of early reply goes to the poll thread as its own
-        /// frames, naming its request, in its place around the held write:
-        /// a filtered request's empty batch, a decoder's refusal, a busy.
+        /// frames, naming its request, ahead of the held write: a filtered
+        /// request's empty batch, a decoder's refusal, a busy.
         #[test]
-        fn every_kind_of_early_reply_keeps_its_place_and_names_its_request() {
+        fn every_kind_of_early_reply_goes_ahead_of_the_held_write_and_names_its_request() {
             for kind in [
                 EarlyKind::Filtered,
                 EarlyKind::Refused {
@@ -1085,14 +1161,242 @@ mod tests {
                 let seen = run_halted(true, Duration::from_millis(500), kind);
                 let expected: Vec<Seen> = frames_of(kind, early_id(0))
                     .into_iter()
+                    .chain(frames_of(kind, early_id(1)))
                     .chain([
                         Seen::App(KIND_RESP_ACK),
                         Seen::Final(TAG_BATCH_END_DEGRADED, HELD),
                     ])
-                    .chain(frames_of(kind, early_id(1)))
                     .collect();
                 assert_eq!(seen, expected, "{kind:?}");
             }
+        }
+    }
+
+    /// The early-release scenarios of `response.rs`'s
+    /// `tests::early_release`, run against this stage: early replies go
+    /// out between events, ahead of held writes, never inside an event.
+    mod early_release {
+        use super::*;
+
+        use std::collections::{HashMap, VecDeque};
+        use std::thread::JoinHandle;
+
+        use counter_server::{Counter, ResponseEncoder};
+        use melin_transport_core::lineage::forced_policy_cell;
+        use proptest::prelude::*;
+
+        use super::degraded_release::wire_frames;
+        use crate::ack_policy::AckPolicy;
+        use crate::durability_gate::GateStart;
+        use crate::response::tests::early_release::{
+            StageHarness, StageInputs, a_gate_held_inside_an_event_sends_no_early_reply,
+            an_early_reply_waits_out_an_event_split_across_reads,
+            connection_first_seen_inside_a_gate_wait, early_replies_overtake_a_held_write,
+            every_kind, every_request_is_answered_once_and_whole, script,
+        };
+        use crate::response::tests::refusal_order::Seen;
+
+        /// The DPDK stage under test, read off its TX ring the way the
+        /// poll thread reads it, each frame filed under its connection.
+        struct DpdkStage {
+            control: mpsc::Sender<ControlEvent>,
+            tx_ring: spsc::Consumer<TxFrame>,
+            /// Frames read off the TX ring and not yet asked for, per
+            /// connection: the ring interleaves connections, a test reads
+            /// one at a time.
+            pending: HashMap<u64, VecDeque<Seen>>,
+            shutdown: Arc<AtomicBool>,
+            handle: Option<JoinHandle<()>>,
+        }
+
+        fn start_dpdk(inputs: StageInputs) -> DpdkStage {
+            let (control, control_rx) = mpsc::channel();
+            let (tx, tx_ring) = spsc::channel::<TxFrame>(1024, WaitStrategy::SpinThenYield);
+            let shutdown = Arc::clone(&inputs.shutdown);
+            let StageInputs {
+                consumer,
+                early_replies,
+                journal,
+                replication_metrics,
+                replica_active,
+                utilization,
+                shutdown: stage_shutdown,
+            } = inputs;
+            let handle = std::thread::spawn(move || {
+                run::<Counter>(
+                    consumer,
+                    control_rx,
+                    journal,
+                    GatePolicy {
+                        start: GateStart::settled(AckPolicy::DiskAndRam),
+                        forced: forced_policy_cell().1,
+                    },
+                    Some(replication_metrics),
+                    Some(replica_active),
+                    &stage_shutdown,
+                    None,
+                    Arc::new(AtomicU64::new(0)),
+                    vec![tx],
+                    utilization,
+                    WaitStrategy::SpinThenYield,
+                    Arc::new(ResponseEncoder),
+                    early_replies,
+                    None,
+                )
+            });
+            DpdkStage {
+                control,
+                tx_ring,
+                pending: HashMap::new(),
+                shutdown,
+                handle: Some(handle),
+            }
+        }
+
+        impl StageHarness for DpdkStage {
+            fn connect(&mut self, connection_id: u64) {
+                self.control
+                    .send(ControlEvent::Connected { connection_id })
+                    .expect("the stage is running");
+            }
+
+            fn next_frame(&mut self, connection_id: u64, within: Duration) -> Option<Seen> {
+                let deadline = Instant::now() + within;
+                loop {
+                    if let Some(frame) = self
+                        .pending
+                        .get_mut(&connection_id)
+                        .and_then(VecDeque::pop_front)
+                    {
+                        return Some(frame);
+                    }
+                    match self.tx_ring.try_consume() {
+                        Some((_, frame)) => {
+                            let mut seen = Vec::new();
+                            wire_frames(frame.as_bytes(), &mut seen);
+                            self.pending
+                                .entry(frame.connection_id)
+                                .or_default()
+                                .extend(seen);
+                        }
+                        None if Instant::now() >= deadline => return None,
+                        None => std::thread::yield_now(),
+                    }
+                }
+            }
+        }
+
+        impl Drop for DpdkStage {
+            fn drop(&mut self) {
+                self.shutdown.store(true, Ordering::Relaxed);
+                if let Some(handle) = self.handle.take() {
+                    // Joined only to surface a panic; while unwinding
+                    // from a failed assertion, another panic would abort.
+                    if handle.join().is_err() && !std::thread::panicking() {
+                        panic!("the stage panicked");
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn an_early_reply_waits_out_an_event_split_across_reads_dpdk() {
+            an_early_reply_waits_out_an_event_split_across_reads(start_dpdk);
+        }
+
+        #[test]
+        fn early_replies_overtake_a_held_write_dpdk() {
+            for kind in every_kind() {
+                early_replies_overtake_a_held_write(start_dpdk, kind);
+            }
+        }
+
+        #[test]
+        fn a_gate_held_inside_an_event_sends_no_early_reply_dpdk() {
+            a_gate_held_inside_an_event_sends_no_early_reply(start_dpdk);
+        }
+
+        #[test]
+        fn connection_first_seen_inside_a_gate_wait_dpdk() {
+            connection_first_seen_inside_a_gate_wait(start_dpdk);
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(24))]
+            #[test]
+            fn every_request_is_answered_once_and_whole_dpdk(script in script()) {
+                every_request_is_answered_once_and_whole(start_dpdk, &script)?;
+            }
+        }
+
+        /// The gate-wait hook called directly, as the io_uring stage's
+        /// `gate_wait_hook` tests call theirs: register nothing, then —
+        /// as if during a wait — queue connection 1's `Connected` and a
+        /// busy for it, and call `while_waiting` once, between events or
+        /// not. Returns the connections after the call and every frame
+        /// handed to the poll thread.
+        fn hook_turn(between_events: bool) -> (FxHashMap<u64, ConnectionHeartbeat>, Vec<Seen>) {
+            use crate::halt::{EarlyKind, early_reply_channel};
+            use crate::response::tests::refusal_order::early;
+
+            let (control_tx, control_rx) = mpsc::channel();
+            let (mut tx, mut rx) = early_reply_channel();
+            let mut registered = rx.register(|| {});
+            let (producer, mut tx_ring) =
+                spsc::channel::<TxFrame>(1024, WaitStrategy::SpinThenYield);
+            let mut producers = vec![producer];
+            let mut connections = FxHashMap::default();
+
+            control_tx
+                .send(ControlEvent::Connected { connection_id: 1 })
+                .expect("the receiver is held");
+            tx.try_send(early(1, 0, EarlyKind::Busy))
+                .expect("queue has room");
+            tx.flush();
+
+            let boundary = BatchBoundary::new();
+            let mut early_buf: EarlyReplyBuf = [0u8; MAX_EARLY_REPLY];
+            GateWaitHook {
+                at_boundary: if between_events {
+                    Some(boundary.at_boundary().expect("between events"))
+                } else {
+                    None
+                },
+                registered: &mut registered,
+                control_rx: &control_rx,
+                connections: &mut connections,
+                active_connections: &AtomicU64::new(1),
+                tx_producers: &mut producers,
+                encoder: &ResponseEncoder,
+                early_buf: &mut early_buf,
+            }
+            .while_waiting();
+
+            let mut seen = Vec::new();
+            while let Some((_, frame)) = tx_ring.try_consume() {
+                assert_eq!(frame.connection_id, 1);
+                wire_frames(frame.as_bytes(), &mut seen);
+            }
+            (connections, seen)
+        }
+
+        #[test]
+        fn gate_wait_hook_between_events_registers_and_sends() {
+            use crate::halt::EarlyKind;
+            use crate::response::tests::refusal_order::{early_id, frames_of};
+
+            let (connections, seen) = hook_turn(true);
+
+            assert!(connections.contains_key(&1), "not registered");
+            assert_eq!(seen, frames_of(EarlyKind::Busy, early_id(0)));
+        }
+
+        #[test]
+        fn gate_wait_hook_inside_an_event_does_nothing() {
+            let (connections, seen) = hook_turn(false);
+
+            assert!(connections.is_empty(), "control drained");
+            assert!(seen.is_empty(), "a reply went out: {seen:?}");
         }
     }
 

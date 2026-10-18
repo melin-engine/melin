@@ -15,13 +15,12 @@
 use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
 use counter_server::{Counter, CounterQuery, CounterReport, KIND_RESP_ACK, ResponseEncoder};
-use melin_pipeline::padding::CachePadded;
 use melin_pipeline::ring::DisruptorBuilder;
 use melin_pipeline::wait::WaitStrategy;
 use melin_server_runtime::ControlEvent;
@@ -98,7 +97,7 @@ fn config_for(journal_cursor: DurableWireSeqCursor) -> Response<Counter> {
         fence_state: Arc::new(FenceState::new(0)),
         active_connections: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         // No reader: nothing is ever answered early.
-        early_replies: halt::early_reply_channel(Arc::new(CachePadded::new(AtomicU64::new(0)))).1,
+        early_replies: halt::early_reply_channel().1,
         ring_sizing: RingSizing::for_max_connections(1).expect("a supported cap"),
         ready: None,
         degraded_release: None,
