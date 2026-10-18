@@ -777,9 +777,8 @@ Alternatives considered for the dirty-page coupling:
 
 Each step is one commit, reviewed before the next.
 
-Steps 0, 1 and 2 change the runtime, step 0 breaks the CLI and the
-library, and step 3 adds `test-lan-bench-suite.sh` to `pre-merge.yml`.
-These go beyond the bench suite the request named. The user confirms
+Steps 0, 1 and 2 change the runtime, and step 0 breaks the CLI and the
+library. These go beyond the bench suite the request named. The user confirms
 them before step 0 begins, rather than the implementation proceeding on
 an assumed go-ahead.
 
@@ -799,7 +798,8 @@ an assumed go-ahead.
 2. **Runtime: bounded snapshot writeback** (`perf(snapshot)`).
    CHANGELOG entry under **Changed**.
 3. **Suite: host-free logic and its tests** (`feat(bench)`). The new
-   `lib.sh` helpers and their cases in `test-lan-bench-suite.sh`.
+   `lib.sh` helpers and their cases in `test-lan-bench-suite.sh`, which
+   stays out of CI (run locally; see "Tests").
 4. **Suite: wiring, rehearsal and docs** (`feat(bench)`). Changes to
    `lan-bench-suite.sh`, `test-containers.sh`, `server-setup.sh`'s
    comment, and `docs/benchmarking.md`.
@@ -834,21 +834,50 @@ untouched by step 0; only its caller changes, passing
 
 **`scripts/bench/lib.sh`** (host-free, tested)
 
+Every helper prints its result, or on failure its reason, on stdout, so
+a caller under `set -e` reads either from one capture
+(`if ! ms=$(duration_ms "$d"); then ...`).
+
 - `duration_ms <d>`: accepts `<n>ms`, `<n>s`, `<n>m`, the forms the
   suite's defaults use, and fails on anything else. The suite refuses a
   duration it cannot parse while snapshots are on.
 - `snapshot_settings_check <interval_ms> <min measured ms>`: the 0,
   floor and ceiling rules from decision 1.
 - `extra_args_conflict <args>`: names the first snapshot flag found.
+- `mount_source <findmnt -nv -o SOURCE,FSTYPE output>`: the device to
+  hand `lsblk`; fails on `tmpfs` or `ramfs` (decision 3's first refusal)
+  and on no output. As built: the plan's first list had no helper for
+  that refusal, which would have left it in the untested wiring.
 - `shared_disks <lsblk A> <lsblk B>`: prints the intersecting `disk`
   names, or fails with "unresolved" when either side has none.
 - `seq_window <health samples>`: the first and last
-  `melin_journal_sequence`.
-- `judge_snapshots <log> <first> <last> <expected> <path>`: prints the
-  verdict line and fails unless it is `ok`, in the style of
-  `judge_health`.
+  `melin_journal_sequence`; unjudged when none was sampled or when the
+  sequence went backwards.
+- `judge_snapshots <log> <first> <last> <measured ms> <interval ms>
+  <path>`: prints the verdict line and fails unless it is `ok` (or `off`,
+  for interval `0`, whatever the other arguments: with the shadow off a
+  run may have no journal window to give), in the style of
+  `judge_health`. As built, it takes
+  the measured duration and the interval rather than an expected count,
+  so that decision 5's `max(1, floor(measured_ms / interval) - 1)` is in
+  the tested helper and not in the wiring. The verdict is one of `ok`,
+  `off`, `FAILED`, `MISPLACED`, `UNREADABLE` (a saved line without a
+  numeric `journal_seq`), `NO SNAPSHOT`, `TOO FEW` or `UNJUDGED` (an empty
+  or missing log, a bound that is not a count), followed by every count
+  and the slowest `elapsed_ms` (to three decimals: the node logs the
+  float at full precision, `0.20887799999999998`) and largest `bytes`
+  among the counted saves. It parses the lines the nodes actually log: tracing's fmt
+  output (`... shadow snapshot saved journal_seq=4 bytes=79
+  elapsed_ms=0.092626 attempts=1 path=/x/primary.snapshot`), with any
+  prefix (timestamp, level, thread name, target), fields matched by name
+  in any order, and ANSI colours stripped (the suite launches nodes with
+  `NO_COLOR=1`, but a binary's subscriber is not ours to rely on). The
+  path is matched whole, and may hold spaces; the `error` field of a
+  failed line does hold spaces, which is why a failed line is only
+  counted, not parsed.
 - `diskstat_written <before> <after> <dev>`: bytes written between the
-  two reads.
+  two reads (the 10th field, in 512-byte sectors), failing when either
+  read lacks the device or the count went backwards.
 
 **`scripts/bench/lan-bench-suite.sh`**
 
@@ -904,17 +933,27 @@ helper:
     `last` is;
   - one "failed" line fails even with enough saves;
   - a save to another path fails;
-  - log lines with fields in another order, or with ANSI-free
-    timestamps, still parse;
+  - log lines with fields in another order, with ANSI colours, or with
+    no timestamp, still parse;
   - an empty log fails;
-  - interval `0` yields `off` and passes.
+  - interval `0` yields `off` and passes;
+  - (added) a path that merely starts with the node's is another path; a
+    path with a space is matched whole; a saved line with no sequence
+    fails; the expected count follows the measured phase, with a floor
+    of one; a bound that is not a count is unjudged.
 - `seq_window`: normal samples; samples where the endpoint did not
-  answer; no sequence at all, which is unjudged.
+  answer; no sequence at all, which is unjudged; (added) a sequence that
+  went backwards, also unjudged.
+- `mount_source` (added): a disk's and a btrfs subvolume's device;
+  `tmpfs` and `ramfs` refused; overlay passed on for `lsblk` to leave
+  unresolved; no output unresolved.
 - `shared_disks`:
   - two disks pass;
   - a partition against its own disk is shared;
   - an LV whose PVs span both disks is shared;
-  - an empty (overlay) side is unresolved.
+  - an empty (overlay) side is unresolved;
+  - (added) an md array's members, two LVs on the same PVs (each disk
+    named once), and a side with no `disk` at all (a loop device).
 - `duration_ms`: each accepted form; refused forms (`1h30m`, `60`,
   empty).
 - `snapshot_settings_check`: `0`; below the floor; above the shortest
@@ -973,9 +1012,9 @@ Step 0's tests are listed in "0d".
 and 2 (step 0: see "0d"), and cover every changed branch it reports
 unexercised. The shell helpers are covered case by case above.
 
-`test-lan-bench-suite.sh` is not run in CI. Add it to `pre-merge.yml`
-(it needs bash and awk only) in step 3, so that the judge's tests
-cannot rot.
+`test-lan-bench-suite.sh` is not run in CI, and this plan leaves it so
+(`pre-merge.yml` is untouched): it is run locally, by whoever changes
+`lib.sh`, before the change is committed.
 
 ## Docs
 
@@ -1016,6 +1055,14 @@ cannot rot.
   default, on the OS disk).
 
 ## Left untested, and why
+
+- **The suite's helpers in CI.** `test-lan-bench-suite.sh` runs
+  locally only, so a change to `lib.sh` that skips running it is not
+  caught by CI. Running it is part of changing `lib.sh`.
+- **`diskstat_written`'s guards against counts the kernel does not
+  produce.** A sector count past what bash arithmetic holds exactly, and
+  a non-numeric 10th field, are one-line guards with no fixture: no
+  `/proc/diskstats` carries either.
 
 - **The DPDK transport with snapshots.** The shadow is
   transport-agnostic and the flags are the same, but the rehearsal is
