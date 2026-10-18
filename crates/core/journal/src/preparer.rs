@@ -741,19 +741,13 @@ fn prepare_zero_filled(
 /// Best-effort: on failure the fill just paces less accurately and the
 /// final `sync_all` remains the durability point.
 fn wait_for_writeback(file: &File, offset: u64, len: u64) {
-    use std::os::fd::AsRawFd;
-    // SAFETY: plain syscall on an owned, open fd; no memory is passed.
-    // Result deliberately dropped — see the function docs.
-    let _ = unsafe {
-        libc::sync_file_range(
-            file.as_raw_fd(),
-            offset as libc::off64_t,
-            len as libc::off64_t,
-            libc::SYNC_FILE_RANGE_WAIT_BEFORE
-                | libc::SYNC_FILE_RANGE_WRITE
-                | libc::SYNC_FILE_RANGE_WAIT_AFTER,
-        )
+    // A zero-length window has nothing to wait for (and `sync_file_range`
+    // would read the zero as "to the end of the file").
+    let Some(len) = std::num::NonZeroU64::new(len) else {
+        return;
     };
+    // Result deliberately dropped: best-effort, see the function docs.
+    let _ = crate::segment::writeback_and_wait(file, offset, len);
 }
 
 /// `FALLOC_FL_WRITE_ZEROES` — not yet in the `libc` crate; merged

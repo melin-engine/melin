@@ -725,10 +725,19 @@ Three small runtime changes make the benchmark mean what it claims:
   is left alone.
 - **The snapshot's dirty footprint is bounded.** `save_with_limit`
   writes the buffer in fixed chunks (4 MiB, a constant with a comment
-  justifying it). After each chunk it calls `sync_file_range` with
+  justifying it). After each chunk it starts that chunk's writeback
+  (`SYNC_FILE_RANGE_WRITE`, no wait), then calls `sync_file_range` with
   `SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE |
   SYNC_FILE_RANGE_WAIT_AFTER` on the previous chunk, so that at most two
-  chunks are dirty at once. The final `sync_all` still provides
+  chunks are dirty or under writeback at once. Starting the current
+  chunk before waiting on the previous one keeps the device busy across
+  the wait; waiting on the previous chunk alone, with nothing started on
+  the current one, gives the same bound but idles the device while the
+  next chunk is copied in. Both calls go through
+  `melin_journal::segment::{start_writeback, writeback_and_wait}`,
+  hoisted from the journal preparer's best-effort copy, which return the
+  error and take a `NonZeroU64` length (a zero length means "to the end
+  of the file"). The final `sync_all` still provides
   durability. `sync_file_range` alone does not flush metadata or the
   device cache, so it does not replace that call. The snapshot can then
   no longer push global dirty memory past the freerun ceiling under
@@ -819,7 +828,9 @@ untouched by step 0; only its caller changes, passing
 - `save` and `save_with_limit`: return the byte count, and write in
   chunks with `sync_file_range` on the previous chunk.
 - Make the chunk size a parameter of `save_with_limit`, as the size cap
-  already is, so that tests can exercise it with small payloads.
+  already is, so that tests can exercise it with small payloads. The two
+  travel together as `SaveLimits` (the chunk a `NonZeroUsize`), which
+  keeps the function under clippy's argument limit.
 
 **`scripts/bench/lib.sh`** (host-free, tested)
 
@@ -945,6 +956,9 @@ helper:
   - an empty application payload.
   Each round-trips through `load`, checks the returned size equals the
   file's length, and keeps the `.prev` rotation.
+- `melin_journal::segment`: both writeback calls succeed on a file
+  range, return the kernel's error (ESPIPE on a pipe), and refuse an
+  offset or length past `i64::MAX`.
 
 **Container rehearsal** (`test-containers.sh`): runs the whole path
 end to end on kernel TCP. It covers the new flags reaching the nodes,

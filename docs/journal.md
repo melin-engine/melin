@@ -214,11 +214,13 @@ The runtime owns the framing; the payload is whatever the application writes to 
 Snapshots are written atomically:
 
 1. Serialize entire state into an in-memory buffer.
-2. Write to a temporary file.
-3. `fdatasync` the temporary file.
+2. Write to a temporary file, 4 MiB at a time (see below).
+3. `fsync` the temporary file.
 4. `rename` the temporary file to the final path (atomic on POSIX).
 
 A crash during snapshot creation leaves only a temporary file, which is harmless. The previous snapshot (if any) remains intact.
+
+A snapshot's writes are sent to disk as they are made: each 4 MiB piece starts writing to disk once it is written, and the save waits for a piece to finish before writing the one after next. A save therefore never has more than two pieces (8 MiB) waiting in the page cache, however large the state. Without that bound, a large snapshot fills the page cache with unwritten data, and once the host's dirty-page limit (`vm.dirty_bytes` or `vm.dirty_ratio`) is reached the kernel slows every writer on the host, the journal included, until the backlog drains: a snapshot would then raise client latency wherever it is stored. The bound adds little to a save's duration, which the disk's write speed sets either way. The final `fsync` remains the point at which the snapshot is durable.
 
 ### When to Snapshot
 
@@ -235,7 +237,7 @@ A snapshot can only be taken at a point the journal has made durable, so when th
 
 A node has one snapshot file, `--snapshot-path` (default: the journal path with a `.snapshot` extension). It is the file the node recovers from at boot, the one it sends to a replica that needs a resync, and the one its shadow stage writes; there is no other. Its temporary file (`.tmp`), its previous copy (`.prev`) and its resync archive stay in its directory, so every rename that touches the snapshot is atomic on its filesystem.
 
-For latency-critical deployments, put `--snapshot-path` on a disk other than the journal's. A snapshot save writes and syncs the whole state at once; on its own disk that I/O shares no device queue and no filesystem log with the journal's writes and syncs. The node refuses to start when the snapshot's directory does not exist, when the snapshot path names a directory rather than a file, when it names no file at all (for example a path ending in a slash), or when the snapshot path is the journal path.
+For latency-critical deployments, put `--snapshot-path` on a disk other than the journal's. A snapshot save writes and syncs the whole state in one sustained stream; on its own disk that I/O shares no device queue and no filesystem log with the journal's writes and syncs. The node refuses to start when the snapshot's directory does not exist, when the snapshot path names a directory rather than a file, when it names no file at all (for example a path ending in a slash), or when the snapshot path is the journal path.
 
 A node that has no journal yet and finds nothing at `--snapshot-path`, but finds a snapshot at the path derived from its journal, refuses to start too: this is a node on the [standard upgrade](#standard-upgrade)'s layout given `--snapshot-path` for the first time, which would otherwise begin a new history beside the snapshot it was meant to continue. Move the derived file to the new location, then start it.
 

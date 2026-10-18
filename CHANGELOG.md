@@ -20,6 +20,11 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   reads, writes, serves or archives the snapshot takes its path from it.
 - **`melin_journal::segment::parent_dir` and `fsync_dir`**: the directory
   a file lives in (a bare name's is `.`), and a sync of a directory itself.
+- **`melin_journal::segment::start_writeback` and `writeback_and_wait`**:
+  `sync_file_range` over a range of a file, starting its writeback or
+  waiting for it to finish, with the error returned and the length
+  non-zero by type (`sync_file_range` reads a zero length as "to the end
+  of the file").
 
 ### Changed
 
@@ -52,6 +57,14 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   Source-breaking where the result was used as a `Result<(), _>` (matched
   on `Ok(())`, returned as a function's tail, or passed on as one);
   callers that apply `?` or discard the value are unaffected.
+- **A snapshot save leaves at most 8 MiB of unwritten data in the page
+  cache.** It writes in 4 MiB pieces, each sent to disk as soon as it is
+  written, and waits for one piece to reach the disk before writing the
+  one after next. A large snapshot used to sit in the page cache whole
+  until its final `fsync`, which could carry the host past its
+  dirty-page limit and make the kernel throttle every writer, the
+  journal's thread included, for the length of the save. The final
+  `fsync` remains the durability point.
 
 ### Removed
 
