@@ -40,6 +40,8 @@
 //! A test that wants its nodes' log in its report, when it fails, calls
 //! [`logs::capture`].
 //!
+//! A test's client waits for a started node to serve with [`connect`].
+//!
 //! A test reads a running node as an operator does, through its health
 //! gauges and admin commands, with [`probe`].
 //!
@@ -55,11 +57,12 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use melin_app::Application;
 use melin_app::decoder::RequestDecoder;
 use melin_app::encoder::ResponseEncoder;
+use melin_client::{Connection, SigningKey};
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::server::ServerConfig;
 
@@ -74,6 +77,20 @@ pub const STARTUP_LIMIT: Duration = if cfg!(feature = "dpdk") {
 } else {
     Duration::from_secs(10)
 };
+
+/// A client of `key`, authenticated by the node at `addr` once it serves,
+/// retried for at most [`STARTUP_LIMIT`]; panics if it does not by then.
+///
+/// [`start`] returns before the node serves, and the kernel accepts a
+/// connection before the node's accept loop runs, so only getting through
+/// the handshake shows the node is up. A test whose client dials once (a
+/// binary that is run against the node, a DPDK client) calls this first
+/// and drops what it returns. It is a kernel client on either transport:
+/// under the runner it reaches a DPDK node over the runner's network.
+pub fn connect(addr: SocketAddr, key: &SigningKey) -> Connection {
+    Connection::connect_by(addr, key, Instant::now() + STARTUP_LIMIT)
+        .unwrap_or_else(|e| panic!("the node at {addr} never served: {e}"))
+}
 
 /// Where a node is reached, decided before it starts: see [`addrs`].
 #[derive(Debug, Clone, Copy)]

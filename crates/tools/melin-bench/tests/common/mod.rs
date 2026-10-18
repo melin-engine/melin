@@ -3,9 +3,8 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::Instant;
 
-use melin_client::{Connection, SigningKey, key};
+use melin_client::{SigningKey, key};
 use melin_journal::{JournalEvent, JournalReader};
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
@@ -55,20 +54,11 @@ pub fn start_echo(dir: &Path, role: &str) -> melin_test_node::Node {
 /// `node`, once a client of the bench's key is authenticated by it: every
 /// node a test runs the binary against.
 ///
-/// The launcher returns before the node serves, and the binary dials
-/// once, giving the handshake its read timeout: a node still starting
-/// eats into that (under a sanitizer, initialising the rings alone takes
-/// seconds). A kernel client, which retries until a deadline, waits for
-/// it instead; on DPDK it reaches the node over the runner's network.
+/// The binary dials once, giving the handshake its read timeout: a node
+/// still starting eats into that (under a sanitizer, initialising the
+/// rings alone takes seconds).
 pub fn serving(node: melin_test_node::Node) -> melin_test_node::Node {
-    drop(
-        Connection::connect_by(
-            node.addr(),
-            &bench_key(),
-            Instant::now() + melin_test_node::STARTUP_LIMIT,
-        )
-        .expect("a serving node"),
-    );
+    drop(melin_test_node::connect(node.addr(), &bench_key()));
     node
 }
 
