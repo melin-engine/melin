@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # Tests for the LAN suite's host-free logic (lib.sh): the health and
 # snapshot verdicts that decide whether a run passed, the snapshot
-# settings and disk guard, and the reading of a host's DPDK configuration
-# and disk counters. The fixtures are real output: node log lines as the
-# nodes log them (NO_COLOR, as the suite launches them, and coloured),
+# settings and disk guard, the reading of a host's DPDK configuration
+# and disk counters, and the summary table built from the verdicts. The
+# fixtures are real output: node log lines as the nodes log them
+# (NO_COLOR, as the suite launches them, and coloured),
 # `findmnt -nv -o SOURCE,FSTYPE`, `lsblk -rnso NAME,TYPE`, and
 # /proc/diskstats. The rest of the suite drives hosts and is exercised by
-# running it. Not run in CI: run it after changing lib.sh.
+# running it. Needs python3, as the suite does. Not run in CI: run it
+# after changing lib.sh.
 #
 # Usage: ./scripts/bench/test-lan-bench-suite.sh
 
@@ -121,8 +123,8 @@ SNAP=/var/lib/melin-bench/snapshots/primary.snapshot
 # Lines as a node logs them under the suite (NO_COLOR, timestamps, thread
 # names and targets on), taken from a running echo-server.
 saved() {
-    local seq="$1" path="${2:-$SNAP}" ms="${3:-0.092626}" bytes="${4:-79}"
-    echo "2026-10-18T19:45:35.254317Z  INFO       shadow melin_transport_core::shadow: shadow snapshot saved journal_seq=${seq} bytes=${bytes} elapsed_ms=${ms} attempts=1 path=${path}"
+    local seq="$1" path="${2:-$SNAP}" ms="${3:-0.092626}" bytes="${4:-79}" attempts="${5:-1}"
+    echo "2026-10-18T19:45:35.254317Z  INFO       shadow melin_transport_core::shadow: shadow snapshot saved journal_seq=${seq} bytes=${bytes} elapsed_ms=${ms} attempts=${attempts} path=${path}"
 }
 FAILED_LINE="2026-10-18T19:45:45.539959Z ERROR       shadow melin_transport_core::shadow: shadow snapshot failed journal_seq=9 error=snapshot I/O: Permission denied (os error 13) attempts=1 path=${SNAP}"
 STARTED_LINE="2026-10-18T19:45:34.253955Z  INFO         main melin_server_runtime::server: shadow snapshot stage started interval_ms=10000 path=${SNAP}"
@@ -139,55 +141,62 @@ snapshots() {
 }
 
 check "enough saves in the window pass, with the slowest and the largest" \
-    "0 ok: 3 saves in window (at least 2), 0 outside, 0 failed, 0 to another path, 0 unreadable; slowest 12.250 ms, largest 10000 bytes" \
+    "0 ok: 3 saves in window (at least 2), 0 outside, 0 failed, 0 to another path, 0 unreadable; slowest 12.250 ms, largest 10000 bytes, most attempts 1" \
     "$(snapshots 100 1000 30000 10000 "$SNAP" "$STARTED_LINE" \
         "$(saved 200 "$SNAP" 1.5 900)" "$(saved 500 "$SNAP" 12.25 79)" "$(saved 900 "$SNAP" 3 10000)")"
 check "the slowest save's time, logged at full precision, is printed to the microsecond" \
-    "0 ok: 1 saves in window (at least 1), 0 outside, 0 failed, 0 to another path, 0 unreadable; slowest 0.209 ms, largest 79 bytes" \
+    "0 ok: 1 saves in window (at least 1), 0 outside, 0 failed, 0 to another path, 0 unreadable; slowest 0.209 ms, largest 79 bytes, most attempts 1" \
     "$(snapshots 100 1000 10000 10000 "$SNAP" "$(saved 500 "$SNAP" 0.20887799999999998)")"
 check "no save in the window fails" \
-    "1 NO SNAPSHOT: 0 saves in window (at least 2), 0 outside, 0 failed, 0 to another path, 0 unreadable; slowest - ms, largest - bytes" \
+    "1 NO SNAPSHOT: 0 saves in window (at least 2), 0 outside, 0 failed, 0 to another path, 0 unreadable; slowest - ms, largest - bytes, most attempts -" \
     "$(snapshots 100 1000 30000 10000 "$SNAP" "$STARTED_LINE" "$DEFERRED_LINE")"
 check "fewer saves than expected fail" \
-    "1 TOO FEW: 1 saves in window (at least 2), 0 outside, 0 failed, 0 to another path, 0 unreadable; slowest 0.093 ms, largest 79 bytes" \
+    "1 TOO FEW: 1 saves in window (at least 2), 0 outside, 0 failed, 0 to another path, 0 unreadable; slowest 0.093 ms, largest 79 bytes, most attempts 1" \
     "$(snapshots 100 1000 30000 10000 "$SNAP" "$(saved 500)")"
 check "idle saves before the load and cooldown saves after it are not counted" \
-    "1 NO SNAPSHOT: 0 saves in window (at least 2), 3 outside, 0 failed, 0 to another path, 0 unreadable; slowest - ms, largest - bytes" \
+    "1 NO SNAPSHOT: 0 saves in window (at least 2), 3 outside, 0 failed, 0 to another path, 0 unreadable; slowest - ms, largest - bytes, most attempts -" \
     "$(snapshots 100 1000 30000 10000 "$SNAP" "$(saved 4)" "$(saved 8)" "$(saved 1200)")"
 check "only the saves inside the window count" \
-    "0 ok: 2 saves in window (at least 2), 3 outside, 0 failed, 0 to another path, 0 unreadable; slowest 0.093 ms, largest 79 bytes" \
+    "0 ok: 2 saves in window (at least 2), 3 outside, 0 failed, 0 to another path, 0 unreadable; slowest 0.093 ms, largest 79 bytes, most attempts 1" \
     "$(snapshots 100 1000 30000 10000 "$SNAP" "$(saved 4)" "$(saved 8)" "$(saved 500)" "$(saved 600)" "$(saved 1200)")"
 check "a save at exactly the first sequence is not counted, one at the last is" \
-    "0 ok: 1 saves in window (at least 1), 1 outside, 0 failed, 0 to another path, 0 unreadable; slowest 0.093 ms, largest 79 bytes" \
+    "0 ok: 1 saves in window (at least 1), 1 outside, 0 failed, 0 to another path, 0 unreadable; slowest 0.093 ms, largest 79 bytes, most attempts 1" \
     "$(snapshots 100 1000 10000 10000 "$SNAP" "$(saved 100)" "$(saved 1000)")"
 check "a save at exactly the first sequence alone is no snapshot" \
-    "1 NO SNAPSHOT: 0 saves in window (at least 1), 1 outside, 0 failed, 0 to another path, 0 unreadable; slowest - ms, largest - bytes" \
+    "1 NO SNAPSHOT: 0 saves in window (at least 1), 1 outside, 0 failed, 0 to another path, 0 unreadable; slowest - ms, largest - bytes, most attempts -" \
     "$(snapshots 100 1000 10000 10000 "$SNAP" "$(saved 100)")"
 check "one failed save fails the run, however many landed" \
-    "1 FAILED: 2 saves in window (at least 2), 0 outside, 1 failed, 0 to another path, 0 unreadable; slowest 0.093 ms, largest 79 bytes" \
+    "1 FAILED: 2 saves in window (at least 2), 0 outside, 1 failed, 0 to another path, 0 unreadable; slowest 0.093 ms, largest 79 bytes, most attempts 1" \
     "$(snapshots 100 1000 30000 10000 "$SNAP" "$(saved 200)" "$FAILED_LINE" "$(saved 900)")"
 check "a save to another path fails the run, however many landed" \
-    "1 MISPLACED: 2 saves in window (at least 2), 0 outside, 0 failed, 1 to another path, 0 unreadable; slowest 0.093 ms, largest 79 bytes" \
+    "1 MISPLACED: 2 saves in window (at least 2), 0 outside, 0 failed, 1 to another path, 0 unreadable; slowest 0.093 ms, largest 79 bytes, most attempts 1" \
     "$(snapshots 100 1000 30000 10000 "$SNAP" "$(saved 200)" "$(saved 300 /mnt/journal/primary.snapshot)" "$(saved 900)")"
 check "a path that merely starts with the node's is another path" \
-    "1 MISPLACED: 0 saves in window (at least 1), 0 outside, 0 failed, 1 to another path, 0 unreadable; slowest - ms, largest - bytes" \
+    "1 MISPLACED: 0 saves in window (at least 1), 0 outside, 0 failed, 1 to another path, 0 unreadable; slowest - ms, largest - bytes, most attempts -" \
     "$(snapshots 100 1000 10000 10000 "$SNAP" "$(saved 300 "${SNAP}.tmp")")"
 check "a path with a space is matched whole" \
-    "0 ok: 1 saves in window (at least 1), 0 outside, 0 failed, 0 to another path, 0 unreadable; slowest 0.093 ms, largest 79 bytes" \
+    "0 ok: 1 saves in window (at least 1), 0 outside, 0 failed, 0 to another path, 0 unreadable; slowest 0.093 ms, largest 79 bytes, most attempts 1" \
     "$(snapshots 100 1000 10000 10000 "/srv/my snaps/primary.snapshot" "$(saved 300 "/srv/my snaps/primary.snapshot")")"
 check "a saved line with no sequence fails the run" \
-    "1 UNREADABLE: 1 saves in window (at least 1), 0 outside, 0 failed, 0 to another path, 1 unreadable; slowest 0.093 ms, largest 79 bytes" \
+    "1 UNREADABLE: 1 saves in window (at least 1), 0 outside, 0 failed, 0 to another path, 1 unreadable; slowest 0.093 ms, largest 79 bytes, most attempts 1" \
     "$(snapshots 100 1000 10000 10000 "$SNAP" "$(saved 300)" "INFO shadow snapshot saved bytes=79 path=${SNAP}")"
 check "fields in another order, with colours, or with no timestamp still parse" \
-    "0 ok: 3 saves in window (at least 2), 0 outside, 0 failed, 0 to another path, 0 unreadable; slowest 7.500 ms, largest 4096 bytes" \
+    "0 ok: 3 saves in window (at least 2), 0 outside, 0 failed, 0 to another path, 0 unreadable; slowest 7.500 ms, largest 4096 bytes, most attempts 2" \
     "$(snapshots 100 1000 30000 10000 "$SNAP" "$ANSI_LINE" \
         "2026-10-18T19:45:36.254275Z  INFO shadow snapshot saved path=${SNAP} attempts=2 elapsed_ms=7.5 bytes=4096 journal_seq=600" \
         "INFO melin_transport_core::shadow: shadow snapshot saved journal_seq=700 bytes=79 elapsed_ms=0.05 attempts=1 path=${SNAP}")"
+check "the most attempts a counted save took is reported, a deferral's warning and a save outside the window aside" \
+    "1 TOO FEW: 2 saves in window (at least 5), 1 outside, 0 failed, 0 to another path, 0 unreadable; slowest 0.093 ms, largest 79 bytes, most attempts 41" \
+    "$(snapshots 100 1000 60000 10000 "$SNAP" "$(saved 200 "$SNAP" 0.092626 79 3)" "$DEFERRED_LINE" \
+        "$(saved 800 "$SNAP" 0.092626 79 41)" "$(saved 1200 "$SNAP" 0.092626 79 90)")"
+check "a counted save with no attempts field still counts, with no attempts to report" \
+    "0 ok: 1 saves in window (at least 1), 0 outside, 0 failed, 0 to another path, 0 unreadable; slowest 0.050 ms, largest 79 bytes, most attempts -" \
+    "$(snapshots 100 1000 10000 10000 "$SNAP" "INFO shadow snapshot saved journal_seq=700 bytes=79 elapsed_ms=0.05 path=${SNAP}")"
 check "the expected count follows the measured phase" \
-    "1 TOO FEW: 4 saves in window (at least 5), 0 outside, 0 failed, 0 to another path, 0 unreadable; slowest 0.093 ms, largest 79 bytes" \
+    "1 TOO FEW: 4 saves in window (at least 5), 0 outside, 0 failed, 0 to another path, 0 unreadable; slowest 0.093 ms, largest 79 bytes, most attempts 1" \
     "$(snapshots 100 1000 60000 10000 "$SNAP" "$(saved 200)" "$(saved 400)" "$(saved 600)" "$(saved 800)")"
 check "a phase shorter than two intervals still expects one save" \
-    "1 NO SNAPSHOT: 0 saves in window (at least 1), 0 outside, 0 failed, 0 to another path, 0 unreadable; slowest - ms, largest - bytes" \
+    "1 NO SNAPSHOT: 0 saves in window (at least 1), 0 outside, 0 failed, 0 to another path, 0 unreadable; slowest - ms, largest - bytes, most attempts -" \
     "$(snapshots 100 1000 5000 2000 "$SNAP" "$STARTED_LINE")"
 check "an empty log is unjudged" \
     "1 UNJUDGED: no node log" \
@@ -248,6 +257,37 @@ check "a side with no disk among its devices is unresolved" \
     "1 unresolved" "$(outcome shared_disks 'loop0 loop' "$JOURNAL_DISK")"
 
 echo ""
+echo "=== disks_of ==="
+check "a partition's disk" "0 nvme0n1" "$(outcome disks_of "$ROOT_PART")"
+check "a whole disk is its own" "0 nvme1n1" "$(outcome disks_of "$JOURNAL_DISK")"
+check "an LV's disks, by the names diskstats uses, not the LV's" \
+    "0 sda sdb" "$(outcome disks_of $'vg0-root lvm\nsda3 part\nsda disk\nsdb1 part\nsdb disk')"
+check "a disk listed twice is named once" \
+    "0 sda" "$(outcome disks_of $'md0 raid1\nsda1 part\nsda disk\nsda2 part\nsda disk')"
+check "a device with no disk under it has none" "0 " "$(outcome disks_of 'loop0 loop')"
+check "no output has none" "0 " "$(outcome disks_of "")"
+
+echo ""
+echo "=== disk_problem ==="
+check "distinct disks pass" \
+    "0 " "$(outcome disk_problem 0 "$ROOT_PART" 0 "$JOURNAL_DISK")"
+check "a snapshot directory on tmpfs" \
+    "0 SNAPSHOT_DIR is tmpfs: in memory, not on a disk" \
+    "$(outcome disk_problem 1 "tmpfs: in memory, not on a disk" 0 "$JOURNAL_DISK")"
+check "a journal directory that did not resolve" \
+    "0 JOURNAL_DIR is unresolved: no filesystem" \
+    "$(outcome disk_problem 0 "$ROOT_PART" 1 "unresolved: no filesystem")"
+check "both, each named" \
+    "0 SNAPSHOT_DIR is tmpfs: in memory, not on a disk; JOURNAL_DIR is unresolved: no filesystem" \
+    "$(outcome disk_problem 1 "tmpfs: in memory, not on a disk" 1 "unresolved: no filesystem")"
+check "a shared disk is named" \
+    "0 both are on nvme0n1" \
+    "$(outcome disk_problem 0 "$ROOT_PART" 0 $'nvme0n1p3 part\nnvme0n1 disk')"
+check "an overlay (resolved, with no tree) is unresolved" \
+    "0 their disks are unresolved" \
+    "$(outcome disk_problem 0 "" 0 "$JOURNAL_DISK")"
+
+echo ""
 echo "=== duration_ms ==="
 check "milliseconds" "0 500" "$(outcome duration_ms 500ms)"
 check "seconds" "0 30000" "$(outcome duration_ms 30s)"
@@ -260,6 +300,24 @@ for refused in 1h30m 60 "" 1.5s -5s 30S " 30s" 1000000000000s 16666666667m 99999
     check "'${refused}' is refused" \
         "1 '${refused}' is not a duration the suite can judge (<n>ms, <n>s or <n>m)" \
         "$(outcome duration_ms "$refused")"
+done
+
+echo ""
+echo "=== snapshots_off ==="
+check "0 is off" "0 " "$(outcome snapshots_off 0)"
+check "0 with leading zeros is off" "0 " "$(outcome snapshots_off 000)"
+check "an interval is on" "1 " "$(outcome snapshots_off 10000)"
+check "a value that is not a count is not off" "1 " "$(outcome snapshots_off 0s)"
+check "an empty value is not off" "1 " "$(outcome snapshots_off "")"
+
+echo ""
+echo "=== remote_dir_check ==="
+check "an absolute path" "0 " "$(outcome remote_dir_check SNAPSHOT_DIR /var/lib/melin-bench/snapshots)"
+check "dots, underscores and dashes" "0 " "$(outcome remote_dir_check JOURNAL_DIR /mnt/journal_2.a-b)"
+for refused in "" relative/dir "~/snaps" "/my snaps" '/x/$HOME' '/x/*' "/x;rm"; do
+    check "'${refused}' is refused" \
+        "1 SNAPSHOT_DIR='${refused}' must be an absolute path of letters, digits, '.', '_', '-' and '/'" \
+        "$(outcome remote_dir_check SNAPSHOT_DIR "$refused")"
 done
 
 echo ""
@@ -325,6 +383,94 @@ check "an empty read fails" \
 check "a count that went backwards fails" \
     "1 the sectors written to nvme0n1 went backwards" \
     "$(outcome diskstat_written "$DISKSTATS_AFTER" "$DISKSTATS_BEFORE" nvme0n1)"
+
+echo ""
+echo "=== disk_writes ==="
+check "a resolved disk on each side" \
+    "0 disk primary snapshot nvme0n1: 2097152 bytes written
+disk primary journal nvme1n1: 0 bytes written" \
+    "$(outcome disk_writes primary nvme0n1 nvme1n1 "$DISKSTATS_BEFORE" "$DISKSTATS_AFTER")"
+check "a side the guard could not resolve is reported, the other still counted" \
+    "0 disk replica1 snapshot -: - (the disk guard could not resolve it)
+disk replica1 journal nvme0n1: 2097152 bytes written" \
+    "$(outcome disk_writes replica1 "" nvme0n1 "$DISKSTATS_BEFORE" "$DISKSTATS_AFTER")"
+check "neither side resolved" \
+    "0 disk replica2 snapshot -: - (the disk guard could not resolve it)
+disk replica2 journal -: - (the disk guard could not resolve it)" \
+    "$(outcome disk_writes replica2 "" "" "$DISKSTATS_BEFORE" "$DISKSTATS_AFTER")"
+check "a disk missing from a read is reported, not counted as 0" \
+    "0 disk primary snapshot nvme1n1: - (no nvme1n1 in /proc/diskstats)
+disk primary journal nvme0n1: 2097152 bytes written" \
+    "$(outcome disk_writes primary nvme1n1 nvme0n1 "$DISKSTATS_BEFORE" "$(head -2 <<< "$DISKSTATS_AFTER")")"
+check "a host whose reads came back empty" \
+    "0 disk primary snapshot nvme0n1: - (no nvme0n1 in /proc/diskstats)
+disk primary journal nvme1n1: - (no nvme1n1 in /proc/diskstats)" \
+    "$(outcome disk_writes primary nvme0n1 nvme1n1 "" "")"
+check "a side on several disks (a RAID or LVM span) gets a line per disk" \
+    "0 disk primary snapshot nvme0n1: 2097152 bytes written
+disk primary snapshot nvme1n1: 0 bytes written
+disk primary journal sdz: - (no sdz in /proc/diskstats)" \
+    "$(outcome disk_writes primary "nvme0n1 nvme1n1" sdz "$DISKSTATS_BEFORE" "$DISKSTATS_AFTER")"
+
+echo ""
+echo "=== summary_table ==="
+# A results directory as the suite leaves it: a `.json` per run that
+# measured, and a `.snapshots` beside it while snapshots are on, whose
+# node lines are judge_snapshots's own output.
+RESULTS="${TMP_ROOT}/results"
+mkdir -p "$RESULTS"
+run_json() {
+    echo '{"throughput_ops": 1234567, "latency": {"p50_us": 20.5, "p99_us": 31, "p99.9_us": 45.25, "max_us": 900}}' \
+        > "${RESULTS}/$1.json"
+}
+# `snapshots_file <run> <lines...>`: `<run>.snapshots` with those lines.
+snapshots_file() {
+    local run="$1"
+    shift
+    printf '%s\n' "$@" > "${RESULTS}/${run}.snapshots"
+}
+# `node_verdict <node> <judge_snapshots args after the log> <log lines...>`:
+# that node's line in a `.snapshots` file.
+node_verdict() {
+    local node="$1" verdict
+    printf '%s\n' "${@:7}" > "${TMP_ROOT}/node.log"
+    verdict=$(judge_snapshots "${TMP_ROOT}/node.log" "$2" "$3" "$4" "$5" "$6")
+    echo "${node}: ${verdict}"
+}
+HEADER="run                                 req/s    p50 µs    p99 µs  p99.9 µs    max µs min saves max save ms"
+FIGURES="      1234567      20.5      31.0      45.2     900.0"
+run_json kernel-single
+run_json kernel-throughput
+snapshots_file kernel-throughput \
+    "$(node_verdict primary 100 1000 30000 10000 "$SNAP" "$(saved 200 "$SNAP" 1.5)" "$(saved 500 "$SNAP" 0.25)")" \
+    "$(node_verdict replica1 100 1000 30000 10000 "$SNAP" "$(saved 200 "$SNAP" 12.25)" "$(saved 500)" "$(saved 900)")" \
+    "$(node_verdict replica2 100 1000 30000 10000 "$SNAP" "$(saved 500)" "$(saved 900)")" \
+    "$(disk_writes primary nvme0n1 nvme1n1 "$DISKSTATS_BEFORE" "$DISKSTATS_AFTER")" \
+    "$(disk_writes replica1 "" nvme1n1 "" "")"
+check "the fewest saves on any node and the slowest save, each run on its row" \
+    "$HEADER
+kernel-single               ${FIGURES}         -           -
+kernel-throughput           ${FIGURES}         2      12.250" \
+    "$(summary_table "$RESULTS")"
+snapshots_file kernel-single \
+    "$(node_verdict primary 100 1000 30000 10000 "$SNAP" "$STARTED_LINE")" \
+    "$(node_verdict replica1 100 1000 30000 10000 "$SNAP" "$STARTED_LINE")"
+check "a run where no node saved has no slowest save" \
+    "kernel-single               ${FIGURES}         0           -" \
+    "$(summary_table "$RESULTS" | grep '^kernel-single')"
+snapshots_file kernel-single \
+    "$(node_verdict primary 100 1000 30000 10000 "$SNAP" "$(saved 500)" "$(saved 900)")" \
+    "replica1: $(judge_snapshots "${TMP_ROOT}/absent.log" 100 1000 30000 10000 "$SNAP")" \
+    "$(disk_writes replica1 "" "" "" "")"
+check "a node whose log could not be judged makes the run's figures unknown" \
+    "kernel-single               ${FIGURES}         ?           ?" \
+    "$(summary_table "$RESULTS" | grep '^kernel-single')"
+snapshots_file kernel-single "$(seq_window "$(samples_file "$LIVE2")")"
+check "an unjudged window makes the run's figures unknown" \
+    "kernel-single               ${FIGURES}         ?           ?" \
+    "$(summary_table "$RESULTS" | grep '^kernel-single')"
+rm "${RESULTS}"/*.json
+check "no run that measured, no table" "" "$(summary_table "$RESULTS")"
 
 
 echo ""

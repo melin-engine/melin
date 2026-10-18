@@ -38,6 +38,12 @@ rewritten on every run, so keep tuning of your own in a drop-in of
 another name. Set `JOURNAL_DISK=/dev/nvmeXn1` to choose the journal
 drive yourself.
 
+The nodes write their snapshots to the root filesystem (see "Snapshots"
+below), so on the server and replica hosts the root filesystem must be
+on a disk other than the journal drive. A host with no journal drive of
+its own, whose `/mnt/journal` is then on the root disk, can run the suite
+only with snapshots off.
+
 For the DPDK transport, each host also needs `/etc/melin-dpdk.conf`,
 written by `scripts/dpdk/dpdk-setup.sh`. The suite runs it on a host
 that has none, which is enough for SR-IOV on Intel NICs. A Mellanox
@@ -94,6 +100,39 @@ live would face.
 suite's own builds of the same name, to compare a build made elsewhere
 against the suite's.
 
+### Snapshots
+
+Every node takes snapshots throughout every run, as it does in
+production, where they are on by default. Each node saves one every
+`SNAPSHOT_INTERVAL_MS` (10 s by default) to `<node>.snapshot` in
+`SNAPSHOT_DIR` (`/var/lib/melin-bench/snapshots` by default, on the root
+filesystem). The interval is far shorter than a production one, so that
+several saves land inside every measured phase: the figures show what
+snapshots cost the latency at worst, not on average. The interval must
+be at least 1000 ms and no longer than the shortest measured phase
+requested; `0` turns snapshots off, to tell whether a regression comes
+from them. The suite sets each node's snapshot flags itself and refuses
+`SERVER_EXTRA_ARGS` or `REPLICA_EXTRA_ARGS` that carry one.
+
+The snapshots are kept on another disk than the journal, which is the
+layout [the journal documentation](journal.md#where-snapshots-go)
+recommends for latency-critical deployments: a save then shares no
+device queue and no filesystem with the journal's writes and syncs.
+Before the first run the suite resolves `SNAPSHOT_DIR` and `JOURNAL_DIR`
+on each node host to the disks under them, through partitions, LVM and
+software RAID, and refuses to run if they share a disk, if
+`SNAPSHOT_DIR` is on a filesystem held in memory (such as `tmpfs`), or if
+either cannot be resolved to a disk at all: a run that cannot show the
+separation does not claim it. With snapshots off the check is skipped.
+
+Before each run, every node's journal and snapshot files from earlier
+runs are removed, by their exact names, so a run never starts from
+another's state, and an aborted run leaves nothing behind for the next
+one to read. The last run's files are left in place for inspection.
+`SNAPSHOT_DIR` may be a directory shared with other files: nothing else
+in it is touched. Files left by an aborted run under a different
+`SNAPSHOT_DIR` are not removed; no node reads them, but they take space.
+
 ## Rehearsing without hosts
 
 `scripts/bench/test-containers.sh [echo|notary|ec]` runs the suite end to
@@ -103,6 +142,14 @@ the cluster's start and the health verdict all run as they would on
 bench hosts. The containers use your machine's architecture, so on an
 ARM machine the build is for ARM rather than x86_64. The figures it
 prints measure nothing, and it does not exercise DPDK.
+
+The rehearsal takes a snapshot every 2 s, so that each of its short
+phases is judged on at least one save per node. A container's filesystem
+cannot be resolved to a disk, so the rehearsal sets
+`SNAPSHOT_SHARED_DISK_OK=1`, which turns the disk check's refusal into a
+warning and records the disks' writes as `-`. That setting is for
+rehearsals only: a run made with it does not show that its snapshots
+were kept off the journal's disk.
 
 ## Results
 
@@ -114,7 +161,17 @@ Each run leaves, in `bench-results/lan-<app>-<timestamp>/`:
 - `<transport>-<workload>.health`: the primary's replica metrics,
   sampled every second from the load-generating host;
 - `<transport>-<workload>.primary.log`, `.replica1.log` and
-  `.replica2.log`: each node's log.
+  `.replica2.log`: each node's log;
+- `<transport>-<workload>.snapshots`, with snapshots on: each node's
+  snapshot verdict (the saves it made during the load, how many it
+  needed, the slowest and largest of them, and the most attempts any of
+  them took: a save is retried until the node can take it consistently,
+  so a count above 1 under heavy load explains a node that fell short of
+  its saves), then the bytes written
+  to each node's snapshot disk and journal disk over the run;
+- `suite.conf`: every setting the suite ran with, the revision it was
+  built from, the CPU it was built for, and the disks each node's
+  snapshots and journal were found on.
 
 A latency is a full round trip as the client sees it, from the request
 leaving the client to its reply arriving. A run whose replicas were
@@ -122,6 +179,16 @@ evicted, missing or catching up at any point is reported
 as degraded, and the suite exits non-zero, as it does when a cluster
 does not start or the load generator fails: a number measured on a
 cluster that was not whole is not the number it claims to be.
+
+A run does not pass, either, unless every node snapshotted during it.
+Each node must have saved at least one snapshot for every interval of
+the measured phase but one (and at least one in all), to its own path in
+`SNAPSHOT_DIR`; a failed save, or a save anywhere else, fails the run
+however many landed. A run that took no snapshots measured a
+configuration nobody deploys. The summary table gives, for each run, the
+fewest saves any node made during the load and the slowest save, the
+figure to compare with the run's latency outliers; both are `-` with
+snapshots off.
 
 After a run on SR-IOV the hosts are rebooted, to release the NIC's
 virtual functions before the kernel transport uses it again; set

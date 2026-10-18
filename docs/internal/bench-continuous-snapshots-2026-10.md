@@ -1,8 +1,10 @@
 # Continuous snapshots in the LAN benchmark, on the OS disk (plan)
 
-Status: **planned** (2026-10). Step 0 addresses the snapshot-location
-half of determinism-audit findings 21 and 22; the rest of both stays open
-(see "Not part of this item").
+Status: **implemented** (2026-10), steps 0 to 4; pending the container
+rehearsal (`test-containers.sh`, for `echo` and `notary`, and `ec` with a
+checkout at hand) and a run on the bench hosts, DPDK included. Step 0
+addresses the snapshot-location half of determinism-audit findings 21
+and 22; the rest of both stays open (see "Not part of this item").
 
 The one-line goal: **every LAN benchmark run takes shadow snapshots
 throughout its measured phase, on every node, written to the OS disk and
@@ -634,7 +636,15 @@ removed, never `SNAPSHOT_DIR/*`, so an operator who points the directory
 at a shared location loses nothing else. A failed cleanup now fails the
 run's start (`|| return 1`). Before any `rm`, the suite checks that
 `SNAPSHOT_DIR` and `JOURNAL_DIR` are absolute and non-empty, so a broken
-expansion cannot turn into `rm -rf /<node>...`.
+expansion cannot turn into `rm -rf /<node>...`. As built
+(`remote_dir_check`, at start-up and again beside the `rm`), the check
+also limits both to letters, digits, `.`, `_`, `-` and `/`: the remote
+command takes them unquoted, so a space would split one into two paths
+for `rm -rf`, and a `~` or `$` would expand on the host. `clean_node_state`
+also creates both directories, because the nodes are given
+`--snapshot-path` even with snapshots off (the layout stays one), and a
+node refuses a snapshot directory that does not exist; the guard, which
+creates it too, does not run then.
 
 Files from an aborted run that used a different `SNAPSHOT_DIR` are left
 behind. They are harmless, because no node reads a path it was not
@@ -676,7 +686,14 @@ needs no new metric:
   `SNAPSHOT_SHARED_DISK_OK=1`), `diskstat_written` is not called for that
   host and the delta is recorded as `-`. The call is guarded explicitly,
   so the suite's `set -e` cannot abort a run on it, and the rehearsal
-  covers that branch.
+  covers that branch. As built, the counters are those of the whole
+  disks under each directory (`disks_of`, the `disk` lines of the
+  guard's `lsblk`), one line per disk: an LV's or an md array's own name
+  (`vg0-root`) is not the one `/proc/diskstats` lists it under (`dm-0`),
+  and a disk's count includes all its partitions. The `-` is per side (a
+  host whose journal disk resolved and whose snapshot disk did not still
+  reports the journal's), and a disk missing from a read is recorded as
+  `-` with `diskstat_written`'s reason.
 - **The cost.** The runtime reports each save's size and duration (step
   1). The judge reports the largest per node, which is the figure to
   compare against the input ring's headroom.
@@ -768,10 +785,19 @@ Alternatives considered for the dirty-page coupling:
   snapshot disks the guard resolved. One function prints the settings
   both to the console header and to this file, so the two cannot drift.
 - `<transport>-<workload>.snapshots`: the judge's verdict per node
-  (saves in the window, largest `elapsed_ms` and `bytes`), followed by
+  (saves in the window, largest `elapsed_ms`, `bytes` and `attempts`), followed by
   the diskstats deltas.
 - The summary table gains a column with the fewest in-window saves on
   any node and the largest save time. A run with snapshots off shows `-`.
+  As built, these are two columns (`min saves`, `max save ms`), and a run
+  whose `.snapshots` has a node line with no count (a node unjudged, or
+  the window itself) shows `?`. The table moved into `lib.sh`
+  (`summary_table`), so that its reading of `judge_snapshots`'s verdict
+  lines is tested against that function's own output.
+- As built, `suite.conf` also gets the platform, target and CPU the
+  build was for, and the guard's disks, through `record_setting`, which
+  appends a line to it and prints it on the console in the header's
+  form: they are learnt after the header is printed.
 
 ## Order of work
 
@@ -802,7 +828,9 @@ an assumed go-ahead.
    stays out of CI (run locally; see "Tests").
 4. **Suite: wiring, rehearsal and docs** (`feat(bench)`). Changes to
    `lan-bench-suite.sh`, `test-containers.sh`, `server-setup.sh`'s
-   comment, and `docs/benchmarking.md`.
+   comment, and `docs/benchmarking.md`. As built, also the `lib.sh`
+   helpers the wiring turned out to need, with their cases (see "Files
+   and functions").
 
 ## Files and functions
 
@@ -865,8 +893,11 @@ a caller under `set -e` reads either from one capture
   numeric `journal_seq`), `NO SNAPSHOT`, `TOO FEW` or `UNJUDGED` (an empty
   or missing log, a bound that is not a count), followed by every count
   and the slowest `elapsed_ms` (to three decimals: the node logs the
-  float at full precision, `0.20887799999999998`) and largest `bytes`
-  among the counted saves. It parses the lines the nodes actually log: tracing's fmt
+  float at full precision, `0.20887799999999998`), largest `bytes` and
+  most `attempts` among the counted saves (added in step 4's review: a
+  save deferred until the shadow reaches a journal fsync boundary is the
+  likely cause of a `TOO FEW` under saturating load, and the verdict
+  should say so without opening the node log). It parses the lines the nodes actually log: tracing's fmt
   output (`... shadow snapshot saved journal_seq=4 bytes=79
   elapsed_ms=0.092626 attempts=1 path=/x/primary.snapshot`), with any
   prefix (timestamp, level, thread name, target), fields matched by name
@@ -878,6 +909,27 @@ a caller under `set -e` reads either from one capture
 - `diskstat_written <before> <after> <dev>`: bytes written between the
   two reads (the 10th field, in 512-byte sectors), failing when either
   read lacks the device or the count went backwards.
+- Added in step 4, host-free logic the wiring turned out to need:
+  - `snapshots_off <interval>`: `0` however spelt; `judge_snapshots`
+    and the suite's settings both ask it, rather than each testing for
+    zero.
+  - `remote_dir_check <variable> <dir>`: decision 4's guard on the two
+    directories.
+  - `disks_of <lsblk output>`: the `disk` names, each once.
+    `shared_disks` is rebuilt on it, and the suite records them and reads
+    their diskstats (decision 5).
+  - `disk_problem <snapshot status> <snapshot tree> <journal status>
+    <journal tree>`: the guard's verdict on one node, from what the suite
+    resolved for each directory: nothing when they are on distinct disks,
+    otherwise every problem found (either side unresolved or not on a
+    disk, or the disks they share), so that the suite only gathers the
+    trees and fails closed on any output.
+  - `disk_writes <node> <snapshot disks> <journal disks> <before>
+    <after>`: one `disk ...` line per snapshot and journal disk with the
+    bytes written between two diskstats reads (decision 5), `-` with the
+    reason for a side the guard could not resolve or a disk a read lacks.
+  - `summary_table <results dir>`: the summary, with its new columns
+    (decision 7).
 
 **`scripts/bench/lan-bench-suite.sh`**
 
@@ -897,8 +949,16 @@ a caller under `set -e` reads either from one capture
 - `run_workload`: add `melin_journal_sequence` to the sampler regex and
   read diskstats around the load. The snapshot verdict moves to a
   `judge_run` called after `save_node_logs` in the main loop, because
-  the replicas' logs exist only then.
+  the replicas' logs exist only then. As built, `run_workload` tells the
+  loop whether the load ran to the end through `RUN_LOADED`, a global
+  rather than its status: calling it as an `if` condition would turn
+  `set -e` off for its whole body.
 - Summary: the new column.
+- As built, also: `NODES` and `node_host`, which `save_node_logs`,
+  `clean_node_state`, the guard and the judge share;
+  `workload_duration_var`, the one mapping of a workload onto its
+  duration variable, for the settings check and `run_workload`; and
+  `SNAPSHOT_SHARED_DISK_OK` refused unless `0` or `1`.
 
 **`scripts/bench/test-containers.sh`**
 
@@ -963,6 +1023,22 @@ helper:
   `--snapshot=x` forms.
 - `diskstat_written`: a device present in both reads; a device missing
   from one, which fails rather than reporting 0.
+- (added in step 4) `snapshots_off`: `0` and `000`; an interval, a
+  non-count and an empty value are not off. `remote_dir_check`: absolute
+  paths pass; empty, relative, `~`, a space, `$`, `*` and `;` are
+  refused. `disks_of`: a partition's disk, a whole disk, an LV's disks,
+  a disk named once, none for a loop device or no output.
+  `disk_problem`: distinct disks pass; a snapshot side on tmpfs, a
+  journal side unresolved, and both at once, each named; a shared disk
+  named; an overlay (resolved, with no tree) unresolved. `disk_writes`:
+  a resolved disk on each side; a side the guard could not resolve
+  reported while the other is still counted; neither side resolved; a
+  disk missing from a read reported, not counted as 0; reads that came
+  back empty.
+  `summary_table`: built from `judge_snapshots`'s real output, the
+  fewest saves and slowest save per run, `-` with no `.snapshots`, `-`
+  for the slowest when nothing saved, `?` for an unjudged node or
+  window, and no table without a `.json`.
 
 **Runtime unit tests:**
 
@@ -1064,6 +1140,15 @@ unexercised. The shell helpers are covered case by case above.
   a non-numeric 10th field, are one-line guards with no fixture: no
   `/proc/diskstats` carries either.
 
+- **The suite's wiring.** What drives hosts (the guard's `findmnt` and
+  `lsblk` calls, `clean_node_state`, the sampler, the diskstats reads,
+  `judge_run`) has no test of its own: the container rehearsal runs it,
+  and the bench hosts run the rest. While building step 4 it was run
+  against the local filesystem with `rssh` replaced by a local shell
+  (a cleanup that keeps unrelated files and removes a resync archive
+  directory, the guard's warning and refusing branches on an overlay, a
+  `tmpfs` directory refused before `lsblk`, a verdict file with resolved and unresolved disks); that
+  harness was throwaway, not kept.
 - **The DPDK transport with snapshots.** The shadow is
   transport-agnostic and the flags are the same, but the rehearsal is
   kernel-only (no NIC). It is covered only by running the suite on the

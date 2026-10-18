@@ -65,6 +65,19 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   dirty-page limit and make the kernel throttle every writer, the
   journal's thread included, for the length of the save. The final
   `fsync` remains the durability point.
+- **The LAN benchmark suite takes snapshots in every run, on the OS
+  disk.** Every node saves one every `SNAPSHOT_INTERVAL_MS` (10 s by
+  default; `0` turns them off) to `SNAPSHOT_DIR`
+  (`/var/lib/melin-bench/snapshots` by default), which the suite refuses
+  to run with when it cannot show it is on another disk than the
+  journal. A run passes only if every node saved enough snapshots during
+  the load, all to its own path; each run records the verdict and the
+  writes to both disks in `<transport>-<workload>.snapshots`, and the
+  suite records its settings in `suite.conf`. Before, the nodes ran at
+  the 50-minute default interval and no run ever took a snapshot. Node
+  arguments carrying a snapshot flag are now refused, and the files of
+  earlier runs are removed by exact name before each run, resync archive
+  directories included. See [docs/benchmarking.md](docs/benchmarking.md).
 
 ### Removed
 

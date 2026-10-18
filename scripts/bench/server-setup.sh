@@ -615,10 +615,16 @@ kernel.watchdog = 0
 # Cap dirty-page accumulation in absolute bytes so the values don't scale
 # with RAM size. Defaults (10%/20% of RAM) on big-RAM boxes let many GiB
 # of dirty pages build up before the kernel forces writeback, which can
-# trigger 10-100ms `balance_dirty_pages` stalls when it does. The journal
-# path itself bypasses this (RWF_DSYNC syncs immediately) but co-tenants
-# — log rotation, snapshot writes, replica catch-up — share the same
-# global accounting and can stall the whole machine.
+# trigger 10-100ms `balance_dirty_pages` stalls when it does. The
+# journal is not exempt: it writes through the page cache and then calls
+# `fdatasync`, so its writes are throttled like any other writer's once
+# the global dirty count passes the limit, whichever device the dirty
+# pages belong to. Co-tenants (log rotation, replica catch-up) share that
+# accounting. A node's snapshot does not push it there: the runtime
+# writes it in chunks, sending each to disk as it goes, and keeps no more
+# than a few of them unwritten in the page cache. The bench also keeps the
+# snapshot directory on the OS disk, away from the journal drive's queue
+# and filesystem.
 vm.dirty_background_bytes = 33554432
 vm.dirty_bytes = 67108864
 # Network buffer tuning.

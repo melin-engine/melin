@@ -54,7 +54,10 @@
 #   BENCH_CORE            core the load generator's loop is pinned to
 #                         (default 7)
 #   SERVER_EXTRA_ARGS     appended to the primary's command line
-#   REPLICA_EXTRA_ARGS    appended to each replica's
+#   REPLICA_EXTRA_ARGS    appended to each replica's; neither may carry a
+#                         snapshot flag (refused), as the suite sets every
+#                         node's --journal, --snapshot-path and
+#                         --snapshot-interval-ms itself
 #   BENCH_EXTRA_ARGS      appended to the load generator's
 #   ECHO_SIZE             bytes per echo request (default 64)
 #   EC_REPO               the Exchange Core checkout (default ../exchange-core)
@@ -68,8 +71,20 @@
 #                         melin-ec-server, melin-ec-bench): an A/B against
 #                         a build made elsewhere
 #   JOURNAL_DIR           where the nodes journal (default /mnt/journal)
+#   SNAPSHOT_INTERVAL_MS  the nodes' shadow snapshot interval (default
+#                         10000); at least 1000 and at most the shortest
+#                         measured phase, or 0 to turn snapshots off
+#   SNAPSHOT_DIR          where the nodes write their snapshots, each as
+#                         <node>.snapshot (default
+#                         /var/lib/melin-bench/snapshots); on a disk other
+#                         than JOURNAL_DIR's, which the suite checks
+#   SNAPSHOT_SHARED_DISK_OK=1  warn rather than refuse when SNAPSHOT_DIR
+#                         cannot be shown to be on another disk than
+#                         JOURNAL_DIR: for rehearsals only (test-containers.sh)
 #   RESULTS_DIR           default bench-results/lan-<app>-<timestamp>
-#   RUST_LOG              the nodes' log filter (default info)
+#   RUST_LOG              the nodes' log filter (default info; with
+#                         snapshots on, the shadow's info lines are kept
+#                         whatever it says)
 #   SKIP_REBOOT=1         skip the reboot that follows SR-IOV DPDK runs
 #
 # Local prerequisites: rustup (the hosts' target, x86_64-unknown-linux-gnu
@@ -83,7 +98,18 @@
 # Each run waits for both replicas to be live before the load starts,
 # and samples the primary's health metrics throughout: a replica
 # evicted, missing or catching up at any point marks the run degraded.
-# The suite exits non-zero if any run was degraded or could not start.
+#
+# Snapshots are on by default, as in production: every node's shadow
+# saves one every SNAPSHOT_INTERVAL_MS to SNAPSHOT_DIR, which must be on
+# another disk than the journal (checked once, after deploy, failing
+# closed). After each run every node's log is judged: a node with too few
+# saves during the load for the measured phase, a failed save, or a save
+# to another path fails the run. The writes to each node's snapshot and
+# journal disks during the run go beside the verdict, in
+# <transport>-<workload>.snapshots; every setting goes in suite.conf.
+#
+# The suite exits non-zero if any run was degraded, could not start, or
+# failed its snapshot verdict.
 
 set -euo pipefail
 
@@ -136,6 +162,11 @@ BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS:-}"
 ECHO_SIZE="${ECHO_SIZE:-64}"
 EC_ACCOUNTS="${EC_ACCOUNTS:-100000}"
 NODE_RUST_LOG="${RUST_LOG:-info}"
+SNAPSHOT_INTERVAL_MS="${SNAPSHOT_INTERVAL_MS:-10000}"
+# On the root filesystem: /tmp is tmpfs on current Debian, and a snapshot
+# written there never reaches a disk.
+SNAPSHOT_DIR="${SNAPSHOT_DIR:-/var/lib/melin-bench/snapshots}"
+SNAPSHOT_SHARED_DISK_OK="${SNAPSHOT_SHARED_DISK_OK:-0}"
 
 RESULTS_DIR="${RESULTS_DIR:-${MELIN_REPO}/bench-results/lan-${APP}-$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "$RESULTS_DIR"
@@ -281,10 +312,104 @@ for w in "${REQ_WORKLOADS[@]}"; do
     fi
 done
 
+# The name of the variable holding `workload`'s measured phase.
+workload_duration_var() {
+    case "$1" in
+        throughput) echo THROUGHPUT_DURATION ;;
+        single) echo SINGLE_DURATION ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Snapshot settings: refused here, before anything is built, rather than
+# by a node that then never logs its ready line
+# ---------------------------------------------------------------------------
+for var in SERVER_EXTRA_ARGS REPLICA_EXTRA_ARGS; do
+    if flag=$(extra_args_conflict "${!var}"); then
+        case "$flag" in
+            --snapshot-interval-ms) instead="set SNAPSHOT_INTERVAL_MS instead" ;;
+            --snapshot-path) instead="set SNAPSHOT_DIR instead" ;;
+            *) instead="the flag no longer exists; set SNAPSHOT_DIR to choose where snapshots go" ;;
+        esac
+        echo "error: ${var} carries ${flag}, which the suite sets itself: ${instead}" >&2
+        exit 1
+    fi
+done
+for var in JOURNAL_DIR SNAPSHOT_DIR; do
+    if ! reason=$(remote_dir_check "$var" "${!var}"); then
+        echo "error: ${reason}" >&2
+        exit 1
+    fi
+done
+# The measured phase of each workload run, in milliseconds, for the
+# snapshot verdict: set only while snapshots are on, the one case a
+# duration must be one the suite can read.
+declare -A MEASURED_MS=()
+if snapshots_off "$SNAPSHOT_INTERVAL_MS"; then
+    SNAPSHOT_INTERVAL_MS=0
+else
+    shortest=""
+    for w in "${REQ_WORKLOADS[@]}"; do
+        var=$(workload_duration_var "$w")
+        if ! ms=$(duration_ms "${!var}"); then
+            echo "error: ${var}: ${ms}" >&2
+            exit 1
+        fi
+        MEASURED_MS[$w]="$ms"
+        if [[ -z "$shortest" ]] || (( ms < shortest )); then shortest="$ms"; fi
+    done
+    if ! reason=$(snapshot_settings_check "$SNAPSHOT_INTERVAL_MS" "$shortest"); then
+        echo "error: ${reason}" >&2
+        exit 1
+    fi
+    # Without its leading zeros, which bash arithmetic would read as octal.
+    SNAPSHOT_INTERVAL_MS=$((10#$SNAPSHOT_INTERVAL_MS))
+    # The lines each run is judged on, whatever RUST_LOG filters out.
+    NODE_RUST_LOG+=",melin_transport_core::shadow=info"
+fi
+if [[ "$SNAPSHOT_SHARED_DISK_OK" != 0 && "$SNAPSHOT_SHARED_DISK_OK" != 1 ]]; then
+    echo "error: SNAPSHOT_SHARED_DISK_OK='${SNAPSHOT_SHARED_DISK_OK}' is neither 0 nor 1" >&2
+    exit 1
+fi
+
+# Every setting this suite runs with, one `KEY=value` per line: the
+# console's header and `suite.conf`, from this one list. What is learnt
+# later (the build's CPU, the disks the guard resolves) is added to both
+# by record_setting.
+suite_settings() {
+    local rev ec_rev var
+    # Best-effort: a tree that is not a git checkout records `unknown`
+    # rather than stopping the suite.
+    rev=$(git -C "$MELIN_REPO" describe --always --dirty 2>/dev/null) || rev=unknown
+    printf '%s=%s\n' APP "$APP" MELIN_REVISION "$rev"
+    if [[ "$APP" == ec ]]; then
+        # Best-effort, as above.
+        ec_rev=$(git -C "$EC_REPO" describe --always --dirty 2>/dev/null) || ec_rev=unknown
+        printf '%s=%s\n' EC_REPO "$EC_REPO" EC_REVISION "$ec_rev" EC_ACCOUNTS "$EC_ACCOUNTS"
+    fi
+    [[ "$APP" == echo ]] && printf '%s=%s\n' ECHO_SIZE "$ECHO_SIZE"
+    printf '%s=%s\n' SERVER "$SERVER_PUB" BENCH "$BENCH_PUB" SERVER_VLAN "$SERVER_VLAN" \
+        REPLICA "$REPLICA_PUB" REPLICA2 "$REPLICA2_PUB" SSH_USER "$SSH_USER" \
+        TRANSPORTS "$(IFS=,; echo "${RUN_TRANSPORTS[*]}")" WORKLOADS "$(IFS=,; echo "${REQ_WORKLOADS[*]}")"
+    for var in THROUGHPUT_DURATION THROUGHPUT_CLIENTS THROUGHPUT_WINDOW SINGLE_DURATION \
+        WARMUP_DURATION COOLDOWN_DURATION ACK_POLICY BENCH_CORE JOURNAL_DIR \
+        SNAPSHOT_INTERVAL_MS SNAPSHOT_DIR SNAPSHOT_SHARED_DISK_OK \
+        SERVER_EXTRA_ARGS REPLICA_EXTRA_ARGS BENCH_EXTRA_ARGS; do
+        printf '%s=%s\n' "$var" "${!var}"
+    done
+    printf '%s=%s\n' SETTLE_SECS "${SETTLE_SECS:-0}" RUST_LOG "$NODE_RUST_LOG" \
+        PREBUILT_BIN_DIR "${PREBUILT_BIN_DIR:-}" RESULTS_DIR "$RESULTS_DIR"
+}
+
+# `record_setting <key> <value>`: a setting learnt after the header, in
+# suite.conf and on the console in the header's form.
+record_setting() {
+    printf '%s=%s\n' "$1" "$2" | tee -a "${RESULTS_DIR}/suite.conf" | sed 's/^/  /'
+}
+
 echo "=== Melin LAN suite: ${APP} ==="
-echo "  transports: ${RUN_TRANSPORTS[*]}"
-echo "  workloads:  ${REQ_WORKLOADS[*]}"
-echo "  results:    ${RESULTS_DIR}"
+suite_settings > "${RESULTS_DIR}/suite.conf"
+sed 's/^/  /' "${RESULTS_DIR}/suite.conf"
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -357,7 +482,10 @@ if ! rustc --print target-cpus --target "$TARGET" | awk '{print $1}' | grep -qx 
     echo "error: rustc does not know the CPU '${TARGET_CPU}'; set TARGET_CPU" >&2
     exit 1
 fi
-echo "  building for ${TARGET_CPU}"
+echo "  building for:"
+record_setting PLATFORM "$PLATFORM"
+record_setting TARGET "$TARGET"
+record_setting TARGET_CPU "$TARGET_CPU"
 
 # The sysroot: the server host's headers and libraries, taken once per
 # architecture, distribution and libdpdk version and kept. `tar -h`
@@ -531,9 +659,113 @@ done
 # ---------------------------------------------------------------------------
 # Node helpers
 # ---------------------------------------------------------------------------
-clean_journal() {
-    local host="$1" journal="$2"
-    rssh "$host" "${SUDO} mkdir -p ${JOURNAL_DIR} && ${SUDO} rm -f ${journal} ${journal}.* ${journal%.journal}.snapshot ${journal%.journal}.snapshot.*"
+# The nodes, by the names their files and logs carry, and the host each
+# runs on.
+NODES=(primary replica1 replica2)
+node_host() {
+    case "$1" in
+        primary) echo "$SERVER" ;;
+        replica1) echo "$REPLICA" ;;
+        replica2) echo "$REPLICA2" ;;
+    esac
+}
+
+# A node's journal and snapshot: named after the node, so that each is
+# its own even where two nodes share a directory, or REPLICA_EXTRA_ARGS
+# (shared by both replicas) would have them share a path.
+node_journal() { echo "${JOURNAL_DIR}/$1.journal"; }
+node_snapshot() { echo "${SNAPSHOT_DIR}/$1.snapshot"; }
+
+# The flags that put a node's journal and snapshots where the suite looks
+# for them, on every transport.
+node_store_flags() {
+    echo "--journal $(node_journal "$1") --snapshot-path $(node_snapshot "$1") --snapshot-interval-ms ${SNAPSHOT_INTERVAL_MS}"
+}
+
+# Remove everything a previous run of `node` left on `host`, an aborted
+# one's included, by exact name: its journal lineage (a resync's archive
+# is a directory, hence `-r`), a snapshot beside the journal (where suite
+# versions before --snapshot-path wrote it), and its snapshot, `.prev`,
+# `.tmp` and resync archives in SNAPSHOT_DIR. Never a whole directory's
+# contents: SNAPSHOT_DIR may be shared with other files. Creates both
+# directories, which the node needs to exist.
+clean_node_state() {
+    local host="$1" node="$2" journal snapshot var reason
+    # Checked at start-up too; again here, beside the `rm -rf` it guards.
+    for var in JOURNAL_DIR SNAPSHOT_DIR; do
+        if ! reason=$(remote_dir_check "$var" "${!var}"); then
+            echo "  ${reason}" >&2
+            return 1
+        fi
+    done
+    journal=$(node_journal "$node")
+    snapshot=$(node_snapshot "$node")
+    rssh "$host" "${SUDO} mkdir -p ${JOURNAL_DIR} ${SNAPSHOT_DIR} && ${SUDO} rm -rf ${journal} ${journal}.* ${journal%.journal}.snapshot ${journal%.journal}.snapshot.* ${snapshot} ${snapshot}.*"
+}
+
+# ---------------------------------------------------------------------------
+# The snapshot disk guard: snapshots on another disk than the journal
+# ---------------------------------------------------------------------------
+# Per node, the whole disks under its SNAPSHOT_DIR and JOURNAL_DIR as the
+# guard resolved them (see disks_of), for the runs' disk writes; empty on
+# a side it could not resolve, or with snapshots off.
+declare -A SNAPSHOT_DISKS=() JOURNAL_DISKS=()
+
+# `dir_devices <host> <dir>`: `lsblk -rnso NAME,TYPE` of the device
+# `dir`'s filesystem is on, on `host`; or why there is none (a filesystem
+# in memory, or none found), failing.
+dir_devices() {
+    local host="$1" dir="$2" mount device tree
+    # A findmnt that fails prints nothing, which mount_source reports as
+    # unresolved: its own error, on stderr, says why.
+    mount=$(rssh "$host" "findmnt -nv -o SOURCE,FSTYPE -T $(printf %q "$dir")") || mount=""
+    device=$(mount_source "$mount") || { echo "$device"; return 1; }
+    # lsblk refuses a source that is no block device (an overlay's), which
+    # shared_disks then reports as unresolved; its error would only repeat
+    # that.
+    tree=$(rssh "$host" "lsblk -rnso NAME,TYPE $(printf %q "$device")" 2>/dev/null) || tree=""
+    echo "$tree"
+}
+
+# Refuse (or with SNAPSHOT_SHARED_DISK_OK=1, warn) unless every node's
+# SNAPSHOT_DIR is shown to be on other disks than its JOURNAL_DIR: a run
+# that cannot show the separation must not claim it. Records the disks.
+check_snapshot_disks() {
+    local node host snap_tree journal_tree snap_rc journal_rc problem refused=0
+    echo ""
+    echo "=== Checking the snapshot and journal disks ==="
+    for node in "${NODES[@]}"; do
+        host=$(node_host "$node")
+        if ! rssh "$host" "${SUDO} mkdir -p ${JOURNAL_DIR} ${SNAPSHOT_DIR}"; then
+            echo "error: cannot create ${JOURNAL_DIR} and ${SNAPSHOT_DIR} on ${node} (${host})" >&2
+            exit 1
+        fi
+        snap_rc=0
+        snap_tree=$(dir_devices "$host" "$SNAPSHOT_DIR") || snap_rc=$?
+        journal_rc=0
+        journal_tree=$(dir_devices "$host" "$JOURNAL_DIR") || journal_rc=$?
+        problem=$(disk_problem "$snap_rc" "$snap_tree" "$journal_rc" "$journal_tree")
+        # A directory that did not resolve holds its reason, not a tree:
+        # it has no disks to record.
+        if (( snap_rc != 0 )); then snap_tree=""; fi
+        if (( journal_rc != 0 )); then journal_tree=""; fi
+        SNAPSHOT_DISKS[$node]=$(disks_of "$snap_tree")
+        JOURNAL_DISKS[$node]=$(disks_of "$journal_tree")
+        record_setting "${node}.snapshot_disks" "${SNAPSHOT_DISKS[$node]:--}"
+        record_setting "${node}.journal_disks" "${JOURNAL_DISKS[$node]:--}"
+        if [[ -n "$problem" ]]; then
+            if [[ "$SNAPSHOT_SHARED_DISK_OK" == 1 ]]; then
+                echo "  warning: ${node} (${host}): ${problem}; going on, as SNAPSHOT_SHARED_DISK_OK=1 (rehearsals only)"
+            else
+                echo "error: ${node} (${host}): ${SNAPSHOT_DIR} cannot be shown to be on another disk than ${JOURNAL_DIR}: ${problem}" >&2
+                refused=1
+            fi
+        fi
+    done
+    if (( refused )); then
+        echo "       the snapshots must not share a disk with the journal: put SNAPSHOT_DIR and JOURNAL_DIR on block-device filesystems of distinct disks (is the journal drive mounted?)" >&2
+        exit 1
+    fi
 }
 
 # Every retargetable IRQ to core 0, and the writeback workqueue with them:
@@ -670,9 +902,10 @@ BENCH_TRANSPORT_ARGS=""
 start_cluster() {
     local transport="$1" bin primary_ready repl_ready primary_flags host
 
-    clean_journal "$SERVER" "${JOURNAL_DIR}/primary.journal"
-    clean_journal "$REPLICA" "${JOURNAL_DIR}/replica1.journal"
-    clean_journal "$REPLICA2" "${JOURNAL_DIR}/replica2.journal"
+    local node
+    for node in "${NODES[@]}"; do
+        clean_node_state "$(node_host "$node")" "$node" || return 1
+    done
     for host in "${HOSTS[@]}"; do pin_irqs "$host"; done
 
     if [[ "$transport" == dpdk ]]; then
@@ -693,18 +926,19 @@ start_cluster() {
         BENCH_TRANSPORT_ARGS=""
     fi
 
-    launch "$SERVER" "${bin} ${primary_flags} --journal ${JOURNAL_DIR}/primary.journal --authorized-keys ${REMOTE_DIR}/authorized_keys --health-bind ${SERVER_VLAN}:${HEALTH_PORT} --ack-policy ${ACK_POLICY} ${APP_SERVER_ARGS} ${SERVER_EXTRA_ARGS}"
+    launch "$SERVER" "${bin} ${primary_flags} $(node_store_flags primary) --authorized-keys ${REMOTE_DIR}/authorized_keys --health-bind ${SERVER_VLAN}:${HEALTH_PORT} --ack-policy ${ACK_POLICY} ${APP_SERVER_ARGS} ${SERVER_EXTRA_ARGS}"
     wait_for_log "$SERVER" "$repl_ready" 30 || return 1
     local i prefix replica_flags
     for i in 1 2; do
-        host="$REPLICA"; prefix=REPLICA
-        (( i == 2 )) && { host="$REPLICA2"; prefix=REPLICA2; }
+        host=$(node_host "replica${i}")
+        # The host's DPDK configuration, as load_dpdk_hosts named it.
+        prefix=REPLICA; (( i == 2 )) && prefix=REPLICA2
         if [[ "$transport" == dpdk ]]; then
             replica_flags="--replica-of ${SERVER_DPDK_IP}:${REPL_PORT} $(dpdk_flags "$prefix") --dpdk-peer-mac ${SERVER_DPDK_MAC}"
         else
             replica_flags="--replica-of ${SERVER_VLAN}:${REPL_PORT}"
         fi
-        launch "$host" "${bin} ${replica_flags} --replication-key ${REMOTE_DIR}/repl.key --journal ${JOURNAL_DIR}/replica${i}.journal --authorized-keys ${REMOTE_DIR}/authorized_keys ${APP_SERVER_ARGS} ${REPLICA_EXTRA_ARGS}"
+        launch "$host" "${bin} ${replica_flags} --replication-key ${REMOTE_DIR}/repl.key $(node_store_flags "replica${i}") --authorized-keys ${REMOTE_DIR}/authorized_keys ${APP_SERVER_ARGS} ${REPLICA_EXTRA_ARGS}"
     done
     # On a fresh journal the primary serves clients only once a replica is
     # live, so this waits for the replicas too.
@@ -740,24 +974,48 @@ bench_command() {
     echo "${REMOTE_DIR}/bin/${bin} ${args} ${BENCH_EXTRA_ARGS}"
 }
 
+# `node_diskstats <node>`: /proc/diskstats on `node`'s host, read only
+# when the disk guard resolved one of its disks.
+node_diskstats() {
+    [[ -n "${SNAPSHOT_DISKS[$1]:-}${JOURNAL_DISKS[$1]:-}" ]] || return 0
+    # Best-effort: an unreadable host gives an empty read, which
+    # disk_writes reports per disk rather than this stopping the suite.
+    rssh "$(node_host "$1")" "cat /proc/diskstats" || true
+}
+
+# Set by run_workload for judge_run: whether the load ran to the end, and
+# each node's disk counters on either side of it.
+RUN_LOADED=0
+declare -A DISKSTATS_BEFORE=() DISKSTATS_AFTER=()
+
 run_workload() {
-    local transport="$1" workload="$2" clients window duration name
+    local transport="$1" workload="$2" clients window duration name node
+    duration=$(workload_duration_var "$workload")
+    duration="${!duration}"
     case "$workload" in
-        throughput) clients="$THROUGHPUT_CLIENTS"; window="$THROUGHPUT_WINDOW"; duration="$THROUGHPUT_DURATION" ;;
-        single) clients=1; window=1; duration="$SINGLE_DURATION" ;;
+        throughput) clients="$THROUGHPUT_CLIENTS"; window="$THROUGHPUT_WINDOW" ;;
+        single) clients=1; window=1 ;;
     esac
     name="${transport}-${workload}"
+    RUN_LOADED=0
     echo ""
     echo "--- ${name}: ${clients} × ${window} for ${duration} ---"
 
-    # The primary's health, sampled every second for the run's length.
+    # The primary's health, sampled every second for the run's length;
+    # its journal sequence bounds the snapshots the run is judged on.
     local samples="${RESULTS_DIR}/${name}.health"
-    sample_metrics "$samples" '^melin_replica(s_connected|_catching_up|_evictions_total)'
+    sample_metrics "$samples" '^melin_(replicas_connected|replica_catching_up|replica_evictions_total|journal_sequence)'
 
+    if (( SNAPSHOT_INTERVAL_MS > 0 )); then
+        for node in "${NODES[@]}"; do DISKSTATS_BEFORE[$node]=$(node_diskstats "$node"); done
+    fi
     local rc=0
     rssh "$BENCH" "${SUDO} rm -f ${BENCH_JSON}"
     rssh "$BENCH" "${SUDO} $(bench_command "$transport" "$clients" "$window" "$duration")" \
         | tee "${RESULTS_DIR}/${name}.txt" || rc=$?
+    if (( SNAPSHOT_INTERVAL_MS > 0 )); then
+        for node in "${NODES[@]}"; do DISKSTATS_AFTER[$node]=$(node_diskstats "$node"); done
+    fi
     stop_samplers
 
     if (( rc != 0 )) || ! rscp "${BENCH}:${BENCH_JSON}" "${RESULTS_DIR}/${name}.json" 2>/dev/null; then
@@ -765,6 +1023,7 @@ run_workload() {
         DEGRADED_RUNS+=("${name}: the load generator failed")
         return
     fi
+    RUN_LOADED=1
     local verdict
     if verdict=$(judge_health "$samples" 2); then
         echo "  cluster ${verdict}"
@@ -778,15 +1037,51 @@ run_workload() {
 # it: a replica's is the only record of why it fell behind. Best-effort:
 # a host that cannot be reached loses its log, not the suite.
 save_node_logs() {
-    local name="$1"
-    rssh "$SERVER" "cat ${NODE_LOG}" > "${RESULTS_DIR}/${name}.primary.log" 2>/dev/null || true
-    rssh "$REPLICA" "cat ${NODE_LOG}" > "${RESULTS_DIR}/${name}.replica1.log" 2>/dev/null || true
-    rssh "$REPLICA2" "cat ${NODE_LOG}" > "${RESULTS_DIR}/${name}.replica2.log" 2>/dev/null || true
+    local name="$1" node
+    for node in "${NODES[@]}"; do
+        rssh "$(node_host "$node")" "cat ${NODE_LOG}" > "${RESULTS_DIR}/${name}.${node}.log" 2>/dev/null || true
+    done
+}
+
+# The snapshot verdict on run `transport`-`workload`, from the logs
+# save_node_logs took: each node must have saved enough snapshots to its
+# own path during the load (judge_snapshots), the window being the
+# journal sequences the primary's health samples bound (seq_window).
+# Writes `<run>.snapshots`, each node's verdict then the disks' writes;
+# a verdict that is not `ok` fails the run.
+judge_run() {
+    local name="$1-$2" workload="$2" out window first last node verdict
+    out="${RESULTS_DIR}/${name}.snapshots"
+    if ! window=$(seq_window "${RESULTS_DIR}/${name}.health"); then
+        echo "  snapshots ${window}"
+        echo "$window" > "$out"
+        DEGRADED_RUNS+=("${name}: snapshots ${window}")
+    else
+        read -r first last <<< "$window"
+        : > "$out"
+        for node in "${NODES[@]}"; do
+            if ! verdict=$(judge_snapshots "${RESULTS_DIR}/${name}.${node}.log" "$first" "$last" \
+                "${MEASURED_MS[$workload]}" "$SNAPSHOT_INTERVAL_MS" "$(node_snapshot "$node")"); then
+                DEGRADED_RUNS+=("${name}: ${node} snapshots ${verdict}")
+            fi
+            echo "  ${node} snapshots ${verdict}"
+            echo "${node}: ${verdict}" >> "$out"
+        done
+    fi
+    for node in "${NODES[@]}"; do
+        disk_writes "$node" "${SNAPSHOT_DISKS[$node]:-}" "${JOURNAL_DISKS[$node]:-}" \
+            "${DISKSTATS_BEFORE[$node]:-}" "${DISKSTATS_AFTER[$node]:-}" >> "$out"
+    done
 }
 
 # ---------------------------------------------------------------------------
 # The runs
 # ---------------------------------------------------------------------------
+# Once, before the first run. With snapshots off there is no separation
+# to show, and a host with no journal drive of its own can still run the
+# suite.
+if (( SNAPSHOT_INTERVAL_MS > 0 )); then check_snapshot_disks; fi
+
 for transport in "${RUN_TRANSPORTS[@]}"; do
     for workload in "${REQ_WORKLOADS[@]}"; do
         # A fresh cluster per run: each run starts from an empty journal.
@@ -799,6 +1094,11 @@ for transport in "${RUN_TRANSPORTS[@]}"; do
         run_workload "$transport" "$workload"
         stop_nodes "${HOSTS[@]}"
         save_node_logs "${transport}-${workload}"
+        # Not on a run whose load generator failed: it has already failed,
+        # with no measured phase to expect saves from.
+        if (( SNAPSHOT_INTERVAL_MS > 0 && RUN_LOADED )); then
+            judge_run "$transport" "$workload"
+        fi
     done
 done
 
@@ -818,21 +1118,7 @@ fi
 # ---------------------------------------------------------------------------
 echo ""
 echo "=== Results (${RESULTS_DIR}) ==="
-python3 - "$RESULTS_DIR" <<'EOF'
-import glob, json, os, sys
-rows = []
-for path in sorted(glob.glob(os.path.join(sys.argv[1], "*.json"))):
-    with open(path) as f:
-        doc = json.load(f)
-    lat = doc.get("latency", {})
-    rows.append((os.path.basename(path)[:-5], doc.get("throughput_ops", 0),
-                 lat.get("p50_us"), lat.get("p99_us"), lat.get("p99.9_us"), lat.get("max_us")))
-if rows:
-    print(f"{'run':<28} {'req/s':>12} {'p50 µs':>9} {'p99 µs':>9} {'p99.9 µs':>9} {'max µs':>9}")
-    fmt = lambda v: f"{v:9.1f}" if isinstance(v, (int, float)) else f"{'-':>9}"
-    for name, tput, *lat in rows:
-        print(f"{name:<28} {tput:12.0f} " + " ".join(fmt(v) for v in lat))
-EOF
+summary_table "$RESULTS_DIR"
 
 if [[ ${#DEGRADED_RUNS[@]} -gt 0 ]]; then
     echo ""
