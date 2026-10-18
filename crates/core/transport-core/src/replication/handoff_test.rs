@@ -36,23 +36,9 @@ use melin_journal::{BufferedWriter, JournalEvent, JournalWrite};
 use melin_pipeline::wait::WaitStrategy;
 
 use super::catchup::{CatchUpResult, bridge_catchup_to_live, catch_up_from_journal_with};
-use crate::pipeline::InputSlot;
 use crate::replication_wire::{encode_input_batch, try_decode_input_batch};
 use crate::test_support::TestEvent;
-
-/// An `InputSlot` carrying its journal sequence, as the journal stage
-/// publishes them to the replication rings on the primary.
-fn slot(sequence: u64) -> InputSlot<TestEvent> {
-    InputSlot {
-        connection_id: 0,
-        key_hash: 0,
-        sequence,
-        timestamp_ns: 0,
-        event: JournalEvent::App(TestEvent::Add(sequence)),
-        publish_ts: Default::default(),
-        recv_ts: Default::default(),
-    }
-}
+use crate::test_support::sequenced_slot as slot;
 
 /// Decode a forwarded byte stream (concatenated length-prefixed
 /// `InputBatch` frames — exactly what the replica's receiver parses)

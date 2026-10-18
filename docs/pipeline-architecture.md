@@ -204,6 +204,7 @@ Because the journal and matching consumers are gated only on the producer, they 
 | Field | Description |
 |-------|-------------|
 | `connection_id: u64` | Originating client connection |
+| `request_id: RequestId` | The client's identifier for the request, which every reply to it carries; 0 for events no client sent. Never journaled or replicated |
 | `key_hash: u64` | Hash of the client's public key; 0 for events the node journals on its own behalf |
 | `sequence: u64` | Journal sequence; assigned by the journal stage on a primary, carried from the primary's stream on a replica |
 | `timestamp_ns: u64` | Wall-clock time stamped at ingress; zero for queries |
@@ -377,6 +378,7 @@ The output SPSC queue connects the matching stage to the response stage. Defined
 | Field | Description |
 |-------|-------------|
 | `connection_id: u64` | Target client connection |
+| `request_id: RequestId` | The originating input slot's request ID, copied into every output slot of the event |
 | `input_seq: u64` | Input disruptor sequence (for journal cursor gating) |
 | `payload: OutputPayload` | `Report` (an application report), `QueryResponse`, `BatchEnd`, `EngineError`, or `AckPolicyChange` (a journaled policy change, at its place in the order; it produces no frame) |
 | `match_complete_ts` | Matching completion timestamp (zero-sized when `latency-trace` disabled) |

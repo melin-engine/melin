@@ -302,7 +302,6 @@ mod tests {
     use melin_pipeline::wait::WaitStrategy;
 
     use super::*;
-    use crate::pipeline::InputSlot;
     use crate::replication::catchup::handoff_pass_from_journal;
     use crate::replication::protocol::{PrimaryMessage, decode_primary_message, encode_rotate};
     use crate::replication_wire::{
@@ -312,17 +311,7 @@ mod tests {
 
     // -- Fixtures ----------------------------------------------------------
 
-    fn slot(seq: u64) -> InputSlot<TestEvent> {
-        InputSlot {
-            connection_id: 0,
-            key_hash: 0,
-            sequence: seq,
-            timestamp_ns: 0,
-            event: JournalEvent::App(TestEvent::Add(seq)),
-            publish_ts: Default::default(),
-            recv_ts: Default::default(),
-        }
-    }
+    use crate::test_support::sequenced_slot as slot;
 
     /// An `InputBatch` frame carrying `seqs`: a ring chunk's shape.
     fn batch(seqs: impl IntoIterator<Item = u64>) -> Vec<u8> {

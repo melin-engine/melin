@@ -11,6 +11,20 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConnectionId(pub u64);
 
+/// A request's identifier, chosen by the client that sent it.
+///
+/// A transport correlation token: the node echoes it on the request's
+/// final reply frame and keeps no state about it, so it is never checked
+/// for uniqueness or order, and `0` is as valid as any other value. It
+/// means nothing outside its connection's lifetime, and is never
+/// journaled, replicated, or handed to the application.
+///
+/// A newtype so it cannot be swapped with the connection ID it travels
+/// beside. `u64` so a connection that lives for months at millions of
+/// requests a second never has to ask what happens when it wraps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RequestId(pub u64);
+
 /// Transport-level response frames that the server runtime encodes
 /// directly, bypassing the application's `ResponseEncoder` trait.
 ///

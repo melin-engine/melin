@@ -16,12 +16,13 @@ use notary_server::{NotaryEvent, NotaryHead, NotaryReport};
 /// Ceiling on the two rings' combined footprint, in bytes.
 ///
 /// At a 32-byte leaf the event is no longer what dominates an input slot:
-/// an `InputSlot` spends 32 bytes on the pipeline's own per-slot metadata
-/// (connection id, key hash, journal sequence, timestamp) and rounds up to
-/// whole cache lines before the event is counted at all, and shrinking the
-/// event further would barely move it — the floor is structural. The output
-/// slot is the receipt's: two 32-byte heads, a position and a timestamp
-/// make it 120 bytes. The two rings come to ~248 MiB.
+/// an `InputSlot` spends 40 bytes on the pipeline's own per-slot metadata
+/// (connection id, request id, key hash, journal sequence, timestamp) and
+/// rounds up to whole cache lines before the event is counted at all, and
+/// shrinking the event further would barely move it — the floor is
+/// structural. The output slot is the receipt's: two 32-byte heads, a
+/// position and a timestamp, plus the slot's own routing metadata, make it
+/// 128 bytes. The two rings come to ~256 MiB.
 ///
 /// That is the state worth protecting. 320 MiB leaves room for
 /// slot-layout drift while still failing loudly if the event grows back

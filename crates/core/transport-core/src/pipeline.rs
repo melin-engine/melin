@@ -45,6 +45,10 @@ use melin_journal::segment_file::SegmentFile;
 use melin_journal::write_ring::{
     ClaimedChunk, JournalWriteMeta, JournalWriteProducer, build_journal_write_ring,
 };
+/// The client's identifier for a request, carried by both ring slots.
+/// Re-exported so code that builds or reads a slot needs no dependency
+/// on the wire-protocol crate to name it.
+pub use melin_wire_protocol::control::RequestId;
 
 use crate::journal_disk::{DiskControl, DurabilityCursors, JournalDisk, RotateRequest};
 use melin_journal::replication::{ReplicationConsumer, ReplicationProducer};
@@ -312,8 +316,9 @@ const MAX_MATCHING_BATCH: usize = 16;
 
 /// Slot in the input disruptor ring buffer.
 ///
-/// Carries a connection ID alongside the event so the response stage
-/// knows where to route the application's reports. `Copy` for zero-cost
+/// Carries a connection ID and the client's request ID alongside the
+/// event so the response stage knows where to route the application's
+/// reports and which request they answer. `Copy` for zero-cost
 /// ring buffer ops. Generic over `E: AppEvent`, the application's event
 /// type.
 ///
@@ -329,6 +334,14 @@ const MAX_MATCHING_BATCH: usize = 16;
 pub struct InputSlot<E: AppEvent> {
     /// Which client connection submitted this command.
     pub connection_id: u64,
+    /// The client's identifier for this request, which the matching stage
+    /// copies into every output slot of the event. Meaningful only with
+    /// `connection_id`, and only while that connection lives:
+    /// `RequestId(0)` on node events and on replicas, as `connection_id`
+    /// is 0 there. Never journaled or replicated: the journal entry is
+    /// built from `sequence`, `timestamp_ns`, `key_hash` and `event`
+    /// alone, and replication ships the journal's bytes.
+    pub request_id: RequestId,
     /// FxHash of the client's Ed25519 public key, journaled with the
     /// event and handed to the application as `ApplyCtx::key_hash`.
     /// 0 for seed/internal events.
@@ -365,6 +378,7 @@ impl<E: AppEvent> Default for InputSlot<E> {
         // value is never observed in steady state.
         Self {
             connection_id: 0,
+            request_id: RequestId(0),
             key_hash: 0,
             sequence: 0,
             timestamp_ns: 0,
@@ -383,12 +397,46 @@ impl<E: AppEvent> InputSlot<E> {
     pub fn node_event(event: melin_journal::JournalEvent<E>, timestamp_ns: u64) -> Self {
         Self {
             connection_id: 0,
+            request_id: RequestId(0),
             key_hash: 0,
             sequence: 0,
             timestamp_ns,
             event,
             publish_ts: mono_trace_ns(),
             recv_ts: mono_trace_ns(),
+        }
+    }
+
+    /// A request a client submitted, as a reader publishes it: `sequence`
+    /// 0, because the journal stage allocates it (see [`Self::sequence`]).
+    ///
+    /// The one place a client slot is built, and built whole, with a
+    /// struct literal: a field added to the slot is a compile error here
+    /// rather than a value left behind by the slot's previous occupant, as
+    /// a field-by-field write into a reused ring slot would leave it.
+    /// `#[inline]` so a reader's `*slot = InputSlot::client(..)` inside
+    /// the ring's in-place write still compiles to a store into the slot.
+    #[inline]
+    pub fn client(
+        origin: ClientOrigin,
+        event: E,
+        timestamp_ns: u64,
+        recv_ts: MonoTraceInstant,
+    ) -> Self {
+        let ClientOrigin {
+            connection_id,
+            request_id,
+            key_hash,
+        } = origin;
+        Self {
+            connection_id,
+            request_id,
+            key_hash,
+            sequence: 0,
+            timestamp_ns,
+            event: melin_journal::JournalEvent::App(event),
+            publish_ts: mono_trace_ns(),
+            recv_ts,
         }
     }
 
@@ -404,6 +452,22 @@ impl<E: AppEvent> InputSlot<E> {
             ..Self::default()
         }
     }
+}
+
+/// Who sent a client request: the input-slot fields a reader takes from
+/// the connection and the frame, for [`InputSlot::client`].
+///
+/// A struct with named fields rather than three positional arguments,
+/// two of them `u64`, so a call site cannot swap the connection ID and
+/// the key hash without it showing.
+#[derive(Debug, Clone, Copy)]
+pub struct ClientOrigin {
+    /// See [`InputSlot::connection_id`].
+    pub connection_id: u64,
+    /// See [`InputSlot::request_id`].
+    pub request_id: RequestId,
+    /// See [`InputSlot::key_hash`].
+    pub key_hash: u64,
 }
 
 /// Slot in the output SPSC queue (matching → response).
@@ -424,6 +488,11 @@ impl<E: AppEvent> InputSlot<E> {
 pub struct OutputSlot<R: Copy, Q: Copy> {
     /// Which client connection receives this response.
     pub connection_id: u64,
+    /// The client's identifier for the request this slot answers: the
+    /// originating input slot's [`InputSlot::request_id`], copied into
+    /// every output slot of the event. `RequestId(0)` wherever the input
+    /// slot's is (node events, replicas).
+    pub request_id: RequestId,
     /// Input disruptor sequence this output originated from.
     /// Retained for per-slot latency attribution and ordering invariants
     /// inside this process. The response stage's *durability* gate uses
@@ -500,6 +569,7 @@ impl<R: Copy, Q: Copy> Default for OutputSlot<R, Q> {
     fn default() -> Self {
         Self {
             connection_id: 0,
+            request_id: RequestId(0),
             input_seq: 0,
             wire_seq: 0,
             payload: OutputPayload::BatchEnd,
@@ -2542,6 +2612,10 @@ fn observe_live_lineage(
 /// client's reply batch. The response stages also never look a
 /// connection up for it (`DurabilityGate::admit` reports it as the
 /// gate's own).
+///
+/// The request ID is still the input slot's, as on every output slot of
+/// an event; for a node event, the only kind that carries a change, that
+/// is `RequestId(0)`, matching the connection.
 #[inline]
 fn ack_policy_change_slot<R: Copy, Q: Copy>(
     input: &InputSlot<impl AppEvent>,
@@ -2552,12 +2626,37 @@ fn ack_policy_change_slot<R: Copy, Q: Copy>(
 ) -> OutputSlot<R, Q> {
     OutputSlot {
         connection_id: 0,
+        request_id: input.request_id,
         input_seq,
         wire_seq,
         payload: OutputPayload::AckPolicyChange(change),
         match_complete_ts,
         recv_ts: input.recv_ts,
         is_last_in_request: true,
+    }
+}
+
+/// An output slot answering `input`'s client: its connection, its request
+/// ID and its receive timestamp, copied here and nowhere else, so the run
+/// loop and the shutdown drain cannot address a reply differently.
+#[inline]
+fn reply_slot<R: Copy, Q: Copy>(
+    input: &InputSlot<impl AppEvent>,
+    input_seq: u64,
+    wire_seq: u64,
+    payload: OutputPayload<R, Q>,
+    match_complete_ts: MonoTraceInstant,
+    is_last_in_request: bool,
+) -> OutputSlot<R, Q> {
+    OutputSlot {
+        connection_id: input.connection_id,
+        request_id: input.request_id,
+        input_seq,
+        wire_seq,
+        payload,
+        match_complete_ts,
+        recv_ts: input.recv_ts,
+        is_last_in_request,
     }
 }
 
@@ -2924,43 +3023,40 @@ impl<A: Application> MatchingStage<A> {
                     // no longer be met.
                     if slot.connection_id != 0 {
                         out_batch.push_with(|s| {
-                            *s = OutputSlot {
-                                connection_id: slot.connection_id,
+                            *s = reply_slot(
+                                slot,
                                 input_seq,
                                 wire_seq,
-                                payload: OutputPayload::BatchEnd,
+                                OutputPayload::BatchEnd,
                                 match_complete_ts,
-                                recv_ts: slot.recv_ts,
-                                is_last_in_request: true,
-                            };
+                                true,
+                            );
                         });
                     }
                 } else {
                     for (j, report) in reports.iter().enumerate() {
                         let is_last = j + 1 == report_count && !last_is_query && !last_is_change;
                         out_batch.push_with(|s| {
-                            *s = OutputSlot {
-                                connection_id: slot.connection_id,
+                            *s = reply_slot(
+                                slot,
                                 input_seq,
                                 wire_seq,
-                                payload: OutputPayload::Report(*report),
+                                OutputPayload::Report(*report),
                                 match_complete_ts,
-                                recv_ts: slot.recv_ts,
-                                is_last_in_request: is_last,
-                            };
+                                is_last,
+                            );
                         });
                     }
                     if let Some(qr) = query_report {
                         out_batch.push_with(|s| {
-                            *s = OutputSlot {
-                                connection_id: slot.connection_id,
+                            *s = reply_slot(
+                                slot,
                                 input_seq,
                                 wire_seq,
-                                payload: OutputPayload::QueryResponse(qr),
+                                OutputPayload::QueryResponse(qr),
                                 match_complete_ts,
-                                recv_ts: slot.recv_ts,
-                                is_last_in_request: true,
-                            };
+                                true,
+                            );
                         });
                     }
                     if let Some(change) = policy_change {
@@ -3070,27 +3166,25 @@ impl<A: Application> MatchingStage<A> {
             let policy_change = slot.event.ack_policy_change();
             let report_count = reports.len();
             if report_count == 0 && policy_change.is_none() {
-                self.output.publish(OutputSlot {
-                    connection_id: slot.connection_id,
+                self.output.publish(reply_slot(
+                    &slot,
                     input_seq,
                     wire_seq,
-                    payload: OutputPayload::BatchEnd,
+                    OutputPayload::BatchEnd,
                     match_complete_ts,
-                    recv_ts: slot.recv_ts,
-                    is_last_in_request: true,
-                });
+                    true,
+                ));
             } else {
                 for (j, report) in reports.iter().enumerate() {
                     let is_last = j + 1 == report_count && policy_change.is_none();
-                    self.output.publish(OutputSlot {
-                        connection_id: slot.connection_id,
+                    self.output.publish(reply_slot(
+                        &slot,
                         input_seq,
                         wire_seq,
-                        payload: OutputPayload::Report(*report),
+                        OutputPayload::Report(*report),
                         match_complete_ts,
-                        recv_ts: slot.recv_ts,
-                        is_last_in_request: is_last,
-                    });
+                        is_last,
+                    ));
                 }
                 if let Some(change) = policy_change {
                     self.output.publish(ack_policy_change_slot(

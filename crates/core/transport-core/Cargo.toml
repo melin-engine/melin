@@ -55,6 +55,10 @@ zerocopy = { version = "0.8", features = ["derive"] }
 melin-app = { workspace = true }
 melin-pipeline = { workspace = true }
 melin-journal = { workspace = true }
+# For `RequestId`, which the ring slots carry beside the connection ID.
+# The wire-protocol crate depends on nothing in the workspace, so this
+# adds no cycle and nothing heavier than the type.
+melin-wire-protocol = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

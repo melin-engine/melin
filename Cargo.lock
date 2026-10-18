@@ -1202,6 +1202,7 @@ dependencies = [
  "melin-app",
  "melin-journal",
  "melin-pipeline",
+ "melin-wire-protocol",
  "proptest",
  "tempfile",
  "tracing",

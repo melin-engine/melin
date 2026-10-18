@@ -1196,7 +1196,7 @@ mod tests {
     use melin_app::{AppEvent, CodecError};
     use melin_journal::JournalEvent;
     use melin_pipeline::ring::DisruptorBuilder;
-    use melin_transport_core::pipeline::InputSlot;
+    use melin_transport_core::pipeline::{InputSlot, RequestId};
     use melin_transport_core::replication::protocol::{encode_heartbeat, encode_input_batch};
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1223,6 +1223,7 @@ mod tests {
     fn slot(primary_seq: u64, tag: u64) -> InputSlot<TestEvent> {
         InputSlot {
             connection_id: 0,
+            request_id: RequestId(0),
             key_hash: tag,
             sequence: primary_seq,
             timestamp_ns: 0,
@@ -3091,6 +3092,7 @@ mod tests {
 
         let lossy = |seq: u64, v: u8| InputSlot {
             connection_id: 0,
+            request_id: RequestId(0),
             key_hash: 0,
             sequence: seq,
             timestamp_ns: 0,

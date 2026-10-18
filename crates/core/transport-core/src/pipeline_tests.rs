@@ -42,7 +42,7 @@ use melin_journal::{AckPolicyByte, AckPolicyChange};
 use crate::pipeline::{AdoptedRotation, StreamMark};
 use crate::pipeline::{
     InputSlot, JournalStage, MAX_JOURNAL_BATCH, MatchingStage, OutputPayload, OutputSlot,
-    build_pipeline_with_replication, max_journal_batch,
+    RequestId, build_pipeline_with_replication, max_journal_batch,
 };
 use crate::test_support::{TestApp, TestEvent, TestQuery, TestReport, ack_policy_change};
 use crate::trace::mono_trace_ns;
@@ -102,15 +102,12 @@ const FIRST_SEQ: u64 = 1;
 /// encode time. Tests that simulate replica input pass a pre-assigned
 /// sequence via the builder method below.
 fn add_slot(n: u64, timestamp_ns: u64) -> TestInput {
-    InputSlot {
-        connection_id: 1,
-        key_hash: 0,
-        sequence: 0,
+    request_slot(
+        1,
+        RequestId(0),
+        JournalEvent::App(TestEvent::Add(n)),
         timestamp_ns,
-        event: JournalEvent::App(TestEvent::Add(n)),
-        publish_ts: mono_trace_ns(),
-        recv_ts: mono_trace_ns(),
-    }
+    )
 }
 
 /// Like `add_slot` but with a pre-assigned journal sequence — simulates
@@ -325,6 +322,7 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
     let mut publish = |event: JournalEvent<TestEvent>| {
         input_producer.publish(InputSlot {
             connection_id: conn_id,
+            request_id: RequestId(0),
             key_hash: 0,
             sequence: 0,
             timestamp_ns: 0,
@@ -414,6 +412,26 @@ struct MatchingRun {
 /// not 1, so a slot stamped from the input position instead would show.
 const POLICY_RUN_WIRE_SEQ: u64 = 10;
 
+/// An input slot for `event` from `connection_id`, naming `request_id`,
+/// stamped `timestamp_ns`, with no key.
+fn request_slot(
+    connection_id: u64,
+    request_id: RequestId,
+    event: JournalEvent<TestEvent>,
+    timestamp_ns: u64,
+) -> TestInput {
+    InputSlot {
+        connection_id,
+        request_id,
+        key_hash: 0,
+        sequence: 0,
+        timestamp_ns,
+        event,
+        publish_ts: mono_trace_ns(),
+        recv_ts: mono_trace_ns(),
+    }
+}
+
 /// Run a matching stage over `events` (connection, event, timestamp) and
 /// collect `expected` output slots. `on_shutdown` publishes everything
 /// with shutdown already requested, so the stage handles every event in
@@ -421,6 +439,27 @@ const POLICY_RUN_WIRE_SEQ: u64 = 10;
 fn run_matching_over<A>(
     app: A,
     events: &[(u64, JournalEvent<TestEvent>, u64)],
+    expected: usize,
+    on_shutdown: bool,
+) -> MatchingRun
+where
+    A: melin_app::Application<Event = TestEvent, Report = TestReport, QueryResponse = TestQuery>
+        + Send
+        + 'static,
+{
+    let slots: Vec<TestInput> = events
+        .iter()
+        .map(|&(connection_id, event, timestamp_ns)| {
+            request_slot(connection_id, RequestId(0), event, timestamp_ns)
+        })
+        .collect();
+    run_matching_over_slots(app, &slots, expected, on_shutdown)
+}
+
+/// [`run_matching_over`], over whole input slots.
+fn run_matching_over_slots<A>(
+    app: A,
+    slots: &[TestInput],
     expected: usize,
     on_shutdown: bool,
 ) -> MatchingRun
@@ -451,16 +490,8 @@ where
     let utilization = stage.utilization();
 
     let shutdown = Arc::new(AtomicBool::new(on_shutdown));
-    for &(connection_id, event, timestamp_ns) in events {
-        input_producer.publish(InputSlot {
-            connection_id,
-            key_hash: 0,
-            sequence: 0,
-            timestamp_ns,
-            event,
-            publish_ts: mono_trace_ns(),
-            recv_ts: mono_trace_ns(),
-        });
+    for &slot in slots {
+        input_producer.publish(slot);
     }
     let shutdown2 = Arc::clone(&shutdown);
     let handle = std::thread::spawn(move || stage.run(&shutdown2));
@@ -634,6 +665,159 @@ fn a_policy_change_closes_the_reports_its_clock_step_produced() {
     }
 }
 
+/// A client slot takes its connection, request ID and key from its
+/// origin, wraps the event as an application event, and leaves the
+/// sequence for the journal stage to allocate.
+#[test]
+fn a_client_slot_is_built_from_its_origin() {
+    let origin = crate::pipeline::ClientOrigin {
+        connection_id: 3,
+        request_id: RequestId(0x0102_0304_0506_0708),
+        key_hash: 0xFEED,
+    };
+    #[allow(clippy::let_unit_value)] // ZST when latency-trace is off
+    let recv_ts = mono_trace_ns();
+    let slot = TestInput::client(origin, TestEvent::Add(9), 1_234, recv_ts);
+    assert_eq!(slot.connection_id, 3);
+    assert_eq!(slot.request_id, RequestId(0x0102_0304_0506_0708));
+    assert_eq!(slot.key_hash, 0xFEED);
+    assert_eq!(slot.sequence, 0);
+    assert_eq!(slot.timestamp_ns, 1_234);
+    assert_eq!(slot.event, JournalEvent::App(TestEvent::Add(9)));
+}
+
+/// Every output slot of an event carries its input slot's request ID,
+/// whatever the event's replies: none (a bare terminator), several reports
+/// (the clock step's, then the write's), a query response, and an
+/// ack-policy change (its clock step's report, then its own slot), in the
+/// run loop and in the shutdown drain alike. The drain skips queries, so
+/// it emits nothing for one.
+#[test]
+fn every_output_slot_of_an_event_carries_its_request_id() {
+    for on_shutdown in [false, true] {
+        let slots = [
+            // Timestamp 0 fires no clock step: no report at all.
+            request_slot(1, RequestId(11), JournalEvent::EpochBump { epoch: 1 }, 0),
+            request_slot(2, RequestId(22), JournalEvent::App(TestEvent::Add(5)), 5),
+            request_slot(3, RequestId(33), JournalEvent::App(TestEvent::Query), 0),
+            // Never on a client connection in practice; a distinct ID here
+            // shows the change slot takes the input's like every other.
+            request_slot(4, RequestId(44), ack_policy_change(1, false), 9),
+        ];
+        let mut expected = vec![
+            (1, RequestId(11), true, "BatchEnd"),
+            (2, RequestId(22), false, "Report"),
+            (2, RequestId(22), true, "Report"),
+            (3, RequestId(33), true, "QueryResponse"),
+            (4, RequestId(44), false, "Report"),
+            (0, RequestId(44), true, "AckPolicyChange"),
+        ];
+        if on_shutdown {
+            expected.retain(|&(_, _, _, kind)| kind != "QueryResponse");
+        }
+        let run = run_matching_over_slots(
+            TickReportingApp(TestApp::new()),
+            &slots,
+            expected.len(),
+            on_shutdown,
+        );
+        let actual: Vec<_> = run
+            .outputs
+            .iter()
+            .map(|s| {
+                let kind = match s.payload {
+                    OutputPayload::Report(_) => "Report",
+                    OutputPayload::QueryResponse(_) => "QueryResponse",
+                    OutputPayload::BatchEnd => "BatchEnd",
+                    OutputPayload::EngineError => "EngineError",
+                    OutputPayload::AckPolicyChange(_) => "AckPolicyChange",
+                };
+                (s.connection_id, s.request_id, s.is_last_in_request, kind)
+            })
+            .collect();
+        assert_eq!(actual, expected, "on_shutdown = {on_shutdown}");
+    }
+}
+
+/// The request ID never reaches the journal or a replica: input slots
+/// that differ only in it journal to identical bytes, through the journal
+/// stage, and encode to identical replication frames.
+#[cfg(not(feature = "no-persist"))]
+#[test]
+fn input_slots_differing_only_in_request_id_journal_and_replicate_identically() {
+    let dir = tempfile::tempdir().unwrap();
+    let slots = |first_id: u64| -> [TestInput; 2] {
+        [
+            InputSlot {
+                key_hash: 0xFEED,
+                ..request_slot(
+                    1,
+                    RequestId(first_id),
+                    JournalEvent::App(TestEvent::Add(7)),
+                    1_000,
+                )
+            },
+            request_slot(
+                1,
+                RequestId(first_id + 1),
+                JournalEvent::App(TestEvent::Add(8)),
+                1_001,
+            ),
+        ]
+    };
+    let journal = |name: &str, first_id: u64| -> Vec<u8> {
+        let path = dir.path().join(name);
+        // A fixed anchor rather than `create`'s random salt, so the two
+        // files can be compared byte for byte, header and chain included.
+        let writer = Writer::create_continuing(&path, FIRST_SEQ, [0x5A; 32], Some(0)).unwrap();
+        let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
+        let stage = JournalStage::new(
+            writer,
+            consumers.pop().unwrap(),
+            Duration::ZERO,
+            MAX_JOURNAL_BATCH,
+            WaitStrategy::SpinThenYield,
+        );
+        for slot in slots(first_id) {
+            producer.publish(slot);
+        }
+        // The stage stops at the sentinel, with everything before it on disk.
+        producer.publish(InputSlot::shutdown_sentinel());
+        let shutdown = AtomicBool::new(false);
+        stage.start().unwrap().run(&shutdown).unwrap();
+        let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
+        let mut entries = 0;
+        while reader.next_entry().unwrap().is_some() {
+            entries += 1;
+        }
+        assert_eq!(entries, 2, "both slots journaled into {name}");
+        std::fs::read(&path).unwrap()
+    };
+    assert!(
+        journal("a.journal", 0) == journal("b.journal", 0xA5A5_0000_0000_0001),
+        "the journal bytes depend on the request ID"
+    );
+
+    // What the journal stage hands to replication: the same slots, now
+    // stamped with their sequences.
+    let replicated = |first_id: u64| -> Vec<u8> {
+        let mut stamped = slots(first_id);
+        for (slot, sequence) in stamped.iter_mut().zip(FIRST_SEQ..) {
+            slot.sequence = sequence;
+        }
+        let mut buf = Vec::new();
+        crate::replication_wire::encode_input_batch(&stamped, &mut buf).unwrap();
+        buf
+    };
+    assert_eq!(
+        replicated(0),
+        replicated(u64::MAX - 1),
+        "the replication frame depends on the request ID"
+    );
+}
+
 /// Regression tripwire for the pre-v14 durability-gate hole: the
 /// response gate compares `OutputSlot.wire_seq` (stamped by the
 /// matching stage) against `last_seq` (published by the journal stage
@@ -707,6 +891,7 @@ fn allocator_wire_seq_and_gate_cursor_agree_across_rotation() {
         published += 1;
         input_producer.publish(InputSlot {
             connection_id: 1,
+            request_id: RequestId(0),
             key_hash: 1,
             sequence: 0,
             timestamp_ns: 1_000_000_000 + published,
@@ -836,6 +1021,7 @@ fn recovery_resumes_allocator_wire_and_gate_agreement() {
         made += 1;
         InputSlot {
             connection_id: 1,
+            request_id: RequestId(0),
             key_hash: 1,
             sequence: 0,
             timestamp_ns: 1_000_000_000 + made,
@@ -1868,6 +2054,7 @@ fn primary_and_replica_journals_contiguous_and_chain_identical() {
                 for slot in slots {
                     replica_input.publish(InputSlot {
                         connection_id: 0,
+                        request_id: RequestId(0),
                         key_hash: slot.key_hash,
                         sequence: slot.sequence,
                         timestamp_ns: slot.timestamp_ns,
@@ -2050,6 +2237,7 @@ fn journal_stage_rotates_on_manual_request() {
         published += 1;
         producer.publish(InputSlot {
             connection_id: 1,
+            request_id: RequestId(0),
             key_hash: 1,
             sequence: 0,
             timestamp_ns: 1_000_000_000 + published,
@@ -3225,6 +3413,7 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
                     for slot in slots {
                         replica_input.publish(InputSlot {
                             connection_id: 0,
+                            request_id: RequestId(0),
                             key_hash: slot.key_hash,
                             sequence: slot.sequence,
                             timestamp_ns: slot.timestamp_ns,
@@ -3512,6 +3701,7 @@ fn journal_stage_rotates_on_size_threshold() {
 
     producer.publish(InputSlot {
         connection_id: 1,
+        request_id: RequestId(0),
         key_hash: 1,
         sequence: 0,
         timestamp_ns: 1_000_000_000,
@@ -3993,6 +4183,7 @@ fn rotate_storm_collapses_to_single_rotation() {
         published += 1;
         producer.publish(InputSlot {
             connection_id: 1,
+            request_id: RequestId(0),
             key_hash: 1,
             sequence: 0,
             timestamp_ns: 1_000_000 + published,
@@ -4073,6 +4264,7 @@ fn post_rotation_events_land_in_live_not_archive() {
         published += 1;
         producer.publish(InputSlot {
             connection_id: 1,
+            request_id: RequestId(0),
             key_hash: 1,
             sequence: 0,
             timestamp_ns: 1_000_000 + published,
@@ -4176,6 +4368,7 @@ fn pipeline_journals_every_event_in_order() {
     for amount in [10u64, 20, 30, 40, 50] {
         producer.publish(InputSlot {
             connection_id: 1,
+            request_id: RequestId(0),
             key_hash: 0,
             sequence: 0,
             timestamp_ns: 1_000_000_000 + amount,
@@ -4222,6 +4415,7 @@ fn stats_query_reports_durable_wire_seq_across_recovery() {
     fn slot(event: JournalEvent<TestEvent>) -> TestInput {
         InputSlot {
             connection_id: 1,
+            request_id: RequestId(0),
             key_hash: 0,
             sequence: 0,
             timestamp_ns: 0,
@@ -4383,6 +4577,7 @@ fn a_query_changes_no_matching_stage_state() {
 
     let slot = |event, timestamp_ns| TestInput {
         connection_id: 1,
+        request_id: RequestId(0),
         key_hash: KEY,
         sequence: 0,
         timestamp_ns,

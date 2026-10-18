@@ -13,10 +13,11 @@ use tracing::debug;
 use melin_app::auth::{ClientRole, RoleId};
 use melin_app::decoder::{Decoded, ErasedDecoder};
 use melin_app::{AppEvent, Application};
-use melin_journal::JournalEvent;
 use melin_pipeline::ring;
-use melin_transport_core::pipeline::InputSlot;
-use melin_transport_core::trace::{MonoTraceInstant, mono_trace_ns};
+use melin_transport_core::pipeline::{ClientOrigin, InputSlot, RequestId};
+use melin_transport_core::trace::MonoTraceInstant;
+#[cfg(any(feature = "latency-trace", feature = "tick-to-trade"))]
+use melin_transport_core::trace::mono_trace_ns;
 use melin_wire_protocol::control_codec::TAG_APP;
 use melin_wire_protocol::framing::split_frame_limited;
 
@@ -186,21 +187,24 @@ pub(crate) fn process_client_frames<A: Application>(
         }
 
         let ts = if event.is_query() { 0 } else { batch_wall_ns };
-        let event = JournalEvent::App(event);
 
         #[cfg(feature = "latency-trace")]
         let pre_publish = mono_trace_ns();
-        #[allow(clippy::let_unit_value)]
-        let publish_ts = mono_trace_ns();
 
+        // The whole slot is rebuilt in place, through the one constructor
+        // for a client slot, so no field keeps the previous occupant's
+        // value. The ID is 0 until the wire carries one.
         let push_result = batch.try_push_with(|slot| {
-            slot.connection_id = connection_id;
-            slot.key_hash = key_hash;
-            slot.sequence = 0;
-            slot.timestamp_ns = ts;
-            slot.event = event;
-            slot.publish_ts = publish_ts;
-            slot.recv_ts = recv_ts;
+            *slot = InputSlot::client(
+                ClientOrigin {
+                    connection_id,
+                    request_id: RequestId(0),
+                    key_hash,
+                },
+                event,
+                ts,
+                recv_ts,
+            );
         });
 
         if push_result.is_err() {

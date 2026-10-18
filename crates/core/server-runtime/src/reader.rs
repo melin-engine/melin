@@ -1952,6 +1952,53 @@ mod tests {
         );
     }
 
+    /// A ring slot is reused once its consumer has passed it, and a request
+    /// published into it is built whole: nothing of the previous occupant
+    /// survives, a request ID and a journal sequence included (a stale
+    /// sequence would be adopted by the journal stage as a replica's).
+    #[test]
+    fn process_frames_rebuilds_every_field_of_a_reused_slot() {
+        use melin_transport_core::pipeline::RequestId;
+
+        const CAPACITY: usize = 4;
+        let Fixture {
+            mut conn,
+            mut producer,
+            mut consumer,
+            ..
+        } = make_fixture(CAPACITY);
+        let stale = InputSlot {
+            connection_id: 99,
+            request_id: RequestId(0xBAD),
+            key_hash: 1,
+            sequence: 77,
+            timestamp_ns: 5,
+            event: JournalEvent::App(TestEvent::Cmd(0xEE)),
+            ..InputSlot::default()
+        };
+        for _ in 0..CAPACITY {
+            producer.publish(stale);
+        }
+        assert_eq!(drain(&mut consumer).len(), CAPACITY, "every slot dirtied");
+
+        for byte in 1..=CAPACITY as u8 {
+            conn.parse_buf.extend_from_slice(&frame(byte));
+        }
+        let (disconnect, _control_rx) = run_process_frames(&mut conn, &mut producer);
+        assert!(!disconnect);
+
+        let events = drain(&mut consumer);
+        assert_eq!(events.len(), CAPACITY, "every dirtied slot reused");
+        for (i, (_, slot)) in events.iter().enumerate() {
+            assert_eq!(slot.connection_id, 7);
+            assert_eq!(slot.request_id, RequestId(0), "no ID on the wire yet");
+            assert_eq!(slot.key_hash, 0xC0FFEE_u64);
+            assert_eq!(slot.sequence, 0, "the journal stage allocates it");
+            assert_eq!(slot.timestamp_ns, 0xDEAD_BEEF);
+            assert_eq!(slot.event, JournalEvent::App(TestEvent::Cmd(i as u8 + 1)));
+        }
+    }
+
     /// A halted reader publishes no write: each is refused, stamped with
     /// the input sequence it would have taken, while queries still go
     /// through. Nothing refused can reach the journal, so replay cannot

@@ -1746,6 +1746,7 @@ mod tests {
     fn encode_input_batch_with_seq(end_sequence: u64, buf: &mut Vec<u8>) {
         let slot = InputSlot {
             connection_id: 0,
+            request_id: melin_transport_core::pipeline::RequestId(0),
             key_hash: 0,
             sequence: end_sequence,
             timestamp_ns: 0,

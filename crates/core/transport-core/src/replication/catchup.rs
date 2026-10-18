@@ -1408,23 +1408,11 @@ mod drain_into_contiguity_tests {
     use super::*;
     use crate::pipeline::InputSlot;
     use crate::test_support::TestEvent;
-    use melin_journal::JournalEvent;
+    use crate::test_support::sequenced_slot as slot;
     use melin_journal::replication::{
         ReplicationConsumer, ReplicationProducer, build_replication_ring,
     };
     use std::cell::{Cell, RefCell};
-
-    fn slot(seq: u64) -> InputSlot<TestEvent> {
-        InputSlot {
-            connection_id: 0,
-            key_hash: 0,
-            sequence: seq,
-            timestamp_ns: 0,
-            event: JournalEvent::App(TestEvent::Add(seq)),
-            publish_ts: Default::default(),
-            recv_ts: Default::default(),
-        }
-    }
 
     /// Encode a one-or-more-slot `InputBatch` frame (the ring-chunk shape).
     fn frame(seqs: &[u64]) -> Vec<u8> {

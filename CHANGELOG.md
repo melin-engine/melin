@@ -12,6 +12,30 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ## [Unreleased]
 
+### Added
+
+- **`RequestId`**, in `melin-wire-protocol`'s `control` module (and
+  re-exported from `melin_transport_core::pipeline`): a request's
+  identifier, chosen by the client, which the ring slots now carry (see
+  Changed). In `melin-transport-core`, `InputSlot::client` and
+  `ClientOrigin` build a client request's slot whole, the way both of
+  the node's readers now publish one.
+
+### Changed
+
+- **`InputSlot` and `OutputSlot` carry a `request_id: RequestId`**,
+  beside `connection_id`, in `melin-transport-core`. The matching stage
+  copies an input slot's ID into every output slot of its event, so an
+  event publisher sees it as it sees the connection. It is never
+  journaled or replicated, and is `RequestId(0)` on node events and
+  replicas; the client wire does not carry one yet, so for now it is 0
+  everywhere. Source-breaking for code that builds either slot with a
+  struct literal: add the field, or build node events with
+  `InputSlot::node_event` and client requests with `InputSlot::client`.
+  A slot whose fixed fields grow by eight bytes can cross a cache-line
+  boundary: an `InputSlot` (padded to whole lines) grows by a line when
+  the application's event comes within eight bytes of one.
+
 ## [0.20.0] - 2026-10-19
 
 ### Added

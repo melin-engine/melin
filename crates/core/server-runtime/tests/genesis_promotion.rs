@@ -37,7 +37,7 @@ use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
 use melin_test_node::probe::admin_reply_when_up;
 use melin_test_node::{Addrs, Node};
-use melin_transport_core::pipeline::InputSlot;
+use melin_transport_core::pipeline::{InputSlot, RequestId};
 use melin_transport_core::replication::protocol::{
     MAX_CONTROL_FRAME, ReplicaMessage, decode_replica_message, encode_auth_ok, encode_challenge,
     encode_stream_start, read_frame,
@@ -205,6 +205,7 @@ fn a_replica_configured_without_genesis_refuses_promotion_mid_genesis() {
         .zip(1u64..)
         .map(|(&amount, sequence)| InputSlot {
             connection_id: 0,
+            request_id: RequestId(0),
             key_hash: 0,
             sequence,
             timestamp_ns: 1,
