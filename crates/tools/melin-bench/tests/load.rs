@@ -8,7 +8,7 @@ use melin_client::key;
 use melin_journal::{JournalEvent, JournalReader};
 use melin_server_runtime::StartupEvents;
 
-use common::{bench_key, config, field, journaled_echoes, load, run, start_echo};
+use common::{bench_key, config, field, journaled_echoes, load, run, serving, start_echo};
 
 #[test]
 fn every_echo_answered_is_journaled() {
@@ -30,13 +30,13 @@ fn every_echo_answered_is_journaled() {
 #[test]
 fn every_notarization_answered_is_journaled() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let node = melin_test_node::start::<notary_server::Notary>(
+    let node = serving(melin_test_node::start::<notary_server::Notary>(
         config(dir.path(), "notary.journal", "submitter"),
         StartupEvents::none(),
         (),
         notary_server::RequestDecoder,
         notary_server::ResponseEncoder,
-    );
+    ));
     let addr = node.addr().to_string();
     let json = load(dir.path(), &["--app", "notary", "--addr", &addr]);
     node.stop();
