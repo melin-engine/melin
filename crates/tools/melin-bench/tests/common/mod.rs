@@ -57,7 +57,7 @@ pub fn start_echo(dir: &Path, role: &str) -> melin_test_node::Node {
 ///
 /// The launcher returns before the node serves, and the binary dials
 /// once, giving the handshake its read timeout: a node still starting
-/// eats into that (under a sanitizer, allocating the rings alone takes
+/// eats into that (under a sanitizer, initialising the rings alone takes
 /// seconds). A kernel client, which retries until a deadline, waits for
 /// it instead; on DPDK it reaches the node over the runner's network.
 pub fn serving(node: melin_test_node::Node) -> melin_test_node::Node {

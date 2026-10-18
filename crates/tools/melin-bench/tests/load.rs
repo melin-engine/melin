@@ -76,6 +76,13 @@ fn a_key_without_the_writing_role_fails_the_run() {
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.starts_with("error: "), "{stderr}");
+    // The node's refusal, the request dropped unanswered, and not any other
+    // failure: a handshake that times out exits 2 with `error: ` as well.
+    let refused = melin_client::Error::NoReply {
+        timeout: melin_client::DEFAULT_TIMEOUT,
+    }
+    .to_string();
+    assert!(stderr.contains(&refused), "{stderr}");
 }
 
 #[test]
