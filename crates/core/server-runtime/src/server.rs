@@ -1836,7 +1836,8 @@ where
         Arc::clone(&fence_state),
         Arc::clone(&refused_writes),
     );
-    let (early_tx, early_rx) = crate::halt::early_reply_channel::<A::Report>();
+    let (early_tx, early_rx) =
+        crate::halt::early_reply_channel::<A::Report>(crate::halt::EARLY_REPLY_QUEUE_CAPACITY);
 
     // Spawn the io_uring reader thread. A single reader uses multishot RECV
     // to multiplex every TCP connection on the server. Pinned to
@@ -3030,7 +3031,8 @@ where
         Arc::clone(&fence_state),
         Arc::clone(&refused_writes),
     );
-    let (early_tx, early_rx) = crate::halt::early_reply_channel::<A::Report>();
+    let (early_tx, early_rx) =
+        crate::halt::early_reply_channel::<A::Report>(crate::halt::EARLY_REPLY_QUEUE_CAPACITY);
 
     // TX SPSC: response stage → DPDK poll thread (encoded frames).
     // Lock-free, fixed-size slots — no heap allocation per frame.

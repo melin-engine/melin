@@ -63,7 +63,7 @@ use crate::halt::{EarlyReplySender, HaltGate};
 use crate::policy_control::AckPolicyPublisher;
 
 use crate::client_auth::MAX_AUTH_FRAME;
-use crate::client_frames::MAX_FRAME_SIZE;
+use crate::client_frames::{ClientIngress, MAX_FRAME_SIZE};
 
 /// Auth handshake timeout. Connections that don't complete auth within
 /// this window are dropped.
@@ -107,8 +107,10 @@ struct ConnectionState {
     /// copied into every InputSlot as the submitting key's identity.
     key_hash: u64,
     /// Incremental frame parsing state: accumulates bytes until a
-    /// complete length-prefixed frame is available.
-    parse_buf: Vec<u8>,
+    /// complete length-prefixed frame is available, and what is left of a
+    /// shed tail (see `client_frames`). The auth handshake reads its frame
+    /// from the same buffer, before any request.
+    ingress: ClientIngress,
     /// Last time data was received from this connection. Used for
     /// idle timeout (drops connections that stop sending).
     last_activity: Instant,
@@ -411,9 +413,11 @@ pub fn run_dpdk_poll<A: Application>(
                 key_hash: 0,
                 // Reuse a pre-allocated buffer from the pool, or allocate
                 // if the pool is exhausted (more connections than pre-allocated).
-                parse_buf: parse_buf_pool
-                    .pop()
-                    .unwrap_or_else(|| Vec::with_capacity(MAX_FRAME_SIZE + 4)),
+                ingress: ClientIngress::new(
+                    parse_buf_pool
+                        .pop()
+                        .unwrap_or_else(|| Vec::with_capacity(MAX_FRAME_SIZE + 4)),
+                ),
                 last_activity: Instant::now(),
             });
             connection_count += 1;
@@ -530,10 +534,10 @@ pub fn run_dpdk_poll<A: Application>(
 
             // Guard against unbounded buffer growth — check before recv.
             const MAX_PARSE_BUF: usize = 65536;
-            if conn.parse_buf.len() >= MAX_PARSE_BUF {
+            if conn.ingress.len() >= MAX_PARSE_BUF {
                 debug!(
                     connection_id = conn.connection_id.0,
-                    buf_len = conn.parse_buf.len(),
+                    buf_len = conn.ingress.len(),
                     "parse buffer exceeded limit, dropping connection"
                 );
                 transport.close(conn.handle);
@@ -552,7 +556,7 @@ pub fn run_dpdk_poll<A: Application>(
 
             // Read directly into parse_buf, skipping the intermediate
             // read_buf stack copy.
-            let n = transport.recv_into_vec(conn.handle, &mut conn.parse_buf);
+            let n = transport.recv_into_vec(conn.handle, conn.ingress.buf_mut());
             if n > 0 {
                 conn.last_activity = Instant::now();
                 #[cfg(feature = "latency-trace")]
@@ -638,12 +642,12 @@ pub fn run_dpdk_poll<A: Application>(
                 }
                 // Terminal: whatever the client sends after a failed
                 // attempt is discarded unread.
-                AuthState::Rejected { .. } => conn.parse_buf.clear(),
+                AuthState::Rejected { .. } => conn.ingress.buf_mut().clear(),
                 AuthState::Authenticated { role } => {
                     use crate::client_frames::{FrameAction, process_client_frames};
                     let role = *role;
                     let action = process_client_frames::<A>(
-                        &mut conn.parse_buf,
+                        &mut conn.ingress,
                         conn.connection_id.0,
                         conn.key_hash,
                         role,
@@ -659,12 +663,23 @@ pub fn run_dpdk_poll<A: Application>(
                         &mut ingest_rec,
                     );
                     // A full input ring is answered with a busy through
-                    // the early-reply queue, and the connection is kept
-                    // (`Continue`): the frames behind the shed request
-                    // wait in `parse_buf` for the client's next bytes.
+                    // the early-reply queue, as is every frame buffered
+                    // behind the shed request, and the connection is kept
+                    // (`Continue`).
                     let close = match action {
                         FrameAction::Continue => false,
                         FrameAction::Disconnect => true,
+                        // Interim, until this loop parks a connection (it
+                        // would stop reading it and retry its buffer each
+                        // iteration): an answer with nowhere to go closes
+                        // the connection, loud and safe.
+                        FrameAction::Park => {
+                            debug!(
+                                connection_id = conn.connection_id.0,
+                                "DPDK: early reply has nowhere to go, closing connection"
+                            );
+                            true
+                        }
                     };
                     if close {
                         transport.close(conn.handle);
@@ -817,7 +832,7 @@ fn process_auth_frame(
     };
 
     let (role, public_key_bytes) = match evaluate_auth_frame(
-        &mut conn.parse_buf,
+        conn.ingress.buf_mut(),
         &nonce,
         authorized_keys,
         conn.connection_id.0,
@@ -827,7 +842,7 @@ fn process_auth_frame(
             send_auth_failed(conn, transport);
             // One attempt per connection: the poll loop closes it once
             // the peer has the AuthFailed frame.
-            conn.parse_buf.clear();
+            conn.ingress.buf_mut().clear();
             conn.auth = AuthState::Rejected { accepted_at };
             return;
         }
@@ -879,9 +894,8 @@ fn release_slot(
     parse_buf_pool: &mut Vec<Vec<u8>>,
     connection_count: &mut usize,
 ) {
-    if let Some(mut removed) = connections[idx].take() {
-        removed.parse_buf.clear();
-        parse_buf_pool.push(removed.parse_buf);
+    if let Some(removed) = connections[idx].take() {
+        parse_buf_pool.push(removed.ingress.into_buf());
         *connection_count -= 1;
     }
 }

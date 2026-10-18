@@ -909,7 +909,7 @@ mod tests {
             .send(ControlEvent::Connected { connection_id: 1 })
             .expect("channel open");
         let (tx, mut rx) = spsc::channel::<TxFrame>(8, WaitStrategy::SpinThenYield);
-        let early_replies = early_reply_channel().1;
+        let early_replies = early_reply_channel(crate::halt::EARLY_REPLY_QUEUE_CAPACITY).1;
 
         producer.publish(reply(1));
         producer.publish(OutputSlot {
@@ -1039,7 +1039,8 @@ mod tests {
                 .send(ControlEvent::Connected { connection_id: 1 })
                 .expect("channel open");
             let (tx, mut rx) = spsc::channel::<TxFrame>(8, WaitStrategy::SpinThenYield);
-            let (mut early_tx, early_rx) = early_reply_channel();
+            let (mut early_tx, early_rx) =
+                early_reply_channel(crate::halt::EARLY_REPLY_QUEUE_CAPACITY);
 
             early_tx
                 .try_send(early(1, 0, kind))
@@ -1340,7 +1341,7 @@ mod tests {
             use crate::response::tests::refusal_order::early;
 
             let (control_tx, control_rx) = mpsc::channel();
-            let (mut tx, mut rx) = early_reply_channel();
+            let (mut tx, mut rx) = early_reply_channel(crate::halt::EARLY_REPLY_QUEUE_CAPACITY);
             let mut registered = rx.register(|| {});
             let (producer, mut tx_ring) =
                 spsc::channel::<TxFrame>(1024, WaitStrategy::SpinThenYield);

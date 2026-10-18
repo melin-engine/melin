@@ -108,16 +108,18 @@ use crate::batch_boundary::AtBoundary;
 use crate::policy_control::{Origin, is_unwitnessed};
 
 /// Early replies in flight from a reader to the response stage before the
-/// reader can queue no more.
+/// reader can queue no more: the capacity a node gives
+/// [`early_reply_channel`].
 ///
 /// The response stage drains the queue between every two events' replies,
 /// and while the ack policy holds an event's first slot, so it fills only
 /// if the stage stops draining (an event whose slots it is waiting on, or
 /// a stage that is not running), not because a write is held. Past it the
-/// reader closes the connection whose answer has nowhere to go. A power of
-/// two, as the ring requires; each entry is the application's rejection,
-/// or a refusal's reason, plus a few words.
-pub(crate) const EARLY_REPLY_QUEUE_CAPACITY: usize = 4096;
+/// reader parks the connection whose answer has nowhere to go, and stops
+/// reading it until the queue has room. A power of two, as the ring
+/// requires; each entry is the application's rejection, or a refusal's
+/// reason, plus a few words.
+pub const EARLY_REPLY_QUEUE_CAPACITY: usize = 4096;
 
 /// What the response stage needs to answer a halted node's held replies
 /// once its own journal holds them: the replies to writes it sequenced
@@ -426,15 +428,19 @@ pub enum EarlyKind<R> {
 }
 
 /// Creates the queue a reader hands early replies to the response stage
-/// through.
-pub fn early_reply_channel<R: Copy>() -> (EarlyReplySender<R>, EarlyReplyQueue<R>) {
+/// through, holding at most `capacity` replies in flight: a node passes
+/// [`EARLY_REPLY_QUEUE_CAPACITY`]; a test that wants the queue to fill
+/// passes less.
+///
+/// # Panics
+///
+/// If `capacity` is not a power of two of at least 2, as the ring
+/// requires.
+pub fn early_reply_channel<R: Copy>(capacity: usize) -> (EarlyReplySender<R>, EarlyReplyQueue<R>) {
     // `Option` because the ring wants `Default` slots and an application's
     // report need not have one. The wait strategy is unused: the reader
     // never blocks on this queue (see `EarlyReplySender::try_send`).
-    let (tx, rx) = spsc::channel::<Option<EarlyReply<R>>>(
-        EARLY_REPLY_QUEUE_CAPACITY,
-        WaitStrategy::SpinThenYield,
-    );
+    let (tx, rx) = spsc::channel::<Option<EarlyReply<R>>>(capacity, WaitStrategy::SpinThenYield);
     (EarlyReplySender { tx }, EarlyReplyQueue { rx })
 }
 
@@ -446,7 +452,7 @@ pub struct EarlyReplySender<R> {
 impl<R: Copy> EarlyReplySender<R> {
     /// Queue an early reply, invisible to the response stage until
     /// [`flush`](Self::flush). Never blocks: a full queue is `Err`, and the
-    /// caller closes the connection whose answer has nowhere to go.
+    /// caller parks the connection whose answer has nowhere to go.
     pub(crate) fn try_send(&mut self, reply: EarlyReply<R>) -> Result<(), spsc::Full> {
         self.tx
             .try_push_with(|slot| *slot = Some(reply))
@@ -854,7 +860,7 @@ mod tests {
     /// has been taken since; a snapshot drained is not drained twice.
     #[test]
     fn a_refusal_waits_for_both_the_flush_and_a_snapshot() {
-        let (mut tx, mut rx) = early_reply_channel::<u64>();
+        let (mut tx, mut rx) = early_reply_channel::<u64>(EARLY_REPLY_QUEUE_CAPACITY);
         tx.try_send(refusal(1)).unwrap();
         let mut registered = rx.register(|| {});
         assert!(drained(&mut registered).is_empty(), "not flushed");
@@ -878,7 +884,7 @@ mod tests {
     /// snapshot, which a drain follows again. On both ways to take one.
     #[test]
     fn a_snapshot_is_taken_before_the_control_drain() {
-        let (mut tx, mut rx) = early_reply_channel::<u64>();
+        let (mut tx, mut rx) = early_reply_channel::<u64>(EARLY_REPLY_QUEUE_CAPACITY);
         tx.try_send(refusal(1)).unwrap();
         tx.flush();
         let mut drains = 0;
@@ -905,18 +911,31 @@ mod tests {
 
     #[test]
     fn a_full_queue_is_an_error_not_a_wait() {
-        let (mut tx, _rx) = early_reply_channel::<u64>();
+        let (mut tx, _rx) = early_reply_channel::<u64>(EARLY_REPLY_QUEUE_CAPACITY);
         for _ in 0..EARLY_REPLY_QUEUE_CAPACITY {
             tx.try_send(refusal(1)).unwrap();
         }
         assert!(tx.try_send(refusal(1)).is_err());
     }
 
+    /// The capacity is the caller's: a queue built smaller fills at its
+    /// own size.
+    #[test]
+    fn a_queue_holds_the_capacity_it_was_built_with() {
+        for capacity in [2, 8] {
+            let (mut tx, _rx) = early_reply_channel::<u64>(capacity);
+            for _ in 0..capacity {
+                tx.try_send(refusal(1)).unwrap();
+            }
+            assert!(tx.try_send(refusal(1)).is_err(), "{capacity}");
+        }
+    }
+
     /// A drained queue has room again: capacity bounds replies in flight,
     /// not replies over the queue's life.
     #[test]
     fn a_drained_queue_takes_more() {
-        let (mut tx, mut rx) = early_reply_channel::<u64>();
+        let (mut tx, mut rx) = early_reply_channel::<u64>(EARLY_REPLY_QUEUE_CAPACITY);
         for round in 0..3u64 {
             for _ in 0..EARLY_REPLY_QUEUE_CAPACITY {
                 tx.try_send(refusal(round)).unwrap();
@@ -935,7 +954,7 @@ mod tests {
     /// with its request's ID, in order among the others.
     #[test]
     fn every_kind_travels_with_its_request_id() {
-        let (mut tx, mut rx) = early_reply_channel::<u64>();
+        let (mut tx, mut rx) = early_reply_channel::<u64>(EARLY_REPLY_QUEUE_CAPACITY);
         let kinds = [
             EarlyKind::Rejected(7),
             EarlyKind::Filtered,

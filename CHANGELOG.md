@@ -116,9 +116,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   `early_reply_channel` (taking the matching stage's progress as
   before), and `response::Response`'s `refusals` field is
   `early_replies`. `ControlEvent::PipelineBusy` is removed: a busy no
-  longer rides the control channel. A full early-reply queue now closes
-  the connection whose answer has nowhere to go, where a full refusal
-  queue answered `ServerBusy`.
+  longer rides the control channel. A full early-reply queue no longer
+  answers `ServerBusy` out of band, as a full refusal queue did (see
+  below for what it does instead).
 - **An early reply no longer waits for the replies to earlier
   requests.** A request the node answers without applying it (a write
   refused while halted, a request the decoder refuses or filters, one
@@ -127,11 +127,31 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   client sent before it: its final frame names it, so the client pairs it
   by ID. Replies to requests the node accepted still arrive in request
   order, and nothing falls inside another request's reply. In
-  `melin-server-runtime`'s `halt` module, `early_reply_channel` takes no
-  argument (it took the matching stage's progress), `EarlyReply` loses
-  its `input_seq`, and `EarlyReplyQueue`'s `idle_bound`, `sync` and
+  `melin-server-runtime`'s `halt` module, `early_reply_channel` no longer
+  takes the matching stage's progress, `EarlyReply` loses its
+  `input_seq`, and `EarlyReplyQueue`'s `idle_bound`, `sync` and
   `release` are gone: the response stages read the queue through the
   crate's own types, which only send it between two requests' replies.
+- **A request shed on a full input ring takes the requests buffered
+  behind it with it, and a reader that cannot queue an answer parks the
+  connection.** Every complete request already received behind the shed
+  one is answered `ServerBusy` too, read only as far as its ID, so
+  nothing a client pipelined behind a shed request in the same burst is
+  applied ahead of its resend; a request on a later receive may be.
+  When the early-reply queue is full (the response stage has stopped
+  taking answers), the kernel transport no longer closes the
+  connection: it stops reading it, leaving the request and everything
+  behind it unread, and retries every millisecond until the queue has
+  room, while the client's sends back up under TCP flow control. A
+  connection parked for over a second is degraded operation, reported
+  at `warn` once a second while any stays parked. On a host that
+  filters io_uring's cancel operation, a parked connection would go on
+  being read, so after a second it is closed instead, with a `warn`
+  naming the cause. The DPDK transport
+  still closes the connection on a full queue. In
+  `melin-server-runtime`'s `halt` module, `early_reply_channel` takes the
+  queue's capacity, and `EARLY_REPLY_QUEUE_CAPACITY`, the capacity a node
+  gives it, is public.
 
 ### Removed
 
@@ -164,6 +184,11 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   full**, answering it `ServerBusy` as the kernel transport does. It used
   to close the connection, throwing away the replies to writes already
   published.
+- **Requests pipelined behind one shed on a full input ring are
+  answered.** They waited unread until the client sent more bytes, which
+  a client waiting for its replies never does, so they ended in its
+  no-reply timeout. They are now shed with it (see Changed), on both
+  transports.
 
 ## [0.20.0] - 2026-10-19
 

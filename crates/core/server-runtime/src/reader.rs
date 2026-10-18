@@ -63,7 +63,7 @@ const BUF_SIZE: usize = 4096;
 /// Buffer group ID for the provided recv buffer pool.
 const BUF_GROUP_ID: u16 = 0;
 
-use crate::client_frames::MAX_FRAME_SIZE;
+use crate::client_frames::{ClientIngress, FrameAction, LONG_PARK, LongParkReport, MAX_FRAME_SIZE};
 use crate::connection_limit::{RingSizing, await_startup, ring_setup_error};
 
 /// User data sentinel for the eventfd read SQE.
@@ -85,6 +85,37 @@ const CANCEL_TOKEN: u64 = u64::MAX - 3;
 /// no information; the loop body checks `Instant::now()` against the next
 /// deadline and emits the actual `JournalEvent::Tick`.
 const TICK_TIMEOUT_TOKEN: u64 = u64::MAX - 2;
+
+/// User data sentinel for the park-retry timeout SQE: armed while any
+/// connection is parked, so the reader comes back round to retry them
+/// even when nothing else wakes it (see [`PARK_RETRY`]). Like the tick's,
+/// its CQE carries no information.
+const PARK_RETRY_TOKEN: u64 = u64::MAX - 4;
+
+/// The longest a parked connection waits for its retry once the
+/// early-reply queue has room again.
+///
+/// Nothing tells the reader that the response stage drained the queue,
+/// so while any connection is parked its wait in the kernel is bounded by
+/// a timeout of this length. A wake from the response stage (the eventfd)
+/// would resume sooner, but needs a fenced park/drain handshake against a
+/// lost wake, and puts a `write` on the response stage's drain, to shorten
+/// a path that is degraded by definition: a park happens only while that
+/// stage is not draining. Any other wake retries parked connections too.
+const PARK_RETRY: Duration = Duration::from_millis(1);
+
+/// The longest a park's `AsyncCancel` may go unanswered before the reader
+/// stops waiting on it and closes the connection.
+///
+/// An honoured cancel's terminal CQE lands within the same submit or the
+/// next, so a cancel still in flight after this long was not honoured:
+/// some hosts filter io_uring opcodes (see the shutdown quiesce), and a
+/// filtered cancel completes with `EINVAL`, leaving the multishot armed.
+/// The connection's bytes would then keep landing while parked, growing
+/// its buffer with nothing pushing back on the client. Closing it is the
+/// behaviour before parking existed; teardown's `shutdown(2)` ends the
+/// multishot whatever the host filters.
+const PARK_CANCEL_DEADLINE: Duration = Duration::from_secs(1);
 
 /// CQE flag: buffer ID is valid in upper 16 bits of flags.
 const IORING_CQE_F_BUFFER: u32 = 1 << 0;
@@ -329,26 +360,250 @@ struct ConnectionEntry<R> {
     /// Owned reader — keeps the fd alive. Dropping closes the fd.
     _reader: R,
     fd: RawFd,
-    /// Accumulated bytes not yet parsed into complete frames.
-    /// Grows when partial frames arrive, shrinks when frames are consumed.
-    parse_buf: Vec<u8>,
-    /// True if a multishot RecvMulti is currently active for this connection.
-    /// Multishot stays active until the kernel clears IORING_CQE_F_MORE
-    /// (e.g., buffer pool exhaustion, socket error, or EOF).
-    multishot_active: bool,
+    /// Bytes received and not yet processed, and what is left of a shed
+    /// tail: the input state the DPDK poll loop keeps too.
+    ingress: ClientIngress,
+    /// Where the connection's receive stands with the kernel: armed,
+    /// between two arms, parked, or dying.
+    recv: RecvState,
     /// Last time any data was received on this connection. Used for
     /// idle timeout detection.
     last_activity: Instant,
-    /// Teardown has begun (malformed frame or idle timeout) while the
-    /// multishot RECV was still armed. The slab index must stay
-    /// allocated until the armed op's terminal CQE arrives — freeing it
-    /// early lets the LIFO free list hand the index to a new
-    /// registration while the kernel can still post CQEs carrying it,
-    /// and the old peer's bytes would be parsed under the new
-    /// connection's identity and permissions (audit review F1). CQEs
-    /// for a dying entry recycle their buffers and are otherwise
+}
+
+/// Where a connection's receive stands with the kernel.
+///
+/// One enum rather than flags, so a parked connection cannot be re-armed
+/// or freed by the paths written for the others: every change goes
+/// through a method here, each an exhaustive `match`, and the reader acts
+/// on the step it returns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecvState {
+    /// A multishot receive is armed: the kernel posts CQEs for it until
+    /// one without `IORING_CQE_F_MORE`.
+    Armed,
+    /// No receive armed, none owed: the multishot ended (pool exhaustion,
+    /// or the kernel's own decision) and is re-armed in the same drain.
+    Idle,
+    /// Parked (see `client_frames`): the early-reply queue had no room for
+    /// an answer, so the connection is not read, and its buffer is retried
+    /// on every wake of the reader. `cancelling`: the multishot's
+    /// `AsyncCancel` is in flight, so the kernel still owes its terminal
+    /// CQE, and data CQEs that land before it are kept. `since`: when it
+    /// parked, for the long-park report.
+    Parked { cancelling: bool, since: Instant },
+    /// A retry came back with the buffer processed while the park's cancel
+    /// was still in flight: the receive is re-armed on the cancelled one's
+    /// terminal CQE, never before, so two multishots never feed one buffer.
+    Resuming,
+    /// Torn down while the kernel still owes a terminal CQE. The slab index
+    /// must stay allocated until it arrives: freed early, the LIFO free
+    /// list hands the index to a new registration while the kernel can
+    /// still post CQEs carrying it, and the old peer's bytes would be
+    /// parsed under the new connection's identity and permissions (audit
+    /// review F1). Its CQEs recycle their buffers and are otherwise
     /// discarded.
-    dying: bool,
+    Dying,
+}
+
+/// What a receive CQE carries, as far as the receive state cares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecvCompletion {
+    /// Bytes, in a provided buffer.
+    Data,
+    /// Nothing, and not the end of the connection: the pool ran dry at
+    /// buffer selection (`ENOBUFS`, nothing read: the bytes wait in the
+    /// socket), the park's cancel landed (`ECANCELED`), or a data CQE
+    /// without a buffer.
+    Empty,
+    /// The peer closed the connection (0), or the receive failed.
+    Closed,
+}
+
+/// What the reader does with a receive CQE ([`RecvState::on_cqe`]). Its
+/// buffer, if it carries one, is recycled whatever the step, once any
+/// bytes are copied out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CqeStep {
+    /// A torn-down connection's CQE: discarded, and the slab index freed
+    /// when it is the terminal one.
+    Discard { free: bool },
+    /// The connection is over: free it and tell the response stage.
+    Remove,
+    /// Append the bytes and process the buffer, then act on
+    /// [`RecvState::after_frames`].
+    Process,
+    /// Append the bytes and nothing more: the connection is parked, and the
+    /// retry processes them.
+    Keep,
+    /// Arm a new multishot receive (the state is `Armed` already).
+    Arm,
+    /// Nothing to do.
+    Nothing,
+}
+
+/// What the reader does once a connection's buffer has been processed
+/// ([`RecvState::after_frames`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FramesStep {
+    /// Nothing to do.
+    Nothing,
+    /// Arm a new multishot receive (the state is `Armed` already).
+    Arm,
+    /// Cancel the armed multishot: the connection has parked.
+    Cancel,
+    /// Tear the connection down ([`begin_teardown`]).
+    Teardown,
+}
+
+/// What tearing a connection down takes ([`RecvState::on_teardown`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TeardownStep {
+    /// Already dying: nothing more, no second `Disconnected`.
+    AlreadyDying,
+    /// Nothing can post a CQE for it: free the slab index now.
+    FreeNow,
+    /// Cancel the armed multishot, and free on its terminal CQE.
+    Cancel,
+    /// A cancel is already in flight (the park's): free on its terminal
+    /// CQE, with no second `AsyncCancel`.
+    AwaitCancel,
+}
+
+impl RecvState {
+    /// The state after a receive CQE, and what the reader does with it.
+    /// `terminal`: the CQE ends the armed multishot (no `F_MORE`).
+    fn on_cqe(self, completion: RecvCompletion, terminal: bool) -> (RecvState, CqeStep) {
+        if self == RecvState::Dying {
+            return (self, CqeStep::Discard { free: terminal });
+        }
+        let after = if terminal {
+            self.after_terminal()
+        } else {
+            self
+        };
+        match completion {
+            // Terminal for the armed op, so the index is free to reuse.
+            RecvCompletion::Closed => (after, CqeStep::Remove),
+            RecvCompletion::Empty => match after {
+                RecvState::Idle => (RecvState::Armed, CqeStep::Arm),
+                _ => (after, CqeStep::Nothing),
+            },
+            RecvCompletion::Data => match after {
+                RecvState::Parked { .. } => (after, CqeStep::Keep),
+                _ => (after, CqeStep::Process),
+            },
+        }
+    }
+
+    /// The state once the armed multishot has posted its last CQE.
+    fn after_terminal(self) -> RecvState {
+        match self {
+            RecvState::Armed | RecvState::Resuming => RecvState::Idle,
+            RecvState::Parked { since, .. } => RecvState::Parked {
+                cancelling: false,
+                since,
+            },
+            // Nothing was armed, or the caller frees it.
+            RecvState::Idle | RecvState::Dying => self,
+        }
+    }
+
+    /// The state after the connection's buffer was processed with
+    /// `action` at `now`, and what the reader does next. A parked
+    /// connection that parks again keeps its `since`.
+    fn after_frames(self, action: FrameAction, now: Instant) -> (RecvState, FramesStep) {
+        match action {
+            FrameAction::Disconnect => (self, FramesStep::Teardown),
+            FrameAction::Continue => match self {
+                RecvState::Armed | RecvState::Resuming | RecvState::Dying => {
+                    (self, FramesStep::Nothing)
+                }
+                RecvState::Parked {
+                    cancelling: true, ..
+                } => (RecvState::Resuming, FramesStep::Nothing),
+                RecvState::Idle
+                | RecvState::Parked {
+                    cancelling: false, ..
+                } => (RecvState::Armed, FramesStep::Arm),
+            },
+            FrameAction::Park => match self {
+                RecvState::Armed => (
+                    RecvState::Parked {
+                        cancelling: true,
+                        since: now,
+                    },
+                    FramesStep::Cancel,
+                ),
+                RecvState::Resuming => (
+                    RecvState::Parked {
+                        cancelling: true,
+                        since: now,
+                    },
+                    FramesStep::Nothing,
+                ),
+                RecvState::Idle => (
+                    RecvState::Parked {
+                        cancelling: false,
+                        since: now,
+                    },
+                    FramesStep::Nothing,
+                ),
+                RecvState::Parked { .. } | RecvState::Dying => (self, FramesStep::Nothing),
+            },
+        }
+    }
+
+    /// The state once teardown has begun, and what it takes.
+    fn on_teardown(self) -> (RecvState, TeardownStep) {
+        match self {
+            RecvState::Dying => (self, TeardownStep::AlreadyDying),
+            RecvState::Idle
+            | RecvState::Parked {
+                cancelling: false, ..
+            } => (self, TeardownStep::FreeNow),
+            RecvState::Armed => (RecvState::Dying, TeardownStep::Cancel),
+            RecvState::Resuming
+            | RecvState::Parked {
+                cancelling: true, ..
+            } => (RecvState::Dying, TeardownStep::AwaitCancel),
+        }
+    }
+
+    /// Whether, at `now`, a park's cancel has been in flight for longer
+    /// than [`PARK_CANCEL_DEADLINE`]: the host did not honour it.
+    fn park_cancel_overdue(self, now: Instant) -> bool {
+        match self {
+            RecvState::Parked {
+                cancelling: true,
+                since,
+            } => now.duration_since(since) > PARK_CANCEL_DEADLINE,
+            RecvState::Armed
+            | RecvState::Idle
+            | RecvState::Resuming
+            | RecvState::Dying
+            | RecvState::Parked {
+                cancelling: false, ..
+            } => false,
+        }
+    }
+
+    /// Whether the kernel still owes this connection a CQE: what the
+    /// shutdown quiesce waits out.
+    fn kernel_owes_cqe(self) -> bool {
+        match self {
+            RecvState::Armed
+            | RecvState::Resuming
+            | RecvState::Dying
+            | RecvState::Parked {
+                cancelling: true, ..
+            } => true,
+            RecvState::Idle
+            | RecvState::Parked {
+                cancelling: false, ..
+            } => false,
+        }
+    }
 }
 
 /// Index-stable allocator for connection state. Slab indices are used as
@@ -576,6 +831,19 @@ fn reader_loop<A: Application, R: AsRawFd>(
     // heap allocation inside the hot loop.
     let mut stale: Vec<usize> = Vec::new();
 
+    // Parking state. `any_parked` is set whenever a connection parks and
+    // recomputed by each retry pass, so it may overstate (a parked
+    // connection removed since) but never understate: an overstatement
+    // costs one pass and one timer. `park_retry_ts` is the timer's length;
+    // like `tick_ts` it must outlive the submit that reads it, so it lives
+    // as long as the loop.
+    let mut any_parked = false;
+    let mut park_retry_armed = false;
+    let park_retry_ts = types::Timespec::new()
+        .sec(PARK_RETRY.as_secs())
+        .nsec(PARK_RETRY.subsec_nanos());
+    let mut long_park_report = LongParkReport::default();
+
     // Tick generator state. `tick_schedule` holds the monotonic instant the
     // next `JournalEvent::Tick` should fire and the floor that keeps the
     // published wall-clock timestamps strictly monotonic (NTP can step the
@@ -657,6 +925,18 @@ fn reader_loop<A: Application, R: AsRawFd>(
             }
         }
 
+        // While a connection is parked, nothing but this timer is sure to
+        // bring the loop back round to retry it.
+        if any_parked && !park_retry_armed {
+            let sqe = opcode::Timeout::new(&park_retry_ts)
+                .build()
+                .user_data(PARK_RETRY_TOKEN);
+            // SAFETY: `park_retry_ts` lives as long as the loop, past the
+            // submit that reads it.
+            unsafe { push_sqe(&mut ring, &sqe, "the park-retry TIMEOUT") };
+            park_retry_armed = true;
+        }
+
         // Enter the kernel only when there is a reason to.
         //
         // Under load the CQ usually already holds completions by the
@@ -723,6 +1003,14 @@ fn reader_loop<A: Application, R: AsRawFd>(
                 continue;
             }
 
+            // ── Park-retry timeout ──
+            // A wakeup and nothing more: the retry pass after the drain
+            // runs on every wake.
+            if token == PARK_RETRY_TOKEN {
+                park_retry_armed = false;
+                continue;
+            }
+
             // ── Legacy ProvideBuffers completion (fallback mode only) ──
             if token == PROVIDE_BUFS_TOKEN {
                 if result < 0 {
@@ -735,7 +1023,9 @@ fn reader_loop<A: Application, R: AsRawFd>(
             if token == CANCEL_TOKEN {
                 // Nothing to do: the cancelled op's own terminal CQE
                 // drives the state machine; ENOENT/EALREADY just mean
-                // it already finished on its own.
+                // it already finished on its own. A filtered cancel
+                // (EINVAL) leaves a parked connection's receive armed;
+                // the retry pass closes it (`PARK_CANCEL_DEADLINE`).
                 continue;
             }
 
@@ -758,16 +1048,16 @@ fn reader_loop<A: Application, R: AsRawFd>(
                             key_hash: reg.key_hash,
                             fd,
                             _reader: reg.reader,
-                            parse_buf: Vec::with_capacity(MAX_FRAME_SIZE + 4),
-                            multishot_active: false,
+                            ingress: ClientIngress::new(Vec::with_capacity(MAX_FRAME_SIZE + 4)),
+                            // Armed just below.
+                            recv: RecvState::Armed,
                             last_activity: Instant::now(),
-                            dying: false,
                         };
                         let idx = slab.insert(entry);
                         fd_to_slab.insert(fd, idx);
 
                         // Submit multishot RECV for this connection.
-                        push_recv_multi(&mut ring, &mut slab, idx);
+                        push_recv_multi(&mut ring, fd, idx);
                     }
                 } else {
                     error!(error = result, "eventfd read error");
@@ -782,14 +1072,8 @@ fn reader_loop<A: Application, R: AsRawFd>(
             // ── Connection multishot RECV completion ──
 
             let slab_idx = token as usize;
-            let has_more = (flags & IORING_CQE_F_MORE) != 0;
-
-            // A cleared F_MORE means THIS armed op posts no further
-            // CQEs — record it before any branch, so no early `continue`
-            // below can wedge the connection with a stale `true`.
-            if !has_more && let Some(entry) = slab.get_mut(slab_idx) {
-                entry.multishot_active = false;
-            }
+            // A cleared F_MORE means THIS armed op posts no further CQEs.
+            let terminal = (flags & IORING_CQE_F_MORE) == 0;
 
             // Extract the buffer (if any) before acting on `result`: a
             // buffer can ride ANY recv CQE, and one that is not recycled
@@ -803,83 +1087,96 @@ fn reader_loop<A: Application, R: AsRawFd>(
                 None
             };
 
-            // Dying connection: teardown began while its multishot was
-            // still armed (see `begin_teardown`). Consume its CQEs
-            // without parsing — the bytes belong to a repudiated peer —
-            // but keep recycling their buffers; free the slab index only
-            // at the terminal CQE, so it cannot be handed to a new
-            // registration while the kernel can still post CQEs carrying
-            // it. Checked before the disconnect branch so the cancel's
-            // -ECANCELED completion lands here, not there (which would
-            // emit a second Disconnected event).
-            if slab.get_mut(slab_idx).is_some_and(|e| e.dying) {
+            let Some(entry) = slab.get_mut(slab_idx) else {
+                // No connection holds the index: an index is freed only
+                // once nothing armed can post for it, so this does not
+                // happen; its buffer goes back all the same.
                 if let Some(bid) = buf_id {
                     recycle_buffer(&mut ring, &mut buf_ring, use_buf_ring, &buffer_pool, bid);
-                }
-                if !has_more && let Some(dead) = slab.remove(slab_idx) {
-                    debug!(
-                        connection_id = dead.connection_id,
-                        "teardown complete, slab index released"
-                    );
                 }
                 continue;
-            }
+            };
 
-            if result == -libc::ENOBUFS {
-                // Pool exhausted at buffer-selection time: the multishot
-                // terminated WITHOUT reading — no data was lost, it sits
-                // in the socket buffer. This is not a client error and
-                // must not disconnect (a bare `result <= 0 ⇒ remove`
-                // here dropped innocent clients under burst). Re-arm:
-                // recycles from data CQEs earlier in this drain have
-                // already refilled the buf_ring (publication is
-                // immediate), and the re-arm SQE submits after the whole
-                // drain, so the retry finds buffers.
-                if let Some(bid) = buf_id {
-                    // No buffer accompanies a selection failure by
-                    // definition; recycle defensively if one appears.
-                    recycle_buffer(&mut ring, &mut buf_ring, use_buf_ring, &buffer_pool, bid);
-                }
-                if has_more {
-                    // Future-kernel guard: should the kernel ever keep
-                    // the multishot alive across ENOBUFS, arming a second
-                    // one would interleave two delivery streams into the
-                    // same parse buffer.
-                    continue;
-                }
-                push_recv_multi(&mut ring, &mut slab, slab_idx);
-                continue;
-            }
+            // `ENOBUFS`: the pool ran dry at buffer-selection time, and
+            // the multishot ended WITHOUT reading — the bytes sit in the
+            // socket buffer. Not a client error, and it must not
+            // disconnect (a bare `result <= 0 ⇒ remove` here dropped
+            // innocent clients under burst): the receive is re-armed, and
+            // recycles from data CQEs earlier in this drain have already
+            // refilled the buf_ring (publication is immediate), while the
+            // re-arm SQE submits after the whole drain, so the retry finds
+            // buffers. `ECANCELED`: a park's cancel landed. A data CQE
+            // without a buffer cannot happen with buffer-select receives;
+            // defensively, it is taken as no bytes.
+            let completion = if result == -libc::ENOBUFS || result == -libc::ECANCELED {
+                RecvCompletion::Empty
+            } else if result <= 0 {
+                RecvCompletion::Closed
+            } else if buf_id.is_none() {
+                debug!(slab_idx, "recv CQE without buffer flag");
+                RecvCompletion::Empty
+            } else {
+                RecvCompletion::Data
+            };
+            let (recv, step) = entry.recv.on_cqe(completion, terminal);
+            entry.recv = recv;
+            let fd = entry.fd;
 
-            if result <= 0 {
-                // Disconnect (0) or error (negative errno) — terminal
-                // for the armed op, so the index is immediately safe to
-                // free. Recycle any buffer riding the CQE first.
+            let (Some(buf_id), CqeStep::Process | CqeStep::Keep) = (buf_id, step) else {
+                // No bytes to take: a buffer riding the CQE (one can ride
+                // ANY recv CQE, as above) goes straight back.
                 if let Some(bid) = buf_id {
                     recycle_buffer(&mut ring, &mut buf_ring, use_buf_ring, &buffer_pool, bid);
                 }
-                if let Some(removed) = slab.remove(slab_idx) {
-                    if result == 0 {
-                        debug!(
-                            connection_id = removed.connection_id,
-                            addr = %removed.addr,
-                            "client disconnected"
-                        );
-                    } else {
-                        debug!(
-                            connection_id = removed.connection_id,
-                            addr = %removed.addr,
-                            error = result,
-                            "recv error"
-                        );
+                match step {
+                    CqeStep::Discard { free } => {
+                        // A torn-down connection: its bytes belong to a
+                        // repudiated peer, and its index is freed only at
+                        // the terminal CQE, so it cannot be handed to a
+                        // new registration while the kernel can still post
+                        // CQEs carrying it.
+                        if free && let Some(dead) = slab.remove(slab_idx) {
+                            debug!(
+                                connection_id = dead.connection_id,
+                                "teardown complete, slab index released"
+                            );
+                        }
                     }
-                    fd_to_slab.remove(&removed.fd);
-                    let _ = control_tx.send(ControlEvent::Disconnected {
-                        connection_id: removed.connection_id,
-                    });
+                    CqeStep::Remove => {
+                        // Disconnect (0) or error (negative errno) —
+                        // terminal for the armed op, so the index is
+                        // immediately safe to free.
+                        if let Some(removed) = slab.remove(slab_idx) {
+                            if result == 0 {
+                                debug!(
+                                    connection_id = removed.connection_id,
+                                    addr = %removed.addr,
+                                    "client disconnected"
+                                );
+                            } else {
+                                debug!(
+                                    connection_id = removed.connection_id,
+                                    addr = %removed.addr,
+                                    error = result,
+                                    "recv error"
+                                );
+                            }
+                            fd_to_slab.remove(&removed.fd);
+                            // Dropped error: a dead control channel means
+                            // the response stage is gone and the server is
+                            // shutting down.
+                            let _ = control_tx.send(ControlEvent::Disconnected {
+                                connection_id: removed.connection_id,
+                            });
+                        }
+                    }
+                    CqeStep::Arm => push_recv_multi(&mut ring, fd, slab_idx),
+                    // `Process` and `Keep` without a buffer are `Empty`'s,
+                    // which never yields them.
+                    CqeStep::Nothing | CqeStep::Process | CqeStep::Keep => {}
                 }
                 continue;
-            }
+            };
 
             let n = result as usize;
 
@@ -893,32 +1190,81 @@ fn reader_loop<A: Application, R: AsRawFd>(
             #[allow(clippy::let_unit_value)] // ZST when latency-trace is off
             let recv_ts = melin_transport_core::trace::mono_trace_ns();
 
-            // Data CQEs always carry a buffer with buffer-select recvs.
-            // Defensive: nothing to copy or recycle without one, but the
-            // multishot bookkeeping already ran above, so a terminal
-            // no-buffer CQE re-arms instead of wedging the connection.
-            let Some(buf_id) = buf_id else {
-                debug!(slab_idx, "recv CQE without buffer flag");
-                if !has_more {
-                    push_recv_multi(&mut ring, &mut slab, slab_idx);
-                }
+            // Any successful recv resets the idle timeout.
+            entry.last_activity = batch_now;
+
+            // Copy received data from the shared buffer pool into the
+            // connection's parse buffer: kept even while it is parked (a
+            // CQE that landed before the park's cancel), for the retry.
+            let buf_start = buf_id * BUF_SIZE;
+            entry
+                .ingress
+                .extend_from_slice(&buffer_pool[buf_start..buf_start + n]);
+
+            // Recycle the consumed buffer. Must happen after the copy-out
+            // above — from this line on the kernel may write fresh recv
+            // data into the slot.
+            recycle_buffer(&mut ring, &mut buf_ring, use_buf_ring, &buffer_pool, buf_id);
+
+            if step == CqeStep::Keep {
                 continue;
-            };
+            }
 
-            // Feed received bytes into the frame parser from the shared pool.
-            let action = if let Some(entry) = slab.get_mut(slab_idx) {
-                // Any successful recv resets the idle timeout.
-                entry.last_activity = batch_now;
+            // Extract and publish complete frames.
+            let action = process_frames::<A, R>(
+                entry,
+                &mut producer,
+                decoder,
+                halt,
+                &mut early_replies,
+                batch_wall_ns,
+                recv_ts,
+                #[cfg(feature = "latency-trace")]
+                &mut publish_rec,
+                #[cfg(feature = "tick-to-trade")]
+                &mut ingest_rec,
+            );
+            let (recv, step) = entry.recv.after_frames(action, batch_now);
+            entry.recv = recv;
+            if matches!(recv, RecvState::Parked { .. }) {
+                any_parked = true;
+                debug!(connection_id = entry.connection_id, "connection parked");
+            }
+            apply_frames_step(
+                &mut ring,
+                &mut slab,
+                &mut fd_to_slab,
+                control_tx,
+                slab_idx,
+                step,
+            );
+        }
 
-                // Copy received data from the shared buffer pool into the
-                // connection's parse buffer.
-                let buf_start = buf_id * BUF_SIZE;
-                entry
-                    .parse_buf
-                    .extend_from_slice(&buffer_pool[buf_start..buf_start + n]);
-
-                // Extract and publish complete frames.
-                let drop_conn = process_frames::<A, R>(
+        // Retry every parked connection's buffer: on the park-retry
+        // timer, and on any other wake. One that comes back processed is
+        // read again; one that parks again stays parked.
+        if any_parked {
+            any_parked = false;
+            let mut long_parked = 0usize;
+            #[allow(clippy::let_unit_value)] // ZST when latency-trace is off
+            let recv_ts = melin_transport_core::trace::mono_trace_ns();
+            for idx in 0..slab.entries.len() {
+                let Some(entry) = slab.get_mut(idx) else {
+                    continue;
+                };
+                let RecvState::Parked { since, .. } = entry.recv else {
+                    continue;
+                };
+                if entry.recv.park_cancel_overdue(batch_now) {
+                    tracing::warn!(
+                        connection_id = entry.connection_id,
+                        "a parked connection's receive cancel went unanswered (is io_uring \
+                         AsyncCancel filtered on this host?): closing the connection"
+                    );
+                    begin_teardown(&mut ring, &mut slab, &mut fd_to_slab, control_tx, idx);
+                    continue;
+                }
+                let action = process_frames::<A, R>(
                     entry,
                     &mut producer,
                     decoder,
@@ -931,36 +1277,33 @@ fn reader_loop<A: Application, R: AsRawFd>(
                     #[cfg(feature = "tick-to-trade")]
                     &mut ingest_rec,
                 );
-                if drop_conn {
-                    Action::Remove
-                } else if !has_more {
-                    // Multishot terminated (buffer pool exhaustion or kernel
-                    // decision) but connection is healthy — resubmit.
-                    Action::Resubmit
-                } else {
-                    Action::None
+                let (recv, step) = entry.recv.after_frames(action, batch_now);
+                entry.recv = recv;
+                match action {
+                    // Still parked, since it first parked.
+                    FrameAction::Park => {
+                        any_parked = true;
+                        if batch_now.duration_since(since) > LONG_PARK {
+                            long_parked += 1;
+                        }
+                    }
+                    FrameAction::Continue => {
+                        // Not read while parked: its idle clock restarts
+                        // now, not at its last bytes.
+                        entry.last_activity = batch_now;
+                        debug!(connection_id = entry.connection_id, "connection resumed");
+                    }
+                    // Torn down below.
+                    FrameAction::Disconnect => {}
                 }
-            } else {
-                // Stale CQE for a removed connection — ignore.
-                Action::None
-            };
-
-            // Recycle the consumed buffer. Must happen after the copy-out
-            // above — from this line on the kernel may write fresh recv
-            // data into the slot.
-            recycle_buffer(&mut ring, &mut buf_ring, use_buf_ring, &buffer_pool, buf_id);
-
-            match action {
-                Action::Remove => {
-                    // Deferred teardown, NOT an immediate slab free — the
-                    // multishot may still be armed and its index must not
-                    // be reused until the terminal CQE (audit review F1).
-                    begin_teardown(&mut ring, &mut slab, &mut fd_to_slab, control_tx, slab_idx);
-                }
-                Action::Resubmit => {
-                    push_recv_multi(&mut ring, &mut slab, slab_idx);
-                }
-                Action::None => {}
+                apply_frames_step(&mut ring, &mut slab, &mut fd_to_slab, control_tx, idx, step);
+            }
+            if long_park_report.due(long_parked, batch_now) {
+                tracing::warn!(
+                    connections = long_parked,
+                    "client connections parked for over a second: the response stage \
+                     is not taking early replies, and these clients are not read"
+                );
             }
         }
 
@@ -976,9 +1319,11 @@ fn reader_loop<A: Application, R: AsRawFd>(
                 for (idx, slot) in slab.entries.iter().enumerate() {
                     // Dying entries are already mid-teardown: their
                     // `last_activity` stays stale by design, and a second
-                    // teardown would emit a duplicate Disconnected.
+                    // teardown would emit a duplicate Disconnected. A
+                    // parked connection is not idle: the node is not
+                    // reading it.
                     if let Some(entry) = slot
-                        && !entry.dying
+                        && !matches!(entry.recv, RecvState::Dying | RecvState::Parked { .. })
                         && now.duration_since(entry.last_activity) > timeout
                     {
                         debug!(
@@ -1079,8 +1424,9 @@ fn reader_loop<A: Application, R: AsRawFd>(
                     // carry no information, legacy ProvideBuffers
                     // completions only registered addresses, and the
                     // tick timeout reads nothing after submit (see
-                    // `owed`).
-                    PROVIDE_BUFS_TOKEN | CANCEL_TOKEN | TICK_TIMEOUT_TOKEN => {}
+                    // `owed`), nor does the park-retry timeout, for the
+                    // same reason.
+                    PROVIDE_BUFS_TOKEN | CANCEL_TOKEN | TICK_TIMEOUT_TOKEN | PARK_RETRY_TOKEN => {}
                     // Connection tokens are slab indices.
                     idx => {
                         // A terminal CQE retires that connection's arm.
@@ -1088,10 +1434,13 @@ fn reader_loop<A: Application, R: AsRawFd>(
                         // and their buffers deliberately not recycled —
                         // nothing re-arms, so the pool cannot be
                         // selected from again once every arm is down.
+                        // Whatever state it was in, the kernel owes it
+                        // nothing more: `Idle` says so (the entry is never
+                        // used again).
                         if (cqe.flags() & IORING_CQE_F_MORE) == 0
                             && let Some(entry) = slab.get_mut(idx as usize)
                         {
-                            entry.multishot_active = false;
+                            entry.recv = RecvState::Idle;
                         }
                     }
                 }
@@ -1110,7 +1459,12 @@ fn reader_loop<A: Application, R: AsRawFd>(
             // filters opcodes refuses. Gating the proof on it would
             // hand those hosts a full-deadline stall and a spurious
             // "leaking" warning on every clean shutdown.
-            let owed = eventfd_armed || slab.entries.iter().flatten().any(|e| e.multishot_active);
+            let owed = eventfd_armed
+                || slab
+                    .entries
+                    .iter()
+                    .flatten()
+                    .any(|e| e.recv.kernel_owes_cqe());
             if !owed {
                 break true;
             }
@@ -1135,7 +1489,7 @@ fn reader_loop<A: Application, R: AsRawFd>(
                 .entries
                 .iter()
                 .flatten()
-                .filter(|e| e.multishot_active)
+                .filter(|e| e.recv.kernel_owes_cqe())
                 .count(),
             "io_uring teardown drain did not complete; leaking reader buffers"
         );
@@ -1149,17 +1503,6 @@ fn reader_loop<A: Application, R: AsRawFd>(
     // this side left that write racing a reused descriptor number. Dropping
     // the `Arc` at the end of this scope releases our share; the descriptor
     // itself closes when the handle drops too.
-}
-
-/// What to do after processing a RECV CQE.
-enum Action {
-    /// Multishot terminated but connection healthy — resubmit RecvMulti.
-    Resubmit,
-    /// Connection should be torn down (malformed frame). Handled via
-    /// `begin_teardown`, which reads what it needs from the slab entry.
-    Remove,
-    /// Multishot still active — nothing to do.
-    None,
 }
 
 // ---------------------------------------------------------------------------
@@ -1287,16 +1630,17 @@ fn recycle_buffer(
 }
 
 /// Begin tearing down a connection the reader decided to drop while its
-/// multishot RECV may still be armed (malformed frame, idle timeout).
+/// multishot RECV may still be armed (malformed frame, idle timeout, a
+/// superseded node), parked or not.
 ///
 /// The slab index must NOT be freed yet: the kernel can still post CQEs
 /// carrying it, and the slab's LIFO free list would hand the index to
 /// the next registration — the old peer's bytes would then be parsed
 /// under the new connection's identity, key hash, and permissions
 /// (request injection; audit review F1). Instead: sever the peer,
-/// mark the entry dying, cancel the armed op, and let the terminal CQE
-/// free the index (the `dying` branch of the CQE loop). When no op is
-/// armed there is nothing that can post — free immediately.
+/// mark the entry dying, cancel the armed op (unless a park's cancel is
+/// already in flight), and let the terminal CQE free the index. When
+/// nothing is owed there is nothing that can post — free immediately.
 fn begin_teardown<R>(
     ring: &mut IoUring,
     slab: &mut ConnectionSlab<R>,
@@ -1307,9 +1651,11 @@ fn begin_teardown<R>(
     let Some(entry) = slab.get_mut(idx) else {
         return;
     };
-    if entry.dying {
+    let (recv, step) = entry.recv.on_teardown();
+    if step == TeardownStep::AlreadyDying {
         return;
     }
+    entry.recv = recv;
     let connection_id = entry.connection_id;
     let fd = entry.fd;
     // Sever the peer now. The fd itself must stay open until the armed
@@ -1324,40 +1670,69 @@ fn begin_teardown<R>(
     // gone and the server is shutting down.
     let _ = control_tx.send(ControlEvent::Disconnected { connection_id });
 
-    if entry.multishot_active {
-        entry.dying = true;
-        let sqe = opcode::AsyncCancel::new(idx as u64)
-            .build()
-            .user_data(CANCEL_TOKEN);
-        // SAFETY: AsyncCancel references no memory.
-        unsafe { push_sqe(ring, &sqe, "a connection teardown's AsyncCancel") };
-    } else {
-        // No armed op ⇒ no future CQEs can carry this index.
-        slab.remove(idx);
+    match step {
+        TeardownStep::Cancel => push_recv_cancel(ring, idx, "a connection teardown's AsyncCancel"),
+        // The park's cancel is in flight: its terminal CQE frees the index.
+        TeardownStep::AwaitCancel => {}
+        // Nothing owed ⇒ no future CQEs can carry this index.
+        TeardownStep::FreeNow => {
+            slab.remove(idx);
+        }
+        // Returned above, before the peer was told anything twice.
+        TeardownStep::AlreadyDying => {}
     }
 }
 
-/// Push a multishot RECV SQE for a connection. The kernel will produce
-/// CQEs continuously until EOF, error, or buffer pool exhaustion —
-/// no resubmission needed unless multishot terminates.
-fn push_recv_multi<R>(ring: &mut IoUring, slab: &mut ConnectionSlab<R>, idx: usize) {
-    let entry = match slab.get_mut(idx) {
-        Some(e) => e,
-        None => return,
-    };
-
-    if entry.multishot_active {
-        return;
+/// Act on what [`RecvState::after_frames`] decided for connection `idx`.
+fn apply_frames_step<R>(
+    ring: &mut IoUring,
+    slab: &mut ConnectionSlab<R>,
+    fd_to_slab: &mut HashMap<RawFd, usize>,
+    control_tx: &mpsc::Sender<ControlEvent>,
+    idx: usize,
+    step: FramesStep,
+) {
+    match step {
+        FramesStep::Nothing => {}
+        FramesStep::Arm => {
+            if let Some(entry) = slab.get_mut(idx) {
+                push_recv_multi(ring, entry.fd, idx);
+            }
+        }
+        // With nothing reading the socket its receive buffer fills, and
+        // TCP's window closes on the client.
+        FramesStep::Cancel => push_recv_cancel(ring, idx, "a park's AsyncCancel"),
+        // Deferred teardown, NOT an immediate slab free — the multishot
+        // may still be armed and its index must not be reused until the
+        // terminal CQE (audit review F1).
+        FramesStep::Teardown => begin_teardown(ring, slab, fd_to_slab, control_tx, idx),
     }
+}
 
-    let sqe = opcode::RecvMulti::new(types::Fd(entry.fd), BUF_GROUP_ID)
+/// Push a multishot RECV SQE for connection `idx` on `fd`. The kernel will
+/// produce CQEs continuously until EOF, error, or buffer pool exhaustion —
+/// no resubmission needed unless multishot terminates. Only on a
+/// transition of [`RecvState`] to `Armed`.
+fn push_recv_multi(ring: &mut IoUring, fd: RawFd, idx: usize) {
+    let sqe = opcode::RecvMulti::new(types::Fd(fd), BUF_GROUP_ID)
         .build()
         .user_data(idx as u64);
 
     // SAFETY: buffer-select RECV writes only into the provided-buffer
     // pool, which outlives the ring.
     unsafe { push_sqe(ring, &sqe, "a multishot RECV") };
-    entry.multishot_active = true;
+}
+
+/// Cancel connection `idx`'s armed multishot RECV (`what` names why, for
+/// a failed push). Its terminal CQE, `ECANCELED` or whatever completed
+/// first, drives the state machine; the cancel's own completion carries
+/// nothing.
+fn push_recv_cancel(ring: &mut IoUring, idx: usize, what: &str) {
+    let sqe = opcode::AsyncCancel::new(idx as u64)
+        .build()
+        .user_data(CANCEL_TOKEN);
+    // SAFETY: AsyncCancel references no memory.
+    unsafe { push_sqe(ring, &sqe, what) };
 }
 
 /// Push a READ SQE for the eventfd (wakeup notification).
@@ -1375,14 +1750,14 @@ fn push_eventfd_read(ring: &mut IoUring, wakeup_fd: RawFd, buf: *mut u8) {
 // Frame parsing
 // ---------------------------------------------------------------------------
 
-/// Extract complete frames from `conn.parse_buf` and publish them as
+/// Extract complete frames from `conn.ingress` and publish them as
 /// `InputSlot`s, answering through `early_replies` the requests not
 /// published (see [`process_client_frames`](crate::client_frames::process_client_frames)).
 /// `batch_wall_ns` is the wall-clock timestamp captured once per CQE batch
 /// by the caller (see `reader_loop`); all non-query requests published in
 /// this call share it, sparing the reader a per-request
-/// `clock_gettime(CLOCK_REALTIME)` on the hot path. Returns `true` if the
-/// connection should be dropped.
+/// `clock_gettime(CLOCK_REALTIME)` on the hot path. Returns what to do
+/// with the connection: keep reading, close it, or park it.
 #[allow(clippy::too_many_arguments)]
 fn process_frames<A: Application, R>(
     conn: &mut ConnectionEntry<R>,
@@ -1394,11 +1769,13 @@ fn process_frames<A: Application, R>(
     recv_ts: melin_transport_core::trace::MonoTraceInstant,
     #[cfg(feature = "latency-trace")] publish_rec: &mut melin_transport_core::trace::StageRecorder,
     #[cfg(feature = "tick-to-trade")] ingest_rec: &mut melin_transport_core::trace::StageRecorder,
-) -> bool {
-    use crate::client_frames::{FrameAction, process_client_frames};
-
-    let action = process_client_frames::<A>(
-        &mut conn.parse_buf,
+) -> FrameAction {
+    // Every answer the reader decides on, a busy for a full ring among
+    // them, goes to the response stage through the early-reply queue: the
+    // response stage owns all egress on a client socket, so no reader-side
+    // send can land between the two halves of a partially flushed reply.
+    crate::client_frames::process_client_frames::<A>(
+        &mut conn.ingress,
         conn.connection_id,
         conn.key_hash,
         conn.role,
@@ -1412,16 +1789,7 @@ fn process_frames<A: Application, R>(
         publish_rec,
         #[cfg(feature = "tick-to-trade")]
         ingest_rec,
-    );
-
-    // Every answer the reader decides on, a busy for a full ring among
-    // them, goes to the response stage through the early-reply queue: the
-    // response stage owns all egress on a client socket, so no reader-side
-    // send can land between the two halves of a partially flushed reply.
-    match action {
-        FrameAction::Continue => false,
-        FrameAction::Disconnect => true,
-    }
+    )
 }
 
 #[cfg(test)]
@@ -1648,10 +2016,9 @@ mod tests {
             key_hash: 0xC0FFEE_u64,
             fd: server_side.as_raw_fd(),
             _reader: server_side,
-            parse_buf: Vec::with_capacity(64),
-            multishot_active: false,
+            ingress: ClientIngress::new(Vec::with_capacity(64)),
+            recv: RecvState::Idle,
             last_activity: Instant::now(),
-            dying: false,
         };
 
         let (producer, mut consumers) =
@@ -1673,17 +2040,17 @@ mod tests {
     /// features are on so the call compiles in every `cargo test`
     /// configuration.
     ///
-    /// Returns the disconnect flag plus every early reply the call queued:
+    /// Returns the call's outcome plus every early reply the call queued:
     /// a busy goes to the response stage through the early-reply queue,
     /// never as reader-side socket bytes, so busy assertions read the
     /// queue, not the peer.
     fn run_process_frames(
         conn: &mut ConnectionEntry<UnixStream>,
         producer: &mut ring::Producer<InputSlot<TestEvent>>,
-    ) -> (bool, Vec<EarlyReply<TestReport>>) {
+    ) -> (FrameAction, Vec<EarlyReply<TestReport>>) {
         let (mut early, mut queue) = early_channel();
-        let disconnect = run_process_frames_with(conn, producer, &gate(None, false), &mut early);
-        (disconnect, released(&mut queue))
+        let action = run_process_frames_with(conn, producer, &gate(None, false), &mut early);
+        (action, released(&mut queue))
     }
 
     /// Every early reply visible on `queue`, oldest first: what the
@@ -1861,12 +2228,22 @@ mod tests {
         (handle, consumer, control)
     }
 
-    /// An early-reply queue.
+    /// An early-reply queue, at a node's capacity.
     fn early_channel() -> (
         EarlyReplySender<TestReport>,
         crate::halt::EarlyReplyQueue<TestReport>,
     ) {
-        crate::halt::early_reply_channel()
+        early_channel_of(crate::halt::EARLY_REPLY_QUEUE_CAPACITY)
+    }
+
+    /// An early-reply queue that fills at `capacity` (a power of two).
+    fn early_channel_of(
+        capacity: usize,
+    ) -> (
+        EarlyReplySender<TestReport>,
+        crate::halt::EarlyReplyQueue<TestReport>,
+    ) {
+        crate::halt::early_reply_channel(capacity)
     }
 
     /// [`run_process_frames`] against a given halt gate and early-reply
@@ -1876,7 +2253,7 @@ mod tests {
         producer: &mut ring::Producer<InputSlot<TestEvent>>,
         halt: &HaltGate,
         early: &mut EarlyReplySender<TestReport>,
-    ) -> bool {
+    ) -> FrameAction {
         #[cfg(feature = "latency-trace")]
         let mut publish_rec = melin_transport_core::trace::register_stage("test: publish");
         #[cfg(feature = "tick-to-trade")]
@@ -1935,11 +2312,15 @@ mod tests {
             mut peer,
         } = make_fixture(16);
         for byte in [0x01, 0x02, 0x03, 0x04, 0x05] {
-            conn.parse_buf.extend_from_slice(&frame(byte));
+            conn.ingress.extend_from_slice(&frame(byte));
         }
 
-        let (disconnect, early) = run_process_frames(&mut conn, &mut producer);
-        assert!(!disconnect, "no oversize frame ⇒ no disconnect");
+        let (action, early) = run_process_frames(&mut conn, &mut producer);
+        assert_eq!(
+            action,
+            FrameAction::Continue,
+            "no oversize frame ⇒ no disconnect"
+        );
 
         let events = drain(&mut consumer);
         assert_eq!(events.len(), 5, "all 5 frames must be visible");
@@ -1955,7 +2336,7 @@ mod tests {
             assert_eq!(slot.timestamp_ns, 0xDEAD_BEEF);
         }
         // Parse buffer fully consumed.
-        assert!(conn.parse_buf.is_empty());
+        assert!(conn.ingress.bytes().is_empty());
         // Every request published: nothing answered early, and the
         // reader never writes the client socket (egress belongs to the
         // response stage).
@@ -1994,10 +2375,10 @@ mod tests {
         assert_eq!(drain(&mut consumer).len(), CAPACITY, "every slot dirtied");
 
         for byte in 1..=CAPACITY as u8 {
-            conn.parse_buf.extend_from_slice(&frame(byte));
+            conn.ingress.extend_from_slice(&frame(byte));
         }
-        let (disconnect, _early) = run_process_frames(&mut conn, &mut producer);
-        assert!(!disconnect);
+        let (action, _early) = run_process_frames(&mut conn, &mut producer);
+        assert_eq!(action, FrameAction::Continue);
 
         let events = drain(&mut consumer);
         assert_eq!(events.len(), CAPACITY, "every dirtied slot reused");
@@ -2024,19 +2405,19 @@ mod tests {
         } = make_fixture(16);
         // Write, query, write, query.
         for byte in [0x01, 0xFF, 0x02, 0xFF] {
-            conn.parse_buf.extend_from_slice(&frame(byte));
+            conn.ingress.extend_from_slice(&frame(byte));
         }
         let (mut early, mut queue) = early_channel();
         let counted = Arc::new(AtomicU64::new(0));
 
-        let disconnect = run_process_frames_with(
+        let action = run_process_frames_with(
             &mut conn,
             &mut producer,
             &gate_counting_into(Some(0), false, Arc::clone(&counted)),
             &mut early,
         );
-        assert!(!disconnect);
-        assert!(conn.parse_buf.is_empty(), "every frame consumed");
+        assert_eq!(action, FrameAction::Continue);
+        assert!(conn.ingress.bytes().is_empty(), "every frame consumed");
         assert_eq!(
             refused_count(&counted),
             2,
@@ -2080,19 +2461,19 @@ mod tests {
             ..
         } = make_fixture(16);
         for byte in [0x01, 0xFF] {
-            conn.parse_buf.extend_from_slice(&frame(byte));
+            conn.ingress.extend_from_slice(&frame(byte));
         }
         let (mut early, mut queue) = early_channel();
         let counted = Arc::new(AtomicU64::new(0));
 
-        let disconnect = run_process_frames_with(
+        let action = run_process_frames_with(
             &mut conn,
             &mut producer,
             &gate_counting_into(Some(1), true, Arc::clone(&counted)),
             &mut early,
         );
 
-        assert!(disconnect, "the connection is dropped");
+        assert_eq!(action, FrameAction::Disconnect, "the connection is dropped");
         assert!(
             drain(&mut consumer).is_empty(),
             "not even the query is published"
@@ -2101,25 +2482,73 @@ mod tests {
         assert_eq!(refused_count(&counted), 0);
     }
 
-    /// An answer with nowhere to go closes its connection (interim, until
-    /// the reader parks instead): the frames before it are committed, and
-    /// nothing from the frame that met the full queue on is published or
-    /// answered. Each kind of early reply meets it the same way: a halt
-    /// refusal, a filtered and a refused request, and a busy on a full
-    /// ring.
+    /// An answer with nowhere to go parks its connection: the frames
+    /// before it are committed, nothing from the frame that met the full
+    /// queue on is published or answered, and that frame and the one behind
+    /// it stay buffered. Once the queue has room, a call with no new bytes
+    /// answers or publishes them as it would have. Each kind of early reply
+    /// meets it the same way: a halt refusal (counted once answered), a
+    /// filtered and a refused request, and a busy on a full ring, whose
+    /// shed tail survives the park, so the frame behind it is shed too
+    /// though the ring has room by then.
     #[test]
-    fn a_full_early_reply_queue_is_disconnect() {
+    fn a_full_early_reply_queue_parks_before_the_frame() {
+        let refused_as =
+            |byte: u8, kind, reason| early_reply(id_of(byte), EarlyKind::Refused { kind, reason });
+        let rejected = |byte: u8| {
+            early_reply(
+                id_of(byte),
+                EarlyKind::Rejected((TestEvent::Cmd(byte), RejectReason::ReplicaDisconnected)),
+            )
+        };
+        let cmd_3 = [JournalEvent::App(TestEvent::Cmd(0x03))];
         // (slots already taken in a two-slot ring, halted, the frame that
-        // meets the full queue)
-        for (prefill, halted, byte) in [
-            (0, true, 0x02),
-            (0, false, 0xFC),
-            (0, false, 0xFD),
-            (0, false, 0xFE),
+        // meets the full queue, what the call after the park answers, and
+        // publishes)
+        type Case<'a> = (
+            usize,
+            bool,
+            u8,
+            Vec<EarlyReply<TestReport>>,
+            &'a [JournalEvent<TestEvent>],
+        );
+        let cases: [Case; 5] = [
+            (0, true, 0x02, vec![rejected(0x02), rejected(0x03)], &[]),
+            (
+                0,
+                false,
+                0xFC,
+                vec![early_reply(id_of(0xFC), EarlyKind::Filtered)],
+                &cmd_3,
+            ),
+            (
+                0,
+                false,
+                0xFD,
+                vec![refused_as(0xFD, RefusalKind::PermissionDenied, "denied")],
+                &cmd_3,
+            ),
+            (
+                0,
+                false,
+                0xFE,
+                vec![refused_as(0xFE, RefusalKind::Malformed, "bad")],
+                &cmd_3,
+            ),
             // The ring has room for the first frame only: the second is
-            // shed.
-            (1, false, 0x02),
-        ] {
+            // shed, and the third with it.
+            (
+                1,
+                false,
+                0x02,
+                vec![
+                    early_reply(id_of(0x02), EarlyKind::Busy),
+                    early_reply(id_of(0x03), EarlyKind::Busy),
+                ],
+                &[],
+            ),
+        ];
+        for (prefill, halted, byte, answers, publishes) in cases {
             let Fixture {
                 mut conn,
                 mut producer,
@@ -2130,10 +2559,10 @@ mod tests {
                 producer.publish(InputSlot::default());
             }
             // A query first, which is published even while halted.
-            conn.parse_buf.extend_from_slice(&frame(0xFF));
-            conn.parse_buf.extend_from_slice(&frame(byte));
-            conn.parse_buf.extend_from_slice(&frame(0x03));
-            let (mut early, mut queue) = early_channel();
+            conn.ingress.extend_from_slice(&frame(0xFF));
+            conn.ingress.extend_from_slice(&frame(byte));
+            conn.ingress.extend_from_slice(&frame(0x03));
+            let (mut early, mut queue) = early_channel_of(4);
             let filler = early_reply(RequestId(0), EarlyKind::Busy);
             let mut filled = 0;
             while early.try_send(filler).is_ok() {
@@ -2141,18 +2570,14 @@ mod tests {
             }
 
             let counted = Arc::new(AtomicU64::new(0));
-            let disconnect = run_process_frames_with(
-                &mut conn,
-                &mut producer,
-                &gate_counting_into(halted.then_some(0), false, Arc::clone(&counted)),
-                &mut early,
-            );
+            let halt = gate_counting_into(halted.then_some(0), false, Arc::clone(&counted));
+            let action = run_process_frames_with(&mut conn, &mut producer, &halt, &mut early);
 
-            assert!(disconnect, "byte {byte:#04x}: the connection is dropped");
+            assert_eq!(action, FrameAction::Park, "byte {byte:#04x}");
             assert_eq!(
                 refused_count(&counted),
                 0,
-                "byte {byte:#04x}: a write closed on, not answered, is not counted as refused"
+                "byte {byte:#04x}: a write parked on is not refused yet"
             );
             let published: Vec<_> = drain(&mut consumer)
                 .into_iter()
@@ -2164,6 +2589,11 @@ mod tests {
                 [JournalEvent::App(TestEvent::Query)],
                 "byte {byte:#04x}: the frame before is committed, nothing after"
             );
+            assert_eq!(
+                conn.ingress.bytes(),
+                [frame(byte), frame(0x03)].concat(),
+                "byte {byte:#04x}: the frame parked on stays, with the tail"
+            );
             let queued = released(&mut queue);
             assert_eq!(
                 queued.len(),
@@ -2171,6 +2601,24 @@ mod tests {
                 "byte {byte:#04x}: nothing more was queued"
             );
             assert!(queued.iter().all(|reply| *reply == filler));
+
+            // The queue has room again (and so does the ring): the retry
+            // takes no new bytes.
+            let action = run_process_frames_with(&mut conn, &mut producer, &halt, &mut early);
+            assert_eq!(action, FrameAction::Continue, "byte {byte:#04x}");
+            assert_eq!(released(&mut queue), answers, "byte {byte:#04x}");
+            let published: Vec<_> = drain(&mut consumer)
+                .into_iter()
+                .map(|(_, slot)| slot.event)
+                .collect();
+            assert_eq!(published, publishes, "byte {byte:#04x}");
+            assert!(conn.ingress.bytes().is_empty(), "byte {byte:#04x}");
+            assert_eq!(conn.ingress.shed_remaining(), 0, "byte {byte:#04x}");
+            assert_eq!(
+                refused_count(&counted),
+                if halted { 2 } else { 0 },
+                "byte {byte:#04x}: each refused write counted once"
+            );
         }
     }
 
@@ -2178,11 +2626,10 @@ mod tests {
     /// to the response stage by then: the queue is flushed on every way
     /// out, and nothing here flushes it after the call (`released` reads
     /// it as the stage does). One case per way out: every frame
-    /// processed, a stop at a full ring, and a close on a frame that is
-    /// not a request and on an oversized prefix, each after an answer was
-    /// staged. A close on a full queue is
-    /// `a_full_early_reply_queue_is_disconnect`, whose unflushed filler is
-    /// visible after it; a fenced node stages nothing.
+    /// processed, a shed tail answered whole, a close on a frame that is
+    /// not a request (also in the middle of a shed tail) and on an
+    /// oversized prefix, and a park (also in the middle of a shed tail),
+    /// each after an answer was staged. A fenced node stages nothing.
     #[test]
     fn every_way_out_leaves_the_early_replies_it_staged_visible() {
         let refused = |byte: u8| {
@@ -2198,49 +2645,100 @@ mod tests {
                 },
             )
         };
-        // (case, ring capacity, frames, whether it closes, what it stages)
+        let busy = |byte: u8| early_reply(id_of(byte), EarlyKind::Busy);
+        let not_a_request = tagged_frame(0x00, &[0x03; 9]);
+        // (case, ring capacity, early-reply queue capacity, frames, the
+        // outcome, what it stages)
         let cases = [
             (
                 "every frame processed",
                 16,
+                16,
                 vec![frame(0xFC), frame(0x01)],
-                false,
+                FrameAction::Continue,
                 vec![early_reply(id_of(0xFC), EarlyKind::Filtered)],
             ),
             (
                 "a full ring",
                 2,
-                vec![frame(0xFD), frame(0x01), frame(0x02), frame(0x03)],
-                false,
-                vec![refused(0xFD), early_reply(id_of(0x03), EarlyKind::Busy)],
+                16,
+                vec![
+                    frame(0xFD),
+                    frame(0x01),
+                    frame(0x02),
+                    frame(0x03),
+                    frame(0x04),
+                ],
+                FrameAction::Continue,
+                vec![refused(0xFD), busy(0x03), busy(0x04)],
             ),
             (
                 "a frame that is not a request",
                 16,
-                vec![frame(0xFE), tagged_frame(0x00, &[0x03; 9])],
-                true,
+                16,
+                vec![frame(0xFE), not_a_request.clone()],
+                FrameAction::Disconnect,
                 vec![refused(0xFE)],
+            ),
+            (
+                "a frame that is not a request, in a shed tail",
+                2,
+                16,
+                vec![
+                    frame(0x01),
+                    frame(0x02),
+                    frame(0x03),
+                    not_a_request,
+                    frame(0x04),
+                ],
+                FrameAction::Disconnect,
+                vec![busy(0x03)],
             ),
             (
                 "an oversized prefix",
                 16,
+                16,
                 vec![frame(0xFC), oversize_prefix().to_vec()],
-                true,
+                FrameAction::Disconnect,
                 vec![early_reply(id_of(0xFC), EarlyKind::Filtered)],
             ),
+            (
+                "a park",
+                16,
+                2,
+                vec![frame(0xFC), frame(0xFE), frame(0xFD)],
+                FrameAction::Park,
+                vec![early_reply(id_of(0xFC), EarlyKind::Filtered), refused(0xFE)],
+            ),
+            (
+                "a park in a shed tail",
+                2,
+                2,
+                vec![
+                    frame(0x01),
+                    frame(0x02),
+                    frame(0x03),
+                    frame(0x04),
+                    frame(0x05),
+                ],
+                FrameAction::Park,
+                vec![busy(0x03), busy(0x04)],
+            ),
         ];
-        for (case, capacity, frames, closes, expected) in cases {
+        for (case, ring_capacity, queue_capacity, frames, outcome, expected) in cases {
             let Fixture {
                 mut conn,
                 mut producer,
                 ..
-            } = make_fixture(capacity);
+            } = make_fixture(ring_capacity);
             for frame in frames {
-                conn.parse_buf.extend_from_slice(&frame);
+                conn.ingress.extend_from_slice(&frame);
             }
-            let (disconnect, early) = run_process_frames(&mut conn, &mut producer);
-            assert_eq!(disconnect, closes, "{case}");
-            assert_eq!(early, expected, "{case}");
+            let (mut early, mut queue) = early_channel_of(queue_capacity);
+            let action =
+                run_process_frames_with(&mut conn, &mut producer, &gate(None, false), &mut early);
+            assert_eq!(action, outcome, "{case}");
+            assert_eq!(released(&mut queue), expected, "{case}");
         }
     }
 
@@ -2261,7 +2759,7 @@ mod tests {
             ..
         } = make_fixture(16);
         for byte in [0x01, 0x02, 0x03, 0x04] {
-            conn.parse_buf.extend_from_slice(&frame(byte));
+            conn.ingress.extend_from_slice(&frame(byte));
         }
 
         // A recognizable sentinel the caller would have captured at the
@@ -2273,7 +2771,7 @@ mod tests {
         let mut ingest_rec = melin_transport_core::trace::register_stage("test: ingest recv_ts");
 
         let (mut early, _queue) = early_channel();
-        let disconnect = process_frames::<TestApp, UnixStream>(
+        let action = process_frames::<TestApp, UnixStream>(
             &mut conn,
             &mut producer,
             &ByteDecoder,
@@ -2285,7 +2783,7 @@ mod tests {
             #[cfg(feature = "tick-to-trade")]
             &mut ingest_rec,
         );
-        assert!(!disconnect);
+        assert_eq!(action, FrameAction::Continue);
 
         let events = drain(&mut consumer);
         assert_eq!(events.len(), 4, "all frames published");
@@ -2319,11 +2817,15 @@ mod tests {
         for i in 0..EVENT_COUNT {
             // Use bytes 1..=32 (each ≤ 0xFB so ByteDecoder yields
             // `Permitted` with `TestEvent::Cmd(byte)`).
-            conn.parse_buf.extend_from_slice(&frame((i + 1) as u8));
+            conn.ingress.extend_from_slice(&frame((i + 1) as u8));
         }
 
-        let (disconnect, _early) = run_process_frames(&mut conn, &mut producer);
-        assert!(!disconnect, "no oversize / no Full ⇒ no disconnect");
+        let (action, _early) = run_process_frames(&mut conn, &mut producer);
+        assert_eq!(
+            action,
+            FrameAction::Continue,
+            "no oversize / no Full ⇒ no disconnect"
+        );
 
         let events = drain(&mut consumer);
         assert_eq!(events.len(), EVENT_COUNT, "every event visible");
@@ -2332,7 +2834,7 @@ mod tests {
             let byte = (i + 1) as u8;
             assert_eq!(slot.event, JournalEvent::App(TestEvent::Cmd(byte)));
         }
-        assert!(conn.parse_buf.is_empty());
+        assert!(conn.ingress.bytes().is_empty());
     }
 
     #[test]
@@ -2346,10 +2848,10 @@ mod tests {
             mut consumer,
             ..
         } = make_fixture(8);
-        conn.parse_buf.extend_from_slice(&frame(0xFF)); // body byte → Query
+        conn.ingress.extend_from_slice(&frame(0xFF)); // body byte → Query
 
-        let (disconnect, _early) = run_process_frames(&mut conn, &mut producer);
-        assert!(!disconnect);
+        let (action, _early) = run_process_frames(&mut conn, &mut producer);
+        assert_eq!(action, FrameAction::Continue);
 
         let events = drain(&mut consumer);
         assert_eq!(events.len(), 1);
@@ -2362,15 +2864,18 @@ mod tests {
     }
 
     #[test]
-    fn a_full_ring_queues_busy_for_the_frame_that_met_it() {
-        // Ring capacity 4 + 6 frames ⇒ first 4 commit, 5th triggers Full,
-        // 6th is never reached because the loop breaks on Full. Validates:
+    fn a_full_ring_sheds_the_frame_that_met_it_and_every_complete_frame_behind() {
+        // Ring capacity 4 + 7 frames, the last cut short ⇒ first 4 commit,
+        // the 5th triggers Full, the 6th is shed with it, the partial 7th
+        // waits. Validates:
         //   * `Err(Full)` does not roll back the prior 4.
-        //   * The frame that triggered Full is answered `Busy`, with its
-        //     ID — its bytes are compacted out of `parse_buf` along with
-        //     every earlier frame — and the connection is kept.
+        //   * The frame that triggered Full, and the complete frame behind
+        //     it, are answered `Busy`, each with its ID, without being
+        //     decoded or published, and the connection is kept.
         //   * The busy goes to the response stage through the early-reply
         //     queue, and nothing is written to the socket from here.
+        //   * A trailing partial frame is not part of the tail: it stays,
+        //     and once whole it is judged on its own.
         let Fixture {
             mut conn,
             mut producer,
@@ -2378,11 +2883,17 @@ mod tests {
             mut peer,
         } = make_fixture(4);
         for byte in [0x01, 0x02, 0x03, 0x04, 0x05, 0x06] {
-            conn.parse_buf.extend_from_slice(&frame(byte));
+            conn.ingress.extend_from_slice(&frame(byte));
         }
+        let partial = frame(0x07);
+        conn.ingress.extend_from_slice(&partial[..5]);
 
-        let (disconnect, early) = run_process_frames(&mut conn, &mut producer);
-        assert!(!disconnect, "Full does not drop the connection");
+        let (action, early) = run_process_frames(&mut conn, &mut producer);
+        assert_eq!(
+            action,
+            FrameAction::Continue,
+            "Full does not drop the connection"
+        );
 
         let events = drain(&mut consumer);
         assert_eq!(
@@ -2400,22 +2911,30 @@ mod tests {
         // (audit review F3).
         assert_eq!(
             early,
-            [early_reply(id_of(0x05), EarlyKind::Busy)],
-            "exactly one busy, for the frame that met the full ring"
+            [
+                early_reply(id_of(0x05), EarlyKind::Busy),
+                early_reply(id_of(0x06), EarlyKind::Busy),
+            ],
+            "a busy for the frame that met the full ring, and for the one behind"
         );
         assert!(
             !peer_got_bytes(&mut peer),
             "reader must never write the client socket"
         );
 
-        // The 6th frame is never inspected because the loop broke (an
-        // interim: it waits for the client's next bytes). Compaction
-        // shifts the unprocessed tail to the front.
-        assert_eq!(
-            conn.parse_buf,
-            frame(0x06),
-            "the 6th frame remains in parse_buf for the next recv-cycle"
-        );
+        // Only the partial frame is left, outside any tail.
+        assert_eq!(conn.ingress.bytes(), &partial[..5]);
+        assert_eq!(conn.ingress.shed_remaining(), 0);
+
+        // The ring has room again (drained above) and the 7th completes:
+        // published, as a request on a later receive is.
+        conn.ingress.extend_from_slice(&partial[5..]);
+        let (action, early) = run_process_frames(&mut conn, &mut producer);
+        assert_eq!(action, FrameAction::Continue);
+        assert!(early.is_empty(), "{early:?}");
+        let events = drain(&mut consumer);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].1.event, JournalEvent::App(TestEvent::Cmd(0x07)));
     }
 
     /// Regression for the 2026-08 io_uring audit, finding 2 and review
@@ -2461,12 +2980,12 @@ mod tests {
         }
 
         // Capacity 2 + 3 frames ⇒ the third triggers Full ⇒ ServerBusy.
-        conn.parse_buf.extend_from_slice(&frame(0x01));
-        conn.parse_buf.extend_from_slice(&frame(0x02));
-        conn.parse_buf.extend_from_slice(&frame(0x03));
+        conn.ingress.extend_from_slice(&frame(0x01));
+        conn.ingress.extend_from_slice(&frame(0x02));
+        conn.ingress.extend_from_slice(&frame(0x03));
 
         let start = std::time::Instant::now();
-        let (disconnect, early) = run_process_frames(&mut conn, &mut producer);
+        let (action, early) = run_process_frames(&mut conn, &mut producer);
         // Generous bound to stay unflaky under CI load — the fixed path
         // returns in microseconds, the broken one only when the peer
         // reads (here: never).
@@ -2474,7 +2993,11 @@ mod tests {
             start.elapsed() < Duration::from_secs(1),
             "pipeline-full path blocked on a full socket"
         );
-        assert!(!disconnect, "Full does not drop the connection");
+        assert_eq!(
+            action,
+            FrameAction::Continue,
+            "Full does not drop the connection"
+        );
         assert_eq!(
             drain(&mut consumer).len(),
             2,
@@ -2514,12 +3037,16 @@ mod tests {
             mut consumer,
             mut peer,
         } = make_fixture(16);
-        conn.parse_buf.extend_from_slice(&frame(0x01));
-        conn.parse_buf.extend_from_slice(&frame(0x02));
-        conn.parse_buf.extend_from_slice(&oversize_prefix());
+        conn.ingress.extend_from_slice(&frame(0x01));
+        conn.ingress.extend_from_slice(&frame(0x02));
+        conn.ingress.extend_from_slice(&oversize_prefix());
 
-        let (disconnect, early) = run_process_frames(&mut conn, &mut producer);
-        assert!(disconnect, "oversize frame must request disconnect");
+        let (action, early) = run_process_frames(&mut conn, &mut producer);
+        assert_eq!(
+            action,
+            FrameAction::Disconnect,
+            "oversize frame must request disconnect"
+        );
 
         let events = drain(&mut consumer);
         assert_eq!(
@@ -2551,12 +3078,16 @@ mod tests {
             ..
         } = make_fixture(16);
         for byte in [0x01, 0xFC, 0xFD, 0xFE, 0x02] {
-            conn.parse_buf.extend_from_slice(&frame(byte));
+            conn.ingress.extend_from_slice(&frame(byte));
         }
-        conn.parse_buf.extend_from_slice(&request_frame(99, b""));
+        conn.ingress.extend_from_slice(&request_frame(99, b""));
 
-        let (disconnect, early) = run_process_frames(&mut conn, &mut producer);
-        assert!(!disconnect, "a refused request keeps the connection");
+        let (action, early) = run_process_frames(&mut conn, &mut producer);
+        assert_eq!(
+            action,
+            FrameAction::Continue,
+            "a refused request keeps the connection"
+        );
 
         let events = drain(&mut consumer);
         assert_eq!(events.len(), 2);
@@ -2590,7 +3121,7 @@ mod tests {
             ]
         );
         assert!(
-            conn.parse_buf.is_empty(),
+            conn.ingress.bytes().is_empty(),
             "all bytes advanced past compaction"
         );
     }
@@ -2631,13 +3162,17 @@ mod tests {
                 mut consumer,
                 ..
             } = make_fixture(16);
-            conn.parse_buf.extend_from_slice(&frame(0x01));
-            conn.parse_buf.extend_from_slice(&frame(0xFC));
-            conn.parse_buf.extend_from_slice(&bad);
-            conn.parse_buf.extend_from_slice(&frame(0x02));
+            conn.ingress.extend_from_slice(&frame(0x01));
+            conn.ingress.extend_from_slice(&frame(0xFC));
+            conn.ingress.extend_from_slice(&bad);
+            conn.ingress.extend_from_slice(&frame(0x02));
 
-            let (disconnect, early) = run_process_frames(&mut conn, &mut producer);
-            assert!(disconnect, "{bad:?} must close the connection");
+            let (action, early) = run_process_frames(&mut conn, &mut producer);
+            assert_eq!(
+                action,
+                FrameAction::Disconnect,
+                "{bad:?} must close the connection"
+            );
 
             let events = drain(&mut consumer);
             assert_eq!(events.len(), 1, "{bad:?}");
@@ -2658,21 +3193,21 @@ mod tests {
             mut consumer,
             ..
         } = make_fixture(16);
-        conn.parse_buf.extend_from_slice(&frame(0x42));
+        conn.ingress.extend_from_slice(&frame(0x42));
         // Three of four length-prefix bytes — not even a length to judge
         // yet, so the loop breaks before consuming anything from the
         // partial.
-        conn.parse_buf.extend_from_slice(&[0xDE, 0xAD, 0xBE]);
+        conn.ingress.extend_from_slice(&[0xDE, 0xAD, 0xBE]);
 
-        let (disconnect, _early) = run_process_frames(&mut conn, &mut producer);
-        assert!(!disconnect);
+        let (action, _early) = run_process_frames(&mut conn, &mut producer);
+        assert_eq!(action, FrameAction::Continue);
 
         let events = drain(&mut consumer);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].1.event, JournalEvent::App(TestEvent::Cmd(0x42)));
         assert_eq!(
-            conn.parse_buf,
-            vec![0xDE, 0xAD, 0xBE],
+            conn.ingress.bytes(),
+            [0xDE, 0xAD, 0xBE],
             "partial length prefix preserved for next recv-cycle"
         );
     }
@@ -2695,26 +3230,34 @@ mod tests {
         assert_eq!(at_limit.len(), 4 + MAX_FRAME_SIZE);
 
         // The prefix and part of the payload: kept, not judged oversized.
-        conn.parse_buf.extend_from_slice(&at_limit[..4 + 1]);
-        let (disconnect, _early) = run_process_frames(&mut conn, &mut producer);
-        assert!(!disconnect, "a frame at the limit is not oversized");
-        assert_eq!(conn.parse_buf, at_limit[..4 + 1]);
+        conn.ingress.extend_from_slice(&at_limit[..4 + 1]);
+        let (action, _early) = run_process_frames(&mut conn, &mut producer);
+        assert_eq!(
+            action,
+            FrameAction::Continue,
+            "a frame at the limit is not oversized"
+        );
+        assert_eq!(conn.ingress.bytes(), &at_limit[..4 + 1]);
         assert!(drain(&mut consumer).is_empty());
 
         // The rest of it arrives: published, buffer drained.
-        conn.parse_buf.extend_from_slice(&at_limit[4 + 1..]);
-        let (disconnect, _early) = run_process_frames(&mut conn, &mut producer);
-        assert!(!disconnect);
+        conn.ingress.extend_from_slice(&at_limit[4 + 1..]);
+        let (action, _early) = run_process_frames(&mut conn, &mut producer);
+        assert_eq!(action, FrameAction::Continue);
         let events = drain(&mut consumer);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].1.event, JournalEvent::App(TestEvent::Cmd(0x2A)));
         assert_eq!(events[0].1.request_id, RequestId(5));
-        assert!(conn.parse_buf.is_empty());
+        assert!(conn.ingress.bytes().is_empty());
 
         // One byte more, announced by a prefix alone: dropped at once.
-        conn.parse_buf.extend_from_slice(&oversize_prefix());
-        let (disconnect, _early) = run_process_frames(&mut conn, &mut producer);
-        assert!(disconnect, "oversize prefix alone must request disconnect");
+        conn.ingress.extend_from_slice(&oversize_prefix());
+        let (action, _early) = run_process_frames(&mut conn, &mut producer);
+        assert_eq!(
+            action,
+            FrameAction::Disconnect,
+            "oversize prefix alone must request disconnect"
+        );
         assert!(drain(&mut consumer).is_empty());
     }
 
@@ -2729,12 +3272,398 @@ mod tests {
             mut peer,
         } = make_fixture(4);
 
-        let (disconnect, early) = run_process_frames(&mut conn, &mut producer);
-        assert!(!disconnect);
+        let (action, early) = run_process_frames(&mut conn, &mut producer);
+        assert_eq!(action, FrameAction::Continue);
         assert_eq!(drain(&mut consumer).len(), 0);
-        assert!(conn.parse_buf.is_empty());
+        assert!(conn.ingress.bytes().is_empty());
         assert!(early.is_empty());
         assert!(!peer_got_bytes(&mut peer));
+    }
+
+    /// The shedding and parking rules over random streams of requests of
+    /// every decoder outcome, split into random receives, through a ring
+    /// and an early-reply queue of random small sizes that the "pipeline"
+    /// drains at random. A receive arrives only once the previous call did
+    /// not park; a park is followed by a retry with no new bytes once the
+    /// queue was drained, as the reader's retry is.
+    mod shedding {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// The body bytes [`ByteDecoder`] maps to each outcome: commands,
+        /// a filtered one, a denied one, a malformed one, a query.
+        fn body() -> impl Strategy<Value = u8> {
+            prop_oneof![1u8..=8, Just(0xFC), Just(0xFD), Just(0xFE), Just(0xFF)]
+        }
+
+        prop_compose! {
+            fn script()(
+                bodies in prop::collection::vec(body(), 1..40),
+                ring_capacity in prop_oneof![Just(2usize), Just(4), Just(8)],
+                queue_capacity in prop_oneof![Just(2usize), Just(4)],
+            )(
+                cuts in prop::collection::vec(0..bodies.len() * 14 + 1, 0..12),
+                drains in prop::collection::vec((0usize..4, any::<bool>()), 64),
+                bodies in Just(bodies),
+                ring_capacity in Just(ring_capacity),
+                queue_capacity in Just(queue_capacity),
+            ) -> (Vec<u8>, Vec<usize>, Vec<(usize, bool)>, usize, usize) {
+                (bodies, cuts, drains, ring_capacity, queue_capacity)
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+            #[test]
+            fn every_request_is_published_or_answered_once_and_a_shed_tail_whole(
+                (bodies, mut cuts, drains, ring_capacity, queue_capacity) in script()
+            ) {
+                // Request `i` carries ID `i`; every frame is 14 bytes.
+                let frames: Vec<Vec<u8>> = bodies
+                    .iter()
+                    .enumerate()
+                    .map(|(i, body)| request_frame(i as u64, &[*body]))
+                    .collect();
+                let stream = frames.concat();
+                cuts.push(0);
+                cuts.push(stream.len());
+                cuts.sort_unstable();
+                cuts.dedup();
+
+                let Fixture { mut conn, mut producer, mut consumer, .. } =
+                    make_fixture(ring_capacity);
+                let (mut early, mut queue) = early_channel_of(queue_capacity);
+                let halt = gate(None, false);
+                let mut published: Vec<u64> = Vec::new();
+                let mut answered: Vec<EarlyReply<TestReport>> = Vec::new();
+                // Per receive (an episode: the call after it and the
+                // retries of its parks), how many frames were complete.
+                let mut episodes: Vec<usize> = Vec::new();
+                let mut drains = drains.into_iter().cycle();
+                let mut take = |consumer: &mut ring::Consumer<InputSlot<TestEvent>>,
+                                queue: &mut crate::halt::EarlyReplyQueue<TestReport>,
+                                published: &mut Vec<u64>,
+                                answered: &mut Vec<EarlyReply<TestReport>>,
+                                all: bool| {
+                    let (events, replies) = drains.next().expect("cycled");
+                    for _ in 0..if all { usize::MAX } else { events } {
+                        let Some((_, slot)) = consumer.try_consume() else { break };
+                        published.push(slot.request_id.0);
+                    }
+                    if all || replies {
+                        answered.extend(released(queue));
+                    }
+                };
+
+                let mut receives = cuts.windows(2).map(|w| &stream[w[0]..w[1]]);
+                let mut action = FrameAction::Continue;
+                loop {
+                    if action == FrameAction::Park {
+                        // The response stage drains the queue; the retry
+                        // brings no new bytes.
+                        answered.extend(released(&mut queue));
+                    } else if let Some(bytes) = receives.next() {
+                        conn.ingress.extend_from_slice(bytes);
+                        let received = stream.len() - receives.clone().map(<[u8]>::len).sum::<usize>();
+                        episodes.push(received / frames[0].len());
+                    } else {
+                        break;
+                    }
+                    action = run_process_frames_with(&mut conn, &mut producer, &halt, &mut early);
+                    prop_assert_ne!(action, FrameAction::Disconnect);
+                    take(&mut consumer, &mut queue, &mut published, &mut answered, false);
+                }
+                take(&mut consumer, &mut queue, &mut published, &mut answered, true);
+                prop_assert!(conn.ingress.bytes().is_empty());
+                prop_assert_eq!(conn.ingress.shed_remaining(), 0);
+
+                // Every request exactly once: published, or answered as its
+                // decoder outcome says, or busy.
+                let mut seen: Vec<u64> = published.clone();
+                seen.extend(answered.iter().map(|reply| reply.request_id.0));
+                seen.sort_unstable();
+                prop_assert_eq!(seen, (0..bodies.len() as u64).collect::<Vec<_>>());
+                for id in &published {
+                    let body = bodies[*id as usize];
+                    prop_assert!(body <= 8 || body == 0xFF, "published {body:#04x}");
+                }
+                let mut busy: Vec<u64> = Vec::new();
+                for reply in &answered {
+                    let body = bodies[reply.request_id.0 as usize];
+                    match reply.kind {
+                        EarlyKind::Busy => busy.push(reply.request_id.0),
+                        EarlyKind::Filtered => prop_assert_eq!(body, 0xFC),
+                        EarlyKind::Refused { kind: RefusalKind::PermissionDenied, .. } => {
+                            prop_assert_eq!(body, 0xFD)
+                        }
+                        EarlyKind::Refused { kind: RefusalKind::Malformed, .. } => {
+                            prop_assert_eq!(body, 0xFE)
+                        }
+                        EarlyKind::Rejected(_) => prop_assert!(false, "not halted"),
+                    }
+                }
+                // A request is answered in the first episode in which it
+                // was complete (an episode ends only once every complete
+                // frame is processed), and a shed request takes every
+                // complete frame behind it then: busy too, never
+                // published, never decoded.
+                for &k in &busy {
+                    let complete = episodes
+                        .iter()
+                        .copied()
+                        .find(|&complete| complete > k as usize)
+                        .expect("answered once complete");
+                    for j in k + 1..complete as u64 {
+                        prop_assert!(
+                            busy.contains(&j),
+                            "request {j} was in the tail shed at {k}, \
+                             {complete} complete: {busy:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every way a connection's receive state can change, against the
+    /// CQEs the kernel can post and the outcomes a buffer can have: a park
+    /// cancels an armed receive, a parked connection keeps the bytes that
+    /// land before the cancel and is never re-armed while a cancel is in
+    /// flight, a teardown issues no second cancel, and a dying connection
+    /// is freed only on its terminal CQE.
+    mod recv_state {
+        use super::super::{
+            CqeStep, FrameAction, FramesStep, RecvCompletion, RecvState, TeardownStep,
+        };
+        use std::time::{Duration, Instant};
+
+        const DATA: RecvCompletion = RecvCompletion::Data;
+        const EMPTY: RecvCompletion = RecvCompletion::Empty;
+        const CLOSED: RecvCompletion = RecvCompletion::Closed;
+
+        fn parked(cancelling: bool, since: Instant) -> RecvState {
+            RecvState::Parked { cancelling, since }
+        }
+
+        /// The normal path: data on an armed receive is processed; its
+        /// end, with or without data, re-arms it once processed, and an
+        /// empty end (a dry pool) re-arms at once.
+        #[test]
+        fn an_armed_receive_is_processed_and_re_armed_when_it_ends() {
+            let now = Instant::now();
+            assert_eq!(
+                RecvState::Armed.on_cqe(DATA, false),
+                (RecvState::Armed, CqeStep::Process)
+            );
+            assert_eq!(
+                RecvState::Armed.on_cqe(DATA, true),
+                (RecvState::Idle, CqeStep::Process)
+            );
+            assert_eq!(
+                RecvState::Idle.after_frames(FrameAction::Continue, now),
+                (RecvState::Armed, FramesStep::Arm)
+            );
+            assert_eq!(
+                RecvState::Armed.after_frames(FrameAction::Continue, now),
+                (RecvState::Armed, FramesStep::Nothing)
+            );
+            assert_eq!(
+                RecvState::Armed.on_cqe(EMPTY, true),
+                (RecvState::Armed, CqeStep::Arm)
+            );
+            assert_eq!(
+                RecvState::Armed.on_cqe(EMPTY, false),
+                (RecvState::Armed, CqeStep::Nothing)
+            );
+            assert_eq!(
+                RecvState::Armed.on_cqe(CLOSED, true),
+                (RecvState::Idle, CqeStep::Remove)
+            );
+            // Nothing was armed: an end changes nothing, and one with no
+            // bytes arms a receive.
+            assert_eq!(RecvState::Idle.after_terminal(), RecvState::Idle);
+            assert_eq!(RecvState::Dying.after_terminal(), RecvState::Dying);
+            assert_eq!(
+                RecvState::Idle.on_cqe(EMPTY, true),
+                (RecvState::Armed, CqeStep::Arm)
+            );
+        }
+
+        /// A park on an armed receive cancels it; bytes landing before the
+        /// cancel's terminal CQE are kept, not processed; the terminal CQE
+        /// (the cancel's, or an end of the receive's own) leaves it parked
+        /// with nothing owed and does not re-arm; a retry that processes
+        /// the buffer re-arms it.
+        #[test]
+        fn a_park_cancels_keeps_late_bytes_and_re_arms_on_resume() {
+            let since = Instant::now();
+            let later = since + std::time::Duration::from_secs(5);
+            assert_eq!(
+                RecvState::Armed.after_frames(FrameAction::Park, since),
+                (parked(true, since), FramesStep::Cancel)
+            );
+            assert_eq!(
+                parked(true, since).on_cqe(DATA, false),
+                (parked(true, since), CqeStep::Keep)
+            );
+            assert_eq!(
+                parked(true, since).on_cqe(DATA, true),
+                (parked(false, since), CqeStep::Keep)
+            );
+            assert_eq!(
+                parked(true, since).on_cqe(EMPTY, true),
+                (parked(false, since), CqeStep::Nothing),
+                "no re-arm while parked"
+            );
+            assert_eq!(
+                parked(true, since).on_cqe(EMPTY, false),
+                (parked(true, since), CqeStep::Nothing)
+            );
+            // Parked again by a retry: still parked since it first did.
+            assert_eq!(
+                parked(false, since).after_frames(FrameAction::Park, later),
+                (parked(false, since), FramesStep::Nothing)
+            );
+            assert_eq!(
+                parked(false, since).after_frames(FrameAction::Continue, later),
+                (RecvState::Armed, FramesStep::Arm)
+            );
+            // A park on a receive already ended needs no cancel.
+            assert_eq!(
+                RecvState::Idle.after_frames(FrameAction::Park, since),
+                (parked(false, since), FramesStep::Nothing)
+            );
+        }
+
+        /// A retry that processes the buffer before the cancel's terminal
+        /// CQE arms nothing: the connection resumes on that CQE, and the
+        /// bytes that land before it are processed, as the connection is
+        /// no longer parked. Parking again there needs no second cancel.
+        #[test]
+        fn a_resume_before_the_cancel_lands_arms_on_its_terminal_cqe() {
+            let since = Instant::now();
+            assert_eq!(
+                parked(true, since).after_frames(FrameAction::Continue, since),
+                (RecvState::Resuming, FramesStep::Nothing)
+            );
+            assert_eq!(
+                RecvState::Resuming.on_cqe(DATA, false),
+                (RecvState::Resuming, CqeStep::Process)
+            );
+            assert_eq!(
+                RecvState::Resuming.after_frames(FrameAction::Continue, since),
+                (RecvState::Resuming, FramesStep::Nothing)
+            );
+            assert_eq!(
+                RecvState::Resuming.on_cqe(EMPTY, true),
+                (RecvState::Armed, CqeStep::Arm)
+            );
+            assert_eq!(
+                RecvState::Resuming.on_cqe(DATA, true),
+                (RecvState::Idle, CqeStep::Process)
+            );
+            assert_eq!(
+                RecvState::Resuming.after_frames(FrameAction::Park, since),
+                (parked(true, since), FramesStep::Nothing)
+            );
+        }
+
+        /// Teardown by state: an armed receive is cancelled; a cancel in
+        /// flight (a park's, or a resume's) is awaited, never doubled;
+        /// nothing owed frees at once; a second teardown does nothing.
+        /// A dying connection discards its CQEs and is freed on the
+        /// terminal one only. A connection whose peer closes while parked
+        /// is removed.
+        #[test]
+        fn teardown_cancels_once_and_frees_once() {
+            let since = Instant::now();
+            assert_eq!(
+                RecvState::Armed.on_teardown(),
+                (RecvState::Dying, TeardownStep::Cancel)
+            );
+            for cancelling in [parked(true, since), RecvState::Resuming] {
+                assert_eq!(
+                    cancelling.on_teardown(),
+                    (RecvState::Dying, TeardownStep::AwaitCancel),
+                    "{cancelling:?}"
+                );
+            }
+            for owed_nothing in [parked(false, since), RecvState::Idle] {
+                assert_eq!(
+                    owed_nothing.on_teardown(),
+                    (owed_nothing, TeardownStep::FreeNow),
+                    "{owed_nothing:?}"
+                );
+            }
+            assert_eq!(
+                RecvState::Dying.on_teardown(),
+                (RecvState::Dying, TeardownStep::AlreadyDying)
+            );
+            for completion in [DATA, EMPTY, CLOSED] {
+                assert_eq!(
+                    RecvState::Dying.on_cqe(completion, false),
+                    (RecvState::Dying, CqeStep::Discard { free: false })
+                );
+                assert_eq!(
+                    RecvState::Dying.on_cqe(completion, true),
+                    (RecvState::Dying, CqeStep::Discard { free: true })
+                );
+            }
+            assert_eq!(parked(true, since).on_cqe(CLOSED, true).1, CqeStep::Remove);
+            // A buffer that closes the connection tears it down, whatever
+            // the state.
+            for state in [
+                RecvState::Armed,
+                RecvState::Idle,
+                RecvState::Resuming,
+                parked(true, since),
+            ] {
+                assert_eq!(
+                    state.after_frames(FrameAction::Disconnect, since),
+                    (state, FramesStep::Teardown)
+                );
+            }
+        }
+
+        /// Only a park whose cancel is still in flight past the deadline
+        /// counts as unhonoured: not one at the deadline, not one whose
+        /// cancel has landed however long it has been parked, and no
+        /// other state.
+        #[test]
+        fn only_a_park_cancel_in_flight_past_the_deadline_is_overdue() {
+            let since = Instant::now();
+            let past = since + super::super::PARK_CANCEL_DEADLINE + Duration::from_nanos(1);
+            let at = since + super::super::PARK_CANCEL_DEADLINE;
+            assert!(parked(true, since).park_cancel_overdue(past));
+            assert!(!parked(true, since).park_cancel_overdue(at));
+            assert!(!parked(true, since).park_cancel_overdue(since));
+            for state in [
+                parked(false, since),
+                RecvState::Armed,
+                RecvState::Idle,
+                RecvState::Resuming,
+                RecvState::Dying,
+            ] {
+                assert!(!state.park_cancel_overdue(past), "{state:?}");
+            }
+        }
+
+        /// What the shutdown quiesce waits for: a CQE the kernel owes.
+        #[test]
+        fn the_kernel_owes_a_cqe_while_a_receive_or_a_cancel_is_in_flight() {
+            let since = Instant::now();
+            for owed in [
+                RecvState::Armed,
+                RecvState::Resuming,
+                RecvState::Dying,
+                parked(true, since),
+            ] {
+                assert!(owed.kernel_owes_cqe(), "{owed:?}");
+            }
+            for free in [RecvState::Idle, parked(false, since)] {
+                assert!(!free.kernel_owes_cqe(), "{free:?}");
+            }
+        }
     }
 
     /// End-to-end soak through the real reader loop: 4 connections
@@ -3082,6 +4011,416 @@ mod tests {
         let _b = b_writer.join().expect("B writer");
         handle.shutdown();
         handle.join();
+    }
+
+    /// Parking through the real reader loop, on a real io_uring over
+    /// socket pairs: a small input ring the test drains (or not), and an
+    /// early-reply queue of capacity 2 that the test drains in the
+    /// response stage's place, so it fills on demand. Filtered requests
+    /// (`0xFC`) are the early replies that fill it.
+    mod parking {
+        use super::*;
+        use crate::halt::EarlyReplyQueue;
+        use melin_transport_core::fence::FenceState;
+        use std::io::Write as _;
+
+        const FILTERED: u8 = 0xFC;
+
+        /// A running reader, the ends the test plays the pipeline with,
+        /// and its client connections.
+        struct Rig {
+            handle: UringReaderHandle<UnixStream>,
+            consumer: ring::Consumer<InputSlot<TestEvent>>,
+            queue: EarlyReplyQueue<TestReport>,
+            control_rx: mpsc::Receiver<ControlEvent>,
+            fence: Arc<FenceState>,
+        }
+
+        impl Rig {
+            /// A reader over an input ring of `ring_capacity` and a
+            /// two-entry early-reply queue, with `connection_timeout`.
+            fn start(ring_capacity: usize, connection_timeout: Option<Duration>) -> Self {
+                let (producer, mut consumers) =
+                    DisruptorBuilder::<InputSlot<TestEvent>>::new(ring_capacity)
+                        .add_consumer()
+                        .build(melin_pipeline::wait::WaitStrategy::SpinThenYield);
+                let consumer = consumers.pop().expect("consumer");
+                let (control_tx, control_rx) = mpsc::channel();
+                let fence = Arc::new(FenceState::new(0));
+                let halt = HaltGate::new(None, Arc::clone(&fence), Arc::new(AtomicU64::new(0)));
+                let (early, queue) = early_channel_of(2);
+                let handle = spawn_reader::<TestApp, UnixStream>(
+                    producer,
+                    Arc::new(ByteDecoder),
+                    halt,
+                    early,
+                    policy_claim(),
+                    control_tx,
+                    0,
+                    connection_timeout,
+                    None,
+                    RingSizing::for_max_connections(4).expect("a supported cap"),
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .expect("the reader starts");
+                Rig {
+                    handle,
+                    consumer,
+                    queue,
+                    control_rx,
+                    fence,
+                }
+            }
+
+            /// Register connection `id`; returns the client's end and a
+            /// second handle on the server's end (the response stage's
+            /// dup, in a node).
+            fn connect(&mut self, id: u64) -> (UnixStream, UnixStream) {
+                let (client, server_side) = UnixStream::pair().expect("socketpair");
+                let dup = server_side.try_clone().expect("dup");
+                self.handle.register(ReaderRegistration {
+                    connection_id: ConnectionId(id),
+                    reader: server_side,
+                    addr: "127.0.0.1:1".parse().expect("addr"),
+                    role: ClientRole::Operator,
+                    key_hash: id,
+                });
+                (client, dup)
+            }
+
+            /// Every early reply queued so far, as the response stage
+            /// would take them: making room in the queue.
+            fn take_replies(&mut self) -> Vec<EarlyReply<TestReport>> {
+                released(&mut self.queue)
+            }
+
+            /// Every request published so far, by ID.
+            fn take_published(&mut self) -> Vec<RequestId> {
+                drain(&mut self.consumer)
+                    .into_iter()
+                    .map(|(_, slot)| slot.request_id)
+                    .collect()
+            }
+
+            /// Wait until `done` holds of what was published and answered
+            /// so far (accumulated into the two vectors), taking both as
+            /// the pipeline would; panics after ten seconds.
+            fn wait_for(
+                &mut self,
+                published: &mut Vec<RequestId>,
+                replies: &mut Vec<EarlyReply<TestReport>>,
+                done: impl Fn(&[RequestId], &[EarlyReply<TestReport>]) -> bool,
+            ) {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    published.extend(self.take_published());
+                    replies.extend(self.take_replies());
+                    if done(published, replies) {
+                        return;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "stalled: published {published:?}, answered {replies:?}"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+
+            /// The `Disconnected` events sent so far, by connection.
+            fn disconnects(&self) -> Vec<u64> {
+                self.control_rx
+                    .try_iter()
+                    .map(|event| match event {
+                        ControlEvent::Disconnected { connection_id } => connection_id,
+                        ControlEvent::Connected { .. } => {
+                            unreachable!("the reader never sends Connected")
+                        }
+                    })
+                    .collect()
+            }
+
+            fn stop(self) {
+                self.handle.shutdown();
+                self.handle.join();
+            }
+        }
+
+        /// What every test's connection writes: three filtered requests,
+        /// the third of which parks it (two fill the queue), then five
+        /// writes, in one burst.
+        fn burst() -> Vec<u8> {
+            let mut bytes = Vec::new();
+            for id in 1..=3 {
+                bytes.extend(request_frame(id, &[FILTERED]));
+            }
+            for id in 4..=8 {
+                bytes.extend(request_frame(id, &[0x01]));
+            }
+            bytes
+        }
+
+        fn filtered_ids(replies: &[EarlyReply<TestReport>]) -> Vec<RequestId> {
+            replies
+                .iter()
+                .map(|reply| {
+                    assert_eq!(reply.kind, EarlyKind::Filtered, "{reply:?}");
+                    reply.request_id
+                })
+                .collect()
+        }
+
+        /// Park the connection: write the burst, give the reader time to
+        /// answer the first two (left in the queue, which they fill) and
+        /// park on the third, and check that nothing behind it was
+        /// published.
+        fn park(rig: &mut Rig, client: &mut UnixStream) {
+            client.write_all(&burst()).expect("client write");
+            std::thread::sleep(Duration::from_millis(100));
+            let published = rig.take_published();
+            assert!(published.is_empty(), "published past a park: {published:?}");
+        }
+
+        /// The lost-signals scenario: a parked connection resumes without
+        /// a byte more from its client once the queue has room, and its
+        /// pipelined writes all complete, in order, each once. Bytes keep
+        /// coming while it is parked too, and are kept.
+        #[test]
+        fn a_parked_connection_resumes_without_new_bytes() {
+            let mut rig = Rig::start(64, None);
+            let (mut client, _dup) = rig.connect(1);
+            park(&mut rig, &mut client);
+            // While parked, more writes behind: kept for the retry (a
+            // data CQE landing before the park's cancel, or the socket's
+            // buffer after it).
+            for id in 9..=12 {
+                client
+                    .write_all(&request_frame(id, &[0x02]))
+                    .expect("client write");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(
+                rig.take_published().is_empty(),
+                "nothing read past the park"
+            );
+
+            let (mut published, mut replies) = (Vec::new(), Vec::new());
+            rig.wait_for(&mut published, &mut replies, |p, _| p.len() == 9);
+            assert_eq!(published, (4..=12).map(RequestId).collect::<Vec<_>>());
+            assert_eq!(
+                filtered_ids(&replies),
+                (1..=3).map(RequestId).collect::<Vec<_>>()
+            );
+            assert!(rig.disconnects().is_empty(), "the connection is kept");
+
+            // Read again normally once resumed.
+            client
+                .write_all(&request_frame(13, &[0x03]))
+                .expect("client write");
+            rig.wait_for(&mut published, &mut replies, |p, _| p.len() == 10);
+            assert_eq!(published.last(), Some(&RequestId(13)));
+            drop(client);
+            rig.stop();
+        }
+
+        /// Many parks and resumes in a row, with the client writing one
+        /// frame per `write` as fast as it can, so data CQEs keep landing
+        /// around each park's cancel: every request is published or
+        /// answered exactly once, the writes in order.
+        #[test]
+        fn repeated_parks_lose_and_repeat_nothing() {
+            const REQUESTS: u64 = 600;
+            let mut rig = Rig::start(1024, None);
+            let (client, _dup) = rig.connect(1);
+            let writer = std::thread::spawn(move || {
+                let mut client = client;
+                for id in 1..=REQUESTS {
+                    let body = if id % 3 == 0 { 0x01 } else { FILTERED };
+                    client
+                        .write_all(&request_frame(id, &[body]))
+                        .expect("client write");
+                }
+                client
+            });
+            let (mut published, mut replies) = (Vec::new(), Vec::new());
+            rig.wait_for(&mut published, &mut replies, |p, r| {
+                (p.len() + r.len()) as u64 >= REQUESTS
+            });
+            let _client = writer.join().expect("writer");
+            assert_eq!(
+                published,
+                (1..=REQUESTS)
+                    .filter(|id| id % 3 == 0)
+                    .map(RequestId)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                filtered_ids(&replies),
+                (1..=REQUESTS)
+                    .filter(|id| id % 3 != 0)
+                    .map(RequestId)
+                    .collect::<Vec<_>>()
+            );
+            assert!(rig.disconnects().is_empty());
+            rig.stop();
+        }
+
+        /// The idle scan skips a parked connection: its client is not
+        /// idle, the node is not reading it. Resumed, it is judged on its
+        /// idle clock restarted then.
+        #[test]
+        fn a_parked_connection_is_not_reaped_as_idle() {
+            let mut rig = Rig::start(64, Some(Duration::from_millis(100)));
+            let (mut client, _dup) = rig.connect(1);
+            park(&mut rig, &mut client);
+            // Past several scans (one a second) and many timeouts.
+            std::thread::sleep(Duration::from_millis(2_500));
+            assert!(rig.disconnects().is_empty(), "reaped while parked");
+
+            let (mut published, mut replies) = (Vec::new(), Vec::new());
+            rig.wait_for(&mut published, &mut replies, |p, _| p.len() == 5);
+            // Idle from its resume on, it is reaped as any other. The scan
+            // runs only when the reader wakes, so a second, busy client
+            // keeps waking it.
+            let (mut other, _other_dup) = rig.connect(2);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut disconnects = Vec::new();
+            let mut id = 100;
+            while disconnects.is_empty() {
+                assert!(Instant::now() < deadline, "never reaped once resumed");
+                id += 1;
+                other.write_all(&request_frame(id, &[0x01])).expect("write");
+                rig.take_published();
+                disconnects.extend(rig.disconnects());
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(disconnects, [1], "the resumed connection, not the busy one");
+            drop((client, other));
+            rig.stop();
+        }
+
+        /// A parked connection whose retry closes it — the node fenced
+        /// while it was parked — is torn down once: one `Disconnected`,
+        /// and its index is freed for the next connection.
+        #[test]
+        fn a_parked_connection_closed_by_its_retry_is_torn_down_once() {
+            let mut rig = Rig::start(64, None);
+            let (mut client, _dup) = rig.connect(1);
+            park(&mut rig, &mut client);
+            // Its cancel has landed by now: torn down with nothing owed.
+            rig.fence.fence();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut disconnects = Vec::new();
+            while disconnects.is_empty() {
+                assert!(Instant::now() < deadline, "never torn down");
+                disconnects.extend(rig.disconnects());
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            disconnects.extend(rig.disconnects());
+            assert_eq!(disconnects, [1], "torn down once");
+            assert!(rig.take_published().is_empty());
+            rig.stop();
+        }
+
+        /// A request that is not a request, in a shed tail a park cut
+        /// short, closes the connection when the retry reaches it: the
+        /// tail before it answered busy, nothing past the full ring
+        /// published, one `Disconnected`.
+        #[test]
+        fn a_non_request_in_a_parked_shed_tail_closes_the_connection_once() {
+            // Two slots, never drained: the third write is shed.
+            let mut rig = Rig::start(2, None);
+            let (mut client, _dup) = rig.connect(1);
+            let mut bytes = Vec::new();
+            for id in 1..=5 {
+                bytes.extend(request_frame(id, &[0x01]));
+            }
+            bytes.extend(tagged_frame(0x00, &[0x03; 9]));
+            client.write_all(&bytes).expect("client write");
+
+            let (mut published, mut replies) = (Vec::new(), Vec::new());
+            // Writes 3 and 4 are shed and fill the queue; 5 parks.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while published.len() < 2 {
+                assert!(Instant::now() < deadline, "the ring never filled");
+                published.extend(
+                    drain(&mut rig.consumer)
+                        .into_iter()
+                        .map(|(_, s)| s.request_id),
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            // Room in the ring now, but 5 is in the tail.
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(rig.disconnects().is_empty(), "parked, not closed");
+            let mut disconnects = Vec::new();
+            rig.wait_for(&mut published, &mut replies, |_, r| r.len() == 3);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while disconnects.is_empty() {
+                assert!(Instant::now() < deadline, "never closed");
+                disconnects.extend(rig.disconnects());
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            disconnects.extend(rig.disconnects());
+            assert_eq!(disconnects, [1], "torn down once");
+            assert_eq!(published, [RequestId(1), RequestId(2)]);
+            assert_eq!(
+                replies,
+                (3..=5)
+                    .map(|id| early_reply_for(1, RequestId(id), EarlyKind::Busy))
+                    .collect::<Vec<_>>()
+            );
+            rig.stop();
+        }
+
+        /// A parked connection the response stage tears down (a
+        /// `shutdown(2)` on its own dup, after a send failure) is freed
+        /// once: the stage drops the connection's early replies, which
+        /// makes room, the retry re-arms the receive, and the receive
+        /// reports the close. One `Disconnected`, and the next connection
+        /// is served.
+        #[test]
+        fn a_parked_connection_torn_down_by_the_response_stage_is_freed_once() {
+            let mut rig = Rig::start(64, None);
+            let (mut client, dup) = rig.connect(1);
+            park(&mut rig, &mut client);
+            // SAFETY: a live descriptor, owned by `dup`.
+            unsafe { libc::shutdown(dup.as_raw_fd(), libc::SHUT_RDWR) };
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut disconnects = Vec::new();
+            while disconnects.is_empty() {
+                assert!(Instant::now() < deadline, "never freed");
+                rig.take_replies();
+                rig.take_published();
+                disconnects.extend(rig.disconnects());
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            disconnects.extend(rig.disconnects());
+            assert_eq!(disconnects, [1], "freed once");
+
+            let (mut next, _next_dup) = rig.connect(2);
+            next.write_all(&request_frame(1, &[0x01])).expect("write");
+            let mut published = Vec::new();
+            rig.wait_for(&mut published, &mut Vec::new(), |p, _| {
+                p.contains(&RequestId(1))
+            });
+            rig.stop();
+        }
+
+        /// [`early_reply`] for connection `connection_id`.
+        fn early_reply_for(
+            connection_id: u64,
+            request_id: RequestId,
+            kind: EarlyKind<TestReport>,
+        ) -> EarlyReply<TestReport> {
+            EarlyReply {
+                connection_id,
+                request_id,
+                kind,
+            }
+        }
     }
 
     /// A reader that cannot create its io_uring instance reports it to

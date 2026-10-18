@@ -10,23 +10,33 @@
 //! later reply on a pipelining connection was paired with the request
 //! before it (S1 of `docs/internal/application-api-review-2026-09.md`).
 //!
+//! A request that finds the input ring full is answered `ServerBusy`, as
+//! is every request buffered behind it, and the connection is kept. The
+//! requests behind it used to wait unread for bytes a client waiting on
+//! its replies never sends ("Pipelined writes after a full input ring are
+//! never parsed" in `docs/internal/lost-signals-2026-10.md`).
+//!
 //! Nodes are started through `melin-test-node`: on kernel TCP by default,
 //! on DPDK with this crate's `dpdk` feature, under
 //! `scripts/dpdk/netns-runner.sh` (see `docs/internal/dpdk-testing.md`).
 
 use std::path::Path;
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use counter_server::{
-    Counter, CounterEvent, CounterRole, GET_VALUE_REQUEST, KIND_RESP_ACK, KIND_RESP_VALUE,
-    RequestDecoder, ResponseEncoder, increment_request,
+    Counter, CounterEvent, CounterQuery, CounterReport, CounterRole, GET_VALUE_REQUEST,
+    KIND_RESP_ACK, KIND_RESP_VALUE, RequestDecoder, ResponseEncoder, increment_request,
 };
 use melin_app::auth::ClientRole;
 use melin_app::decoder::Decoded;
-use melin_client::{Connection, Frame, RefusalKind, RequestId, SigningKey, key};
+use melin_app::{Application, ApplyCtx, QueryCtx, RejectReason};
+use melin_client::{Connection, Frame, RefusalKind, RequestId, SigningKey, StreamConnection, key};
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
+use melin_transport_core::pipeline::INPUT_RING_CAPACITY;
 
 /// The writer's key, and the reader's.
 const WRITER: [u8; 32] = [0xA1; 32];
@@ -56,8 +66,74 @@ impl melin_app::decoder::RequestDecoder for FilteringDecoder {
     }
 }
 
-/// A standalone counter node on `dir`, with a writer and a reader key.
-fn start(dir: &Path) -> melin_test_node::Node {
+/// The counter, whose `apply` waits for the test's leave: the test holds
+/// the matching stage at the first write, and the input ring fills behind
+/// it. Same events and codecs as the counter.
+///
+/// The leave is a count of applies rather than a switch, so the test can
+/// let the stage go a window at a time as it reads the replies: let go at
+/// once, a full ring's replies leave faster than one client thread reads
+/// them, and the node drops it as a reader that has fallen behind.
+#[derive(Default)]
+struct Latched {
+    counter: Counter,
+    /// How many writes may be applied. Handed over as the node's sizing,
+    /// the one thing the runtime passes an instance from the test
+    /// (`prefault`); `None` until then. `u64`, as a count of events.
+    leave: Option<Arc<AtomicU64>>,
+    /// Writes applied so far.
+    applied: u64,
+}
+
+impl Application for Latched {
+    type Event = CounterEvent;
+    type Report = CounterReport;
+    type QueryResponse = CounterQuery;
+    type Sizing = Arc<AtomicU64>;
+    const APP_VERSION: u16 = Counter::APP_VERSION;
+
+    fn apply(&mut self, event: Self::Event, ctx: &ApplyCtx, out: &mut Vec<Self::Report>) {
+        while self
+            .leave
+            .as_ref()
+            .is_some_and(|leave| self.applied >= leave.load(Ordering::Acquire))
+        {
+            std::thread::sleep(Duration::from_micros(50));
+        }
+        self.applied += 1;
+        self.counter.apply(event, ctx, out)
+    }
+
+    fn query(&self, event: Self::Event, ctx: &QueryCtx) -> Option<Self::QueryResponse> {
+        self.counter.query(event, ctx)
+    }
+
+    fn tick(&mut self, now_ns: u64, out: &mut Vec<Self::Report>) {
+        self.counter.tick(now_ns, out)
+    }
+
+    fn build_reject(event: &Self::Event, reason: RejectReason) -> Self::Report {
+        Counter::build_reject(event, reason)
+    }
+
+    fn snapshot<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        self.counter.snapshot(w)
+    }
+
+    fn restore<R: std::io::Read>(r: &mut R) -> std::io::Result<Self> {
+        Counter::restore(r).map(|counter| Latched {
+            counter,
+            ..Latched::default()
+        })
+    }
+
+    fn prefault(&mut self, leave: &Self::Sizing) {
+        self.leave = Some(Arc::clone(leave));
+    }
+}
+
+/// The authorized-keys file on `dir`, with a writer and a reader key.
+fn authorized_keys(dir: &Path) -> std::path::PathBuf {
     let auth_path = dir.join("authorized_keys");
     let line = |role: &str, secret: [u8; 32]| {
         key::authorized_keys_line(role, &SigningKey::from_bytes(&secret).verifying_key(), role)
@@ -67,9 +143,14 @@ fn start(dir: &Path) -> melin_test_node::Node {
         format!("{}\n{}\n", line("writer", WRITER), line("reader", READER)),
     )
     .expect("write auth keys");
-    let config = ServerConfig {
-        journal: dir.join("counter.journal"),
-        authorized_keys: auth_path,
+    auth_path
+}
+
+/// A standalone node's configuration on `dir`, its journal named `name`.
+fn config(dir: &Path, name: &str) -> ServerConfig {
+    ServerConfig {
+        journal: dir.join(name),
+        authorized_keys: authorized_keys(dir),
         standalone: true,
         ack_policy: melin_server_runtime::ack_policy::AckPolicy::Disk,
         // Unpinned, and therefore yielding: see `startup_events.rs`.
@@ -78,15 +159,34 @@ fn start(dir: &Path) -> melin_test_node::Node {
         snapshot_interval_ms: 0,
         health_bind: None,
         ..melin_test_node::config()
-    };
+    }
+}
+
+/// A standalone counter node on `dir`, with a writer and a reader key.
+fn start(dir: &Path) -> melin_test_node::Node {
     melin_test_node::start::<Counter>(
-        config,
+        config(dir, "counter.journal"),
         StartupEvents {
             genesis: Vec::new(),
             on_primary: Vec::new(),
         },
         (),
         FilteringDecoder,
+        ResponseEncoder,
+    )
+}
+
+/// A standalone node of the latched counter, applying as many writes as
+/// `leave` says.
+fn start_latched(dir: &Path, leave: &Arc<AtomicU64>) -> melin_test_node::Node {
+    melin_test_node::start::<Latched>(
+        config(dir, "latched.journal"),
+        StartupEvents {
+            genesis: Vec::new(),
+            on_primary: Vec::new(),
+        },
+        Arc::clone(leave),
+        RequestDecoder,
         ResponseEncoder,
     )
 }
@@ -244,5 +344,129 @@ fn every_pipelined_request_is_answered_and_paired_by_id() {
     );
 
     drop((writer, reader));
+    node.stop();
+}
+
+/// A full input ring sheds load and keeps the connection: one client fills
+/// the ring of a node whose matching stage the test holds, and every
+/// request past it is answered `ServerBusy { id }` at once (the ones
+/// buffered behind a shed request with it), while the client is still
+/// sending. Once the test lets the matching stage go, every request is
+/// answered exactly once, applied or busy; no request the node shed is
+/// followed by an applied one (the ring stayed full, so everything behind
+/// a shed request was shed); and the connection serves the next request.
+///
+/// The client reads while it sends, and the stage is let go a window at
+/// a time as the replies are read (see [`Latched`]), so an unread socket
+/// never trips the node's send cap and the test measures shedding, not a
+/// slow reader.
+/// Nothing is answered until the ring is full, and the read deadline runs
+/// while any request is owed, so it is long enough to cover filling the
+/// ring on a slow host. The input ring is the node's fixed one, so more
+/// requests than it holds are sent, and journaled.
+#[test]
+fn a_full_input_ring_answers_busy_and_keeps_the_connection() {
+    /// Requests sent past the ring's capacity, all of which find it full.
+    const PAST_THE_RING: usize = 20_000;
+    /// How long the busy answers must stay still before the test takes
+    /// the node to have read every request: the reader takes millions a
+    /// second, so a pause this long means it has caught up.
+    const SETTLED: Duration = Duration::from_secs(2);
+    /// Writes the node may apply ahead of the replies read: a few tens of
+    /// kilobytes of replies, well inside what a node buffers for a client.
+    const WINDOW: u64 = 1024;
+
+    // Opt-in diagnostics: with RUST_LOG set, the node says why it closed
+    // a connection or shed a request. No-op when RUST_LOG is unset.
+    melin_test_node::logs::capture_if_requested();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leave = Arc::new(AtomicU64::new(0));
+    let node = start_latched(dir.path(), &leave);
+    let key = SigningKey::from_bytes(&WRITER);
+    // Up and serving: the handshake goes through.
+    drop(melin_test_node::connect(node.addr(), &key));
+    // Well past filling the ring, inside the suite's per-test limit.
+    let mut conn = StreamConnection::connect_timeout(node.addr(), &key, Duration::from_secs(60))
+        .expect("the client connects");
+
+    let total = INPUT_RING_CAPACITY + PAST_THE_RING;
+    let body = increment_request(1);
+    let mut busy: Vec<RequestId> = Vec::new();
+    let mut applied: Vec<RequestId> = Vec::new();
+    // Every answer that has arrived, without waiting for more.
+    fn read_answers(
+        conn: &mut StreamConnection<melin_client::NonBlockingTcp>,
+        busy: &mut Vec<RequestId>,
+        applied: &mut Vec<RequestId>,
+    ) {
+        while let Some(frame) = conn.poll().expect("the connection stays up") {
+            match frame {
+                Frame::ServerBusy { id } => busy.push(id),
+                Frame::BatchEnd { id, .. } => applied.push(id),
+                Frame::Response(_) => {}
+                Frame::Refused { id, kind, reason } => {
+                    panic!("request {id:?} refused ({kind:?}: {reason})")
+                }
+            }
+        }
+    }
+    let mut sent = Vec::with_capacity(total);
+    for n in 0..total {
+        sent.push(conn.send(&body).expect("send"));
+        if n % 256 == 255 {
+            read_answers(&mut conn, &mut busy, &mut applied);
+        }
+    }
+    // Every request handed over, and read by the node: the busies stop.
+    let mut last_change = (busy.len(), Instant::now());
+    while conn.connection().unsent() > 0 || last_change.1.elapsed() < SETTLED {
+        read_answers(&mut conn, &mut busy, &mut applied);
+        if busy.len() != last_change.0 {
+            last_change = (busy.len(), Instant::now());
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        applied.is_empty(),
+        "nothing applied while the stage is held"
+    );
+    assert!(
+        busy.len() >= PAST_THE_RING / 2,
+        "the requests past the ring are shed: {} of {total}",
+        busy.len()
+    );
+
+    while busy.len() + applied.len() < total {
+        leave.store(applied.len() as u64 + WINDOW, Ordering::Release);
+        read_answers(&mut conn, &mut busy, &mut applied);
+        std::thread::yield_now();
+    }
+    // Leave for the next request.
+    leave.store(u64::MAX, Ordering::Release);
+    // Each ID once (the client refuses an answer for none, or a second
+    // one), applied in request order, and every one shed after every one
+    // applied.
+    assert_eq!(busy.len() + applied.len(), total);
+    assert!(applied.windows(2).all(|w| w[0] < w[1]), "in request order");
+    let last_applied = *applied.last().expect("the ring's requests are applied");
+    let first_busy = *busy.iter().min().expect("some are shed");
+    assert!(
+        last_applied < first_busy,
+        "applied {last_applied:?} after shedding {first_busy:?}"
+    );
+    assert_eq!(*sent.last().expect("sent"), RequestId(total as u64));
+
+    // The connection serves the next request, on a counter that applied
+    // exactly the requests answered as applied.
+    let ack = conn
+        .request_one(&increment_request(5))
+        .expect("the next request");
+    assert_eq!(ack[0], KIND_RESP_ACK);
+    assert_eq!(
+        u64::from_le_bytes(ack[1..9].try_into().expect("8 bytes")),
+        applied.len() as u64 + 5
+    );
+
+    drop(conn);
     node.stop();
 }
