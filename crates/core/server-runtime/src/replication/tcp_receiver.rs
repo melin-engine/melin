@@ -16,6 +16,7 @@ use tracing::{info, warn};
 
 use melin_app::Application;
 use melin_journal::BufferedWriter;
+use melin_transport_core::node_store::NodeStore;
 
 use super::auth::authenticate_with_primary;
 use super::receiver_transport::{
@@ -546,7 +547,9 @@ pub type ReceiverResult<A, W> = Result<Option<(A, W)>, Box<dyn std::error::Error
 #[allow(clippy::too_many_arguments)]
 pub fn run_receiver<A>(
     primary_addr: SocketAddr,
-    journal_path: &std::path::Path,
+    // The node's journal and snapshot: recovered from, written by the
+    // replica's shadow stage, and replaced (archived first) by a resync.
+    store: &NodeStore,
     signing_key: &ed25519_dalek::SigningKey,
     shutdown: &AtomicBool,
     // The handles this loop shares with the admin endpoint and the
@@ -554,7 +557,6 @@ pub fn run_receiver<A>(
     // for each field's contract.
     control: &super::ReplicaControlPlane,
     snapshot_interval_ms: u64,
-    snapshot_path: std::path::PathBuf,
     cores: crate::layout::PipelineCores,
     // Passed straight to the replica's journal stage; see
     // `build_replica_pipeline_with_threads`.
@@ -587,8 +589,7 @@ where
     // `recover_replica_state` for the lineage rules.
     let (mut app, mut journal_writer, mut last_sequence, mut chain_hash) =
         recover_replica_state::<A, BufferedWriter<A::Event>>(
-            journal_path,
-            &snapshot_path,
+            store,
             &fence_state,
             lineage_ack_policy,
             sizing,
@@ -644,8 +645,7 @@ where
                         &mut divergence_resyncs,
                         &mut backoff,
                         last_sequence,
-                        journal_path,
-                        &snapshot_path,
+                        store,
                         &fence_state,
                         lineage_ack_policy,
                         shutdown,
@@ -824,8 +824,7 @@ where
                     &mut pipeline,
                     &mut app,
                     &mut journal_writer,
-                    journal_path,
-                    &snapshot_path,
+                    store,
                     &fence_state,
                     control,
                     &mut last_sequence,
@@ -870,7 +869,7 @@ where
         if pipeline.is_none() && journal_writer.is_none() {
             let (lineage_start, lineage_anchor, lineage_genesis) = stream_lineage;
             let writer = BufferedWriter::create_continuing(
-                journal_path,
+                store.journal(),
                 lineage_start,
                 lineage_anchor,
                 lineage_genesis,
@@ -889,7 +888,7 @@ where
                 cores,
                 staging_mode,
                 snapshot_interval_ms,
-                snapshot_path.clone(),
+                store,
                 group_commit_delay,
                 Arc::clone(&fence_state),
                 lineage_ack_policy,
@@ -961,8 +960,7 @@ where
             &mut divergence_resyncs,
             &mut backoff,
             last_sequence,
-            journal_path,
-            &snapshot_path,
+            store,
             &fence_state,
             lineage_ack_policy,
             shutdown,
@@ -998,6 +996,15 @@ mod tests {
 
     use melin_transport_core::replication::protocol::{ReplicaMessage, decode_replica_message};
     use melin_wire_protocol::framing::split_frame_limited;
+
+    /// The store of a node whose snapshot is derived from `journal`, as a
+    /// node without `--snapshot-path` resolves it. For the tests that run
+    /// a receiver on a real journal, which a `no-persist` build has none
+    /// of.
+    #[cfg(not(feature = "no-persist"))]
+    fn store(journal: &std::path::Path) -> NodeStore {
+        NodeStore::resolve(journal.to_path_buf(), None).expect("store")
+    }
 
     /// Connected localhost pair: (transport side, peer side).
     fn socket_pair() -> (TcpStream, TcpStream) {
@@ -1382,7 +1389,7 @@ mod tests {
                     ack_policy: Some(PRIMARY_LINEAGE_POLICY),
                 },
                 Some(0),
-                &primary_journal.with_extension("snapshot"),
+                store(&primary_journal).snapshot(),
             )
             .expect("save snapshot");
             let origin = lineage_origin(&primary_journal).expect("lineage");
@@ -1401,8 +1408,7 @@ mod tests {
 
             // --- Replica under test.
             let replica_journal = dir.path().join("replica.journal");
-            let replica_snapshot = dir.path().join("replica.snapshot");
-            let replica_snapshot_check = replica_snapshot.clone();
+            let replica_snapshot_check = store(&replica_journal).snapshot().to_path_buf();
             let shutdown = Arc::new(AtomicBool::new(false));
             let control = crate::replication::ReplicaControlPlane::new();
             let cores = crate::layout::PipelineCores::unpinned();
@@ -1413,7 +1419,7 @@ mod tests {
                 std::thread::spawn(move || -> Result<bool, String> {
                     run_receiver::<App>(
                         addr,
-                        &journal,
+                        &store(&journal),
                         &ed25519_dalek::SigningKey::from_bytes(&REPLICA_KEY),
                         &shutdown,
                         &control,
@@ -1421,7 +1427,6 @@ mod tests {
                         // snapshot of its own after the resync (see the
                         // lineage check below).
                         SHADOW_INTERVAL_MS,
-                        replica_snapshot,
                         cores,
                         melin_journal::StagingMode::ZeroFill,
                         Duration::ZERO,
@@ -1533,7 +1538,7 @@ mod tests {
             // Real sender-side resync: SnapshotBegin → chunks →
             // SegmentSeedBegin → seed → StreamStart → catch-up (entry 5).
             let end = snapshot_transfer_with::<EvtAdd>(
-                &primary_journal,
+                &store(&primary_journal),
                 &mut publish,
                 &transfer_shutdown,
             )
@@ -1643,7 +1648,7 @@ mod tests {
                     ack_policy: Some(PRIMARY_LINEAGE_POLICY),
                 },
                 Some(0),
-                &primary_journal.with_extension("snapshot"),
+                store(&primary_journal).snapshot(),
             )
             .expect("save snapshot");
             let origin = lineage_origin(&primary_journal).expect("lineage");
@@ -1660,7 +1665,6 @@ mod tests {
             let addr = listener.local_addr().expect("addr");
 
             let replica_journal = dir.path().join("replica.journal");
-            let replica_snapshot = dir.path().join("replica.snapshot");
             let shutdown = Arc::new(AtomicBool::new(false));
             let control = crate::replication::ReplicaControlPlane::new();
             let cores = crate::layout::PipelineCores::unpinned();
@@ -1671,12 +1675,11 @@ mod tests {
                 std::thread::spawn(move || -> Result<bool, String> {
                     run_receiver::<App>(
                         addr,
-                        &journal,
+                        &store(&journal),
                         &ed25519_dalek::SigningKey::from_bytes(&REPLICA_KEY),
                         &shutdown,
                         &control,
                         3_600_000,
-                        replica_snapshot,
                         cores,
                         melin_journal::StagingMode::ZeroFill,
                         Duration::ZERO,
@@ -1766,7 +1769,7 @@ mod tests {
                     s2.flush()
                 };
                 snapshot_transfer_with::<EvtAdd>(
-                    &primary_journal,
+                    &store(&primary_journal),
                     &mut publish,
                     &transfer_shutdown,
                 )
@@ -1850,7 +1853,7 @@ mod tests {
                 chain_at_4,
                 melin_transport_core::lineage::Lineage::GENESIS,
                 Some(0),
-                &primary_journal.with_extension("snapshot"),
+                store(&primary_journal).snapshot(),
             )
             .expect("save snapshot");
             let origin = lineage_origin(&primary_journal).expect("lineage");
@@ -1867,7 +1870,6 @@ mod tests {
             let addr = listener.local_addr().expect("addr");
 
             let replica_journal = dir.path().join("replica.journal");
-            let replica_snapshot = dir.path().join("replica.snapshot");
             let shutdown = Arc::new(AtomicBool::new(false));
             let control = crate::replication::ReplicaControlPlane::new();
             let cores = crate::layout::PipelineCores::unpinned();
@@ -1878,12 +1880,11 @@ mod tests {
                 std::thread::spawn(move || -> Result<bool, String> {
                     run_receiver::<App>(
                         addr,
-                        &journal,
+                        &store(&journal),
                         &ed25519_dalek::SigningKey::from_bytes(&REPLICA_KEY),
                         &shutdown,
                         &control,
                         3_600_000,
-                        replica_snapshot,
                         cores,
                         melin_journal::StagingMode::ZeroFill,
                         Duration::ZERO,
@@ -1953,7 +1954,7 @@ mod tests {
                     s2.flush()
                 };
                 snapshot_transfer_with::<EvtAdd>(
-                    &primary_journal,
+                    &store(&primary_journal),
                     &mut publish,
                     &transfer_shutdown,
                 )
@@ -2159,18 +2160,16 @@ mod tests {
             let control = crate::replication::ReplicaControlPlane::new();
             let replica = {
                 let journal = dir.path().join("replica.journal");
-                let snapshot = dir.path().join("replica.snapshot");
                 let shutdown = Arc::clone(&shutdown);
                 let control = control.clone();
                 std::thread::spawn(move || -> Result<bool, String> {
                     run_receiver::<App>(
                         addr,
-                        &journal,
+                        &store(&journal),
                         &ed25519_dalek::SigningKey::from_bytes(&REPLICA_KEY),
                         &shutdown,
                         &control,
                         3_600_000,
-                        snapshot,
                         crate::layout::PipelineCores::unpinned(),
                         melin_journal::StagingMode::ZeroFill,
                         Duration::ZERO,
@@ -2307,17 +2306,15 @@ mod tests {
             shutdown: &Arc<AtomicBool>,
         ) -> std::thread::JoinHandle<Result<bool, String>> {
             let journal = dir.join("replica.journal");
-            let snapshot = dir.join("replica.snapshot");
             let shutdown = Arc::clone(shutdown);
             std::thread::spawn(move || -> Result<bool, String> {
                 run_receiver::<App>(
                     addr,
-                    &journal,
+                    &store(&journal),
                     &ed25519_dalek::SigningKey::from_bytes(&REPLICA_KEY),
                     &shutdown,
                     &crate::replication::ReplicaControlPlane::new(),
                     3_600_000,
-                    snapshot,
                     crate::layout::PipelineCores::unpinned(),
                     melin_journal::StagingMode::ZeroFill,
                     group_commit_delay,
@@ -2810,18 +2807,16 @@ mod tests {
             let control = crate::replication::ReplicaControlPlane::new();
             let replica = {
                 let journal = dir.path().join("replica.journal");
-                let snapshot = dir.path().join("replica.snapshot");
                 let shutdown = Arc::clone(&shutdown);
                 let control = control.clone();
                 std::thread::spawn(move || -> Result<Option<String>, String> {
                     run_receiver::<App>(
                         addr,
-                        &journal,
+                        &store(&journal),
                         &ed25519_dalek::SigningKey::from_bytes(&REPLICA_KEY),
                         &shutdown,
                         &control,
                         3_600_000,
-                        snapshot,
                         crate::layout::PipelineCores::unpinned(),
                         melin_journal::StagingMode::ZeroFill,
                         Duration::ZERO,
@@ -2947,18 +2942,16 @@ mod tests {
             let control = crate::replication::ReplicaControlPlane::new();
             let replica = {
                 let journal = replica_journal.clone();
-                let snapshot = dir.path().join("replica.snapshot");
                 let shutdown = Arc::clone(&shutdown);
                 let control = control.clone();
                 std::thread::spawn(move || -> Result<bool, String> {
                     run_receiver::<App>(
                         addr,
-                        &journal,
+                        &store(&journal),
                         &ed25519_dalek::SigningKey::from_bytes(&REPLICA_KEY),
                         &shutdown,
                         &control,
                         3_600_000,
-                        snapshot,
                         crate::layout::PipelineCores::unpinned(),
                         mode,
                         Duration::ZERO,

@@ -109,17 +109,17 @@ const CRC_SIZE: usize = 4;
 const MAX_SNAPSHOT_SIZE: u64 = 256 * 1024 * 1024;
 
 /// Suffix appended to the snapshot path for the one-deep rollback file.
-const PREV_SUFFIX: &str = ".prev";
+pub(crate) const PREV_SUFFIX: &str = ".prev";
 
 /// Suffix used for the in-progress write before the atomic publish rename.
-const TMP_SUFFIX: &str = ".tmp";
+pub(crate) const TMP_SUFFIX: &str = ".tmp";
 
 /// Append `suffix` to a snapshot path. Keeps the full filename intact
 /// (e.g. `melin.snapshot` → `melin.snapshot.prev`) so operators can run
 /// `mv melin.snapshot.prev melin.snapshot` to roll back. Using
 /// [`Path::with_extension`] is wrong here — it would replace the existing
 /// extension instead of appending, which breaks multi-dot filenames.
-fn with_suffix(path: &Path, suffix: &str) -> std::path::PathBuf {
+pub(crate) fn with_suffix(path: &Path, suffix: &str) -> std::path::PathBuf {
     let mut buf = path.as_os_str().to_owned();
     buf.push(suffix);
     std::path::PathBuf::from(buf)
@@ -466,11 +466,9 @@ fn save_with_limit<A: Application>(
     // but the directory entries they create/remove are not durable until
     // the parent's metadata is fsynced — without that, a crash can lose
     // the rename on ext4/xfs. Empty parent ("snap" with no separator)
-    // denotes CWD; use "." so the open succeeds rather than ENOENT.
-    let parent = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-        _ => std::path::PathBuf::from("."),
-    };
+    // denotes CWD (see `parent_dir`).
+    use melin_journal::segment::{fsync_dir, parent_dir};
+    let parent = parent_dir(path);
 
     // Rotate the previous snapshot to `<path>.prev` before clobbering it.
     // Operators rely on this as a one-deep rollback target — see
@@ -503,11 +501,11 @@ fn save_with_limit<A: Application>(
     // when no rotation happened (first save) to avoid a syscall on the
     // common path.
     if rotated {
-        File::open(&parent)?.sync_all()?;
+        fsync_dir(parent)?;
     }
 
     std::fs::rename(&tmp_path, path)?;
-    File::open(&parent)?.sync_all()?;
+    fsync_dir(parent)?;
 
     Ok(())
 }

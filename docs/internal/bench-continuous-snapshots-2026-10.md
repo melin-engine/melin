@@ -146,16 +146,29 @@ creates the file. But a mistyped `--snapshot-path` on the upgrade's
 snapshot-only layout still boots Fresh from genesis, the same hazard as a
 mistyped `--journal`. Closing it needs an explicit "this boot continues a
 history" intent, which is the follow-up's, and the audit keeps this
-sub-point open. Step 0 only adds three start-up refusals that are cheap and
-unambiguous:
+sub-point open. Step 0 only adds start-up refusals that are cheap and
+unambiguous (three planned, two more found while building it):
 
+- the snapshot path names no file (empty, or ending in `..`): nothing
+  could be written at it, and its `.tmp`/`.prev` siblings and its
+  archive directory are named after its file name;
+- the snapshot path names an existing directory, or a link to one (e.g.
+  `--snapshot-path /var/lib/snaps/`): boot would fail later with EISDIR
+  reading it, or the shadow would log `error!` every interval; refused
+  up front with a message naming the flag;
 - the snapshot's parent directory is missing or not a directory (today
   the shadow would log `error!` every interval and never save). The
   resolver maps both a `None` parent and an empty one to `.`: the default
   bare `melin.snapshot` has `Some("")` as its parent, not `None`, and
   `Path::new("").is_dir()` is false, so mapping only `None` (as
-  `archive.rs` does today) would refuse the default layout;
-- the snapshot path equals the journal path;
+  `archive.rs` did) would refuse the default layout. That rule was
+  already written out twice in `melin_journal::segment` and once in
+  `snapshot.rs`; it is hoisted to `melin_journal::segment::parent_dir`
+  (with `fsync_dir`, the sync of a directory itself), and every copy uses
+  it;
+- the snapshot path equals the journal path, compared after
+  canonicalising both directories (a `..` or a symlink does not hide it;
+  a journal whose directory does not exist yet is in another directory);
 - `--snapshot-path` is given, nothing is at it, the node has no journal
   lineage, and the derived `<journal>.snapshot` exists. This is an
   operator adding `--snapshot-path` for the first time to a node on the
@@ -178,8 +191,17 @@ impl NodeStore {
     pub fn snapshot(&self) -> &Path;
     pub fn snapshot_tmp(&self) -> PathBuf;  // <snapshot>.tmp
     pub fn snapshot_prev(&self) -> PathBuf; // <snapshot>.prev
+    pub fn journal_lineage_exists(&self) -> io::Result<bool>;
+    pub(crate) fn snapshot_shares_journal_dir(&self) -> io::Result<bool>;
 }
 ```
+
+As built, `journal_lineage_exists` (a live or archived segment on disk)
+is the check the third refusal makes and replica recovery's "fresh
+replica" test, one copy for both, and `snapshot_shares_journal_dir` is
+the archive's canonicalised layout test. `NodeStoreError` has a variant
+per refusal and an `Io` one carrying the path that could not be
+inspected; it is re-exported at the crate root with `NodeStore`.
 
 Every function that reads, writes, serves or archives the snapshot takes
 `&NodeStore` instead of a journal path or a bare snapshot `&Path`, with
@@ -195,7 +217,11 @@ The journal and the snapshot are paired, rather than wrapping the snapshot
 alone in a newtype, because catch-up and archival take both. A pair means
 no caller can combine the right snapshot with another node's journal,
 which several tests in `tcp_receiver.rs` do by hand today. The pair is
-built once in `run`, by `ServerConfig::store()`, and passed down.
+built once per boot by `ServerConfig::store()`, right after
+`validate_primary_config` in each transport's entry chain (`run_impl`
+and `run_dpdk_impl`), so a refused layout leaves the disk untouched, and
+passed down: to `init_engine`, `run_as_primary`/`run_as_primary_dpdk`
+(and through them the shadow spawn and the senders), and the receivers.
 
 `ServerConfig::shadow_snapshot_path` is removed.
 
@@ -254,6 +280,12 @@ archived file cannot be picked up. The order of the moves is unchanged.
 On two filesystems the existing non-atomic window gains one directory.
 The durable intent marker (follow-up) closes it.
 
+One more gap of the same kind was closed while building this: a
+re-seeded replica renamed the received snapshot into place and relied on
+the seed's later `fsync_parent_dir(journal)` for its durability, which
+covers the snapshot only when the two share a directory. It now syncs the
+snapshot's own directory after that rename.
+
 ### 0c. Files and functions
 
 - `transport-core/src/node_store.rs` (new): `NodeStore`,
@@ -290,10 +322,18 @@ The durable intent marker (follow-up) closes it.
   - the TCP and DPDK senders and `run_receiver_dpdk` carry the store;
   - the `tcp_receiver.rs` tests stop pairing
     `primary_journal.with_extension("snapshot")` by hand.
+- `server-runtime/src/server.rs`, beyond the above: `init_engine`,
+  `run_as_primary`, `run_as_primary_dpdk` and `spawn_shadow_stage` take
+  `&NodeStore`; `init_engine` reads the journal from the store too.
+- `journal/src/segment.rs`: `parent_dir` and `fsync_dir` (see 0a), used
+  by `list_archives`, `fsync_parent_dir`, `snapshot::save_with_limit`,
+  the store and the archive.
+- `.config/nextest.toml`: the new `snapshot_location` binary joins the
+  `cluster-serial` group.
 - `scripts/miri.sh`: add `--skip node_store::` to `SKIPS` (its tests
-  touch the filesystem), and `--skip test_fs::` if that module carries
-  tests; `replication::archive` and `replication::catchup` are already
-  skipped.
+  touch the filesystem). `test_fs` carries no tests of its own, so it
+  needs no skip; `replication::archive` and `replication::catchup` are
+  already skipped.
 - `docs/internal/determinism-audit-2026-09.md`: in the triage table and
   in sections 21 and 22, mark both findings partially fixed and name what
   remains (for 22, the missing-explicit-path-boots-Fresh sub-point stays
@@ -317,7 +357,12 @@ The durable intent marker (follow-up) closes it.
     with no derived file, or with a journal present, is accepted;
   - `snapshot_tmp` and `snapshot_prev` equal the names `snapshot::save`
     actually writes. The test saves twice through `save` and lists the
-    directory.
+    directory, then makes a save fail before its publish rename, which
+    leaves the temp file under the store's name;
+  - (added) a path naming no file is refused; the same file spelled
+    through `..` or a symlink is still the journal; the same file name in
+    another directory, or with the journal's directory not yet created,
+    is accepted.
 - `archive_local_lineage`:
   - default layout: one directory holding the archives, the live
     segment, the snapshot and `.prev` (the existing test, extended with
@@ -376,17 +421,34 @@ The durable intent marker (follow-up) closes it.
 - A primary with `--snapshot-path` in another directory, beside a stale
   `<journal>.snapshot` holding other state, recovers from its own
   snapshot on restart. The test checks the recovered state, which differs
-  from the stale file's, so no log capture is needed.
-- A divergent replica resyncs from that primary. Its `--snapshot-path` is
-  on the second filesystem (`melin_transport_core::test_fs`, so the
-  same CI rule). It ends with
-  the primary's state, and its old snapshot sits in
-  `<second fs>/…/<snapshot-name>.divergent.0/`.
+  from the stale file's, so no log capture is needed. As built: the stale
+  file is placed after the primary's first run (before it, the node has
+  no journal and the third refusal applies), and the primary is
+  restarted twice, with its journal and then with the snapshot alone.
+- A divergent replica resyncs from a primary that serves its snapshot
+  from its own `--snapshot-path`. The replica's `--snapshot-path` is on
+  the second filesystem (`melin_transport_core::test_fs`, so the same CI
+  rule). It ends acking the primary's whole history, and its old snapshot
+  (checked by header) sits in `<second fs>/…/<snapshot-name>.divergent.0/`
+  with its old journal in `<journal-name>.divergent.0/`. As built: each
+  node first writes its history standalone and is then restarted in its
+  role, because a primary that begins a history waits for a replica
+  before it serves, and the replica must find a snapshot to be served.
+- Added while building: a snapshot directory that does not exist, and a
+  first `--snapshot-path` on the upgrade layout, are refused at start,
+  naming the paths, with no journal created.
+
+The file runs on DPDK too, under the netns runner with the `dpdk`
+feature, like the crate's other cluster tests, and joins the nextest
+`cluster-serial` group.
 
 **DPDK (netns runner):** extend `large_joins_complete_a_tick_at_a_time`
 so that the primary and the divergent replica both take `--snapshot-path`
 in a directory of their own. The join then serves the snapshot from
-there, and the divergent replica's archive lands there.
+there (and no `<journal>.snapshot` is written), and the divergent
+replica's archive lands there. As built, the divergent replica is given
+an old snapshot of its one-event history (`JournaledApp::save_snapshot`)
+so there is a snapshot to archive.
 
 **Coverage:** run `cargo llvm-cov` on `transport-core` and
 `server-runtime`, and cover every changed branch it reports as
@@ -395,7 +457,9 @@ unexercised.
 ### 0e. CHANGELOG
 
 - **Added:** `NodeStore`, the one resolver of a node's journal and
-  snapshot paths, and `ServerConfig::store()`.
+  snapshot paths, and `ServerConfig::store()`. As built, also
+  `melin_journal::segment::parent_dir` and `fsync_dir` (0a), and under
+  **Fixed** the received snapshot's directory sync (0b).
 - **Removed (breaking):**
   - `--snapshot`. A command line with `--snapshot X` is refused.
     - If `--snapshot-path` is already set, drop `--snapshot` and leave
@@ -423,7 +487,8 @@ unexercised.
     where `mv <snapshot>.prev <snapshot>` would have restored a snapshot
     of another history; it is now in the resync archive.
   - A node refuses to start when its snapshot's directory does not exist,
-    when the snapshot path is the journal path, or when `--snapshot-path`
+    when the snapshot path names a directory, when the snapshot path is
+    the journal path, or when `--snapshot-path`
     names nothing while a derived `<journal>.snapshot` exists and there is
     no journal.
 - **Fixed:**
@@ -450,7 +515,12 @@ unexercised.
     journal's for latency-critical deployments (see "Docs" below for the
     wording);
   - in "Standard Upgrade", the snapshot is the one at `--snapshot-path`,
-    and restoring from a backup means copying it there.
+    and restoring from a backup means copying it there;
+  - in "Limitations", state what step 0 leaves of determinism-audit
+    findings 21 and 22, as the roadmap asks of open findings: a snapshot
+    served to a replica is checked only by its header, a resync's archive
+    is not crash-atomic, and a mistyped `--snapshot-path` on a node with
+    no journal and nothing at either path is not caught.
 - `docs/replication.md`, the archive paragraph: with `--snapshot-path` in
   another directory, the snapshot is archived beside it in a directory
   named after the snapshot file with the same reason and index as the

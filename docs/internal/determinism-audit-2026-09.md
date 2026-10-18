@@ -71,8 +71,8 @@ Severity is a judgement from code reading.
 | 18 | A ServerBusy reply can overtake replies to earlier requests | Medium | Confirmed |
 | 19 | Recovery trusts the page cache after a failed fsync | Medium | Reported |
 | 20 | A failed directory fsync after rotation does not hold back acks | Medium | Confirmed |
-| 21 | The resync archive is not atomic, and a lone snapshot is ignored | Medium | Confirmed |
-| 22 | Snapshot paths are resolved three ways, and a served snapshot is barely checked | Medium | Confirmed |
+| 21 | The resync archive is not atomic, and a lone snapshot is ignored | Medium | Confirmed (partially fixed: snapshot archived on its own filesystem) |
+| 22 | Snapshot paths are resolved three ways, and a served snapshot is barely checked | Medium | Confirmed (partially fixed: one resolver for every role) |
 | 23 | Without the hash chain, an ahead-of-tip replica is credited by the ack gate | Medium | Confirmed |
 | 24 | The shutdown drain skips a failed encode after allocating its sequence | Low | Confirmed (fixed) |
 | 25 | A crash inside a snapshot save leaves no snapshot under its name | Low | Confirmed |
@@ -1078,6 +1078,20 @@ two archive directories.
 archive the snapshot on its own filesystem, and treat a lone snapshot as
 an orphan to archive.
 
+**Status: partially fixed** (the location half, step 0 of
+`bench-continuous-snapshots-2026-10.md`). `archive_local_lineage` takes
+the node's `NodeStore` and archives the snapshot and its `.prev` into
+`<snapshot-name>.<reason>.<n>/` beside the snapshot, with the journal's
+material in `<journal-name>.<reason>.<n>/` beside the journal and one `n`
+free in both; a snapshot sharing the journal's directory keeps the single
+archive directory. Every rename stays in one directory, so EXDEV cannot
+occur, and both source parents and both archive directories are fsynced
+(best effort). The copy-fallback claim in `docs/journal-rotation.md` is
+corrected. Still open: the durable intent marker (the archive is still a
+sequence of renames with no rollback, now across two directories when the
+snapshot is elsewhere), and archiving a lone snapshot at replica
+recovery.
+
 ### 22. Snapshot paths are resolved three ways, and a served snapshot is barely checked
 
 **Medium. Confirmed.**
@@ -1104,6 +1118,22 @@ frame has already made the replica archive its lineage.
 
 **Fix direction.** One resolver for every role, and validation as strict
 as `snapshot::load` before the verdict is sent.
+
+**Status: partially fixed** (the location half, step 0 of
+`bench-continuous-snapshots-2026-10.md`). `--snapshot` is removed;
+`NodeStore` (`transport-core/src/node_store.rs`), built once by
+`ServerConfig::store()`, resolves `--snapshot-path` or the derived path,
+and every role (primary boot, replica recovery and resync, the shadow,
+the transfer and its preflight) takes the snapshot from it. The store
+refuses a snapshot directory that is missing or not a directory, a
+snapshot path equal to the journal, and a first `--snapshot-path` on a
+node with no journal whose snapshot is still at the derived path. Still
+open: validation of a served snapshot (the primary still checks only its
+header before the verdict), and the second consequence: a node with no
+journal and nothing at its snapshot path still boots `Fresh` from
+genesis, so a mistyped `--snapshot-path` on the snapshot-only upgrade
+layout is not caught. Closing that needs an explicit "this boot continues
+a history" intent.
 
 ### 23. Without the hash chain, an ahead-of-tip replica is credited by the ack gate
 
@@ -1301,8 +1331,9 @@ Not determinism, but each one defeats failover or stalls a node.
   previous snapshot remains intact (finding 25) and that a crash mid-write
   is handled (finding 16).
 - `docs/journal-rotation.md` says a headerless live file is recreated
-  (finding 38), describes an EXDEV copy fallback (finding 21) and promises
-  matching archive numbering (finding 39).
+  (finding 38) and promises matching archive numbering (finding 39). (Its
+  EXDEV copy fallback, finding 21, was replaced with the snapshot's
+  archive on its own filesystem.)
 - `docs/building-an-application.md` lacks the tick pattern (finding 17), a
   canonical and query-free decode requirement (finding 26), a warning that
   interior mutability defeats `query(&self)`, the debug-versus-release

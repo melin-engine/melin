@@ -24,6 +24,7 @@ use melin_journal::JournalError;
 use melin_journal::JournalWrite;
 use melin_transport_core::journaled_app::JournaledApp;
 use melin_transport_core::lineage::{Lineage, LineagePolicy};
+use melin_transport_core::node_store::{NodeStore, NodeStoreError};
 use melin_transport_core::pipeline::{
     InputSlot, OutputSlot as GenericOutputSlot, Pipeline as GenericPipeline,
     build_pipeline_with_replication,
@@ -183,9 +184,6 @@ pub struct ServerConfig {
     /// Path to the journal file for durable event sourcing.
     #[arg(long, default_value = "melin.journal")]
     pub journal: PathBuf,
-    /// Path to a snapshot file for faster recovery.
-    #[arg(long)]
-    pub snapshot: Option<PathBuf>,
     /// Where each pipeline thread runs, as comma-separated `thread=core`
     /// entries in any order. Threads: journal-seq, matching, response, reader,
     /// event-publisher, shadow, repl-handler-0, repl-handler-1, journal-prep,
@@ -449,8 +447,11 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 3_000_000)]
     pub snapshot_interval_ms: u64,
 
-    /// Path for shadow snapshots. Defaults to the journal path with a
-    /// `.snapshot` extension (same as the startup snapshot path).
+    /// The node's snapshot file: read at boot, served to replicas that
+    /// need one, and written by the shadow stage. Defaults to the journal
+    /// path with a `.snapshot` extension. Its directory must exist; its
+    /// temporary file (`.tmp`), its previous copy (`.prev`) and any resync
+    /// archive of it stay in that directory.
     #[arg(long)]
     pub snapshot_path: Option<PathBuf>,
 
@@ -542,7 +543,6 @@ impl Default for ServerConfig {
         Self {
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9876),
             journal: PathBuf::from("melin.journal"),
-            snapshot: None,
             cores: PipelineCores {
                 journal_seq: Placement::spinning(1),
                 matching: Placement::spinning(2),
@@ -634,12 +634,13 @@ impl ServerConfig {
         }
     }
 
-    /// Snapshot path for the shadow stage. Uses the explicit `--snapshot-path`
-    /// if set, otherwise derives from the journal path with `.snapshot` extension.
-    pub fn shadow_snapshot_path(&self) -> PathBuf {
-        self.snapshot_path
-            .clone()
-            .unwrap_or_else(|| self.journal.with_extension("snapshot"))
+    /// The node's journal and snapshot locations, resolved from `--journal`
+    /// and `--snapshot-path` (see [`NodeStore::resolve`], which refuses a
+    /// layout the node must not start on). The node builds it once, as it
+    /// starts, and hands it to every role that reads, writes, serves or
+    /// archives the snapshot.
+    pub fn store(&self) -> Result<NodeStore, NodeStoreError> {
+        NodeStore::resolve(self.journal.clone(), self.snapshot_path.clone())
     }
 
     /// What the response stage needs to release a halted primary's held
@@ -1032,6 +1033,10 @@ where
     // middle of a failover. `run_as_primary` re-checks (a promotion
     // reaches it without passing through boot).
     validate_primary_config(&config)?;
+    // Where this node's journal and snapshot are, for every role below.
+    // Resolved here, with the configuration's other checks: it refuses a
+    // layout the node must not start on, and writes nothing.
+    let store = config.store()?;
 
     // Bind the replication listener up front, before any pipeline thread
     // exists and regardless of role: a bad or stolen --replication-bind
@@ -1181,12 +1186,11 @@ where
 
         match crate::replication::run_receiver::<A>(
             primary_addr,
-            &config.journal,
+            &store,
             &signing_key,
             &shutdown,
             &control,
             config.snapshot_interval_ms,
-            config.shadow_snapshot_path(),
             config.cores,
             config.journal_staging_mode.into(),
             config.group_commit_delay(),
@@ -1229,6 +1233,7 @@ where
                     listener,
                     repl_listener,
                     &config,
+                    &store,
                     startup.on_primary,
                     decoder,
                     encoder,
@@ -1279,6 +1284,7 @@ where
         began_history,
     } = init_engine::<A, BufferedWriter<A::Event>>(
         &config,
+        &store,
         &sizing,
         std::mem::take(&mut startup.genesis),
     )?;
@@ -1332,6 +1338,7 @@ where
         listener,
         repl_listener,
         &config,
+        &store,
         startup.on_primary,
         decoder,
         encoder,
@@ -1701,6 +1708,9 @@ fn run_as_primary<A, L>(
     // and held from boot on replicas so a promotion cannot fail on it.
     repl_listener: Option<crate::replication::ReplicationListener>,
     config: &ServerConfig,
+    // The node's journal and snapshot, as resolved at boot: written by the
+    // shadow stage and served by the replication sender.
+    store: &NodeStore,
     // The `on_primary` half of the application's `StartupEvents`. Genesis
     // never reaches here: it is journaled as the journal is created, in
     // `init_engine`, and a promoted node has it from the stream.
@@ -2032,7 +2042,7 @@ where
 
         let batch_size = config.replication_batch_size;
         let heartbeat_secs = config.replication_heartbeat_secs;
-        let journal_path = config.journal.clone();
+        let store = store.clone();
         let repl_auth_keys = Arc::clone(&authorized_keys);
         let evict_flags = replication_ring_progress
             .as_ref()
@@ -2092,7 +2102,7 @@ where
                         repl_consumer_1,
                         repl_consumer_2,
                         replica_slots: repl_slots,
-                        journal_path,
+                        store,
                         authorized_keys: repl_auth_keys,
                         evict_flags,
                         active_flags,
@@ -2136,6 +2146,7 @@ where
         shadow_app,
         chain_hash_lock,
         config,
+        store,
         &cores,
         &shutdown,
         Lineage {
@@ -2542,6 +2553,9 @@ where
     // every role — a replica's configuration is the one it serves under
     // once promoted.
     validate_primary_config(&config)?;
+    // As on the kernel-TCP path: the node's journal and snapshot, for
+    // every role below, refused before anything touches the disk.
+    let store = config.store()?;
     // Initialize shared DPDK resources (EAL, mempool, ports with N queues).
     let shared = melin_dpdk::DpdkShared::init(&dpdk_config)?;
     // Actual queue count may be less than requested (TAP only supports 1).
@@ -2685,11 +2699,10 @@ where
             primary_ipv4,
             primary_addr.port(),
             &signing_key,
-            &config.journal,
+            &store,
             &shutdown,
             &control,
             config.snapshot_interval_ms,
-            config.shadow_snapshot_path(),
             config.cores,
             config.journal_staging_mode.into(),
             config.group_commit_delay(),
@@ -2752,6 +2765,7 @@ where
                     transport,
                     &dpdk_config,
                     &config,
+                    &store,
                     startup.on_primary,
                     decoder,
                     encoder,
@@ -2816,6 +2830,7 @@ where
         began_history: _,
     } = init_engine::<A, BufferedWriter<A::Event>>(
         &config,
+        &store,
         &sizing,
         std::mem::take(&mut startup.genesis),
     )?;
@@ -2880,6 +2895,7 @@ where
         transport,
         &dpdk_config,
         &config,
+        &store,
         startup.on_primary,
         decoder,
         encoder,
@@ -2920,6 +2936,8 @@ fn run_as_primary_dpdk<A>(
     mut transport: melin_dpdk::DpdkTransport,
     dpdk_config: &melin_dpdk::DpdkConfig,
     config: &ServerConfig,
+    // As `run_as_primary`'s.
+    store: &NodeStore,
     on_primary: Vec<A::Event>,
     decoder: RequestDecoderArc<A>,
     encoder: ResponseEncoderArc<A>,
@@ -3157,6 +3175,7 @@ where
         shadow_app,
         chain_hash_lock,
         config,
+        store,
         &cores,
         &shutdown,
         Lineage {
@@ -3221,7 +3240,6 @@ where
                     Arc::new(AtomicBool::new(false)),
                 ]
             });
-        let journal_path = config.journal.clone();
 
         // Add the replication listener to the client transport so the
         // poll thread accepts both client and replication connections
@@ -3244,7 +3262,7 @@ where
         let driver = crate::replication::DpdkReplicationDriver::new(
             [repl_consumer_1, repl_consumer_2],
             repl_slots,
-            journal_path,
+            store.clone(),
             ready_flag,
             connected_counter,
             dpdk_evict_flags,
@@ -3672,6 +3690,9 @@ pub(crate) struct InitializedEngine<A, W> {
 /// [`write_genesis_journal`]: melin_transport_core::journaled_app::write_genesis_journal
 pub(crate) fn init_engine<A, W>(
     config: &ServerConfig,
+    // The node's journal and its one snapshot location — the file the
+    // shadow stage writes, so the one a restart recovers from.
+    store: &NodeStore,
     sizing: &A::Sizing,
     genesis: Vec<A::Event>,
 ) -> Result<InitializedEngine<A, W>, Box<dyn std::error::Error>>
@@ -3681,6 +3702,7 @@ where
 {
     use melin_transport_core::journaled_app::write_genesis_journal;
 
+    let journal = store.journal();
     // Replay the journal at the configured path into a fresh instance,
     // sized before the history is applied to it, as a replica is before
     // it applies the stream: replay must not grow the collections the
@@ -3688,19 +3710,10 @@ where
     let recover_journal = || -> Result<JournaledApp<A, W>, Box<dyn std::error::Error>> {
         let mut app = A::default();
         <A as Application>::prefault(&mut app, sizing);
-        Ok(JournaledApp::<A, W>::recover(app, &config.journal)?)
+        Ok(JournaledApp::<A, W>::recover(app, journal)?)
     };
 
-    // Check for a snapshot: either the explicit --snapshot path, or the
-    // default derived path (used by auto-rotation when --snapshot is not set).
-    let derived_snap = config.journal.with_extension("snapshot");
-    let snap_path = config.snapshot.as_deref().or_else(|| {
-        if derived_snap.exists() {
-            Some(derived_snap.as_path())
-        } else {
-            None
-        }
-    });
+    let snap_path = store.snapshot();
 
     // The journal *lineage* exists if either the live segment or any
     // archived segment is on disk. Deciding on the live file alone is
@@ -3710,21 +3723,20 @@ where
     // that layout would silently rewind every event in the archives.
     // `JournaledApp::recover*` handles the missing-live case itself
     // (replays archives, synthesizes a fresh live continuing the chain).
-    let journal_exists = config.journal.exists();
-    let archives_exist = !melin_journal::segment::list_archives(&config.journal)?.is_empty();
-    let snapshot_exists = snap_path.is_some_and(|p| p.exists());
+    let journal_exists = journal.try_exists()?;
+    let archives_exist = !melin_journal::segment::list_archives(journal)?.is_empty();
+    let snapshot_exists = snap_path.try_exists()?;
     // An interrupted first boot's staging file is never history: sweep
     // it on every boot, not only on one that journals a genesis, so it
     // does not linger next to a history begun some other way.
-    melin_transport_core::journaled_app::discard_genesis_staging(&config.journal)?;
+    melin_transport_core::journaled_app::discard_genesis_staging(journal)?;
     // Set by the two arms that begin the history.
     let mut began_history = false;
     let mut engine: JournaledApp<A, W> =
         match choose_bootstrap(snapshot_exists, journal_exists, archives_exist) {
             BootstrapSource::SnapshotAndJournal => {
-                let snap_path = snap_path.expect("snapshot_exists implies snap_path");
                 info!(snapshot = %snap_path.display(), "recovering from snapshot + journal");
-                JournaledApp::<A, W>::recover_from_snapshot(snap_path, &config.journal)?
+                JournaledApp::<A, W>::recover_from_snapshot(snap_path, journal)?
             }
             BootstrapSource::SnapshotOnly => {
                 // Snapshot exists but no journal segment survives at all —
@@ -3734,7 +3746,6 @@ where
                 // segment starts empty (the standard upgrade, which
                 // starts a new binary on a fresh journal next to a
                 // snapshot, lands here).
-                let snap_path = snap_path.expect("snapshot_exists implies snap_path");
                 info!(
                     snapshot = %snap_path.display(),
                     "recovering from snapshot only (no journal segments on disk)"
@@ -3743,7 +3754,7 @@ where
                 // the only record of the lineage left on disk.
                 let (app, snap) = melin_transport_core::snapshot::load::<A>(snap_path)?;
                 let writer = W::create_continuing(
-                    &config.journal,
+                    journal,
                     snap.sequence + 1,
                     snap.chain_hash,
                     snap.genesis_entries,
@@ -3772,19 +3783,14 @@ where
                         // copied the empty journal still chains to this
                         // one.
                         drop(engine);
-                        let anchor =
-                            melin_journal::segment::read_header_info(&config.journal)?.anchor_hash;
+                        let anchor = melin_journal::segment::read_header_info(journal)?.anchor_hash;
                         warn!(
-                            journal = %config.journal.display(),
+                            journal = %journal.display(),
                             "the journal holds no entry and records no genesis \
                              length: journaling genesis (an earlier release's \
                              first boot stopped before journaling it)"
                         );
-                        write_genesis_journal::<A::Event, W>(
-                            &config.journal,
-                            Some(anchor),
-                            genesis,
-                        )?;
+                        write_genesis_journal::<A::Event, W>(journal, Some(anchor), genesis)?;
                         began_history = true;
                         recover_journal()?
                     }
@@ -3792,7 +3798,7 @@ where
             }
             BootstrapSource::Fresh => {
                 info!("creating new journal");
-                write_genesis_journal::<A::Event, W>(&config.journal, None, genesis)?;
+                write_genesis_journal::<A::Event, W>(journal, None, genesis)?;
                 began_history = true;
                 recover_journal()?
             }
@@ -3892,6 +3898,8 @@ fn spawn_shadow_stage<A: Application + Send + 'static>(
         melin_pipeline::seqlock::SeqLockReader<melin_transport_core::pipeline::FsyncState>,
     >,
     config: &ServerConfig,
+    // Where the stage writes: the node's one snapshot location.
+    store: &NodeStore,
     cores: &PipelineCores,
     shutdown: &Arc<AtomicBool>,
     initial_lineage: Lineage,
@@ -3908,7 +3916,7 @@ where
     let Some(shadow_cons) = shadow_consumer else {
         return Ok(None);
     };
-    let snap_path = config.shadow_snapshot_path();
+    let snap_path = store.snapshot().to_path_buf();
     let interval = std::time::Duration::from_millis(config.snapshot_interval_ms);
     let chain_hash =
         chain_hash_lock.ok_or("chain hash lock must be Some when shadow is enabled")?;
@@ -3933,7 +3941,7 @@ where
 
     info!(
         interval_ms = config.snapshot_interval_ms,
-        path = %config.shadow_snapshot_path().display(),
+        path = %store.snapshot().display(),
         "shadow snapshot stage started"
     );
     Ok(Some(handle))
@@ -4414,6 +4422,60 @@ mod tests {
         }
     }
 
+    /// `--snapshot` is gone, refused as unknown rather than read as
+    /// something else; `--snapshot-path` is the store's snapshot, and
+    /// without it the store derives one from `--journal`.
+    #[test]
+    fn the_snapshot_path_flag_is_the_store_s_snapshot() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = dir.path().join("node.journal");
+        let snapshot = dir.path().join("elsewhere.snap");
+        let journal_arg = journal.to_str().expect("utf-8 path");
+        let snapshot_arg = snapshot.to_str().expect("utf-8 path");
+
+        let Err(removed) = super::ServerConfig::try_parse_from([
+            "melin-server",
+            "--journal",
+            journal_arg,
+            "--snapshot",
+            snapshot_arg,
+        ]) else {
+            panic!("--snapshot is no longer a flag");
+        };
+        assert_eq!(removed.kind(), clap::error::ErrorKind::UnknownArgument);
+
+        let given = super::ServerConfig::try_parse_from([
+            "melin-server",
+            "--journal",
+            journal_arg,
+            "--snapshot-path",
+            snapshot_arg,
+        ])
+        .expect("parses");
+        let store = given.store().expect("store");
+        assert_eq!(store.snapshot(), snapshot);
+        assert_eq!(store.journal(), journal);
+
+        let derived =
+            super::ServerConfig::try_parse_from(["melin-server", "--journal", journal_arg])
+                .expect("parses")
+                .store()
+                .expect("store");
+        assert_eq!(derived.snapshot(), dir.path().join("node.snapshot"));
+
+        // A refused layout surfaces through `store()`.
+        let missing = super::ServerConfig {
+            journal: journal.clone(),
+            snapshot_path: Some(dir.path().join("missing").join("x.snapshot")),
+            ..super::ServerConfig::default()
+        };
+        assert!(matches!(
+            missing.store(),
+            Err(super::NodeStoreError::SnapshotDirMissing { .. })
+        ));
+    }
+
     /// Full bootstrap decision matrix. The two archive-only cells are
     /// the regression guard: a post-rotation crash leaves archives with
     /// no live segment, and bootstrapping "snapshot only" (or "fresh")
@@ -4834,8 +4896,13 @@ mod genesis_tests {
     /// Boot `init_engine` on `cfg` with `genesis`: the recovered value and
     /// the writer's next sequence.
     fn boot(cfg: &ServerConfig, genesis: &[u64]) -> (u64, u64) {
-        let engine =
-            init_engine::<Counter, Writer>(cfg, &(), increments(genesis)).expect("init_engine");
+        let engine = init_engine::<Counter, Writer>(
+            cfg,
+            &cfg.store().expect("store"),
+            &(),
+            increments(genesis),
+        )
+        .expect("init_engine");
         (value(&engine.app), engine.writer.next_sequence())
     }
 
@@ -4843,7 +4910,7 @@ mod genesis_tests {
     /// history — what holds a new primary's clients until its first
     /// replica attaches.
     fn began_history(cfg: &ServerConfig, genesis: &[u64]) -> bool {
-        init_engine::<Counter, Writer>(cfg, &(), increments(genesis))
+        init_engine::<Counter, Writer>(cfg, &cfg.store().expect("store"), &(), increments(genesis))
             .expect("init_engine")
             .began_history
     }
@@ -4915,9 +4982,14 @@ mod genesis_tests {
     fn a_snapshot_only_boot_journals_no_genesis() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = config(dir.path());
-        let engine =
-            init_engine::<Counter, Writer>(&cfg, &(), increments(&[1_000_000])).expect("boot");
-        save_snapshot(&engine, &cfg.journal.with_extension("snapshot"));
+        let engine = init_engine::<Counter, Writer>(
+            &cfg,
+            &cfg.store().expect("store"),
+            &(),
+            increments(&[1_000_000]),
+        )
+        .expect("boot");
+        save_snapshot(&engine, cfg.store().expect("store").snapshot());
         drop(engine);
         std::fs::remove_file(&cfg.journal).expect("move the journal aside");
 
@@ -5006,9 +5078,14 @@ mod genesis_tests {
                 .expect("a replica's empty copy"),
         );
         for configured in [&[][..], &[1_000, 2_000], &[1_000, 2_000, 4_000]] {
-            let refused = init_engine::<Counter, Writer>(&cfg, &(), increments(configured))
-                .err()
-                .expect("an empty copy of a genesis is refused");
+            let refused = init_engine::<Counter, Writer>(
+                &cfg,
+                &cfg.store().expect("store"),
+                &(),
+                increments(configured),
+            )
+            .err()
+            .expect("an empty copy of a genesis is refused");
             assert!(
                 refused.to_string().contains("refusing to start"),
                 "{configured:?}: {refused}"
@@ -5106,9 +5183,14 @@ mod genesis_tests {
         partial_replica_copy(&cfg.journal);
 
         for configured in [&[][..], &[1_000, 2_000, 4_000], &[1, 2, 3, 4, 5]] {
-            let refused = init_engine::<Counter, Writer>(&cfg, &(), increments(configured))
-                .err()
-                .expect("a genesis prefix is refused");
+            let refused = init_engine::<Counter, Writer>(
+                &cfg,
+                &cfg.store().expect("store"),
+                &(),
+                increments(configured),
+            )
+            .err()
+            .expect("a genesis prefix is refused");
             assert!(
                 refused.to_string().contains("refusing to start"),
                 "{configured:?}: {refused}"
@@ -5118,21 +5200,21 @@ mod genesis_tests {
 
         // The same history behind a snapshot: still a prefix, whose
         // snapshot records the genesis length too.
-        let snapshot = cfg.journal.with_extension("snapshot");
         melin_transport_core::JournaledApp::<Counter, Writer>::recover(
             Counter::default(),
             &cfg.journal,
         )
         .expect("recover the partial copy")
-        .save_snapshot(&snapshot)
+        .save_snapshot(cfg.store().expect("store").snapshot())
         .expect("save snapshot");
-        init_engine::<Counter, Writer>(&cfg, &(), Vec::new())
+        init_engine::<Counter, Writer>(&cfg, &cfg.store().expect("store"), &(), Vec::new())
             .err()
             .expect("snapshot + journal holding a prefix is refused");
         std::fs::remove_file(&cfg.journal).expect("move the journal aside");
-        let refused = init_engine::<Counter, Writer>(&cfg, &(), Vec::new())
-            .err()
-            .expect("a snapshot holding a prefix is refused");
+        let refused =
+            init_engine::<Counter, Writer>(&cfg, &cfg.store().expect("store"), &(), Vec::new())
+                .err()
+                .expect("a snapshot holding a prefix is refused");
         assert!(
             refused.to_string().contains("refusing to start"),
             "{refused}"
@@ -5170,8 +5252,13 @@ mod genesis_tests {
             .expect("one entry");
         drop(writer);
 
-        let engine = init_engine::<Counter, Writer>(&cfg, &(), increments(&[1, 2, 3]))
-            .expect("an unknown genesis length is not checked");
+        let engine = init_engine::<Counter, Writer>(
+            &cfg,
+            &cfg.store().expect("store"),
+            &(),
+            increments(&[1, 2, 3]),
+        )
+        .expect("an unknown genesis length is not checked");
         assert_eq!(value(&engine.app), 7);
         assert_eq!(engine.writer.next_sequence(), 2);
         assert_eq!(genesis_entries(&cfg.journal), None, "still a v15 lineage");
@@ -5179,7 +5266,7 @@ mod genesis_tests {
 
         // Snapshot-only: the v2 snapshot (unknown length) starts a v15
         // segment, and the boot is not checked.
-        save_snapshot(&engine, &cfg.journal.with_extension("snapshot"));
+        save_snapshot(&engine, cfg.store().expect("store").snapshot());
         drop(engine);
         std::fs::remove_file(&cfg.journal).expect("move the journal aside");
         assert_eq!(boot(&cfg, &[1, 2, 3]), (7, 2));
@@ -5445,7 +5532,13 @@ mod primary_gate_policy_tests {
 
         type Writer = melin_journal::BufferedWriter<CounterEvent>;
         let boot = |cfg: &super::ServerConfig| {
-            super::init_engine::<Counter, Writer>(cfg, &(), Vec::new()).expect("boot")
+            super::init_engine::<Counter, Writer>(
+                cfg,
+                &cfg.store().expect("store"),
+                &(),
+                Vec::new(),
+            )
+            .expect("boot")
         };
         let change = |policy: AckPolicy, unwitnessed| {
             JournalEvent::AckPolicyChange(AckPolicyChange {
@@ -5494,7 +5587,7 @@ mod primary_gate_policy_tests {
             engine.recovered_lineage, expected,
             "recovered from the journal"
         );
-        super::genesis_tests::save_snapshot(&engine, &cfg.journal.with_extension("snapshot"));
+        super::genesis_tests::save_snapshot(&engine, cfg.store().expect("store").snapshot());
         drop(engine);
         std::fs::remove_file(&cfg.journal).expect("prune the journal");
         assert!(

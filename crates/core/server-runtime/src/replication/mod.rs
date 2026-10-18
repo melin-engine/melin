@@ -66,6 +66,7 @@ use melin_journal::{BufferedWriter, JournalWrite};
 
 use melin_app::Application;
 use melin_transport_core::lineage::SharedLineagePolicy;
+use melin_transport_core::node_store::NodeStore;
 use melin_transport_core::pipeline::{InputSlot, OutputSlot};
 use melin_transport_core::replication::archive::{ArchiveReason, archive_local_lineage};
 use melin_transport_core::replication::protocol::{MAX_CONTROL_FRAME, decode_primary_message};
@@ -560,7 +561,8 @@ pub(super) fn build_replica_pipeline_with_threads<A>(
     // is not a primary-only tuning knob.
     staging_mode: melin_journal::StagingMode,
     snapshot_interval_ms: u64,
-    snapshot_path: std::path::PathBuf,
+    // Where the replica's shadow stage writes its snapshots.
+    store: &NodeStore,
     group_commit_delay: std::time::Duration,
     fence_state: Arc<melin_transport_core::fence::FenceState>,
     // The lineage's ack policy as recovered (see
@@ -693,7 +695,7 @@ where
     .map_err(|e| abandon(format!("start the replica's drain thread: {e}")))?;
 
     let shadow_handle = if let Some(shadow_cons) = pipeline.shadow_consumer {
-        let snap_path = snapshot_path;
+        let snap_path = store.snapshot().to_path_buf();
         let chain_lock = pipeline.chain_hash_lock.clone();
         let ps = Arc::clone(&pipeline_shutdown);
         let shadow = cores.shadow;
@@ -805,8 +807,7 @@ pub(super) const MAX_INPROCESS_DIVERGENCE_RESYNCS: u32 = 1;
 /// HashMismatch → archive → reseed path in-process.
 #[allow(clippy::type_complexity)]
 pub(super) fn recover_replica_state<A, W>(
-    journal_path: &std::path::Path,
-    snapshot_path: &std::path::Path,
+    store: &NodeStore,
     fence_state: &melin_transport_core::fence::FenceState,
     lineage_policy: &SharedLineagePolicy,
     // Applied to a genesis instance before the journal is replayed into
@@ -819,16 +820,16 @@ where
 {
     // Swept every boot, like the genesis staging file: only a later adopt
     // that meets its narrow guard would otherwise remove it.
+    let journal_path = store.journal();
+    let snapshot_path = store.snapshot();
     remove_restamp_staging(journal_path)?;
-    let lineage_exists =
-        journal_path.exists() || !melin_journal::segment::list_archives(journal_path)?.is_empty();
-    if !lineage_exists {
+    if !store.journal_lineage_exists()? {
         // Nothing held, so no policy either (the epoch stays: fencing
         // never moves it back).
         lineage_policy.store(None);
         return Ok((None, None, 0u64, [0u8; 32]));
     }
-    let engine = if snapshot_path.exists() {
+    let engine = if snapshot_path.try_exists()? {
         tracing::info!("recovering replica from snapshot + journal");
         melin_transport_core::JournaledApp::<A, W>::recover_from_snapshot(
             snapshot_path,
@@ -956,8 +957,7 @@ pub(in crate::replication) fn handle_session_exit<A, W>(
     divergence_resyncs: &mut u32,
     backoff: &mut std::time::Duration,
     last_sequence: u64,
-    journal_path: &std::path::Path,
-    snapshot_path: &std::path::Path,
+    store: &NodeStore,
     fence_state: &melin_transport_core::fence::FenceState,
     lineage_policy: &SharedLineagePolicy,
     shutdown: &AtomicBool,
@@ -1040,13 +1040,7 @@ where
                 max_attempts = MAX_INPROCESS_DIVERGENCE_RESYNCS,
                 "mid-stream chain divergence — re-deriving local state for in-process resync"
             );
-            match recover_replica_state::<A, W>(
-                journal_path,
-                snapshot_path,
-                fence_state,
-                lineage_policy,
-                sizing,
-            ) {
+            match recover_replica_state::<A, W>(store, fence_state, lineage_policy, sizing) {
                 Ok((app, journal_writer, seq, hash)) => AfterSession::Resync {
                     app,
                     journal_writer,
@@ -1198,8 +1192,9 @@ pub(in crate::replication) enum ResyncDecision {
 }
 
 /// Receive the snapshot + segment-seed transfer that follows a resync
-/// verdict, installing both (snapshot → `snapshot_path`, seed →
-/// `journal_path`), and returns what they yield ([`ResyncTransfer`]).
+/// verdict, installing both (snapshot → the store's snapshot, by way of
+/// its `.tmp`, the shadow stage's own temp name; seed → the store's
+/// journal), and returns what they yield ([`ResyncTransfer`]).
 /// Shared by both receivers via [`ControlFrameSource`].
 ///
 /// Errors here are network-shaped — the caller retries (see
@@ -1207,8 +1202,7 @@ pub(in crate::replication) enum ResyncDecision {
 /// [`handle_resync_verdict`] is what's fatal.
 fn receive_resync_transfer<A, S>(
     source: &mut S,
-    snapshot_path: &std::path::Path,
-    journal_path: &std::path::Path,
+    store: &NodeStore,
 ) -> Result<ResyncTransfer<A>, Box<dyn std::error::Error + Send + Sync>>
 where
     A: Application + Send,
@@ -1225,9 +1219,14 @@ where
         };
 
     tracing::info!(snap_sequence, snap_len, "receiving snapshot");
-    let tmp_path = snapshot_path.with_extension("snapshot.tmp");
+    let snapshot_path = store.snapshot();
+    let journal_path = store.journal();
+    let tmp_path = store.snapshot_tmp();
     receive_chunked_body(source, &tmp_path, snap_len, "snapshot")?;
     std::fs::rename(&tmp_path, snapshot_path)?;
+    // The snapshot's own directory: the seed's sync below covers only the
+    // journal's, which the snapshot need not share.
+    melin_journal::segment::fsync_parent_dir(snapshot_path)?;
     tracing::info!(snap_sequence, snap_len, "snapshot received and verified");
 
     // The primary is already sending the seed: a large state must not
@@ -1299,8 +1298,7 @@ pub(in crate::replication) fn handle_resync_verdict<A, W, S>(
     pipeline: &mut Option<ReplicaPipelineHandles<A, W>>,
     app: &mut Option<A>,
     journal_writer: &mut Option<W>,
-    journal_path: &std::path::Path,
-    snapshot_path: &std::path::Path,
+    store: &NodeStore,
     fence_state: &melin_transport_core::fence::FenceState,
     control: &ReplicaControlPlane,
     last_sequence: &mut u64,
@@ -1364,7 +1362,9 @@ where
         // Dropped after the teardown and before the archive, as before.
         drop(old_app);
         drop(old_writer);
-        archive_local_lineage(journal_path, snapshot_path, reason)
+        // Where the lineage went is logged by the archive itself; the
+        // resync needs only the paths freed.
+        archive_local_lineage(store, reason).map(drop)
     })?;
     // Archived — a retried handshake must present as a fresh replica,
     // holding no lineage, so no policy either.
@@ -1385,17 +1385,18 @@ where
         snap_chain_hash,
         seed_len,
         lineage: snap_lineage,
-    } = match receive_resync_transfer::<A, S>(source, snapshot_path, journal_path) {
+    } = match receive_resync_transfer::<A, S>(source, store) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(error = %e, "snapshot transfer failed — retrying");
             // Half-applied resync state, not audit material — drop it
             // so the retry starts clean (the pre-resync lineage is
             // already archived; this is not it).
-            let _ = std::fs::remove_file(snapshot_path);
+            let _ = std::fs::remove_file(store.snapshot());
             return Ok(ResyncDecision::Retry);
         }
     };
+    let journal_path = store.journal();
     // Adopt the primary's snapshot lineage — the resync rebases this
     // replica onto the primary's lineage, its epoch and ack policy
     // included. Only now: a transfer that failed part-way adopts nothing.
@@ -1924,14 +1925,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let fence = melin_transport_core::fence::FenceState::new(0);
         let journal = dir.path().join("replica.journal");
-        let snapshot = dir.path().join("replica.snapshot");
+        let store = NodeStore::resolve(journal.clone(), None).expect("store");
         let staging = journal.with_extension("restamp.tmp");
 
         // No lineage at all.
         std::fs::write(&staging, b"debris").expect("write staging");
         let (app, writer, _, _) = recover_replica_state::<counter_server::Counter, Writer>(
-            &journal,
-            &snapshot,
+            &store,
             &fence,
             &SharedLineagePolicy::new(None),
             &(),
@@ -1949,8 +1949,7 @@ mod tests {
         drop(w);
         std::fs::write(&staging, b"debris").expect("write staging");
         let (_, writer, last, _) = recover_replica_state::<counter_server::Counter, Writer>(
-            &journal,
-            &snapshot,
+            &store,
             &fence,
             &SharedLineagePolicy::new(None),
             &(),
@@ -1974,7 +1973,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let fence = melin_transport_core::fence::FenceState::new(0);
         let journal = dir.path().join("replica.journal");
-        let snapshot = dir.path().join("replica.snapshot");
+        let store = NodeStore::resolve(journal.clone(), None).expect("store");
         // A value no recovery below produces, so a record left alone
         // shows.
         let stale = Some(LineagePolicy {
@@ -1987,14 +1986,8 @@ mod tests {
         });
         let cell = SharedLineagePolicy::new(stale);
         let recover = |cell: &SharedLineagePolicy| {
-            recover_replica_state::<counter_server::Counter, Writer>(
-                &journal,
-                &snapshot,
-                &fence,
-                cell,
-                &(),
-            )
-            .expect("recover")
+            recover_replica_state::<counter_server::Counter, Writer>(&store, &fence, cell, &())
+                .expect("recover")
         };
 
         // No lineage: nothing held.
@@ -3773,7 +3766,7 @@ mod tests {
                 // Non-zero so the shadow thread is spawned; long enough
                 // that it never takes a snapshot.
                 3_600_000,
-                dir.path().join("replica.snapshot"),
+                &NodeStore::resolve(dir.path().join("replica.journal"), None).expect("store"),
                 std::time::Duration::ZERO,
                 Arc::new(melin_transport_core::fence::FenceState::new(0)),
                 &SharedLineagePolicy::new(None),
@@ -4003,8 +3996,7 @@ mod tests {
             &mut divergence_resyncs,
             &mut backoff,
             0,
-            &dir.path().join("r.journal"),
-            &dir.path().join("r.snapshot"),
+            &NodeStore::resolve(dir.path().join("r.journal"), None).expect("store"),
             &melin_transport_core::fence::FenceState::new(0),
             &SharedLineagePolicy::new(None),
             &AtomicBool::new(false),
@@ -4065,8 +4057,7 @@ mod tests {
                 &mut divergence_resyncs,
                 &mut backoff,
                 0,
-                &dir.path().join("r.journal"),
-                &dir.path().join("r.snapshot"),
+                &NodeStore::resolve(dir.path().join("r.journal"), None).expect("store"),
                 &melin_transport_core::fence::FenceState::new(0),
                 &SharedLineagePolicy::new(None),
                 &shutdown,
@@ -4106,8 +4097,7 @@ mod tests {
             &mut divergence_resyncs,
             &mut backoff,
             0,
-            &dir.path().join("r.journal"),
-            &dir.path().join("r.snapshot"),
+            &NodeStore::resolve(dir.path().join("r.journal"), None).expect("store"),
             &melin_transport_core::fence::FenceState::new(0),
             &SharedLineagePolicy::new(None),
             &shutdown,
@@ -4204,8 +4194,7 @@ mod tests {
             &mut divergence_resyncs,
             &mut backoff,
             2,
-            &dir.path().join("r.journal"),
-            &dir.path().join("r.snapshot"),
+            &NodeStore::resolve(dir.path().join("r.journal"), None).expect("store"),
             &melin_transport_core::fence::FenceState::new(0),
             &SharedLineagePolicy::new(None),
             &shutdown,

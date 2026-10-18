@@ -887,6 +887,16 @@ from a node that was ever a primary may contain a fork and deserves
 the same care as a `.divergent.<n>` one. These directories are never
 cleaned up automatically — reclaim the space once reconciled.
 
+The snapshot's `.prev` (its one-deep rollback copy) is archived with it,
+so rolling a snapshot back to its `.prev` stays within one history. With
+`--snapshot-path` in another directory than the journal, the snapshot is
+archived beside itself, in a directory named after the snapshot file
+with the same reason and index as the journal's archive (for example
+`node-a.snapshot.divergent.0/` beside the snapshot and
+`melin.journal.divergent.0/` beside the journal): the two halves of one
+resync carry the same `<n>`, and the snapshot never leaves its own
+filesystem.
+
 ## Entry integrity in transit
 
 Every replicated entry carries the CRC32C its primary journaled it

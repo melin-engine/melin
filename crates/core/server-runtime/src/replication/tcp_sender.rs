@@ -13,6 +13,7 @@ use tracing::{debug, error, info, warn};
 
 use melin_journal::replication::ReplicationConsumer;
 use melin_pipeline::wait::WaitStrategy;
+use melin_transport_core::node_store::NodeStore;
 use melin_transport_core::replica_presence::{FirstAck, ReplicaPresence};
 
 use super::auth::authenticate_replica;
@@ -63,7 +64,9 @@ pub struct Sender {
     pub repl_consumer_1: ReplicationConsumer,
     pub repl_consumer_2: ReplicationConsumer,
     pub replica_slots: Arc<melin_transport_core::ReplicaSlotCursors>,
-    pub journal_path: std::path::PathBuf,
+    /// The node's journal, streamed to replicas, and its snapshot, sent to
+    /// one that needs a resync.
+    pub store: NodeStore,
     pub authorized_keys: Arc<melin_app::auth::AuthorizedKeys>,
     pub evict_flags: [Arc<AtomicBool>; 2],
     pub active_flags: [Arc<AtomicBool>; 2],
@@ -95,7 +98,7 @@ pub fn run_sender<A: Application>(
         repl_consumer_1,
         repl_consumer_2,
         replica_slots,
-        journal_path,
+        store,
         authorized_keys,
         evict_flags,
         active_flags,
@@ -300,7 +303,7 @@ pub fn run_sender<A: Application>(
                         .expect("empty_slot check guarantees consumer is Some");
 
                     let slot_cursors = Arc::clone(&cursors);
-                    let jpath = journal_path.clone();
+                    let slot_store = store.clone();
                     let auth_keys = Arc::clone(&authorized_keys);
                     let slot_metrics = Arc::clone(&metrics);
                     let slot_active = Arc::clone(&active_flags[slot_idx]);
@@ -333,7 +336,7 @@ pub fn run_sender<A: Application>(
                                 unsafe { &*(connected_flag as *const ReplicaPresence) };
                             let ctx = SlotContext {
                                 cursors: &slot_cursors,
-                                journal_path: &jpath,
+                                store: &slot_store,
                                 authorized_keys: &auth_keys,
                                 shutdown: shutdown_ref,
                                 replica_ready: ready_ref,
@@ -399,7 +402,7 @@ fn take_new_eviction(evict_flag_set: bool, handler_running: bool, counted: &mut 
 /// (`run_replica_slot` → `handle_replica_connection` → `live_stream_uring`).
 struct SlotContext<'a> {
     cursors: &'a Arc<ReplicaCursors>,
-    journal_path: &'a std::path::Path,
+    store: &'a NodeStore,
     authorized_keys: &'a melin_app::auth::AuthorizedKeys,
     shutdown: &'a AtomicBool,
     replica_ready: &'a AtomicBool,
@@ -441,7 +444,7 @@ fn handle_replica_connection<A: Application>(
 ) -> io::Result<()> {
     let SlotContext {
         cursors,
-        journal_path,
+        store,
         authorized_keys,
         shutdown,
         replica_ready,
@@ -458,6 +461,7 @@ fn handle_replica_connection<A: Application>(
     } = ctx;
     let slot_idx = *slot_idx;
     let heartbeat_secs = *heartbeat_secs;
+    let journal_path = store.journal();
 
     let mut reader = stream.try_clone()?;
     let mut writer = stream;
@@ -609,7 +613,7 @@ fn handle_replica_connection<A: Application>(
         // cannot produce (none configured, boundary segment pruned)
         // would strand it with its history moved aside. Failing here
         // drops the connection with the replica's journal intact.
-        preflight_snapshot_transfer(journal_path)?;
+        preflight_snapshot_transfer(store)?;
         if divergent {
             encode_hash_mismatch(&mut send_buf);
         } else {
@@ -617,7 +621,7 @@ fn handle_replica_connection<A: Application>(
         }
         publish(&send_buf)?;
         send_buf.clear();
-        match snapshot_transfer_with::<A::Event>(journal_path, &mut publish, shutdown)? {
+        match snapshot_transfer_with::<A::Event>(store, &mut publish, shutdown)? {
             CatchUpResult::Ok(end) => end,
             CatchUpResult::NeedSnapshot => {
                 return Err(io::Error::other(
@@ -804,7 +808,7 @@ fn live_stream_uring(
         wait,
         replicas_connected,
         // Only used during handshake/catch-up (handle_replica_connection).
-        journal_path: _,
+        store: _,
         authorized_keys: _,
         replica_ready: _,
         active_flag: _,

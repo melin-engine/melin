@@ -229,6 +229,14 @@ Journal segment rotation is independent of snapshots. When the live journal exce
 - **On interval** — the shadow stage writes snapshots every `--snapshot-interval-ms`.
 - **Before deploying a new application version** — version boundary (see Migration below).
 
+### Where Snapshots Go
+
+A node has one snapshot file, `--snapshot-path` (default: the journal path with a `.snapshot` extension). It is the file the node recovers from at boot, the one it sends to a replica that needs a resync, and the one its shadow stage writes; there is no other. Its temporary file (`.tmp`), its previous copy (`.prev`) and its resync archive stay in its directory, so every rename that touches the snapshot is atomic on its filesystem.
+
+For latency-critical deployments, put `--snapshot-path` on a disk other than the journal's. A snapshot save writes and syncs the whole state at once; on its own disk that I/O shares no device queue and no filesystem log with the journal's writes and syncs. The node refuses to start when the snapshot's directory does not exist, when the snapshot path names a directory rather than a file, when it names no file at all (for example a path ending in a slash), or when the snapshot path is the journal path.
+
+A node that has no journal yet and finds nothing at `--snapshot-path`, but finds a snapshot at the path derived from its journal, refuses to start too: this is a node on the [standard upgrade](#standard-upgrade)'s layout given `--snapshot-path` for the first time, which would otherwise begin a new history beside the snapshot it was meant to continue. Move the derived file to the new location, then start it.
+
 ## BLAKE3 Hash Chain
 
 Every journal segment maintains a BLAKE3 hash chain for tamper evidence. The chain is **schedule-free**: its value at any point depends only on the segment's header anchor and the raw bytes written so far — never on how writes were batched or when intermediate values were computed.
@@ -349,9 +357,9 @@ When changing the journal format (bumping `format_version`) or the application's
 
 ### Standard Upgrade
 
-1. **Take a snapshot** with the current (old) version. This captures the full application state at a known journal sequence.
+1. **Take a snapshot** with the current (old) version. This captures the full application state at a known journal sequence. It is the file at the node's `--snapshot-path` (see [Where Snapshots Go](#where-snapshots-go)); to start from a backup instead, copy the backup there.
 2. **Deploy the new version.**
-3. **Start fresh**: the new version creates a new journal file (new format) and loads the snapshot.
+3. **Start fresh**: the new version creates a new journal file (new format) and loads the snapshot at the same `--snapshot-path`.
    - The application's genesis is not journaled again: the snapshot's state already includes it, and the new journal continues from the snapshot with no entry of its own. Its header takes the genesis length the snapshot recorded.
    - The restarted node continues a history rather than beginning one, so it serves clients immediately, as after any restart. With replication enabled and an acknowledgement policy that requires a replica, it refuses writes until a replica reconnects.
    - The snapshot must be one the new version accepts. If the application's snapshot layout changed, the new version refuses the old `app_version`, and a one-time migration tool must convert the snapshot.
@@ -452,3 +460,8 @@ The `timestamp_ns` field is wall-clock time from `clock_gettime(CLOCK_REALTIME)`
 - **Single journal file** — no striping or parallel writes. The journal is single-threaded by design (LMAX architecture).
 - **No encryption** — journal and snapshot files are plaintext binary. Whatever the application's events and state contain is visible to anyone with file access.
 - **No verification without the chain** — a build with `--no-default-features` omits the hash chain, and with it every tamper and divergence check described above. See "Turning It Off".
+- **A snapshot sent to a replica is checked only by its header** — a primary does not verify the body's checksum or the application version before it tells a replica to resync. A damaged snapshot is found by the replica as it loads it, after the replica has moved its own history aside (into its resync archive, never deleted), and the replica retries until the primary has a good one.
+- **A resync's archive is not crash-atomic** — the old history is moved aside file by file. A crash in the middle can leave part of it in place beside the new one, which the hash chain then refuses at the next boot until an operator moves it aside.
+- **A mistyped `--snapshot-path` is not always caught** — a node with no journal and nothing at its snapshot path starts a new history, as on a first boot. On the standard upgrade's layout (a snapshot and no journal), check the path before starting.
+
+These hold wherever the snapshot lives: none is a reason to keep the snapshot on the journal's disk.

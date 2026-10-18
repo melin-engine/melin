@@ -454,6 +454,11 @@ fn a_stalled_join_costs_the_other_replica_nothing() {
 /// is held up is `a_stalled_join_costs_the_other_replica_nothing`'s to
 /// check; this one checks only that a join spread over many ticks
 /// completes intact.)
+///
+/// The primary and the divergent replica each keep their snapshot in a
+/// directory of their own (`--snapshot-path`): the join serves the
+/// primary's from there, and the divergent replica's resync archives its
+/// own old snapshot there, beside it.
 #[test]
 fn large_joins_complete_a_tick_at_a_time() {
     let _serial = serialise();
@@ -474,8 +479,10 @@ fn large_joins_complete_a_tick_at_a_time() {
     drop(writer);
 
     let mut primary_config = cluster.config(0, "primary");
-    // A snapshot to serve the divergent replica.
+    // A snapshot to serve the divergent replica, in a directory of its own.
     primary_config.snapshot_interval_ms = 200;
+    let snapshot = cluster.snapshot_dir("primary").join("primary.snapshot");
+    primary_config.snapshot_path = Some(snapshot.clone());
     let primary_addrs = Cluster::addrs(0);
     primary_config.replication_bind = Some(primary_addrs.replication());
     let primary = Cluster::start(&primary_addrs, primary_config);
@@ -488,14 +495,18 @@ fn large_joins_complete_a_tick_at_a_time() {
     for _ in 0..4 {
         assert_acked(&mut conn, "before the snapshot");
     }
-    let snapshot = cluster.dir.path().join("primary.snapshot");
     let deadline = Instant::now() + STARTUP_LIMIT;
     while !snapshot.exists() {
         assert!(Instant::now() < deadline, "the primary wrote no snapshot");
         std::thread::sleep(Duration::from_millis(100));
     }
+    assert!(
+        !cluster.dir.path().join("primary.snapshot").exists(),
+        "the primary wrote its snapshot only at --snapshot-path"
+    );
 
-    // The divergent replica: its own one-event history.
+    // The divergent replica: its own one-event history, and a snapshot of
+    // it in a directory of its own.
     let divergent_journal = cluster.dir.path().join("divergent.journal");
     let mut writer =
         BufferedWriter::<CounterEvent>::create(&divergent_journal).expect("create journal");
@@ -503,7 +514,18 @@ fn large_joins_complete_a_tick_at_a_time() {
         .append(&JournalEvent::App(CounterEvent::Increment { amount: 7 }))
         .expect("append");
     drop(writer);
-    let divergent = cluster.start_replica(2, "divergent");
+    let divergent_snapshots = cluster.snapshot_dir("divergent");
+    let divergent_snapshot = divergent_snapshots.join("divergent.snapshot");
+    melin_transport_core::JournaledApp::<Counter, BufferedWriter<CounterEvent>>::recover(
+        Counter::default(),
+        &divergent_journal,
+    )
+    .expect("recover the divergent history")
+    .save_snapshot(&divergent_snapshot)
+    .expect("save the divergent snapshot");
+    let mut divergent_config = cluster.replica_config(2, "divergent");
+    divergent_config.snapshot_path = Some(divergent_snapshot);
+    let divergent = Cluster::start(&Cluster::addrs(2), divergent_config);
     wait_for_gauge_within(
         primary_health,
         "melin_replica_divergence_total",
@@ -525,6 +547,25 @@ fn large_joins_complete_a_tick_at_a_time() {
             STARTUP_LIMIT,
         );
     }
+
+    // The divergent replica's old lineage: its snapshot archived beside the
+    // snapshot, its journal beside the journal, under one index.
+    assert!(
+        divergent_snapshots
+            .join("divergent.snapshot.divergent.0")
+            .join("divergent.snapshot")
+            .exists(),
+        "the old snapshot is archived in the snapshot's own directory"
+    );
+    assert!(
+        cluster
+            .dir
+            .path()
+            .join("divergent.journal.divergent.0")
+            .join("divergent.journal")
+            .exists(),
+        "the old journal is archived beside the journal"
+    );
 
     drop(conn);
     divergent.stop();
@@ -1190,6 +1231,14 @@ impl Cluster {
         }
     }
 
+    /// A directory of its own for `name`'s snapshots, apart from the
+    /// journals.
+    fn snapshot_dir(&self, name: &str) -> std::path::PathBuf {
+        let dir = self.dir.path().join(format!("{name}-snapshots"));
+        std::fs::create_dir(&dir).expect("create the snapshot directory");
+        dir
+    }
+
     /// The primary, on slot 0, journal `primary.journal`.
     fn start_primary(&self) -> melin_test_node::Node {
         let addrs = Self::addrs(0);
@@ -1200,9 +1249,15 @@ impl Cluster {
 
     /// A replica of the primary, on `slot`, journal `{name}.journal`.
     fn start_replica(&self, slot: usize, name: &str) -> melin_test_node::Node {
+        Self::start(&Self::addrs(slot), self.replica_config(slot, name))
+    }
+
+    /// The configuration of a replica of the primary, on `slot`, for a
+    /// test that changes it before [`start`](Self::start).
+    fn replica_config(&self, slot: usize, name: &str) -> ServerConfig {
         let mut config = self.config(slot, name);
         config.replica_of = Some(Self::addrs(0).replication());
-        Self::start(&Self::addrs(slot), config)
+        config
     }
 
     fn start(addrs: &melin_test_node::Addrs, config: ServerConfig) -> melin_test_node::Node {

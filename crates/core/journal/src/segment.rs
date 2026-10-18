@@ -351,11 +351,7 @@ fn parse_archive_index(live: &Path, candidate: &Path) -> Option<u32> {
 /// disambiguate which segment's hash anchors the next, so we refuse to
 /// proceed rather than risk a non-deterministic walk order.
 pub fn list_archives(live: &Path) -> std::io::Result<Vec<(u32, PathBuf)>> {
-    let dir = match live.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-        _ => PathBuf::from("."),
-    };
-    let read_dir = match std::fs::read_dir(&dir) {
+    let read_dir = match std::fs::read_dir(parent_dir(live)) {
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
@@ -462,17 +458,29 @@ pub fn compact_archive(archived: &Path, valid_end: u64) {
 /// pair that has reached the page cache may be lost on power loss even
 /// though both file contents are durable.
 ///
-/// Treats a missing parent directory as a no-op (the rename would have
-/// already failed in that case).
+/// A missing parent directory is an error (`NotFound`), as in
+/// [`fsync_dir`]; the rename into it would have failed first.
 pub fn fsync_parent_dir(live: &Path) -> std::io::Result<()> {
-    let dir = match live.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-        _ => PathBuf::from("."),
-    };
+    fsync_dir(parent_dir(live))
+}
+
+/// Fsync the directory `dir` itself, durably committing the dirent
+/// changes made inside it (renames into it, files created in it).
+pub fn fsync_dir(dir: &Path) -> std::io::Result<()> {
     // Open with read-only — fsync(2) on a directory fd flushes its
     // metadata regardless of open mode.
-    let f = std::fs::File::open(&dir)?;
-    f.sync_all()
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// The directory a file at `path` lives in. A bare file name has
+/// `Some("")` as its parent, not `None`, and an empty path names no
+/// directory (`Path::new("").is_dir()` is false), so both are taken as
+/// the current directory.
+pub fn parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    }
 }
 
 /// Pacing for [`DirFsyncRetry`]: coarse enough not to hammer a failing

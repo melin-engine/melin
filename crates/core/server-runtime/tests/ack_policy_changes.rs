@@ -760,7 +760,10 @@ fn a_replica_restarted_from_its_own_snapshot_keeps_the_change_pending() {
     // The replica's archive, and a snapshot of its own covering it,
     // recording the stream's transition at the change's sequence.
     let journal = cluster.replica_journal();
-    let snapshot = journal.with_extension("snapshot");
+    let snapshot = melin_transport_core::NodeStore::resolve(journal.clone(), None)
+        .expect("the replica's store")
+        .snapshot()
+        .to_path_buf();
     let deadline = Instant::now() + LIMIT;
     let lineage = loop {
         let archived = !melin_journal::segment::list_archives(&journal)

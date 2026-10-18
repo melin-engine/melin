@@ -12,6 +12,72 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ## [Unreleased]
 
+### Added
+
+- **`melin_transport_core::NodeStore`**, the one resolver of a node's
+  journal and snapshot paths, and **`ServerConfig::store()`**, which
+  builds it from `--journal` and `--snapshot-path`. Every role that
+  reads, writes, serves or archives the snapshot takes its path from it.
+- **`melin_journal::segment::parent_dir` and `fsync_dir`**: the directory
+  a file lives in (a bare name's is `.`), and a sync of a directory itself.
+
+### Changed
+
+- **`--snapshot-path` is the node's one snapshot location**: read at
+  boot by a primary and a replica, served to a replica that needs a
+  resync, and written by the shadow stage. It defaults, as before, to the
+  journal path with a `.snapshot` extension.
+- **A node refuses to start on a snapshot location it cannot use**: when
+  the snapshot path names no file or names a directory, when the
+  snapshot's directory does not exist (or is not a directory), when the
+  snapshot path is the journal path, or when `--snapshot-path` names
+  nothing while a snapshot exists at the derived `<journal>.snapshot` and
+  the node has no journal (move that snapshot to `--snapshot-path`).
+- **A resync archives `<snapshot>.prev` with the snapshot.** The old
+  history's `.prev` used to stay beside the new history's snapshot, where
+  rolling the snapshot back to it would have restored a snapshot of
+  another history. A snapshot in another directory than the journal is
+  archived beside itself, in `<snapshot-name>.<reason>.<n>/`, with the
+  same `<n>` as the journal's archive.
+- **The library takes a `NodeStore`** (source-breaking):
+  `archive_local_lineage`, `preflight_snapshot_transfer` and
+  `snapshot_transfer_with` take the store instead of paths, and
+  `archive_local_lineage` returns both archive directories
+  (`ArchivedLineage`). In `melin_server_runtime::replication`,
+  `run_receiver`, `run_receiver_dpdk` and `DpdkReplicationDriver::new`
+  take the store in place of their journal and snapshot paths, and
+  `Sender`'s `journal_path` field is now `store`.
+
+### Removed
+
+- **`--snapshot`** (breaking). A command line that still carries it is
+  refused at parse time. It was read once, at a primary's boot, while the
+  shadow stage went on writing elsewhere. To migrate:
+  - with `--snapshot-path` already set, drop `--snapshot` and leave the
+    file at `--snapshot-path` alone: it is the freshest snapshot, and a
+    `<journal>.snapshot`, if any, is a stale leftover;
+  - with `--snapshot X` alone, the shadow stage kept writing the derived
+    `<journal>.snapshot`, so that file, not X, is the freshest snapshot.
+    If `--snapshot` was a one-off restore, drop it: the derived path is
+    already the live location. To keep a custom location, move the
+    current `<journal>.snapshot` there first, then set `--snapshot-path`;
+  - to restore from a backup, copy it to the snapshot path.
+- **`ServerConfig::snapshot` and `ServerConfig::shadow_snapshot_path`**.
+  Use `ServerConfig::store()`.
+
+### Fixed
+
+- **A primary with `--snapshot-path` recovers from, and serves, its own
+  snapshot** (the location half of findings 21 and 22 of the
+  determinism audit). It used to ignore that snapshot at boot and when a
+  replica needed a resync, and could serve a stale `<journal>.snapshot`.
+- **A replica whose `--snapshot-path` is on another filesystem than its
+  journal no longer fails every resync** with EXDEV: its snapshot is
+  archived beside itself, on its own filesystem.
+- **A re-seeded replica's temporary snapshot is `<snapshot>.tmp`**, the
+  shadow stage's own temporary name, and its directory is synced once
+  the received snapshot is in place.
+
 ## [0.20.0] - 2026-10-19
 
 ### Added
