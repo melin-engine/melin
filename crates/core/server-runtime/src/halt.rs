@@ -81,6 +81,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use melin_app::RejectReason;
 use melin_journal::AckPolicyChange;
@@ -102,6 +103,25 @@ use crate::policy_control::{Origin, is_unwitnessed};
 /// the ring requires; each entry is the application's rejection plus two
 /// words.
 pub(crate) const REFUSAL_QUEUE_CAPACITY: usize = 4096;
+
+/// What the response stage needs to answer a halted node's held replies
+/// once its own journal holds them: the replies to writes it sequenced
+/// before the halt, and queries, which no replica can confirm while none
+/// is connected. Each goes out terminated by `BatchEndDegraded`, which
+/// tells the client only the primary's disk backs it.
+///
+/// `None` where a stage takes one is the operator switch off
+/// (`--no-degraded-acks`): every held reply, and every refusal and query
+/// queued behind one, waits for a replica or a policy swap. A standalone
+/// node never halts and takes `None` too.
+pub struct DegradedRelease {
+    /// The node's replica presence: whether a replica is streaming, and
+    /// since when none has been.
+    pub presence: Arc<ReplicaPresence>,
+    /// How long the halt must last before the release starts
+    /// (`--degraded-ack-grace-ms`).
+    pub grace: Duration,
+}
 
 /// What a reader does with a client write right now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

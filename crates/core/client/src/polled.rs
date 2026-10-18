@@ -35,9 +35,9 @@ use melin_wire_protocol::control_codec::{CHALLENGE_RESPONSE_LEN, TAG_LEN};
 
 use crate::framing::{PREFIX_LEN, RequestFrameError, request_payload_len, split_frame};
 use crate::{
-    Connection, DEFAULT_TIMEOUT, Error, Frame, Handshake, MAX_FRAME_SIZE, MAX_HANDSHAKE_FRAME,
-    MAX_REQUEST_BODY, REQUEST_HEADER_LEN, Reply, SigningKey, Step, VerifyingKey, classify,
-    frame_request,
+    Ack, Batch, Connection, DEFAULT_TIMEOUT, Error, Frame, Handshake, MAX_FRAME_SIZE,
+    MAX_HANDSHAKE_FRAME, MAX_REQUEST_BODY, REQUEST_HEADER_LEN, Reply, SigningKey, Step,
+    VerifyingKey, classify, frame_request,
 };
 
 // ---------------------------------------------------------------------------
@@ -358,7 +358,7 @@ enum Found {
         start: usize,
         end: usize,
     },
-    BatchEnd,
+    BatchEnd(Ack),
     ServerBusy,
     EngineError,
 }
@@ -729,9 +729,9 @@ impl PolledConnection {
                     start: start + TAG_LEN,
                     end,
                 },
-                Reply::BatchEnd => {
+                Reply::BatchEnd(ack) => {
                     self.in_flight = self.in_flight.saturating_sub(1);
-                    Found::BatchEnd
+                    Found::BatchEnd(ack)
                 }
                 // The node refuses a request with this frame alone, no
                 // batch end after it, and keeps the connection: the refused
@@ -753,7 +753,7 @@ impl PolledConnection {
     fn frame(&self, found: Found) -> Frame<'_> {
         match found {
             Found::Response { start, end } => Frame::Response(&self.rx[start..end]),
-            Found::BatchEnd => Frame::BatchEnd,
+            Found::BatchEnd(ack) => Frame::BatchEnd(ack),
             Found::ServerBusy => Frame::ServerBusy,
             Found::EngineError => Frame::EngineError,
         }
@@ -1218,10 +1218,18 @@ impl<S: ByteStream> StreamConnection<S> {
     }
 
     /// Send one request and collect the application frames of its reply
-    /// batch, in order: [`Connection::request`], polled.
-    pub fn request(&mut self, body: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
+    /// batch, in order, with what backs them:
+    /// [`Connection::request_batch`], polled.
+    pub fn request_batch(&mut self, body: &[u8]) -> Result<Batch, Error> {
         self.send(body)?;
         collect_batch(self)
+    }
+
+    /// [`request_batch`](Self::request_batch) for a caller that takes only
+    /// a reply backed as the node's ack policy requires:
+    /// [`Connection::request`], polled.
+    pub fn request(&mut self, body: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
+        policy_frames(self.request_batch(body)?)
     }
 
     /// [`request`](Self::request) for exactly one frame in reply; any
@@ -1231,22 +1239,33 @@ impl<S: ByteStream> StreamConnection<S> {
     }
 }
 
-/// The frames of one reply batch, read through `session`'s next-frame
-/// call: [`Connection::request`]'s loop, for any session.
-fn collect_batch(session: &mut (impl Session + ?Sized)) -> Result<Vec<Vec<u8>>, Error> {
+/// The frames of one reply batch, with what backs them, read through
+/// `session`'s next-frame call: [`Connection::request_batch`]'s loop, for
+/// any session.
+pub(crate) fn collect_batch(session: &mut (impl Session + ?Sized)) -> Result<Batch, Error> {
     let mut frames = Vec::new();
     loop {
         match session.next_frame()? {
             Frame::Response(bytes) => frames.push(bytes.to_vec()),
-            Frame::BatchEnd => return Ok(frames),
+            Frame::BatchEnd(ack) => return Ok(Batch { frames, ack }),
             Frame::ServerBusy => return Err(Error::ServerBusy),
             Frame::EngineError => return Err(Error::EngineError),
         }
     }
 }
 
+/// The frames of a batch backed as the node's ack policy requires; a batch
+/// only the primary's disk backs is [`Error::Degraded`], which carries its
+/// frames, so that a weaker reply is never taken for a full one unawares.
+pub(crate) fn policy_frames(Batch { frames, ack }: Batch) -> Result<Vec<Vec<u8>>, Error> {
+    match ack {
+        Ack::Policy => Ok(frames),
+        Ack::PrimaryOnly => Err(Error::Degraded { frames }),
+    }
+}
+
 /// The one frame of a batch that must hold exactly one.
-fn one_frame(mut frames: Vec<Vec<u8>>) -> Result<Vec<u8>, Error> {
+pub(crate) fn one_frame(mut frames: Vec<Vec<u8>>) -> Result<Vec<u8>, Error> {
     match frames.len() {
         1 => Ok(frames.swap_remove(0)),
         n => Err(Error::Protocol(format!(
@@ -1265,8 +1284,8 @@ fn one_frame(mut frames: Vec<Vec<u8>>) -> Result<Vec<u8>, Error> {
 /// `&mut dyn Session` or a generic, and the transport picked at runtime.
 ///
 /// Each call is the blocking connection's, with its errors: see
-/// [`Connection::send`], [`Connection::next_frame`] and
-/// [`Connection::request`].
+/// [`Connection::send`], [`Connection::next_frame`],
+/// [`Connection::request_batch`] and [`Connection::request`].
 pub trait Session {
     /// Send one request, the application's bytes, as an application frame.
     fn send(&mut self, body: &[u8]) -> Result<(), Error>;
@@ -1276,10 +1295,17 @@ pub trait Session {
     fn next_frame(&mut self) -> Result<Frame<'_>, Error>;
 
     /// Send one request and collect the application frames of its reply
-    /// batch, in order.
-    fn request(&mut self, body: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
+    /// batch, in order, with what backs them.
+    fn request_batch(&mut self, body: &[u8]) -> Result<Batch, Error> {
         self.send(body)?;
         collect_batch(self)
+    }
+
+    /// [`request_batch`](Self::request_batch) for a caller that takes only
+    /// a reply backed as the node's ack policy requires; a degraded one is
+    /// [`Error::Degraded`].
+    fn request(&mut self, body: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
+        policy_frames(self.request_batch(body)?)
     }
 
     /// [`request`](Self::request) for exactly one frame in reply; any other
@@ -1298,6 +1324,10 @@ impl Session for Connection {
         Connection::next_frame(self)
     }
 
+    fn request_batch(&mut self, body: &[u8]) -> Result<Batch, Error> {
+        Connection::request_batch(self, body)
+    }
+
     fn request(&mut self, body: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
         Connection::request(self, body)
     }
@@ -1314,6 +1344,10 @@ impl<S: ByteStream> Session for StreamConnection<S> {
 
     fn next_frame(&mut self) -> Result<Frame<'_>, Error> {
         StreamConnection::next_frame(self)
+    }
+
+    fn request_batch(&mut self, body: &[u8]) -> Result<Batch, Error> {
+        StreamConnection::request_batch(self, body)
     }
 
     fn request(&mut self, body: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
@@ -1368,8 +1402,48 @@ mod tests {
                 node.next_frame().unwrap(),
                 Frame::Response(&n.to_le_bytes())
             );
-            assert_eq!(node.next_frame().unwrap(), Frame::BatchEnd);
+            assert_eq!(node.next_frame().unwrap(), Frame::BatchEnd(Ack::Policy));
         }
+
+        let batch = node.request_batch(b"backed").unwrap();
+        assert_eq!(batch.frames, [b"backed".to_vec()]);
+        assert_eq!(batch.ack, Ack::Policy);
+    }
+
+    /// Twin of `a_degraded_reply_is_marked_and_never_taken_for_a_full_one`.
+    #[test]
+    fn a_degraded_reply_is_marked_and_never_taken_for_a_full_one() {
+        let key = client_key();
+        let addr = fake_node(key.verifying_key(), Behaviour::DegradedEcho);
+        let mut node = Polled::connect(addr, &key).unwrap();
+
+        node.send(b"held").unwrap();
+        assert_eq!(node.next_frame().unwrap(), Frame::Response(b"held"));
+        assert_eq!(
+            node.next_frame().unwrap(),
+            Frame::BatchEnd(Ack::PrimaryOnly)
+        );
+
+        let batch = node.request_batch(b"held").unwrap();
+        assert_eq!(batch.frames, [b"held".to_vec()]);
+        assert_eq!(batch.ack, Ack::PrimaryOnly);
+
+        let err = node.request_one(b"held").unwrap_err();
+        assert!(
+            matches!(&err, Error::Degraded { frames } if frames == &[b"held".to_vec()]),
+            "{err:?}"
+        );
+        // And through the session trait, whose default methods any other
+        // session inherits.
+        let session: &mut dyn Session = &mut node;
+        assert!(matches!(
+            session.request(b"held"),
+            Err(Error::Degraded { .. })
+        ));
+        assert_eq!(
+            session.request_batch(b"after").unwrap().frames,
+            [b"after".to_vec()]
+        );
     }
 
     #[test]
@@ -1602,7 +1676,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(node.next_frame().unwrap(), Frame::Response(b"by hand"));
-        assert_eq!(node.next_frame().unwrap(), Frame::BatchEnd);
+        assert_eq!(node.next_frame().unwrap(), Frame::BatchEnd(Ack::Policy));
     }
 
     /// Twin of `into_stream_hands_over_an_authenticated_socket`.
@@ -1636,14 +1710,15 @@ mod tests {
         // And a request on it still gets its reply, through the polled form.
         node.send(b"late").unwrap();
         let mut got = Vec::new();
-        while !got.contains(&"BatchEnd".to_string()) {
+        let end = format!("{:?}", Frame::BatchEnd(Ack::Policy));
+        while !got.contains(&end) {
             match node.poll().unwrap() {
                 Some(Frame::Response(body)) => got.push(String::from_utf8(body.to_vec()).unwrap()),
                 Some(other) => got.push(format!("{other:?}")),
                 None => {}
             }
         }
-        assert_eq!(got, ["late", "BatchEnd"]);
+        assert_eq!(got, ["late".to_string(), end]);
     }
 
     /// The exchange bench's shape: several state-only connections, each on
@@ -1677,7 +1752,7 @@ mod tests {
                 }
                 match connection.poll(stream, now()).unwrap() {
                     Some(Frame::Response(body)) => replies[i].push(body.to_vec()),
-                    Some(Frame::BatchEnd) => ended[i] = true,
+                    Some(Frame::BatchEnd(Ack::Policy)) => ended[i] = true,
                     Some(other) => panic!("unexpected {other:?}"),
                     None => {}
                 }
@@ -1698,7 +1773,7 @@ mod tests {
                 panic!("expected a response");
             };
             let reply = reply.to_vec();
-            assert_eq!(session.next_frame().unwrap(), Frame::BatchEnd);
+            assert_eq!(session.next_frame().unwrap(), Frame::BatchEnd(Ack::Policy));
             assert_eq!(session.request(body).unwrap(), std::slice::from_ref(&reply));
             assert_eq!(session.request_one(body).unwrap(), reply);
             reply
@@ -1782,7 +1857,11 @@ mod tests {
                     }
                     got.extend(drain_frames(&mut connection, &mut stream, 0));
                 }
-                assert_eq!(got, ["Response(body)", "BatchEnd"], "split at {split}");
+                assert_eq!(
+                    got,
+                    ["Response(body)", "BatchEnd(Policy)"],
+                    "split at {split}"
+                );
                 // The challenge response, then the request: the request was
                 // held until the node was ready.
                 let sent = stream.sent();
@@ -2099,7 +2178,7 @@ mod tests {
         stream.push_received(&control(TransportResponse::BatchEnd));
         assert_eq!(
             connection.poll(&mut stream, 3 * t - 1).unwrap(),
-            Some(Frame::BatchEnd)
+            Some(Frame::BatchEnd(Ack::Policy))
         );
         assert!(connection.poll(&mut stream, 100 * t).unwrap().is_none());
 
@@ -2181,7 +2260,7 @@ mod tests {
         stream.close();
         assert_eq!(
             drain_frames_until_err(&mut connection, &mut stream),
-            ["Response(last)", "BatchEnd"]
+            ["Response(last)", "BatchEnd(Policy)"]
         );
         assert!(matches!(
             connection.poll(&mut stream, 0),
@@ -2223,7 +2302,7 @@ mod tests {
         ));
         assert_eq!(
             connection.poll(&mut stream, 0).unwrap(),
-            Some(Frame::BatchEnd)
+            Some(Frame::BatchEnd(Ack::Policy))
         );
     }
 

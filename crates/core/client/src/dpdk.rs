@@ -92,7 +92,9 @@ use crate::{ByteStream, Error, SigningKey, StreamConnection};
 ///             *owed = true;
 ///         }
 ///         while let Some(frame) = connection.poll(&mut nic.stream(id), now_ns)? {
-///             if frame == Frame::BatchEnd {
+///             // Either backing settles the request; a real client
+///             // decides what a degraded one (`Ack::PrimaryOnly`) means.
+///             if matches!(frame, Frame::BatchEnd(_)) {
 ///                 *owed = false;
 ///             }
 ///         }

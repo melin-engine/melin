@@ -1,7 +1,14 @@
 # Degraded acks on a halted node (plan)
 
-Status: **step 0 done** (with journaled ack-policy changes, see below);
-the rest **proposed** (2026-10). Covers the roadmap item "Degraded acks on
+Status: **implemented, pending step 1's root cause** (2026-10). Step 0
+landed with journaled ack-policy changes (see below), and steps 2–5 on
+top of them; the end-to-end tests pass on kernel TCP and on DPDK under
+the netns runner. Step 1's test does not reproduce the `disk` hang on
+either transport, at load or idle, with ticks on or off: the primary's
+persisted cursor keeps passing the ticks it journals with no replica
+attached, which rules the leading hypothesis out. It is still to be run
+against the Exchange Core's reproduction. Covers the roadmap item
+"Degraded acks on
 a halted node", which replaces the former items "Halt refusals behind a
 stalled ack gate" and "Answer queries on a halted node": both are
 symptoms of the same stall, and one change resolves both.
@@ -122,7 +129,9 @@ journal** (`journal_persisted_wire_seq`). A slot released that way is
 answered normally, except that its request's terminator is a new frame,
 `BatchEndDegraded`, instead of `BatchEnd`. While no replica is
 connected, the evaluator confirms nothing in full (see "What the code
-shows"), so every reply released during the halt is degraded. A full
+shows"), so every reply released during the halt is degraded, except
+one at or below the position the gate cached before the loss, until the
+gate next evaluates the policy (see decision 3). A full
 `BatchEnd` comes back only once a replica is streaming again and the
 policy confirms the slot.
 
@@ -131,8 +140,9 @@ It has to be the primary's journal cursor, not the policy evaluator's
 the two agree, but the degraded condition is a statement about the
 primary's disk and should read that cursor directly.
 
-The degraded release keeps **its own position** and never writes to
-`cached_durable_pos`. If it advanced that cache, every later slot would
+The degraded release keeps no position of its own: it reads the
+primary's journal cursor on each slot and **never writes to
+`cached_durable_pos`**. If it advanced that cache, every later slot would
 pass the cached check without waiting and go out with a full
 `BatchEnd`: a false ack, the one outcome this design exists to prevent.
 The full path and the degraded path are evaluated separately on each
@@ -155,7 +165,15 @@ the policy says so.
 
 Degraded release starts when the node has been halted (replica count
 zero, the `HaltGate` condition) for a **grace period**, and stops as soon
-as a replica is streaming again. It is driven by the halt, never by gate
+as the halt ends. As built, that is when a replica joins the count
+(`ReplicaPresence`), once the primary accepts its handshake, before it
+has caught up: the same boundary the write halt uses, so the node never
+takes writes with full acks while still sending degraded ones. Replies
+held during the catch-up wait for it, and a replica that is accepted and
+then fails restarts the grace period when it leaves (the receiver's
+doubling backoff bounds how often). Keying
+release on the streaming flag instead would split the two boundaries;
+it is not worth that. It is driven by the halt, never by gate
 lag: a slow but connected replica is backpressure, and its replies wait
 as they do today.
 
@@ -166,11 +184,30 @@ configurable, with its default in a named constant of its own. It must
 not borrow `REPLICATION_LIVENESS`, which exists only on DPDK. The grace
 period starts when the replica count drops to zero, so on kernel TCP
 under a real partition it runs after the retransmit timeout has already
-passed. The plan accepts that: the halt itself starts no earlier.
+passed. The plan accepts that: the halt itself starts no earlier. A
+primary that starts, or is promoted, with no replica is halted from the
+moment its `ReplicaPresence` is made, with the pipeline, so its grace
+period may already have passed when it first serves.
 
 When the halt ends, replies already sent as degraded are not followed by
 a second, full ack (see "Not part of this item"). Events sequenced after
 the replica is back are acked under the policy as usual.
+
+**Journaled policy changes (as built).** This plan predates
+[journaled-ack-policy-2026-10.md](journaled-ack-policy-2026-10.md), under
+which a policy change is an output slot the gate applies once the change
+is durable under the policy before it. A degraded release must not apply
+one: the primary's disk alone is not that witness, and applying a
+witnessed change on it would undo what the journaled plan guarantees. So
+the gate never applies a change it released degraded. Such a change
+joins the gate's pending changes (the queue that also holds a new
+tenure's carried-over change), applied in order, each once the policy
+before it confirms it; an unwitnessed one, already on this node's disk,
+applies at once, as a forced swap does. While a change is pending, every
+slot after it can only go out degraded, which is true under either
+policy. A halted node's carried-over change is handled the same way, so
+a restarted primary with no replica answers its queries degraded after
+the grace period rather than holding them until a replica returns.
 
 ### 3. Queries take the same release and the same mark
 
@@ -178,8 +215,20 @@ A query's slot follows the same rule as a write's: released in full when
 the policy confirms its `wire_seq`, or, while halted past the grace
 period, released once the primary's fsync covers it and terminated by
 `BatchEndDegraded`. The mark then means "this answer may reflect events
-that only the primary's disk holds". A position query on a halted venue
-answers after one fsync instead of never.
+that only the primary's disk holds". As built, a query is marked even
+when it reads only state every replica confirmed before it left: with no
+replica streaming the evaluator confirms nothing, so once the gate has
+evaluated the policy after the loss every slot released during the halt
+goes out degraded and counts in `melin_degraded_acks_total`, queries
+included (a decision, pinned by a `durability_gate.rs` test). Until that
+evaluation, `cached_durable_pos` keeps what the policy last confirmed,
+and a slot at or below it (a query over confirmed state) skips the gate
+and goes out with a full `BatchEnd`. The evaluation comes from
+`idle_recheck` after `POLICY_CHECK_INTERVAL` without a batch (each batch
+postpones it via `after_batch`) or from `wait_durable` on a slot past
+the cache, so a node with no new wire seqs serving a query batch at
+least every second keeps sending those in full. A position query on a
+halted venue answers after one fsync instead of never.
 
 This replaces the durable-prefix read path (serving queries from the
 shadow stage's state) that the former item listed. That path gives a
@@ -304,8 +353,9 @@ boot does not.
    `DurabilityGate`, shared by the io_uring and DPDK stages, so they
    cannot drift. It reads the halt state (the replica count the
    `HaltGate` reads), the grace period and the operator switch, and
-   returns which terminator the slot gets. The degraded release keeps
-   its own position, separate from `cached_durable_pos`. Add a
+   returns which terminator the slot gets. The degraded release reads
+   the primary's journal cursor directly and never writes
+   `cached_durable_pos`. Add a
    `melin_degraded_acks_total` counter and log at `warn!` on entering
    and leaving degraded release. Unit tests cover: no degraded release
    before the grace period, none under `disk`, none with the switch off,

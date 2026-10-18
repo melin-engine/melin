@@ -312,8 +312,9 @@ struct HealthSnapshot {
     response_gate_replication: u64,
     /// Whether the ack policy was last evaluated as degraded —
     /// at least one clause requires more nodes than are currently
-    /// connected, so the response gate stalls until the cluster shape
-    /// recovers (or an operator swaps the policy). Trips when a replica
+    /// connected, so the response gate holds replies until the cluster
+    /// shape recovers, an operator swaps the policy, or a halted node
+    /// answers them as degraded acks. Trips when a replica
     /// disconnects from a two-node cluster running `persisted>=2`, etc.
     /// Operator alerting should fire on this transitioning to `true`.
     response_policy_degraded: bool,
@@ -330,6 +331,9 @@ struct HealthSnapshot {
     /// — `StageUtilization::ack_policy_journaled`. `None` while the
     /// lineage holds no change, and then the series is omitted.
     ack_policy_journaled: Option<u8>,
+    /// Replies a halted node terminated with `BatchEndDegraded` — see
+    /// `StageUtilization::degraded_acks`.
+    response_degraded_acks: u64,
     /// Journal rotations that adopted a pre-staged segment (fast path).
     journal_rotations_fast_path: u64,
     /// Journal rotations that fell back to the synchronous allocate
@@ -580,6 +584,10 @@ impl HealthSnapshot {
                 .ack_policy_journaled
                 .load()
                 .map(|p| p.0),
+            response_degraded_acks: state
+                .response_utilization
+                .degraded_acks
+                .load(Ordering::Relaxed),
             journal_rotations_fast_path: state
                 .journal_utilization
                 .rotations_fast_path
@@ -717,7 +725,7 @@ impl HealthSnapshot {
              melin_stage_idle_total{{stage=\"journal\"}} {}\n\
              melin_stage_idle_total{{stage=\"matching\"}} {}\n\
              melin_stage_idle_total{{stage=\"response\"}} {}\n\
-             # HELP melin_response_gate_total Gate opens by which node supplied the binding cursor of the configured ack policy (journal = the local primary, replication = a replica). While the cluster shape cannot satisfy the policy the gate does not open and neither label moves (see melin_ack_policy_degraded).\n\
+             # HELP melin_response_gate_total Gate opens by which node supplied the binding cursor of the configured ack policy (journal = the local primary, replication = a replica). While the cluster shape cannot satisfy the policy the gate does not open and neither label moves (see melin_ack_policy_degraded); replies a halted node releases on its own disk count in melin_degraded_acks_total instead.\n\
              # TYPE melin_response_gate_total counter\n\
              melin_response_gate_total{{blocker=\"journal\"}} {}\n\
              melin_response_gate_total{{blocker=\"replication\"}} {}\n\
@@ -729,12 +737,15 @@ impl HealthSnapshot {
              # HELP melin_journal_disk_lag_batches Journal batches handed to the disk thread that are not yet durable. Zero in steady state; a sustained non-zero value is the disk falling behind the sequencer, which the pipeline absorbs up to the hand-off ring depth before backpressuring producers.\n\
              # TYPE melin_journal_disk_lag_batches gauge\n\
              melin_journal_disk_lag_batches {}\n\
-             # HELP melin_ack_policy_degraded Ack policy currently unsatisfiable by the connected cluster shape; the response gate stalls while set (1 = degraded, 0 = healthy).\n\
+             # HELP melin_ack_policy_degraded Ack policy currently unsatisfiable by the connected cluster shape; the response gate holds replies while set, until a halted node answers them as degraded acks (1 = degraded, 0 = healthy).\n\
              # TYPE melin_ack_policy_degraded gauge\n\
              melin_ack_policy_degraded {}\n\
              # HELP melin_ack_policy_degraded_seconds_total Cumulative seconds the ack policy has spent unsatisfiable by the connected cluster shape.\n\
              # TYPE melin_ack_policy_degraded_seconds_total counter\n\
              melin_ack_policy_degraded_seconds_total {:.6}\n\
+             # HELP melin_degraded_acks_total Replies a node halted for want of a replica released on its own journal's fsync, terminated by BatchEndDegraded: weaker than the ack policy, and marked so. One per request; queries count too, even one over state every replica had confirmed, except until the node first re-evaluates the ack policy after the loss (see docs/replication.md).\n\
+             # TYPE melin_degraded_acks_total counter\n\
+             melin_degraded_acks_total {}\n\
              # HELP melin_durability_policy_degraded DEPRECATED: renamed melin_ack_policy_degraded in 0.15; this alias is removed in the next minor release.\n\
              # TYPE melin_durability_policy_degraded gauge\n\
              melin_durability_policy_degraded {}\n\
@@ -784,6 +795,7 @@ impl HealthSnapshot {
             self.journal_disk_lag,
             if self.response_policy_degraded { 1 } else { 0 },
             self.response_policy_degraded_nanos as f64 / 1e9,
+            self.response_degraded_acks,
             // The deprecated aliases repeat the two values above so an
             // alert written against the old names keeps firing for one
             // release instead of going dark the day the rename ships.
@@ -2599,6 +2611,7 @@ mod tests {
         matching_util
             .ack_policy_journaled
             .store(Some(melin_journal::AckPolicyByte(0)));
+        response_util.degraded_acks.store(7, Ordering::Relaxed);
 
         let state = HealthState {
             active_connections: Arc::new(AtomicU64::new(0)),
@@ -2639,6 +2652,10 @@ mod tests {
         assert!(
             response.contains("melin_ack_policy_degraded_seconds_total 2.500000\n"),
             "policy_degraded_seconds_total: {response}"
+        );
+        assert!(
+            response.contains("melin_degraded_acks_total 7\n"),
+            "degraded_acks_total: {response}"
         );
         // Deprecated aliases carry the same values until they are removed.
         assert!(

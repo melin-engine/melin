@@ -262,6 +262,25 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   one journal pass of a handoff into live streaming, which both senders
   run. It streams as `catch_up_from_journal_with` does, and reports a
   start point lost to a prune as an error rather than a snapshot verdict.
+- **Degraded acks on a halted primary.** A primary that has lost its
+  last replica no longer goes silent on the replies it holds. Once the
+  halt has lasted `--degraded-ack-grace-ms` (2 seconds by default), each
+  held reply — to a write accepted before the halt, or to a query — is
+  sent as soon as the primary's own journal has the event fsynced,
+  ending in the new `BatchEndDegraded` frame: backed by the primary's
+  disk alone, weaker than the ack policy, and marked so. The rejections
+  and queries queued behind them are answered too, in order; a
+  rejection always ends in a plain `BatchEnd`. A replica that returns
+  within the grace period confirms everything in full; under `disk`
+  nothing is ever degraded. The policy itself never changes, and
+  `melin_ack_policy_degraded` stays `1`; a journaled policy change
+  released this way is applied only once the policy before it confirms
+  it, as any change is. `melin_degraded_acks_total` counts degraded
+  acks, and a `warn` marks the start and end of each stretch.
+  `--no-degraded-acks` keeps the previous behaviour: every held reply,
+  and everything behind it, waits for a replica or a policy swap. See
+  "Degraded acks" in `docs/replication.md`, and the source-breaking side
+  under Changed.
 
 ### Changed
 
@@ -540,6 +559,34 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   unless those are all the process was given, and `capture_home_mask`
   now also narrows the calling thread to it, so the threads it spawns
   start off the isolated CPUs too. It only ever narrows, never widens.
+- **Degraded acks change the response stages' and the config's shape**
+  (see Added). `ServerConfig` gains `no_degraded_acks` and
+  `degraded_ack_grace_ms`, `StageUtilization` gains `degraded_acks`,
+  and `response::Response` gains `degraded_release`, a
+  `halt::DegradedRelease` that `dpdk_response::run` takes too (`None`
+  keeps the previous stall). Source-breaking for code that builds a
+  `Response`, or a `ServerConfig` or `StageUtilization` without
+  `..Default::default()`. `ReplicaPresence` records when its count last
+  dropped to zero, and `ReplicaPresence::last_loss` reads it:
+  `Some(LastLoss)` while none streams (the instant, or `Unknown` when
+  the stamp was cleared), `None` otherwise.
+- **A reply batch says what backs it: a new `BatchEndDegraded` frame,
+  and `melin_client`'s `Frame::BatchEnd(Ack)` / `Reply::BatchEnd(Ack)`.**
+  The wire protocol gains `TAG_BATCH_END_DEGRADED` (`0x0A`) and
+  `TransportResponse::BatchEndDegraded`: the end of a reply backed by the
+  primary's own disk alone, weaker than the ack policy, which a primary
+  halted for want of a replica sends (see Added). In `melin-client`,
+  `Frame::BatchEnd` and `Reply::BatchEnd` carry an `Ack`, `Policy` or
+  `PrimaryOnly`, so every caller that matches a batch end decides what a
+  degraded one means to it; `request_batch`, new on `Connection`,
+  `StreamConnection` and `Session`, returns a reply's frames with their
+  `Ack`; and `request` and `request_one` take only a full reply,
+  reporting a degraded one as the new `Error::Degraded`, which carries
+  its frames. Source-breaking for every `match` on `Frame`, `Reply`,
+  `Error` or `TransportResponse`. Wire-breaking by design: a
+  client built against an older `melin-client` gets `Error::Protocol` on
+  the first degraded reply rather than reading it as a full ack, so
+  upgrade clients before nodes.
 
 ### Removed
 

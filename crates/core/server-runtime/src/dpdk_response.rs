@@ -20,7 +20,9 @@ use melin_pipeline::ring;
 use melin_pipeline::spsc;
 use melin_pipeline::wait::WaitStrategy;
 
-use crate::durability_gate::{Admission, DurabilityGate, GateInputs, GatePolicy};
+use crate::durability_gate::{
+    Admission, Backing, BatchEnds, DurabilityGate, GateInputs, GatePolicy,
+};
 use crate::halt::RefusalQueue;
 use melin_app::Application;
 use melin_app::amortized_timer::AmortizedTimer;
@@ -129,6 +131,9 @@ pub fn run<A: Application>(
     // Writes the poll thread refused while halted, each sent once
     // everything published before it is answered — see `crate::halt`.
     mut refusals: RefusalQueue<A::Report>,
+    // Release of held replies on this node's own fsync while halted;
+    // `None` when off. See `crate::halt::DegradedRelease`.
+    degraded_release: Option<crate::halt::DegradedRelease>,
 ) {
     // The ack policy in force and the durability gate — the same state
     // machine the kernel response stage runs. See `DurabilityGate`.
@@ -139,6 +144,7 @@ pub fn run<A: Application>(
             replica_active,
             utilization: Arc::clone(&utilization),
             wait,
+            degraded_release,
         },
         policy,
         "dpdk response",
@@ -152,15 +158,15 @@ pub fn run<A: Application>(
 
     let mut encode_buf: EncodeBuf = [0u8; MAX_APP_FRAME];
 
-    // The BatchEnd terminator is the same bytes on every request, so it is
-    // encoded once here instead of per slot.
-    let batch_end_wire_frame = {
-        let mut buf = [0u8; MAX_BATCH_END_FRAME];
-        let written =
-            control_codec::encode_transport_response(&TransportResponse::BatchEnd, &mut buf)
-                .expect("BatchEnd encodes");
-        buf[..written].to_vec()
-    };
+    // The two request terminators are the same bytes on every request, so
+    // they are encoded once here instead of per slot. A refusal always
+    // ends in the plain one — see `response::run`.
+    let batch_ends = BatchEnds::new();
+    debug_assert!(
+        batch_ends.policy.len() <= MAX_BATCH_END_FRAME
+            && batch_ends.primary_only.len() <= MAX_BATCH_END_FRAME,
+        "a terminator outgrew the room a TX frame keeps for it"
+    );
 
     // Pre-encode heartbeat frame (fixed-size, no heap allocation).
     let mut heartbeat_frame = [0u8; 8];
@@ -257,7 +263,7 @@ pub fn run<A: Application>(
                         &mut connections,
                         &mut tx_producers,
                         &mut encode_buf,
-                        &batch_end_wire_frame,
+                        &batch_ends.policy,
                         now,
                     );
                 });
@@ -367,7 +373,7 @@ pub fn run<A: Application>(
                         &mut connections,
                         &mut tx_producers,
                         &mut encode_buf,
-                        &batch_end_wire_frame,
+                        &batch_ends.policy,
                         batch_now,
                     );
                 });
@@ -394,16 +400,21 @@ pub fn run<A: Application>(
             // A gate that cannot open does not hold the shutdown sequence;
             // the reply the policy never confirmed is not queued. A policy
             // change slot is the gate's own: its frames go to no
-            // connection, whatever it is addressed to.
-            let destination = match gate.admit(
+            // connection, whatever it is addressed to. What backs a reply
+            // decides its terminator: the policy, unless the gate released
+            // it on this node's own fsync while halted.
+            let (destination, backing) = match gate.admit(
                 slot,
                 shutdown,
                 #[cfg(feature = "tick-to-trade")]
                 &mut gate_tracker,
                 || {},
             ) {
-                Admission::Reply { connection_id } => Some(connection_id),
-                Admission::GateOnly => None,
+                Admission::Reply {
+                    connection_id,
+                    backing,
+                } => (Some(connection_id), backing),
+                Admission::GateOnly => (None, Backing::Policy),
                 Admission::Shutdown => continue 'run,
             };
 
@@ -455,11 +466,12 @@ pub fn run<A: Application>(
             // the terminator below handles them via is_last_in_request.
             let payload_result = encode_slot_payload(&slot.payload, &*encoder, &mut encode_buf);
 
-            // The BatchEnd terminator rides in the same frame. It is
-            // transport-shaped and byte-identical every time, so it is
+            // The terminator rides in the same frame: `BatchEnd`, or
+            // `BatchEndDegraded` as the slot is backed. Both are
+            // transport-shaped and byte-identical every time, so they are
             // encoded once at startup rather than per slot.
             let trailer: &[u8] = if slot.is_last_in_request {
-                &batch_end_wire_frame
+                gate.batch_end(backing, &batch_ends)
             } else {
                 &[]
             };
@@ -847,6 +859,7 @@ mod tests {
                     WaitStrategy::SpinThenYield,
                     Arc::new(ResponseEncoder),
                     refusals,
+                    None,
                 )
             });
 
@@ -873,6 +886,160 @@ mod tests {
                 "one frame per reply, and none for the policy change"
             );
         });
+    }
+
+    /// A halted node past the grace period answers a held write once its
+    /// own journal holds it, ending in `BatchEndDegraded`, and the
+    /// refusals around it keep their place and end in a plain `BatchEnd`.
+    /// With the switch off the held write, and the refusal behind it, wait.
+    /// The kernel stage's counterpart is `response.rs`'s
+    /// `tests::degraded_release`.
+    mod degraded_release {
+        use super::*;
+
+        use counter_server::{
+            Counter, CounterQuery, CounterReport, KIND_RESP_ACK, KIND_RESP_REJECTED,
+            ResponseEncoder,
+        };
+        use melin_pipeline::padding::CachePadded;
+        use melin_pipeline::ring::DisruptorBuilder;
+        use melin_transport_core::WireSeq;
+        use melin_transport_core::lineage::forced_policy_cell;
+        use melin_transport_core::pipeline::OutputPayload;
+        use melin_transport_core::replica_presence::ReplicaPresence;
+        use melin_wire_protocol::control_codec::{TAG_BATCH_END, TAG_BATCH_END_DEGRADED};
+
+        use crate::ack_policy::AckPolicy;
+        use crate::durability_gate::GateStart;
+        use crate::halt::{DegradedRelease, refusal_channel};
+        use crate::replication::ReplicationMetrics;
+        use crate::response::tests::refusal_order::{Seen, refusal};
+
+        /// Every wire frame a TX frame carries — a response, then its
+        /// terminator when it closes a request — in order.
+        fn wire_frames(bytes: &[u8], seen: &mut Vec<Seen>) {
+            let mut rest = bytes;
+            while !rest.is_empty() {
+                let (len, tail) = rest.split_first_chunk::<4>().expect("a length prefix");
+                let (payload, tail) = tail.split_at(u32::from_le_bytes(*len) as usize);
+                seen.push(Seen::of(payload));
+                rest = tail;
+            }
+        }
+
+        /// Run a stage under `disk+ram` on a primary whose one replica is
+        /// gone, with degraded release `on` (no grace) or off, holding one
+        /// write the primary's journal already holds between two
+        /// refusals. Returns what the poll thread was handed before
+        /// `quiet` passed with nothing more.
+        fn run_halted(on: bool, quiet: Duration) -> Vec<Seen> {
+            let (mut producer, mut consumers) =
+                DisruptorBuilder::<OutputSlot<CounterReport, CounterQuery>>::new(64)
+                    .add_consumer()
+                    .build(WaitStrategy::SpinThenYield);
+            let consumer = consumers.pop().expect("one consumer was requested");
+            let (control_tx, control_rx) = mpsc::channel();
+            control_tx
+                .send(ControlEvent::Connected { connection_id: 1 })
+                .expect("channel open");
+            let (tx, mut rx) = spsc::channel::<TxFrame>(8, WaitStrategy::SpinThenYield);
+            let matching_progress = Arc::new(CachePadded::new(AtomicU64::new(0)));
+            let (mut refusals, refusal_rx) = refusal_channel(Arc::clone(&matching_progress));
+
+            refusals.try_send(refusal(1, 0)).expect("queue has room");
+            refusals.try_send(refusal(1, 1)).expect("queue has room");
+            refusals.flush();
+            producer.publish(OutputSlot {
+                connection_id: 1,
+                input_seq: 0,
+                wire_seq: 1,
+                payload: OutputPayload::Report(CounterReport::Ack { new_value: 7 }),
+                is_last_in_request: true,
+                ..Default::default()
+            });
+            matching_progress.get().store(1, Ordering::Release);
+
+            let shutdown = AtomicBool::new(false);
+            let mut seen = Vec::new();
+            std::thread::scope(|scope| {
+                let stage = scope.spawn(|| {
+                    run::<Counter>(
+                        consumer,
+                        control_rx,
+                        // The primary's journal holds the write.
+                        DurableWireSeqCursor::detached(WireSeq::new(1)),
+                        GatePolicy {
+                            start: GateStart::settled(AckPolicy::DiskAndRam),
+                            forced: forced_policy_cell().1,
+                        },
+                        Some(Arc::new(ReplicationMetrics::default())),
+                        Some([
+                            Arc::new(AtomicBool::new(false)),
+                            Arc::new(AtomicBool::new(false)),
+                        ]),
+                        &shutdown,
+                        None,
+                        Arc::new(AtomicU64::new(0)),
+                        vec![tx],
+                        Arc::new(StageUtilization::default()),
+                        WaitStrategy::SpinThenYield,
+                        Arc::new(ResponseEncoder),
+                        refusal_rx,
+                        // No replica ever streaming: halted from the start.
+                        on.then(|| DegradedRelease {
+                            presence: Arc::new(ReplicaPresence::new()),
+                            grace: Duration::ZERO,
+                        }),
+                    )
+                });
+
+                let mut last_frame = Instant::now();
+                while last_frame.elapsed() < quiet {
+                    match rx.try_consume() {
+                        Some((_, frame)) => {
+                            assert_eq!(frame.connection_id, 1);
+                            wire_frames(frame.as_bytes(), &mut seen);
+                            last_frame = Instant::now();
+                        }
+                        None => std::thread::yield_now(),
+                    }
+                }
+                shutdown.store(true, Ordering::Relaxed);
+                stage.join().expect("stage panicked");
+                // Anything the stage queued before it stopped.
+                while let Some((_, frame)) = rx.try_consume() {
+                    wire_frames(frame.as_bytes(), &mut seen);
+                }
+            });
+            seen
+        }
+
+        #[test]
+        fn a_held_write_is_answered_degraded_and_refusals_end_in_a_plain_batch_end() {
+            let seen = run_halted(true, Duration::from_millis(500));
+            assert_eq!(
+                seen,
+                [
+                    Seen::App(KIND_RESP_REJECTED),
+                    Seen::Protocol(TAG_BATCH_END),
+                    Seen::App(KIND_RESP_ACK),
+                    Seen::Protocol(TAG_BATCH_END_DEGRADED),
+                    Seen::App(KIND_RESP_REJECTED),
+                    Seen::Protocol(TAG_BATCH_END),
+                ],
+                "in request order, only the held write marked"
+            );
+        }
+
+        #[test]
+        fn with_the_switch_off_the_held_write_and_the_refusal_behind_it_wait() {
+            let seen = run_halted(false, Duration::from_millis(300));
+            assert_eq!(
+                seen,
+                [Seen::App(KIND_RESP_REJECTED), Seen::Protocol(TAG_BATCH_END)],
+                "only the refusal ahead of the held write goes out"
+            );
+        }
     }
 
     mod push_frame {
