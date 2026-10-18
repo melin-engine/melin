@@ -29,7 +29,7 @@ use tracing::{debug, error};
 
 use crate::ControlEvent;
 use crate::buf_ring::BufRing;
-use crate::halt::{HaltGate, RefusalSender};
+use crate::halt::{EarlyReplySender, HaltGate};
 use crate::policy_control::{AckPolicyPublisher, BootedClaim};
 use melin_app::Application;
 use melin_app::auth::{ClientRole, RoleId};
@@ -202,8 +202,10 @@ pub(crate) fn wake_reader(event_fd: &OwnedFd) {
 /// client requests. Pass `None` to disable the tick (useful for benchmarks
 /// that don't exercise time-driven features).
 ///
-/// While `halt` refuses writes, the reader answers them through
-/// `refusals` instead of publishing them — see [`crate::halt`].
+/// Every request it does not publish — one the application's decoder
+/// filters or refuses, a write refused while `halt` refuses writes, one
+/// shed on a full input ring — the reader answers through
+/// `early_replies` — see [`crate::halt`].
 ///
 /// The reader also journals the admin `ACK-POLICY` command's requests: it
 /// attaches `ack_policy` with its wakeup eventfd, so a request posted while
@@ -221,7 +223,7 @@ pub fn spawn_reader<A: Application, R: AsRawFd + Send + 'static>(
     mut producer: ring::Producer<InputSlot<A::Event>>,
     decoder: RequestDecoderArc<A>,
     halt: HaltGate,
-    refusals: RefusalSender<A::Report>,
+    early_replies: EarlyReplySender<A::Report>,
     ack_policy: BootedClaim,
     control_tx: mpsc::Sender<ControlEvent>,
     core: usize,
@@ -275,7 +277,7 @@ where
             producer,
             &*decoder,
             &halt,
-            refusals,
+            early_replies,
             ack_policy,
             &control_tx,
             connection_timeout,
@@ -438,7 +440,7 @@ fn reader_loop<A: Application, R: AsRawFd>(
     mut producer: ring::Producer<InputSlot<A::Event>>,
     decoder: &dyn ErasedDecoder<A::Event>,
     halt: &HaltGate,
-    mut refusals: RefusalSender<A::Report>,
+    mut early_replies: EarlyReplySender<A::Report>,
     mut ack_policy: AckPolicyPublisher,
     control_tx: &mpsc::Sender<ControlEvent>,
     connection_timeout: Option<Duration>,
@@ -921,8 +923,7 @@ fn reader_loop<A: Application, R: AsRawFd>(
                     &mut producer,
                     decoder,
                     halt,
-                    &mut refusals,
-                    control_tx,
+                    &mut early_replies,
                     batch_wall_ns,
                     recv_ts,
                     #[cfg(feature = "latency-trace")]
@@ -1374,23 +1375,21 @@ fn push_eventfd_read(ring: &mut IoUring, wakeup_fd: RawFd, buf: *mut u8) {
 // Frame parsing
 // ---------------------------------------------------------------------------
 
-/// Extract complete frames from the connection's parse buffer, decode them,
-/// and publish to the disruptor. Returns `true` if the connection should be
-/// dropped (e.g., oversized frame).
 /// Extract complete frames from `conn.parse_buf` and publish them as
-/// `InputSlot`s. `batch_wall_ns` is the wall-clock timestamp captured
-/// once per CQE batch by the caller (see `reader_loop`); all non-query
-/// requests published in this call share it, sparing the reader a
-/// per-request `clock_gettime(CLOCK_REALTIME)` on the hot path. Returns
-/// `true` if the connection should be dropped.
+/// `InputSlot`s, answering through `early_replies` the requests not
+/// published (see [`process_client_frames`](crate::client_frames::process_client_frames)).
+/// `batch_wall_ns` is the wall-clock timestamp captured once per CQE batch
+/// by the caller (see `reader_loop`); all non-query requests published in
+/// this call share it, sparing the reader a per-request
+/// `clock_gettime(CLOCK_REALTIME)` on the hot path. Returns `true` if the
+/// connection should be dropped.
 #[allow(clippy::too_many_arguments)]
 fn process_frames<A: Application, R>(
     conn: &mut ConnectionEntry<R>,
     producer: &mut ring::Producer<InputSlot<A::Event>>,
     decoder: &dyn ErasedDecoder<A::Event>,
     halt: &HaltGate,
-    refusals: &mut RefusalSender<A::Report>,
-    control_tx: &mpsc::Sender<ControlEvent>,
+    early_replies: &mut EarlyReplySender<A::Report>,
     batch_wall_ns: u64,
     recv_ts: melin_transport_core::trace::MonoTraceInstant,
     #[cfg(feature = "latency-trace")] publish_rec: &mut melin_transport_core::trace::StageRecorder,
@@ -1406,7 +1405,7 @@ fn process_frames<A: Application, R>(
         producer,
         decoder,
         halt,
-        refusals,
+        early_replies,
         batch_wall_ns,
         recv_ts,
         #[cfg(feature = "latency-trace")]
@@ -1415,50 +1414,36 @@ fn process_frames<A: Application, R>(
         ingest_rec,
     );
 
+    // Every answer the reader decides on, a busy for a full ring among
+    // them, goes to the response stage through the early-reply queue: the
+    // response stage owns all egress on a client socket, so no reader-side
+    // send can land between the two halves of a partially flushed reply.
     match action {
         FrameAction::Continue => false,
         FrameAction::Disconnect => true,
-        FrameAction::PipelineFull => {
-            debug!(
-                connection_id = conn.connection_id,
-                "pipeline full, routing ServerBusy via response stage"
-            );
-            // The response stage owns ALL egress on a client socket. A
-            // reader-side send here — however non-blocking — races the
-            // response stage's own writes and can land between the two
-            // halves of a partially-flushed response frame, permanently
-            // desyncing the client's length-prefix framing (audit review
-            // F3). It also kept a client-socket syscall on the ingress
-            // thread. Routing through the control channel makes the
-            // notice an ordinary send_buf append over there.
-            //
-            // Error deliberately dropped: a dead control channel means
-            // the response stage is gone and the server is shutting
-            // down — same reasoning as the Disconnected sends below.
-            let _ = control_tx.send(ControlEvent::PipelineBusy {
-                connection_id: conn.connection_id,
-            });
-            false
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    //! Unit tests for [`process_frames`]. The function has four exit paths
-    //! (normal end, partial parse-buf, pipeline-full, oversize-frame), each
-    //! with subtle batch-commit ordering requirements. These tests pin that
-    //! behaviour against a synthetic decoder so refactors of the batch path
-    //! (e.g. moving the batch up to span the whole CQE drain) can't silently
+    //! Unit tests for [`process_frames`]. The function has several exit
+    //! paths (normal end, partial parse-buf, pipeline-full, oversize or
+    //! non-request frame, full early-reply queue), each with subtle
+    //! batch-commit ordering requirements. These tests pin that behaviour
+    //! against a synthetic decoder so refactors of the batch path (e.g.
+    //! moving the batch up to span the whole CQE drain) can't silently
     //! regress the "earlier frames must be visible before ServerBusy /
     //! disconnect" guarantees.
     use super::*;
     use crate::client_frames::MAX_REQUEST_BODY;
+    use crate::halt::{EarlyKind, EarlyReply};
     use melin_app::auth::NoRoles;
     use melin_app::decoder::{Decoded, RequestDecoder};
     use melin_app::{AppEvent, Application, ApplyCtx, CodecError, QueryCtx, RejectReason};
     use melin_journal::JournalEvent;
     use melin_pipeline::ring::DisruptorBuilder;
+    use melin_transport_core::pipeline::RequestId;
+    use melin_wire_protocol::control::RefusalKind;
     use melin_wire_protocol::control_codec::{
         TAG_APP, TAG_CHALLENGE_RESPONSE, TAG_LEN, TAG_RESPONSE_HEARTBEAT,
     };
@@ -1590,21 +1575,42 @@ mod tests {
         }
     }
 
-    /// A request frame as a client sends it — `[u32 LE length][tag][body]`
-    /// — with the tag chosen by the caller.
-    fn request_frame(tag: u8, body: &[u8]) -> Vec<u8> {
-        let len = (TAG_LEN + body.len()) as u32;
+    /// A frame under any tag — `[u32 LE length][tag][rest]` — as no
+    /// well-behaved client sends after the handshake unless `tag` is the
+    /// request's and `rest` starts with an ID.
+    fn tagged_frame(tag: u8, rest: &[u8]) -> Vec<u8> {
+        let len = (TAG_LEN + rest.len()) as u32;
         let mut f = Vec::with_capacity(4 + len as usize);
         f.extend_from_slice(&len.to_le_bytes());
         f.push(tag);
-        f.extend_from_slice(body);
+        f.extend_from_slice(rest);
         f
     }
 
-    /// The frame most tests use: an application frame, and `byte` as the
-    /// one body byte [`ByteDecoder`] keys on.
+    /// Request `id`'s frame as a client sends it —
+    /// `[u32 LE length][TAG_REQUEST][id][body]`.
+    fn request_frame(id: u64, body: &[u8]) -> Vec<u8> {
+        let mut buf = vec![0u8; melin_wire_protocol::framing::REQUEST_HEADER_LEN + body.len()];
+        let n = melin_wire_protocol::framing::frame_request(&mut buf, RequestId(id), |out| {
+            out[..body.len()].copy_from_slice(body);
+            Ok::<_, melin_wire_protocol::framing::RequestFrameError>(body.len())
+        })
+        .expect("a test request fits");
+        buf.truncate(n);
+        buf
+    }
+
+    /// The ID [`frame`] gives a request carrying `byte`: distinct per byte,
+    /// and never the byte itself, so a test cannot pass by confusing the
+    /// two.
+    fn id_of(byte: u8) -> RequestId {
+        RequestId(0x1_0000 + u64::from(byte))
+    }
+
+    /// The frame most tests use: a request whose ID is [`id_of`] `byte`,
+    /// and `byte` as the one body byte [`ByteDecoder`] keys on.
     fn frame(byte: u8) -> Vec<u8> {
-        request_frame(TAG_APP, &[byte])
+        request_frame(id_of(byte).0, &[byte])
     }
 
     /// Length prefix announcing an oversize frame. No payload bytes follow —
@@ -1662,20 +1668,47 @@ mod tests {
         }
     }
 
-    /// Invoke `process_frames::<TestApp, UnixStream>`, threading the
-    /// feature-gated histogram args when the relevant features are on so
-    /// the call compiles in every `cargo test` configuration.
+    /// Invoke `process_frames::<TestApp, UnixStream>` on a standalone gate,
+    /// threading the feature-gated histogram args when the relevant
+    /// features are on so the call compiles in every `cargo test`
+    /// configuration.
     ///
-    /// Returns the disconnect flag plus the control-channel receiver —
-    /// pipeline-full now surfaces as a `PipelineBusy` event for the
-    /// response stage rather than reader-side socket bytes, so busy
-    /// assertions read the channel, not the peer.
+    /// Returns the disconnect flag plus every early reply the call queued:
+    /// a busy goes to the response stage through the early-reply queue,
+    /// never as reader-side socket bytes, so busy assertions read the
+    /// queue, not the peer.
     fn run_process_frames(
         conn: &mut ConnectionEntry<UnixStream>,
         producer: &mut ring::Producer<InputSlot<TestEvent>>,
-    ) -> (bool, mpsc::Receiver<ControlEvent>) {
-        let (mut refusals, _queue) = refusal_channel();
-        run_process_frames_with(conn, producer, &gate(None, false), &mut refusals)
+    ) -> (bool, Vec<EarlyReply<TestReport>>) {
+        let (mut early, mut queue) = early_channel();
+        let disconnect = run_process_frames_with(conn, producer, &gate(None, false), &mut early);
+        (disconnect, released(&mut queue))
+    }
+
+    /// Every early reply visible on `queue`, oldest first.
+    fn released(
+        queue: &mut crate::halt::EarlyReplyQueue<TestReport>,
+    ) -> Vec<EarlyReply<TestReport>> {
+        let mut out = Vec::new();
+        queue.sync();
+        queue.release(u64::MAX, |reply| out.push(reply));
+        out
+    }
+
+    /// The early reply the fixture connection (id 7) gets for request
+    /// `id`, stamped `input_seq`.
+    fn early_reply(
+        id: RequestId,
+        input_seq: u64,
+        kind: EarlyKind<TestReport>,
+    ) -> EarlyReply<TestReport> {
+        EarlyReply {
+            connection_id: 7,
+            request_id: id,
+            input_seq,
+            kind,
+        }
     }
 
     /// A halt gate: `replicas` connected (`None` for standalone), fenced
@@ -1816,7 +1849,7 @@ mod tests {
             producer,
             Arc::new(ByteDecoder),
             halt,
-            refusal_channel().0,
+            early_channel().0,
             claim,
             control_tx,
             0,
@@ -1830,23 +1863,25 @@ mod tests {
         (handle, consumer, control)
     }
 
-    /// A refusal queue whose idle bound is never consulted by these tests.
-    fn refusal_channel() -> (
-        RefusalSender<TestReport>,
-        crate::halt::RefusalQueue<TestReport>,
+    /// An early-reply queue whose idle bound is never consulted by these
+    /// tests.
+    fn early_channel() -> (
+        EarlyReplySender<TestReport>,
+        crate::halt::EarlyReplyQueue<TestReport>,
     ) {
-        crate::halt::refusal_channel(Arc::new(melin_pipeline::padding::CachePadded::new(
+        crate::halt::early_reply_channel(Arc::new(melin_pipeline::padding::CachePadded::new(
             std::sync::atomic::AtomicU64::new(0),
         )))
     }
 
-    /// [`run_process_frames`] against a given halt gate and refusal queue.
+    /// [`run_process_frames`] against a given halt gate and early-reply
+    /// queue.
     fn run_process_frames_with(
         conn: &mut ConnectionEntry<UnixStream>,
         producer: &mut ring::Producer<InputSlot<TestEvent>>,
         halt: &HaltGate,
-        refusals: &mut RefusalSender<TestReport>,
-    ) -> (bool, mpsc::Receiver<ControlEvent>) {
+        early: &mut EarlyReplySender<TestReport>,
+    ) -> bool {
         #[cfg(feature = "latency-trace")]
         let mut publish_rec = melin_transport_core::trace::register_stage("test: publish");
         #[cfg(feature = "tick-to-trade")]
@@ -1855,34 +1890,19 @@ mod tests {
         #[allow(clippy::let_unit_value)] // ZST when latency-trace is off
         let recv_ts = melin_transport_core::trace::mono_trace_ns();
 
-        let (control_tx, control_rx) = mpsc::channel();
-        let disconnect = process_frames::<TestApp, UnixStream>(
+        process_frames::<TestApp, UnixStream>(
             conn,
             producer,
             &ByteDecoder,
             halt,
-            refusals,
-            &control_tx,
+            early,
             0xDEAD_BEEF,
             recv_ts,
             #[cfg(feature = "latency-trace")]
             &mut publish_rec,
             #[cfg(feature = "tick-to-trade")]
             &mut ingest_rec,
-        );
-        (disconnect, control_rx)
-    }
-
-    /// Count `PipelineBusy` events for the fixture connection (id 7)
-    /// queued on the control channel.
-    fn busy_events(rx: &mpsc::Receiver<ControlEvent>) -> usize {
-        let mut n = 0;
-        while let Ok(event) = rx.try_recv() {
-            if matches!(event, ControlEvent::PipelineBusy { connection_id } if connection_id == 7) {
-                n += 1;
-            }
-        }
-        n
+        )
     }
 
     /// Drain `consumer` into a Vec of `(seq, slot)` until it yields `None`.
@@ -1897,14 +1917,14 @@ mod tests {
         out
     }
 
-    /// Try to read exactly 5 bytes (the ServerBusy frame size) from the
-    /// peer. Returns `Some(bytes)` if the read completes within the peer's
-    /// configured timeout, `None` if it times out (i.e. nothing was sent).
-    fn read_server_busy(peer: &mut UnixStream) -> Option<[u8; 5]> {
-        let mut buf = [0u8; 5];
-        match peer.read_exact(&mut buf) {
-            Ok(()) => Some(buf),
-            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => None,
+    /// Whether the peer can read anything within its configured timeout:
+    /// the reader never writes the client socket (egress belongs to the
+    /// response stage), so it must not.
+    fn peer_got_bytes(peer: &mut UnixStream) -> bool {
+        let mut buf = [0u8; 1];
+        match peer.read(&mut buf) {
+            Ok(n) => n > 0,
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => false,
             Err(e) => panic!("unexpected peer read error: {e}"),
         }
     }
@@ -1923,7 +1943,7 @@ mod tests {
             conn.parse_buf.extend_from_slice(&frame(byte));
         }
 
-        let (disconnect, control_rx) = run_process_frames(&mut conn, &mut producer);
+        let (disconnect, early) = run_process_frames(&mut conn, &mut producer);
         assert!(!disconnect, "no oversize frame ⇒ no disconnect");
 
         let events = drain(&mut consumer);
@@ -1933,21 +1953,20 @@ mod tests {
             assert_eq!(slot.connection_id, 7);
             assert_eq!(slot.key_hash, 0xC0FFEE_u64);
             let byte = (i + 1) as u8;
+            // The client's ID travels in the slot.
+            assert_eq!(slot.request_id, id_of(byte));
             assert_eq!(slot.event, JournalEvent::App(TestEvent::Cmd(byte)));
             // Non-query event ⇒ inherits the caller-supplied wall-clock.
             assert_eq!(slot.timestamp_ns, 0xDEAD_BEEF);
         }
         // Parse buffer fully consumed.
         assert!(conn.parse_buf.is_empty());
-        // No Full happened: no busy event, and the reader never writes
-        // the client socket (egress belongs to the response stage).
-        assert_eq!(
-            busy_events(&control_rx),
-            0,
-            "no PipelineBusy on the happy path"
-        );
+        // Every request published: nothing answered early, and the
+        // reader never writes the client socket (egress belongs to the
+        // response stage).
+        assert!(early.is_empty(), "{early:?}");
         assert!(
-            read_server_busy(&mut peer).is_none(),
+            !peer_got_bytes(&mut peer),
             "reader must never write the client socket"
         );
     }
@@ -1958,8 +1977,6 @@ mod tests {
     /// sequence would be adopted by the journal stage as a replica's).
     #[test]
     fn process_frames_rebuilds_every_field_of_a_reused_slot() {
-        use melin_transport_core::pipeline::RequestId;
-
         const CAPACITY: usize = 4;
         let Fixture {
             mut conn,
@@ -1984,14 +2001,14 @@ mod tests {
         for byte in 1..=CAPACITY as u8 {
             conn.parse_buf.extend_from_slice(&frame(byte));
         }
-        let (disconnect, _control_rx) = run_process_frames(&mut conn, &mut producer);
+        let (disconnect, _early) = run_process_frames(&mut conn, &mut producer);
         assert!(!disconnect);
 
         let events = drain(&mut consumer);
         assert_eq!(events.len(), CAPACITY, "every dirtied slot reused");
         for (i, (_, slot)) in events.iter().enumerate() {
             assert_eq!(slot.connection_id, 7);
-            assert_eq!(slot.request_id, RequestId(0), "no ID on the wire yet");
+            assert_eq!(slot.request_id, id_of(i as u8 + 1), "the frame's own ID");
             assert_eq!(slot.key_hash, 0xC0FFEE_u64);
             assert_eq!(slot.sequence, 0, "the journal stage allocates it");
             assert_eq!(slot.timestamp_ns, 0xDEAD_BEEF);
@@ -2015,17 +2032,16 @@ mod tests {
         for byte in [0x01, 0xFF, 0x02, 0xFF] {
             conn.parse_buf.extend_from_slice(&frame(byte));
         }
-        let (mut refusals, mut queue) = refusal_channel();
+        let (mut early, mut queue) = early_channel();
         let counted = Arc::new(AtomicU64::new(0));
 
-        let (disconnect, control_rx) = run_process_frames_with(
+        let disconnect = run_process_frames_with(
             &mut conn,
             &mut producer,
             &gate_counting_into(Some(0), false, Arc::clone(&counted)),
-            &mut refusals,
+            &mut early,
         );
         assert!(!disconnect);
-        assert_eq!(busy_events(&control_rx), 0);
         assert!(conn.parse_buf.is_empty(), "every frame consumed");
         assert_eq!(
             refused_count(&counted),
@@ -2046,18 +2062,17 @@ mod tests {
             "only the queries enter the pipeline"
         );
 
-        let mut refused = Vec::new();
-        assert!(queue.sync(), "the refusals are flushed");
-        queue.release(u64::MAX, |r| refused.push(r));
-        let expect = |input_seq, byte| crate::halt::Refusal {
-            connection_id: 7,
-            input_seq,
-            report: (TestEvent::Cmd(byte), RejectReason::ReplicaDisconnected),
+        let expect = |input_seq, byte| {
+            early_reply(
+                id_of(byte),
+                input_seq,
+                EarlyKind::Rejected((TestEvent::Cmd(byte), RejectReason::ReplicaDisconnected)),
+            )
         };
         assert_eq!(
-            refused,
+            released(&mut queue),
             [expect(0, 0x01), expect(1, 0x02)],
-            "each write is stamped with the sequence of the query that followed it"
+            "each write is stamped with its ID and the sequence of the query that followed it"
         );
     }
 
@@ -2074,61 +2089,96 @@ mod tests {
         for byte in [0x01, 0xFF] {
             conn.parse_buf.extend_from_slice(&frame(byte));
         }
-        let (mut refusals, mut queue) = refusal_channel();
+        let (mut early, mut queue) = early_channel();
         let counted = Arc::new(AtomicU64::new(0));
 
-        let (disconnect, control_rx) = run_process_frames_with(
+        let disconnect = run_process_frames_with(
             &mut conn,
             &mut producer,
             &gate_counting_into(Some(1), true, Arc::clone(&counted)),
-            &mut refusals,
+            &mut early,
         );
 
         assert!(disconnect, "the connection is dropped");
-        assert_eq!(busy_events(&control_rx), 0);
         assert!(
             drain(&mut consumer).is_empty(),
             "not even the query is published"
         );
-        assert!(!queue.sync(), "no refusal is queued");
+        assert!(!queue.sync(), "no early reply is queued");
         assert_eq!(refused_count(&counted), 0);
     }
 
-    /// Refusals that cannot be queued shed load the way a full input ring
-    /// does, and the write is still not published.
+    /// An answer with nowhere to go closes its connection (interim, until
+    /// the reader parks instead): the frames before it are committed, and
+    /// nothing from the frame that met the full queue on is published or
+    /// answered. Each kind of early reply meets it the same way: a halt
+    /// refusal, a filtered and a refused request, and a busy on a full
+    /// ring.
     #[test]
-    fn a_full_refusal_queue_is_pipeline_busy() {
-        let Fixture {
-            mut conn,
-            mut producer,
-            mut consumer,
-            ..
-        } = make_fixture(16);
-        conn.parse_buf.extend_from_slice(&frame(0x01));
-        let (mut refusals, _queue) = refusal_channel();
-        let filler = crate::halt::Refusal {
-            connection_id: 1,
-            input_seq: 0,
-            report: (TestEvent::Cmd(0), RejectReason::ReplicaDisconnected),
-        };
-        while refusals.try_send(filler).is_ok() {}
-        let counted = Arc::new(AtomicU64::new(0));
+    fn a_full_early_reply_queue_is_disconnect() {
+        // (slots already taken in a two-slot ring, halted, the frame that
+        // meets the full queue)
+        for (prefill, halted, byte) in [
+            (0, true, 0x02),
+            (0, false, 0xFC),
+            (0, false, 0xFD),
+            (0, false, 0xFE),
+            // The ring has room for the first frame only: the second is
+            // shed.
+            (1, false, 0x02),
+        ] {
+            let Fixture {
+                mut conn,
+                mut producer,
+                mut consumer,
+                ..
+            } = make_fixture(2);
+            for _ in 0..prefill {
+                producer.publish(InputSlot::default());
+            }
+            // A query first, which is published even while halted.
+            conn.parse_buf.extend_from_slice(&frame(0xFF));
+            conn.parse_buf.extend_from_slice(&frame(byte));
+            conn.parse_buf.extend_from_slice(&frame(0x03));
+            let (mut early, mut queue) = early_channel();
+            let filler = early_reply(RequestId(0), 0, EarlyKind::Busy);
+            let mut filled = 0;
+            while early.try_send(filler).is_ok() {
+                filled += 1;
+            }
 
-        let (disconnect, control_rx) = run_process_frames_with(
-            &mut conn,
-            &mut producer,
-            &gate_counting_into(Some(0), false, Arc::clone(&counted)),
-            &mut refusals,
-        );
+            let counted = Arc::new(AtomicU64::new(0));
+            let disconnect = run_process_frames_with(
+                &mut conn,
+                &mut producer,
+                &gate_counting_into(halted.then_some(0), false, Arc::clone(&counted)),
+                &mut early,
+            );
 
-        assert!(!disconnect);
-        assert_eq!(busy_events(&control_rx), 1);
-        assert!(drain(&mut consumer).is_empty());
-        assert_eq!(
-            refused_count(&counted),
-            1,
-            "a shed write still counts as refused by the halt"
-        );
+            assert!(disconnect, "byte {byte:#04x}: the connection is dropped");
+            assert_eq!(
+                refused_count(&counted),
+                0,
+                "byte {byte:#04x}: a write closed on, not answered, is not counted as refused"
+            );
+            let published: Vec<_> = drain(&mut consumer)
+                .into_iter()
+                .skip(prefill)
+                .map(|(_, slot)| slot.event)
+                .collect();
+            assert_eq!(
+                published,
+                [JournalEvent::App(TestEvent::Query)],
+                "byte {byte:#04x}: the frame before is committed, nothing after"
+            );
+            let queued = released(&mut queue);
+            assert_eq!(
+                queued.len(),
+                filled,
+                "byte {byte:#04x}: nothing more was queued"
+            );
+            assert!(queued.iter().all(|reply| *reply == filler));
+        }
     }
 
     /// The caller stamps `recv_ts` once per recv (at the kernel-return
@@ -2159,15 +2209,13 @@ mod tests {
         #[cfg(feature = "tick-to-trade")]
         let mut ingest_rec = melin_transport_core::trace::register_stage("test: ingest recv_ts");
 
-        let (control_tx, _control_rx) = mpsc::channel();
-        let (mut refusals, _queue) = refusal_channel();
+        let (mut early, _queue) = early_channel();
         let disconnect = process_frames::<TestApp, UnixStream>(
             &mut conn,
             &mut producer,
             &ByteDecoder,
             &gate(None, false),
-            &mut refusals,
-            &control_tx,
+            &mut early,
             0xDEAD_BEEF,
             RECV_TS,
             &mut publish_rec,
@@ -2197,7 +2245,7 @@ mod tests {
         //
         // Capacity 64 leaves room for the entire input (no Full); ring
         // backpressure is exercised separately in
-        // `process_frames_partial_commit_then_server_busy_when_pipeline_full`.
+        // `a_full_ring_queues_busy_for_the_frame_that_met_it`.
         let Fixture {
             mut conn,
             mut producer,
@@ -2211,7 +2259,7 @@ mod tests {
             conn.parse_buf.extend_from_slice(&frame((i + 1) as u8));
         }
 
-        let (disconnect, _control_rx) = run_process_frames(&mut conn, &mut producer);
+        let (disconnect, _early) = run_process_frames(&mut conn, &mut producer);
         assert!(!disconnect, "no oversize / no Full ⇒ no disconnect");
 
         let events = drain(&mut consumer);
@@ -2237,7 +2285,7 @@ mod tests {
         } = make_fixture(8);
         conn.parse_buf.extend_from_slice(&frame(0xFF)); // body byte → Query
 
-        let (disconnect, _control_rx) = run_process_frames(&mut conn, &mut producer);
+        let (disconnect, _early) = run_process_frames(&mut conn, &mut producer);
         assert!(!disconnect);
 
         let events = drain(&mut consumer);
@@ -2251,16 +2299,16 @@ mod tests {
     }
 
     #[test]
-    fn process_frames_partial_commit_then_server_busy_when_pipeline_full() {
+    fn a_full_ring_queues_busy_for_the_frame_that_met_it() {
         // Ring capacity 4 + 6 frames ⇒ first 4 commit, 5th triggers Full,
         // 6th is never reached because the loop breaks on Full. Validates:
-        //   * `Err(Full)` does not roll back the prior 4 (single commit
-        //     happens before the ServerBusy write).
-        //   * The frame that triggered Full is silently dropped — its bytes
-        //     are compacted out of `parse_buf` along with every earlier
-        //     frame, mirroring pre-batch behaviour.
-        //   * Exactly one PipelineBusy event is routed to the response
-        //     stage, and nothing is written to the socket from here.
+        //   * `Err(Full)` does not roll back the prior 4.
+        //   * The frame that triggered Full is answered `Busy`, with its
+        //     ID, stamped with the sequence it would have taken — its
+        //     bytes are compacted out of `parse_buf` along with every
+        //     earlier frame — and the connection is kept.
+        //   * The busy goes to the response stage through the early-reply
+        //     queue, and nothing is written to the socket from here.
         let Fixture {
             mut conn,
             mut producer,
@@ -2271,7 +2319,7 @@ mod tests {
             conn.parse_buf.extend_from_slice(&frame(byte));
         }
 
-        let (disconnect, control_rx) = run_process_frames(&mut conn, &mut producer);
+        let (disconnect, early) = run_process_frames(&mut conn, &mut producer);
         assert!(!disconnect, "Full does not drop the connection");
 
         let events = drain(&mut consumer);
@@ -2285,23 +2333,22 @@ mod tests {
             assert_eq!(slot.event, JournalEvent::App(TestEvent::Cmd(byte)));
         }
 
-        // The busy notice goes to the response stage — never directly
-        // onto the socket, where it could tear a partially-flushed
-        // response frame (audit review F3).
+        // The busy goes to the response stage — never directly onto the
+        // socket, where it could tear a partially-flushed response frame
+        // (audit review F3).
         assert_eq!(
-            busy_events(&control_rx),
-            1,
-            "exactly one PipelineBusy routed"
+            early,
+            [early_reply(id_of(0x05), 4, EarlyKind::Busy)],
+            "exactly one busy, for the frame that met the full ring"
         );
         assert!(
-            read_server_busy(&mut peer).is_none(),
+            !peer_got_bytes(&mut peer),
             "reader must never write the client socket"
         );
 
-        // The frame that triggered Full (0x05) had its bytes consumed by
-        // the loop's `cursor +=` before `try_push_with` ran; the 6th frame
-        // is never inspected because the loop broke. Compaction shifts
-        // the unprocessed tail (the 6th frame's bytes) to the front.
+        // The 6th frame is never inspected because the loop broke (an
+        // interim: it waits for the client's next bytes). Compaction
+        // shifts the unprocessed tail to the front.
         assert_eq!(
             conn.parse_buf,
             frame(0x06),
@@ -2316,10 +2363,10 @@ mod tests {
     /// parked the reader thread whenever the offender's socket buffer
     /// was also full — stalling ingress for *every* connection exactly
     /// on the overload path (against that code this test never
-    /// returns). The busy notice now routes to the response stage,
-    /// which also closes the frame-tearing race of any reader-side
-    /// send. The socket-buffer fill stays: it proves the path is
-    /// insensitive to socket state.
+    /// returns). The busy notice now routes to the response stage
+    /// through the early-reply queue, which also closes the
+    /// frame-tearing race of any reader-side send. The socket-buffer
+    /// fill stays: it proves the path is insensitive to socket state.
     #[test]
     fn pipeline_full_never_touches_the_client_socket() {
         let Fixture {
@@ -2357,7 +2404,7 @@ mod tests {
         conn.parse_buf.extend_from_slice(&frame(0x03));
 
         let start = std::time::Instant::now();
-        let (disconnect, control_rx) = run_process_frames(&mut conn, &mut producer);
+        let (disconnect, early) = run_process_frames(&mut conn, &mut producer);
         // Generous bound to stay unflaky under CI load — the fixed path
         // returns in microseconds, the broken one only when the peer
         // reads (here: never).
@@ -2372,8 +2419,8 @@ mod tests {
             "the frames that fit are still published"
         );
         assert_eq!(
-            busy_events(&control_rx),
-            1,
+            early,
+            [early_reply(id_of(0x03), 2, EarlyKind::Busy)],
             "busy notice routed to response stage"
         );
         // Nothing beyond the pre-fill junk arrives: drain it, then the
@@ -2398,7 +2445,7 @@ mod tests {
         //     pipeline observes them even though we're about to tear the
         //     connection down,
         //   * return `true` so the caller drops the connection,
-        //   * NOT emit PipelineBusy (that is reserved for pipeline-full).
+        //   * answer nothing early (a busy is for a full ring).
         let Fixture {
             mut conn,
             mut producer,
@@ -2409,7 +2456,7 @@ mod tests {
         conn.parse_buf.extend_from_slice(&frame(0x02));
         conn.parse_buf.extend_from_slice(&oversize_prefix());
 
-        let (disconnect, control_rx) = run_process_frames(&mut conn, &mut producer);
+        let (disconnect, early) = run_process_frames(&mut conn, &mut producer);
         assert!(disconnect, "oversize frame must request disconnect");
 
         let events = drain(&mut consumer);
@@ -2421,22 +2468,20 @@ mod tests {
         assert_eq!(events[0].1.event, JournalEvent::App(TestEvent::Cmd(0x01)));
         assert_eq!(events[1].1.event, JournalEvent::App(TestEvent::Cmd(0x02)));
 
-        assert_eq!(
-            busy_events(&control_rx),
-            0,
-            "PipelineBusy is emitted on Full, not on oversize"
-        );
+        assert!(early.is_empty(), "{early:?}");
         assert!(
-            read_server_busy(&mut peer).is_none(),
+            !peer_got_bytes(&mut peer),
             "reader must never write the client socket"
         );
     }
 
+    /// Each decoder outcome that publishes nothing yields its early reply,
+    /// with the frame's ID and the sequence it would have taken, in order
+    /// among the published frames around them; all bytes are consumed.
     #[test]
-    fn process_frames_filters_denied_and_decode_errors_advance_cursor() {
+    fn each_decoder_outcome_yields_its_early_reply_with_the_frames_id() {
         // Mixed batch: Permitted, Filter, PermissionDenied, DecodeError,
-        // Permitted. Only the two Permitted frames must reach the
-        // consumer; all bytes are consumed (parse_buf fully drains).
+        // Permitted, and a request with an empty body (a decode error).
         let Fixture {
             mut conn,
             mut producer,
@@ -2446,53 +2491,101 @@ mod tests {
         for byte in [0x01, 0xFC, 0xFD, 0xFE, 0x02] {
             conn.parse_buf.extend_from_slice(&frame(byte));
         }
+        conn.parse_buf.extend_from_slice(&request_frame(99, b""));
 
-        let (disconnect, _control_rx) = run_process_frames(&mut conn, &mut producer);
-        assert!(!disconnect);
+        let (disconnect, early) = run_process_frames(&mut conn, &mut producer);
+        assert!(!disconnect, "a refused request keeps the connection");
 
         let events = drain(&mut consumer);
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].1.event, JournalEvent::App(TestEvent::Cmd(0x01)));
         assert_eq!(events[1].1.event, JournalEvent::App(TestEvent::Cmd(0x02)));
+        assert_eq!(
+            early,
+            [
+                early_reply(id_of(0xFC), 1, EarlyKind::Filtered),
+                early_reply(
+                    id_of(0xFD),
+                    1,
+                    EarlyKind::Refused {
+                        kind: RefusalKind::PermissionDenied,
+                        reason: "denied"
+                    }
+                ),
+                early_reply(
+                    id_of(0xFE),
+                    1,
+                    EarlyKind::Refused {
+                        kind: RefusalKind::Malformed,
+                        reason: "bad"
+                    }
+                ),
+                early_reply(
+                    RequestId(99),
+                    2,
+                    EarlyKind::Refused {
+                        kind: RefusalKind::Malformed,
+                        reason: "empty body"
+                    }
+                ),
+            ]
+        );
         assert!(
             conn.parse_buf.is_empty(),
             "all bytes advanced past compaction"
         );
     }
 
-    /// The request tag is the runtime's to read: an empty frame, or one
-    /// whose tag is not the application's, is dropped before any decoder
-    /// sees it, and the frames around it still publish. The decoder gets
-    /// the body alone, so a body byte equal to a protocol tag is just
-    /// that — `frame(0x01)` carries the heartbeat's value as a command.
+    /// The request tag and ID are the runtime's to read: a frame that is
+    /// not a request — an empty one, one under any other tag, a request
+    /// too short for its ID — closes the connection before any decoder
+    /// sees it, with the frames before it committed and nothing after it
+    /// read. One such frame per connection. The decoder gets the body
+    /// alone, so a body byte equal to a protocol tag is just that —
+    /// `frame(0x01)` carries the heartbeat's value as a command.
     #[test]
-    fn process_frames_reads_the_request_tag_itself() {
-        let Fixture {
-            mut conn,
-            mut producer,
-            mut consumer,
-            ..
-        } = make_fixture(16);
-        conn.parse_buf.extend_from_slice(&frame(0x01));
-        // An empty frame: no tag at all.
-        conn.parse_buf.extend_from_slice(&0u32.to_le_bytes());
-        // A zeroed tag, the protocol's own frames, and a request framed
-        // under an application tag, as a pre-release build did — each
-        // would decode to `Cmd(0x03)` if a decoder saw it.
-        for tag in [0x00, TAG_CHALLENGE_RESPONSE, TAG_RESPONSE_HEARTBEAT, 0x10] {
-            conn.parse_buf
-                .extend_from_slice(&request_frame(tag, &[0x03]));
+    fn a_frame_that_is_not_a_request_closes_the_connection() {
+        let mut not_requests = vec![
+            // An empty frame: no tag at all.
+            0u32.to_le_bytes().to_vec(),
+            // A request tag with fewer bytes than an ID behind it.
+            tagged_frame(melin_wire_protocol::control_codec::TAG_REQUEST, &[0x03; 7]),
+            tagged_frame(melin_wire_protocol::control_codec::TAG_REQUEST, &[]),
+        ];
+        // A zeroed tag, the protocol's own frames, the application tag of
+        // a protocol-0 request, and an application tag as a pre-release
+        // build framed one — each would decode to `Cmd(0x03)` if a
+        // decoder saw it.
+        for tag in [
+            0x00,
+            TAG_CHALLENGE_RESPONSE,
+            TAG_RESPONSE_HEARTBEAT,
+            TAG_APP,
+            0x10,
+        ] {
+            not_requests.push(tagged_frame(tag, &[0x03; 9]));
         }
-        conn.parse_buf.extend_from_slice(&frame(0x02));
+        for bad in not_requests {
+            let Fixture {
+                mut conn,
+                mut producer,
+                mut consumer,
+                ..
+            } = make_fixture(16);
+            conn.parse_buf.extend_from_slice(&frame(0x01));
+            conn.parse_buf.extend_from_slice(&frame(0xFC));
+            conn.parse_buf.extend_from_slice(&bad);
+            conn.parse_buf.extend_from_slice(&frame(0x02));
 
-        let (disconnect, _control_rx) = run_process_frames(&mut conn, &mut producer);
-        assert!(!disconnect, "malformed requests do not drop the connection");
+            let (disconnect, early) = run_process_frames(&mut conn, &mut producer);
+            assert!(disconnect, "{bad:?} must close the connection");
 
-        let events = drain(&mut consumer);
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].1.event, JournalEvent::App(TestEvent::Cmd(0x01)));
-        assert_eq!(events[1].1.event, JournalEvent::App(TestEvent::Cmd(0x02)));
-        assert!(conn.parse_buf.is_empty(), "every frame was consumed");
+            let events = drain(&mut consumer);
+            assert_eq!(events.len(), 1, "{bad:?}");
+            assert_eq!(events[0].1.event, JournalEvent::App(TestEvent::Cmd(0x01)));
+            // The answer decided before it is still sent.
+            assert_eq!(early, [early_reply(id_of(0xFC), 1, EarlyKind::Filtered)]);
+        }
     }
 
     #[test]
@@ -2512,7 +2605,7 @@ mod tests {
         // partial.
         conn.parse_buf.extend_from_slice(&[0xDE, 0xAD, 0xBE]);
 
-        let (disconnect, _control_rx) = run_process_frames(&mut conn, &mut producer);
+        let (disconnect, _early) = run_process_frames(&mut conn, &mut producer);
         assert!(!disconnect);
 
         let events = drain(&mut consumer);
@@ -2539,28 +2632,29 @@ mod tests {
         } = make_fixture(16);
         let mut body = vec![0x05; MAX_REQUEST_BODY];
         body[0] = 0x2A;
-        let at_limit = request_frame(TAG_APP, &body);
+        let at_limit = request_frame(5, &body);
         assert_eq!(at_limit.len(), 4 + MAX_FRAME_SIZE);
 
         // The prefix and part of the payload: kept, not judged oversized.
         conn.parse_buf.extend_from_slice(&at_limit[..4 + 1]);
-        let (disconnect, _control_rx) = run_process_frames(&mut conn, &mut producer);
+        let (disconnect, _early) = run_process_frames(&mut conn, &mut producer);
         assert!(!disconnect, "a frame at the limit is not oversized");
         assert_eq!(conn.parse_buf, at_limit[..4 + 1]);
         assert!(drain(&mut consumer).is_empty());
 
         // The rest of it arrives: published, buffer drained.
         conn.parse_buf.extend_from_slice(&at_limit[4 + 1..]);
-        let (disconnect, _control_rx) = run_process_frames(&mut conn, &mut producer);
+        let (disconnect, _early) = run_process_frames(&mut conn, &mut producer);
         assert!(!disconnect);
         let events = drain(&mut consumer);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].1.event, JournalEvent::App(TestEvent::Cmd(0x2A)));
+        assert_eq!(events[0].1.request_id, RequestId(5));
         assert!(conn.parse_buf.is_empty());
 
         // One byte more, announced by a prefix alone: dropped at once.
         conn.parse_buf.extend_from_slice(&oversize_prefix());
-        let (disconnect, _control_rx) = run_process_frames(&mut conn, &mut producer);
+        let (disconnect, _early) = run_process_frames(&mut conn, &mut producer);
         assert!(disconnect, "oversize prefix alone must request disconnect");
         assert!(drain(&mut consumer).is_empty());
     }
@@ -2576,12 +2670,12 @@ mod tests {
             mut peer,
         } = make_fixture(4);
 
-        let (disconnect, control_rx) = run_process_frames(&mut conn, &mut producer);
+        let (disconnect, early) = run_process_frames(&mut conn, &mut producer);
         assert!(!disconnect);
         assert_eq!(drain(&mut consumer).len(), 0);
         assert!(conn.parse_buf.is_empty());
-        assert_eq!(busy_events(&control_rx), 0);
-        assert!(read_server_busy(&mut peer).is_none());
+        assert!(early.is_empty());
+        assert!(!peer_got_bytes(&mut peer));
     }
 
     /// End-to-end soak through the real reader loop: 4 connections
@@ -2617,7 +2711,7 @@ mod tests {
             producer,
             Arc::new(ByteDecoder),
             gate(None, false),
-            refusal_channel().0,
+            early_channel().0,
             policy_claim(),
             control_tx,
             0,    // "do not pin" sentinel
@@ -2695,9 +2789,6 @@ mod tests {
                 ControlEvent::Disconnected { connection_id } => {
                     panic!("spurious disconnect of connection {connection_id}")
                 }
-                ControlEvent::PipelineBusy { connection_id } => {
-                    panic!("spurious pipeline-full for connection {connection_id}")
-                }
                 ControlEvent::Connected { .. } => {
                     unreachable!("reader never sends Connected")
                 }
@@ -2737,7 +2828,7 @@ mod tests {
             producer,
             Arc::new(ByteDecoder),
             gate(None, false),
-            refusal_channel().0,
+            early_channel().0,
             policy_claim(),
             control_tx,
             0,    // "do not pin" sentinel
@@ -2816,7 +2907,7 @@ mod tests {
             producer,
             Arc::new(ByteDecoder),
             gate(None, false),
-            refusal_channel().0,
+            early_channel().0,
             policy_claim(),
             control_tx,
             0,
@@ -2948,7 +3039,7 @@ mod tests {
             producer,
             Arc::new(ByteDecoder),
             gate(None, false),
-            refusal_channel().0,
+            early_channel().0,
             policy_claim(),
             control_tx,
             0,

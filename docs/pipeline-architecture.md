@@ -378,9 +378,9 @@ The output SPSC queue connects the matching stage to the response stage. Defined
 | Field | Description |
 |-------|-------------|
 | `connection_id: u64` | Target client connection |
-| `request_id: RequestId` | The originating input slot's request ID, copied into every output slot of the event |
+| `request_id: RequestId` | The originating input slot's request ID, copied into every output slot of the event, and echoed on the request's terminal frame |
 | `input_seq: u64` | Input disruptor sequence (for journal cursor gating) |
-| `payload: OutputPayload` | `Report` (an application report), `QueryResponse`, `BatchEnd`, `EngineError`, or `AckPolicyChange` (a journaled policy change, at its place in the order; it produces no frame) |
+| `payload: OutputPayload` | `Report` (an application report), `QueryResponse`, `BatchEnd`, or `AckPolicyChange` (a journaled policy change, at its place in the order; it produces no frame) |
 | `match_complete_ts` | Matching completion timestamp (zero-sized when `latency-trace` disabled) |
 | `recv_ts` | Wire receive timestamp (zero-sized when `latency-trace` disabled) |
 

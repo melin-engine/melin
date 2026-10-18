@@ -10,6 +10,17 @@
 //! heartbeats, and turn a node's silence into an error. This crate is
 //! those four things, once.
 //!
+//! Every request carries an ID ([`RequestId`]) the connection allocates,
+//! from 1 upward, and returns from every send. The node answers every
+//! request exactly once, with a final frame naming it: the end of its
+//! reply batch, [`Frame::ServerBusy`] (shed at ingress, safe to resend),
+//! or [`Frame::Refused`] (the application refused it, with the reason).
+//! Replies to requests the node accepted arrive in request order; a
+//! request it did not accept may be answered ahead of requests sent
+//! before it, but never in the middle of another request's reply. A
+//! connection pairs each final frame with its request by ID and reports
+//! a final frame for no outstanding request as [`Error::Protocol`].
+//!
 //! What it is not: the application's protocol. A node hosts an
 //! application whose requests and responses are its own bytes; this crate
 //! frames them as application frames and never looks inside. Encoding a
@@ -22,7 +33,8 @@
 //! [`Connection::request`] — one request, and the domain frames of its
 //! reply batch — or the pair [`Connection::send`] and
 //! [`Connection::next_frame`], for callers that keep several requests in
-//! flight or want to time the reply frame itself.
+//! flight or want to time the reply frame itself: `send` returns the
+//! request's ID, and each final frame names the ID it answers.
 //!
 //! Every reply batch ends by saying what backs it ([`Ack`]): the node's
 //! ack policy, or, from a primary halted for want of a replica, its own
@@ -50,8 +62,10 @@
 //! - sending, a request is framed in place in its send buffer, at any
 //!   offset, so several batch into one write: the body is encoded into
 //!   the region [`request_body`] hands out, behind room for a header of
-//!   [`REQUEST_HEADER_LEN`] bytes, and [`seal_request`] writes the header
-//!   in front of it ([`frame_request`] does both around a closure).
+//!   [`REQUEST_HEADER_LEN`] bytes, and [`seal_request`] writes the header,
+//!   the request's ID among it, in front of it ([`frame_request`] does
+//!   both around a closure). The ID is the caller's to choose here, and
+//!   to keep unique among its requests in flight.
 //!
 //! The request framing is the wire protocol's own, re-exported here: an
 //! application's codec crate that needs only framing can depend on
@@ -131,14 +145,20 @@
 //!
 //! ## Silence
 //!
-//! A node does not answer a request it refuses — a key whose role may
-//! not perform the operation, a malformed frame, a request laid out for
-//! another version of the node's application — it drops the frame and
-//! keeps the connection. The only signal is the read timeout, which this
-//! crate reports as [`Error::NoReply`] with that explanation attached, so
-//! callers do not each have to know it. A node heartbeats idle
+//! A node answers every request, including one it refuses (a key whose
+//! role may not perform the operation, a request laid out for another
+//! version of the node's application: [`Error::Refused`], with the
+//! application's reason) and one it sheds under load
+//! ([`Error::ServerBusy`]); both leave the connection usable. Silence
+//! therefore means the node or the network: a read that waits longer
+//! than the read timeout is [`Error::NoReply`]. A node heartbeats idle
 //! connections, and a heartbeat is not an answer: it does not push the
 //! timeout back.
+//!
+//! The node and the client must speak the same client protocol
+//! ([`CLIENT_PROTOCOL_VERSION`]): a node of another release is refused
+//! during the handshake, before anything is signed, as
+//! [`Error::ProtocolVersion`]. Upgrade clients with the nodes.
 //!
 //! ```no_run
 //! use melin_client::{Connection, key};
@@ -161,15 +181,25 @@ use ed25519_dalek::Signer;
 use melin_wire_protocol::blocking::{BlockingFrameReader, BlockingFrameWriter};
 use melin_wire_protocol::control::ChallengeResponse;
 use melin_wire_protocol::control_codec::{
-    CHALLENGE_RESPONSE_LEN, TAG_APP, TAG_AUTH_FAILED, TAG_BATCH_END, TAG_BATCH_END_DEGRADED,
-    TAG_CHALLENGE, TAG_ENGINE_ERROR, TAG_LEN, TAG_RESPONSE_HEARTBEAT, TAG_SERVER_BUSY,
-    TAG_SERVER_READY, encode_challenge_response,
+    BATCH_END_FRAME_LEN, BadChallenge, CHALLENGE_RESPONSE_LEN, TAG_APP, TAG_AUTH_FAILED,
+    TAG_BATCH_END, TAG_BATCH_END_DEGRADED, TAG_REFUSED, TAG_RESPONSE_HEARTBEAT, TAG_SERVER_BUSY,
+    TAG_SERVER_READY, decode_challenge, decode_refused, encode_challenge_response,
+    terminal_request_id,
 };
 
 #[cfg(feature = "dpdk")]
 mod dpdk;
 pub mod key;
+mod outstanding;
 mod polled;
+
+use outstanding::Outstanding;
+
+// A request's ID and a refusal's kind are the wire protocol's, re-exported
+// so a client needs no direct dependency on the wire crate to name them;
+// so is the protocol version a node must speak.
+pub use melin_wire_protocol::control::{RefusalKind, RequestId};
+pub use melin_wire_protocol::control_codec::CLIENT_PROTOCOL_VERSION;
 
 // The polled connection lives in a module of its own, re-exported item by
 // item so it sits beside the blocking connection at the crate's root.
@@ -194,7 +224,8 @@ pub use melin_dpdk::{
 // is enough to authenticate.
 pub use ed25519_dalek::{SigningKey, VerifyingKey};
 // The bound on a frame. A caller sizing its widest request body wants
-// `MAX_REQUEST_BODY`, which already takes off the protocol's tag.
+// `MAX_REQUEST_BODY`, which already takes off the protocol's tag and the
+// request's ID.
 pub use melin_wire_protocol::blocking::MAX_FRAME_SIZE;
 // The I/O-free frame splitter and decoder, so a program running its own
 // I/O loop frames the node's bytes without depending on the wire crate.
@@ -210,12 +241,12 @@ pub use melin_wire_protocol::framing::{
     seal_request,
 };
 
-use framing::{FrameDecoder, FrameTooLarge, PREFIX_LEN, request_payload_len};
+use framing::{FrameDecoder, FrameTooLarge, PREFIX_LEN, request_payload_len, request_tag_and_id};
 
 /// Read and connect timeout used by [`Connection::connect`] and
 /// [`Connection::connect_by`]. Generous for a round trip anywhere on a
-/// LAN; short enough that a silently dropped request (see the crate
-/// docs) becomes an error rather than a hang.
+/// LAN; short enough that a node or network gone quiet becomes an error
+/// rather than a hang.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
@@ -250,15 +281,21 @@ pub enum Error {
     /// than a [`VerifyingKey`], which also holds its decompressed point
     /// and would make every `Result` in this crate a wide one).
     AuthFailed { public_key: [u8; 32] },
-    /// Nothing arrived within the read timeout. Almost always a request
-    /// the node refused and silently dropped — see the crate docs.
+    /// Nothing arrived within the read timeout: the node, or the network
+    /// to it, stopped answering. The connection is to be dropped.
     NoReply { timeout: Duration },
     /// The node closed the connection.
     Disconnected,
     /// The node sent something the protocol does not allow here: a frame
-    /// no reply carries, or one out of place in the handshake. The
-    /// connection is to be dropped.
+    /// no reply carries, one out of place in the handshake, an answer for
+    /// a request not outstanding, or a final frame inside another
+    /// request's reply. The connection is to be dropped.
     Protocol(String),
+    /// The node speaks client protocol `node`, this build `client`
+    /// ([`CLIENT_PROTOCOL_VERSION`]): found in the node's challenge,
+    /// before anything was signed. Protocol 0 is a node of a release
+    /// before request IDs. Upgrade clients with the nodes.
+    ProtocolVersion { node: u16, client: u16 },
     /// A length prefix from the node declared a payload of `declared`
     /// bytes, over the limit of `max`. Past it the stream has no frame
     /// boundary left: a [`FrameDecoder`] that reported it is poisoned,
@@ -267,8 +304,9 @@ pub enum Error {
     /// can tell the two apart (and log the length) without asking the
     /// decoder, which the `Result` of [`next_reply`] still borrows.
     FrameTooLarge { declared: u32, max: usize },
-    /// The request, with the protocol's tag in front of it, would not
-    /// fit in one frame of [`MAX_FRAME_SIZE`] bytes; nothing was sent
+    /// The request, with the protocol's tag and its ID in front of it,
+    /// would not fit in one frame of [`MAX_FRAME_SIZE`] bytes; nothing was
+    /// sent
     /// (from [`Connection::send`]) or framed (from [`frame_request`] or
     /// [`seal_request`]).
     RequestTooLarge { len: usize },
@@ -280,10 +318,16 @@ pub enum Error {
     /// [`RequestFrameError::BufferTooSmall`] of [`frame_request`] and
     /// [`seal_request`], for a codec whose error is this one.
     BufferTooSmall { needed: usize, available: usize },
-    /// The node is shedding load; retry later, on a new connection.
+    /// The node shed the request at ingress, under load: it was not
+    /// applied, and may be resent. Requests sent after it may have been
+    /// applied, so a caller whose requests depend on each other's order
+    /// waits for the replies it is owed and resends from this one on. The
+    /// connection is still good.
     ServerBusy,
-    /// The node's application failed on the request; do not retry.
-    EngineError,
+    /// The node's application refused the request, which was not applied.
+    /// `reason` is the application's text, for people. The connection is
+    /// still good.
+    Refused { kind: RefusalKind, reason: String },
     /// The reply came back backed by the primary's disk alone
     /// ([`Ack::PrimaryOnly`]), weaker than the node's ack policy, from a
     /// convenience method that takes only a full one. The reply's frames
@@ -313,13 +357,16 @@ impl fmt::Display for Error {
             ),
             Error::NoReply { timeout } => write!(
                 f,
-                "no reply within {:.1}s: a node silently drops requests it refuses — check \
-                 that the key's role in authorized_keys may perform this operation, and that \
-                 the request is well-formed for the application version the node runs",
+                "no reply within {:.1}s: the node or the network stopped answering",
                 timeout.as_secs_f64()
             ),
             Error::Disconnected => f.write_str("the node closed the connection"),
             Error::Protocol(what) => write!(f, "protocol violation: {what}"),
+            Error::ProtocolVersion { node, client } => write!(
+                f,
+                "the node speaks client protocol {node}, this client {client}: upgrade clients \
+                 with the nodes"
+            ),
             Error::FrameTooLarge { declared, max } => write!(
                 f,
                 "protocol violation: the node declared a {declared}-byte frame, the limit is {max}"
@@ -332,8 +379,16 @@ impl fmt::Display for Error {
                 f,
                 "request buffer too small: the frame needs {needed} bytes, the buffer holds {available}"
             ),
-            Error::ServerBusy => f.write_str("the node is busy: retry later on a new connection"),
-            Error::EngineError => f.write_str("the node reported an engine error; do not retry"),
+            Error::ServerBusy => {
+                f.write_str("the node is busy: the request was not applied, resend it")
+            }
+            Error::Refused { kind, reason } => {
+                let kind = match kind {
+                    RefusalKind::PermissionDenied => "not permitted",
+                    RefusalKind::Malformed => "malformed",
+                };
+                write!(f, "the node refused the request ({kind}): {reason}")
+            }
             Error::Degraded { .. } => f.write_str(
                 "the reply is backed by the primary's disk alone, not by the node's ack policy: \
                  the request is unconfirmed until the cluster is whole again",
@@ -419,20 +474,32 @@ pub struct Batch {
 
 /// One frame from the node, as [`Connection::next_frame`] hands it over.
 /// Heartbeats never surface: they carry nothing and are skipped.
+///
+/// Every request gets exactly one final frame naming it: `BatchEnd`,
+/// `ServerBusy` or `Refused`. `Response` frames carry no ID: they belong
+/// to the next `BatchEnd`, and nothing but heartbeats falls between them
+/// and it.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Frame<'a> {
     /// An application response: its body, the application's bytes with
     /// the protocol's framing stripped. Borrowed from the connection's
     /// buffer, valid until the next read.
     Response(&'a [u8]),
-    /// The last frame of one request's reply batch, saying what backs
-    /// the reply.
-    BatchEnd(Ack),
-    /// The node is shedding load; nothing further will come for the
-    /// request, and the connection should be dropped.
-    ServerBusy,
-    /// The application failed on the request.
-    EngineError,
+    /// The last frame of request `id`'s reply batch, saying what backs
+    /// the reply. A batch may hold no `Response` at all: the application
+    /// had nothing to say, or filtered the request.
+    BatchEnd { id: RequestId, ack: Ack },
+    /// Request `id` was shed at ingress, under load: not applied, safe to
+    /// resend. The connection stays open.
+    ServerBusy { id: RequestId },
+    /// The application refused request `id`, which was not applied:
+    /// `kind` says why, `reason` is the application's text, for people.
+    /// The connection stays open.
+    Refused {
+        id: RequestId,
+        kind: RefusalKind,
+        reason: &'a str,
+    },
 }
 
 /// One frame from the node as [`classify`] sees it: a [`Frame`], or the
@@ -449,11 +516,29 @@ pub enum Reply<'a> {
     /// waiting on a reply keeps its own deadline, as `next_frame` does.
     Heartbeat,
     /// As [`Frame::BatchEnd`].
-    BatchEnd(Ack),
+    BatchEnd { id: RequestId, ack: Ack },
     /// As [`Frame::ServerBusy`].
-    ServerBusy,
-    /// As [`Frame::EngineError`].
-    EngineError,
+    ServerBusy { id: RequestId },
+    /// As [`Frame::Refused`].
+    Refused {
+        id: RequestId,
+        kind: RefusalKind,
+        reason: &'a str,
+    },
+}
+
+impl<'a> Reply<'a> {
+    /// The frame a connection hands over for this reply; `None` for a
+    /// heartbeat, which never surfaces.
+    fn frame(self) -> Option<Frame<'a>> {
+        match self {
+            Reply::Heartbeat => None,
+            Reply::Response(body) => Some(Frame::Response(body)),
+            Reply::BatchEnd { id, ack } => Some(Frame::BatchEnd { id, ack }),
+            Reply::ServerBusy { id } => Some(Frame::ServerBusy { id }),
+            Reply::Refused { id, kind, reason } => Some(Frame::Refused { id, kind, reason }),
+        }
+    }
 }
 
 /// One frame's payload from the node, told apart without I/O: the
@@ -462,22 +547,61 @@ pub enum Reply<'a> {
 /// load generator on a user-space TCP stack — so it need not know the
 /// protocol's tags.
 ///
-/// A tag that is not one of the six a reply may carry — the
-/// handshake's tags, which are over before any reply, and any the
-/// protocol does not define — is [`Error::Protocol`]. So is an empty
-/// frame, and `0x00` with it: a zeroed buffer on the wire is a loud
-/// error, not an application response.
+/// A tag that is not one of those a reply may carry — the handshake's
+/// tags, which are over before any reply, and any the protocol does not
+/// define — is [`Error::Protocol`]. So is an empty frame, and `0x00` with
+/// it: a zeroed buffer on the wire is a loud error, not an application
+/// response. A final frame's length is checked exactly: a batch end or
+/// busy frame one byte short of its ID or one byte long, and a refusal
+/// whose kind names none, whose reason is not UTF-8 or does not fill the
+/// rest of the frame exactly, are [`Error::Protocol`] too.
+///
+/// The ID of a final frame is read here; whether it names a request
+/// outstanding on the connection is the connection's to check, as
+/// [`Connection`] and [`PolledConnection`] do.
 pub fn classify(payload: &[u8]) -> Result<Reply<'_>, Error> {
-    match payload.split_first() {
-        None => Err(Error::Protocol("empty frame".into())),
-        Some((&TAG_APP, body)) => Ok(Reply::Response(body)),
-        Some((&TAG_RESPONSE_HEARTBEAT, _)) => Ok(Reply::Heartbeat),
-        Some((&TAG_BATCH_END, _)) => Ok(Reply::BatchEnd(Ack::Policy)),
-        Some((&TAG_BATCH_END_DEGRADED, _)) => Ok(Reply::BatchEnd(Ack::PrimaryOnly)),
-        Some((&TAG_SERVER_BUSY, _)) => Ok(Reply::ServerBusy),
-        Some((&TAG_ENGINE_ERROR, _)) => Ok(Reply::EngineError),
-        Some((&tag, _)) => Err(Error::Protocol(format!(
+    let Some((&tag, body)) = payload.split_first() else {
+        return Err(Error::Protocol("empty frame".into()));
+    };
+    match tag {
+        TAG_APP => Ok(Reply::Response(body)),
+        TAG_RESPONSE_HEARTBEAT => Ok(Reply::Heartbeat),
+        TAG_BATCH_END => Ok(Reply::BatchEnd {
+            id: id_frame(payload, "batch end")?,
+            ack: Ack::Policy,
+        }),
+        TAG_BATCH_END_DEGRADED => Ok(Reply::BatchEnd {
+            id: id_frame(payload, "degraded batch end")?,
+            ack: Ack::PrimaryOnly,
+        }),
+        TAG_SERVER_BUSY => Ok(Reply::ServerBusy {
+            id: id_frame(payload, "busy frame")?,
+        }),
+        TAG_REFUSED => {
+            let refused = decode_refused(payload)
+                .map_err(|e| Error::Protocol(format!("{e} in a response frame")))?;
+            Ok(Reply::Refused {
+                id: refused.id,
+                kind: refused.kind,
+                reason: refused.reason,
+            })
+        }
+        tag => Err(Error::Protocol(format!(
             "unexpected tag {tag:#04x} in a response frame"
+        ))),
+    }
+}
+
+/// The ID of a final frame whose payload is its tag and the ID alone,
+/// through the one decoder of a final frame's ID, its length checked
+/// exactly.
+fn id_frame(payload: &[u8], what: &str) -> Result<RequestId, Error> {
+    match terminal_request_id(payload) {
+        Some(id) if payload.len() == BATCH_END_FRAME_LEN - PREFIX_LEN => Ok(id),
+        _ => Err(Error::Protocol(format!(
+            "a {}-byte {what}, not {}",
+            payload.len(),
+            BATCH_END_FRAME_LEN - PREFIX_LEN
         ))),
     }
 }
@@ -505,8 +629,9 @@ pub fn classify(payload: &[u8]) -> Result<Reply<'_>, Error> {
 /// and with it [`Error::NoReply`], are the caller's. So is the rule that
 /// [`Connection::next_frame`] follows: a heartbeat is not an answer and
 /// does not push a reply's deadline back, or a node that heartbeats
-/// idle connections would keep a silently dropped request waiting
-/// forever.
+/// idle connections would keep a caller waiting forever on a node that
+/// has stopped answering. And so is the pairing of each final frame with
+/// the request whose ID it names.
 ///
 /// The handshake's frames come out of the same decoder before any reply:
 /// take them with [`FrameDecoder::next`] and feed them to a
@@ -515,18 +640,19 @@ pub fn classify(payload: &[u8]) -> Result<Reply<'_>, Error> {
 /// ```
 /// use std::time::{Duration, Instant};
 /// use melin_client::framing::FrameDecoder;
-/// use melin_client::{Ack, Error, Reply, next_reply};
+/// use melin_client::{Ack, Error, Reply, RequestId, next_reply};
 ///
 /// # use melin_wire_protocol::control_codec::{TAG_APP, TAG_BATCH_END, TAG_RESPONSE_HEARTBEAT};
 /// # let stream = [
 /// #     &[1, 0, 0, 0, TAG_RESPONSE_HEARTBEAT][..],
 /// #     &[3, 0, 0, 0, TAG_APP, b'o', b'k'],
-/// #     &[1, 0, 0, 0, TAG_BATCH_END],
+/// #     &[9, 0, 0, 0, TAG_BATCH_END, 1, 0, 0, 0, 0, 0, 0, 0],
 /// # ]
 /// # .concat();
 /// // What an I/O loop received, in arbitrary chunks: a heartbeat, then a
-/// // response and the end of its batch.
+/// // response and the end of its batch, for the request sent as ID 1.
 /// let received = [&stream[..6], &stream[6..9], &stream[9..]];
+/// let sent = RequestId(1);
 ///
 /// let deadline = Instant::now() + Duration::from_secs(5);
 /// let mut decoder = FrameDecoder::new();
@@ -538,14 +664,19 @@ pub fn classify(payload: &[u8]) -> Result<Reply<'_>, Error> {
 ///             // Not an answer: the deadline stands.
 ///             Reply::Heartbeat => {}
 ///             Reply::Response(body) => responses.push(body.to_vec()),
-///             Reply::BatchEnd(Ack::Policy) => break 'io,
+///             Reply::BatchEnd { id, .. } if id != sent => {
+///                 return Err(Error::Protocol(format!("an answer for {id:?}")));
+///             }
+///             Reply::BatchEnd { ack: Ack::Policy, .. } => break 'io,
 ///             // Only the primary's disk holds it: this caller wants the
 ///             // policy's guarantee, so the request is unconfirmed.
-///             Reply::BatchEnd(Ack::PrimaryOnly) => {
+///             Reply::BatchEnd { ack: Ack::PrimaryOnly, .. } => {
 ///                 return Err(Error::Degraded { frames: responses });
 ///             }
-///             Reply::ServerBusy => return Err(Error::ServerBusy),
-///             Reply::EngineError => return Err(Error::EngineError),
+///             Reply::ServerBusy { .. } => return Err(Error::ServerBusy),
+///             Reply::Refused { kind, reason, .. } => {
+///                 return Err(Error::Refused { kind, reason: reason.to_string() });
+///             }
 ///         }
 ///     }
 ///     if Instant::now() >= deadline {
@@ -574,11 +705,16 @@ pub fn next_reply(decoder: &mut FrameDecoder) -> Result<Option<Reply<'_>>, Error
 /// An authenticated connection to a node.
 ///
 /// Every read is bounded by the read timeout; there is no unbounded
-/// read. A node drops a request it refuses without a word (see the
-/// crate docs), so a read with no deadline could wait forever on a reply
-/// that is never coming. The timeout bounds a wait for a reply, nothing
-/// else: a connection that sends nothing reads nothing, and is not timed
-/// out by this crate.
+/// read: a node, or the network to it, can stop answering, and a read
+/// with no deadline would then wait forever. The timeout bounds a wait
+/// for a reply, nothing else: a connection that sends nothing reads
+/// nothing, and is not timed out by this crate.
+///
+/// Requests are numbered from 1 ([`send`](Self::send) returns each one's
+/// ID), and every final frame [`next_frame`](Self::next_frame) hands over
+/// is checked against the requests outstanding: an answer for none, or a
+/// busy or refusal inside another request's reply, is
+/// [`Error::Protocol`].
 ///
 /// The node has a timeout of its own: it closes a connection that has
 /// sent it nothing for longer than its configured connection timeout,
@@ -586,8 +722,11 @@ pub fn next_reply(decoder: &mut FrameDecoder) -> Result<Option<Reply<'_>>, Error
 /// longer than that sends something within the window, or finds
 /// [`Error::Disconnected`] on its next request.
 ///
-/// After any error the connection's framing can no longer be trusted
-/// (a timeout may have cut a frame in half); drop it and connect again.
+/// After any error but two the connection's framing can no longer be
+/// trusted (a timeout may have cut a frame in half); drop it and connect
+/// again. The two are answers to one request, which leave the connection
+/// usable for the next: [`Error::ServerBusy`] and [`Error::Refused`]
+/// (and [`Error::Degraded`], a reply that did arrive).
 pub struct Connection {
     reader: BlockingFrameReader<TcpStream>,
     writer: BlockingFrameWriter<TcpStream>,
@@ -597,6 +736,8 @@ pub struct Connection {
     stream: TcpStream,
     read_timeout: Duration,
     public_key: VerifyingKey,
+    /// The requests sent and not yet answered, and the next one's ID.
+    outstanding: Outstanding,
 }
 
 impl fmt::Debug for Connection {
@@ -639,6 +780,7 @@ impl Connection {
             stream,
             read_timeout: timeout,
             public_key: key.verifying_key(),
+            outstanding: Outstanding::default(),
         })
     }
 
@@ -646,7 +788,8 @@ impl Connection {
     /// starting. Retries what time can fix — a refused connection, a
     /// listener whose backlog took the connection before the node was
     /// serving (the handshake then times out) — and gives up at once on
-    /// a refused key. The connection returned reads with
+    /// a refused key or a node on another client protocol
+    /// ([`Error::ProtocolVersion`]). The connection returned reads with
     /// [`DEFAULT_TIMEOUT`].
     pub fn connect_by(
         addr: SocketAddr,
@@ -668,6 +811,7 @@ impl Connection {
                     return Ok(connection);
                 }
                 Err(refused @ Error::AuthFailed { .. }) => return Err(refused),
+                Err(mismatch @ Error::ProtocolVersion { .. }) => return Err(mismatch),
                 Err(last) if remaining <= RETRY => {
                     return Err(Error::Deadline {
                         addr,
@@ -687,7 +831,8 @@ impl Connection {
     /// fire the connection is to be dropped. Whether the same request can
     /// then be sent again, on a new connection, without applying it twice
     /// is the application's protocol to say — typically a per-client
-    /// sequence carried in the request body.
+    /// sequence carried in the request body; a request ID means nothing
+    /// past its connection.
     pub fn set_read_timeout(&mut self, timeout: Duration) -> Result<(), Error> {
         self.stream.set_read_timeout(Some(timeout))?;
         self.read_timeout = timeout;
@@ -704,27 +849,33 @@ impl Connection {
         self.stream.peer_addr()
     }
 
-    /// Send one request, the application's bytes, as an application
-    /// frame, flushed.
+    /// Send one request, the application's bytes, as a request frame,
+    /// flushed, and return the ID the connection gave it: the next in
+    /// order, from 1.
     ///
     /// The body is copied once in user space, into the writer's buffer;
     /// there is no staging buffer in between. A body that would take the
     /// frame over [`MAX_FRAME_SIZE`] is [`Error::RequestTooLarge`], and
-    /// nothing is written: the node would drop the connection on it.
-    pub fn send(&mut self, body: &[u8]) -> Result<(), Error> {
+    /// nothing is written (nor an ID taken): the node would drop the
+    /// connection on it.
+    pub fn send(&mut self, body: &[u8]) -> Result<RequestId, Error> {
         // Not built on `seal_request`: that frames into a caller's
         // buffer, and here the body would then be copied a second time,
-        // into the writer's. The limit is the shared one.
+        // into the writer's. The limit and the header's layout are the
+        // shared ones.
         request_payload_len(body.len())?;
-        self.writer.write_frame_parts(&[&[TAG_APP], body])?;
+        let header = request_tag_and_id(self.outstanding.next_id());
+        self.writer.write_frame_parts(&[&header, body])?;
         self.writer.flush()?;
-        Ok(())
+        Ok(self.outstanding.sent())
     }
 
     /// The next frame from the node, heartbeats skipped. Blocks up to
     /// the read timeout: heartbeats do not extend it, or a node that
     /// heartbeats idle connections more often than the timeout would
-    /// keep a silently dropped request waiting forever.
+    /// keep a caller waiting forever on a node that has stopped
+    /// answering. A final frame is checked against the requests
+    /// outstanding (see the type's docs).
     pub fn next_frame(&mut self) -> Result<Frame<'_>, Error> {
         // Each read re-arms the socket's timeout, so silence is measured
         // against this deadline; a heartbeat that arrives past it is the
@@ -734,36 +885,35 @@ impl Connection {
         let deadline = Instant::now() + self.read_timeout;
         loop {
             // Decide on the classification alone, then borrow the frame
-            // back for the one arm that returns it: a borrow that lives
-            // across the loop and is conditionally returned is what the
-            // borrow checker cannot follow.
-            match classify(self.raw_frame()?)? {
-                Reply::Heartbeat => {
-                    if Instant::now() >= deadline {
-                        return Err(Error::NoReply {
-                            timeout: self.read_timeout,
-                        });
-                    }
-                    continue;
-                }
-                Reply::BatchEnd(ack) => return Ok(Frame::BatchEnd(ack)),
-                Reply::ServerBusy => return Ok(Frame::ServerBusy),
-                Reply::EngineError => return Ok(Frame::EngineError),
-                // `classify` saw the tag, so the frame holds at least it.
-                Reply::Response(_) => {
-                    return Ok(Frame::Response(&self.reader.frame()[TAG_LEN..]));
-                }
+            // back to return it: a borrow that lives across the loop and
+            // is conditionally returned is what the borrow checker cannot
+            // follow.
+            let reply = classify(raw_frame(&mut self.reader, self.read_timeout)?)?;
+            self.outstanding.observe(&reply)?;
+            if !matches!(reply, Reply::Heartbeat) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::NoReply {
+                    timeout: self.read_timeout,
+                });
             }
         }
+        Ok(reclassified(self.reader.frame()))
     }
 
     /// Send one request and collect the application frames of its reply
     /// batch, in order, with what backs them. A batch may hold none (the
     /// application had nothing to say) or several (an acknowledgement and
     /// the reports the request caused, say).
+    ///
+    /// Assumes nothing else is in flight on the connection: an answer for
+    /// another request is [`Error::Protocol`], not a reply taken for this
+    /// one. A busy or refused request is [`Error::ServerBusy`] or
+    /// [`Error::Refused`], and the connection stays usable.
     pub fn request_batch(&mut self, body: &[u8]) -> Result<Batch, Error> {
-        self.send(body)?;
-        polled::collect_batch(self)
+        let id = self.send(body)?;
+        polled::collect_batch(self, id)
     }
 
     /// [`request_batch`](Self::request_batch) for a caller that takes
@@ -791,21 +941,38 @@ impl Connection {
     pub fn into_stream(self) -> TcpStream {
         self.stream
     }
+}
 
-    /// One frame's payload, with the transport's outcomes mapped: a clean
-    /// close is [`Error::Disconnected`], a timed-out read is
-    /// [`Error::NoReply`].
-    // Kept on the blocking reader rather than a `FrameDecoder`: the
-    // reader parses in its own read buffer, where a decoder would need a
-    // second copy of every byte read off the socket.
-    fn raw_frame(&mut self) -> Result<&[u8], Error> {
-        let timeout = self.read_timeout;
-        match self.reader.read_frame() {
-            Ok(Some(frame)) => Ok(frame),
-            Ok(None) => Err(Error::Disconnected),
-            Err(e) => Err(io_error(e, timeout)),
-        }
+/// One frame's payload off `reader`, with the transport's outcomes
+/// mapped: a clean close is [`Error::Disconnected`], a read timed out
+/// under `timeout` is [`Error::NoReply`]. A function of the reader alone,
+/// not of the connection, so the connection's other fields stay free
+/// while the frame is borrowed.
+// Kept on the blocking reader rather than a `FrameDecoder`: the reader
+// parses in its own read buffer, where a decoder would need a second copy
+// of every byte read off the socket.
+fn raw_frame(
+    reader: &mut BlockingFrameReader<TcpStream>,
+    timeout: Duration,
+) -> Result<&[u8], Error> {
+    match reader.read_frame() {
+        Ok(Some(frame)) => Ok(frame),
+        Ok(None) => Err(Error::Disconnected),
+        Err(e) => Err(io_error(e, timeout)),
     }
+}
+
+/// The frame a payload already classified, accounted for and found not
+/// to be a heartbeat holds, borrowed back for the caller: what both
+/// connections return once their loop over the payloads they read has
+/// decided on one (see [`Connection::next_frame`]). Classifying again is a
+/// few compares, a UTF-8 check for a refusal's reason, and spares a second
+/// description of every reply as positions.
+pub(crate) fn reclassified(payload: &[u8]) -> Frame<'_> {
+    classify(payload)
+        .ok()
+        .and_then(Reply::frame)
+        .expect("a payload classified as a frame moments ago")
 }
 
 /// A read that failed under a socket timeout of `timeout` is the node's
@@ -918,24 +1085,24 @@ impl Handshake {
     /// One frame from the node, its payload after the length prefix.
     /// The first must be the challenge and the answer is
     /// [`Step::Send`]; the second is the node's verdict, [`Step::Ready`]
-    /// or [`Error::AuthFailed`]. Anything else, in either place, is
-    /// [`Error::Protocol`], as is a frame after the handshake is done.
+    /// or [`Error::AuthFailed`]. A challenge from a node speaking another
+    /// client protocol than [`CLIENT_PROTOCOL_VERSION`] (a protocol-0
+    /// challenge, which carries no version, among them) is
+    /// [`Error::ProtocolVersion`], before anything is signed. Anything
+    /// else, in either place, is [`Error::Protocol`], as is a frame after
+    /// the handshake is done.
     pub fn feed(&mut self, payload: &[u8]) -> Result<Step<'_>, Error> {
         match &self.state {
             HandshakeState::Challenge { key } => {
-                // `[tag][nonce: 32]`
-                let nonce: [u8; 32] = match payload {
-                    [TAG_CHALLENGE, nonce @ ..] if nonce.len() == 32 => {
-                        nonce.try_into().expect("length checked")
-                    }
-                    other => {
-                        return Err(Error::Protocol(format!(
-                            "expected an auth challenge, got a {}-byte frame with tag {:?}",
-                            other.len(),
-                            other.first()
-                        )));
-                    }
-                };
+                let nonce = decode_challenge(payload).map_err(|e| match e {
+                    BadChallenge::Version { node } => Error::ProtocolVersion {
+                        node,
+                        client: CLIENT_PROTOCOL_VERSION,
+                    },
+                    BadChallenge::NotAChallenge { len, tag } => Error::Protocol(format!(
+                        "expected an auth challenge, got a {len}-byte frame with tag {tag:?}"
+                    )),
+                })?;
                 let response = ChallengeResponse {
                     signature: key.sign(&nonce).to_bytes(),
                     public_key: self.public_key,
@@ -968,8 +1135,8 @@ impl Handshake {
 }
 
 /// The longest frame the node sends during the handshake. Its two frames
-/// are a tag and a 32-byte nonce, then a tag: a longer frame is not a
-/// handshake.
+/// are a tag, a version and a 32-byte nonce, then a tag: a longer frame
+/// is not a handshake.
 pub(crate) const MAX_HANDSHAKE_FRAME: usize = 64;
 
 /// Answer a node's challenge on a bare stream: read the nonce, sign it,
@@ -1052,8 +1219,10 @@ mod tests {
     use ed25519_dalek::{Signature, Verifier};
     use melin_wire_protocol::control::TransportResponse;
     use melin_wire_protocol::control_codec::{
+        CHALLENGE_LEN, MAX_CONTROL_FRAME_LEN, TAG_CHALLENGE, TAG_LEN, TAG_REQUEST,
         decode_challenge_response, encode_transport_response,
     };
+    use melin_wire_protocol::framing::split_request;
 
     use super::*;
 
@@ -1084,20 +1253,42 @@ mod tests {
         /// Answer every request with a length prefix over the frame
         /// limit, and nothing after it.
         Oversized,
-        /// Answer every request with `ServerBusy`.
-        Busy,
-        /// Answer every request with `EngineError`.
-        Failing,
+        /// Judge each request by its body: [`SHED`] is answered
+        /// `ServerBusy`, [`REFUSE`] is refused with [`REASON`], anything
+        /// else is echoed as by `Echo`. The connection stays open
+        /// throughout, as a node keeps it.
+        Judging,
+        /// End every request's batch under an ID one past the request's:
+        /// an answer for a request the client never sent.
+        WrongId,
         /// Close the connection once authenticated.
         Hangup,
         /// The admin listener's shape: one text line in, `OK` out.
         AdminLines,
     }
 
+    /// The body [`Behaviour::Judging`] sheds.
+    pub(crate) const SHED: &[u8] = b"shed me";
+    /// The body [`Behaviour::Judging`] refuses.
+    pub(crate) const REFUSE: &[u8] = b"refuse me";
+    /// The reason [`Behaviour::Judging`] refuses with.
+    pub(crate) const REASON: &str = "auditor role may not notarize";
+
     pub(crate) fn control(response: TransportResponse) -> Vec<u8> {
-        let mut buf = [0u8; 64];
+        let mut buf = [0u8; MAX_CONTROL_FRAME_LEN];
         let n = encode_transport_response(&response, &mut buf).unwrap();
         buf[..n].to_vec()
+    }
+
+    /// The end of request `id`'s batch, backed by the policy.
+    pub(crate) fn batch_end(id: u64) -> Vec<u8> {
+        control(TransportResponse::BatchEnd { id: RequestId(id) })
+    }
+
+    /// Request `id`'s frame carrying `body`, length prefix included, as a
+    /// client sends it.
+    pub(crate) fn request_frame(id: u64, body: &[u8]) -> Vec<u8> {
+        tagged_frame(TAG_REQUEST, &[&id.to_le_bytes()[..], body].concat())
     }
 
     /// A frame under any tag, length prefix included.
@@ -1169,23 +1360,43 @@ mod tests {
             _ => {}
         }
         while let Ok(Some(request)) = reader.read_frame() {
-            // `[tag][body]`
-            assert_eq!(request[0], TAG_APP);
-            let body = request[TAG_LEN..].to_vec();
+            // `[tag][id][body]`
+            let (id, body) = split_request(request).expect("a request frame");
+            let body = body.to_vec();
             let reply: Vec<u8> = match behaviour {
-                Behaviour::Echo | Behaviour::EagerHeartbeat => {
-                    [app_frame(&body), control(TransportResponse::BatchEnd)].concat()
-                }
+                Behaviour::Echo | Behaviour::EagerHeartbeat => [
+                    app_frame(&body),
+                    control(TransportResponse::BatchEnd { id }),
+                ]
+                .concat(),
                 Behaviour::DegradedEcho => [
                     app_frame(&body),
-                    control(TransportResponse::BatchEndDegraded),
+                    control(TransportResponse::BatchEndDegraded { id }),
                 ]
                 .concat(),
                 Behaviour::ChattyEcho => [
                     control(TransportResponse::Heartbeat),
                     app_frame(&body),
                     app_frame(b"again"),
-                    control(TransportResponse::BatchEnd),
+                    control(TransportResponse::BatchEnd { id }),
+                ]
+                .concat(),
+                Behaviour::Judging if body == SHED => control(TransportResponse::ServerBusy { id }),
+                Behaviour::Judging if body == REFUSE => control(TransportResponse::Refused {
+                    id,
+                    kind: RefusalKind::PermissionDenied,
+                    reason: REASON,
+                }),
+                Behaviour::Judging => [
+                    app_frame(&body),
+                    control(TransportResponse::BatchEnd { id }),
+                ]
+                .concat(),
+                Behaviour::WrongId => [
+                    app_frame(&body),
+                    control(TransportResponse::BatchEnd {
+                        id: RequestId(id.0 + 1),
+                    }),
                 ]
                 .concat(),
                 Behaviour::Silent => continue,
@@ -1202,8 +1413,6 @@ mod tests {
                 }
                 Behaviour::ZeroTag => tagged_frame(0x00, b"looks zeroed"),
                 Behaviour::Oversized => ((MAX_FRAME_SIZE + 1) as u32).to_le_bytes().to_vec(),
-                Behaviour::Busy => control(TransportResponse::ServerBusy),
-                Behaviour::Failing => control(TransportResponse::EngineError),
                 Behaviour::Hangup | Behaviour::AdminLines => unreachable!(),
             };
             stream.write_all(&reply).unwrap();
@@ -1238,16 +1447,24 @@ mod tests {
         let reply = node.request_one(b"hello").unwrap();
         assert_eq!(reply, b"hello");
 
-        // The same over the pipelined pair, several requests in flight.
+        // The same over the pipelined pair, several requests in flight,
+        // each batch naming the request it ends: IDs follow on from the
+        // first request's.
         for n in 2..=4u64 {
-            node.send(&n.to_le_bytes()).unwrap();
+            assert_eq!(node.send(&n.to_le_bytes()).unwrap(), RequestId(n));
         }
         for n in 2..=4u64 {
             assert_eq!(
                 node.next_frame().unwrap(),
                 Frame::Response(&n.to_le_bytes())
             );
-            assert_eq!(node.next_frame().unwrap(), Frame::BatchEnd(Ack::Policy));
+            assert_eq!(
+                node.next_frame().unwrap(),
+                Frame::BatchEnd {
+                    id: RequestId(n),
+                    ack: Ack::Policy
+                }
+            );
         }
 
         let batch = node.request_batch(b"backed").unwrap();
@@ -1264,11 +1481,14 @@ mod tests {
         let addr = fake_node(key.verifying_key(), Behaviour::DegradedEcho);
         let mut node = Connection::connect(addr, &key).unwrap();
 
-        node.send(b"held").unwrap();
+        let id = node.send(b"held").unwrap();
         assert_eq!(node.next_frame().unwrap(), Frame::Response(b"held"));
         assert_eq!(
             node.next_frame().unwrap(),
-            Frame::BatchEnd(Ack::PrimaryOnly)
+            Frame::BatchEnd {
+                id,
+                ack: Ack::PrimaryOnly
+            }
         );
 
         let batch = node.request_batch(b"held").unwrap();
@@ -1348,7 +1568,7 @@ mod tests {
         let err = node.request(b"dropped").unwrap_err();
         assert!(started.elapsed() >= timeout);
         assert!(matches!(err, Error::NoReply { timeout: t } if t == timeout));
-        assert!(err.to_string().contains("authorized_keys"), "{err}");
+        assert!(err.to_string().contains("stopped answering"), "{err}");
     }
 
     #[test]
@@ -1379,16 +1599,18 @@ mod tests {
         let addr = fake_node(key.verifying_key(), Behaviour::Echo);
         let mut node = Connection::connect(addr, &key).unwrap();
 
-        // One byte over the widest body a frame takes once the tag is
-        // counted.
-        let body = vec![0xAB; MAX_FRAME_SIZE];
+        // One byte over the widest body a frame takes once the tag and the
+        // ID are counted.
+        let body = vec![0xAB; MAX_REQUEST_BODY + 1];
         let err = node.send(&body).unwrap_err();
         assert!(matches!(err, Error::RequestTooLarge { len } if len == MAX_FRAME_SIZE + 1));
         assert!(err.to_string().contains("request too large"), "{err}");
 
         // Nothing reached the node, so the connection is as good as new,
-        // and the widest body that fits goes through it.
-        assert_eq!(node.request_one(b"still here").unwrap(), b"still here");
+        // no ID was taken, and the widest body that fits goes through it.
+        assert_eq!(node.send(b"still here").unwrap(), RequestId(1));
+        assert_eq!(node.next_frame().unwrap(), Frame::Response(b"still here"));
+        assert!(matches!(node.next_frame().unwrap(), Frame::BatchEnd { .. }));
         assert_eq!(node.request_one(&body[1..]).unwrap(), &body[1..]);
     }
 
@@ -1418,21 +1640,90 @@ mod tests {
         assert!(matches!(err, Error::NoReply { timeout: t } if t == timeout));
     }
 
+    /// A shed and a refused request are frames naming them when
+    /// pipelining, and errors from the convenience calls, which leave the
+    /// connection usable for the next request.
     #[test]
-    fn busy_and_engine_error_are_frames_when_pipelining_and_errors_from_request() {
+    fn busy_and_refused_are_frames_when_pipelining_and_errors_from_request() {
         let key = client_key();
-
-        let addr = fake_node(key.verifying_key(), Behaviour::Busy);
+        let addr = fake_node(key.verifying_key(), Behaviour::Judging);
         let mut node = Connection::connect(addr, &key).unwrap();
-        node.send(b"").unwrap();
-        assert_eq!(node.next_frame().unwrap(), Frame::ServerBusy);
-        assert!(matches!(node.request(b""), Err(Error::ServerBusy)));
 
-        let addr = fake_node(key.verifying_key(), Behaviour::Failing);
+        let shed = node.send(SHED).unwrap();
+        let refused = node.send(REFUSE).unwrap();
+        assert_eq!(node.next_frame().unwrap(), Frame::ServerBusy { id: shed });
+        assert_eq!(
+            node.next_frame().unwrap(),
+            Frame::Refused {
+                id: refused,
+                kind: RefusalKind::PermissionDenied,
+                reason: REASON
+            }
+        );
+        assert_judged_by_the_convenience_calls(&mut node);
+    }
+
+    /// `session`'s convenience calls against a [`Behaviour::Judging`]
+    /// node: a busy and a refusal are their errors, and the next request
+    /// on the same connection still gets its reply.
+    pub(crate) fn assert_judged_by_the_convenience_calls(session: &mut dyn polled::Session) {
+        let err = session.request(SHED).unwrap_err();
+        assert!(matches!(err, Error::ServerBusy), "{err:?}");
+        assert!(err.to_string().contains("resend"), "{err}");
+        assert_eq!(
+            session.request_one(b"after a shed").unwrap(),
+            b"after a shed"
+        );
+
+        let err = session.request_batch(REFUSE).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                Error::Refused { kind: RefusalKind::PermissionDenied, reason } if reason == REASON
+            ),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains(REASON), "{err}");
+        assert!(err.to_string().contains("not permitted"), "{err}");
+        assert_eq!(
+            session.request_one(b"after a refusal").unwrap(),
+            b"after a refusal"
+        );
+    }
+
+    /// An answer for another request is a protocol error from the
+    /// convenience calls, not a reply taken for the one they sent; and it
+    /// is one from the pipelined pair too, since nothing outstanding has
+    /// that ID.
+    #[test]
+    fn an_answer_for_another_request_is_refused() {
+        let key = client_key();
+        let addr = fake_node(key.verifying_key(), Behaviour::WrongId);
         let mut node = Connection::connect(addr, &key).unwrap();
-        node.send(b"").unwrap();
-        assert_eq!(node.next_frame().unwrap(), Frame::EngineError);
-        assert!(matches!(node.request(b""), Err(Error::EngineError)));
+        let err = node.request(b"mine").unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)), "{err:?}");
+        assert!(err.to_string().contains("not outstanding"), "{err}");
+    }
+
+    /// The pairing check in the convenience calls, apart from the
+    /// connection's: a request in flight before the call, answered first,
+    /// is outstanding (so the connection accepts the answer) but not the
+    /// call's.
+    #[test]
+    fn a_convenience_call_does_not_take_another_requests_answer() {
+        let key = client_key();
+        let addr = fake_node(key.verifying_key(), Behaviour::Echo);
+        let mut node = Connection::connect(addr, &key).unwrap();
+        let earlier = node.send(b"earlier").unwrap();
+        let err = node.request(b"mine").unwrap_err();
+        assert!(
+            err.to_string().contains(&format!(
+                "an answer for request {} while waiting on request {}",
+                earlier.0,
+                earlier.0 + 1
+            )),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1532,13 +1823,13 @@ mod tests {
         authenticate(&mut stream, &key).unwrap();
 
         // The stream is the caller's from here: a request framed by hand
-        // gets its reply batch.
-        stream.write_all(&app_frame(b"raw")).unwrap();
+        // gets its reply batch, under the ID it chose.
+        stream.write_all(&request_frame(77, b"raw")).unwrap();
         assert_eq!(
             read_raw_frame(&mut stream),
             [&[TAG_APP][..], b"raw"].concat()
         );
-        assert_eq!(read_raw_frame(&mut stream), [TAG_BATCH_END]);
+        assert_eq!(read_raw_frame(&mut stream), batch_end(77)[PREFIX_LEN..]);
     }
 
     #[test]
@@ -1552,7 +1843,7 @@ mod tests {
         authenticate(&mut stream, &key).unwrap();
         assert_eq!(read_raw_frame(&mut stream), [TAG_RESPONSE_HEARTBEAT]);
 
-        stream.write_all(&app_frame(b"after")).unwrap();
+        stream.write_all(&request_frame(1, b"after")).unwrap();
         assert_eq!(
             read_raw_frame(&mut stream),
             [&[TAG_APP][..], b"after"].concat()
@@ -1772,28 +2063,172 @@ mod tests {
         ));
     }
 
+    /// A challenge from a node on another client protocol, by hand: a
+    /// protocol-0 one carries no version, a later one names its own.
+    fn challenge_of(version: Option<u16>) -> Vec<u8> {
+        let version = version.map(u16::to_le_bytes);
+        let mut payload = vec![TAG_CHALLENGE];
+        payload.extend(version.iter().flatten());
+        payload.extend([0x5A; 32]);
+        payload
+    }
+
+    #[test]
+    fn a_node_on_another_protocol_is_refused_before_anything_is_signed() {
+        let key = client_key();
+        for (version, node) in [
+            (None, 0),
+            (Some(0), 0),
+            (Some(2), 2),
+            (Some(u16::MAX), u16::MAX),
+        ] {
+            let mut handshake = Handshake::new(&key);
+            let err = handshake.feed(&challenge_of(version)).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    Error::ProtocolVersion { node: n, client: CLIENT_PROTOCOL_VERSION } if n == node
+                ),
+                "{version:?}: {err:?}"
+            );
+            let shown = err.to_string();
+            assert!(shown.contains(&format!("protocol {node}")), "{shown}");
+            assert!(
+                shown.contains(&format!("this client {CLIENT_PROTOCOL_VERSION}")),
+                "{shown}"
+            );
+            // Nothing was signed: the handshake still waits for a
+            // challenge, and takes a good one.
+            assert!(format!("{handshake:?}").contains("challenge"));
+            assert!(matches!(
+                handshake.feed(&payload(TransportResponse::Challenge { nonce: [1; 32] })),
+                Ok(Step::Send(_))
+            ));
+        }
+        // This build's own protocol: answered.
+        let ours = challenge_of(Some(CLIENT_PROTOCOL_VERSION));
+        assert_eq!(ours.len(), CHALLENGE_LEN);
+        assert!(matches!(
+            Handshake::new(&key).feed(&ours),
+            Ok(Step::Send(_))
+        ));
+    }
+
+    /// Over a socket: a node on protocol 0 sees the client close without a
+    /// byte sent, and the client reports both versions.
+    #[test]
+    fn a_protocol_0_node_gets_nothing_from_the_client() {
+        let key = client_key();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let node = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let challenge = challenge_of(None);
+            stream
+                .write_all(&tagged_frame(challenge[0], &challenge[1..]))
+                .unwrap();
+            let mut got = Vec::new();
+            stream.read_to_end(&mut got).unwrap();
+            got
+        });
+        let err = Connection::connect(addr, &key).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::ProtocolVersion {
+                    node: 0,
+                    client: CLIENT_PROTOCOL_VERSION
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(node.join().unwrap().is_empty(), "the client sent something");
+    }
+
+    /// A protocol mismatch is a definite answer, as a refused key is:
+    /// `connect_by` reports it at once rather than retrying to the deadline.
+    #[test]
+    fn connect_by_does_not_retry_a_node_on_another_protocol() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            // Answer every attempt the same way: a client that retried
+            // would keep failing until the deadline.
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let challenge = challenge_of(None);
+                let _ = stream.write_all(&tagged_frame(challenge[0], &challenge[1..]));
+            }
+        });
+        let started = Instant::now();
+        let err = Connection::connect_by(
+            addr,
+            &client_key(),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::ProtocolVersion {
+                    node: 0,
+                    client: CLIENT_PROTOCOL_VERSION
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
     #[test]
     fn classify_tells_each_reply_apart() {
+        let id = RequestId(0x1122_3344_5566_7788);
         assert_eq!(
             classify(&payload(TransportResponse::Heartbeat)).unwrap(),
             Reply::Heartbeat
         );
         assert_eq!(
-            classify(&payload(TransportResponse::BatchEnd)).unwrap(),
-            Reply::BatchEnd(Ack::Policy)
+            classify(&payload(TransportResponse::BatchEnd { id })).unwrap(),
+            Reply::BatchEnd {
+                id,
+                ack: Ack::Policy
+            }
         );
         assert_eq!(
-            classify(&payload(TransportResponse::BatchEndDegraded)).unwrap(),
-            Reply::BatchEnd(Ack::PrimaryOnly)
+            classify(&payload(TransportResponse::BatchEndDegraded { id })).unwrap(),
+            Reply::BatchEnd {
+                id,
+                ack: Ack::PrimaryOnly
+            }
         );
         assert_eq!(
-            classify(&payload(TransportResponse::ServerBusy)).unwrap(),
-            Reply::ServerBusy
+            classify(&payload(TransportResponse::ServerBusy { id })).unwrap(),
+            Reply::ServerBusy { id }
         );
-        assert_eq!(
-            classify(&payload(TransportResponse::EngineError)).unwrap(),
-            Reply::EngineError
-        );
+        for kind in [RefusalKind::PermissionDenied, RefusalKind::Malformed] {
+            assert_eq!(
+                classify(&payload(TransportResponse::Refused {
+                    id,
+                    kind,
+                    reason: "why ✓"
+                }))
+                .unwrap(),
+                Reply::Refused {
+                    id,
+                    kind,
+                    reason: "why ✓"
+                }
+            );
+        }
+        // An empty reason.
+        assert!(matches!(
+            classify(&payload(TransportResponse::Refused {
+                id,
+                kind: RefusalKind::Malformed,
+                reason: ""
+            })),
+            Ok(Reply::Refused { reason: "", .. })
+        ));
 
         // A response is handed back as its body, the tag stripped, and
         // the body may start with any byte or be empty.
@@ -1821,6 +2256,10 @@ mod tests {
             payload(TransportResponse::ServerReady),
             vec![0x0F],
             vec![0x10, 0x01],
+            // A request, which a node never sends, and the retired
+            // engine-error tag.
+            request_frame(1, b"x")[PREFIX_LEN..].to_vec(),
+            vec![0x03],
         ] {
             let err = classify(&wrong).unwrap_err();
             assert!(matches!(err, Error::Protocol(_)), "{wrong:?}: {err}");
@@ -1831,12 +2270,102 @@ mod tests {
         }
     }
 
+    /// A final frame is checked to its exact length: one byte short of
+    /// its ID or one byte long is a protocol error, as is a refusal whose
+    /// kind names none, whose reason is not UTF-8, or whose reason's
+    /// length disagrees with the frame.
+    #[test]
+    fn classify_checks_each_final_frame_exactly() {
+        let id = RequestId(5);
+        for terminal in [
+            TransportResponse::BatchEnd { id },
+            TransportResponse::BatchEndDegraded { id },
+            TransportResponse::ServerBusy { id },
+        ] {
+            let exact = payload(terminal);
+            assert!(classify(&exact).is_ok(), "{terminal:?}");
+            let short = &exact[..exact.len() - 1];
+            let long = [&exact[..], &[0]].concat();
+            for wrong in [short, &long[..], &exact[..1]] {
+                let err = classify(wrong).unwrap_err();
+                assert!(matches!(err, Error::Protocol(_)), "{terminal:?}: {err:?}");
+                assert!(err.to_string().contains("-byte"), "{err}");
+            }
+        }
+
+        let refused = payload(TransportResponse::Refused {
+            id,
+            kind: RefusalKind::Malformed,
+            reason: "abc",
+        });
+        assert!(classify(&refused).is_ok());
+        let kind_at = TAG_LEN + 8;
+        let mut wrong = Vec::new();
+        // An unknown kind and a zeroed one.
+        for kind in [0x00, 0x03] {
+            let mut bad = refused.clone();
+            bad[kind_at] = kind;
+            wrong.push(bad);
+        }
+        // A reason that is not UTF-8.
+        let mut bad = refused.clone();
+        bad[kind_at + 2] = 0xFF;
+        wrong.push(bad);
+        // A reason's length past the end of the frame, and short of it.
+        let mut bad = refused.clone();
+        bad[kind_at + 1] = 4;
+        wrong.push(bad);
+        wrong.push([&refused[..], b"x"].concat());
+        // Cut inside the ID, before the kind, before the length.
+        for cut in [5, kind_at, kind_at + 1] {
+            wrong.push(refused[..cut].to_vec());
+        }
+        for bad in wrong {
+            let err = classify(&bad).unwrap_err();
+            assert!(matches!(err, Error::Protocol(_)), "{bad:?}: {err:?}");
+            assert!(err.to_string().contains("refusal"), "{err}");
+        }
+    }
+
+    /// Every final frame's ID is read through the wire protocol's one
+    /// decoder of it.
+    #[test]
+    fn classify_reads_ids_through_the_wire_protocol() {
+        for id in [0, 1, u64::MAX] {
+            for terminal in [
+                TransportResponse::BatchEnd { id: RequestId(id) },
+                TransportResponse::BatchEndDegraded { id: RequestId(id) },
+                TransportResponse::ServerBusy { id: RequestId(id) },
+                TransportResponse::Refused {
+                    id: RequestId(id),
+                    kind: RefusalKind::PermissionDenied,
+                    reason: "r",
+                },
+            ] {
+                let payload = payload(terminal);
+                let classified = match classify(&payload).unwrap() {
+                    Reply::BatchEnd { id, .. }
+                    | Reply::ServerBusy { id }
+                    | Reply::Refused { id, .. } => id,
+                    other => panic!("{other:?}"),
+                };
+                assert_eq!(Some(classified), terminal_request_id(&payload));
+                assert_eq!(classified, RequestId(id));
+            }
+        }
+    }
+
     // --- the I/O-free path ---
 
     /// `frame_request` with an encoder that copies `body`, under the
-    /// crate's own error type.
+    /// crate's own error type, as request 1.
     fn frame_body(buf: &mut [u8], body: &[u8]) -> Result<usize, Error> {
-        frame_request(buf, |out| {
+        frame_body_as(buf, 1, body)
+    }
+
+    /// [`frame_body`] as request `id`.
+    fn frame_body_as(buf: &mut [u8], id: u64, body: &[u8]) -> Result<usize, Error> {
+        frame_request(buf, RequestId(id), |out| {
             let Some(dst) = out.get_mut(..body.len()) else {
                 return Err(Error::Protocol("encoder: no room".into()));
             };
@@ -1847,13 +2376,18 @@ mod tests {
 
     #[test]
     fn next_reply_surfaces_heartbeats_and_waits_for_whole_frames() {
+        let refused = TransportResponse::Refused {
+            id: RequestId(4),
+            kind: RefusalKind::Malformed,
+            reason: "bad",
+        };
         let stream = [
             control(TransportResponse::Heartbeat),
             app_frame(b"body"),
-            control(TransportResponse::BatchEnd),
-            control(TransportResponse::BatchEndDegraded),
-            control(TransportResponse::ServerBusy),
-            control(TransportResponse::EngineError),
+            batch_end(1),
+            control(TransportResponse::BatchEndDegraded { id: RequestId(2) }),
+            control(TransportResponse::ServerBusy { id: RequestId(3) }),
+            control(refused),
         ]
         .concat();
         let mut decoder = FrameDecoder::new();
@@ -1872,10 +2406,29 @@ mod tests {
             [
                 format!("{:?}", Reply::Heartbeat),
                 format!("{:?}", Reply::Response(b"body")),
-                format!("{:?}", Reply::BatchEnd(Ack::Policy)),
-                format!("{:?}", Reply::BatchEnd(Ack::PrimaryOnly)),
-                format!("{:?}", Reply::ServerBusy),
-                format!("{:?}", Reply::EngineError),
+                format!(
+                    "{:?}",
+                    Reply::BatchEnd {
+                        id: RequestId(1),
+                        ack: Ack::Policy
+                    }
+                ),
+                format!(
+                    "{:?}",
+                    Reply::BatchEnd {
+                        id: RequestId(2),
+                        ack: Ack::PrimaryOnly
+                    }
+                ),
+                format!("{:?}", Reply::ServerBusy { id: RequestId(3) }),
+                format!(
+                    "{:?}",
+                    Reply::Refused {
+                        id: RequestId(4),
+                        kind: RefusalKind::Malformed,
+                        reason: "bad"
+                    }
+                ),
             ]
         );
         assert!(decoder.pending().is_empty());
@@ -1939,19 +2492,21 @@ mod tests {
         // The same items, reachable from this crate's root and through
         // its `framing` module.
         assert_eq!(REQUEST_HEADER_LEN, framing::REQUEST_HEADER_LEN);
-        assert_eq!(REQUEST_HEADER_LEN, PREFIX_LEN + TAG_LEN);
+        assert_eq!(REQUEST_HEADER_LEN, PREFIX_LEN + TAG_LEN + 8);
         assert_eq!(MAX_REQUEST_BODY, framing::MAX_REQUEST_BODY);
-        assert_eq!(MAX_REQUEST_BODY, MAX_FRAME_SIZE - TAG_LEN);
+        assert_eq!(MAX_REQUEST_BODY, MAX_FRAME_SIZE - TAG_LEN - 8);
         // Compiles only if the root's names are the module's items.
-        let _: fn(&mut [u8], usize) -> Result<usize, framing::RequestFrameError> = seal_request;
+        let _: fn(&mut [u8], RequestId, usize) -> Result<usize, framing::RequestFrameError> =
+            seal_request;
         let _: fn(&mut [u8]) -> Result<&mut [u8], RequestFrameError> = framing::request_body;
+        let _: RequestId = melin_wire_protocol::control::RequestId(1);
 
         // The closure-free form through the root names.
         let mut buf = [0xEEu8; 32];
         let body = request_body(&mut buf).unwrap();
         body[..3].copy_from_slice(b"abc");
-        let n = seal_request(&mut buf, 3).unwrap();
-        assert_eq!(&buf[..n], app_frame(b"abc").as_slice());
+        let n = seal_request(&mut buf, RequestId(9), 3).unwrap();
+        assert_eq!(&buf[..n], request_frame(9, b"abc").as_slice());
         assert!(buf[n..].iter().all(|&b| b == 0xEE));
     }
 
@@ -1977,7 +2532,10 @@ mod tests {
         // With this crate's `Error` as the encoder's error type, each
         // framing failure arrives as its own variant.
         let mut wide = vec![0x5C; REQUEST_HEADER_LEN + MAX_FRAME_SIZE + 16];
-        let err = frame_request(&mut wide, |_| Ok::<_, Error>(MAX_REQUEST_BODY + 1)).unwrap_err();
+        let err = frame_request(&mut wide, RequestId(1), |_| {
+            Ok::<_, Error>(MAX_REQUEST_BODY + 1)
+        })
+        .unwrap_err();
         assert!(
             matches!(err, Error::RequestTooLarge { len } if len == MAX_FRAME_SIZE + 1),
             "{err:?}"
@@ -1985,7 +2543,7 @@ mod tests {
         assert!(err.to_string().contains("request too large"), "{err}");
 
         let mut short = [0u8; 2];
-        let err = frame_request(&mut short, |_| -> Result<usize, Error> {
+        let err = frame_request(&mut short, RequestId(1), |_| -> Result<usize, Error> {
             panic!("the encoder must not run without room for the header")
         })
         .unwrap_err();
@@ -2003,13 +2561,13 @@ mod tests {
 
         let mut buf = [0u8; REQUEST_HEADER_LEN + 4];
         assert!(matches!(
-            seal_request(&mut buf, 5).map_err(Error::from),
+            seal_request(&mut buf, RequestId(1), 5).map_err(Error::from),
             Err(Error::BufferTooSmall { needed, available })
                 if needed == REQUEST_HEADER_LEN + 5 && available == REQUEST_HEADER_LEN + 4
         ));
         // An encoder's own failure passes through untouched.
         assert!(matches!(
-            frame_request(&mut buf, |_| Err(Error::Protocol("mine".into()))),
+            frame_request(&mut buf, RequestId(1), |_| Err(Error::Protocol("mine".into()))),
             Err(Error::Protocol(what)) if what == "mine"
         ));
     }
@@ -2035,20 +2593,22 @@ mod tests {
         // Start part-way in, as after bytes already queued for sending.
         let start = 7;
         let mut end = start;
-        for body in bodies {
-            end += frame_body(&mut buf[end..], body).unwrap();
+        let mut expected = Vec::new();
+        for (id, body) in (1..).zip(bodies) {
+            end += frame_body_as(&mut buf[end..], id, body).unwrap();
+            expected.extend(request_frame(id, body));
         }
         assert!(buf[..start].iter().all(|&b| b == 0xEE));
         assert!(buf[end..].iter().all(|&b| b == 0xEE));
-        assert_eq!(&buf[start..end], bodies.map(app_frame).concat().as_slice());
+        assert_eq!(&buf[start..end], expected.as_slice());
 
-        // A decoder on the other side gets each body back, in order.
+        // A node on the other side gets each request back, in order.
         let mut decoder = FrameDecoder::new();
         decoder.push(&buf[start..end]);
-        for body in bodies {
+        for (id, body) in (1..).zip(bodies) {
             assert_eq!(
-                classify(decoder.next().unwrap().unwrap()).unwrap(),
-                Reply::Response(body)
+                split_request(decoder.next().unwrap().unwrap()).unwrap(),
+                (RequestId(id), body)
             );
         }
         assert_eq!(decoder.next().unwrap(), None);
@@ -2069,7 +2629,13 @@ mod tests {
         let mut decoder = FrameDecoder::new();
         let mut chunk = [0u8; 64];
         let mut replies = Vec::new();
-        let end = format!("{:?}", Reply::BatchEnd(Ack::Policy));
+        let end = format!(
+            "{:?}",
+            Reply::BatchEnd {
+                id: RequestId(1),
+                ack: Ack::Policy
+            }
+        );
         while !replies.contains(&end) {
             let got = stream.read(&mut chunk).unwrap();
             assert_ne!(got, 0, "the node closed the connection");
@@ -2085,34 +2651,36 @@ mod tests {
     }
 
     proptest::proptest! {
-        /// Any run of bodies that fit, framed back to back from any
-        /// offset, decodes to the same bodies however the bytes arrive.
+        /// Any run of requests that fit, under any IDs, framed back to back
+        /// from any offset, decodes to the same IDs and bodies however the
+        /// bytes arrive.
         #[test]
         fn framed_requests_round_trip_through_the_decoder(
-            bodies in proptest::collection::vec(
-                proptest::collection::vec(proptest::prelude::any::<u8>(), 0..=64),
+            requests in proptest::collection::vec(
+                (
+                    proptest::prelude::any::<u64>(),
+                    proptest::collection::vec(proptest::prelude::any::<u8>(), 0..=64),
+                ),
                 0..8,
             ),
             offset in 0usize..16,
             chunk in 1usize..32,
         ) {
-            let mut buf = vec![0u8; offset + bodies.len() * (REQUEST_HEADER_LEN + 64)];
+            let mut buf = vec![0u8; offset + requests.len() * (REQUEST_HEADER_LEN + 64)];
             let mut end = offset;
-            for body in &bodies {
-                end += frame_body(&mut buf[end..], body).unwrap();
+            for (id, body) in &requests {
+                end += frame_body_as(&mut buf[end..], *id, body).unwrap();
             }
             let mut decoder = FrameDecoder::new();
             let mut got = Vec::new();
             for piece in buf[offset..end].chunks(chunk) {
                 decoder.push(piece);
-                while let Some(reply) = next_reply(&mut decoder).unwrap() {
-                    let Reply::Response(body) = reply else {
-                        panic!("a request frame classified as {reply:?}");
-                    };
-                    got.push(body.to_vec());
+                while let Some(payload) = decoder.next().unwrap() {
+                    let (id, body) = split_request(payload).unwrap();
+                    got.push((id.0, body.to_vec()));
                 }
             }
-            proptest::prop_assert_eq!(got, bodies);
+            proptest::prop_assert_eq!(got, requests);
             proptest::prop_assert!(decoder.pending().is_empty());
         }
     }

@@ -97,8 +97,8 @@ fn config_for(journal_cursor: DurableWireSeqCursor) -> Response<Counter> {
         encoder: Arc::new(ResponseEncoder),
         fence_state: Arc::new(FenceState::new(0)),
         active_connections: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        // No reader: nothing is ever refused.
-        refusals: halt::refusal_channel(Arc::new(CachePadded::new(AtomicU64::new(0)))).1,
+        // No reader: nothing is ever answered early.
+        early_replies: halt::early_reply_channel(Arc::new(CachePadded::new(AtomicU64::new(0)))).1,
         ring_sizing: RingSizing::for_max_connections(1).expect("a supported cap"),
         ready: None,
         degraded_release: None,

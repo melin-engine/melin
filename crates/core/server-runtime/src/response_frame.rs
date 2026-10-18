@@ -6,7 +6,11 @@
 use melin_app::encoder::ResponseEncoder;
 use melin_transport_core::pipeline::OutputPayload;
 use melin_wire_protocol::control::TransportResponse;
-use melin_wire_protocol::control_codec::{self, TAG_APP, TAG_LEN};
+use melin_wire_protocol::control_codec::{
+    self, BATCH_END_FRAME_LEN, MAX_CONTROL_FRAME_LEN, TAG_APP, TAG_LEN,
+};
+
+use crate::halt::{EarlyKind, EarlyReply};
 
 /// Bound on one application response body — what a `ResponseEncoder`
 /// may write for a single report or query response.
@@ -63,8 +67,7 @@ pub(crate) fn frame_app_response(
 /// Encode one output slot's payload frame into `buf`.
 ///
 /// Application-shaped payloads (`Report`, `QueryResponse`) go through the
-/// application's encoder and [`frame_app_response`]; `EngineError` is
-/// transport-shaped and encoded by the runtime directly. `BatchEnd` carries
+/// application's encoder and [`frame_app_response`]. `BatchEnd` carries
 /// no body and returns `None` — the wire terminator is emitted from the
 /// slot's `is_last_in_request` flag, not from the payload. So does
 /// `AckPolicyChange`, which the durability gate consumes and no client
@@ -82,18 +85,72 @@ pub(crate) fn encode_slot_payload<R: Copy, Q: Copy>(
         OutputPayload::QueryResponse(q) => Some(frame_app_response(buf, |body| {
             encoder.encode_query(q, body)
         })),
-        OutputPayload::EngineError => Some(
-            control_codec::encode_transport_response(&TransportResponse::EngineError, buf)
-                .map_err(|_| "encode error"),
-        ),
         // A policy change is the gate's, not a reply: it has no client.
         OutputPayload::BatchEnd | OutputPayload::AckPolicyChange(_) => None,
     }
 }
 
+/// The widest early reply, every frame of it, length prefixes included:
+/// a halt rejection (the application's report and a `BatchEnd`) or a
+/// refusal with the longest reason, whichever is wider.
+pub(crate) const MAX_EARLY_REPLY: usize = {
+    let rejected = MAX_APP_FRAME + BATCH_END_FRAME_LEN;
+    if rejected > MAX_CONTROL_FRAME_LEN {
+        rejected
+    } else {
+        MAX_CONTROL_FRAME_LEN
+    }
+};
+
+/// Scratch buffer one early reply's frames are encoded into: on the stack,
+/// fixed size, no allocation.
+pub(crate) type EarlyReplyBuf = [u8; MAX_EARLY_REPLY];
+
+/// Encode every frame of an early reply into `buf`, back to back, and
+/// return their length: the one encoding of an early reply, for both
+/// response stages. A rejection is the application's report then
+/// `BatchEnd`, a filtered request `BatchEnd` alone, a refusal its
+/// `Refused` frame, a shed request `ServerBusy`; each final frame names
+/// the request's ID.
+///
+/// A report the application's encoder fails on is this server's bug: it
+/// is logged at `error!` and dropped, and the `BatchEnd` still goes out,
+/// so the request is answered rather than leaving the client waiting.
+pub(crate) fn encode_early_reply<R: Copy, Q: Copy>(
+    reply: &EarlyReply<R>,
+    encoder: &dyn ResponseEncoder<Report = R, Query = Q>,
+    buf: &mut EarlyReplyBuf,
+) -> usize {
+    let id = reply.request_id;
+    let (written, last) = match reply.kind {
+        EarlyKind::Rejected(report) => {
+            let (app, _) = buf
+                .split_first_chunk_mut::<MAX_APP_FRAME>()
+                .expect("an early reply's buffer holds an application frame (`MAX_EARLY_REPLY`)");
+            let written = match frame_app_response(app, |body| encoder.encode_report(&report, body))
+            {
+                Ok(n) => n,
+                Err(reason) => {
+                    tracing::error!(connection_id = reply.connection_id, reason, "encode error");
+                    0
+                }
+            };
+            (written, TransportResponse::BatchEnd { id })
+        }
+        EarlyKind::Filtered => (0, TransportResponse::BatchEnd { id }),
+        EarlyKind::Refused { kind, reason } => (0, TransportResponse::Refused { id, kind, reason }),
+        EarlyKind::Busy => (0, TransportResponse::ServerBusy { id }),
+    };
+    let tail = control_codec::encode_transport_response(&last, &mut buf[written..])
+        .expect("an early reply's final frame fits behind its report (`MAX_EARLY_REPLY`)");
+    written + tail
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use melin_transport_core::pipeline::RequestId;
+    use melin_wire_protocol::control::RefusalKind;
 
     /// Writes the report / query value as one byte, so a test can see
     /// which encoder method ran.
@@ -134,23 +191,117 @@ mod tests {
         assert_eq!(&buf[..7], &[3, 0, 0, 0, TAG_APP, 1, 2]);
     }
 
+    /// `response`, encoded on its own.
+    fn control(response: TransportResponse) -> Vec<u8> {
+        let mut buf = [0u8; MAX_CONTROL_FRAME_LEN];
+        let n = control_codec::encode_transport_response(&response, &mut buf).unwrap();
+        buf[..n].to_vec()
+    }
+
+    /// An early reply of `kind` for request 42 on connection 7, encoded.
+    fn early(kind: EarlyKind<u8>) -> Vec<u8> {
+        early_with(&ByteEncoder, kind)
+    }
+
+    fn early_with(
+        encoder: &dyn ResponseEncoder<Report = u8, Query = u16>,
+        kind: EarlyKind<u8>,
+    ) -> Vec<u8> {
+        let mut buf = [0u8; MAX_EARLY_REPLY];
+        let reply = EarlyReply {
+            connection_id: 7,
+            request_id: RequestId(42),
+            input_seq: 0,
+            kind,
+        };
+        let n = encode_early_reply(&reply, encoder, &mut buf);
+        buf[..n].to_vec()
+    }
+
+    const ID: RequestId = RequestId(42);
+
     #[test]
-    fn an_engine_error_is_the_transport_frame() {
-        let mut buf = [0u8; MAX_APP_FRAME];
-        let n = encode_slot_payload(
-            &OutputPayload::<u8, u16>::EngineError,
-            &ByteEncoder,
-            &mut buf,
-        )
-        .expect("EngineError has a body")
-        .expect("EngineError encodes");
-        let mut expected = [0u8; 16];
-        let m = control_codec::encode_transport_response(
-            &TransportResponse::EngineError,
-            &mut expected,
-        )
-        .expect("EngineError encodes");
-        assert_eq!(&buf[..n], &expected[..m]);
+    fn each_early_reply_is_its_frames_naming_the_request() {
+        // A rejection: the report, then the batch end.
+        assert_eq!(
+            early(EarlyKind::Rejected(9)),
+            [
+                &[2, 0, 0, 0, TAG_APP, 9][..],
+                &control(TransportResponse::BatchEnd { id: ID })
+            ]
+            .concat()
+        );
+        // A filtered request: an empty batch.
+        assert_eq!(
+            early(EarlyKind::Filtered),
+            control(TransportResponse::BatchEnd { id: ID })
+        );
+        // A refusal and a busy: one frame each.
+        let refused = EarlyKind::Refused {
+            kind: RefusalKind::PermissionDenied,
+            reason: "no",
+        };
+        assert_eq!(
+            early(refused),
+            control(TransportResponse::Refused {
+                id: ID,
+                kind: RefusalKind::PermissionDenied,
+                reason: "no"
+            })
+        );
+        assert_eq!(
+            early(EarlyKind::Busy),
+            control(TransportResponse::ServerBusy { id: ID })
+        );
+    }
+
+    /// The widest of each fits the buffer: a report of the widest body
+    /// with its batch end, and a refusal whose reason is cut to the limit.
+    #[test]
+    fn the_widest_early_replies_fit() {
+        struct Widest;
+        impl ResponseEncoder for Widest {
+            type Report = u8;
+            type Query = u16;
+            fn encode_report(&self, _: &u8, buf: &mut [u8]) -> Result<usize, &'static str> {
+                buf.fill(0xAB);
+                Ok(buf.len())
+            }
+            fn encode_query(&self, _: &u16, _: &mut [u8]) -> Result<usize, &'static str> {
+                Ok(0)
+            }
+        }
+        let rejected = early_with(&Widest, EarlyKind::Rejected(0));
+        assert_eq!(rejected.len(), MAX_APP_FRAME + BATCH_END_FRAME_LEN);
+        assert!(rejected.len() <= MAX_EARLY_REPLY);
+        let long: &'static str = "r".repeat(1000).leak();
+        let refused = early(EarlyKind::Refused {
+            kind: RefusalKind::Malformed,
+            reason: long,
+        });
+        assert_eq!(refused.len(), MAX_CONTROL_FRAME_LEN);
+        assert!(refused.len() <= MAX_EARLY_REPLY);
+    }
+
+    /// A report the encoder fails on is dropped, and the request is still
+    /// answered with its batch end.
+    #[test]
+    fn a_rejection_that_fails_to_encode_still_ends_its_batch() {
+        struct Failing;
+        impl ResponseEncoder for Failing {
+            type Report = u8;
+            type Query = u16;
+            fn encode_report(&self, _: &u8, _: &mut [u8]) -> Result<usize, &'static str> {
+                Err("no")
+            }
+            fn encode_query(&self, _: &u16, _: &mut [u8]) -> Result<usize, &'static str> {
+                Err("no")
+            }
+        }
+        assert_eq!(
+            early_with(&Failing, EarlyKind::Rejected(1)),
+            control(TransportResponse::BatchEnd { id: ID })
+        );
     }
 
     #[test]

@@ -7,9 +7,8 @@
 //! (`Report`, `QueryResponse`) into wire bytes. The encoding is
 //! application-shaped (a trading server emits execution reports, a
 //! payments server emits settlement acks), so it lives behind this
-//! trait. Transport-shaped output-payload variants (`BatchEnd`,
-//! `EngineError`) are encoded by the runtime directly and never
-//! reach this trait.
+//! trait. The transport-shaped output-payload variant (`BatchEnd`) is
+//! encoded by the runtime directly and never reaches this trait.
 //!
 //! As on the request side, the frame is the runtime's. Every response is
 //! `[length: u32 LE][tag: u8][body]`: the encoder writes the body, and

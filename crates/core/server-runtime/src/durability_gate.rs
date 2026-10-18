@@ -73,13 +73,13 @@ use melin_app::amortized_timer::AmortizedTimer;
 use melin_journal::{AckPolicyByte, AckPolicyChange};
 use melin_pipeline::wait::WaitStrategy;
 use melin_transport_core::lineage::{ForcedPolicyReader, LineagePolicy};
-use melin_transport_core::pipeline::{OutputPayload, OutputSlot, StageUtilization};
+use melin_transport_core::pipeline::{OutputPayload, OutputSlot, RequestId, StageUtilization};
 use melin_transport_core::replica_presence::LastLoss;
 #[cfg(feature = "tick-to-trade")]
 use melin_transport_core::trace;
 use melin_transport_core::{DurableWireSeqCursor, WireSeq};
 use melin_wire_protocol::control::TransportResponse;
-use melin_wire_protocol::control_codec;
+use melin_wire_protocol::control_codec::{self, BATCH_END_FRAME_LEN};
 
 use crate::ack_policy::{AckPolicy, Blocker, Policy};
 use crate::halt::{DegradedRelease, Replication};
@@ -145,28 +145,48 @@ impl Backing {
 }
 
 /// The two pre-encoded request terminators, full wire frames (length
-/// prefix and tag), shared by both stages. Encoded once at startup:
-/// every request ends with one, and picking one of two buffers in hand
-/// costs nothing on the normal path.
+/// prefix, tag and a request ID), shared by both stages. Encoded once at
+/// startup: every request ends with one, so the stage only writes the
+/// request's ID into the one it picks ([`control_codec::write_terminal_id`],
+/// one eight-byte store) rather than encode a frame per request.
 pub(crate) struct BatchEnds {
     /// `BatchEnd`: backed as the policy requires.
-    pub policy: Vec<u8>,
+    policy: [u8; BATCH_END_FRAME_LEN],
     /// `BatchEndDegraded`: backed by the primary's disk alone.
-    pub primary_only: Vec<u8>,
+    primary_only: [u8; BATCH_END_FRAME_LEN],
 }
 
 impl BatchEnds {
     pub(crate) fn new() -> Self {
         let encode = |response| {
-            let mut buf = [0u8; 8];
+            let mut buf = [0u8; BATCH_END_FRAME_LEN];
             let written = control_codec::encode_transport_response(&response, &mut buf)
-                .expect("a tag-only control frame encodes into eight bytes");
-            buf[..written].to_vec()
+                .expect("a batch terminator encodes into `BATCH_END_FRAME_LEN` bytes");
+            assert_eq!(
+                written, BATCH_END_FRAME_LEN,
+                "a batch terminator fills its frame"
+            );
+            buf
         };
         Self {
-            policy: encode(TransportResponse::BatchEnd),
-            primary_only: encode(TransportResponse::BatchEndDegraded),
+            policy: encode(TransportResponse::BatchEnd { id: RequestId(0) }),
+            primary_only: encode(TransportResponse::BatchEndDegraded { id: RequestId(0) }),
         }
+    }
+
+    /// `BatchEnd` for request `id`, the terminator of a reply backed as
+    /// the policy requires.
+    #[inline]
+    fn policy(&mut self, id: RequestId) -> &[u8] {
+        control_codec::write_terminal_id(&mut self.policy, id);
+        &self.policy
+    }
+
+    /// `BatchEndDegraded` for request `id`.
+    #[inline]
+    fn primary_only(&mut self, id: RequestId) -> &[u8] {
+        control_codec::write_terminal_id(&mut self.primary_only, id);
+        &self.primary_only
     }
 }
 
@@ -531,19 +551,24 @@ impl DurabilityGate {
         self.apply_change(pending.wire_seq, pending.policy.to_byte(), cause);
     }
 
-    /// The terminator for the request `backing` closes, from `ends`.
-    /// Counts each degraded one for `melin_degraded_acks_total`: called
-    /// once per request (on its last slot), by both stages.
+    /// The terminator for request `id`, which `backing` closes, from
+    /// `ends`. Counts each degraded one for `melin_degraded_acks_total`:
+    /// called once per request (on its last slot), by both stages.
     #[inline]
-    pub(crate) fn batch_end<'e>(&self, backing: Backing, ends: &'e BatchEnds) -> &'e [u8] {
+    pub(crate) fn batch_end<'e>(
+        &self,
+        backing: Backing,
+        ends: &'e mut BatchEnds,
+        id: RequestId,
+    ) -> &'e [u8] {
         match backing {
-            Backing::Policy => &ends.policy,
+            Backing::Policy => ends.policy(id),
             Backing::PrimaryOnly => {
                 self.inputs
                     .utilization
                     .degraded_acks
                     .fetch_add(1, Ordering::Relaxed);
-                &ends.primary_only
+                ends.primary_only(id)
             }
         }
     }
@@ -824,8 +849,7 @@ impl DurabilityGate {
             OutputPayload::AckPolicyChange(change) => Some(change),
             OutputPayload::Report(_)
             | OutputPayload::QueryResponse(_)
-            | OutputPayload::BatchEnd
-            | OutputPayload::EngineError => None,
+            | OutputPayload::BatchEnd => None,
         };
         if slot_needs_gate(slot, self.cached_durable_pos) {
             if let Some(before_wait) = before_wait.take() {
@@ -2163,12 +2187,20 @@ mod tests {
             Some(Backing::PrimaryOnly),
             "marked, though every replica confirmed position 5 before it left"
         );
-        let ends = BatchEnds::new();
+        let mut ends = BatchEnds::new();
         assert_eq!(
-            p.gate.batch_end(Backing::PrimaryOnly, &ends),
-            ends.primary_only
+            p.gate
+                .batch_end(Backing::PrimaryOnly, &mut ends, RequestId(5)),
+            encoded(TransportResponse::BatchEndDegraded { id: RequestId(5) })
         );
         assert_eq!(p.degraded_acks(), 1, "counted in melin_degraded_acks_total");
+    }
+
+    /// `response`'s frame, as the control codec encodes it.
+    fn encoded(response: TransportResponse) -> Vec<u8> {
+        let mut buf = [0u8; BATCH_END_FRAME_LEN];
+        let n = control_codec::encode_transport_response(&response, &mut buf).unwrap();
+        buf[..n].to_vec()
     }
 
     /// The cache trap: a degraded release must not advance the position
@@ -2421,21 +2453,25 @@ mod tests {
     #[test]
     fn the_terminator_follows_the_backing_and_counts_degraded_acks() {
         let p = Primary::new(AckPolicy::DiskAndRam, 5, false, NO_GRACE);
-        let ends = BatchEnds::new();
-        assert_eq!(p.gate.batch_end(Backing::Policy, &ends), ends.policy);
+        let mut ends = BatchEnds::new();
+        // Each request's terminator names it, whatever the template's
+        // previous request was.
+        for id in [RequestId(1), RequestId(u64::MAX), RequestId(0)] {
+            assert_eq!(
+                p.gate.batch_end(Backing::Policy, &mut ends, id),
+                encoded(TransportResponse::BatchEnd { id })
+            );
+        }
         assert_eq!(p.degraded_acks(), 0);
         assert_eq!(
-            p.gate.batch_end(Backing::PrimaryOnly, &ends),
-            ends.primary_only
+            p.gate
+                .batch_end(Backing::PrimaryOnly, &mut ends, RequestId(7)),
+            encoded(TransportResponse::BatchEndDegraded { id: RequestId(7) })
         );
         assert_eq!(p.degraded_acks(), 1);
         assert_eq!(
-            ends.policy[4],
-            melin_wire_protocol::control_codec::TAG_BATCH_END
-        );
-        assert_eq!(
-            ends.primary_only[4],
-            melin_wire_protocol::control_codec::TAG_BATCH_END_DEGRADED
+            ends.policy(RequestId(3)),
+            encoded(TransportResponse::BatchEnd { id: RequestId(3) })
         );
     }
 

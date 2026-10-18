@@ -1836,8 +1836,8 @@ where
         Arc::clone(&fence_state),
         Arc::clone(&refused_writes),
     );
-    let (refusal_tx, refusal_rx) =
-        crate::halt::refusal_channel::<A::Report>(Arc::clone(&matching_cursor));
+    let (early_tx, early_rx) =
+        crate::halt::early_reply_channel::<A::Report>(Arc::clone(&matching_cursor));
 
     // Spawn the io_uring reader thread. A single reader uses multishot RECV
     // to multiplex every TCP connection on the server. Pinned to
@@ -1983,7 +1983,7 @@ where
                     encoder,
                     fence_state: response_fence,
                     active_connections: active_connections_response,
-                    refusals: refusal_rx,
+                    early_replies: early_rx,
                     ring_sizing,
                     ready: Some(response_ready_tx),
                     degraded_release,
@@ -2236,7 +2236,7 @@ where
         input_producer,
         decoder,
         halt_gate,
-        refusal_tx,
+        early_tx,
         ack_policy_claim,
         control_tx.clone(),
         config.cores.reader.core,
@@ -3031,8 +3031,8 @@ where
         Arc::clone(&fence_state),
         Arc::clone(&refused_writes),
     );
-    let (refusal_tx, refusal_rx) =
-        crate::halt::refusal_channel::<A::Report>(Arc::clone(&matching_cursor));
+    let (early_tx, early_rx) =
+        crate::halt::early_reply_channel::<A::Report>(Arc::clone(&matching_cursor));
 
     // TX SPSC: response stage → DPDK poll thread (encoded frames).
     // Lock-free, fixed-size slots — no heap allocation per frame.
@@ -3145,7 +3145,7 @@ where
                 response_utilization_thread,
                 wait,
                 encoder,
-                refusal_rx,
+                early_rx,
                 degraded_release,
             );
         })
@@ -3356,7 +3356,7 @@ where
         input_producer,
         decoder,
         halt_gate,
-        refusal_tx,
+        early_tx,
         ack_policy,
         control_tx,
         tx_rx_0,
@@ -4264,8 +4264,7 @@ mod tests {
     use melin_app::decoder::{Decoded, RequestDecoder};
     use melin_wire_protocol::control::ConnectionId;
     use melin_wire_protocol::control_codec::{
-        TAG_AUTH_FAILED, TAG_CHALLENGE, TAG_CHALLENGE_RESPONSE, TAG_RESPONSE_HEARTBEAT,
-        TAG_SERVER_READY,
+        TAG_AUTH_FAILED, TAG_CHALLENGE_RESPONSE, TAG_RESPONSE_HEARTBEAT, TAG_SERVER_READY,
     };
 
     use super::authenticate_connection;
@@ -4506,15 +4505,17 @@ mod tests {
     }
 
     /// Read a length-prefixed Challenge frame and return its 32-byte
-    /// nonce. Frame layout: `[len:u32][TAG_CHALLENGE][nonce:32]`.
+    /// nonce. Frame layout: `[len:u32][TAG_CHALLENGE][version:u16][nonce:32]`
+    /// (see `decode_challenge`).
     fn read_challenge(stream: &mut UnixStream) -> [u8; 32] {
         let mut len_buf = [0u8; 4];
         stream.read_exact(&mut len_buf).unwrap();
         let len = u32::from_le_bytes(len_buf) as usize;
         let mut payload = vec![0u8; len];
         stream.read_exact(&mut payload).unwrap();
-        assert_eq!(payload[0], TAG_CHALLENGE, "expected Challenge");
-        payload[1..33].try_into().unwrap()
+        // The wire protocol's one parser of the challenge, which also
+        // checks the node speaks this build's client protocol.
+        melin_wire_protocol::control_codec::decode_challenge(&payload).expect("a Challenge")
     }
 
     /// Write a length-prefixed ChallengeResponse frame, matching the

@@ -554,8 +554,6 @@ pub enum OutputPayload<R: Copy, Q: Copy> {
     QueryResponse(Q),
     /// Signals the end of reports for one request.
     BatchEnd,
-    /// Internal error during matching.
-    EngineError,
     /// A journaled ack-policy change, at its exact position in the ring:
     /// the slot's `wire_seq` is the entry's. Carries no reply. The
     /// response stage switches policy here, for every slot after it, once

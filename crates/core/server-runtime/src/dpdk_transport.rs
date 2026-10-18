@@ -59,7 +59,7 @@ use melin_dpdk::SocketHandle;
 use tracing::{debug, warn};
 
 use crate::dpdk_response::{ControlEvent, TxFrame};
-use crate::halt::{HaltGate, RefusalSender};
+use crate::halt::{EarlyReplySender, HaltGate};
 use crate::policy_control::AckPolicyPublisher;
 
 use crate::client_auth::MAX_AUTH_FRAME;
@@ -141,10 +141,11 @@ pub fn run_dpdk_poll<A: Application>(
     mut transport: DpdkTransport,
     mut producer: ring::Producer<InputSlot<A::Event>>,
     decoder: crate::reader::RequestDecoderArc<A>,
-    // While it refuses writes, they are answered through `refusals`
-    // instead of published — see `crate::halt`.
+    // Every request not published — filtered or refused by the decoder,
+    // refused while `halt` refuses writes, shed on a full input ring — is
+    // answered through `early_replies` — see `crate::halt`.
     halt: HaltGate,
-    mut refusals: RefusalSender<A::Report>,
+    mut early_replies: EarlyReplySender<A::Report>,
     // The admin `ACK-POLICY` command's requests, journaled by this thread
     // as the ring's one producer — see `crate::policy_control`.
     mut ack_policy: AckPolicyPublisher,
@@ -649,7 +650,7 @@ pub fn run_dpdk_poll<A: Application>(
                         &mut producer,
                         &*decoder,
                         &halt,
-                        &mut refusals,
+                        &mut early_replies,
                         *batch_wall_ns.get_or_insert_with(unix_epoch_nanos),
                         recv_ts,
                         #[cfg(feature = "latency-trace")]
@@ -657,13 +658,15 @@ pub fn run_dpdk_poll<A: Application>(
                         #[cfg(feature = "tick-to-trade")]
                         &mut ingest_rec,
                     );
-                    if matches!(action, FrameAction::Disconnect | FrameAction::PipelineFull) {
-                        if matches!(action, FrameAction::PipelineFull) {
-                            debug!(
-                                connection_id = conn.connection_id.0,
-                                "DPDK: pipeline full, dropping connection"
-                            );
-                        }
+                    // A full input ring is answered with a busy through
+                    // the early-reply queue, and the connection is kept
+                    // (`Continue`): the frames behind the shed request
+                    // wait in `parse_buf` for the client's next bytes.
+                    let close = match action {
+                        FrameAction::Continue => false,
+                        FrameAction::Disconnect => true,
+                    };
+                    if close {
                         transport.close(conn.handle);
                         let _ = control_tx.send(ControlEvent::Disconnected {
                             connection_id: conn.connection_id.0,

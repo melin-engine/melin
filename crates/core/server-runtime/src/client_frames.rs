@@ -18,10 +18,10 @@ use melin_transport_core::pipeline::{ClientOrigin, InputSlot, RequestId};
 use melin_transport_core::trace::MonoTraceInstant;
 #[cfg(any(feature = "latency-trace", feature = "tick-to-trade"))]
 use melin_transport_core::trace::mono_trace_ns;
-use melin_wire_protocol::control_codec::TAG_APP;
-use melin_wire_protocol::framing::split_frame_limited;
+use melin_wire_protocol::control::RefusalKind;
+use melin_wire_protocol::framing::{split_frame_limited, split_request};
 
-use crate::halt::{HaltGate, Refusal, RefusalSender, Verdict};
+use crate::halt::{EarlyKind, EarlyReply, EarlyReplySender, HaltGate, Verdict};
 
 /// Bound on one client request frame, after the 4-byte length prefix:
 /// the wire protocol's, so a client library and a node agree on it by
@@ -34,7 +34,7 @@ use crate::halt::{HaltGate, Refusal, RefusalSender, Verdict};
 pub const MAX_FRAME_SIZE: usize = melin_wire_protocol::blocking::MAX_FRAME_SIZE;
 
 /// Bound on one request body — what an application's `RequestDecoder`
-/// is handed after the runtime has read the tag.
+/// is handed after the runtime has read the tag and the request's ID.
 /// Public so an application can check its widest request against it at
 /// compile time; see the re-export in the crate root. The wire
 /// protocol's, the bound a client's request framing enforces, so the two
@@ -43,37 +43,41 @@ pub const MAX_REQUEST_BODY: usize = melin_wire_protocol::framing::MAX_REQUEST_BO
 
 /// Outcome of [`process_client_frames`].
 pub(crate) enum FrameAction {
-    /// All complete frames processed. Any partial trailing bytes remain
-    /// in `parse_buf` for the next recv cycle.
+    /// Every complete frame was processed, or processing stopped at a full
+    /// input ring after the request that met it was answered `ServerBusy`.
+    /// Whatever was not processed (a partial trailing frame, the frames
+    /// behind a shed request) remains in `parse_buf` for the next receive.
     Continue,
-    /// An oversized frame was encountered (prior frames were committed),
-    /// or the node is superseded and takes nothing more from anyone.
-    /// Caller should drop the connection.
+    /// The connection is to be closed (the frames before the cause were
+    /// committed): an oversized frame, a frame that is not a request (an
+    /// empty frame, another tag, a request too short for its ID), a full
+    /// early-reply queue, or a superseded node that takes nothing more
+    /// from anyone.
     Disconnect,
-    /// The pipeline ring — or, while halted, the refusal queue — is full.
-    /// Prior frames were committed. The frame that triggered full was
-    /// consumed from `parse_buf` (bytes dropped). Caller should signal
-    /// backpressure (e.g. ServerBusy).
-    PipelineFull,
 }
 
 /// Extract, decode, and publish client request frames from `parse_buf`.
 ///
-/// Processes every complete length-prefixed frame, decodes each through
-/// `decoder`, and publishes permitted events to the input ring under
-/// batched commits (cap: 16 events per commit to bound consumer
-/// visibility delay). Compacts `parse_buf` on return.
+/// Processes every complete length-prefixed frame: each must be a request
+/// (`TAG_REQUEST` and the client's ID), decoded through `decoder`, and
+/// published to the input ring, the ID in its slot, under batched commits
+/// (cap: 16 events per commit to bound consumer visibility delay).
+/// Compacts `parse_buf` on return.
 ///
-/// While `halt` refuses writes, a permitted write is not published: its
-/// rejection goes to `refusals`, stamped with the input sequence it would
-/// have taken (see [`crate::halt`]). Queries are published either way.
-/// The halt is sampled once per call, so one receive is judged as a whole,
-/// and the writes it refused are counted into `halt` once, at the end. On
-/// a superseded node nothing is read: the call returns
+/// Every request the reader does not publish is answered through
+/// `early_replies`, stamped with the input sequence it would have taken
+/// and its ID (see [`crate::halt`]): a filtered request with an empty
+/// batch, a refused one with the decoder's reason, a write refused while
+/// `halt` refuses writes with the application's rejection (queries are
+/// published either way), and the request that finds the input ring full
+/// with `ServerBusy`, after which processing stops for this call. The halt
+/// is sampled once per call, so one receive is judged as a whole, and the
+/// writes it refused are counted into `halt` once, at the end. On a
+/// superseded node nothing is read: the call returns
 /// [`FrameAction::Disconnect`] before the first frame.
 ///
-/// Returns [`FrameAction`] so the caller can handle transport-specific
-/// side effects (ServerBusy write, transport close, control events).
+/// A full early-reply queue closes the connection whose answer has
+/// nowhere to go ([`FrameAction::Disconnect`]).
 ///
 /// `recv_ts` is the trace timestamp the caller captured once, at the
 /// moment the kernel handed it this recv's bytes (the io_uring CQE /
@@ -92,7 +96,7 @@ pub(crate) fn process_client_frames<A: Application>(
     producer: &mut ring::Producer<InputSlot<A::Event>>,
     decoder: &dyn ErasedDecoder<A::Event>,
     halt: &HaltGate,
-    refusals: &mut RefusalSender<A::Report>,
+    early_replies: &mut EarlyReplySender<A::Report>,
     batch_wall_ns: u64,
     recv_ts: MonoTraceInstant,
     #[cfg(feature = "latency-trace")] publish_rec: &mut melin_transport_core::trace::StageRecorder,
@@ -115,8 +119,7 @@ pub(crate) fn process_client_frames<A: Application>(
     };
     let mut batch = producer.batch();
     // Writes refused in this call, counted into the gate once at the end
-    // rather than with an atomic add each. Includes one shed for a full
-    // refusal queue: the halt is what turned it away.
+    // rather than with an atomic add each.
     let mut refused: u64 = 0;
 
     loop {
@@ -137,101 +140,104 @@ pub(crate) fn process_client_frames<A: Application>(
             }
         };
         cursor += frame.consumed();
-        let frame = frame.payload;
 
-        // Only an application frame carries a request: a client sends none
-        // of the protocol's own frames after the handshake. Anything else
-        // is dropped here, so no decoder ever sees the tag.
-        let body = match frame.split_first() {
-            Some((&TAG_APP, body)) => body,
-            Some((&tag, _)) => {
+        // Only a request may come after the handshake: a client sends none
+        // of the protocol's own frames, and the tag and the ID are read
+        // here, so no decoder ever sees them. Anything else is a client
+        // speaking another protocol, told at once by the close.
+        let (request_id, body) = match split_request(frame.payload) {
+            Ok(request) => request,
+            Err(not_a_request) => {
                 debug!(
                     connection_id,
-                    tag, "frame is not an application request, dropping"
+                    %not_a_request,
+                    "not a request, dropping connection"
                 );
-                continue;
-            }
-            None => {
-                debug!(connection_id, "empty frame, dropping");
-                continue;
-            }
-        };
-
-        let event = match decoder.decode_erased(body, role) {
-            Decoded::Filter => continue,
-            Decoded::PermissionDenied(reason) => {
-                debug!(connection_id, reason, "permission denied, dropping request");
-                continue;
-            }
-            Decoded::DecodeError(reason) => {
-                debug!(connection_id, reason, "decode error");
-                continue;
-            }
-            Decoded::Permitted(event) => event,
-        };
-
-        if let Some(reason) = refusal_reason
-            && !event.is_query()
-        {
-            refused += 1;
-            let refusal = Refusal {
-                connection_id,
-                input_seq: batch.next_sequence(),
-                report: A::build_reject(&event, reason),
-            };
-            if refusals.try_send(refusal).is_err() {
-                result = FrameAction::PipelineFull;
+                result = FrameAction::Disconnect;
                 break;
             }
-            continue;
-        }
+        };
 
-        let ts = if event.is_query() { 0 } else { batch_wall_ns };
-
-        #[cfg(feature = "latency-trace")]
-        let pre_publish = mono_trace_ns();
-
-        // The whole slot is rebuilt in place, through the one constructor
-        // for a client slot, so no field keeps the previous occupant's
-        // value. The ID is 0 until the wire carries one.
-        let push_result = batch.try_push_with(|slot| {
-            *slot = InputSlot::client(
-                ClientOrigin {
-                    connection_id,
-                    request_id: RequestId(0),
-                    key_hash,
-                },
-                event,
-                ts,
-                recv_ts,
-            );
-        });
-
-        if push_result.is_err() {
-            result = FrameAction::PipelineFull;
+        // An answer decided here, or the event to publish.
+        let early = match decoder.decode_erased(body, role) {
+            Decoded::Filter => EarlyKind::Filtered,
+            Decoded::PermissionDenied(reason) => {
+                debug!(connection_id, reason, "permission denied, refusing request");
+                EarlyKind::Refused {
+                    kind: RefusalKind::PermissionDenied,
+                    reason,
+                }
+            }
+            Decoded::DecodeError(reason) => {
+                debug!(connection_id, reason, "decode error, refusing request");
+                EarlyKind::Refused {
+                    kind: RefusalKind::Malformed,
+                    reason,
+                }
+            }
+            Decoded::Permitted(event) => match refusal_reason {
+                Some(reason) if !event.is_query() => {
+                    EarlyKind::Rejected(A::build_reject(&event, reason))
+                }
+                _ => {
+                    if publish::<A>(
+                        &mut batch,
+                        ClientOrigin {
+                            connection_id,
+                            request_id,
+                            key_hash,
+                        },
+                        event,
+                        batch_wall_ns,
+                        recv_ts,
+                        #[cfg(feature = "latency-trace")]
+                        publish_rec,
+                        #[cfg(feature = "tick-to-trade")]
+                        ingest_rec,
+                    ) {
+                        if batch.len() >= COMMIT_EVERY {
+                            early_replies.flush();
+                            batch.commit();
+                            batch = producer.batch();
+                        }
+                        continue;
+                    }
+                    // The input ring is full: this request is shed, and
+                    // parsing stops; the frames behind it wait in
+                    // `parse_buf` for the next receive.
+                    debug!(connection_id, "input ring full, shedding request");
+                    let input_seq = batch.next_sequence();
+                    if !queue_early(
+                        early_replies,
+                        connection_id,
+                        request_id,
+                        input_seq,
+                        EarlyKind::Busy,
+                    ) {
+                        result = FrameAction::Disconnect;
+                    }
+                    break;
+                }
+            },
+        };
+        let input_seq = batch.next_sequence();
+        if !queue_early(early_replies, connection_id, request_id, input_seq, early) {
+            result = FrameAction::Disconnect;
             break;
         }
-
-        #[cfg(feature = "latency-trace")]
-        {
-            let publish_done = mono_trace_ns();
-            publish_rec.record_elapsed(pre_publish, publish_done);
-        }
-        #[cfg(feature = "tick-to-trade")]
-        ingest_rec.record_elapsed(recv_ts, mono_trace_ns());
-
-        if batch.len() >= COMMIT_EVERY {
-            refusals.flush();
-            batch.commit();
-            batch = producer.batch();
+        // A halt refusal is counted once its answer is queued: a write the
+        // connection was closed on instead was not refused, it was never
+        // read.
+        if matches!(early, EarlyKind::Rejected(_)) {
+            refused += 1;
         }
     }
 
-    // Refusals become visible before the events published after them, at
-    // every commit. The other way round, the response stage could answer
-    // such an event before it sees the refusal that came first, and send
-    // the two replies out of order.
-    refusals.flush();
+    // Early replies become visible before the events published after
+    // them, at every commit. The other way round, the response stage
+    // could answer such an event before it sees the early reply that came
+    // first, and send the two replies out of order.
+    early_replies.flush();
     batch.commit();
 
     if refused > 0 {
@@ -246,4 +252,69 @@ pub(crate) fn process_client_frames<A: Application>(
     }
 
     result
+}
+
+/// Queue the early reply `kind` for request `request_id`, stamped with
+/// `input_seq`, the input sequence it would have taken. `false` when the
+/// queue is full: the caller closes the connection, since the answer has
+/// nowhere to go.
+fn queue_early<R: Copy>(
+    early_replies: &mut EarlyReplySender<R>,
+    connection_id: u64,
+    request_id: RequestId,
+    input_seq: u64,
+    kind: EarlyKind<R>,
+) -> bool {
+    let queued = early_replies
+        .try_send(EarlyReply {
+            connection_id,
+            request_id,
+            input_seq,
+            kind,
+        })
+        .is_ok();
+    if !queued {
+        debug!(connection_id, "early-reply queue full, dropping connection");
+    }
+    queued
+}
+
+/// Publish one client event into `batch`. `false` when the input ring is
+/// full and nothing was published.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn publish<A: Application>(
+    batch: &mut ring::Batch<'_, InputSlot<A::Event>>,
+    origin: ClientOrigin,
+    event: A::Event,
+    batch_wall_ns: u64,
+    recv_ts: MonoTraceInstant,
+    #[cfg(feature = "latency-trace")] publish_rec: &mut melin_transport_core::trace::StageRecorder,
+    #[cfg(feature = "tick-to-trade")] ingest_rec: &mut melin_transport_core::trace::StageRecorder,
+) -> bool {
+    let ts = if event.is_query() { 0 } else { batch_wall_ns };
+
+    #[cfg(feature = "latency-trace")]
+    let pre_publish = mono_trace_ns();
+
+    // The whole slot is rebuilt in place, through the one constructor
+    // for a client slot, so no field keeps the previous occupant's
+    // value.
+    if batch
+        .try_push_with(|slot| {
+            *slot = InputSlot::client(origin, event, ts, recv_ts);
+        })
+        .is_err()
+    {
+        return false;
+    }
+
+    #[cfg(feature = "latency-trace")]
+    {
+        let publish_done = mono_trace_ns();
+        publish_rec.record_elapsed(pre_publish, publish_done);
+    }
+    #[cfg(feature = "tick-to-trade")]
+    ingest_rec.record_elapsed(recv_ts, mono_trace_ns());
+    true
 }

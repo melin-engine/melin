@@ -378,7 +378,6 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
             OutputPayload::Report(_) => "Report",
             OutputPayload::QueryResponse(_) => "QueryResponse",
             OutputPayload::BatchEnd => "BatchEnd",
-            OutputPayload::EngineError => "EngineError",
             OutputPayload::AckPolicyChange(_) => "AckPolicyChange",
         })
         .collect();
@@ -729,7 +728,6 @@ fn every_output_slot_of_an_event_carries_its_request_id() {
                     OutputPayload::Report(_) => "Report",
                     OutputPayload::QueryResponse(_) => "QueryResponse",
                     OutputPayload::BatchEnd => "BatchEnd",
-                    OutputPayload::EngineError => "EngineError",
                     OutputPayload::AckPolicyChange(_) => "AckPolicyChange",
                 };
                 (s.connection_id, s.request_id, s.is_last_in_request, kind)

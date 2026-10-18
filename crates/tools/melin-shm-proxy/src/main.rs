@@ -33,9 +33,9 @@
 //! and what makes the packet rate a function of the backlog rather than
 //! of the message rate. `--trace` is the one exception: it has the loop
 //! time itself, and the round trip from a request reaching the stack to
-//! the batch-end that closes its reply, reported on stderr at the end.
-//! Even then it reads only the protocol's tags, never an application
-//! body.
+//! the final frame that answers it, reported on stderr at the end. Even
+//! then it reads only the protocol's tags and request IDs, never an
+//! application body.
 //!
 //! ```sh
 //! shm-proxy --server 10.0.1.30:9876 --shm /dev/shm/melin-client.shm \
@@ -47,7 +47,7 @@
 //! the server ended the connection cleanly, 1 when the connection
 //! failed mid-run, 2 when it could not be set up.
 
-use std::collections::VecDeque;
+use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -56,7 +56,9 @@ use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 use hdrhistogram::Histogram;
-use melin_wire_protocol::control_codec::{TAG_APP, TAG_BATCH_END};
+use melin_wire_protocol::control::RequestId;
+use melin_wire_protocol::control_codec::{REQUEST_ID_LEN, TAG_LEN, terminal_request_id};
+use melin_wire_protocol::framing::split_request;
 
 #[cfg(feature = "dpdk")]
 mod dpdk;
@@ -104,8 +106,9 @@ struct Cli {
     #[arg(long)]
     core: Option<usize>,
     /// Time the loop: its iteration, the stack's servicing, and the
-    /// round trip from an echo request reaching the stack to its reply
-    /// being in hand. Percentiles on stderr when the bridge ends.
+    /// round trip from a request reaching the stack to the final frame
+    /// that answers it being in hand. Percentiles on stderr when the
+    /// bridge ends.
     #[arg(long)]
     trace: bool,
     #[cfg(feature = "dpdk")]
@@ -272,33 +275,47 @@ fn bridge_loop<T: Transport>(
 
 /// The loop's own figures, on `--trace`: what an iteration costs, what
 /// servicing the stack costs, and the round trip from a request being
-/// handed to the stack to the batch-end that closes its reply being in
-/// hand -- the wire twice, the node, and a turn of this loop on each
-/// side. Requests and replies are matched by order: one connection, a
-/// node that answers in order, and exactly one batch-end per request,
-/// whatever the application put in the batch.
+/// handed to the stack to the final frame that answers it being in hand
+/// -- the wire twice, the node, and a turn of this loop on each side.
 ///
-/// Every frame is `[len: u32 LE][tag][body]`, and the tag is all the
-/// trace reads. On the way out, a frame with the protocol's application
-/// tag is a request; the handshake's frames before it carry other tags.
-/// On the way back, the protocol closes each request's reply batch --
-/// empty, one response, several, or a rejection -- with a batch-end
-/// frame of its own, so that frame is the answer and the application's
-/// bodies are never looked at. Heartbeats carry nothing and are skipped
-/// like every other tag.
+/// Requests and their answers are paired by the request's ID: a request
+/// carries one the client chose, and the node names it on the one final
+/// frame it sends for that request -- a batch end (whatever the
+/// application put in the batch, nothing included), a busy, or a refusal.
+/// A request the node did not accept may be answered ahead of earlier
+/// ones, so the pairing does not rest on order.
+///
+/// Every frame is `[len: u32 LE][tag][body]`, and the head of it -- the
+/// tag and the eight bytes after it -- is all the trace reads. On the way
+/// out, a request frame (`[tag][id][body]`) is a request; the handshake's
+/// frames before it carry other tags. On the way back, a final frame
+/// (`[tag][id]...`) is the answer; the application's responses and the
+/// heartbeats are skipped like every other tag, and the application's
+/// bodies are never looked at.
 struct Trace {
     iteration: Histogram<u64>,
     service: Histogram<u64>,
     round_trip: Histogram<u64>,
     requests: FrameScanner,
     replies: FrameScanner,
-    /// Send stamps of the requests not yet answered, oldest first.
-    in_flight: VecDeque<u64>,
+    /// Send stamps of the requests not yet answered, by ID. A map, not
+    /// the client library's sorted queue: the IDs are the client's (the
+    /// Java rig's), and the proxy cannot assume they increase. Reserved to
+    /// [`IN_FLIGHT_CAP`](Self::IN_FLIGHT_CAP) up front, so the steady state
+    /// allocates nothing; the default hasher, since this is a diagnostic
+    /// path and not the node's.
+    in_flight: HashMap<RequestId, u64>,
+    /// Requests whose stamp the trace did not keep: sent at the cap, or
+    /// under an ID already in flight (whose stamp the new one replaced).
+    untracked: u64,
+    /// Final frames for an ID the trace held no stamp for.
+    unmatched: u64,
 }
 
 impl Trace {
-    /// More than a node holds unanswered on one connection; past it the
-    /// oldest stamp goes rather than the queue growing.
+    /// More than a node holds unanswered on one connection; past it a new
+    /// request's stamp is not kept, rather than an old one evicted (which
+    /// would need a second, ordered structure) or the map growing.
     const IN_FLIGHT_CAP: usize = 1 << 16;
 
     fn new() -> Self {
@@ -311,75 +328,89 @@ impl Trace {
             round_trip: histogram(),
             requests: FrameScanner::new(),
             replies: FrameScanner::new(),
-            in_flight: VecDeque::with_capacity(Self::IN_FLIGHT_CAP),
+            in_flight: HashMap::with_capacity(Self::IN_FLIGHT_CAP),
+            untracked: 0,
+            unmatched: 0,
         }
     }
 
-    /// Whether a frame on its way out is a request: an application frame.
-    fn is_request(tag: Option<u8>) -> bool {
-        tag == Some(TAG_APP)
+    /// A request on its way out, by its frame's head, sent at `now`.
+    fn request(&mut self, head: &[u8], now: u64) {
+        // Anything else -- the handshake's frames, a request too short
+        // for its ID, which the node closes the connection on -- is no
+        // request to time.
+        let Ok((id, _)) = split_request(head) else {
+            return;
+        };
+        // At the cap a new ID's stamp is not kept; an ID already in flight
+        // has its stamp replaced, and the earlier one is lost. Either way a
+        // request goes untimed.
+        let at_cap = self.in_flight.len() == Self::IN_FLIGHT_CAP;
+        let lost = if at_cap && !self.in_flight.contains_key(&id) {
+            true
+        } else {
+            self.in_flight.insert(id, now).is_some()
+        };
+        if lost {
+            self.untracked += 1;
+        }
     }
 
-    /// Whether a frame on its way back answers a request: the batch-end
-    /// that closes a reply batch.
-    fn is_answer(tag: Option<u8>) -> bool {
-        tag == Some(TAG_BATCH_END)
+    /// A frame on its way back, by its head, received at `now`.
+    fn reply(&mut self, head: &[u8], now: u64, clock: &TscClock) {
+        let Some(id) = terminal_request_id(head) else {
+            return;
+        };
+        match self.in_flight.remove(&id) {
+            Some(sent) => self
+                .round_trip
+                .saturating_record(clock.elapsed_ns(sent, now)),
+            None => self.unmatched += 1,
+        }
     }
 
     /// `sent` bytes of `first` then `second` went to the stack just now.
     fn sent(&mut self, first: &[u8], second: &[u8], sent: usize) {
         let now = rdtscp();
-        let Self {
-            requests,
-            in_flight,
-            ..
-        } = self;
-        let mut on_frame = |tag: Option<u8>| {
-            if Self::is_request(tag) {
-                if in_flight.len() == Self::IN_FLIGHT_CAP {
-                    in_flight.pop_front();
-                }
-                in_flight.push_back(now);
-            }
-        };
         let from_first = sent.min(first.len());
+        let mut requests = std::mem::take(&mut self.requests);
+        let mut on_frame = |head: &[u8]| self.request(head, now);
         requests.feed(&first[..from_first], &mut on_frame);
         requests.feed(&second[..sent - from_first], &mut on_frame);
+        self.requests = requests;
     }
 
     /// `n` bytes into `first` then `second` came from the stack just now.
     fn received(&mut self, first: &[u8], second: &[u8], n: usize, clock: &TscClock) {
         let now = rdtscp();
-        let Self {
-            replies,
-            in_flight,
-            round_trip,
-            ..
-        } = self;
-        let mut on_frame = |tag: Option<u8>| {
-            if Self::is_answer(tag)
-                && let Some(sent) = in_flight.pop_front()
-            {
-                round_trip.saturating_record(clock.elapsed_ns(sent, now));
-            }
-        };
         let into_first = n.min(first.len());
+        let mut replies = std::mem::take(&mut self.replies);
+        let mut on_frame = |head: &[u8]| self.reply(head, now, clock);
         replies.feed(&first[..into_first], &mut on_frame);
         replies.feed(&second[..n - into_first], &mut on_frame);
+        self.replies = replies;
     }
 
     fn report(&self) {
-        eprintln!(
+        for line in self.report_lines() {
+            eprintln!("{line}");
+        }
+    }
+
+    /// The report's lines, as [`report`](Self::report) prints them on
+    /// stderr.
+    fn report_lines(&self) -> Vec<String> {
+        let mut lines = vec![format!(
             "trace: {:<28} {:>10} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
             "µs", "samples", "min", "p50", "p90", "p99", "p99.9", "max"
-        );
+        )];
         for (name, histogram) in [
             ("loop iteration", &self.iteration),
             ("service()", &self.service),
             ("request → batch end", &self.round_trip),
         ] {
             let micros = |ns: u64| ns as f64 / 1_000.0;
-            eprintln!(
+            lines.push(format!(
                 "trace: {:<28} {:>10} {:>9.1} {:>9.1} {:>9.1} {:>9.1} {:>9.1} {:>9.1}",
                 name,
                 histogram.len(),
@@ -389,41 +420,74 @@ impl Trace {
                 micros(histogram.value_at_quantile(0.99)),
                 micros(histogram.value_at_quantile(0.999)),
                 micros(histogram.max()),
-            );
+            ));
         }
         if !self.in_flight.is_empty() {
-            eprintln!(
+            lines.push(format!(
                 "trace: {} requests were never answered",
                 self.in_flight.len()
-            );
+            ));
         }
+        if self.untracked > 0 {
+            lines.push(format!(
+                "trace: {} requests were not tracked (sent past {} in flight, or under an ID \
+                 already in flight)",
+                self.untracked,
+                Self::IN_FLIGHT_CAP
+            ));
+        }
+        if self.unmatched > 0 {
+            lines.push(format!(
+                "trace: {} answers named no request the trace held",
+                self.unmatched
+            ));
+        }
+        lines
     }
 }
 
+/// The head of a frame the trace reads: its tag, and the request ID that
+/// follows it in a request and in every final frame -- the widest head
+/// either direction needs.
+const HEAD_LEN: usize = TAG_LEN + REQUEST_ID_LEN;
+
 /// Walks a stream of `[len: u32 LE][tag][body]` frames as its bytes come,
-/// in whatever pieces, and reports each complete frame's tag -- the first
-/// payload byte, or `None` for an empty payload, which the protocol never
-/// sends.
+/// in whatever pieces, and reports each complete frame's head: the first
+/// [`HEAD_LEN`] payload bytes, kept across pieces and feeds, or fewer for
+/// a shorter frame (none for an empty one, which the protocol never
+/// sends). A fixed array, so scanning allocates nothing.
+#[derive(Default)]
 struct FrameScanner {
     state: Scan,
 }
 
 enum Scan {
-    Header { got: usize, bytes: [u8; 4] },
-    Payload { left: usize, tag: Option<u8> },
+    Header {
+        got: usize,
+        bytes: [u8; 4],
+    },
+    Payload {
+        left: usize,
+        head: [u8; HEAD_LEN],
+        got: usize,
+    },
+}
+
+impl Default for Scan {
+    fn default() -> Self {
+        Scan::Header {
+            got: 0,
+            bytes: [0; 4],
+        }
+    }
 }
 
 impl FrameScanner {
     fn new() -> Self {
-        Self {
-            state: Scan::Header {
-                got: 0,
-                bytes: [0; 4],
-            },
-        }
+        Self::default()
     }
 
-    fn feed(&mut self, mut bytes: &[u8], on_frame: &mut impl FnMut(Option<u8>)) {
+    fn feed(&mut self, mut bytes: &[u8], on_frame: &mut impl FnMut(&[u8])) {
         while !bytes.is_empty() {
             match &mut self.state {
                 Scan::Header { got, bytes: header } => {
@@ -434,34 +498,28 @@ impl FrameScanner {
                     if *got == 4 {
                         let len = u32::from_le_bytes(*header) as usize;
                         if len == 0 {
-                            on_frame(None);
-                            self.state = Scan::Header {
-                                got: 0,
-                                bytes: [0; 4],
-                            };
+                            on_frame(&[]);
+                            self.state = Scan::default();
                         } else {
                             self.state = Scan::Payload {
                                 left: len,
-                                tag: None,
+                                head: [0; HEAD_LEN],
+                                got: 0,
                             };
                         }
                     }
                 }
-                Scan::Payload { left, tag } => {
-                    // The first payload byte is the tag, whichever piece
-                    // carries it: the piece that starts the payload.
-                    if tag.is_none() {
-                        *tag = Some(bytes[0]);
-                    }
+                Scan::Payload { left, head, got } => {
                     let take = (*left).min(bytes.len());
+                    // The head, from whichever pieces carry it.
+                    let keep = take.min(HEAD_LEN - *got);
+                    head[*got..*got + keep].copy_from_slice(&bytes[..keep]);
+                    *got += keep;
                     *left -= take;
                     bytes = &bytes[take..];
                     if *left == 0 {
-                        on_frame(*tag);
-                        self.state = Scan::Header {
-                            got: 0,
-                            bytes: [0; 4],
-                        };
+                        on_frame(&head[..*got]);
+                        self.state = Scan::default();
                     }
                 }
             }
@@ -492,65 +550,188 @@ mod tests {
         out
     }
 
-    use melin_wire_protocol::control_codec::{TAG_CHALLENGE_RESPONSE, TAG_RESPONSE_HEARTBEAT};
+    use melin_wire_protocol::control::{RefusalKind, TransportResponse};
+    use melin_wire_protocol::control_codec::{
+        MAX_CONTROL_FRAME_LEN, TAG_APP, TAG_CHALLENGE_RESPONSE, TAG_REQUEST,
+        TAG_RESPONSE_HEARTBEAT, encode_transport_response,
+    };
+    use proptest::prelude::*;
+
+    /// Request `id`'s frame carrying `body`.
+    fn request(id: u64, body: &[u8]) -> Vec<u8> {
+        frame(&[&[TAG_REQUEST][..], &id.to_le_bytes(), body].concat())
+    }
+
+    /// The node's `response`, length prefix included.
+    fn control(response: TransportResponse) -> Vec<u8> {
+        let mut buf = [0u8; MAX_CONTROL_FRAME_LEN];
+        let n = encode_transport_response(&response, &mut buf).unwrap();
+        buf[..n].to_vec()
+    }
+
+    /// Every head `scanner` reports for `stream` fed in `pieces`.
+    fn heads(stream: &[u8], cuts: &[usize]) -> Vec<Vec<u8>> {
+        let mut scanner = FrameScanner::new();
+        let mut heads = Vec::new();
+        let mut prev = 0;
+        for &cut in cuts.iter().chain(std::iter::once(&stream.len())) {
+            scanner.feed(&stream[prev..cut], &mut |head| heads.push(head.to_vec()));
+            prev = cut;
+        }
+        heads
+    }
+
+    /// A stream of every shape of frame the trace meets: a request (its
+    /// head the tag and the ID), a frame shorter than a head, an empty
+    /// one, a final frame, and a long application response.
+    fn every_shape() -> (Vec<u8>, Vec<Vec<u8>>) {
+        let stream = [
+            request(0x0102_0304_0506_0708, b"body"),
+            frame(&[TAG_CHALLENGE_RESPONSE, 1, 2]),
+            frame(&[]),
+            control(TransportResponse::BatchEnd {
+                id: RequestId(u64::MAX),
+            }),
+            frame(&[&[TAG_APP][..], &[0xEE; 40]].concat()),
+        ]
+        .concat();
+        let expected = vec![
+            [&[TAG_REQUEST][..], &0x0102_0304_0506_0708u64.to_le_bytes()].concat(),
+            vec![TAG_CHALLENGE_RESPONSE, 1, 2],
+            vec![],
+            control(TransportResponse::BatchEnd {
+                id: RequestId(u64::MAX),
+            })[4..]
+                .to_vec(),
+            [&[TAG_APP][..], &[0xEE; 8]].concat(),
+        ];
+        (stream, expected)
+    }
 
     #[test]
-    fn frames_are_tagged_whatever_the_pieces() {
-        // Two frames -- `[tag][body]` -- and an empty one, fed a byte at a
-        // time, then in threes, then as one slice: the same tags.
-        let mut stream = frame(&[TAG_APP, b'h', b'i']);
-        stream.extend(frame(&[]));
-        stream.extend(frame(&[TAG_CHALLENGE_RESPONSE]));
-        let expected = vec![Some(TAG_APP), None, Some(TAG_CHALLENGE_RESPONSE)];
-
+    fn frames_report_their_heads_whatever_the_pieces() {
+        let (stream, expected) = every_shape();
+        // A byte at a time (every head cut inside its ID), in threes, and
+        // as one slice: the same heads.
         for pieces in [1usize, 3, stream.len()] {
-            let mut scanner = FrameScanner::new();
-            let mut tags = Vec::new();
-            for piece in stream.chunks(pieces) {
-                scanner.feed(piece, &mut |tag| tags.push(tag));
-            }
-            assert_eq!(tags, expected, "pieces of {pieces}");
+            let cuts: Vec<usize> = (pieces..stream.len()).step_by(pieces).collect();
+            assert_eq!(heads(&stream, &cuts), expected, "pieces of {pieces}");
         }
     }
 
-    #[test]
-    fn requests_are_application_frames_and_answers_are_batch_ends() {
-        // On the way out, the handshake's challenge response is not a
-        // request; an application frame is, whatever its body.
-        assert!(Trace::is_request(Some(TAG_APP)));
-        assert!(!Trace::is_request(Some(TAG_CHALLENGE_RESPONSE)));
-        assert!(!Trace::is_request(None));
+    proptest! {
+        /// Any split of the stream across feeds reports the same heads.
+        #[test]
+        fn any_split_reports_the_same_heads(
+            raw_cuts in prop::collection::vec(any::<prop::sample::Index>(), 0..12),
+        ) {
+            let (stream, expected) = every_shape();
+            let mut cuts: Vec<usize> =
+                raw_cuts.iter().map(|i| i.index(stream.len() + 1)).collect();
+            cuts.sort_unstable();
+            prop_assert_eq!(heads(&stream, &cuts), expected);
+        }
+    }
 
-        // On the way back, the application's responses and the heartbeats
-        // are not the answer; the batch-end that closes the batch is.
-        assert!(!Trace::is_answer(Some(TAG_APP)));
-        assert!(!Trace::is_answer(Some(TAG_RESPONSE_HEARTBEAT)));
-        assert!(!Trace::is_answer(None));
-        assert!(Trace::is_answer(Some(TAG_BATCH_END)));
+    /// `trace` fed `bytes` as the stack's receive.
+    fn receive(trace: &mut Trace, bytes: &[u8]) {
+        let clock = TscClock::calibrate();
+        trace.received(bytes, &[], bytes.len(), &clock);
     }
 
     #[test]
-    fn replies_answer_requests_in_order() {
+    fn answers_pair_with_their_own_requests_whatever_the_order() {
         let mut trace = Trace::new();
-        let request = frame(&[TAG_APP, b'a']);
-        let mut two = request.clone();
-        two.extend(&request);
-        trace.sent(&two, &[], two.len());
-        assert_eq!(trace.in_flight.len(), 2);
+        // The handshake's answer is no request.
+        let out = [
+            frame(&[TAG_CHALLENGE_RESPONSE; 97]),
+            request(7, b"a"),
+            request(3, b"b"),
+            request(9, b""),
+            request(11, b"c"),
+        ]
+        .concat();
+        // Split across the ring's two halves, mid-request.
+        trace.sent(&out[..60], &out[60..], out.len());
+        assert_eq!(trace.in_flight.len(), 4);
 
-        // The first request's batch holds two application responses, the
-        // second's none -- a rejection the application reported with no
-        // body, say -- and a heartbeat sits between them. Two batch-ends,
-        // two round trips.
-        let clock = TscClock::calibrate();
-        let mut replies = frame(&[TAG_APP, 0x30, b'a']);
-        replies.extend(frame(&[TAG_APP, 0x31]));
-        replies.extend(frame(&[TAG_BATCH_END]));
-        replies.extend(frame(&[TAG_RESPONSE_HEARTBEAT]));
-        replies.extend(frame(&[TAG_BATCH_END]));
-        let n = replies.len();
-        trace.received(&replies, &[], n, &clock);
+        // Out of order, every kind of final frame, with responses and a
+        // heartbeat among them: each pairs with its own request.
+        let replies = [
+            control(TransportResponse::ServerBusy { id: RequestId(9) }),
+            frame(&[TAG_APP, 0x30, b'a']),
+            frame(&[TAG_RESPONSE_HEARTBEAT]),
+            control(TransportResponse::BatchEnd { id: RequestId(7) }),
+            control(TransportResponse::Refused {
+                id: RequestId(11),
+                kind: RefusalKind::Malformed,
+                reason: "no",
+            }),
+        ]
+        .concat();
+        receive(&mut trace, &replies);
+        assert_eq!(trace.round_trip.len(), 3);
+        assert_eq!(
+            trace.in_flight.keys().copied().collect::<Vec<_>>(),
+            [RequestId(3)],
+            "only the unanswered request is left"
+        );
+        receive(
+            &mut trace,
+            &control(TransportResponse::BatchEndDegraded { id: RequestId(3) }),
+        );
         assert!(trace.in_flight.is_empty());
-        assert_eq!(trace.round_trip.len(), 2);
+        assert_eq!(trace.round_trip.len(), 4);
+        assert_eq!((trace.untracked, trace.unmatched), (0, 0));
+    }
+
+    /// An answer for no request held, and a repeated ID, are counted, not
+    /// paired.
+    #[test]
+    fn unknown_and_repeated_ids_are_counted() {
+        let mut trace = Trace::new();
+        let out = [request(1, b""), request(1, b"again")].concat();
+        trace.sent(&out, &[], out.len());
+        assert_eq!(trace.untracked, 1, "the repeated ID");
+        assert_eq!(trace.in_flight.len(), 1);
+
+        receive(
+            &mut trace,
+            &control(TransportResponse::BatchEnd { id: RequestId(2) }),
+        );
+        assert_eq!(trace.unmatched, 1);
+        assert_eq!(trace.round_trip.len(), 0);
+        // The report says so, beside the request never answered, after the
+        // three histograms and their header.
+        let lines = trace.report_lines();
+        assert_eq!(lines.len(), 4 + 3, "{lines:#?}");
+        assert!(lines[1].contains("loop iteration"), "{lines:#?}");
+        assert_eq!(lines[4], "trace: 1 requests were never answered");
+        assert!(lines[5].starts_with("trace: 1 requests were not tracked"));
+        assert_eq!(lines[6], "trace: 1 answers named no request the trace held");
+        // A request too short for its ID is no request.
+        let short = frame(&[TAG_REQUEST, 1, 2]);
+        trace.sent(&short, &[], short.len());
+        assert_eq!(trace.in_flight.len(), 1);
+    }
+
+    /// At the cap a new request's stamp is not kept, and is counted; the
+    /// stamps held stay.
+    #[test]
+    fn past_the_cap_a_new_stamp_is_not_recorded() {
+        let mut trace = Trace::new();
+        let now = rdtscp();
+        for id in 0..Trace::IN_FLIGHT_CAP as u64 {
+            trace.in_flight.insert(RequestId(id), now);
+        }
+        let past = request(u64::MAX, b"");
+        trace.sent(&past, &[], past.len());
+        assert_eq!(trace.untracked, 1);
+        assert_eq!(trace.in_flight.len(), Trace::IN_FLIGHT_CAP);
+        assert!(!trace.in_flight.contains_key(&RequestId(u64::MAX)));
+        // An ID already held is still a repeat, counted the same way.
+        let again = request(0, b"");
+        trace.sent(&again, &[], again.len());
+        assert_eq!(trace.untracked, 2);
     }
 }

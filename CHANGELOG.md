@@ -20,6 +20,29 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   Changed). In `melin-transport-core`, `InputSlot::client` and
   `ClientOrigin` build a client request's slot whole, the way both of
   the node's readers now publish one.
+- **Client protocol 1's pieces, in `melin-wire-protocol`** (see Changed):
+  `control_codec::CLIENT_PROTOCOL_VERSION`; the `Refused` frame
+  (`TransportResponse::Refused`, `TAG_REFUSED`, `decode_refused`) and
+  `control::RefusalKind`, with `control_codec::Refused` (a decoded
+  refusal), `BadRefusal` and `MAX_REFUSAL_REASON`; `REQUEST_ID_LEN`;
+  `TAG_REQUEST`, `framing::split_request` (the one parser of a request:
+  its ID and its body, or `NotARequest`), `framing::request_tag_and_id`
+  and `REQUEST_TAG_AND_ID_LEN`; `control_codec::terminal_request_id`
+  (the ID a final frame names); `control_codec::decode_challenge` (the
+  one parser of the node's challenge, or `BadChallenge`), with
+  `CHALLENGE_LEN`, `CHALLENGE_V0_LEN` and `CHALLENGE_NONCE_LEN`;
+  `RequestId` is ordered (`PartialOrd`, `Ord`); `BATCH_END_FRAME_LEN` and
+  `write_terminal_id`, for a stage that pre-encodes its batch
+  terminators; `MAX_CONTROL_FRAME_LEN`; and `RETIRED_TAGS`, tags no frame
+  may reuse. `melin-client` re-exports `RequestId`, `RefusalKind` and
+  `CLIENT_PROTOCOL_VERSION`.
+- **`melin-bench` reports shed requests**: a request the node answers
+  `ServerBusy` is counted as shed (`shed: N requests` in the summary,
+  `shed_requests` in the JSON results) instead of failing the run.
+- **`shm-proxy --trace` pairs each request with the final frame that
+  names it**, a busy or a refusal included, and reports requests it did
+  not track and answers it could not pair beside the requests never
+  answered.
 
 ### Changed
 
@@ -28,13 +51,99 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   copies an input slot's ID into every output slot of its event, so an
   event publisher sees it as it sees the connection. It is never
   journaled or replicated, and is `RequestId(0)` on node events and
-  replicas; the client wire does not carry one yet, so for now it is 0
-  everywhere. Source-breaking for code that builds either slot with a
+  replicas; on a client's request it is the ID the request frame carries
+  (see client protocol 1 below). Source-breaking for code that builds either slot with a
   struct literal: add the field, or build node events with
   `InputSlot::node_event` and client requests with `InputSlot::client`.
   A slot whose fixed fields grow by eight bytes can cross a cache-line
   boundary: an `InputSlot` (padded to whole lines) grows by a line when
   the application's event comes within eight bytes of one.
+- **Client protocol 1: every request carries an ID, and is answered once,
+  naming it.** Wire-breaking: upgrade clients with the nodes, admin tools
+  and the shm-proxy's client included. The node's challenge carries the
+  client protocol version ahead of its nonce; a client refuses a node of
+  another protocol before it signs anything (`Error::ProtocolVersion`,
+  which `Connection::connect_by` reports at once rather than retrying),
+  and a client of an earlier release refuses the new challenge. A request
+  is `[len][TAG_REQUEST][id: u64 LE][body]`; anything else after the
+  handshake (an empty frame, another tag, a request too short for its
+  ID) closes the connection, where it used to be dropped silently. Every
+  frame that ends a request's reply names the request: `BatchEnd` and
+  `BatchEndDegraded` carry its ID, and so does `ServerBusy`. A request the
+  application's decoder refuses is answered with a new `Refused` frame
+  carrying the refusal's kind (`PermissionDenied`, `Malformed`) and the
+  decoder's reason, cut to 255 bytes (the text is for people, may change
+  with any release, and reaches the authenticated client whose request
+  it was); one it filters is answered with an empty batch. A request
+  that finds the input ring full is answered `ServerBusy` through the
+  same path as every other early answer, in its place among the
+  connection's replies, and the connection is kept (on DPDK too, which
+  used to close it). The sizes: `REQUEST_HEADER_LEN` is 13, and
+  `MAX_REQUEST_BODY` 1015 (the ID comes out of the body; the frame limit
+  stays 1024), so an application that does not check its widest request
+  at build time fails at run time for a body between 1016 and 1023 bytes.
+  Source-breaking in `melin-wire-protocol`: `seal_request` and
+  `frame_request` take the request's ID; `TransportResponse::BatchEnd`,
+  `BatchEndDegraded` and `ServerBusy` carry a `RequestId`, and
+  `TransportResponse` gains `Refused` (exhaustive, so a new arm in every
+  match). In `melin-client`: `send` and `send_with` return the
+  request's `RequestId` on every surface (`Connection`,
+  `PolledConnection`, `StreamConnection` and the `Session` trait), each
+  connection numbering its requests from 1; `Frame` and `Reply` are
+  `Response`, `BatchEnd { id, ack }`, `ServerBusy { id }` and
+  `Refused { id, kind, reason }`; `Error::Refused` and
+  `Error::ProtocolVersion` are new variants of an exhaustive `Error`.
+  The connections check every final frame against the requests
+  outstanding: an answer for none, or a busy or refusal inside another
+  request's reply, is `Error::Protocol`. The convenience calls
+  (`request`, `request_batch`, `request_one`) refuse an answer for
+  another request as `Error::Protocol`, and report a refusal and a busy
+  as `Error::Refused` and `Error::ServerBusy`, which now leave the
+  connection usable (`ServerBusy` means resend, no longer reconnect).
+  `Error::NoReply` now means the node or the network stopped answering:
+  a node no longer drops a request silently.
+- **The shm-proxy's contract with the Aeron benchmark harness changes
+  with the protocol**: the harness's Java rig frames each request with
+  `TAG_REQUEST` and an ID, and reads the new final frames. The proxy's
+  flags and its `connected to` and `error:` lines on stderr are
+  unchanged; its `--trace` report gains two lines (see Added).
+- **`melin-server-runtime`'s refusal queue is the early-reply queue**,
+  which carries every answer a reader decides on without publishing the
+  request: in the `halt` module, `Refusal` is `EarlyReply` (with an
+  `EarlyKind`: `Rejected`, `Filtered`, `Refused`, `Busy`, and the
+  request's ID), `RefusalSender` and `RefusalQueue` are
+  `EarlyReplySender` and `EarlyReplyQueue`, `refusal_channel` is
+  `early_reply_channel` (taking the matching stage's progress as
+  before), and `response::Response`'s `refusals` field is
+  `early_replies`. `ControlEvent::PipelineBusy` is removed: a busy no
+  longer rides the control channel. A full early-reply queue now closes
+  the connection whose answer has nowhere to go, where a full refusal
+  queue answered `ServerBusy`.
+
+### Removed
+
+- **`EngineError`**: `TransportResponse::EngineError`,
+  `control_codec::TAG_ENGINE_ERROR` (its value, `0x03`, is retired, in
+  `RETIRED_TAGS`), `melin_transport_core`'s `OutputPayload::EngineError`,
+  and `melin-client`'s `Frame::EngineError`, `Reply::EngineError` and
+  `Error::EngineError`. No node ever sent the frame, and the two client
+  surfaces disagreed on whether it ended a request.
+
+### Fixed
+
+- **A request the application's decoder refuses or filters is answered**
+  (S1 of the application API review). It used to be dropped without a
+  reply, so on a pipelining connection every later reply was paired with
+  the request before it.
+- **A `ServerBusy` no longer overtakes replies to earlier requests, nor
+  lands inside another request's reply** (finding 18 of the determinism
+  audit). It went out of band, on the response stage's control channel,
+  ahead of replies still in the output ring; it is now an early reply
+  like a halt refusal, released in request order.
+- **A DPDK node keeps a connection whose request finds the input ring
+  full**, answering it `ServerBusy` as the kernel transport does. It used
+  to close the connection, throwing away the replies to writes already
+  published.
 
 ## [0.20.0] - 2026-10-19
 

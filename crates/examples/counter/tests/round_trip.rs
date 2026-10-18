@@ -239,6 +239,40 @@ fn a_dpdk_client_round_trips_through_a_dpdk_node() {
         let value = client.request_one(&GET_VALUE_REQUEST).expect("query");
         assert_eq!(value[0], KIND_RESP_VALUE);
         assert_eq!(value_of(&value), 42);
+
+        // Pipelined over the client NIC: each final frame names its
+        // request, a malformed one refused by the DPDK poll thread with
+        // the decoder's reason, in its place between the others.
+        use melin_client::{Ack, Frame, RefusalKind, RequestId};
+        let sent = [
+            client.send(&GET_VALUE_REQUEST).expect("send"),
+            client.send(&[0x55]).expect("send"),
+            client.send(&GET_VALUE_REQUEST).expect("send"),
+        ];
+        // The connection's second to fourth requests: the query above
+        // took the first ID.
+        assert_eq!(sent, [RequestId(2), RequestId(3), RequestId(4)]);
+        for (i, id) in sent.into_iter().enumerate() {
+            if i == 1 {
+                assert_eq!(
+                    client.next_frame().expect("the refusal"),
+                    Frame::Refused {
+                        id,
+                        kind: RefusalKind::Malformed,
+                        reason: "unknown kind"
+                    }
+                );
+                continue;
+            }
+            assert!(matches!(client.next_frame(), Ok(Frame::Response(_))));
+            assert_eq!(
+                client.next_frame().expect("the batch end"),
+                Frame::BatchEnd {
+                    id,
+                    ack: Ack::Policy
+                }
+            );
+        }
     }
 
     drop(nic);

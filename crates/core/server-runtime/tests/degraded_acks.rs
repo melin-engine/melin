@@ -97,7 +97,7 @@ fn writer(
             while ends < BURST {
                 match conn.next_frame() {
                     Ok(Frame::Response(body)) => kind = body.first().copied(),
-                    Ok(Frame::BatchEnd(ack)) => {
+                    Ok(Frame::BatchEnd { ack, .. }) => {
                         let Some(kind) = kind.take() else {
                             return (replies, Some("a batch with no response".into()));
                         };
@@ -250,7 +250,7 @@ fn run(policy: AckPolicy, scenario: Scenario) {
             // The writers are all waiting on held replies by now, so
             // nothing else is refused meanwhile.
             let refused_before = gauge(health, "melin_writes_refused_total").expect("health is up");
-            refused
+            let refused_id = refused
                 .send(&increment_request(1))
                 .expect("send the write the halt refuses");
             // The refusal is decided on arrival: wait for the reader to
@@ -265,7 +265,10 @@ fn run(policy: AckPolicy, scenario: Scenario) {
             }
             assert_eq!(
                 refused.next_frame().expect("the refusal's batch end"),
-                Frame::BatchEnd(Ack::Policy)
+                Frame::BatchEnd {
+                    id: refused_id,
+                    ack: Ack::Policy
+                }
             );
             let query = ask(&fx, &primary, &GET_VALUE_REQUEST, READ_TIMEOUT)
                 .expect("the query is answered");

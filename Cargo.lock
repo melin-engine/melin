@@ -1011,6 +1011,7 @@ dependencies = [
  "melin-journal",
  "melin-server-runtime",
  "melin-test-node",
+ "melin-wire-protocol",
  "tempfile",
 ]
 
@@ -1175,6 +1176,7 @@ dependencies = [
  "melin-server-runtime",
  "melin-test-node",
  "melin-wire-protocol",
+ "proptest",
  "tempfile",
 ]
 

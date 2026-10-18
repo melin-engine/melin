@@ -51,33 +51,40 @@
 //! request refused for the halt never reached the application, so a
 //! client may resend it as it was once the node takes writes again.
 //!
+//! # Early replies
+//!
+//! A halt refusal is one of the answers a reader decides on without
+//! publishing the request: the early replies ([`EarlyReply`]). The others
+//! are the answers to a request the application's decoder filters (an
+//! empty batch) or refuses (a `Refused` frame naming why), and to a
+//! request shed because the input ring is full (`ServerBusy`). All of them
+//! reach the response stage through one queue, from the reader (or the
+//! DPDK poll thread) that decided them, and every one names its request's
+//! ID.
+//!
 //! # Delivered in order
 //!
-//! Replies carry no request identifier: a client pairs them with its
-//! requests by order. A refusal can therefore not go out as soon as it is
-//! decided — the connection may still be waiting on replies to requests it
-//! sent before, held by the ack policy. The reader stamps the refusal with
-//! the input-ring sequence the request would have taken, and the response
-//! stage sends it once every event published before that sequence has been
-//! answered ([`RefusalQueue::release`]). The reader makes each refusal
-//! visible before it commits anything published after it, so the response
-//! stage cannot reach a later event without seeing the refusal first.
+//! An early reply waits for the replies to the requests published before
+//! it. The reader stamps it with the input-ring sequence the request would
+//! have taken, and the response stage sends it once every event published
+//! before that sequence has been answered ([`EarlyReplyQueue::release`]).
+//! The reader makes each early reply visible before it commits anything
+//! published after it, so the response stage cannot reach a later event
+//! without seeing the early reply first.
 //!
 //! The response stage works from a snapshot of the queue, taken once per
 //! iteration between reading the output ring and draining its control
-//! channel ([`RefusalQueue::sync`]). Before the drain, because a refusal
-//! must never reach the stage ahead of its connection's registration;
-//! after the read, because that is when every refusal due before an event
-//! in the batch is already visible. One snapshot per iteration is also
-//! all the steady state pays: no poll per event.
+//! channel ([`EarlyReplyQueue::sync`]). Before the drain, because an
+//! early reply must never reach the stage ahead of its connection's
+//! registration; after the read, because that is when every early reply
+//! due before an event in the batch is already visible. One snapshot per
+//! iteration is also all the steady state pays: no poll per event.
 //!
 //! # Counted
 //!
 //! A refused write leaves no other trace — nothing is journaled — so the
 //! reader counts them ([`HaltGate::record_refused`]) and the health
-//! endpoint exports the count as `melin_writes_refused_total`. A write
-//! shed for a full refusal queue is counted too: the halt is why it was
-//! turned away, whatever the client was told.
+//! endpoint exports the count as `melin_writes_refused_total`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -89,20 +96,23 @@ use melin_pipeline::padding::Sequence;
 use melin_pipeline::spsc;
 use melin_pipeline::wait::WaitStrategy;
 use melin_transport_core::fence::FenceState;
+use melin_transport_core::pipeline::RequestId;
 use melin_transport_core::replica_presence::{Observed, ReplicaPresence};
+use melin_wire_protocol::control::RefusalKind;
 
 use crate::ack_policy::AckPolicy;
 use crate::policy_control::{Origin, is_unwitnessed};
 
-/// Refusals the response stage can hold before a reader has to shed load.
+/// Early replies the response stage can hold before a reader can queue no
+/// more.
 ///
-/// Refusals only queue while the response stage is held up behind a reply
-/// the ack policy has not released, so this bounds memory during a halt
-/// rather than sizing a steady-state flow. Past it a refused write is
-/// answered like a full input ring, with `ServerBusy`. A power of two, as
-/// the ring requires; each entry is the application's rejection plus two
-/// words.
-pub(crate) const REFUSAL_QUEUE_CAPACITY: usize = 4096;
+/// Early replies queue while the response stage is held up behind a reply
+/// the ack policy has not released, so this bounds memory then rather than
+/// sizing a steady-state flow. Past it the reader closes the connection
+/// whose answer has nowhere to go. A power of two, as the ring requires;
+/// each entry is the application's rejection, or a refusal's reason, plus
+/// a few words.
+pub(crate) const EARLY_REPLY_QUEUE_CAPACITY: usize = 4096;
 
 /// What the response stage needs to answer a halted node's held replies
 /// once its own journal holds them: the replies to writes it sequenced
@@ -378,34 +388,59 @@ impl HaltGate {
     }
 }
 
-/// A client write refused at ingress, on its way to the response stage.
+/// An answer a reader decided on without publishing the request, on its
+/// way to the response stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Refusal<R> {
+pub struct EarlyReply<R> {
     /// Connection the request arrived on.
     pub connection_id: u64,
+    /// The client's ID for the request, echoed on the reply's final frame.
+    pub request_id: RequestId,
     /// Input-ring sequence the request would have taken: every event
     /// published before it has a lower one.
     pub input_seq: u64,
-    /// The application's rejection for the request.
-    pub report: R,
+    /// What the answer is.
+    pub kind: EarlyKind<R>,
 }
 
-/// Creates the queue a reader hands refusals to the response stage through.
+/// What an [`EarlyReply`] answers, and so the frames it is sent as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EarlyKind<R> {
+    /// A write refused while the node is halted: the application's
+    /// rejection, then `BatchEnd`.
+    Rejected(R),
+    /// A request the application's decoder filters: an empty batch, a
+    /// `BatchEnd` alone.
+    Filtered,
+    /// A request the application's decoder refuses: a `Refused` frame with
+    /// the decoder's reason.
+    Refused {
+        kind: RefusalKind,
+        reason: &'static str,
+    },
+    /// A request shed because the input ring is full: `ServerBusy`.
+    Busy,
+}
+
+/// Creates the queue a reader hands early replies to the response stage
+/// through.
 ///
 /// `matching_progress` is the matching stage's consumer progress on the
 /// input ring, which tells an idle response stage that everything
-/// published before a refusal has been answered.
-pub fn refusal_channel<R: Copy>(
+/// published before an early reply has been answered.
+pub fn early_reply_channel<R: Copy>(
     matching_progress: Arc<Sequence>,
-) -> (RefusalSender<R>, RefusalQueue<R>) {
+) -> (EarlyReplySender<R>, EarlyReplyQueue<R>) {
     // `Option` because the ring wants `Default` slots and an application's
     // report need not have one. The wait strategy is unused: the reader
-    // never blocks on this queue (see `RefusalSender::try_send`).
-    let (tx, rx) =
-        spsc::channel::<Option<Refusal<R>>>(REFUSAL_QUEUE_CAPACITY, WaitStrategy::SpinThenYield);
+    // never blocks on this queue (see `EarlyReplySender::try_send`).
+    let (tx, rx) = spsc::channel::<Option<EarlyReply<R>>>(
+        EARLY_REPLY_QUEUE_CAPACITY,
+        WaitStrategy::SpinThenYield,
+    );
     (
-        RefusalSender { tx },
-        RefusalQueue {
+        EarlyReplySender { tx },
+        EarlyReplyQueue {
             rx,
             head: None,
             matching_progress,
@@ -413,33 +448,33 @@ pub fn refusal_channel<R: Copy>(
     )
 }
 
-/// The reader's end of the refusal queue.
-pub struct RefusalSender<R> {
-    tx: spsc::Producer<Option<Refusal<R>>>,
+/// The reader's end of the early-reply queue.
+pub struct EarlyReplySender<R> {
+    tx: spsc::Producer<Option<EarlyReply<R>>>,
 }
 
-impl<R: Copy> RefusalSender<R> {
-    /// Queue a refusal, invisible to the response stage until
+impl<R: Copy> EarlyReplySender<R> {
+    /// Queue an early reply, invisible to the response stage until
     /// [`flush`](Self::flush). Never blocks: a full queue is `Err`, and the
-    /// caller sheds the request as it would on a full input ring.
-    pub(crate) fn try_send(&mut self, refusal: Refusal<R>) -> Result<(), spsc::Full> {
+    /// caller closes the connection whose answer has nowhere to go.
+    pub(crate) fn try_send(&mut self, reply: EarlyReply<R>) -> Result<(), spsc::Full> {
         self.tx
-            .try_push_with(|slot| *slot = Some(refusal))
+            .try_push_with(|slot| *slot = Some(reply))
             .map(|_| ())
     }
 
-    /// Make every queued refusal visible to the response stage. Call before
-    /// committing the input-ring entries published after them: the
-    /// response stage relies on a refusal being visible by the time it
-    /// handles any event that came later.
+    /// Make every queued early reply visible to the response stage. Call
+    /// before committing the input-ring entries published after them: the
+    /// response stage relies on an early reply being visible by the time
+    /// it handles any event that came later.
     pub(crate) fn flush(&mut self) {
         self.tx.flush();
     }
 }
 
-/// The response stage's end of the refusal queue.
+/// The response stage's end of the early-reply queue.
 ///
-/// Everything here works on the refusals taken in by the last
+/// Everything here works on the early replies taken in by the last
 /// [`sync`](Self::sync); those made visible since wait for the next one.
 /// A stage iteration goes:
 ///
@@ -447,18 +482,19 @@ impl<R: Copy> RefusalSender<R> {
 /// 2. [`sync`](Self::sync), then drain the control channel;
 /// 3. [`release`](Self::release) — with the idle bound if the read came
 ///    back empty, else before the first slot of each event in the batch.
-pub struct RefusalQueue<R> {
-    rx: spsc::Consumer<Option<Refusal<R>>>,
-    /// The oldest synced refusal, taken off the ring but not yet released.
-    head: Option<Refusal<R>>,
+pub struct EarlyReplyQueue<R> {
+    rx: spsc::Consumer<Option<EarlyReply<R>>>,
+    /// The oldest synced early reply, taken off the ring but not yet
+    /// released.
+    head: Option<EarlyReply<R>>,
     matching_progress: Arc<Sequence>,
 }
 
-impl<R: Copy> RefusalQueue<R> {
+impl<R: Copy> EarlyReplyQueue<R> {
     /// The release bound for an iteration whose output read comes back
     /// empty: the matching stage's progress on the input ring. `None` when
-    /// no synced refusal waits, so the steady state leaves the matching
-    /// stage's counter alone.
+    /// no synced early reply waits, so the steady state leaves the
+    /// matching stage's counter alone.
     ///
     /// Must be taken *before* the read. Every event below the progress had
     /// all its output slots published before the progress moved, so a read
@@ -469,47 +505,44 @@ impl<R: Copy> RefusalQueue<R> {
         Some(self.matching_progress.get().load(Ordering::Acquire))
     }
 
-    /// Take in the refusals the reader has made visible so far, and report
-    /// whether any waits. One load of the queue's cursor.
+    /// Take in the early replies the reader has made visible so far, and
+    /// report whether any waits. One load of the queue's cursor.
     ///
-    /// Call after reading the output ring, so that every refusal due before
-    /// an event in that batch is taken in, and before draining the control
-    /// channel, so that every refusal taken in belongs to a connection the
-    /// drain registers.
+    /// Call after reading the output ring, so that every early reply due
+    /// before an event in that batch is taken in, and before draining the
+    /// control channel, so that every early reply taken in belongs to a
+    /// connection the drain registers.
     #[inline]
     pub fn sync(&mut self) -> bool {
         self.rx.refresh();
         self.peek().is_some()
     }
 
-    /// Hand `emit` every synced refusal whose request came before `bound`,
-    /// oldest first.
+    /// Hand `emit` every synced early reply whose request came before
+    /// `bound`, oldest first.
     ///
     /// Call with the input sequence of an output slot before handling the
     /// first slot of that event — everything published before it has been
     /// answered — or with [`idle_bound`](Self::idle_bound) when the output
-    /// ring is empty. Never between two slots of one event: the refusal
-    /// would split that event's reply.
+    /// ring is empty. Never between two slots of one event: the early
+    /// reply would split that event's reply.
     #[inline]
-    pub fn release(&mut self, bound: u64, mut emit: impl FnMut(Refusal<R>)) {
-        while let Some(refusal) = self.peek() {
-            if refusal.input_seq > bound {
+    pub fn release(&mut self, bound: u64, mut emit: impl FnMut(EarlyReply<R>)) {
+        while let Some(reply) = self.peek() {
+            if reply.input_seq > bound {
                 return;
             }
             self.head = None;
-            emit(refusal);
+            emit(reply);
         }
     }
 
-    /// The oldest synced refusal. Never reads the queue's cursor, so it
-    /// cannot see past the last [`sync`](Self::sync).
-    fn peek(&mut self) -> Option<Refusal<R>> {
+    /// The oldest synced early reply. Never reads the queue's cursor, so
+    /// it cannot see past the last [`sync`](Self::sync).
+    fn peek(&mut self) -> Option<EarlyReply<R>> {
         if self.head.is_none() {
             // Only `try_send` writes the ring, and it never writes `None`.
-            self.head = self
-                .rx
-                .try_consume_visible()
-                .and_then(|(_, refusal)| refusal);
+            self.head = self.rx.try_consume_visible().and_then(|(_, reply)| reply);
         }
         self.head
     }
@@ -554,11 +587,12 @@ mod tests {
         Arc::new(CachePadded::new(AtomicU64::new(value)))
     }
 
-    fn refusal(connection_id: u64, input_seq: u64) -> Refusal<u64> {
-        Refusal {
+    fn refusal(connection_id: u64, input_seq: u64) -> EarlyReply<u64> {
+        EarlyReply {
             connection_id,
+            request_id: RequestId(connection_id * 10),
             input_seq,
-            report: connection_id * 100,
+            kind: EarlyKind::Rejected(connection_id * 100),
         }
     }
 
@@ -822,7 +856,7 @@ mod tests {
 
     #[test]
     fn a_refusal_waits_for_both_the_flush_and_a_sync() {
-        let (mut tx, mut rx) = refusal_channel::<u64>(progress(10));
+        let (mut tx, mut rx) = early_reply_channel::<u64>(progress(10));
         tx.try_send(refusal(1, 0)).unwrap();
         assert!(!rx.sync(), "not flushed");
 
@@ -841,7 +875,7 @@ mod tests {
     /// drained its control channel — waits for the next iteration.
     #[test]
     fn release_does_not_reach_past_the_sync() {
-        let (mut tx, mut rx) = refusal_channel::<u64>(progress(0));
+        let (mut tx, mut rx) = early_reply_channel::<u64>(progress(0));
         tx.try_send(refusal(1, 0)).unwrap();
         tx.flush();
         assert!(rx.sync());
@@ -860,7 +894,7 @@ mod tests {
 
     #[test]
     fn release_stops_at_the_first_refusal_past_the_bound() {
-        let (mut tx, mut rx) = refusal_channel::<u64>(progress(0));
+        let (mut tx, mut rx) = early_reply_channel::<u64>(progress(0));
         for (conn, seq) in [(1, 3), (2, 3), (3, 5), (4, 9)] {
             tx.try_send(refusal(conn, seq)).unwrap();
         }
@@ -889,10 +923,43 @@ mod tests {
 
     #[test]
     fn a_full_queue_is_an_error_not_a_wait() {
-        let (mut tx, _rx) = refusal_channel::<u64>(progress(0));
-        for seq in 0..REFUSAL_QUEUE_CAPACITY as u64 {
+        let (mut tx, _rx) = early_reply_channel::<u64>(progress(0));
+        for seq in 0..EARLY_REPLY_QUEUE_CAPACITY as u64 {
             tx.try_send(refusal(1, seq)).unwrap();
         }
         assert!(tx.try_send(refusal(1, 0)).is_err());
+    }
+
+    /// Every kind of early reply goes through the queue as it was sent,
+    /// with its request's ID, in order among the others.
+    #[test]
+    fn every_kind_travels_with_its_request_id() {
+        let (mut tx, mut rx) = early_reply_channel::<u64>(progress(0));
+        let kinds = [
+            EarlyKind::Rejected(7),
+            EarlyKind::Filtered,
+            EarlyKind::Refused {
+                kind: RefusalKind::Malformed,
+                reason: "bad",
+            },
+            EarlyKind::Busy,
+        ];
+        for (n, kind) in (0u64..).zip(kinds) {
+            tx.try_send(EarlyReply {
+                connection_id: 1,
+                request_id: RequestId(100 + n),
+                input_seq: n,
+                kind,
+            })
+            .unwrap();
+        }
+        tx.flush();
+        assert!(rx.sync());
+        let mut released = Vec::new();
+        rx.release(u64::MAX, |r| released.push((r.request_id, r.kind)));
+        assert_eq!(
+            released,
+            (100..).map(RequestId).zip(kinds).collect::<Vec<_>>()
+        );
     }
 }

@@ -21,7 +21,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use melin_client::{Connection, SigningKey, key};
+use melin_client::{Connection, Error, RefusalKind, SigningKey, key};
 use melin_journal::{JournalEvent, JournalReader};
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
@@ -48,9 +48,13 @@ fn request(node: &mut Connection, kind: u8, fields: &[u8]) -> Vec<u8> {
         .expect("one response")
 }
 
-/// Send a request the server is expected to drop: no reply is read.
-fn send(node: &mut Connection, kind: u8, fields: &[u8]) {
-    node.send(&[&[kind][..], fields].concat()).expect("send");
+/// Send a request the server must refuse, its `kind` then its `fields`,
+/// and return the refusal's kind and reason.
+fn refused(node: &mut Connection, kind: u8, fields: &[u8]) -> (RefusalKind, String) {
+    match node.request(&[&[kind][..], fields].concat()) {
+        Err(Error::Refused { kind, reason }) => (kind, reason),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
 }
 
 /// The digest a client would submit for `document` — hashed client-side,
@@ -110,9 +114,7 @@ fn head_of(frame: &[u8]) -> (u64, [u8; HEAD_LEN]) {
 fn connect_authenticated(addr: SocketAddr, key: &SigningKey) -> Connection {
     let mut node = melin_test_node::connect(addr, key);
     // Generous: the suite shares the machine, and how fast a node answers
-    // under full-suite load is not what these tests check. A refused
-    // request still surfaces — as a 30 s `NoReply` rather than a 5 s one:
-    // the node's idle-connection heartbeats do not push the timeout back.
+    // under full-suite load is not what these tests check.
     node.set_read_timeout(Duration::from_secs(30))
         .expect("set timeout");
     node
@@ -328,10 +330,16 @@ fn a_malformed_leaf_is_refused_without_dropping_the_connection() {
     let (_tmp, server) = start_server();
     let mut stream = connect_authenticated(server.addr(), &submitter_key());
 
-    // Wrong digest width: the runtime drops the frame and logs at debug,
-    // leaving the connection usable — a malformed client request is not a
-    // server fault and must not cost the session.
-    send(&mut stream, KIND_NOTARIZE, &[0u8; LEAF_LEN - 1]);
+    // Wrong digest width: the runtime refuses it as malformed, with the
+    // decoder's reason, leaving the connection usable — a malformed client
+    // request is not a server fault and must not cost the session.
+    assert_eq!(
+        refused(&mut stream, KIND_NOTARIZE, &[0u8; LEAF_LEN - 1]),
+        (
+            RefusalKind::Malformed,
+            "leaf must be exactly 32 bytes".to_string()
+        )
+    );
 
     // The connection still serves the next request, and nothing was
     // committed.
@@ -350,11 +358,15 @@ fn an_auditor_key_can_audit_but_not_notarize() {
     let (_tmp, server) = start_server();
     let mut stream = connect_authenticated(server.addr(), &auditor_key());
 
-    // The submission is refused at the decoder: the runtime drops it
-    // without a response and keeps the connection, so the refusal is
-    // observable only as the chain not having moved. Had the gate let it
-    // through, the next frame read would be a receipt, not the head.
-    send(&mut stream, KIND_NOTARIZE, &digest(b"not mine to attest"));
+    // The submission is refused at the decoder as not permitted, with the
+    // decoder's reason, and the connection is kept.
+    assert_eq!(
+        refused(&mut stream, KIND_NOTARIZE, &digest(b"not mine to attest")),
+        (
+            RefusalKind::PermissionDenied,
+            "notarizing requires a writing role".to_string()
+        )
+    );
 
     let response = request(&mut stream, KIND_GET_HEAD, &[]);
     assert_eq!(
@@ -597,12 +609,10 @@ fn the_client_reports_an_unauthorized_key() {
 }
 
 /// A key the server knows but whose role may not write: the runtime
-/// drops the submission without a reply and keeps the connection, so the
-/// client has only silence to go on. It must turn that silence into an
-/// error that says where to look, not hang. Waits out the client's
-/// reply timeout — the one slow test in this file, by design.
+/// refuses the submission with the decoder's reason, and the client
+/// reports that reason, at once rather than after a timeout.
 #[test]
-fn the_client_explains_a_silently_dropped_request() {
+fn the_client_reports_the_refusals_reason() {
     let (tmp, server) = start_server();
     drop(connect_authenticated(server.addr(), &submitter_key()));
 
@@ -622,12 +632,12 @@ fn the_client_explains_a_silently_dropped_request() {
     ]);
     assert_eq!(code, 2, "{stderr}");
     assert!(
-        stderr.contains("no reply within") && stderr.contains("authorized_keys"),
+        stderr.contains("refused") && stderr.contains("notarizing requires a writing role"),
         "{stderr}"
     );
     assert!(
-        started.elapsed() >= Duration::from_secs(5),
-        "the client gave up before its reply timeout"
+        started.elapsed() < Duration::from_secs(5),
+        "the client waited out its reply timeout for an answer the node gives at once"
     );
     assert!(
         !tmp.path().join("audit-only.txt.receipt").exists(),

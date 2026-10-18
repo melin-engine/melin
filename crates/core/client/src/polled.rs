@@ -31,13 +31,14 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
-use melin_wire_protocol::control_codec::{CHALLENGE_RESPONSE_LEN, TAG_LEN};
+use melin_wire_protocol::control_codec::CHALLENGE_RESPONSE_LEN;
 
 use crate::framing::{PREFIX_LEN, RequestFrameError, request_payload_len, split_frame};
+use crate::outstanding::Outstanding;
 use crate::{
     Ack, Batch, Connection, DEFAULT_TIMEOUT, Error, Frame, Handshake, MAX_FRAME_SIZE,
-    MAX_HANDSHAKE_FRAME, MAX_REQUEST_BODY, REQUEST_HEADER_LEN, Reply, SigningKey, Step,
-    VerifyingKey, classify, frame_request,
+    MAX_HANDSHAKE_FRAME, MAX_REQUEST_BODY, REQUEST_HEADER_LEN, Reply, RequestId, SigningKey, Step,
+    VerifyingKey, classify, frame_request, reclassified,
 };
 
 // ---------------------------------------------------------------------------
@@ -347,20 +348,15 @@ const MAX_WIRE_FRAME: usize = PREFIX_LEN + MAX_FRAME_SIZE;
 /// its end always has room to complete after the buffer is compacted.
 const RECEIVE_BUFFER: usize = 16 * MAX_WIRE_FRAME;
 
-/// One frame found in the receive buffer, as positions rather than a
-/// borrow: [`PolledConnection::poll`] decides on a frame in a loop and
-/// borrows it back only to return it, which the borrow checker cannot
-/// follow for a borrow held across the loop.
+/// One frame found in the receive buffer, as the position of its payload,
+/// `rx[start..end]`, rather than a borrow: [`PolledConnection::poll`]
+/// decides on a frame in a loop and borrows it back only to return it,
+/// which the borrow checker cannot follow for a borrow held across the
+/// loop.
 #[derive(Clone, Copy, Debug)]
-enum Found {
-    /// An application response's body: `rx[start..end]`.
-    Response {
-        start: usize,
-        end: usize,
-    },
-    BatchEnd(Ack),
-    ServerBusy,
-    EngineError,
+struct Found {
+    start: usize,
+    end: usize,
 }
 
 /// The client side of one connection to a node, as protocol state with no
@@ -398,12 +394,18 @@ enum Found {
 ///   request, so a loop of its own gates on [`unsent`](Self::unsent) (or
 ///   on the stream's own room) before queueing more.
 ///
+/// Requests are numbered from 1 ([`send`](Self::send) returns each one's
+/// ID). Every final frame [`poll`](Self::poll) hands over names the
+/// request it answers, and is checked against those outstanding: an
+/// answer for none, or a busy or refusal inside another request's reply,
+/// is [`Error::Protocol`].
+///
 /// The read deadline runs while a reply is owed: during the handshake,
-/// and while a request sent has not had its batch end (or the node's
-/// refusal, which ends it without one). It starts with the
-/// request, or with the first poll that finds nothing after a frame, ends
-/// with the next frame that is not a heartbeat, and expires as
-/// [`Error::NoReply`]. A heartbeat does not push it back. A connection
+/// and while a request sent has not had its final frame (its batch end,
+/// or the node's busy or refusal, which end it without one). It starts
+/// with the request, or with the first poll that finds nothing after a
+/// frame, ends with the next frame that is not a heartbeat, and expires
+/// as [`Error::NoReply`]. A heartbeat does not push it back. A connection
 /// with nothing owed is never timed out, however long it is polled.
 ///
 /// After [`Error::FrameTooLarge`] the stream has no frame boundary left
@@ -443,10 +445,8 @@ pub struct PolledConnection {
     /// When the node's silence becomes [`Error::NoReply`], on the caller's
     /// clock; `None` while no wait is running.
     deadline_ns: Option<u64>,
-    /// Requests sent whose batch has not ended. `u64`: a count of
-    /// requests, never near overflow, and wide enough not to wrap if a
-    /// node stopped ending batches.
-    in_flight: u64,
+    /// The requests sent and not yet answered, and the next one's ID.
+    outstanding: Outstanding,
 }
 
 impl std::fmt::Debug for PolledConnection {
@@ -455,7 +455,7 @@ impl std::fmt::Debug for PolledConnection {
             .field("handshake", &self.handshake)
             .field("buffered", &(self.rx_tail - self.rx_head))
             .field("unsent", &self.unsent())
-            .field("in_flight", &self.in_flight)
+            .field("in_flight", &self.outstanding.len())
             .field("deadline_ns", &self.deadline_ns)
             .finish_non_exhaustive()
     }
@@ -492,7 +492,7 @@ impl PolledConnection {
             read_timeout,
             read_timeout_ns: duration_ns(read_timeout),
             deadline_ns: None,
-            in_flight: 0,
+            outstanding: Outstanding::default(),
         }
     }
 
@@ -571,20 +571,21 @@ impl PolledConnection {
         Ok(())
     }
 
-    /// Send one request, the application's bytes, as an application frame.
+    /// Send one request, the application's bytes, as a request frame, and
+    /// return the ID the connection gave it: the next in order, from 1.
     ///
     /// Framed where the stream lends room for it, or in the scratch buffer
     /// and copied through the stream's plain send when it does not (see the
     /// type's docs); whatever the stream does not take now is queued and
     /// goes out on later calls. `now_ns` starts the wait for its reply. A
     /// body that would take the frame over [`MAX_FRAME_SIZE`] is
-    /// [`Error::RequestTooLarge`], and nothing is queued.
+    /// [`Error::RequestTooLarge`], and nothing is queued (nor an ID taken).
     pub fn send<S: ByteStream>(
         &mut self,
         stream: &mut S,
         now_ns: u64,
         body: &[u8],
-    ) -> Result<(), Error> {
+    ) -> Result<RequestId, Error> {
         request_payload_len(body.len())?;
         self.send_with(stream, now_ns, body.len(), |out: &mut [u8]| {
             // `send_with` hands no less than `body.len()` bytes; checked
@@ -612,7 +613,8 @@ impl PolledConnection {
     /// wrap), and runs exactly once. [`MAX_REQUEST_BODY`] serves when the
     /// bound is not known, at the cost of the scratch buffer for any room
     /// shorter than the widest frame; a value over it is taken as it, the
-    /// widest body a frame carries. Nothing is queued on an error.
+    /// widest body a frame carries. Nothing is queued, and no ID taken, on
+    /// an error. Returns the request's ID, as [`send`](Self::send) does.
     ///
     /// The error type is the encoder's, as with [`frame_request`]; it takes
     /// this crate's [`Error`] too, for the stream's own failures, so
@@ -623,20 +625,20 @@ impl PolledConnection {
         now_ns: u64,
         max_body: usize,
         encode: F,
-    ) -> Result<(), E>
+    ) -> Result<RequestId, E>
     where
         S: ByteStream,
         E: From<RequestFrameError> + From<Error>,
         F: FnOnce(&mut [u8]) -> Result<usize, E>,
     {
         let needed = REQUEST_HEADER_LEN + max_body.min(MAX_REQUEST_BODY);
+        let id = self.outstanding.next_id();
         // Whatever is queued goes first: requests leave in order.
         self.flush(stream)?;
         let encode = if self.is_ready() && self.tx_head == self.tx.len() {
-            match frame_in_place(stream, needed, encode).map_err(Error::Io)? {
+            match frame_in_place(stream, needed, id, encode).map_err(Error::Io)? {
                 InPlace::Framed(Ok(written), queued) if queued == written => {
-                    self.request_sent(now_ns);
-                    return Ok(());
+                    return Ok(self.request_sent(now_ns));
                 }
                 InPlace::Framed(Ok(written), queued) => {
                     return Err(Error::Io(io::Error::other(format!(
@@ -652,10 +654,10 @@ impl PolledConnection {
         } else {
             encode
         };
-        self.frame_in_scratch(needed, encode)?;
-        self.request_sent(now_ns);
+        self.frame_in_scratch(needed, id, encode)?;
+        let id = self.request_sent(now_ns);
         self.flush(stream)?;
-        Ok(())
+        Ok(id)
     }
 
     /// The next frame from the node, heartbeats skipped, or `None` when
@@ -673,8 +675,9 @@ impl PolledConnection {
     /// - [`Error::NoReply`] once a reply is owed (see the type's docs) and
     ///   `now_ns` is past the deadline.
     /// - [`Error::AuthFailed`], [`Error::Protocol`] from the handshake.
-    /// - [`Error::Protocol`] for a frame no reply carries; the frame is
-    ///   consumed.
+    /// - [`Error::Protocol`] for a frame no reply carries, an answer for no
+    ///   outstanding request, or a busy or refusal inside another
+    ///   request's reply; the frame is consumed.
     /// - [`Error::FrameTooLarge`] for a length prefix over the limit, every
     ///   time from then on.
     /// - [`Error::Disconnected`] once the node has closed the connection
@@ -723,46 +726,29 @@ impl PolledConnection {
                 self.handshake_frame(stream, start, end)?;
                 continue;
             }
-            let found = match classify(&self.rx[start..end])? {
-                Reply::Heartbeat => continue,
-                Reply::Response(_) => Found::Response {
-                    start: start + TAG_LEN,
-                    end,
-                },
-                Reply::BatchEnd(ack) => {
-                    self.in_flight = self.in_flight.saturating_sub(1);
-                    Found::BatchEnd(ack)
-                }
-                // The node refuses a request with this frame alone, no
-                // batch end after it, and keeps the connection: the refused
-                // request is owed nothing more. An engine error is not the
-                // same: the batch end the node sends after it settles it.
-                Reply::ServerBusy => {
-                    self.in_flight = self.in_flight.saturating_sub(1);
-                    Found::ServerBusy
-                }
-                Reply::EngineError => Found::EngineError,
-            };
+            // Each final frame settles the request it names, which ends
+            // its wait however it was answered: a busy or a refusal is
+            // the request's only frame, and the node keeps the connection.
+            let reply = classify(&self.rx[start..end])?;
+            self.outstanding.observe(&reply)?;
+            if matches!(reply, Reply::Heartbeat) {
+                continue;
+            }
             // An answer: the wait is over.
             self.deadline_ns = None;
-            return Ok(Some(found));
+            return Ok(Some(Found { start, end }));
         }
     }
 
     /// The frame `found` describes, borrowed back from the receive buffer.
     fn frame(&self, found: Found) -> Frame<'_> {
-        match found {
-            Found::Response { start, end } => Frame::Response(&self.rx[start..end]),
-            Found::BatchEnd(ack) => Frame::BatchEnd(ack),
-            Found::ServerBusy => Frame::ServerBusy,
-            Found::EngineError => Frame::EngineError,
-        }
+        reclassified(&self.rx[found.start..found.end])
     }
 
     /// A poll that found no frame: start the wait if a reply is owed and
     /// none is running, or report the silence if it has run out.
     fn nothing_yet(&mut self, now_ns: u64, waiting: bool) -> Result<(), Error> {
-        if !(waiting || self.in_flight > 0 || !self.handshake.is_done()) {
+        if !(waiting || !self.outstanding.is_empty() || !self.handshake.is_done()) {
             return Ok(());
         }
         match self.deadline_ns {
@@ -798,21 +784,22 @@ impl PolledConnection {
         self.flush(stream)
     }
 
-    /// A request is queued: count it owed, and start the wait for its reply
-    /// if none is running.
-    fn request_sent(&mut self, now_ns: u64) {
-        self.in_flight = self.in_flight.saturating_add(1);
+    /// A request is queued under the next ID: count it owed, start the
+    /// wait for its reply if none is running, and return its ID.
+    fn request_sent(&mut self, now_ns: u64) -> RequestId {
+        let id = self.outstanding.sent();
         if self.deadline_ns.is_none() {
             self.deadline_ns = Some(now_ns.saturating_add(self.read_timeout_ns));
         }
+        id
     }
 
-    /// Frame a request at the end of the scratch buffer, behind anything
-    /// still queued there, in `needed` bytes of room: the header and the
-    /// widest body the encoder was promised, not the widest frame, so the
-    /// kernel path (every request of which goes through here) zeroes only
-    /// what the request can take.
-    fn frame_in_scratch<E, F>(&mut self, needed: usize, encode: F) -> Result<(), E>
+    /// Frame request `id` at the end of the scratch buffer, behind
+    /// anything still queued there, in `needed` bytes of room: the header
+    /// and the widest body the encoder was promised, not the widest frame,
+    /// so the kernel path (every request of which goes through here)
+    /// zeroes only what the request can take.
+    fn frame_in_scratch<E, F>(&mut self, needed: usize, id: RequestId, encode: F) -> Result<(), E>
     where
         E: From<RequestFrameError>,
         F: FnOnce(&mut [u8]) -> Result<usize, E>,
@@ -825,7 +812,7 @@ impl PolledConnection {
         }
         let start = self.tx.len();
         self.tx.resize(start + needed, 0);
-        match frame_request(&mut self.tx[start..], encode) {
+        match frame_request(&mut self.tx[start..], id, encode) {
             Ok(written) => {
                 self.tx.truncate(start + written);
                 Ok(())
@@ -889,10 +876,15 @@ enum EncoderSlot<E, F> {
     Framed(Result<usize, E>),
 }
 
-/// Frame a request through `stream`'s in-place send, when the region it
+/// Frame request `id` through `stream`'s in-place send, when the region it
 /// lends holds `needed` bytes. Never frames into a shorter region, so the
 /// encoder sees the room it was promised and runs at most once.
-fn frame_in_place<S, E, F>(stream: &mut S, needed: usize, encode: F) -> io::Result<InPlace<E, F>>
+fn frame_in_place<S, E, F>(
+    stream: &mut S,
+    needed: usize,
+    id: RequestId,
+    encode: F,
+) -> io::Result<InPlace<E, F>>
 where
     S: ByteStream,
     E: From<RequestFrameError>,
@@ -910,7 +902,7 @@ where
         else {
             return 0;
         };
-        let outcome = frame_request(region, encode);
+        let outcome = frame_request(region, id, encode);
         // Nothing is written on an error, which is returned as it is.
         let written = match &outcome {
             Ok(written) => *written,
@@ -1139,31 +1131,35 @@ impl<S: ByteStream> StreamConnection<S> {
         (self.stream, self.connection)
     }
 
-    /// Send one request, the application's bytes, as an application frame,
-    /// and spin until the stream has taken it: [`Connection::send`],
+    /// Send one request, the application's bytes, as a request frame, and
+    /// spin until the stream has taken it: [`Connection::send`],
     /// polled. A stream that has not taken the whole request within the
     /// read timeout (a node that has stopped reading, or one taking a few
     /// bytes at a time for longer than that) is [`Error::Io`] with
     /// [`io::ErrorKind::TimedOut`]. A body over the frame limit is
-    /// [`Error::RequestTooLarge`], and nothing is sent.
-    pub fn send(&mut self, body: &[u8]) -> Result<(), Error> {
+    /// [`Error::RequestTooLarge`], and nothing is sent. Returns the
+    /// request's ID.
+    pub fn send(&mut self, body: &[u8]) -> Result<RequestId, Error> {
         let now_ns = self.clock.refresh();
-        self.connection.send(&mut self.stream, now_ns, body)?;
-        self.drain(now_ns)
+        let id = self.connection.send(&mut self.stream, now_ns, body)?;
+        self.drain(now_ns)?;
+        Ok(id)
     }
 
     /// Send one request whose body `encode` writes, as
     /// [`PolledConnection::send_with`], and spin until the stream has taken
-    /// it, as [`send`](Self::send).
-    pub fn send_with<E, F>(&mut self, max_body: usize, encode: F) -> Result<(), E>
+    /// it, as [`send`](Self::send). Returns the request's ID.
+    pub fn send_with<E, F>(&mut self, max_body: usize, encode: F) -> Result<RequestId, E>
     where
         E: From<RequestFrameError> + From<Error>,
         F: FnOnce(&mut [u8]) -> Result<usize, E>,
     {
         let now_ns = self.clock.refresh();
-        self.connection
+        let id = self
+            .connection
             .send_with(&mut self.stream, now_ns, max_body, encode)?;
-        Ok(self.drain(now_ns)?)
+        self.drain(now_ns)?;
+        Ok(id)
     }
 
     /// Service the stream until it has taken everything queued, bounded by
@@ -1219,10 +1215,10 @@ impl<S: ByteStream> StreamConnection<S> {
 
     /// Send one request and collect the application frames of its reply
     /// batch, in order, with what backs them:
-    /// [`Connection::request_batch`], polled.
+    /// [`Connection::request_batch`], polled, with its errors.
     pub fn request_batch(&mut self, body: &[u8]) -> Result<Batch, Error> {
-        self.send(body)?;
-        collect_batch(self)
+        let id = self.send(body)?;
+        collect_batch(self, id)
     }
 
     /// [`request_batch`](Self::request_batch) for a caller that takes only
@@ -1239,17 +1235,45 @@ impl<S: ByteStream> StreamConnection<S> {
     }
 }
 
-/// The frames of one reply batch, with what backs them, read through
-/// `session`'s next-frame call: [`Connection::request_batch`]'s loop, for
-/// any session.
-pub(crate) fn collect_batch(session: &mut (impl Session + ?Sized)) -> Result<Batch, Error> {
+/// The frames of request `sent`'s reply batch, with what backs them, read
+/// through `session`'s next-frame call: [`Connection::request_batch`]'s
+/// loop, for any session, and the one place a batch is collected. Assumes
+/// nothing else is in flight: a final frame for another request is
+/// [`Error::Protocol`] rather than a reply taken for this one. A busy or a
+/// refusal is its error, the connection left usable.
+pub(crate) fn collect_batch(
+    session: &mut (impl Session + ?Sized),
+    sent: RequestId,
+) -> Result<Batch, Error> {
+    let mine = |answered: RequestId| {
+        if answered == sent {
+            Ok(())
+        } else {
+            Err(Error::Protocol(format!(
+                "an answer for request {} while waiting on request {}",
+                answered.0, sent.0
+            )))
+        }
+    };
     let mut frames = Vec::new();
     loop {
         match session.next_frame()? {
             Frame::Response(bytes) => frames.push(bytes.to_vec()),
-            Frame::BatchEnd(ack) => return Ok(Batch { frames, ack }),
-            Frame::ServerBusy => return Err(Error::ServerBusy),
-            Frame::EngineError => return Err(Error::EngineError),
+            Frame::BatchEnd { id, ack } => {
+                mine(id)?;
+                return Ok(Batch { frames, ack });
+            }
+            Frame::ServerBusy { id } => {
+                mine(id)?;
+                return Err(Error::ServerBusy);
+            }
+            Frame::Refused { id, kind, reason } => {
+                mine(id)?;
+                return Err(Error::Refused {
+                    kind,
+                    reason: reason.to_string(),
+                });
+            }
         }
     }
 }
@@ -1287,18 +1311,20 @@ pub(crate) fn one_frame(mut frames: Vec<Vec<u8>>) -> Result<Vec<u8>, Error> {
 /// [`Connection::send`], [`Connection::next_frame`],
 /// [`Connection::request_batch`] and [`Connection::request`].
 pub trait Session {
-    /// Send one request, the application's bytes, as an application frame.
-    fn send(&mut self, body: &[u8]) -> Result<(), Error>;
+    /// Send one request, the application's bytes, as a request frame, and
+    /// return the ID the connection gave it.
+    fn send(&mut self, body: &[u8]) -> Result<RequestId, Error>;
 
     /// The next frame from the node, heartbeats skipped, waiting up to the
     /// read timeout.
     fn next_frame(&mut self) -> Result<Frame<'_>, Error>;
 
     /// Send one request and collect the application frames of its reply
-    /// batch, in order, with what backs them.
+    /// batch, in order, with what backs them. Assumes nothing else is in
+    /// flight: an answer for another request is [`Error::Protocol`].
     fn request_batch(&mut self, body: &[u8]) -> Result<Batch, Error> {
-        self.send(body)?;
-        collect_batch(self)
+        let id = self.send(body)?;
+        collect_batch(self, id)
     }
 
     /// [`request_batch`](Self::request_batch) for a caller that takes only
@@ -1316,7 +1342,7 @@ pub trait Session {
 }
 
 impl Session for Connection {
-    fn send(&mut self, body: &[u8]) -> Result<(), Error> {
+    fn send(&mut self, body: &[u8]) -> Result<RequestId, Error> {
         Connection::send(self, body)
     }
 
@@ -1338,7 +1364,7 @@ impl Session for Connection {
 }
 
 impl<S: ByteStream> Session for StreamConnection<S> {
-    fn send(&mut self, body: &[u8]) -> Result<(), Error> {
+    fn send(&mut self, body: &[u8]) -> Result<RequestId, Error> {
         StreamConnection::send(self, body)
     }
 
@@ -1373,8 +1399,19 @@ mod tests {
     };
 
     use super::*;
-    use crate::key;
-    use crate::tests::{Behaviour, app_frame, client_key, control, fake_node, tagged_frame};
+    use crate::tests::{
+        Behaviour, REASON, app_frame, assert_judged_by_the_convenience_calls, batch_end,
+        client_key, control, fake_node, request_frame, tagged_frame,
+    };
+    use crate::{RefusalKind, key};
+
+    /// The end of request `id`'s batch, as a connection hands it over.
+    fn ended(id: u64) -> Frame<'static> {
+        Frame::BatchEnd {
+            id: RequestId(id),
+            ack: Ack::Policy,
+        }
+    }
 
     type Polled = StreamConnection<NonBlockingTcp>;
 
@@ -1393,16 +1430,17 @@ mod tests {
 
         assert_eq!(node.request_one(b"hello").unwrap(), b"hello");
 
-        // The same over the pipelined pair, several requests in flight.
+        // The same over the pipelined pair, several requests in flight,
+        // numbered on from the first.
         for n in 2..=4u64 {
-            node.send(&n.to_le_bytes()).unwrap();
+            assert_eq!(node.send(&n.to_le_bytes()).unwrap(), RequestId(n));
         }
         for n in 2..=4u64 {
             assert_eq!(
                 node.next_frame().unwrap(),
                 Frame::Response(&n.to_le_bytes())
             );
-            assert_eq!(node.next_frame().unwrap(), Frame::BatchEnd(Ack::Policy));
+            assert_eq!(node.next_frame().unwrap(), ended(n));
         }
 
         let batch = node.request_batch(b"backed").unwrap();
@@ -1417,11 +1455,14 @@ mod tests {
         let addr = fake_node(key.verifying_key(), Behaviour::DegradedEcho);
         let mut node = Polled::connect(addr, &key).unwrap();
 
-        node.send(b"held").unwrap();
+        let id = node.send(b"held").unwrap();
         assert_eq!(node.next_frame().unwrap(), Frame::Response(b"held"));
         assert_eq!(
             node.next_frame().unwrap(),
-            Frame::BatchEnd(Ack::PrimaryOnly)
+            Frame::BatchEnd {
+                id,
+                ack: Ack::PrimaryOnly
+            }
         );
 
         let batch = node.request_batch(b"held").unwrap();
@@ -1502,7 +1543,7 @@ mod tests {
         let err = node.request(b"dropped").unwrap_err();
         assert!(started.elapsed() >= timeout);
         assert!(matches!(err, Error::NoReply { timeout: t } if t == timeout));
-        assert!(err.to_string().contains("authorized_keys"), "{err}");
+        assert!(err.to_string().contains("stopped answering"), "{err}");
     }
 
     #[test]
@@ -1530,12 +1571,15 @@ mod tests {
         let addr = fake_node(key.verifying_key(), Behaviour::Echo);
         let mut node = Polled::connect(addr, &key).unwrap();
 
-        let body = vec![0xAB; MAX_FRAME_SIZE];
+        let body = vec![0xAB; MAX_REQUEST_BODY + 1];
         let err = node.send(&body).unwrap_err();
         assert!(matches!(err, Error::RequestTooLarge { len } if len == MAX_FRAME_SIZE + 1));
         assert_eq!(node.connection().unsent(), 0);
 
-        assert_eq!(node.request_one(b"still here").unwrap(), b"still here");
+        // No ID was taken by the request that was not sent.
+        assert_eq!(node.send(b"still here").unwrap(), RequestId(1));
+        assert_eq!(node.next_frame().unwrap(), Frame::Response(b"still here"));
+        assert_eq!(node.next_frame().unwrap(), ended(1));
         assert_eq!(node.request_one(&body[1..]).unwrap(), &body[1..]);
     }
 
@@ -1563,20 +1607,75 @@ mod tests {
     }
 
     #[test]
-    fn busy_and_engine_error_are_frames_when_pipelining_and_errors_from_request() {
+    fn busy_and_refused_are_frames_when_pipelining_and_errors_from_request() {
         let key = client_key();
-
-        let addr = fake_node(key.verifying_key(), Behaviour::Busy);
+        let addr = fake_node(key.verifying_key(), Behaviour::Judging);
         let mut node = Polled::connect(addr, &key).unwrap();
-        node.send(b"").unwrap();
-        assert_eq!(node.next_frame().unwrap(), Frame::ServerBusy);
-        assert!(matches!(node.request(b""), Err(Error::ServerBusy)));
 
-        let addr = fake_node(key.verifying_key(), Behaviour::Failing);
+        let shed = node.send(crate::tests::SHED).unwrap();
+        let refused = node.send(crate::tests::REFUSE).unwrap();
+        assert_eq!(node.next_frame().unwrap(), Frame::ServerBusy { id: shed });
+        assert_eq!(
+            node.next_frame().unwrap(),
+            Frame::Refused {
+                id: refused,
+                kind: RefusalKind::PermissionDenied,
+                reason: REASON
+            }
+        );
+        // On the wrapper, and through the session trait's default methods,
+        // which any other session inherits.
+        assert_judged_by_the_convenience_calls(&mut node);
+    }
+
+    /// Twin of `an_answer_for_another_request_is_refused`.
+    #[test]
+    fn an_answer_for_another_request_is_refused() {
+        let key = client_key();
+        let addr = fake_node(key.verifying_key(), Behaviour::WrongId);
         let mut node = Polled::connect(addr, &key).unwrap();
-        node.send(b"").unwrap();
-        assert_eq!(node.next_frame().unwrap(), Frame::EngineError);
-        assert!(matches!(node.request(b""), Err(Error::EngineError)));
+        let err = node.request(b"mine").unwrap_err();
+        assert!(err.to_string().contains("not outstanding"), "{err}");
+    }
+
+    /// Twin of `a_convenience_call_does_not_take_another_requests_answer`.
+    #[test]
+    fn a_convenience_call_does_not_take_another_requests_answer() {
+        let key = client_key();
+        let addr = fake_node(key.verifying_key(), Behaviour::Echo);
+        let mut node = Polled::connect(addr, &key).unwrap();
+        node.send(b"earlier").unwrap();
+        let err = node.request_one(b"mine").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("an answer for request 1 while waiting on request 2"),
+            "{err}"
+        );
+    }
+
+    /// The session trait's own default `request_batch`, which a session
+    /// implemented outside this crate inherits, pairs by ID too.
+    #[test]
+    fn the_session_traits_default_request_pairs_by_id() {
+        /// A session that implements only what the trait requires.
+        struct Bare(Connection);
+        impl Session for Bare {
+            fn send(&mut self, body: &[u8]) -> Result<RequestId, Error> {
+                self.0.send(body)
+            }
+            fn next_frame(&mut self) -> Result<Frame<'_>, Error> {
+                self.0.next_frame()
+            }
+        }
+        let key = client_key();
+        let addr = fake_node(key.verifying_key(), Behaviour::Judging);
+        let mut bare = Bare(Connection::connect(addr, &key).unwrap());
+        assert_judged_by_the_convenience_calls(&mut bare);
+
+        let addr = fake_node(key.verifying_key(), Behaviour::Echo);
+        let mut bare = Bare(Connection::connect(addr, &key).unwrap());
+        assert_eq!(bare.send(b"earlier").unwrap(), RequestId(1));
+        assert!(matches!(bare.request(b"mine"), Err(Error::Protocol(_))));
     }
 
     #[test]
@@ -1668,15 +1767,25 @@ mod tests {
         let key = client_key();
         let addr = fake_node(key.verifying_key(), Behaviour::Echo);
         let mut node = Polled::connect(addr, &key).unwrap();
-        node.send_with(MAX_REQUEST_BODY, |out: &mut [u8]| {
-            // The widest body was promised: the encoder may index freely.
-            assert!(out.len() >= MAX_REQUEST_BODY);
-            out[..7].copy_from_slice(b"by hand");
-            Ok::<_, Error>(7)
-        })
-        .unwrap();
+        let id = node
+            .send_with(MAX_REQUEST_BODY, |out: &mut [u8]| {
+                // The widest body was promised: the encoder may index freely.
+                assert!(out.len() >= MAX_REQUEST_BODY);
+                out[..7].copy_from_slice(b"by hand");
+                Ok::<_, Error>(7)
+            })
+            .unwrap();
+        assert_eq!(id, RequestId(1));
         assert_eq!(node.next_frame().unwrap(), Frame::Response(b"by hand"));
-        assert_eq!(node.next_frame().unwrap(), Frame::BatchEnd(Ack::Policy));
+        assert_eq!(node.next_frame().unwrap(), ended(1));
+        // And a failing encoder takes no ID.
+        assert!(
+            node.send_with(8, |_: &mut [u8]| Err::<usize, _>(Error::Protocol(
+                "no".into()
+            )))
+            .is_err()
+        );
+        assert_eq!(node.send(b"next").unwrap(), RequestId(2));
     }
 
     /// Twin of `into_stream_hands_over_an_authenticated_socket`.
@@ -1710,7 +1819,7 @@ mod tests {
         // And a request on it still gets its reply, through the polled form.
         node.send(b"late").unwrap();
         let mut got = Vec::new();
-        let end = format!("{:?}", Frame::BatchEnd(Ack::Policy));
+        let end = format!("{:?}", ended(1));
         while !got.contains(&end) {
             match node.poll().unwrap() {
                 Some(Frame::Response(body)) => got.push(String::from_utf8(body.to_vec()).unwrap()),
@@ -1752,7 +1861,11 @@ mod tests {
                 }
                 match connection.poll(stream, now()).unwrap() {
                     Some(Frame::Response(body)) => replies[i].push(body.to_vec()),
-                    Some(Frame::BatchEnd(Ack::Policy)) => ended[i] = true,
+                    // Each connection numbers its own requests from 1.
+                    Some(Frame::BatchEnd {
+                        id: RequestId(1),
+                        ack: Ack::Policy,
+                    }) => ended[i] = true,
                     Some(other) => panic!("unexpected {other:?}"),
                     None => {}
                 }
@@ -1768,14 +1881,19 @@ mod tests {
     #[test]
     fn a_session_loop_runs_over_either_connection() {
         fn round_trip(session: &mut dyn Session, body: &[u8]) -> Vec<u8> {
-            session.send(body).unwrap();
+            // The first request on every surface is ID 1.
+            assert_eq!(session.send(body).unwrap(), RequestId(1));
             let Frame::Response(reply) = session.next_frame().unwrap() else {
                 panic!("expected a response");
             };
             let reply = reply.to_vec();
-            assert_eq!(session.next_frame().unwrap(), Frame::BatchEnd(Ack::Policy));
+            assert_eq!(session.next_frame().unwrap(), ended(1));
             assert_eq!(session.request(body).unwrap(), std::slice::from_ref(&reply));
             assert_eq!(session.request_one(body).unwrap(), reply);
+            // Two IDs went to the convenience calls.
+            assert_eq!(session.send(body).unwrap(), RequestId(4));
+            assert!(matches!(session.next_frame().unwrap(), Frame::Response(_)));
+            assert_eq!(session.next_frame().unwrap(), ended(4));
             reply
         }
         let key = client_key();
@@ -1838,10 +1956,10 @@ mod tests {
             node_handshake(),
             control(TransportResponse::Heartbeat),
             app_frame(b"body"),
-            control(TransportResponse::BatchEnd),
+            batch_end(1),
         ]
         .concat();
-        let request = app_frame(b"early");
+        let request = request_frame(1, b"early");
         // Both ways in: through the stream, and fed directly.
         for fed in [false, true] {
             for split in 0..=wire.len() {
@@ -1859,7 +1977,7 @@ mod tests {
                 }
                 assert_eq!(
                     got,
-                    ["Response(body)", "BatchEnd(Policy)"],
+                    ["Response(body)".to_string(), format!("{:?}", ended(1))],
                     "split at {split}"
                 );
                 // The challenge response, then the request: the request was
@@ -1890,7 +2008,7 @@ mod tests {
         // The ready: now the request.
         stream.push_received(&control(TransportResponse::ServerReady));
         assert!(connection.poll(&mut stream, 0).unwrap().is_none());
-        assert_eq!(stream.sent(), app_frame(b"early").as_slice());
+        assert_eq!(stream.sent(), request_frame(1, b"early").as_slice());
     }
 
     #[test]
@@ -1917,7 +2035,7 @@ mod tests {
         stream.set_send_capacity(Some(0));
         connection.send(&mut stream, 0, b"hello").unwrap();
         connection.send(&mut stream, 0, b"world").unwrap();
-        let both = [app_frame(b"hello"), app_frame(b"world")].concat();
+        let both = [request_frame(1, b"hello"), request_frame(2, b"world")].concat();
         assert!(stream.sent().is_empty());
         assert_eq!(connection.unsent(), both.len());
         // A poll tries again, and the stream still takes nothing.
@@ -1936,7 +2054,7 @@ mod tests {
         connection.flush(&mut stream).unwrap();
         assert_eq!(
             stream.sent(),
-            [both.as_slice(), app_frame(b"third").as_slice()].concat()
+            [both.as_slice(), request_frame(3, b"third").as_slice()].concat()
         );
         assert_eq!(connection.unsent(), 0);
     }
@@ -2058,7 +2176,7 @@ mod tests {
     fn a_request_that_meets_the_rings_wrap_goes_through_the_scratch_buffer() {
         let (mut connection, mut ring) = ready_on_a_ring();
 
-        // 40-byte bodies make 45-byte frames: two fit the 128-byte ring's
+        // 40-byte bodies make 53-byte frames: two fit the 128-byte ring's
         // contiguous room in turn, framed where the ring sends them from.
         let body = |n: u8| [n; 40];
         let mut wire = Vec::new();
@@ -2069,7 +2187,7 @@ mod tests {
         assert_eq!((ring.in_place, ring.plain), (2, 0));
         assert_eq!(connection.unsent(), 0);
 
-        // The ring's tail is now 38 bytes from its end: the third frame
+        // The ring's tail is now 22 bytes from its end: the third frame
         // does not fit there, so it is framed in the scratch buffer and
         // copied through the plain send, round the wrap.
         connection.send(&mut ring, 0, &body(2)).unwrap();
@@ -2082,7 +2200,9 @@ mod tests {
         assert_eq!((ring.in_place, ring.plain), (3, 1));
         wire.extend(ring.transmit());
 
-        let expected: Vec<u8> = (0..4).flat_map(|n| app_frame(&body(n))).collect();
+        let expected: Vec<u8> = (0..4)
+            .flat_map(|n| request_frame(u64::from(n) + 1, &body(n)))
+            .collect();
         assert_eq!(wire, expected);
     }
 
@@ -2125,7 +2245,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!((ring.in_place, ring.plain), (0, 1));
-        assert_eq!(ring.transmit(), app_frame(b"abc"));
+        assert_eq!(ring.transmit(), request_frame(1, b"abc"));
 
         // A bound that the room holds: framed in place.
         connection
@@ -2136,7 +2256,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!((ring.in_place, ring.plain), (1, 1));
-        assert_eq!(ring.transmit(), app_frame(b"def"));
+        assert_eq!(ring.transmit(), request_frame(2, b"def"));
     }
 
     #[test]
@@ -2175,10 +2295,10 @@ mod tests {
         // Still owed its batch end: a fresh wait, from the next empty poll.
         assert!(connection.poll(&mut stream, 2 * t).unwrap().is_none());
         assert!(connection.poll(&mut stream, 3 * t - 1).unwrap().is_none());
-        stream.push_received(&control(TransportResponse::BatchEnd));
+        stream.push_received(&batch_end(1));
         assert_eq!(
             connection.poll(&mut stream, 3 * t - 1).unwrap(),
-            Some(Frame::BatchEnd(Ack::Policy))
+            Some(ended(1))
         );
         assert!(connection.poll(&mut stream, 100 * t).unwrap().is_none());
 
@@ -2225,42 +2345,138 @@ mod tests {
     fn a_refused_request_is_owed_nothing_more() {
         let timeout = Duration::from_millis(10);
         let t = timeout.as_nanos() as u64;
-        let (mut connection, mut stream) = ready(timeout);
-        connection.send(&mut stream, 0, b"refused").unwrap();
-        // The node refuses it with a busy frame alone, no batch end.
-        stream.push_received(&tagged_frame(TAG_SERVER_BUSY, b""));
-        assert_eq!(
-            connection.poll(&mut stream, 0).unwrap(),
-            Some(Frame::ServerBusy)
-        );
-        // Idle well past the read timeout: nothing is owed, so nothing
-        // times out.
-        for now in [t, 2 * t, 10 * t] {
-            assert!(connection.poll(&mut stream, now).unwrap().is_none());
-        }
+        // A busy and a refusal each settle their request alone, with no
+        // batch end after them.
+        for answer in [
+            control(TransportResponse::ServerBusy { id: RequestId(1) }),
+            control(TransportResponse::Refused {
+                id: RequestId(1),
+                kind: RefusalKind::Malformed,
+                reason: "no",
+            }),
+        ] {
+            let (mut connection, mut stream) = ready(timeout);
+            connection.send(&mut stream, 0, b"refused").unwrap();
+            stream.push_received(&answer);
+            assert!(matches!(
+                connection.poll(&mut stream, 0).unwrap(),
+                Some(
+                    Frame::ServerBusy { id: RequestId(1) }
+                        | Frame::Refused {
+                            id: RequestId(1),
+                            ..
+                        }
+                )
+            ));
+            // Idle well past the read timeout: nothing is owed, so nothing
+            // times out.
+            for now in [t, 2 * t, 10 * t] {
+                assert!(connection.poll(&mut stream, now).unwrap().is_none());
+            }
 
-        // An engine error is still owed its batch end.
-        connection.send(&mut stream, 10 * t, b"failing").unwrap();
-        stream.push_received(&control(TransportResponse::EngineError));
-        assert_eq!(
-            connection.poll(&mut stream, 10 * t).unwrap(),
-            Some(Frame::EngineError)
+            // A request answered only with a response is still owed its
+            // batch end.
+            connection.send(&mut stream, 10 * t, b"partial").unwrap();
+            stream.push_received(&app_frame(b"partial"));
+            assert_eq!(
+                connection.poll(&mut stream, 10 * t).unwrap(),
+                Some(Frame::Response(b"partial"))
+            );
+            assert!(connection.poll(&mut stream, 10 * t).unwrap().is_none());
+            assert!(matches!(
+                connection.poll(&mut stream, 12 * t),
+                Err(Error::NoReply { .. })
+            ));
+        }
+    }
+
+    /// An early answer — a busy, a refusal, or a batch end that overtakes
+    /// earlier requests — settles the request it names and leaves the
+    /// others owed, so the deadline keeps running for them; and a busy or
+    /// refusal inside another request's reply is a protocol error, where a
+    /// heartbeat there is not.
+    #[test]
+    fn an_early_answer_settles_its_own_request_and_keeps_the_rest_owed() {
+        let timeout = Duration::from_millis(10);
+        let t = duration_ns(timeout);
+        let (mut connection, mut stream) = ready(timeout);
+        for n in 1..=3 {
+            assert_eq!(connection.send(&mut stream, 0, b"x").unwrap(), RequestId(n));
+        }
+        stream.push_received(
+            &[
+                control(TransportResponse::ServerBusy { id: RequestId(3) }),
+                control(TransportResponse::Refused {
+                    id: RequestId(2),
+                    kind: RefusalKind::PermissionDenied,
+                    reason: REASON,
+                }),
+            ]
+            .concat(),
         );
-        assert!(connection.poll(&mut stream, 10 * t).unwrap().is_none());
+        assert_eq!(
+            drain_frames(&mut connection, &mut stream, 0),
+            [
+                format!("{:?}", Frame::ServerBusy { id: RequestId(3) }),
+                format!(
+                    "{:?}",
+                    Frame::Refused {
+                        id: RequestId(2),
+                        kind: RefusalKind::PermissionDenied,
+                        reason: REASON
+                    }
+                ),
+            ]
+        );
+        // Request 1 is still owed: the wait runs out.
         assert!(matches!(
-            connection.poll(&mut stream, 12 * t),
+            connection.poll(&mut stream, 2 * t),
             Err(Error::NoReply { .. })
         ));
+
+        // A refusal inside request 1's reply.
+        let (mut connection, mut stream) = ready(DEFAULT_TIMEOUT);
+        connection.send(&mut stream, 0, b"x").unwrap();
+        connection.send(&mut stream, 0, b"y").unwrap();
+        stream.push_received(
+            &[
+                app_frame(b"part"),
+                control(TransportResponse::Heartbeat),
+                control(TransportResponse::Refused {
+                    id: RequestId(2),
+                    kind: RefusalKind::Malformed,
+                    reason: "no",
+                }),
+            ]
+            .concat(),
+        );
+        assert_eq!(
+            connection.poll(&mut stream, 0).unwrap(),
+            Some(Frame::Response(b"part"))
+        );
+        let err = connection.poll(&mut stream, 0).unwrap_err();
+        assert!(
+            err.to_string().contains("inside another request's reply"),
+            "{err}"
+        );
+
+        // An answer for an ID never sent.
+        let (mut connection, mut stream) = ready(DEFAULT_TIMEOUT);
+        connection.send(&mut stream, 0, b"x").unwrap();
+        stream.push_received(&batch_end(7));
+        let err = connection.poll(&mut stream, 0).unwrap_err();
+        assert!(err.to_string().contains("not outstanding"), "{err}");
     }
 
     #[test]
     fn a_close_is_reported_after_the_frames_before_it() {
         let (mut connection, mut stream) = ready(DEFAULT_TIMEOUT);
-        stream.push_received(&[app_frame(b"last"), control(TransportResponse::BatchEnd)].concat());
+        connection.send(&mut stream, 0, b"last").unwrap();
+        stream.push_received(&[app_frame(b"last"), batch_end(1)].concat());
         stream.close();
         assert_eq!(
             drain_frames_until_err(&mut connection, &mut stream),
-            ["Response(last)", "BatchEnd(Policy)"]
+            ["Response(last)".to_string(), format!("{:?}", ended(1))]
         );
         assert!(matches!(
             connection.poll(&mut stream, 0),
@@ -2289,26 +2505,19 @@ mod tests {
     #[test]
     fn a_frame_no_reply_carries_is_consumed_with_its_error() {
         let (mut connection, mut stream) = ready(DEFAULT_TIMEOUT);
-        stream.push_received(
-            &[
-                tagged_frame(0x00, b"zeroed"),
-                control(TransportResponse::BatchEnd),
-            ]
-            .concat(),
-        );
+        connection.send(&mut stream, 0, b"x").unwrap();
+        stream.push_received(&[tagged_frame(0x00, b"zeroed"), batch_end(1)].concat());
         assert!(matches!(
             connection.poll(&mut stream, 0),
             Err(Error::Protocol(_))
         ));
-        assert_eq!(
-            connection.poll(&mut stream, 0).unwrap(),
-            Some(Frame::BatchEnd(Ack::Policy))
-        );
+        assert_eq!(connection.poll(&mut stream, 0).unwrap(), Some(ended(1)));
     }
 
     #[test]
     fn fed_bytes_beyond_the_buffer_grow_it() {
         let (mut connection, mut stream) = ready(DEFAULT_TIMEOUT);
+        connection.send(&mut stream, 0, b"x").unwrap();
         // More replies in one completion than the receive buffer holds.
         let one = app_frame(&[0x42; 1000]);
         let count = RECEIVE_BUFFER / one.len() + 4;

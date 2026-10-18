@@ -12,17 +12,19 @@
 //! concrete wire enum.
 //!
 //! The frame around the request is not the application's. Every client
-//! frame is `[length: u32 LE][tag: u8][body]`, and the tag is the
-//! protocol's: the runtime reads it, handles or drops the protocol's own
-//! frames, and hands the decoder the body of an application frame alone.
-//! The body's layout is the application's from its first byte, with no
-//! value reserved.
+//! request is `[length: u32 LE][tag: u8][request ID: u64 LE][body]`, and
+//! the tag and the ID are the protocol's: the runtime reads them, closes
+//! a connection that sends anything but a request, and hands the decoder
+//! the body alone. The body's layout is the application's from its first
+//! byte, with no value reserved.
 //!
 //! The runtime calls
 //! [`RequestDecoder::decode`](crate::decoder::RequestDecoder::decode) once
-//! per such frame; the [`Decoded`](crate::decoder::Decoded) return value
-//! encodes exactly the four outcomes the runtime acts on (drop, publish,
-//! reject with reason, log decode error).
+//! per request; the [`Decoded`](crate::decoder::Decoded) return value
+//! encodes exactly the four outcomes the runtime acts on (answer with an
+//! empty batch, publish, refuse as not permitted, refuse as malformed).
+//! Every request is answered: the client is told which of its requests
+//! each answer is for.
 
 use tracing::error;
 
@@ -56,24 +58,26 @@ pub trait RequestDecoder: Send + Sync {
 /// Outcome of a single [`RequestDecoder::decode`] call. The runtime
 /// branches on this and never needs to know the underlying wire enum.
 pub enum Decoded<E: AppEvent> {
-    /// Drop the request silently. For application messages that are not
-    /// events — a subscription request arriving on a connection that
-    /// only submits events, say. The protocol's own frames never reach the
-    /// decoder.
+    /// Nothing to apply: the request is answered with an empty batch. For
+    /// application messages that are not events — a subscription request
+    /// arriving on a connection that only submits events, say. The
+    /// protocol's own frames never reach the decoder.
     Filter,
     /// Request OK and authorized. The runtime publishes the event. Whether
     /// it needs a timestamp is derived by the runtime from
     /// [`AppEvent::is_query`] — query events bypass the journal and skip
     /// the wall-clock stamp.
     Permitted(E),
-    /// The connection's role may not make this request. The static string
-    /// is logged at debug level on the reader thread; the runtime drops
-    /// the request.
+    /// The connection's role may not make this request. The runtime
+    /// refuses it, sending the static string to the client as the reason
+    /// (cut to 255 bytes), and logs it at debug level; the connection
+    /// stays open. The text is for people: the authenticated client whose
+    /// request it was sees it, and it may change with any release.
     PermissionDenied(&'static str),
     /// Decode failure (unknown message, malformed body, invalid field). The
-    /// runtime logs at debug level and drops the request; the connection
-    /// is not closed (a misbehaving client drops itself on the next read
-    /// timeout).
+    /// runtime refuses the request as malformed, with the static string as
+    /// the reason, as for [`PermissionDenied`](Self::PermissionDenied); the
+    /// connection stays open.
     DecodeError(&'static str),
 }
 

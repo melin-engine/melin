@@ -24,7 +24,7 @@ use melin_pipeline::wait::WaitStrategy;
 use crate::ack_policy::{Blocker, CursorView, EvalStatus, MAX_CLUSTER_SIZE, Policy};
 use crate::durability_gate::{Admission, Backing, BatchEnds, DurabilityGate, GateInputs};
 pub use crate::durability_gate::{GatePolicy, GateStart};
-use crate::halt::{Refusal, RefusalQueue};
+use crate::halt::{EarlyReply, EarlyReplyQueue};
 use crate::replication::ReplicationMetrics;
 use melin_app::Application;
 use melin_app::amortized_timer::AmortizedTimer;
@@ -37,7 +37,10 @@ use melin_wire_protocol::control::TransportResponse;
 use melin_wire_protocol::control_codec;
 
 use crate::connection_limit::{RingSizing, ring_setup_error};
-use crate::response_frame::{EncodeBuf, MAX_APP_FRAME, encode_slot_payload, frame_app_response};
+use crate::response_frame::{
+    EarlyReplyBuf, EncodeBuf, MAX_APP_FRAME, MAX_EARLY_REPLY, encode_early_reply,
+    encode_slot_payload,
+};
 
 /// Maximum number of output slots consumed per batch.
 const MAX_BATCH: usize = 1024;
@@ -192,11 +195,13 @@ pub struct Response<A: Application> {
     /// exactly once, whichever side (reader disconnect or a drop
     /// decision here) initiated it.
     pub active_connections: Arc<AtomicU64>,
-    /// Writes the reader refused while the node was halted. Each reply is
-    /// sent once everything published before the refused request has been
+    /// The answers the reader decided on without publishing the request:
+    /// writes refused while the node was halted, requests the decoder
+    /// filtered or refused, requests shed on a full input ring. Each is
+    /// sent once everything published before its request has been
     /// answered, so a client sees its replies in request order — see
     /// [`crate::halt`].
-    pub refusals: RefusalQueue<A::Report>,
+    pub early_replies: EarlyReplyQueue<A::Report>,
     /// Sizes the stage's io_uring instance. A flush submits at most one
     /// SEND per dirty connection, and the connection table never holds
     /// more than `--max-connections` entries (the accept gate counts
@@ -292,7 +297,7 @@ pub fn run<A: Application>(
         encoder,
         fence_state,
         active_connections,
-        mut refusals,
+        mut early_replies,
         ring_sizing,
         ready,
         degraded_release,
@@ -357,6 +362,9 @@ pub fn run<A: Application>(
         FxHashMap::with_capacity_and_hasher(256, Default::default());
 
     let mut encode_buf: EncodeBuf = [0u8; MAX_APP_FRAME];
+    // An early reply's frames, encoded together: off the hot path, but on
+    // the stack all the same.
+    let mut early_buf: EarlyReplyBuf = [0u8; MAX_EARLY_REPLY];
 
     /// Cadence at which the idle spin does its housekeeping *clock read*.
     /// The heartbeat scan, the policy re-check and the trace-stats flush
@@ -476,25 +484,14 @@ pub fn run<A: Application>(
         buf[..written].to_vec()
     };
 
-    // Pre-encode the ServerBusy frame the same way. Sent on behalf of
-    // the reader (`ControlEvent::PipelineBusy`) — this stage owns all
-    // egress on a client socket, so the busy notice appends to
-    // `send_buf` like any other frame instead of racing our sends from
-    // the reader thread.
-    let server_busy_wire_frame = {
-        let mut buf = [0u8; 8];
-        let written =
-            control_codec::encode_transport_response(&TransportResponse::ServerBusy, &mut buf)
-                .expect("ServerBusy encodes");
-        buf[..written].to_vec()
-    };
-
-    // Pre-encode the two request terminators once. Unlike the two above
-    // these are on the hot path — every request ends with one — and their
-    // bytes are constants, so re-encoding per request was pure overhead.
-    // A refusal always ends in the plain one: it is a definite answer,
-    // with nothing on any disk to qualify.
-    let batch_ends = BatchEnds::new();
+    // Pre-encode the two request terminators once. Unlike the heartbeat
+    // these are on the hot path — every request ends with one — and only
+    // their request ID changes, so the stage writes the ID into one rather
+    // than encode a frame per request. An early reply's batch end is the
+    // plain one: it is a definite answer, with nothing on any disk to
+    // qualify. A busy, as every other early reply, is encoded per reply
+    // with its request's ID (`encode_early_reply`).
+    let mut batch_ends = BatchEnds::new();
 
     // Coarse timestamp for heartbeat scan — avoids Instant::now() on every spin.
     let mut last_heartbeat_scan = Instant::now();
@@ -510,7 +507,7 @@ pub fn run<A: Application>(
     let mut busy_count: u64 = 0;
     let mut idle_count: u64 = 0;
 
-    // Input sequence of the last output slot handled. Refused writes are
+    // Input sequence of the last output slot handled. Early replies are
     // released only where it changes — between two events' replies, never
     // inside one. `u64::MAX` is no event's sequence.
     let mut last_input_seq = u64::MAX;
@@ -563,12 +560,12 @@ pub fn run<A: Application>(
         // at most `MAX_BATCH` of a 1 M-slot ring, and the ring fills at
         // the same rate either way.
         //
-        // Refusals follow the order `RefusalQueue` documents: the idle
-        // bound before the read, the sync between the read and the
+        // Early replies follow the order `EarlyReplyQueue` documents: the
+        // idle bound before the read, the sync between the read and the
         // control drain.
-        let idle_refusal_bound = refusals.idle_bound();
+        let idle_early_bound = early_replies.idle_bound();
         let slots = consumer.read_contiguous(MAX_BATCH);
-        let refusals_waiting = refusals.sync();
+        let early_waiting = early_replies.sync();
 
         // Poll the control channel (non-blocking) for connect and
         // disconnect — after the ring is read, never before. A reply
@@ -620,20 +617,6 @@ pub fn run<A: Application>(
                     #[cfg(feature = "latency-trace")]
                     discard_e2e_samples(&mut pending_e2e, &[connection_id]);
                 }
-                ControlEvent::PipelineBusy { connection_id } => {
-                    if let Some(entry) = connections.get_mut(&connection_id) {
-                        // Overflow discipline: a busy notice to a peer
-                        // already at its buffer cap is not worth more
-                        // memory — skip it; the cap (or the blocked
-                        // timeout) is about to drop the connection
-                        // anyway. Missing entry likewise: best-effort.
-                        if entry.send_buf.len() + server_busy_wire_frame.len() <= MAX_SEND_BUF {
-                            entry.send_buf.extend_from_slice(&server_busy_wire_frame);
-                            entry.last_send = Instant::now();
-                            mark_dirty(entry, connection_id, &mut dirty_connections);
-                        }
-                    }
-                }
             }
         }
 
@@ -645,25 +628,24 @@ pub fn run<A: Application>(
         }
 
         if slots.is_empty() {
-            // Every event published before a refusal up to the bound has
-            // been answered: send those refusals with this flush.
-            if let Some(bound) = idle_refusal_bound {
+            // Every event published before an early reply up to the bound
+            // has been answered: send those early replies with this flush.
+            if let Some(bound) = idle_early_bound {
                 let now = Instant::now();
-                refusals.release(bound, |refusal| {
-                    append_refusal(
-                        refusal,
+                early_replies.release(bound, |reply| {
+                    append_early_reply(
+                        reply,
                         &*encoder,
                         &mut connections,
-                        &mut encode_buf,
-                        &batch_ends.policy,
+                        &mut early_buf,
                         now,
                         &mut dirty_connections,
                         &mut to_remove,
                         &mut flush,
                     );
                 });
-                // A refusal can overflow its connection's buffer; drop
-                // those before the flush, as the batch end does.
+                // An early reply can overflow its connection's buffer;
+                // drop those before the flush, as the batch end does.
                 #[cfg(feature = "latency-trace")]
                 discard_e2e_samples(&mut pending_e2e, &to_remove);
                 for conn_id in to_remove.drain(..) {
@@ -873,20 +855,19 @@ pub fn run<A: Application>(
             spsc_rec.record_elapsed(slot.match_complete_ts, consume_ts);
 
             // First slot of an event: every event before it has been
-            // answered, so refusals stamped up to its sequence go first.
-            // Ahead of the gate, which holds this event, not them. A
-            // refusal due here was visible before the read, so the
+            // answered, so early replies stamped up to its sequence go
+            // first. Ahead of the gate, which holds this event, not them.
+            // An early reply due here was visible before the read, so the
             // iteration's sync decides for the whole batch.
             let first_of_event = slot.input_seq != last_input_seq;
             last_input_seq = slot.input_seq;
-            if refusals_waiting && first_of_event {
-                refusals.release(slot.input_seq, |refusal| {
-                    append_refusal(
-                        refusal,
+            if early_waiting && first_of_event {
+                early_replies.release(slot.input_seq, |reply| {
+                    append_early_reply(
+                        reply,
                         &*encoder,
                         &mut connections,
-                        &mut encode_buf,
-                        &batch_ends.policy,
+                        &mut early_buf,
                         batch_now,
                         &mut dirty_connections,
                         &mut to_remove,
@@ -1005,12 +986,11 @@ pub fn run<A: Application>(
             }
 
             // Each slot expands to at most two wire frames: the
-            // application payload (Report / Query / EngineError) and
-            // an optional trailing `BatchEnd` when
+            // application payload (Report / Query) and an optional
+            // trailing `BatchEnd`, naming the slot's request, when
             // `is_last_in_request` is set. Application-shaped
-            // payloads go through the encoder; transport-shaped
-            // frames (EngineError, BatchEnd) are encoded by the
-            // runtime directly.
+            // payloads go through the encoder; the transport-shaped
+            // `BatchEnd` is the runtime's own.
             if let Some((connection_id, entry)) =
                 destination.and_then(|id| connections.get_mut(&id).map(|entry| (id, entry)))
             {
@@ -1020,10 +1000,11 @@ pub fn run<A: Application>(
                 let payload_result = encode_slot_payload(&slot.payload, &*encoder, &mut encode_buf);
 
                 // Frame 2: the pre-encoded terminator, `BatchEnd` or
-                // `BatchEndDegraded` as the slot is backed, appended with
-                // the payload in one call.
+                // `BatchEndDegraded` as the slot is backed, with the
+                // request's ID written in, appended with the payload in
+                // one call.
                 let trailer: &[u8] = if slot.is_last_in_request {
-                    gate.batch_end(backing, &batch_ends)
+                    gate.batch_end(backing, &mut batch_ends, slot.request_id)
                 } else {
                     &[]
                 };
@@ -1375,42 +1356,39 @@ fn append_frames(
     AppendOutcome::Continue
 }
 
-/// Append the reply to a write refused at ingress — the application's
-/// rejection, then the request terminator — to its connection's send
-/// buffer. A connection that has gone away loses nothing it can still
-/// receive.
+/// Append an answer the reader decided on — a halt rejection, a filtered
+/// or refused request, a shed one — to its connection's send buffer, its
+/// frames encoded by [`encode_early_reply`]. A connection that has gone
+/// away loses nothing it can still receive.
 ///
 /// No durability gate: nothing was published, so there is nothing to wait
 /// for. The caller has already waited for what comes before it on the
 /// connection (see [`crate::halt`]).
 #[allow(clippy::too_many_arguments)]
-fn append_refusal<R: Copy, Q: Copy>(
-    refusal: Refusal<R>,
+fn append_early_reply<R: Copy, Q: Copy>(
+    reply: EarlyReply<R>,
     encoder: &dyn melin_app::encoder::ResponseEncoder<Report = R, Query = Q>,
     connections: &mut FxHashMap<u64, ConnectionEntry>,
-    encode_buf: &mut EncodeBuf,
-    batch_end_wire_frame: &[u8],
+    early_buf: &mut EarlyReplyBuf,
     now: Instant,
     dirty_connections: &mut Vec<u64>,
     to_remove: &mut Vec<u64>,
     flush: &mut FlushCadence,
 ) {
-    let Some(entry) = connections.get_mut(&refusal.connection_id) else {
+    let Some(entry) = connections.get_mut(&reply.connection_id) else {
         debug!(
-            connection_id = refusal.connection_id,
-            "refusal dropped: connection not registered"
+            connection_id = reply.connection_id,
+            "early reply dropped: connection not registered"
         );
         return;
     };
-    let payload = frame_app_response(encode_buf, |body| {
-        encoder.encode_report(&refusal.report, body)
-    });
+    let written = encode_early_reply(&reply, encoder, early_buf);
     append_frames(
-        Some(payload),
-        batch_end_wire_frame,
-        refusal.connection_id,
+        Some(Ok(written)),
+        &[],
+        reply.connection_id,
         entry,
-        encode_buf,
+        early_buf,
         now,
         dirty_connections,
         to_remove,
@@ -3741,8 +3719,8 @@ pub(crate) mod tests {
                 encoder: Arc::new(ResponseEncoder),
                 fence_state: Arc::new(FenceState::new(0)),
                 active_connections: Arc::new(AtomicU64::new(0)),
-                // No reader: nothing is ever refused.
-                refusals: crate::halt::refusal_channel(Arc::new(
+                // No reader: nothing is ever answered early.
+                early_replies: crate::halt::early_reply_channel(Arc::new(
                     melin_pipeline::padding::CachePadded::new(AtomicU64::new(0)),
                 ))
                 .1,
@@ -3800,14 +3778,15 @@ pub(crate) mod tests {
         }
     }
 
-    /// A write refused at ingress is answered in request order: after the
-    /// replies to everything published before it — even while one of
-    /// those is held by the durability gate — and before anything
-    /// published after it. Replies carry no request id, so a refusal sent
-    /// early would be paired with the wrong request.
+    /// A request answered at ingress (a write refused while halted, a
+    /// request filtered or refused by the decoder, one shed on a full
+    /// ring) is answered in request order: after the replies to everything
+    /// published before it — even while one of those is held by the
+    /// durability gate — and before anything published after it, each
+    /// final frame naming its request.
     ///
-    /// Its frame classifier and refusal builder are shared with the DPDK
-    /// stage's tests (`dpdk_response.rs`).
+    /// Its frame classifier and early-reply builders are shared with the
+    /// DPDK stage's tests (`dpdk_response.rs`).
     pub(crate) mod refusal_order {
         use std::io::{ErrorKind, Read, Write};
         use std::os::unix::io::AsRawFd;
@@ -3825,14 +3804,19 @@ pub(crate) mod tests {
         use melin_pipeline::ring::DisruptorBuilder;
         use melin_pipeline::wait::WaitStrategy;
         use melin_transport_core::fence::FenceState;
-        use melin_transport_core::pipeline::{OutputPayload, OutputSlot, StageUtilization};
+        use melin_transport_core::pipeline::{
+            OutputPayload, OutputSlot, RequestId, StageUtilization,
+        };
         use melin_transport_core::{DurableWireSeqCursor, WireSeq};
         use melin_wire_protocol::blocking::BlockingFrameWriter;
-        use melin_wire_protocol::control_codec::{TAG_APP, TAG_BATCH_END};
+        use melin_wire_protocol::control::RefusalKind;
+        use melin_wire_protocol::control_codec::{
+            TAG_APP, TAG_BATCH_END, TAG_REFUSED, TAG_SERVER_BUSY, terminal_request_id,
+        };
 
         use crate::ControlEvent;
         use crate::ack_policy::AckPolicy;
-        use crate::halt::{Refusal, RefusalQueue, refusal_channel};
+        use crate::halt::{EarlyKind, EarlyReply, EarlyReplyQueue, early_reply_channel};
         use crate::response::{Response, run};
 
         /// Bounds a read that must succeed; generous for a loaded box.
@@ -3841,11 +3825,13 @@ pub(crate) mod tests {
         const QUIET: Duration = Duration::from_millis(100);
 
         /// What one frame on the wire was: a counter response, by the
-        /// kind its body starts with, or one of the protocol's own frames,
-        /// by its tag.
+        /// kind its body starts with; a frame that ends a request's reply,
+        /// by its tag and the request's ID; or another of the protocol's
+        /// own frames, by its tag.
         #[derive(Debug, PartialEq, Eq)]
         pub(crate) enum Seen {
             App(u8),
+            Final(u8, RequestId),
             Protocol(u8),
         }
 
@@ -3853,6 +3839,9 @@ pub(crate) mod tests {
             /// What a frame with this payload (its length prefix stripped)
             /// is.
             pub(crate) fn of(payload: &[u8]) -> Self {
+                if let Some(id) = terminal_request_id(payload) {
+                    return Seen::Final(payload[0], id);
+                }
                 match *payload {
                     [TAG_APP, kind, ..] => Seen::App(kind),
                     // Every counter response carries a kind.
@@ -3860,6 +3849,43 @@ pub(crate) mod tests {
                     [tag, ..] => Seen::Protocol(tag),
                     [] => panic!("an empty frame on the wire"),
                 }
+            }
+        }
+
+        /// The ID the early reply stamped `input_seq` carries in these
+        /// tests: distinct per reply, and from the events' own.
+        pub(crate) fn early_id(input_seq: u64) -> RequestId {
+            RequestId(1000 + input_seq)
+        }
+
+        /// An early reply of `kind` for `connection_id`, stamped
+        /// `input_seq`, its request [`early_id`].
+        pub(crate) fn early(
+            connection_id: u64,
+            input_seq: u64,
+            kind: EarlyKind<CounterReport>,
+        ) -> EarlyReply<CounterReport> {
+            EarlyReply {
+                connection_id,
+                request_id: early_id(input_seq),
+                input_seq,
+                kind,
+            }
+        }
+
+        /// The frames an early reply of `kind` for request `id` goes out
+        /// as.
+        pub(crate) fn frames_of(kind: EarlyKind<CounterReport>, id: RequestId) -> Vec<Seen> {
+            match kind {
+                EarlyKind::Rejected(_) => {
+                    vec![
+                        Seen::App(KIND_RESP_REJECTED),
+                        Seen::Final(TAG_BATCH_END, id),
+                    ]
+                }
+                EarlyKind::Filtered => vec![Seen::Final(TAG_BATCH_END, id)],
+                EarlyKind::Refused { .. } => vec![Seen::Final(TAG_REFUSED, id)],
+                EarlyKind::Busy => vec![Seen::Final(TAG_SERVER_BUSY, id)],
             }
         }
 
@@ -3885,6 +3911,32 @@ pub(crate) mod tests {
 
         #[test]
         fn a_refusal_waits_for_earlier_replies_and_precedes_later_ones() {
+            early_replies_keep_request_order(EarlyKind::Rejected(CounterReport::Rejected));
+        }
+
+        #[test]
+        fn a_busy_waits_for_earlier_replies_and_precedes_later_ones() {
+            early_replies_keep_request_order(EarlyKind::Busy);
+        }
+
+        #[test]
+        fn a_decoder_refusal_waits_for_earlier_replies_and_precedes_later_ones() {
+            early_replies_keep_request_order(EarlyKind::Refused {
+                kind: RefusalKind::Malformed,
+                reason: "unknown message kind",
+            });
+        }
+
+        #[test]
+        fn a_filtered_requests_empty_batch_waits_for_earlier_replies_and_precedes_later_ones() {
+            early_replies_keep_request_order(EarlyKind::Filtered);
+        }
+
+        /// Early replies of `kind` around a write the gate holds: the one
+        /// stamped before the write goes out while the gate is shut, the
+        /// one after waits for the write's reply; each names its request,
+        /// and the write's batch end names the write.
+        fn early_replies_keep_request_order(kind: EarlyKind<CounterReport>) {
             let (mut producer, mut consumers) =
                 DisruptorBuilder::<OutputSlot<CounterReport, CounterQuery>>::new(64)
                     .add_consumer()
@@ -3896,7 +3948,7 @@ pub(crate) mod tests {
             // The test plays the matching stage: it publishes the one
             // event's reply, then moves the progress past it.
             let matching_progress = Arc::new(CachePadded::new(AtomicU64::new(0)));
-            let (mut refusals, refusal_rx) = refusal_channel(Arc::clone(&matching_progress));
+            let (mut early_tx, early_rx) = early_reply_channel(Arc::clone(&matching_progress));
             // The event's gate is shut until the test opens it.
             let journal_cursor = DurableWireSeqCursor::detached(WireSeq::new(0));
 
@@ -3906,21 +3958,28 @@ pub(crate) mod tests {
             let config = config(
                 journal_cursor.clone(),
                 Arc::new(FenceState::new(0)),
-                refusal_rx,
+                early_rx,
                 None,
             );
 
-            // What a reader does for: refused write, accepted write,
-            // refused write — refusals visible before the event published
-            // after them. All in place before the stage starts, so its
-            // first iteration reads the event with both refusals behind
-            // it: the first goes out ahead of the event (the batch path),
-            // the second once the ring is empty (the idle path).
-            refusals.try_send(refusal(1, 0)).expect("queue has room");
-            refusals.try_send(refusal(1, 1)).expect("queue has room");
-            refusals.flush();
+            // What a reader does for: answered request, accepted write,
+            // answered request — early replies visible before the event
+            // published after them. All in place before the stage starts,
+            // so its first iteration reads the event with both early
+            // replies behind it: the first goes out ahead of the event
+            // (the batch path), the second once the ring is empty (the
+            // idle path).
+            early_tx
+                .try_send(early(1, 0, kind))
+                .expect("queue has room");
+            early_tx
+                .try_send(early(1, 1, kind))
+                .expect("queue has room");
+            early_tx.flush();
+            let write = RequestId(7);
             producer.publish(OutputSlot {
                 connection_id: 1,
+                request_id: write,
                 input_seq: 0,
                 wire_seq: 1,
                 payload: OutputPayload::Report(CounterReport::Ack { new_value: 7 }),
@@ -3929,15 +3988,16 @@ pub(crate) mod tests {
             });
             matching_progress.get().store(1, Ordering::Release);
 
+            let before = frames_of(kind, early_id(0));
+            let after = frames_of(kind, early_id(1));
             thread::scope(|scope| {
                 let stage = scope.spawn(|| run::<Counter>(consumer, control_rx, config, &shutdown));
 
                 let mut seen = Vec::new();
 
-                // The first refusal came before the held event: it goes
-                // out while the gate is shut.
-                let first = read_into(&mut client_sock, &mut seen)
-                    && read_into(&mut client_sock, &mut seen);
+                // The first early reply came before the held event: it
+                // goes out while the gate is shut.
+                let first = (0..before.len()).all(|_| read_into(&mut client_sock, &mut seen));
 
                 // The second came after it: nothing more until the gate
                 // opens.
@@ -3947,7 +4007,7 @@ pub(crate) mod tests {
                 let mut probe = [0u8; 1];
                 // Anything but a timeout — bytes, or the stage closing the
                 // socket — means something went out early.
-                let early = !matches!(
+                let overtook = !matches!(
                     client_sock.read(&mut probe),
                     Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
                 );
@@ -3956,31 +4016,29 @@ pub(crate) mod tests {
                     .expect("set read timeout");
 
                 journal_cursor.store(WireSeq::new(1));
-                let rest = !early && (0..4).all(|_| read_into(&mut client_sock, &mut seen));
+                let rest = !overtook
+                    && (0..2 + after.len()).all(|_| read_into(&mut client_sock, &mut seen));
 
                 // Stop the stage before asserting, so a failure cannot
                 // leave the scope waiting on a spinning thread.
                 shutdown.store(true, Ordering::Relaxed);
                 stage.join().expect("stage panicked");
 
-                assert!(first, "the refusal ahead of the held event never arrived");
                 assert!(
-                    !early,
-                    "the later refusal overtook the reply the gate was holding"
+                    first,
+                    "the early reply ahead of the held event never arrived"
+                );
+                assert!(
+                    !overtook,
+                    "the later early reply overtook the reply the gate was holding"
                 );
                 assert!(rest, "replies missing after the gate opened: {seen:x?}");
-                assert_eq!(
-                    seen,
-                    [
-                        Seen::App(KIND_RESP_REJECTED),
-                        Seen::Protocol(TAG_BATCH_END),
-                        Seen::App(KIND_RESP_ACK),
-                        Seen::Protocol(TAG_BATCH_END),
-                        Seen::App(KIND_RESP_REJECTED),
-                        Seen::Protocol(TAG_BATCH_END),
-                    ],
-                    "replies out of request order"
-                );
+                let expected: Vec<Seen> = before
+                    .into_iter()
+                    .chain([Seen::App(KIND_RESP_ACK), Seen::Final(TAG_BATCH_END, write)])
+                    .chain(after)
+                    .collect();
+                assert_eq!(seen, expected, "replies out of request order");
             });
         }
 
@@ -4008,7 +4066,7 @@ pub(crate) mod tests {
 
             // Nothing is ever published, so no refusal waits on an event.
             let progress = Arc::new(CachePadded::new(AtomicU64::new(0)));
-            let (mut refusals, refusal_rx) = refusal_channel(progress);
+            let (mut refusals, refusal_rx) = early_reply_channel(progress);
             let (control_tx, control_rx) = mpsc::channel();
             control_tx.send(connected_1).expect("channel open");
 
@@ -4059,7 +4117,10 @@ pub(crate) mod tests {
                 for seen in [seen_1, seen_2] {
                     assert_eq!(
                         seen,
-                        [Seen::App(KIND_RESP_REJECTED), Seen::Protocol(TAG_BATCH_END)]
+                        [
+                            Seen::App(KIND_RESP_REJECTED),
+                            Seen::Final(TAG_BATCH_END, early_id(0))
+                        ]
                     );
                 }
             });
@@ -4080,19 +4141,21 @@ pub(crate) mod tests {
             (event, client_sock)
         }
 
-        pub(crate) fn refusal(connection_id: u64, input_seq: u64) -> Refusal<CounterReport> {
-            Refusal {
+        /// A halt refusal for `connection_id`, stamped `input_seq`.
+        pub(crate) fn refusal(connection_id: u64, input_seq: u64) -> EarlyReply<CounterReport> {
+            early(
                 connection_id,
                 input_seq,
-                report: CounterReport::Rejected,
-            }
+                EarlyKind::Rejected(CounterReport::Rejected),
+            )
         }
 
-        /// A stage gating on `journal_cursor` under `disk`, fed `refusals`.
+        /// A stage gating on `journal_cursor` under `disk`, fed
+        /// `early_replies`.
         pub(super) fn config(
             journal_cursor: DurableWireSeqCursor,
             fence_state: Arc<FenceState>,
-            refusals: RefusalQueue<CounterReport>,
+            early_replies: EarlyReplyQueue<CounterReport>,
             pause_after_control_drain: Option<Box<dyn FnMut() + Send>>,
         ) -> Response<Counter> {
             Response::<Counter> {
@@ -4109,7 +4172,7 @@ pub(crate) mod tests {
                 encoder: Arc::new(ResponseEncoder),
                 fence_state,
                 active_connections: Arc::new(AtomicU64::new(0)),
-                refusals,
+                early_replies,
                 ring_sizing: crate::connection_limit::RingSizing::for_max_connections(4)
                     .expect("a supported cap"),
                 ready: None,
@@ -4136,14 +4199,14 @@ pub(crate) mod tests {
         use melin_pipeline::ring::DisruptorBuilder;
         use melin_pipeline::wait::WaitStrategy;
         use melin_transport_core::fence::FenceState;
-        use melin_transport_core::pipeline::{OutputPayload, OutputSlot};
+        use melin_transport_core::pipeline::{OutputPayload, OutputSlot, RequestId};
         use melin_transport_core::replica_presence::ReplicaPresence;
         use melin_transport_core::{DurableWireSeqCursor, WireSeq};
         use melin_wire_protocol::control_codec::{TAG_BATCH_END, TAG_BATCH_END_DEGRADED};
 
-        use super::refusal_order::{Seen, config, connection, read_frame, refusal};
+        use super::refusal_order::{Seen, config, connection, early_id, read_frame, refusal};
         use crate::ack_policy::AckPolicy;
-        use crate::halt::{DegradedRelease, refusal_channel};
+        use crate::halt::{DegradedRelease, early_reply_channel};
         use crate::replication::ReplicationMetrics;
         use crate::response::run;
 
@@ -4160,7 +4223,7 @@ pub(crate) mod tests {
             let consumer = consumers.pop().expect("one consumer was requested");
             let (connected, mut client) = connection(1);
             let matching_progress = Arc::new(CachePadded::new(AtomicU64::new(0)));
-            let (mut refusals, refusal_rx) = refusal_channel(Arc::clone(&matching_progress));
+            let (mut refusals, refusal_rx) = early_reply_channel(Arc::clone(&matching_progress));
 
             let journal_cursor = DurableWireSeqCursor::detached(WireSeq::new(1));
             let mut config = config(
@@ -4191,6 +4254,7 @@ pub(crate) mod tests {
             refusals.flush();
             producer.publish(OutputSlot {
                 connection_id: 1,
+                request_id: HELD,
                 input_seq: 0,
                 wire_seq: 1,
                 payload: OutputPayload::Report(CounterReport::Ack { new_value: 7 }),
@@ -4215,6 +4279,9 @@ pub(crate) mod tests {
             seen
         }
 
+        /// The held write's ID.
+        const HELD: RequestId = RequestId(7);
+
         #[test]
         fn a_held_write_is_answered_degraded_and_refusals_end_in_a_plain_batch_end() {
             let seen = run_halted(true, Duration::from_millis(500));
@@ -4222,11 +4289,11 @@ pub(crate) mod tests {
                 seen,
                 [
                     Seen::App(KIND_RESP_REJECTED),
-                    Seen::Protocol(TAG_BATCH_END),
+                    Seen::Final(TAG_BATCH_END, early_id(0)),
                     Seen::App(KIND_RESP_ACK),
-                    Seen::Protocol(TAG_BATCH_END_DEGRADED),
+                    Seen::Final(TAG_BATCH_END_DEGRADED, HELD),
                     Seen::App(KIND_RESP_REJECTED),
-                    Seen::Protocol(TAG_BATCH_END),
+                    Seen::Final(TAG_BATCH_END, early_id(1)),
                 ],
                 "in request order, only the held write marked"
             );
@@ -4237,7 +4304,10 @@ pub(crate) mod tests {
             let seen = run_halted(false, Duration::from_millis(300));
             assert_eq!(
                 seen,
-                [Seen::App(KIND_RESP_REJECTED), Seen::Protocol(TAG_BATCH_END)],
+                [
+                    Seen::App(KIND_RESP_REJECTED),
+                    Seen::Final(TAG_BATCH_END, early_id(0))
+                ],
                 "only the refusal ahead of the held write goes out"
             );
         }
@@ -4260,12 +4330,12 @@ pub(crate) mod tests {
         use melin_pipeline::ring::DisruptorBuilder;
         use melin_pipeline::wait::WaitStrategy;
         use melin_transport_core::fence::FenceState;
-        use melin_transport_core::pipeline::{OutputPayload, OutputSlot};
+        use melin_transport_core::pipeline::{OutputPayload, OutputSlot, RequestId};
         use melin_transport_core::{DurableWireSeqCursor, WireSeq};
         use melin_wire_protocol::control_codec::TAG_BATCH_END;
 
         use super::refusal_order::{Seen, config, connection, read_frame};
-        use crate::halt::refusal_channel;
+        use crate::halt::early_reply_channel;
         use crate::response::run;
 
         /// How long the stage gets to exit once told to; generous for a
@@ -4285,11 +4355,13 @@ pub(crate) mod tests {
             // The journal confirms the first event and never the second.
             let journal_cursor = DurableWireSeqCursor::detached(WireSeq::new(1));
             let fence = Arc::new(FenceState::new(0));
-            let refusals = refusal_channel(Arc::new(CachePadded::new(AtomicU64::new(0)))).1;
-            let config = config(journal_cursor, Arc::clone(&fence), refusals, None);
+            let early_replies =
+                early_reply_channel(Arc::new(CachePadded::new(AtomicU64::new(0)))).1;
+            let config = config(journal_cursor, Arc::clone(&fence), early_replies, None);
             for wire_seq in [1, 2] {
                 producer.publish(OutputSlot {
                     connection_id: 1,
+                    request_id: RequestId(wire_seq),
                     input_seq: wire_seq - 1,
                     wire_seq,
                     payload: OutputPayload::Report(CounterReport::Ack {
@@ -4317,7 +4389,10 @@ pub(crate) mod tests {
             }
             assert_eq!(
                 seen,
-                [Seen::App(KIND_RESP_ACK), Seen::Protocol(TAG_BATCH_END)]
+                [
+                    Seen::App(KIND_RESP_ACK),
+                    Seen::Final(TAG_BATCH_END, RequestId(1))
+                ]
             );
 
             if fenced {
@@ -4374,13 +4449,13 @@ pub(crate) mod tests {
         use melin_pipeline::wait::WaitStrategy;
         use melin_transport_core::fence::FenceState;
         use melin_transport_core::lineage::{ForcedPolicy, forced_policy_cell};
-        use melin_transport_core::pipeline::{OutputPayload, OutputSlot};
+        use melin_transport_core::pipeline::{OutputPayload, OutputSlot, RequestId};
         use melin_transport_core::{DurableWireSeqCursor, WireSeq};
         use melin_wire_protocol::control_codec::TAG_BATCH_END;
 
         use super::refusal_order::{Seen, config, connection, read_frame};
         use crate::ack_policy::AckPolicy;
-        use crate::halt::refusal_channel;
+        use crate::halt::early_reply_channel;
         use crate::response::run;
 
         /// How long the test waits for the stage to reach a state.
@@ -4393,6 +4468,7 @@ pub(crate) mod tests {
         fn reply(wire_seq: u64) -> OutputSlot<CounterReport, CounterQuery> {
             OutputSlot {
                 connection_id: 1,
+                request_id: RequestId(wire_seq),
                 input_seq: wire_seq - 1,
                 wire_seq,
                 payload: OutputPayload::Report(CounterReport::Ack {
@@ -4433,11 +4509,12 @@ pub(crate) mod tests {
             // Everything up to the reply after the change is on disk; a
             // standalone stage cannot satisfy `two-disks` at all.
             let journal_cursor = DurableWireSeqCursor::detached(WireSeq::new(3));
-            let refusals = refusal_channel(Arc::new(CachePadded::new(AtomicU64::new(0)))).1;
+            let early_replies =
+                early_reply_channel(Arc::new(CachePadded::new(AtomicU64::new(0)))).1;
             let mut config = config(
                 journal_cursor.clone(),
                 Arc::new(FenceState::new(0)),
-                refusals,
+                early_replies,
                 None,
             );
             let (mut forced_writer, forced) = forced_policy_cell();
@@ -4491,11 +4568,14 @@ pub(crate) mod tests {
                 shutdown.store(true, Ordering::Relaxed);
                 stage.join().expect("stage panicked");
 
-                for frames in [before, after] {
+                for (frames, id) in [(before, 1), (after, 3)] {
                     let frames = frames.map(|frame| frame.expect("a reply arrived"));
                     assert_eq!(
                         frames,
-                        [Seen::App(KIND_RESP_ACK), Seen::Protocol(TAG_BATCH_END)]
+                        [
+                            Seen::App(KIND_RESP_ACK),
+                            Seen::Final(TAG_BATCH_END, RequestId(id))
+                        ]
                     );
                 }
                 assert!(
@@ -4527,7 +4607,7 @@ pub(crate) mod tests {
 
         use super::refusal_order::config;
         use crate::connection_limit::RingSizing;
-        use crate::halt::refusal_channel;
+        use crate::halt::early_reply_channel;
         use crate::response::run;
 
         /// A zero-entry ring stands in for the locked-memory limit: both
@@ -4542,12 +4622,13 @@ pub(crate) mod tests {
                     .build(WaitStrategy::SpinThenYield);
             let consumer = consumers.pop().expect("one consumer was requested");
             let (_control_tx, control_rx) = mpsc::channel();
-            let refusals = refusal_channel(Arc::new(CachePadded::new(AtomicU64::new(0)))).1;
+            let early_replies =
+                early_reply_channel(Arc::new(CachePadded::new(AtomicU64::new(0)))).1;
             let (ready_tx, ready_rx) = mpsc::sync_channel(1);
             let mut config = config(
                 DurableWireSeqCursor::detached(WireSeq::new(0)),
                 Arc::new(FenceState::new(0)),
-                refusals,
+                early_replies,
                 None,
             );
             config.ring_sizing = RingSizing::unchecked(0, 32);

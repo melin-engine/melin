@@ -78,10 +78,25 @@ fn a_write_refused_while_halted_is_not_replayed() {
     // --- Halted: the replica leaves, the next write is refused. ---
     replica.stop();
     wait_for_gauge(primary_health, "melin_replicas_connected", 0);
-    let refused = one_reply(&mut conn, &increment_request(5));
+    // Pipelined by hand, so the refusal's batch end can be seen naming
+    // the request it answers.
+    let refused_id = conn
+        .send(&increment_request(5))
+        .expect("send the write the halt refuses");
+    match conn.next_frame() {
+        Ok(Frame::Response(body)) => assert_eq!(
+            body[0], KIND_RESP_REJECTED,
+            "a halted primary must refuse the write"
+        ),
+        other => panic!("expected the refusal, got {other:?}"),
+    }
     assert_eq!(
-        refused[0], KIND_RESP_REJECTED,
-        "a halted primary must refuse the write"
+        conn.next_frame().expect("the refusal's batch end"),
+        Frame::BatchEnd {
+            id: refused_id,
+            ack: Ack::Policy
+        },
+        "the refusal ends in a plain batch end naming the refused request"
     );
     assert_eq!(
         value_of(&mut conn),
@@ -153,10 +168,15 @@ fn pipelined_writer(
             let mut ends = 0;
             while ends < BURST {
                 match conn.next_frame() {
-                    Ok(Frame::BatchEnd(Ack::Policy)) => ends += 1,
+                    Ok(Frame::BatchEnd {
+                        ack: Ack::Policy, ..
+                    }) => ends += 1,
                     // Under `disk` the policy is met by the primary's own
                     // journal: nothing is ever weaker than it.
-                    Ok(Frame::BatchEnd(Ack::PrimaryOnly)) => {
+                    Ok(Frame::BatchEnd {
+                        ack: Ack::PrimaryOnly,
+                        ..
+                    }) => {
                         return (answered, Some("a degraded ack under disk".into()));
                     }
                     Ok(_) => {}
