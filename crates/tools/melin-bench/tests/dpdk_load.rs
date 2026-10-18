@@ -7,26 +7,15 @@
 mod common;
 
 use std::net::SocketAddr;
-use std::time::Instant;
 
-use melin_client::{Connection, fmt_mac};
+use melin_client::fmt_mac;
 
-use common::{bench_key, field, journaled_echoes, load, run, start_echo};
+use common::{field, journaled_echoes, load, run, start_echo};
 
 #[test]
 fn every_echo_answered_over_dpdk_is_journaled() {
     let dir = tempfile::tempdir().expect("tempdir");
     let node = start_echo(dir.path(), "writer");
-    // The launcher returns before the node serves, and the binary dials
-    // once: a kernel client, which retries until a deadline, waits for it.
-    drop(
-        Connection::connect_by(
-            node.addr(),
-            &bench_key(),
-            Instant::now() + melin_test_node::STARTUP_LIMIT,
-        )
-        .expect("a serving node"),
-    );
     let SocketAddr::V4(server) = node.addr() else {
         panic!("a DPDK node is on IPv4: {}", node.addr());
     };

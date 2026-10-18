@@ -39,15 +39,27 @@ pub fn config(dir: &Path, journal: &str, role: &str) -> ServerConfig {
     }
 }
 
-/// An echo node, its journal in `dir`, the bench's key in `role`.
+/// An echo node, its journal in `dir`, the bench's key in `role`, once it
+/// serves.
 pub fn start_echo(dir: &Path, role: &str) -> melin_test_node::Node {
-    melin_test_node::start::<echo_server::Echo>(
+    serving(melin_test_node::start::<echo_server::Echo>(
         config(dir, "echo.journal", role),
         StartupEvents::none(),
         (),
         echo_server::RequestDecoder,
         echo_server::ResponseEncoder,
-    )
+    ))
+}
+
+/// `node`, once a client of the bench's key is authenticated by it: every
+/// node a test runs the binary against.
+///
+/// The binary dials once, giving the handshake its read timeout: a node
+/// still starting eats into that (under a sanitizer, initialising the
+/// rings alone takes seconds).
+pub fn serving(node: melin_test_node::Node) -> melin_test_node::Node {
+    drop(melin_test_node::connect(node.addr(), &bench_key()));
+    node
 }
 
 /// The bench's key, written into `dir` for the binary to read.

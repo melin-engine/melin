@@ -34,8 +34,7 @@ use std::time::{Duration, Instant};
 use echo_server::{Echo, KIND_RESP_ECHO, MAX_PAYLOAD, RequestDecoder, ResponseEncoder};
 use melin_client::framing::split_frame;
 use melin_client::{
-    Ack, Connection, Handshake, Reply, RequestFrameError, SigningKey, Step, classify,
-    frame_request, key,
+    Ack, Handshake, Reply, RequestFrameError, SigningKey, Step, classify, frame_request, key,
 };
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
@@ -416,16 +415,8 @@ const RING_KIB: u64 = 4;
 fn the_proxy_bridges_a_client_to_a_dpdk_node_over_dpdk() {
     let dir = tempfile::tempdir().expect("tempdir");
     let node = start_node(dir.path());
-    // The launcher returns before the node serves, and the proxy dials
-    // once: a kernel client, which retries until a deadline, waits for it.
-    drop(
-        Connection::connect_by(
-            node.addr(),
-            &writer_key(),
-            Instant::now() + melin_test_node::STARTUP_LIMIT,
-        )
-        .expect("a serving node"),
-    );
+    // The proxy dials once: wait for the node to serve first.
+    drop(melin_test_node::connect(node.addr(), &writer_key()));
 
     let SocketAddr::V4(server) = node.addr() else {
         panic!("a DPDK node is on IPv4: {}", node.addr());

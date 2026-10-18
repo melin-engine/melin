@@ -53,13 +53,9 @@ fn bytes(len: usize, seed: u8) -> Vec<u8> {
     (0..len).map(|i| seed.wrapping_add(i as u8)).collect()
 }
 
-/// Connect and authenticate, retrying until the server is serving: the
-/// kernel accepts the connection before the accept loop runs, so the
-/// client has to get through the handshake to know.
+/// Connect and authenticate once the server is serving.
 fn connect_authenticated(addr: SocketAddr, key: &SigningKey) -> Connection {
-    let mut node =
-        Connection::connect_by(addr, key, Instant::now() + melin_test_node::STARTUP_LIMIT)
-            .expect("a serving node");
+    let mut node = melin_test_node::connect(addr, key);
     // Generous: the suite shares the machine, and how fast a node answers
     // under full-suite load is not what these tests check. A refused
     // request still surfaces — as a 30 s `NoReply` rather than a 5 s one:
