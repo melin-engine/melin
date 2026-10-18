@@ -229,6 +229,8 @@ Journal segment rotation is independent of snapshots. When the live journal exce
 - **On interval** — the shadow stage writes snapshots every `--snapshot-interval-ms`.
 - **Before deploying a new application version** — version boundary (see Migration below).
 
+A snapshot can only be taken at a point the journal has made durable, so when the interval elapses while events are still on their way to disk, the save waits for the next such point and is taken then. The interval keeps its cadence: a save that waited does not push the next one back. Each save logs `shadow snapshot saved` with the sequence it covers, its size in bytes, how long it took (`elapsed_ms`), and how many attempts it took (1 when the first one landed); a save still waiting when the next interval elapses logs a warning, once an interval, until it lands. A save that fails (for example, the snapshot's disk is full) logs `shadow snapshot failed` and is tried again at the next interval, not continuously.
+
 ### Where Snapshots Go
 
 A node has one snapshot file, `--snapshot-path` (default: the journal path with a `.snapshot` extension). It is the file the node recovers from at boot, the one it sends to a replica that needs a resync, and the one its shadow stage writes; there is no other. Its temporary file (`.tmp`), its previous copy (`.prev`) and its resync archive stay in its directory, so every rename that touches the snapshot is atomic on its filesystem.

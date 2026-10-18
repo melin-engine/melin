@@ -691,8 +691,14 @@ Three small runtime changes make the benchmark mean what it claims:
   save succeeds. When a save *fails* (I/O error), the flag also clears,
   and the next attempt is a full interval later, so a persistent `EIO`
   does not become a hot loop of `error!` lines. The decision lives in a
-  small pure type (for example `SnapshotSchedule`) that can be unit-tested
-  without threads or clocks.
+  small pure type (`SnapshotSchedule`) that can be unit-tested
+  without threads or clocks. A tick that finds the previous save still
+  due logs a `warn!` ("shadow snapshot deferred for a whole interval",
+  with its attempts so far), at most once an interval, so a node that
+  cannot align is visible before the judge reads its log. The check made
+  on every iteration while a save is due is the `FsyncState` seqlock read
+  (lock-free; an L1 hit until the journal publishes again) and one
+  comparison; the save itself is a `#[cold]` out-of-line function.
 
   The retry assumes an aligned moment occurs under sustained load.
   Alignment needs the fsync boundary (`FsyncState.input_ring_seq`) to
@@ -710,7 +716,10 @@ Three small runtime changes make the benchmark mean what it claims:
 - **The saved line says what it cost.** `snapshot::save` returns the
   bytes it wrote. The log line becomes "shadow snapshot saved
   journal_seq= bytes= elapsed_ms= attempts= path=", where `attempts`
-  counts the deferrals before the save. The shadow calls `snapshot::save`
+  counts every attempt at the save, the one that landed included (1 when
+  the first attempt saved), and `elapsed_ms` is fractional (a small
+  state saves in well under a millisecond). The "shadow snapshot failed"
+  line carries `attempts` too. The shadow calls `snapshot::save`
   directly, so the size flows from there to `try_save_snapshot` and no
   further; `JournaledApp::save_snapshot`, whose callers are all tests,
   is left alone.
@@ -776,7 +785,8 @@ an assumed go-ahead.
    `SnapshotSchedule`, the retry, the new fields on the saved line, and
    `save` returning its size. CHANGELOG entry under **Fixed** ("a
    snapshot deferred under load is retried, not skipped for an
-   interval").
+   interval"), and one under **Changed** for `snapshot::save`'s new
+   return type (it is public API).
 2. **Runtime: bounded snapshot writeback** (`perf(snapshot)`).
    CHANGELOG entry under **Changed**.
 3. **Suite: host-free logic and its tests** (`feat(bench)`). The new
@@ -794,11 +804,15 @@ untouched by step 0; only its caller changes, passing
 **`crates/core/transport-core/src/shadow.rs`**
 
 - `run`: replace the single-shot tick with `SnapshotSchedule`
-  (`on_tick`, `should_attempt`, `on_saved`, `on_failed`), and count
-  attempts.
-- `try_save_snapshot`: return an outcome enum (`Saved { bytes, elapsed }`,
-  `Deferred`, `Failed`). Use an exhaustive `match` at the call site, so
-  that a fourth outcome cannot fall through.
+  (`on_tick`, which returns the attempts so far when the previous save
+  is still due, `should_attempt`, `on_deferred`, `on_saved`,
+  `on_failed`), and count attempts. The tick and the due-save attempt
+  are one block after the (possibly empty) batch, shared by busy and
+  idle passes, rather than one copy in each branch.
+- `try_save_snapshot`: return an outcome enum (`Saved { journal_seq,
+  bytes, elapsed }`, `Deferred`, `Failed { journal_seq, error }`). Use an
+  exhaustive `match` at the call site (`attempt_save`), so that a fourth
+  outcome cannot fall through.
 
 **`crates/core/transport-core/src/snapshot.rs`**
 
@@ -907,12 +921,23 @@ helper:
   - a deferred attempt followed by an aligned one saves;
   - a failed save clears the due flag until the next tick;
   - no attempt is made before the first tick;
-  - `attempts` resets after a save.
-- A threaded `shadow.rs` test: `FsyncState` is misaligned at the first
-  tick and aligned shortly after. With a 5 s interval and a deadline
-  well under it, the snapshot exists before the second interval. Under
-  the old behaviour it could not appear before the second tick, so
-  scheduling noise cannot make the test pass by accident.
+  - `attempts` resets after a save;
+  - a tick that finds the save still due reports it, and the count runs
+    on across the tick.
+- A threaded `shadow.rs` test, its log captured: `FsyncState` is
+  misaligned at the first tick and aligned shortly after. With a 4 s
+  interval, the snapshot must exist before the second tick could fire,
+  and its saved line must count more than one attempt. The count is what
+  keeps scheduling noise from passing the test by accident: a first tick
+  late enough to land after the alignment would save at once, with one
+  attempt.
+- Two more threaded tests with captured logs: a save misaligned for
+  more than an interval warns at most once a tick and still lands; a
+  save to a missing directory fails at most once a tick, each with one
+  attempt.
+- `snapshot.rs`, independent of chunking: the size `save` returns equals
+  the file's length (on a first save and on a rotating one), and a save
+  of exactly the size cap is written while one byte under it is refused.
 - `snapshot.rs`, with the chunk size made small:
   - a payload of exactly one chunk;
   - a payload of one chunk plus one byte;

@@ -8,10 +8,11 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
+use crate::cursors::WireSeq;
 use crate::dispatch::dispatch;
 use crate::lineage::Lineage;
 use crate::pipeline::{FsyncState, InputSlot};
@@ -77,6 +78,10 @@ pub fn run<A: Application>(
     // defers the clock read to roughly 1 Hz, collapsing the overhead
     // to a single `AND` + predictable branch per iteration.
     let mut snapshot_timer = AmortizedTimer::new();
+    // Whether a save is due, set by the timer and kept until a save lands
+    // or fails. Its per-iteration check is a field load, so the timer's
+    // amortization above still holds while no save is due.
+    let mut schedule = SnapshotSchedule::default();
     let mut waiter = wait.waiter();
     // Track whether any events have been consumed. Prevents snapshotting
     // empty state before the first event arrives.
@@ -105,29 +110,10 @@ pub fn run<A: Application>(
         }
 
         let count = consumer.consume_batch(&mut batch, SHADOW_BATCH_SIZE);
-        if count == 0 {
-            // Check snapshot timer even when idle — events may have been
-            // consumed before the interval elapsed, and no more events
-            // will arrive to trigger the post-consume check.
-            if has_events
-                && snapshot_timer
-                    .tick(snapshot_interval, waiter.spinning())
-                    .is_some()
-            {
-                try_save_snapshot::<A>(
-                    &app,
-                    &consumer,
-                    &fsync_state,
-                    &snapshot_path,
-                    shadow_lineage,
-                    genesis_entries,
-                );
-            }
-            waiter.idle();
-            continue;
+        if count > 0 {
+            waiter.reset();
+            has_events = true;
         }
-        waiter.reset();
-        has_events = true;
 
         // Replay each event on the shadow app. last_drain_ns lives
         // outside the loop so the per-event drain stays monotonic across
@@ -163,15 +149,30 @@ pub fn run<A: Application>(
                     key_hash: slot.key_hash,
                 },
                 &mut last_drain_ns,
-                |event| shadow_lineage.observe(crate::cursors::WireSeq::new(wire_seq), event),
+                |event| shadow_lineage.observe(WireSeq::new(wire_seq), event),
                 &mut reports,
             );
             reports.clear();
         }
 
-        // Check if a snapshot is due.
-        if snapshot_timer.tick(snapshot_interval, true).is_some() {
-            try_save_snapshot::<A>(
+        // Check if a snapshot is due, and attempt it while it is: after a
+        // batch, and when idle too — events may have been consumed before
+        // the interval elapsed, and no more may arrive. Idle is also where
+        // a deferred save usually lands: the shadow has drained the ring
+        // and the journal publishes the fsync boundary that matches it.
+        // `has_events` keeps an empty state from being snapshotted before
+        // the first event. After a batch the waiter was just reset, so
+        // `spinning()` is true and the timer stays amortized.
+        if has_events
+            && snapshot_timer
+                .tick(snapshot_interval, waiter.spinning())
+                .is_some()
+        {
+            tick_schedule(&mut schedule, &snapshot_path);
+        }
+        if schedule.should_attempt() {
+            attempt_save::<A>(
+                &mut schedule,
                 &app,
                 &consumer,
                 &fsync_state,
@@ -180,7 +181,153 @@ pub fn run<A: Application>(
                 genesis_entries,
             );
         }
+
+        if count == 0 {
+            waiter.idle();
+        }
     }
+}
+
+/// When the shadow attempts a snapshot save: the decision alone, with no
+/// clock and no I/O, so every transition is unit-tested.
+///
+/// A timer tick makes a save due. While it is due, the shadow attempts it
+/// on every consumed batch and every idle pass, so a save deferred
+/// because the shadow was not at an fsync boundary lands at the next one
+/// rather than an interval later. A save that succeeds clears it; so does
+/// one that fails, whose next attempt waits for the next tick, so that a
+/// persistent I/O error costs one attempt (and one log line) an interval
+/// rather than one per loop iteration.
+#[derive(Debug, Default)]
+struct SnapshotSchedule {
+    due: bool,
+    /// Attempts at the save now due, the deferred ones included. `u64`:
+    /// a save is attempted at loop frequency (millions a second) while
+    /// it waits, so a `u32` could wrap within an interval of a workload
+    /// that never aligns; the count saturates rather than wraps all the
+    /// same, since it only reaches the logs.
+    attempts: u64,
+}
+
+impl SnapshotSchedule {
+    /// The snapshot interval elapsed: a save is due. Returns the attempts
+    /// already made when the previous tick's save is still due, i.e. it
+    /// has been deferred for a whole interval; the save stays due and its
+    /// count runs on.
+    fn on_tick(&mut self) -> Option<u64> {
+        let overdue = self.due.then_some(self.attempts);
+        self.due = true;
+        overdue
+    }
+
+    /// Whether to attempt the save on this iteration. Read on every
+    /// iteration of the shadow's busy loop, so a field load and nothing
+    /// more.
+    #[inline(always)]
+    fn should_attempt(&self) -> bool {
+        self.due
+    }
+
+    /// An attempt found the shadow off the fsync boundary: the save stays
+    /// due.
+    fn on_deferred(&mut self) {
+        self.attempts = self.attempts.saturating_add(1);
+    }
+
+    /// The save landed. Returns the attempts it took, this one included.
+    fn on_saved(&mut self) -> u64 {
+        self.finish()
+    }
+
+    /// The save failed. It is no longer due: the next attempt waits for
+    /// the next tick. Returns the attempts it took, this one included.
+    fn on_failed(&mut self) -> u64 {
+        self.finish()
+    }
+
+    fn finish(&mut self) -> u64 {
+        let attempts = self.attempts.saturating_add(1);
+        self.due = false;
+        self.attempts = 0;
+        attempts
+    }
+}
+
+/// A timer tick: make a save due, and say so when the one before it is
+/// still waiting a whole interval later — the shadow has not met an fsync
+/// boundary since, and the node has no fresh snapshot to recover from.
+/// Logged at most once an interval.
+fn tick_schedule(schedule: &mut SnapshotSchedule, path: &std::path::Path) {
+    if let Some(attempts) = schedule.on_tick() {
+        warn!(
+            attempts,
+            path = %path.display(),
+            "shadow snapshot deferred for a whole interval: the shadow has not \
+             reached a journal fsync boundary since it fell due; still retrying"
+        );
+    }
+}
+
+/// Attempt the due save and log what came of it.
+fn attempt_save<A: Application>(
+    schedule: &mut SnapshotSchedule,
+    app: &A,
+    consumer: &ring::Consumer<InputSlot<A::Event>>,
+    fsync_state: &SeqLockReader<FsyncState>,
+    path: &std::path::Path,
+    lineage: Lineage,
+    genesis_entries: Option<u64>,
+) {
+    // Exhaustive: a new outcome must be decided here, not fall through.
+    match try_save_snapshot::<A>(app, consumer, fsync_state, path, lineage, genesis_entries) {
+        SaveOutcome::Deferred => schedule.on_deferred(),
+        SaveOutcome::Saved {
+            journal_seq,
+            bytes,
+            elapsed,
+        } => {
+            let attempts = schedule.on_saved();
+            info!(
+                journal_seq = journal_seq.get(),
+                bytes,
+                // Fractional: a small state saves in well under a
+                // millisecond, which a whole count would show as 0.
+                elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+                attempts,
+                path = %path.display(),
+                "shadow snapshot saved"
+            );
+        }
+        SaveOutcome::Failed { journal_seq, error } => {
+            let attempts = schedule.on_failed();
+            error!(
+                journal_seq = journal_seq.get(),
+                error = %error,
+                attempts,
+                path = %path.display(),
+                "shadow snapshot failed"
+            );
+        }
+    }
+}
+
+/// What came of one attempt at a save.
+enum SaveOutcome {
+    /// The snapshot at `journal_seq` is on disk: `bytes` long, written in
+    /// `elapsed` (serialization, write, syncs and renames).
+    Saved {
+        journal_seq: WireSeq,
+        bytes: u64,
+        elapsed: Duration,
+    },
+    /// The shadow was not at the journal's last fsync boundary; nothing
+    /// was written.
+    Deferred,
+    /// The save of the snapshot at `journal_seq` failed.
+    Failed {
+        journal_seq: WireSeq,
+        error: snapshot::SnapshotError,
+    },
 }
 
 /// Save a shadow snapshot if the shadow's ring cursor is aligned with
@@ -189,8 +336,12 @@ pub fn run<A: Application>(
 /// shadow's app state.
 ///
 /// When not aligned (shadow mid-batch or journal fsynced again since
-/// shadow's last consume), the snapshot is deferred — the next timer
-/// tick retries.
+/// shadow's last consume), the snapshot is deferred: the schedule
+/// retries on the next batch or idle pass. That check is what runs on
+/// every iteration while a save is due, so it is kept to a lock-free
+/// seqlock read of [`FsyncState`] (an L1 hit until the journal publishes
+/// again) and one comparison; the save itself is out of line.
+#[inline]
 fn try_save_snapshot<A: Application>(
     app: &A,
     consumer: &ring::Consumer<InputSlot<A::Event>>,
@@ -198,12 +349,27 @@ fn try_save_snapshot<A: Application>(
     path: &std::path::Path,
     lineage: Lineage,
     genesis_entries: Option<u64>,
-) {
+) -> SaveOutcome {
     let state = fsync_state.load();
     // Both ring-index space — compare the raw positions.
     if state.input_ring_seq.get() != consumer.next_read() {
-        return;
+        return SaveOutcome::Deferred;
     }
+    save_aligned::<A>(app, &state, path, lineage, genesis_entries)
+}
+
+/// The save proper, at an fsync boundary. Cold and out of line: it runs
+/// once an interval, and keeps the per-iteration check above small.
+#[cold]
+#[inline(never)]
+fn save_aligned<A: Application>(
+    app: &A,
+    state: &FsyncState,
+    path: &std::path::Path,
+    lineage: Lineage,
+    genesis_entries: Option<u64>,
+) -> SaveOutcome {
+    let started = Instant::now();
     match snapshot::save::<A>(
         app,
         state.journal_seq,
@@ -212,35 +378,397 @@ fn try_save_snapshot<A: Application>(
         genesis_entries,
         path,
     ) {
-        Ok(()) => {
-            info!(
-                journal_seq = state.journal_seq.get(),
-                path = %path.display(),
-                "shadow snapshot saved"
-            );
-        }
-        Err(e) => {
-            error!(
-                journal_seq = state.journal_seq.get(),
-                error = %e,
-                path = %path.display(),
-                "shadow snapshot failed"
-            );
-        }
+        Ok(bytes) => SaveOutcome::Saved {
+            journal_seq: state.journal_seq,
+            bytes,
+            elapsed: started.elapsed(),
+        },
+        Err(error) => SaveOutcome::Failed {
+            journal_seq: state.journal_seq,
+            error,
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cursors::{RingPos, WireSeq};
+    use crate::cursors::RingPos;
     use crate::pipeline::InputSlot;
     use crate::test_support::{TestApp, TestEvent};
     use melin_journal::JournalEvent;
     use melin_pipeline::ring::DisruptorBuilder;
     use melin_pipeline::seqlock;
-    use std::sync::Arc;
-    use std::time::Instant;
+    use std::sync::{Arc, Mutex};
+    use std::thread::JoinHandle;
+
+    // --- SnapshotSchedule ---
+
+    #[test]
+    fn schedule_attempts_nothing_before_the_first_tick() {
+        let schedule = SnapshotSchedule::default();
+        assert!(!schedule.should_attempt());
+    }
+
+    #[test]
+    fn schedule_keeps_a_deferred_save_due() {
+        let mut schedule = SnapshotSchedule::default();
+        assert_eq!(schedule.on_tick(), None, "nothing was due before");
+        assert!(schedule.should_attempt());
+        schedule.on_deferred();
+        assert!(schedule.should_attempt(), "a deferred save stays due");
+        schedule.on_deferred();
+        assert!(schedule.should_attempt());
+    }
+
+    #[test]
+    fn schedule_saves_at_the_aligned_attempt_after_deferred_ones() {
+        let mut schedule = SnapshotSchedule::default();
+        schedule.on_tick();
+        schedule.on_deferred();
+        schedule.on_deferred();
+        assert_eq!(schedule.on_saved(), 3, "two deferred, then the save");
+        assert!(!schedule.should_attempt(), "a landed save is no longer due");
+    }
+
+    #[test]
+    fn schedule_counts_one_attempt_for_a_save_that_lands_first_time() {
+        let mut schedule = SnapshotSchedule::default();
+        schedule.on_tick();
+        assert_eq!(schedule.on_saved(), 1);
+    }
+
+    #[test]
+    fn schedule_clears_a_failed_save_until_the_next_tick() {
+        let mut schedule = SnapshotSchedule::default();
+        schedule.on_tick();
+        schedule.on_deferred();
+        assert_eq!(schedule.on_failed(), 2);
+        assert!(
+            !schedule.should_attempt(),
+            "a failed save is not retried before the next tick"
+        );
+        assert_eq!(
+            schedule.on_tick(),
+            None,
+            "a failed save is not reported as overdue at the next tick"
+        );
+        assert!(schedule.should_attempt());
+        assert_eq!(
+            schedule.on_failed(),
+            1,
+            "the count restarts after a failure"
+        );
+    }
+
+    #[test]
+    fn schedule_resets_attempts_after_a_save() {
+        let mut schedule = SnapshotSchedule::default();
+        schedule.on_tick();
+        schedule.on_deferred();
+        schedule.on_deferred();
+        schedule.on_saved();
+        schedule.on_tick();
+        assert_eq!(schedule.on_saved(), 1, "the next save counts from zero");
+    }
+
+    #[test]
+    fn schedule_reports_a_save_still_due_at_the_next_tick() {
+        let mut schedule = SnapshotSchedule::default();
+        schedule.on_tick();
+        schedule.on_deferred();
+        schedule.on_deferred();
+        assert_eq!(
+            schedule.on_tick(),
+            Some(2),
+            "deferred for a whole interval: overdue, with its attempts so far"
+        );
+        assert!(schedule.should_attempt(), "still due");
+        schedule.on_deferred();
+        assert_eq!(schedule.on_saved(), 4, "the count runs on across the tick");
+    }
+
+    // --- The shadow's save, threaded ---
+
+    /// The shadow thread's log, captured. A subscriber of the shadow's
+    /// thread alone, so tests running beside it neither see nor disturb
+    /// it. Not `melin_test_node::logs` nor `stall_guards`' sink: the one
+    /// crate is built on this one, the other is another crate's
+    /// integration test.
+    #[derive(Clone, Default)]
+    struct Logs(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Logs {
+        /// The captured lines carrying `message`.
+        fn lines(&self, message: &str) -> Vec<String> {
+            String::from_utf8(self.0.lock().unwrap().clone())
+                .unwrap()
+                .lines()
+                .filter(|line| line.contains(message))
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    /// The value of `field=` on a log line.
+    fn field<'a>(line: &'a str, field: &str) -> &'a str {
+        let start = line
+            .find(&format!(" {field}="))
+            .unwrap_or_else(|| panic!("no {field}= in {line:?}"))
+            + field.len()
+            + 2;
+        line[start..].split_whitespace().next().unwrap()
+    }
+
+    /// A shadow stage on its own thread, its log captured, saving to
+    /// `path` every `interval`.
+    fn spawn_shadow(
+        consumer: ring::Consumer<InputSlot<TestEvent>>,
+        path: PathBuf,
+        interval: Duration,
+        fsync_state: SeqLockReader<FsyncState>,
+        shutdown: &Arc<AtomicBool>,
+    ) -> (JoinHandle<()>, Logs) {
+        let logs = Logs::default();
+        let writer = logs.clone();
+        let shutdown = Arc::clone(shutdown);
+        let handle = std::thread::Builder::new()
+            .name("test-shadow-logged".into())
+            .spawn(move || {
+                let subscriber = tracing_subscriber::fmt()
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::INFO)
+                    .with_writer(move || writer.clone())
+                    .finish();
+                tracing::subscriber::with_default(subscriber, || {
+                    run(
+                        consumer,
+                        TestApp::new(),
+                        path,
+                        interval,
+                        fsync_state,
+                        &shutdown,
+                        WaitStrategy::SpinThenYield,
+                        Lineage::GENESIS,
+                        1,       // starting_wire_seq
+                        Some(0), // genesis_entries
+                    );
+                });
+            })
+            .unwrap();
+        (handle, logs)
+    }
+
+    fn add(n: u64) -> InputSlot<TestEvent> {
+        InputSlot {
+            connection_id: 0,
+            key_hash: 0,
+            sequence: 0,
+            timestamp_ns: 0,
+            event: JournalEvent::App(TestEvent::Add(n)),
+            publish_ts: Default::default(),
+            recv_ts: Default::default(),
+        }
+    }
+
+    /// The journal's fsync boundary after `events` events, one each.
+    fn boundary(events: u64, chain_hash: [u8; 32]) -> FsyncState {
+        FsyncState {
+            journal_seq: WireSeq::new(events),
+            chain_hash,
+            input_ring_seq: RingPos::new(events),
+        }
+    }
+
+    fn wait_for(path: &std::path::Path, deadline: Instant) -> bool {
+        while !path.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        path.exists()
+    }
+
+    /// A save deferred at its tick lands as soon as the shadow meets the
+    /// fsync boundary, not an interval later. The boundary is behind the
+    /// shadow at the first tick and catches up well before the second;
+    /// the snapshot must exist before the second tick could have fired,
+    /// and its line must count more than one attempt, which proves the
+    /// first tick found the shadow off the boundary (so a late first
+    /// tick cannot pass the test by saving at once).
+    #[test]
+    fn deferred_save_lands_at_the_next_boundary_not_the_next_tick() {
+        const INTERVAL: Duration = Duration::from_secs(4);
+        let (mut producer, mut consumers) = DisruptorBuilder::<InputSlot<TestEvent>>::new(64)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
+        // Before the shadow's timer starts, so every tick is later than
+        // the same multiple of the interval from here.
+        let started = Instant::now();
+        // The boundary before the event: misaligned once it is consumed.
+        let (mut fsync_writer, fsync_state) = seqlock::split(boundary(0, [0; 32]));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.snapshot");
+        let (handle, logs) = spawn_shadow(
+            consumers.pop().unwrap(),
+            path.clone(),
+            INTERVAL,
+            fsync_state,
+            &shutdown,
+        );
+        producer.publish(add(9));
+
+        // Past the first tick, with a margin for a late one.
+        std::thread::sleep((INTERVAL + INTERVAL * 3 / 8).saturating_sub(started.elapsed()));
+        assert!(!path.exists(), "no save off the fsync boundary");
+        fsync_writer.store(boundary(1, [0x77; 32]));
+
+        // Before the second tick, which is no earlier than this.
+        let saved = wait_for(&path, started + INTERVAL * 2 - Duration::from_millis(100));
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+        assert!(saved, "the deferred save must land before the next tick");
+
+        let (restored, header) = snapshot::load::<TestApp>(&path).unwrap();
+        assert_eq!(restored.total, 9);
+        assert_eq!(header.sequence, 1);
+        assert_eq!(header.chain_hash, [0x77; 32]);
+        let saved = logs.lines("shadow snapshot saved");
+        assert_eq!(saved.len(), 1, "{saved:?}");
+        let attempts: u64 = field(&saved[0], "attempts").parse().unwrap();
+        assert!(attempts > 1, "the first attempt was deferred: {saved:?}");
+        let bytes: u64 = field(&saved[0], "bytes").parse().unwrap();
+        assert_eq!(bytes, std::fs::metadata(&path).unwrap().len());
+        let elapsed_ms: f64 = field(&saved[0], "elapsed_ms").parse().unwrap();
+        assert!(elapsed_ms >= 0.0);
+        assert_eq!(field(&saved[0], "journal_seq"), "1");
+    }
+
+    /// A save still deferred a whole interval after it fell due is
+    /// reported, once a tick rather than once an attempt, and keeps being
+    /// retried until it lands.
+    #[test]
+    fn save_deferred_for_an_interval_warns_once_a_tick_and_still_lands() {
+        const INTERVAL: Duration = Duration::from_millis(50);
+        let (mut producer, mut consumers) = DisruptorBuilder::<InputSlot<TestEvent>>::new(64)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
+        let started = Instant::now();
+        let (mut fsync_writer, fsync_state) = seqlock::split(boundary(0, [0; 32]));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.snapshot");
+        let (handle, logs) = spawn_shadow(
+            consumers.pop().unwrap(),
+            path.clone(),
+            INTERVAL,
+            fsync_state,
+            &shutdown,
+        );
+        producer.publish(add(4));
+
+        // Wait for the overdue report, then align.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while logs.lines("deferred for a whole interval").is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!path.exists(), "no save off the fsync boundary");
+        // More events while the save is due: it lands at the boundary
+        // that covers them, with their state.
+        producer.publish(add(5));
+        fsync_writer.store(boundary(2, [0x33; 32]));
+        let saved = wait_for(&path, Instant::now() + Duration::from_secs(10));
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+        let ran = started.elapsed();
+        assert!(saved, "the save must land once aligned");
+        let (restored, header) = snapshot::load::<TestApp>(&path).unwrap();
+        assert_eq!(restored.total, 9);
+        assert_eq!(header.sequence, 2);
+
+        let overdue = logs.lines("deferred for a whole interval");
+        assert!(!overdue.is_empty(), "an overdue save is reported");
+        // At most one report a tick: a report per attempt would be
+        // thousands.
+        let ticks = (ran.as_millis() / INTERVAL.as_millis()) as usize + 1;
+        assert!(
+            overdue.len() <= ticks,
+            "{} reports in {ran:?}",
+            overdue.len()
+        );
+        assert!(overdue[0].contains("WARN"), "{overdue:?}");
+        let saved = logs.lines("shadow snapshot saved");
+        assert!(!saved.is_empty());
+        let attempts: u64 = field(&saved[0], "attempts").parse().unwrap();
+        let reported: u64 = field(&overdue[overdue.len() - 1], "attempts")
+            .parse()
+            .unwrap();
+        assert!(
+            attempts > reported,
+            "the save counts every attempt since it fell due: {saved:?} {overdue:?}"
+        );
+    }
+
+    /// A save that fails is not retried at loop frequency: one attempt,
+    /// and one error line, a tick.
+    #[test]
+    fn failed_save_is_retried_once_a_tick() {
+        const INTERVAL: Duration = Duration::from_millis(50);
+        let (mut producer, mut consumers) = DisruptorBuilder::<InputSlot<TestEvent>>::new(64)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
+        let started = Instant::now();
+        let (_fsync_writer, fsync_state) = seqlock::split(boundary(1, [0; 32]));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let dir = tempfile::tempdir().unwrap();
+        // A directory that does not exist: every save fails.
+        let path = dir.path().join("missing").join("test.snapshot");
+        let (handle, logs) = spawn_shadow(
+            consumers.pop().unwrap(),
+            path.clone(),
+            INTERVAL,
+            fsync_state,
+            &shutdown,
+        );
+        producer.publish(add(1));
+
+        // Several intervals' worth of failures.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while logs.lines("shadow snapshot failed").len() < 3 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+        let ran = started.elapsed();
+
+        let failed = logs.lines("shadow snapshot failed");
+        assert!(failed.len() >= 3, "{failed:?}");
+        let ticks = (ran.as_millis() / INTERVAL.as_millis()) as usize + 1;
+        assert!(
+            failed.len() <= ticks,
+            "{} failures in {ran:?}",
+            failed.len()
+        );
+        for line in &failed {
+            assert!(line.contains("ERROR"), "{line}");
+            assert_eq!(field(line, "attempts"), "1", "{line}");
+        }
+        assert!(logs.lines("shadow snapshot saved").is_empty());
+        assert!(
+            logs.lines("deferred for a whole interval").is_empty(),
+            "a failed save is not a deferred one"
+        );
+    }
 
     #[test]
     fn shadow_shutdown_exits_promptly() {

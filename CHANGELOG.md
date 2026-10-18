@@ -47,6 +47,11 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   `run_receiver`, `run_receiver_dpdk` and `DpdkReplicationDriver::new`
   take the store in place of their journal and snapshot paths, and
   `Sender`'s `journal_path` field is now `store`.
+- **`melin_transport_core::snapshot::save` returns the size it wrote**
+  (`Result<u64, SnapshotError>`; it returned `Result<(), _>`).
+  Source-breaking where the result was used as a `Result<(), _>` (matched
+  on `Ok(())`, returned as a function's tail, or passed on as one);
+  callers that apply `?` or discard the value are unaffected.
 
 ### Removed
 
@@ -67,6 +72,15 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Fixed
 
+- **A snapshot deferred under load is retried, not skipped for an
+  interval.** The shadow stage saves only at a journal fsync boundary,
+  and tried once per `--snapshot-interval-ms`: under sustained load it
+  could miss the boundary at every tick and go several intervals without
+  a snapshot, logging nothing. A due save is now attempted until it
+  lands; a save still waiting at the next interval logs a warning, and a
+  failed save is retried at the next interval rather than continuously.
+  The `shadow snapshot saved` line now carries `bytes`, `elapsed_ms` and
+  `attempts`, and `shadow snapshot failed` carries `attempts`.
 - **A primary with `--snapshot-path` recovers from, and serves, its own
   snapshot** (the location half of findings 21 and 22 of the
   determinism audit). It used to ignore that snapshot at boot and when a

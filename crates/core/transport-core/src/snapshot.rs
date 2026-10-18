@@ -362,6 +362,10 @@ impl SnapshotHeader {
 /// `genesis_entries` is the lineage's genesis length from the journal
 /// header. A lineage that knows neither it nor an ack policy writes a v2
 /// file, which has a field for neither; any other a v4 file.
+///
+/// Returns the size of the file written, in bytes: the shadow stage logs
+/// it with each save, so an operator sees what a save costs. `u64`, the
+/// type of a file length and of the size cap.
 pub fn save<A: Application>(
     app: &A,
     journal_sequence: WireSeq,
@@ -369,7 +373,7 @@ pub fn save<A: Application>(
     lineage: Lineage,
     genesis_entries: Option<u64>,
     path: &Path,
-) -> Result<(), SnapshotError> {
+) -> Result<u64, SnapshotError> {
     save_with_limit::<A>(
         app,
         journal_sequence,
@@ -391,7 +395,7 @@ fn save_with_limit<A: Application>(
     genesis_entries: Option<u64>,
     path: &Path,
     max_size: u64,
-) -> Result<(), SnapshotError> {
+) -> Result<u64, SnapshotError> {
     let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     let v4 = genesis_entries.is_some() || lineage.ack_policy.is_some();
     let transport_version = if v4 {
@@ -446,8 +450,9 @@ fn save_with_limit<A: Application>(
     // Refuse to write a file the matching `load` would reject. Without
     // this guard a runaway `Application::snapshot` produces a file that
     // every subsequent recovery fails on.
-    if buf.len() as u64 > max_size {
-        return Err(SnapshotError::TooLarge(buf.len() as u64));
+    let size = buf.len() as u64;
+    if size > max_size {
+        return Err(SnapshotError::TooLarge(size));
     }
 
     let tmp_path = with_suffix(path, TMP_SUFFIX);
@@ -507,7 +512,7 @@ fn save_with_limit<A: Application>(
     std::fs::rename(&tmp_path, path)?;
     fsync_dir(parent)?;
 
-    Ok(())
+    Ok(size)
 }
 
 /// Load a snapshot from `path`. Returns the restored application with the
@@ -918,7 +923,7 @@ mod tests {
         let app = populated_app();
 
         // First save — no previous snapshot exists; `.prev` is not created.
-        save::<TestApp>(
+        let first_size = save::<TestApp>(
             &app,
             WireSeq::new(1),
             [0x11; 32],
@@ -933,10 +938,17 @@ mod tests {
             "no .prev file should be created on first save"
         );
         let first_bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            first_size,
+            first_bytes.len() as u64,
+            "save returns the size of the file it wrote"
+        );
 
         // Second save — previous snapshot must be rotated to .prev verbatim.
-        save::<TestApp>(
-            &app,
+        // A smaller state, so the returned size is the new file's, not
+        // the one it replaced.
+        let second_size = save::<TestApp>(
+            &TestApp::new(),
             WireSeq::new(2),
             [0x22; 32],
             at_epoch(0),
@@ -945,6 +957,11 @@ mod tests {
         )
         .unwrap();
         assert!(path.exists());
+        assert_eq!(second_size, std::fs::metadata(&path).unwrap().len());
+        assert!(
+            second_size < first_size,
+            "an empty state's snapshot is smaller than a populated one's"
+        );
         assert!(prev_path.exists(), "second save must produce a .prev file");
         assert_eq!(
             std::fs::read(&prev_path).unwrap(),
@@ -1241,6 +1258,48 @@ mod tests {
             !tmp.exists(),
             "save_with_limit must not leave a .tmp on size-check failure"
         );
+    }
+
+    /// A snapshot of exactly the cap is written (the cap is inclusive,
+    /// as `load`'s is), and the size returned is the file's: the
+    /// header, the application payload and the CRC.
+    #[test]
+    fn save_at_exactly_the_cap_returns_the_file_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snap");
+        let app = populated_app();
+        let expected = (HEADER_SIZE + payload_of(&app).len() + CRC_SIZE) as u64;
+
+        let size = save_with_limit::<TestApp>(
+            &app,
+            WireSeq::new(3),
+            [0x5A; 32],
+            at_epoch(1),
+            Some(0),
+            &path,
+            /* max_size */ expected,
+        )
+        .unwrap();
+        assert_eq!(size, expected);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), expected);
+        let (restored, header) = load::<TestApp>(&path).unwrap();
+        assert_eq!(restored, app);
+        assert_eq!(header.sequence, 3);
+
+        // One byte under it refuses, and leaves the saved file alone.
+        match save_with_limit::<TestApp>(
+            &app,
+            WireSeq::new(4),
+            [0x5A; 32],
+            at_epoch(1),
+            Some(0),
+            &path,
+            /* max_size */ expected - 1,
+        ) {
+            Err(SnapshotError::TooLarge(size)) => assert_eq!(size, expected),
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+        assert_eq!(load::<TestApp>(&path).unwrap().1.sequence, 3);
     }
 
     #[test]
