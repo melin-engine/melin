@@ -9,9 +9,23 @@ use notary_server::{
     KIND_NOTARIZE, KIND_RESP_RECEIPT, KIND_RESP_REJECTED as NOTARY_REJECTED, LEAF_LEN,
 };
 
-/// Bytes a request's fingerprint takes: the client's index and the
+/// Bytes a request's fingerprint takes: the client's number and the
 /// request's number on its connection.
 const FINGERPRINT_LEN: usize = 12;
+
+/// A client's number across the whole run, whichever thread drives it:
+/// what its requests' fingerprints and its errors carry. A type of its own
+/// so that a thread's index into its own clients is never taken for one.
+/// `u32`: the fingerprint's width, and far more connections than a run
+/// opens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClientId(pub u32);
+
+impl std::fmt::Display for ClientId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
 pub enum AppKind {
@@ -59,7 +73,7 @@ impl App {
 
     /// Write request `seq` of `client` into `out`, returning its length.
     /// `out` holds at least [`max_body`](Self::max_body) bytes.
-    pub fn encode(&self, out: &mut [u8], client: u32, seq: u64) -> usize {
+    pub fn encode(&self, out: &mut [u8], client: ClientId, seq: u64) -> usize {
         let body = &mut out[..self.max_body()];
         match self {
             Self::Echo { .. } => {
@@ -78,7 +92,7 @@ impl App {
     }
 
     /// Check `reply`, the response to request `seq` of `client`.
-    pub fn check(&self, reply: &[u8], client: u32, seq: u64) -> Result<(), String> {
+    pub fn check(&self, reply: &[u8], client: ClientId, seq: u64) -> Result<(), String> {
         let (expected, rejected) = match self {
             Self::Echo { .. } => (KIND_RESP_ECHO, ECHO_REJECTED),
             Self::Notary => (KIND_RESP_RECEIPT, NOTARY_REJECTED),
@@ -111,10 +125,10 @@ impl App {
     }
 }
 
-/// The client's index and the request's number, little-endian, at the
+/// The client's number and the request's number, little-endian, at the
 /// start of `out`.
-fn fingerprint(out: &mut [u8], client: u32, seq: u64) {
-    out[..4].copy_from_slice(&client.to_le_bytes());
+fn fingerprint(out: &mut [u8], client: ClientId, seq: u64) {
+    out[..4].copy_from_slice(&client.0.to_le_bytes());
     out[4..FINGERPRINT_LEN].copy_from_slice(&seq.to_le_bytes());
 }
 
@@ -124,7 +138,7 @@ mod tests {
 
     fn request(app: App, client: u32, seq: u64) -> Vec<u8> {
         let mut out = vec![0xAA; app.max_body() + 8];
-        let n = app.encode(&mut out, client, seq);
+        let n = app.encode(&mut out, ClientId(client), seq);
         out.truncate(n);
         out
     }
@@ -137,13 +151,20 @@ mod tests {
 
         let mut reply = vec![KIND_RESP_ECHO];
         reply.extend_from_slice(&sent);
-        app.check(&reply, 3, 41).unwrap();
-        assert!(app.check(&reply, 3, 42).is_err(), "another request's echo");
-        assert!(app.check(&reply, 4, 41).is_err(), "another client's echo");
-        assert!(app.check(&reply[..32], 3, 41).is_err(), "a short echo");
-        let rejected = app.check(&[ECHO_REJECTED], 3, 41).unwrap_err();
+        let (three, four) = (ClientId(3), ClientId(4));
+        app.check(&reply, three, 41).unwrap();
+        assert!(
+            app.check(&reply, three, 42).is_err(),
+            "another request's echo"
+        );
+        assert!(
+            app.check(&reply, four, 41).is_err(),
+            "another client's echo"
+        );
+        assert!(app.check(&reply[..32], three, 41).is_err(), "a short echo");
+        let rejected = app.check(&[ECHO_REJECTED], three, 41).unwrap_err();
         assert!(rejected.contains("rejected"), "{rejected}");
-        assert!(app.check(&[], 3, 41).is_err());
+        assert!(app.check(&[], three, 41).is_err());
     }
 
     #[test]
@@ -155,10 +176,11 @@ mod tests {
         assert_eq!(a[0], KIND_NOTARIZE);
         assert_ne!(a, b, "two requests notarize two leaves");
 
-        app.check(&[KIND_RESP_RECEIPT, 0, 0], 0, 1).unwrap();
-        let rejected = app.check(&[NOTARY_REJECTED], 0, 1).unwrap_err();
+        let zero = ClientId(0);
+        app.check(&[KIND_RESP_RECEIPT, 0, 0], zero, 1).unwrap();
+        let rejected = app.check(&[NOTARY_REJECTED], zero, 1).unwrap_err();
         assert!(rejected.contains("rejected"), "{rejected}");
-        assert!(app.check(&[0x99], 0, 1).is_err());
+        assert!(app.check(&[0x99], zero, 1).is_err());
     }
 
     #[test]

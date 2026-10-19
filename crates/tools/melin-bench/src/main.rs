@@ -1,15 +1,16 @@
 //! `melin-bench`: a closed-loop load generator for the example
 //! applications. `--clients` connections, each keeping `--window`
-//! requests in flight, all driven from one thread over kernel TCP or a
-//! DPDK NIC; replies arriving inside the measured phase are timed, and the
+//! requests in flight, driven over kernel TCP from `--threads` threads
+//! (one by default), or from one thread over a DPDK NIC; replies arriving
+//! inside the measured phase are timed, and the
 //! run's throughput and latency percentiles are printed and, with
 //! `--json`, written in the shape the Exchange Core's bench writes, so
 //! the LAN suite (`scripts/bench/`) reads every application's results the
 //! same way.
 //!
 //! A run: dial and authenticate every client, then warm up, measure and
-//! cool down under the same load, and finally stop sending and wait for
-//! the requests still in flight. The latency of a request is from its
+//! cool down under the same load, every thread over the same window, and
+//! finally stop sending and wait for the requests still in flight. The latency of a request is from its
 //! send to its reply frame, not to the batch end after it. On kernel TCP,
 //! the requests a connection sends in one pass of the loop leave in one
 //! write, not one each.
@@ -21,6 +22,7 @@ mod batched;
 #[cfg(feature = "dpdk")]
 mod dpdk;
 mod load;
+mod shard;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -28,13 +30,12 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
-use melin_client::{
-    DEFAULT_TIMEOUT, NonBlockingTcp, PolledConnection, REQUEST_HEADER_LEN, SigningKey, key,
-};
+use melin_client::{DEFAULT_TIMEOUT, NonBlockingTcp, REQUEST_HEADER_LEN, key};
 
-use app::{App, AppKind};
+use app::{App, AppKind, ClientId};
 use batched::Batched;
 use load::{Outcome, Plan, Streams};
+use shard::Shards;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
 enum TransportKind {
@@ -95,7 +96,13 @@ struct Cli {
     #[arg(long)]
     json: Option<PathBuf>,
 
-    /// Pin the loop's thread to this core once the connections are up.
+    /// Load threads, the clients dealt among them round-robin, each
+    /// connecting and loading its own. Kernel TCP only: a DPDK NIC is
+    /// driven from one thread.
+    #[arg(long, default_value_t = 1)]
+    threads: usize,
+
+    /// Pin load thread `i` to core `CORE + i` once its connections are up.
     #[arg(long)]
     core: Option<usize>,
 
@@ -138,6 +145,14 @@ fn run(cli: Cli) -> Result<(), Error> {
     if cli.duration.is_zero() {
         return Err("--duration must be longer than zero".into());
     }
+    let shards = Shards::new(cli.threads, cli.clients)?;
+    if cli.transport == TransportKind::Dpdk && shards.threads() > 1 {
+        return Err(format!(
+            "--threads {} is for --transport kernel: a DPDK NIC is driven from one thread",
+            cli.threads
+        )
+        .into());
+    }
     let plan = Plan {
         window: cli.window,
         warmup: cli.warmup_duration,
@@ -151,7 +166,7 @@ fn run(cli: Cli) -> Result<(), Error> {
         melin_app::affinity::capture_home_mask();
     }
 
-    let outcome = match cli.transport {
+    let outcomes = match cli.transport {
         TransportKind::Kernel => {
             #[cfg(feature = "dpdk")]
             if let Some(flag) = cli.dpdk.first_given() {
@@ -162,14 +177,28 @@ fn run(cli: Cli) -> Result<(), Error> {
                 .into());
             }
             let frame_len = REQUEST_HEADER_LEN + app.max_body();
-            let mut streams = Kernel::connect(cli.addr, cli.clients, cli.window, frame_len)?;
-            measure(&mut streams, &cli, &key, app, plan)?
+            // One origin for every thread's clock: the run's start is read
+            // on one of them and compared on all.
+            let origin = Instant::now();
+            shard::run(shards, |index, ids, shared| {
+                let connect = |ids: &[ClientId]| {
+                    let streams = Kernel::connect(cli.addr, ids, cli.window, frame_len, origin)?;
+                    pin(cli.core, index)?;
+                    Ok(streams)
+                };
+                load::shard(connect, ids, &key, app, plan, shared)
+            })
         }
         #[cfg(feature = "dpdk")]
-        TransportKind::Dpdk => {
-            let mut streams = dpdk::Nic::connect(&cli.dpdk, cli.addr, cli.clients)?;
-            measure(&mut streams, &cli, &key, app, plan)?
-        }
+        TransportKind::Dpdk => shard::run(shards, |index, ids, shared| {
+            let connect = |ids: &[ClientId]| {
+                let streams =
+                    dpdk::Nic::connect(&cli.dpdk, cli.addr, ids).map_err(|e| e.to_string())?;
+                pin(cli.core, index)?;
+                Ok(streams)
+            };
+            load::shard(connect, ids, &key, app, plan, shared)
+        }),
         #[cfg(not(feature = "dpdk"))]
         TransportKind::Dpdk => {
             return Err(
@@ -178,14 +207,15 @@ fn run(cli: Cli) -> Result<(), Error> {
                     .into(),
             );
         }
-    };
+    }?;
 
     let results = Results {
         app,
         clients: cli.clients,
         window: cli.window,
+        threads: shards.threads(),
         plan,
-        outcome,
+        outcome: load::merge(outcomes)?,
     };
     print!("{}", results.summary());
     if let Some(path) = &cli.json {
@@ -196,56 +226,49 @@ fn run(cli: Cli) -> Result<(), Error> {
     Ok(())
 }
 
-/// Pin if asked, then run the load over `streams`.
-fn measure<S: Streams>(
-    streams: &mut S,
-    cli: &Cli,
-    key: &SigningKey,
-    app: App,
-    plan: Plan,
-) -> Result<Outcome, Error> {
-    if let Some(core) = cli.core {
-        // After the connections are up: a DPDK NIC's EAL pins the thread
-        // that initialises it to its main lcore, which would undo a pin
-        // taken before.
-        let core =
-            melin_app::affinity::pin_to_core(core).map_err(|e| format!("--core {core}: {e}"))?;
-        eprintln!("pinned to core {core}");
-    }
-    let connections = (0..cli.clients)
-        .map(|_| PolledConnection::new(key))
-        .collect();
-    Ok(load::run(streams, connections, app, plan)?)
+/// Pin load thread `index` to `core + index`, if asked. After its
+/// connections are up: a DPDK NIC's EAL pins the thread that initialises
+/// it to its main lcore, which would undo a pin taken before.
+fn pin(core: Option<usize>, index: usize) -> Result<(), String> {
+    let Some(core) = core else {
+        return Ok(());
+    };
+    let wanted = core + index;
+    let pinned = melin_app::affinity::pin_to_core(wanted)
+        .map_err(|e| format!("--core {core}: load thread {index} on core {wanted}: {e}"))?;
+    eprintln!("load thread {index} pinned to core {pinned}");
+    Ok(())
 }
 
 /// Kernel sockets, one per client, each writing a pass's requests at once,
-/// on a clock of the process's own.
+/// on a clock every thread of the run shares.
 struct Kernel {
-    // A `Vec` indexed by client: the loop visits every one in turn.
+    // A `Vec` indexed by the thread's client: the loop visits every one in
+    // turn.
     sockets: Vec<Batched<NonBlockingTcp>>,
     origin: Instant,
 }
 
 impl Kernel {
-    /// Dial `clients` sockets to `addr`, each holding up to `window`
-    /// requests of `frame_len` bytes between writes.
+    /// Dial a socket to `addr` for each of `clients`, each holding up to
+    /// `window` requests of `frame_len` bytes between writes, on a clock
+    /// counting from `origin`.
     fn connect(
         addr: SocketAddr,
-        clients: usize,
+        clients: &[ClientId],
         window: usize,
         frame_len: usize,
-    ) -> Result<Self, Error> {
-        let sockets = (0..clients)
-            .map(|_| {
+        origin: Instant,
+    ) -> Result<Self, String> {
+        let sockets = clients
+            .iter()
+            .map(|client| {
                 NonBlockingTcp::connect(addr, DEFAULT_TIMEOUT)
                     .map(|socket| Batched::new(socket, window, frame_len))
+                    .map_err(|e| format!("client {client}: cannot connect to {addr}: {e}"))
             })
-            .collect::<Result<_, _>>()
-            .map_err(|e| format!("cannot connect to {addr}: {e}"))?;
-        Ok(Self {
-            sockets,
-            origin: Instant::now(),
-        })
+            .collect::<Result<_, _>>()?;
+        Ok(Self { sockets, origin })
     }
 }
 
@@ -272,6 +295,7 @@ struct Results {
     app: App,
     clients: usize,
     window: usize,
+    threads: usize,
     plan: Plan,
     outcome: Outcome,
 }
@@ -299,10 +323,12 @@ impl Results {
     fn summary(&self) -> String {
         let latency = &self.outcome.latency;
         let mut out = format!(
-            "=== {} — {} clients × window {} ===\n  throughput: {:.0} requests/sec ({} timed)\n",
+            "=== {} — {} clients × window {}, {} load thread(s) ===\n  throughput: {:.0} \
+             requests/sec ({} timed)\n",
             self.app.name(),
             self.clients,
             self.window,
+            self.threads,
             self.throughput(),
             self.measured_requests(),
         );
@@ -329,12 +355,13 @@ impl Results {
         }
         percentiles.push_str(&format!(",\"max_us\":{}", us(latency.max())));
         let mut out = format!(
-            "{{\"label\":\"{}\",\"clients\":{},\"window\":{},\"measured_requests\":{},\
+            "{{\"label\":\"{}\",\"clients\":{},\"window\":{},\"threads\":{},\"measured_requests\":{},\
              \"completed_requests\":{},\"warmup_ms\":{},\"measured_ms\":{},\"cooldown_ms\":{},\"wall_ms\":{},\
              \"throughput_ops\":{:.1},\"latency\":{{{percentiles}}}}}",
             self.app.name(),
             self.clients,
             self.window,
+            self.threads,
             self.measured_requests(),
             self.outcome.completed,
             self.plan.warmup.as_millis(),

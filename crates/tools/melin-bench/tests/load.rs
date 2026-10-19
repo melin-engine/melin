@@ -54,6 +54,51 @@ fn every_notarization_answered_is_journaled() {
 }
 
 #[test]
+fn every_echo_answered_across_threads_is_journaled() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let node = start_echo(dir.path(), "writer");
+    let addr = node.addr().to_string();
+    // Three clients over two threads: one thread drives two of them.
+    let json = load(
+        dir.path(),
+        &["--app", "echo", "--threads", "2", "--addr", &addr],
+    );
+    node.stop();
+    assert_eq!(field(&json, "threads"), 2, "{json}");
+    assert_eq!(
+        journaled_echoes(dir.path(), 64),
+        field(&json, "completed_requests"),
+        "{json}"
+    );
+}
+
+#[test]
+fn a_thread_count_the_run_cannot_use_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for (threads, transport) in [("0", "kernel"), ("4", "kernel"), ("2", "dpdk")] {
+        let output = run(
+            dir.path(),
+            &[
+                "--app",
+                "echo",
+                "--clients",
+                "3",
+                "--threads",
+                threads,
+                "--transport",
+                transport,
+            ],
+        );
+        assert_eq!(output.status.code(), Some(2));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.starts_with(&format!("error: --threads {threads}")),
+            "{stderr}"
+        );
+    }
+}
+
+#[test]
 fn a_key_without_the_writing_role_fails_the_run() {
     let dir = tempfile::tempdir().expect("tempdir");
     // Authorized as a reader: may connect, may not echo.

@@ -25,6 +25,12 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   waiting for it to finish, with the error returned and the length
   non-zero by type (`sync_file_range` reads a zero length as "to the end
   of the file").
+- **`melin-bench --threads N`**: the clients dealt round-robin across `N`
+  load threads on kernel TCP, thread `i` pinned to `--core` + `i`, as the
+  Exchange Core's bench does with `--bench-threads`. Every thread measures
+  the same window, a failure in any thread stops the run, and the JSON
+  results carry `threads`. One thread by default; refused on DPDK and
+  above `--clients`.
 
 ### Changed
 

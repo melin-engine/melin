@@ -7,6 +7,7 @@ use melin_client::{DEFAULT_TIMEOUT, NicClock, NicHandle, NicStream, StreamId, di
 use melin_dpdk::DpdkArgs;
 
 use crate::Error;
+use crate::app::ClientId;
 use crate::load::{Streams, nanos};
 
 /// Each stream's receive and transmit buffer: room for a window of
@@ -21,9 +22,9 @@ pub struct Nic {
 }
 
 impl Nic {
-    /// Bring the NIC up from `args` and dial `clients` streams to `addr`,
-    /// one at a time, as a DPDK node takes them.
-    pub fn connect(args: &DpdkArgs, addr: SocketAddr, clients: usize) -> Result<Self, Error> {
+    /// Bring the NIC up from `args` and dial a stream to `addr` for each of
+    /// `clients`, one at a time, as a DPDK node takes them.
+    pub fn connect(args: &DpdkArgs, addr: SocketAddr, clients: &[ClientId]) -> Result<Self, Error> {
         let addr = dial_addr(addr).map_err(|why| format!("--addr {addr}: {why}"))?;
         let config = args.nic_config()?;
         let mut nic = NicHandle::open(&config).map_err(melin_client::Error::Nic)?;
@@ -32,8 +33,8 @@ impl Nic {
             eprintln!("warning: {warning}");
         }
         let clock = nic.clock();
-        let mut streams = Vec::with_capacity(clients);
-        for client in 0..clients {
+        let mut streams = Vec::with_capacity(clients.len());
+        for client in clients {
             let deadline_ns = clock.now_ns() + nanos(DEFAULT_TIMEOUT);
             let id = nic
                 .dial(addr, SOCKET_BUFFER, deadline_ns, || clock.now_ns())
