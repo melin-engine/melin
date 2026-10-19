@@ -91,10 +91,11 @@ up. A replica that has only just caught up can still be busy with what
 it received, and full load arriving within a second or two of that can
 evict it; at the default replication ring size it then cannot rejoin
 under that load, and the run is degraded. `SETTLE_SECS` waits that many
-seconds between the replicas going live and the load starting: 5 is
-enough on current hardware. The default, 0, starts the load straight
-away, which is what a cluster taking traffic as soon as its replicas are
-live would face.
+seconds between the replicas going live and the load starting, 5 by
+default, which is enough on current hardware. `SETTLE_SECS=0` starts the
+load straight away, which is what a cluster taking traffic as soon as its
+replicas are live would face; the Exchange Core evicts a replica under it
+on current builds.
 
 `PREBUILT_BIN_DIR` names a local directory whose binaries replace the
 suite's own builds of the same name, to compare a build made elsewhere

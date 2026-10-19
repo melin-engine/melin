@@ -84,6 +84,11 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   Exchange Core's state at 100,000 accounts is about 480 MB. A load still
   reads the snapshot whole, so the limit no longer bounds the memory a
   load takes.
+- **The LAN bench suite waits 5 s between both replicas going live and
+  the load** (`SETTLE_SECS`, which defaulted to 0). Full load on a
+  replica that has only just caught up evicted it into a rejoin loop for
+  the rest of the run, as on the Exchange Core; `SETTLE_SECS=0` restores
+  the old behaviour.
 
 ### Removed
 

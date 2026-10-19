@@ -49,7 +49,7 @@
 #   WARMUP_DURATION       load before the measured phase (default 5s)
 #   COOLDOWN_DURATION     load after it, untimed (default 5s)
 #   SETTLE_SECS           seconds between both replicas live and the load
-#                         starting (default 0)
+#                         starting (default 5; 0 starts it at once)
 #   ACK_POLICY            the cluster's ack policy (default disk+ram)
 #   BENCH_CORE            core the load generator's loop is pinned to
 #                         (default 7)
@@ -155,6 +155,13 @@ SINGLE_DURATION="${SINGLE_DURATION:-30s}"
 WARMUP_DURATION="${WARMUP_DURATION:-5s}"
 COOLDOWN_DURATION="${COOLDOWN_DURATION:-5s}"
 ACK_POLICY="${ACK_POLICY:-disk+ram}"
+# Not 0: a replica that has only just caught up is still cold, and full
+# load arriving within a second or two evicts it into a rejoin loop it
+# cannot leave at that rate. A workaround, until the fix described in
+# docs/internal/roadmap.md, "A replica that falls behind at full rate
+# cannot rejoin, and a new history serves before its replicas are live",
+# makes a node wait for warm replicas itself.
+SETTLE_SECS="${SETTLE_SECS:-5}"
 BENCH_CORE="${BENCH_CORE:-7}"
 SERVER_EXTRA_ARGS="${SERVER_EXTRA_ARGS:-}"
 REPLICA_EXTRA_ARGS="${REPLICA_EXTRA_ARGS:-}"
@@ -397,7 +404,7 @@ suite_settings() {
         SERVER_EXTRA_ARGS REPLICA_EXTRA_ARGS BENCH_EXTRA_ARGS; do
         printf '%s=%s\n' "$var" "${!var}"
     done
-    printf '%s=%s\n' SETTLE_SECS "${SETTLE_SECS:-0}" RUST_LOG "$NODE_RUST_LOG" \
+    printf '%s=%s\n' SETTLE_SECS "$SETTLE_SECS" RUST_LOG "$NODE_RUST_LOG" \
         PREBUILT_BIN_DIR "${PREBUILT_BIN_DIR:-}" RESULTS_DIR "$RESULTS_DIR"
 }
 
@@ -944,7 +951,7 @@ start_cluster() {
     # live, so this waits for the replicas too.
     wait_for_log "$SERVER" "$primary_ready" 120 || return 1
     wait_for_replicas 2 || return 1
-    if (( ${SETTLE_SECS:-0} > 0 )); then
+    if (( SETTLE_SECS > 0 )); then
         echo "  settling ${SETTLE_SECS}s before the load"
         sleep "$SETTLE_SECS"
     fi
