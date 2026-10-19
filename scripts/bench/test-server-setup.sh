@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Tests for server-setup.sh's kernel-parameter verification, and for the
-# udev rule that tunes the journal disk.
+# udev rule that tunes the journal disk and the read-back that checks it.
 #
 # This is the half of the setup script that has no other safety net: it
 # is what stands between "the params were applied" and the silent no-op
@@ -28,13 +28,19 @@ fi
 TMP_ROOT=$(mktemp -d)
 trap 'rm -rf "$TMP_ROOT"' EXIT
 
-# Pull the two verification functions out of the setup script. Sourcing
-# the whole script is not an option: it is a root-only provisioner that
-# would start installing packages. Anchoring on `^name() {` .. `^}` works
-# because the file is shfmt-shaped — the closing brace of a top-level
-# function is the only `}` in column 0 within its range.
+# Pull the functions under test, and the journal tuning list two of them
+# share, out of the setup script. Sourcing the whole script is not an
+# option: it is a root-only provisioner that would start installing
+# packages. Anchoring on `^name() {` .. `^}` works because the file is
+# shfmt-shaped — the closing brace of a top-level function is the only
+# `}` in column 0 within its range, as the closing parenthesis of a
+# top-level array is the only `)` in column 0 within its.
 extract_fn() {
     awk "/^$1\(\) \{/,/^\}/" "$SETUP_SCRIPT"
+}
+
+extract_array() {
+    awk "/^$1=\(/,/^\)/" "$SETUP_SCRIPT"
 }
 
 FN_FILE="${TMP_ROOT}/fns.sh"
@@ -46,11 +52,13 @@ FN_FILE="${TMP_ROOT}/fns.sh"
     extract_fn write_grub_dropin
     extract_fn verify_kernel_params
     extract_fn write_journal_udev_rule
+    extract_fn verify_journal_queue_tuning
+    extract_array JOURNAL_QUEUE_TUNING
 } > "$FN_FILE"
 
 for fn in kernel_param_live kernel_param_in_cfg kernel_param_values_in_cfg \
     resolve_physical_cores write_grub_dropin verify_kernel_params \
-    write_journal_udev_rule; do
+    write_journal_udev_rule verify_journal_queue_tuning; do
     if ! grep -q "^${fn}() {" "$FN_FILE"; then
         echo "error: failed to extract ${fn} from server-setup.sh — has it been" >&2
         echo "  renamed or reformatted? These tests are now vacuous; fix the" >&2
@@ -61,6 +69,14 @@ done
 
 # shellcheck source=/dev/null
 source "$FN_FILE"
+
+if ! declare -p JOURNAL_QUEUE_TUNING >/dev/null 2>&1 \
+    || [[ "${#JOURNAL_QUEUE_TUNING[@]}" -eq 0 ]]; then
+    echo "error: failed to extract JOURNAL_QUEUE_TUNING from server-setup.sh —" >&2
+    echo "  has it been renamed or reformatted? The journal tuning tests are" >&2
+    echo "  now vacuous; fix the extraction before trusting a pass." >&2
+    exit 1
+fi
 
 PASS=0
 FAIL=0
@@ -260,7 +276,6 @@ echo "=== server-setup.sh journal udev rule ==="
 # drives they swapped across the setup's own reboot, so a rule keyed on
 # `nvme0n1` tuned the OS disk and left the journal untuned.
 # ---------------------------------------------------------------------
-JOURNAL_QUEUE_TUNING=("scheduler none" "nr_requests 4" "nomerges 2")
 UUID_A="38781855-bba1-4d2e-b375-e7619b2edfed"
 RULE="${TMP_ROOT}/99-melin-journal-nvme.rules"
 write_journal_udev_rule "$RULE" "$UUID_A"
@@ -289,6 +304,29 @@ if [[ "${#missing[@]}" -eq 0 && $(grep -c '^ACTION' "$RULE") -eq 1 ]]; then
     ok "every tuning setting is in the rule, on one line"
 else
     bad "the rule is missing settings: ${missing[*]}" "$(cat "$RULE")"
+fi
+
+# udev applies the assignments left to right, and switching the scheduler
+# resets nr_requests: set after it, the scheduler would undo the queue
+# depth the rule just asked for.
+first_attr=""
+[[ "$rule_line" =~ ATTR\{queue/([a-z_]+)\} ]] && first_attr="${BASH_REMATCH[1]}"
+if [[ "$first_attr" == "scheduler" ]]; then
+    ok "the rule sets the scheduler before anything it resets"
+else
+    bad "the scheduler must be the rule's first setting" "$rule_line"
+fi
+
+# The kernel raises an nr_requests below its floor of 4 (BLKDEV_MIN_RQ)
+# without a word, and the read-back would then fail every setup.
+below_floor=()
+for param in "${JOURNAL_QUEUE_TUNING[@]}"; do
+    [[ "${param% *}" == "nr_requests" && "${param#* }" -lt 4 ]] && below_floor+=("$param")
+done
+if [[ "${#below_floor[@]}" -eq 0 ]]; then
+    ok "nr_requests asks for no less than the kernel's floor"
+else
+    bad "nr_requests below 4 is silently raised" "${below_floor[*]}"
 fi
 
 # Rewriting must replace, as with the grub drop-in: a second run on a
@@ -321,6 +359,69 @@ elif out=$(udevadm verify "$RULE" 2>&1); then
     ok "udevadm verify accepts the generated rule"
 else
     bad "udevadm rejects the generated rule" "$out"
+fi
+
+echo ""
+echo "=== server-setup.sh journal tuning read-back ==="
+
+# ---------------------------------------------------------------------
+# The read-back is what turns a rule that matches nothing into a failed
+# setup rather than a journal on kernel defaults, so it gets the same
+# treatment as verify_kernel_params: a fake sysfs queue directory per
+# case.
+# ---------------------------------------------------------------------
+
+# A queue directory showing JOURNAL_QUEUE_TUNING as the kernel does once
+# it is applied: `scheduler` lists every choice with the active one
+# bracketed, the rest are a bare value. Prints the directory.
+fake_queue() {
+    local dir="${TMP_ROOT}/$1/queue" param key val
+    mkdir -p "$dir"
+    for param in "${JOURNAL_QUEUE_TUNING[@]}"; do
+        key="${param% *}"
+        val="${param#* }"
+        if [[ "$key" == "scheduler" ]]; then
+            printf '[%s] mq-deadline kyber bfq\n' "$val" > "$dir/$key"
+        else
+            printf '%s\n' "$val" > "$dir/$key"
+        fi
+    done
+    printf '%s' "$dir"
+}
+
+QUEUE=$(fake_queue tuned)
+if out=$(verify_journal_queue_tuning "$QUEUE" 2>&1); then
+    ok "a tuned disk passes, the bracketed scheduler read as the active one"
+else
+    bad "every setting is in place, so the read-back must pass" "$out"
+fi
+
+# A disk the rule never reached: the kernel defaults, as the journal disk
+# showed them on the hosts whose names swapped. Every difference must be
+# named, and nothing that does match.
+QUEUE=$(fake_queue untuned)
+printf 'none [mq-deadline] kyber bfq\n' > "$QUEUE/scheduler"
+printf '1023\n' > "$QUEUE/nr_requests"
+if out=$(verify_journal_queue_tuning "$QUEUE" 2>&1 >/dev/null); then
+    bad "an untuned disk must fail the read-back" "verify_journal_queue_tuning returned 0"
+elif grep -q "did not tune the disk at $QUEUE" <<< "$out" \
+    && grep -q "scheduler=mq-deadline" <<< "$out" \
+    && grep -q "nr_requests=1023" <<< "$out" \
+    && ! grep -q "nomerges" <<< "$out"; then
+    ok "an untuned disk fails, naming exactly the settings that differ"
+else
+    bad "the failure should name the disk and each differing setting only" "$out"
+fi
+
+# An attribute this kernel does not offer cannot be set by any rule; it
+# is reported, not counted against the disk.
+QUEUE=$(fake_queue missing-attr)
+rm "$QUEUE/add_random"
+if out=$(verify_journal_queue_tuning "$QUEUE" 2>&1) \
+    && grep -q "add_random: (not available)" <<< "$out"; then
+    ok "an attribute the kernel lacks is reported and skipped"
+else
+    bad "a missing attribute should be reported, not fail the disk" "$out"
 fi
 
 echo ""

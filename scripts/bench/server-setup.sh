@@ -754,6 +754,10 @@ JOURNAL_MOUNT="/mnt/journal"
 #                     dedicated single-writer device
 #   add_random=0:     don't feed I/O completion timing into the entropy
 #                     pool — avoids a spinlock per I/O completion
+#
+# Order matters: udev applies a rule's assignments left to right, and
+# switching the scheduler resets nr_requests to the new scheduler's
+# default, so `scheduler` comes first.
 JOURNAL_QUEUE_TUNING=(
     "scheduler none"
     "nr_requests 4"
@@ -792,6 +796,33 @@ write_journal_udev_rule() {
 # filesystem's UUID. Overwritten on every setup run.
 ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", ENV{ID_FS_UUID}=="${fs_uuid}"${attrs}
 EOF
+}
+
+# Read JOURNAL_QUEUE_TUNING back from a disk's sysfs `queue_dir`, printing
+# each setting, and return 1 naming every one that differs. An attribute
+# this kernel does not offer is reported and skipped.
+verify_journal_queue_tuning() {
+    local queue_dir="$1" param key val target now
+    local missed=()
+    for param in "${JOURNAL_QUEUE_TUNING[@]}"; do
+        key="${param% *}"
+        val="${param#* }"
+        target="$queue_dir/$key"
+        if [[ -f "$target" ]]; then
+            # `scheduler` lists every choice with the active one bracketed;
+            # the others are a bare value, which this leaves untouched.
+            now=$(sed 's/.*\[\(.*\)\].*/\1/' "$target")
+            echo "    $key: $now"
+            [[ "$now" == "$val" ]] || missed+=("$key=$now (want $val)")
+        else
+            echo "    $key: (not available)"
+        fi
+    done
+    if [[ "${#missed[@]}" -gt 0 ]]; then
+        echo "error: the udev rule did not tune the disk at $queue_dir:" >&2
+        printf '         %s\n' "${missed[@]}" >&2
+        return 1
+    fi
 }
 
 # Pick the journal disk. Order of preference:
@@ -909,10 +940,23 @@ if [[ -n "$JOURNAL_DISK" ]]; then
         echo "  Remounted with $JOURNAL_MOUNT_OPTS"
     fi
 
-    # Empty rather than fatal when blkid finds nothing: `set -e` would end
-    # the run without a word, and write_journal_udev_rule below refuses an
-    # empty UUID with an explanation, before fstab is touched.
+    # The fstab entry and the udev rule below both key on the filesystem's
+    # UUID. A missing one is reported here: left to `set -e`, blkid would
+    # end the run without a word.
     JOURNAL_UUID=$(blkid -s UUID -o value "$JOURNAL_DISK" || true)
+    if [[ -z "$JOURNAL_UUID" ]]; then
+        echo "error: blkid found no filesystem UUID on $JOURNAL_DISK" >&2
+        exit 1
+    fi
+
+    # Add to fstab if not present. Before the udev rule, so that a failure
+    # from there on cannot leave the disk mounted for this boot only: after
+    # a reboot the nodes would journal to $JOURNAL_MOUNT on the OS disk,
+    # and nothing would say so.
+    if ! grep -q "$JOURNAL_MOUNT" /etc/fstab; then
+        echo "UUID=$JOURNAL_UUID $JOURNAL_MOUNT xfs $JOURNAL_MOUNT_OPTS 0 2" >> /etc/fstab
+        echo "  Added to /etc/fstab (UUID=$JOURNAL_UUID)"
+    fi
 
     # Install the udev rule, then apply it now by replaying a change event
     # on the disk, rather than writing sysfs directly: the settings then
@@ -925,33 +969,9 @@ if [[ -n "$JOURNAL_DISK" ]]; then
     udevadm control --reload
     udevadm trigger --action=change --settle "$JOURNAL_DISK"
 
-    # Add to fstab if not present.
-    if ! grep -q "$JOURNAL_MOUNT" /etc/fstab; then
-        echo "UUID=$JOURNAL_UUID $JOURNAL_MOUNT xfs $JOURNAL_MOUNT_OPTS 0 2" >> /etc/fstab
-        echo "  Added to /etc/fstab (UUID=$JOURNAL_UUID)"
-    fi
-
     JOURNAL_DEV=$(basename "$JOURNAL_DISK")
-    BLOCK_SYSFS="/sys/block/$JOURNAL_DEV/queue"
     echo "  NVMe block tuning ($JOURNAL_DEV):"
-    TUNING_MISSED=()
-    for param in "${JOURNAL_QUEUE_TUNING[@]}"; do
-        key="${param% *}"
-        val="${param#* }"
-        target="$BLOCK_SYSFS/$key"
-        if [[ -f "$target" ]]; then
-            # `scheduler` lists every choice with the active one bracketed;
-            # the others are a bare value, which this leaves untouched.
-            now=$(sed 's/.*\[\(.*\)\].*/\1/' "$target")
-            echo "    $key: $now"
-            [[ "$now" == "$val" ]] || TUNING_MISSED+=("$key=$now (want $val)")
-        else
-            echo "    $key: (not available)"
-        fi
-    done
-    if [[ "${#TUNING_MISSED[@]}" -gt 0 ]]; then
-        echo "error: the udev rule did not tune $JOURNAL_DISK:" >&2
-        printf '         %s\n' "${TUNING_MISSED[@]}" >&2
+    if ! verify_journal_queue_tuning "/sys/block/$JOURNAL_DEV/queue"; then
         echo "  Check it with: udevadm test /sys/block/$JOURNAL_DEV" >&2
         exit 1
     fi
