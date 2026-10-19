@@ -117,6 +117,14 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 - **A re-seeded replica's temporary snapshot is `<snapshot>.tmp`**, the
   shadow stage's own temporary name, and its directory is synced once
   the received snapshot is in place.
+- **`scripts/bench/server-setup.sh` tunes the journal disk after a
+  reboot.** Its udev rule matched the disk by kernel name, which NVMe
+  assigns in probe order: on a host with two identical drives the names
+  swapped across the setup's own reboot, and the rule tuned the OS disk
+  instead. It now matches the journal's filesystem UUID, applies the
+  settings through the rule and reads them back, failing the setup when
+  they did not land. `nr_requests` asks for 4, the kernel's minimum,
+  rather than a 2 it silently raised.
 
 ## [0.20.0] - 2026-10-19
 

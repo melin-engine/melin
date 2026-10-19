@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Tests for server-setup.sh's kernel-parameter verification.
+# Tests for server-setup.sh's kernel-parameter verification, and for the
+# udev rule that tunes the journal disk.
 #
 # This is the half of the setup script that has no other safety net: it
 # is what stands between "the params were applied" and the silent no-op
@@ -44,10 +45,12 @@ FN_FILE="${TMP_ROOT}/fns.sh"
     extract_fn resolve_physical_cores
     extract_fn write_grub_dropin
     extract_fn verify_kernel_params
+    extract_fn write_journal_udev_rule
 } > "$FN_FILE"
 
 for fn in kernel_param_live kernel_param_in_cfg kernel_param_values_in_cfg \
-    resolve_physical_cores write_grub_dropin verify_kernel_params; do
+    resolve_physical_cores write_grub_dropin verify_kernel_params \
+    write_journal_udev_rule; do
     if ! grep -q "^${fn}() {" "$FN_FILE"; then
         echo "error: failed to extract ${fn} from server-setup.sh — has it been" >&2
         echo "  renamed or reformatted? These tests are now vacuous; fix the" >&2
@@ -246,6 +249,78 @@ if [[ "$got" == "quiet ${BENCH_PARAMS}" ]]; then
     ok "a changed parameter set replaces the previous one"
 else
     bad "regenerating must pick up the new params" "got: [${got}]"
+fi
+
+echo ""
+echo "=== server-setup.sh journal udev rule ==="
+
+# ---------------------------------------------------------------------
+# The rule must find the journal disk by its filesystem, never by kernel
+# name: NVMe names follow probe order, and on a host with two identical
+# drives they swapped across the setup's own reboot, so a rule keyed on
+# `nvme0n1` tuned the OS disk and left the journal untuned.
+# ---------------------------------------------------------------------
+JOURNAL_QUEUE_TUNING=("scheduler none" "nr_requests 4" "nomerges 2")
+UUID_A="38781855-bba1-4d2e-b375-e7619b2edfed"
+RULE="${TMP_ROOT}/99-melin-journal-nvme.rules"
+write_journal_udev_rule "$RULE" "$UUID_A"
+rule_line=$(grep '^ACTION' "$RULE")
+
+if [[ "$rule_line" == *"ENV{ID_FS_UUID}==\"${UUID_A}\""* \
+    && "$rule_line" == *'ENV{DEVTYPE}=="disk"'* ]]; then
+    ok "the rule matches the journal disk by its filesystem UUID"
+else
+    bad "the rule must match on the filesystem UUID, whole disks only" "$rule_line"
+fi
+if grep -q 'KERNEL==' "$RULE"; then
+    bad "the rule must not match on a kernel name, which can change at boot" "$rule_line"
+else
+    ok "the rule does not depend on the disk's kernel name"
+fi
+
+# Every setting in the list, and only one line carrying them: the rule and
+# the setup's read-back iterate the same list, so a setting missing here is
+# one the read-back would then report as never applied.
+missing=()
+for param in "${JOURNAL_QUEUE_TUNING[@]}"; do
+    [[ "$rule_line" == *"ATTR{queue/${param% *}}=\"${param#* }\""* ]] || missing+=("$param")
+done
+if [[ "${#missing[@]}" -eq 0 && $(grep -c '^ACTION' "$RULE") -eq 1 ]]; then
+    ok "every tuning setting is in the rule, on one line"
+else
+    bad "the rule is missing settings: ${missing[*]}" "$(cat "$RULE")"
+fi
+
+# Rewriting must replace, as with the grub drop-in: a second run on a
+# reformatted disk must not leave a rule for the old filesystem behind.
+UUID_B="54f81ef7-ed20-4662-a1f0-f9b976d41880"
+write_journal_udev_rule "$RULE" "$UUID_B"
+if grep -q "$UUID_B" "$RULE" && ! grep -q "$UUID_A" "$RULE"; then
+    ok "rewriting the rule replaces the previous disk's"
+else
+    bad "a rewrite must leave only the new UUID" "$(cat "$RULE")"
+fi
+
+# An empty UUID would make `ENV{ID_FS_UUID}==""`, which matches every disk
+# without a filesystem. It must be refused, and nothing written.
+EMPTY_RULE="${TMP_ROOT}/empty.rules"
+if out=$(write_journal_udev_rule "$EMPTY_RULE" "" 2>&1); then
+    bad "an empty UUID must be refused" "$out"
+elif [[ -e "$EMPTY_RULE" ]]; then
+    bad "a refused rule must not be written" "$(cat "$EMPTY_RULE")"
+else
+    ok "an empty UUID is refused and no rule written"
+fi
+
+# udev's own parser on the generated file, where this host has one that
+# can check a file offline (systemd 254 and later).
+write_journal_udev_rule "$RULE" "$UUID_A"
+if ! udevadm verify --help >/dev/null 2>&1; then
+    echo "  skipped — udevadm verify is not available here to parse the rule"
+elif out=$(udevadm verify "$RULE" 2>&1); then
+    ok "udevadm verify accepts the generated rule"
+else
+    bad "udevadm rejects the generated rule" "$out"
 fi
 
 echo ""
