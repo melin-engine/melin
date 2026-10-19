@@ -130,7 +130,9 @@ done
 echo ""
 # Short phases: the rehearsal is of the suite, not of the figures. The
 # nodes unpinned and yielding, without locking their memory (a container's
-# memlock limit is small), on small journal segments.
+# memlock limit is small), on small journal segments. As many load
+# threads as a container has whole cores (CPUS may be a fraction), and at
+# least one: each spins on one.
 NODE_ARGS="--cores none --no-mlock --max-journal-mib 64"
 SSH_CONFIG="$SSH_CONFIG" \
 TRANSPORTS=kernel \
@@ -140,6 +142,7 @@ SINGLE_DURATION="${SINGLE_DURATION:-5s}" \
 WARMUP_DURATION="${WARMUP_DURATION:-1s}" \
 COOLDOWN_DURATION="${COOLDOWN_DURATION:-1s}" \
 BENCH_CORE="${BENCH_CORE:-0}" \
+BENCH_THREADS="${BENCH_THREADS:-$(( ${CPUS%.*} > 1 ? ${CPUS%.*} : 1 ))}" \
 SNAPSHOT_INTERVAL_MS="${SNAPSHOT_INTERVAL_MS:-2000}" \
 SNAPSHOT_SHARED_DISK_OK=1 \
 SERVER_EXTRA_ARGS="${SERVER_EXTRA_ARGS:-$NODE_ARGS}" \

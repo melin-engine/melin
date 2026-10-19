@@ -127,17 +127,26 @@ snapshot_settings_check() {
     fi
 }
 
-# `extra_args_conflict <args>`: the first snapshot flag in a node's extra
-# arguments, which the suite sets itself, alone or as `--flag=value`.
-# Succeeds (a conflict found) after printing it; fails when there is none.
+# The flags of a node's that the suite sets itself, for extra_args_conflict.
 # `--snapshot` no longer exists, and is listed so that a stale setting is
 # named rather than refused by the node with no log line to show for it.
+NODE_SUITE_FLAGS=(--snapshot-interval-ms --snapshot-path --snapshot)
+# The load generators' flags that the suite sets itself from BENCH_THREADS
+# and BENCH_CORE (see load_thread_args). Both generators refuse a flag
+# given twice, so one in BENCH_EXTRA_ARGS would fail every run.
+BENCH_SUITE_FLAGS=(--threads --core --bench-threads --bench-cores --dpdk-core)
+
+# `extra_args_conflict <args> <flag>...`: the first of the flags in a
+# program's extra arguments, which the suite sets itself, alone or as
+# `--flag=value`. Succeeds (a conflict found) after printing it; fails when
+# there is none.
 extra_args_conflict() {
     local -a words
     local word flag
     read -ra words <<< "$1"
+    shift
     for word in "${words[@]}"; do
-        for flag in --snapshot-interval-ms --snapshot-path --snapshot; do
+        for flag in "$@"; do
             if [[ "$word" == "$flag" || "$word" == "${flag}="* ]]; then
                 echo "$flag"
                 return 0
@@ -145,6 +154,38 @@ extra_args_conflict() {
         done
     done
     return 1
+}
+
+# `positive_count_check <variable> <value>`: whether a setting that counts
+# something the run cannot do without (connections, load threads) is a
+# count of at least one.
+positive_count_check() {
+    if ! is_count "$2" || (( 10#$2 == 0 )); then
+        echo "${1}='${2}' is not a whole number of at least 1"
+        return 1
+    fi
+}
+
+# `load_thread_args <app> <transport> <clients> <threads> <core>`: the
+# load generator's threading and pinning flags, the same for every
+# application's generator: on kernel TCP, `threads` threads, or one per
+# client when there are fewer clients (as the `single` workload has),
+# thread i pinned to core `core` + i; on DPDK, one thread on `core`, with
+# no thread flag, as both generators drive a NIC from one thread.
+load_thread_args() {
+    local app="$1" transport="$2" clients="$3" threads="$4" core="$5"
+    if ! is_count "$clients" || ! is_count "$threads"; then
+        echo "clients '${clients}' and threads '${threads}' must be counts"
+        return 1
+    fi
+    clients=$((10#$clients)) threads=$((10#$threads))
+    (( threads > clients )) && threads="$clients"
+    case "${app}-${transport}" in
+        ec-dpdk) echo "--dpdk-core ${core}" ;;
+        ec-*) echo "--bench-threads ${threads} --bench-cores ${core}" ;;
+        *-dpdk) echo "--core ${core}" ;;
+        *) echo "--threads ${threads} --core ${core}" ;;
+    esac
 }
 
 # `mount_source <findmnt -nv -o SOURCE,FSTYPE output>`: the device a

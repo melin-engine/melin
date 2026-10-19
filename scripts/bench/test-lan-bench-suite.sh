@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Tests for the LAN suite's host-free logic (lib.sh): the health and
 # snapshot verdicts that decide whether a run passed, the snapshot
-# settings and disk guard, the reading of a host's DPDK configuration
-# and disk counters, and the summary table built from the verdicts. The
+# settings and disk guard, the flags the suite sets itself and refuses in
+# extra arguments, the load generators' thread and core flags, the
+# reading of a host's DPDK configuration and disk counters, and the
+# summary table built from the verdicts. The
 # fixtures are real output: node log lines as the nodes log them
 # (NO_COLOR, as the suite launches them, and coloured),
 # `findmnt -nv -o SOURCE,FSTYPE`, `lsblk -rnso NAME,TYPE`, and
@@ -359,20 +361,71 @@ check "a shortest phase that is not a number is refused" \
 
 echo ""
 echo "=== extra_args_conflict ==="
+# A node's extra arguments, against the node flags the suite sets.
+node_conflict() { extra_args_conflict "$1" "${NODE_SUITE_FLAGS[@]}"; }
+# The load generator's, against its flags the suite sets.
+bench_conflict() { extra_args_conflict "$1" "${BENCH_SUITE_FLAGS[@]}"; }
 check "--snapshot-interval-ms" "0 --snapshot-interval-ms" \
-    "$(outcome extra_args_conflict "--cores none --snapshot-interval-ms 5000")"
-check "--snapshot-path" "0 --snapshot-path" "$(outcome extra_args_conflict "--snapshot-path /x")"
-check "--snapshot, which no longer exists" "0 --snapshot" "$(outcome extra_args_conflict "--snapshot /x")"
-check "--snapshot=x" "0 --snapshot" "$(outcome extra_args_conflict "--snapshot=/x")"
-check "--snapshot-path=x" "0 --snapshot-path" "$(outcome extra_args_conflict "--cores none --snapshot-path=/x")"
+    "$(outcome node_conflict "--cores none --snapshot-interval-ms 5000")"
+check "--snapshot-path" "0 --snapshot-path" "$(outcome node_conflict "--snapshot-path /x")"
+check "--snapshot, which no longer exists" "0 --snapshot" "$(outcome node_conflict "--snapshot /x")"
+check "--snapshot=x" "0 --snapshot" "$(outcome node_conflict "--snapshot=/x")"
+check "--snapshot-path=x" "0 --snapshot-path" "$(outcome node_conflict "--cores none --snapshot-path=/x")"
 check "the first found is named" "0 --snapshot-path" \
-    "$(outcome extra_args_conflict "--snapshot-path /x --snapshot-interval-ms 5000")"
+    "$(outcome node_conflict "--snapshot-path /x --snapshot-interval-ms 5000")"
 check "a flag that merely shares a prefix is not matched" "1 " \
-    "$(outcome extra_args_conflict "--snapshot-interval-msx 5000 --snapshots")"
+    "$(outcome node_conflict "--snapshot-interval-msx 5000 --snapshots")"
 check "a flag's name as another flag's value is still named" "0 --snapshot" \
-    "$(outcome extra_args_conflict "--journal --snapshot")"
-check "no arguments" "1 " "$(outcome extra_args_conflict "")"
-check "no snapshot flag" "1 " "$(outcome extra_args_conflict "--cores none --max-journal-mib 0")"
+    "$(outcome node_conflict "--journal --snapshot")"
+check "no arguments" "1 " "$(outcome node_conflict "")"
+check "no snapshot flag" "1 " "$(outcome node_conflict "--cores none --max-journal-mib 0")"
+for flag in --threads --core --bench-threads --bench-cores --dpdk-core; do
+    check "the load generator's ${flag}" "0 ${flag}" "$(outcome bench_conflict "--size 64 ${flag} 1")"
+    check "the load generator's ${flag}=x" "0 ${flag}" "$(outcome bench_conflict "${flag}=1")"
+done
+check "a load generator flag the suite does not set passes" "1 " \
+    "$(outcome bench_conflict "--target-rate 1000 --health-addr 10.0.0.1:9878")"
+check "the node's flags are not the load generator's" "1 " \
+    "$(outcome bench_conflict "--cores none --snapshot /x")"
+
+echo ""
+echo "=== positive_count_check ==="
+check "a count" "0 " "$(outcome positive_count_check BENCH_THREADS 4)"
+check "leading zeros are still a count" "0 " "$(outcome positive_count_check BENCH_THREADS 04)"
+check "zero is refused" "1 BENCH_THREADS='0' is not a whole number of at least 1" \
+    "$(outcome positive_count_check BENCH_THREADS 0)"
+check "zeros are refused" "1 THROUGHPUT_CLIENTS='00' is not a whole number of at least 1" \
+    "$(outcome positive_count_check THROUGHPUT_CLIENTS 00)"
+check "a word is refused" "1 BENCH_THREADS='four' is not a whole number of at least 1" \
+    "$(outcome positive_count_check BENCH_THREADS four)"
+check "nothing is refused" "1 BENCH_THREADS='' is not a whole number of at least 1" \
+    "$(outcome positive_count_check BENCH_THREADS "")"
+
+echo ""
+echo "=== load_thread_args ==="
+# The suite's two workloads on each transport, for every generator: the
+# same threads and first core on kernel TCP whichever application.
+for app in echo notary; do
+    check "${app}: throughput on kernel TCP" "0 --threads 4 --core 7" \
+        "$(outcome load_thread_args "$app" kernel 4 4 7)"
+    check "${app}: one thread per client when clients are fewer" "0 --threads 1 --core 7" \
+        "$(outcome load_thread_args "$app" kernel 1 4 7)"
+    check "${app}: on DPDK, one thread and no thread flag" "0 --core 7" \
+        "$(outcome load_thread_args "$app" dpdk 4 4 7)"
+done
+check "ec: throughput on kernel TCP" "0 --bench-threads 4 --bench-cores 7" \
+    "$(outcome load_thread_args ec kernel 4 4 7)"
+check "ec: one thread per client when clients are fewer" "0 --bench-threads 1 --bench-cores 7" \
+    "$(outcome load_thread_args ec kernel 1 4 7)"
+check "ec: on DPDK, its poll thread's core" "0 --dpdk-core 7" \
+    "$(outcome load_thread_args ec dpdk 4 4 7)"
+check "fewer threads than clients are kept" "0 --threads 2 --core 3" \
+    "$(outcome load_thread_args echo kernel 16 2 3)"
+check "leading zeros are read in base 10" "0 --threads 8 --core 7" \
+    "$(outcome load_thread_args echo kernel 010 08 7)"
+check "a value that is not a count is refused" \
+    "1 clients 'x' and threads '4' must be counts" \
+    "$(outcome load_thread_args echo kernel x 4 7)"
 
 echo ""
 echo "=== diskstat_written ==="

@@ -100,6 +100,16 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   Core's bench does. It made one write per request, which with Nagle off
   put up to a segment per request on the wire. Echo and notary results
   on kernel TCP are not comparable with earlier ones.
+- **The LAN bench suite gives every load generator the same threads**:
+  `BENCH_THREADS` (default 4) on kernel TCP, as `--threads` to
+  `melin-bench` and `--bench-threads` to the Exchange Core's bench,
+  capped at a workload's connections, thread `i` pinned to
+  `BENCH_CORE + i`. The Exchange Core's bench ran four threads before,
+  by its own default, and echo and notary one; they now run four. A
+  non-numeric or zero `THROUGHPUT_CLIENTS` or `BENCH_THREADS`, a
+  non-numeric `BENCH_CORE`, and a thread or core flag in
+  `BENCH_EXTRA_ARGS` (which would now be given twice) are refused before
+  anything is built.
 
 ### Removed
 

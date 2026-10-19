@@ -51,14 +51,20 @@
 #   SETTLE_SECS           seconds between both replicas live and the load
 #                         starting (default 5; 0 starts it at once)
 #   ACK_POLICY            the cluster's ack policy (default disk+ram)
-#   BENCH_CORE            core the load generator's loop is pinned to
-#                         (default 7)
+#   BENCH_CORE            core the load generator's first thread is pinned
+#                         to (default 7); thread i on BENCH_CORE + i
+#   BENCH_THREADS         the load generator's threads on kernel TCP, the
+#                         same for every application's (default 4; fewer
+#                         when a workload has fewer clients, and one on
+#                         DPDK)
 #   SERVER_EXTRA_ARGS     appended to the primary's command line
 #   REPLICA_EXTRA_ARGS    appended to each replica's; neither may carry a
 #                         snapshot flag (refused), as the suite sets every
 #                         node's --journal, --snapshot-path and
 #                         --snapshot-interval-ms itself
-#   BENCH_EXTRA_ARGS      appended to the load generator's
+#   BENCH_EXTRA_ARGS      appended to the load generator's; it may not
+#                         carry a thread or core flag (refused), which
+#                         come from BENCH_THREADS and BENCH_CORE
 #   ECHO_SIZE             bytes per echo request (default 64)
 #   EC_REPO               the Exchange Core checkout (default ../exchange-core)
 #   EC_ACCOUNTS           funded accounts the Exchange Core seeds and the
@@ -163,6 +169,9 @@ ACK_POLICY="${ACK_POLICY:-disk+ram}"
 # makes a node wait for warm replicas itself.
 SETTLE_SECS="${SETTLE_SECS:-5}"
 BENCH_CORE="${BENCH_CORE:-7}"
+# What the Exchange Core's bench defaulted to when the suite started
+# giving every generator the same threads.
+BENCH_THREADS="${BENCH_THREADS:-4}"
 SERVER_EXTRA_ARGS="${SERVER_EXTRA_ARGS:-}"
 REPLICA_EXTRA_ARGS="${REPLICA_EXTRA_ARGS:-}"
 BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS:-}"
@@ -318,6 +327,23 @@ for w in "${REQ_WORKLOADS[@]}"; do
         exit 1
     fi
 done
+# Counts the load generator's command line is built from (load_thread_args
+# compares them), refused here rather than by the generator mid-suite.
+for var in THROUGHPUT_CLIENTS BENCH_THREADS; do
+    if ! reason=$(positive_count_check "$var" "${!var}"); then
+        echo "error: ${reason}" >&2
+        exit 1
+    fi
+done
+# Core 0 is a core, unlike zero threads.
+if ! is_count "$BENCH_CORE"; then
+    echo "error: BENCH_CORE='${BENCH_CORE}' is not a core number" >&2
+    exit 1
+fi
+if flag=$(extra_args_conflict "$BENCH_EXTRA_ARGS" "${BENCH_SUITE_FLAGS[@]}"); then
+    echo "error: BENCH_EXTRA_ARGS carries ${flag}, which the suite sets itself: set BENCH_THREADS and BENCH_CORE instead" >&2
+    exit 1
+fi
 
 # The name of the variable holding `workload`'s measured phase.
 workload_duration_var() {
@@ -332,7 +358,7 @@ workload_duration_var() {
 # by a node that then never logs its ready line
 # ---------------------------------------------------------------------------
 for var in SERVER_EXTRA_ARGS REPLICA_EXTRA_ARGS; do
-    if flag=$(extra_args_conflict "${!var}"); then
+    if flag=$(extra_args_conflict "${!var}" "${NODE_SUITE_FLAGS[@]}"); then
         case "$flag" in
             --snapshot-interval-ms) instead="set SNAPSHOT_INTERVAL_MS instead" ;;
             --snapshot-path) instead="set SNAPSHOT_DIR instead" ;;
@@ -399,7 +425,7 @@ suite_settings() {
         REPLICA "$REPLICA_PUB" REPLICA2 "$REPLICA2_PUB" SSH_USER "$SSH_USER" \
         TRANSPORTS "$(IFS=,; echo "${RUN_TRANSPORTS[*]}")" WORKLOADS "$(IFS=,; echo "${REQ_WORKLOADS[*]}")"
     for var in THROUGHPUT_DURATION THROUGHPUT_CLIENTS THROUGHPUT_WINDOW SINGLE_DURATION \
-        WARMUP_DURATION COOLDOWN_DURATION ACK_POLICY BENCH_CORE JOURNAL_DIR \
+        WARMUP_DURATION COOLDOWN_DURATION ACK_POLICY BENCH_CORE BENCH_THREADS JOURNAL_DIR \
         SNAPSHOT_INTERVAL_MS SNAPSHOT_DIR SNAPSHOT_SHARED_DISK_OK \
         SERVER_EXTRA_ARGS REPLICA_EXTRA_ARGS BENCH_EXTRA_ARGS; do
         printf '%s=%s\n' "$var" "${!var}"
@@ -966,15 +992,13 @@ bench_command() {
     local transport="$1" clients="$2" window="$3" duration="$4" bin="$BENCH_BIN"
     [[ "$transport" == dpdk ]] && bin="${BENCH_BIN}.dpdk"
     local args="--addr ${CLIENT_ADDR} --key ${REMOTE_DIR}/bench.key --json ${BENCH_JSON} --clients ${clients} --window ${window} --duration ${duration} --warmup-duration ${WARMUP_DURATION} --cooldown-duration ${COOLDOWN_DURATION}"
+    # Both counts were checked with the settings, so this cannot fail.
+    args+=" $(load_thread_args "$APP" "$transport" "$clients" "$BENCH_THREADS" "$BENCH_CORE")"
     if [[ "$APP" == ec ]]; then
         args+=" --accounts ${EC_ACCOUNTS} --health-addr ${SERVER_VLAN}:${HEALTH_PORT}"
-        if [[ "$transport" == dpdk ]]; then
-            args+=" --dpdk-core ${BENCH_CORE} ${BENCH_TRANSPORT_ARGS}"
-        else
-            args+=" --bench-cores ${BENCH_CORE}"
-        fi
+        [[ "$transport" == dpdk ]] && args+=" ${BENCH_TRANSPORT_ARGS}"
     else
-        args+=" --app ${APP} --core ${BENCH_CORE}"
+        args+=" --app ${APP}"
         [[ "$APP" == echo ]] && args+=" --size ${ECHO_SIZE}"
         [[ "$transport" == dpdk ]] && args+=" --transport dpdk ${BENCH_TRANSPORT_ARGS}"
     fi

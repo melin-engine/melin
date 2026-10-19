@@ -80,6 +80,15 @@ connections, each keeping `THROUGHPUT_WINDOW` requests in flight; 4 × 56
 by default) and `single` (one request in flight). The script's header
 lists every setting.
 
+Every application's load generator gets the same client-side capacity:
+on kernel TCP, `BENCH_THREADS` load threads (4 by default, and no more
+than a workload has connections, so `single` runs one), pinned to
+consecutive cores from `BENCH_CORE` (7 by default), each writing a
+connection's requests in one go; on DPDK, one thread on `BENCH_CORE`.
+Keep those cores free of other work on the load generator's host. The
+threads and cores come from these two settings only: `BENCH_EXTRA_ARGS`
+carrying a thread or core flag is refused.
+
 Each run starts a fresh cluster on empty journals, acknowledging under
 `ACK_POLICY` (`disk+ram` by default). The load generator warms up,
 measures, then keeps the load on through a cool-down so that the last
