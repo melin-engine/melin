@@ -107,7 +107,14 @@ const LINEAGE_FLAGS: u8 =
 /// header alone must read.
 pub const MAX_HEADER_SIZE: usize = HEADER_SIZE;
 const CRC_SIZE: usize = 4;
-const MAX_SNAPSHOT_SIZE: u64 = 256 * 1024 * 1024;
+/// The largest snapshot a save writes and a load reads, in bytes: 1 TiB.
+/// Set far above any real application's state, so that the cap never
+/// stops a node from snapshotting; it remains a bound on a corrupt file,
+/// but no longer on the memory a load takes, since a load reads the file
+/// whole. A per-node setting, which lets an operator bound that by the
+/// host's memory, is on the roadmap. `u64`: a file's length, as the
+/// filesystem reports it.
+const MAX_SNAPSHOT_SIZE: u64 = 1024 * 1024 * 1024 * 1024;
 
 /// Suffix appended to the snapshot path for the one-deep rollback file.
 pub(crate) const PREV_SUFFIX: &str = ".prev";
@@ -491,7 +498,7 @@ fn write_bounded<F: WritebackTarget>(
 }
 
 /// Internal form of [`save`] taking explicit [`SaveLimits`]. Factored out
-/// so tests can exercise the cap without allocating a 256 MiB payload,
+/// so tests can exercise the cap without allocating a payload that size,
 /// and the writeback chunking with a payload of a few bytes.
 fn save_with_limit<A: Application>(
     app: &A,
@@ -1335,7 +1342,7 @@ mod tests {
         // `load` caps at MAX_SNAPSHOT_SIZE; `save` must symmetrically
         // refuse to write a file that the matching `load` would reject.
         // A small limit lets us trip the guard without allocating the
-        // real 256 MiB cap.
+        // real cap.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("snap");
         let app = populated_app();
@@ -1685,7 +1692,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("snap");
         // Sparse file one byte larger than the cap — set_len avoids
-        // actually writing 256 MiB to disk.
+        // actually writing the cap's worth of bytes to disk.
         let f = OpenOptions::new()
             .create(true)
             .write(true)

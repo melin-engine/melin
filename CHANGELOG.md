@@ -78,6 +78,12 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   arguments carrying a snapshot flag are now refused, and the files of
   earlier runs are removed by exact name before each run, resync archive
   directories included. See [docs/benchmarking.md](docs/benchmarking.md).
+- **A snapshot may be up to 1 TiB; the limit was 256 MiB.** A larger
+  state could never be snapshotted: every save failed, logged at `ERROR`
+  each interval, and recovery fell back to replaying the journal. The
+  Exchange Core's state at 100,000 accounts is about 480 MB. A load still
+  reads the snapshot whole, so the limit no longer bounds the memory a
+  load takes.
 
 ### Removed
 
