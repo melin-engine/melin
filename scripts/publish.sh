@@ -69,8 +69,8 @@ echo "==> CHANGELOG.md has an entry for $WORKSPACE_VERSION"
 # The dry run deliberately skips the already-published filter. It never
 # uploads, so what is on crates.io is irrelevant to it, and CI runs it on main
 # — where every crate *is* already published at the current version, so
-# filtering would reduce the check to nothing. Verifying that all eight still
-# package and build is the whole point. It also needs neither curl nor jq,
+# filtering would reduce the check to nothing. Verifying that every crate still
+# packages and builds is the whole point. It also needs neither curl nor jq,
 # which keeps the CI path free of both.
 #
 # `--allow-dirty` because this mode answers "does everything package and
