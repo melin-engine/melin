@@ -284,6 +284,58 @@ if ! sed -n '/^## \[Unreleased\]$/,/^## \[/p' CHANGELOG.md | grep '^### ' >/dev/
     exit 1
 fi
 
+# The files the Change Date is stamped into: the root LICENSE and each BSL
+# crate's copy of it. Gathered and checked here rather than at the stamping
+# step, so a copy that has drifted stops the release before the branch and
+# the edits exist, rather than leaving them behind to undo. The usual cause
+# is a crate branched before one release and merged after it, which still
+# carries the Change Date of the release before.
+step "Checking the LICENSE copies match the root"
+
+# `mapfile` from a process substitution cannot fail the script under `set -e`,
+# so an empty result is checked for explicitly below — silently falling back to
+# stamping the root LICENSE alone would ship crates carrying a stale date.
+# `.publish` is absent (null) on a publishable crate and `[]` on one marked
+# `publish = false`, so the comparison sorts them without a special case.
+mapfile -t CRATE_DIRS < <(
+    cargo metadata --no-deps --format-version 1 | jq -r '
+        .workspace_root as $root
+        | .packages[]
+        | select(.license == "BUSL-1.1")
+        | [(.publish != []),
+           (.manifest_path | ltrimstr($root + "/") | rtrimstr("/Cargo.toml"))]
+        | @tsv'
+)
+
+if (( ${#CRATE_DIRS[@]} == 0 )); then
+    echo "error: cargo metadata listed no BUSL-1.1 workspace members" >&2
+    exit 1
+fi
+
+# A copy that differs from the root is refused rather than overwritten, so the
+# difference is inspected rather than erased. An unpublished crate may go
+# without a copy, since it never leaves the repository; one that has a copy is
+# still checked, because it is stamped along with the rest. Every problem is
+# reported before failing, so they are fixed in one pass rather than one per run.
+ROOT_SUM=$(sha256sum LICENSE | cut -d' ' -f1)
+LICENSES=(LICENSE)
+LICENSE_ERRORS=0
+for entry in "${CRATE_DIRS[@]}"; do
+    publishable="${entry%%$'\t'*}"
+    dir="${entry#*$'\t'}"
+    if [[ -f "$dir/LICENSE" ]]; then
+        if [[ "$(sha256sum "$dir/LICENSE" | cut -d' ' -f1)" != "$ROOT_SUM" ]]; then
+            echo "error: $dir/LICENSE differs from the root LICENSE; copy the root over it ('cp LICENSE $dir/LICENSE') once the difference is confirmed to be only the Change Date" >&2
+            LICENSE_ERRORS=$(( LICENSE_ERRORS + 1 ))
+        fi
+        LICENSES+=("$dir/LICENSE")
+    elif [[ "$publishable" == "true" ]]; then
+        echo "error: $dir has no LICENSE; every published crate must carry a copy of the root one" >&2
+        LICENSE_ERRORS=$(( LICENSE_ERRORS + 1 ))
+    fi
+done
+(( LICENSE_ERRORS == 0 )) || exit 1
+
 echo
 echo "    version:     $OLD_VERSION -> $NEW_VERSION"
 echo "    branch:      $BRANCH"
@@ -311,7 +363,7 @@ DID_BRANCH=1
 
 # --- Version bump ------------------------------------------------------------
 
-# The root manifest carries the version in nine places — the inherited
+# The root manifest carries the version in several places — the inherited
 # `[workspace.package]` one plus a pin per intra-workspace dependency — and
 # they must move in lockstep: a dependent resolving against a version its
 # provider no longer has is a broken publish, discovered halfway through.
@@ -430,47 +482,8 @@ cargo metadata --locked --format-version 1 >/dev/null
 # the manifest's `license` field is what decides.
 step "Stamping the BSL Change Date"
 
-# `mapfile` from a process substitution cannot fail the script under `set -e`,
-# so an empty result is checked for explicitly below — silently falling back to
-# stamping the root LICENSE alone would ship crates carrying a stale date.
-# `.publish` is absent (null) on a publishable crate and `[]` on one marked
-# `publish = false`, so the comparison sorts them without a special case.
-mapfile -t CRATE_DIRS < <(
-    cargo metadata --no-deps --format-version 1 | jq -r '
-        .workspace_root as $root
-        | .packages[]
-        | select(.license == "BUSL-1.1")
-        | [(.publish != []),
-           (.manifest_path | ltrimstr($root + "/") | rtrimstr("/Cargo.toml"))]
-        | @tsv'
-)
-
-if (( ${#CRATE_DIRS[@]} == 0 )); then
-    echo "error: cargo metadata listed no workspace members" >&2
-    exit 1
-fi
-
-LICENSES=(LICENSE)
-for entry in "${CRATE_DIRS[@]}"; do
-    publishable="${entry%%$'\t'*}"
-    dir="${entry#*$'\t'}"
-    if [[ -f "$dir/LICENSE" ]]; then
-        LICENSES+=("$dir/LICENSE")
-    elif [[ "$publishable" == "true" ]]; then
-        echo "error: $dir has no LICENSE; every published crate must carry one" >&2
-        exit 1
-    fi
-done
-
-# Divergence here means a copy was edited by hand at some point. Catch it
-# before overwriting, so the difference is inspected rather than erased.
-ROOT_SUM=$(sha256sum LICENSE | cut -d' ' -f1)
-for license in "${LICENSES[@]:1}"; do
-    if [[ "$(sha256sum "$license" | cut -d' ' -f1)" != "$ROOT_SUM" ]]; then
-        echo "error: $license differs from the root LICENSE; reconcile them first" >&2
-        exit 1
-    fi
-done
+# `LICENSES` was gathered, and every copy in it checked against the root, with
+# the preconditions above.
 
 # Anchored to the start of the line so the two places the licence *prose*
 # mentions the Change Date are left alone.
