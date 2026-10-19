@@ -89,6 +89,11 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   replica that has only just caught up evicted it into a rejoin loop for
   the rest of the run, as on the Exchange Core; `SETTLE_SECS=0` restores
   the old behaviour.
+- **`melin-bench` writes a connection's requests once per pass on kernel
+  TCP**, framed straight into a per-connection buffer, as the Exchange
+  Core's bench does. It made one write per request, which with Nagle off
+  put up to a segment per request on the wire. Echo and notary results
+  on kernel TCP are not comparable with earlier ones.
 
 ### Removed
 

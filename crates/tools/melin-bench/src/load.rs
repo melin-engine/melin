@@ -27,6 +27,12 @@ pub trait Streams {
 
     /// Client `client`'s stream.
     fn stream(&mut self, client: usize) -> Self::Stream<'_>;
+
+    /// Put on the wire what client `client` sent since the last call, as
+    /// much as the stream takes now, the rest held for the next call: the
+    /// end of its sends for this pass. Nothing for a stream that already
+    /// sends from a buffer of its own on [`service`](Self::service).
+    fn end_sends(&mut self, client: usize) -> std::io::Result<()>;
 }
 
 /// How long a run loads the node, and how wide.
@@ -127,6 +133,10 @@ pub fn run<S: Streams>(
                 client.sent_ns.push_back(now_ns);
                 client.next_seq += 1;
             }
+            // The pass's requests, in one write.
+            streams
+                .end_sends(index)
+                .map_err(|e| format!("client {id}: {e}"))?;
             loop {
                 let frame = client
                     .connection
@@ -168,6 +178,12 @@ pub fn run<S: Streams>(
                     }
                 }
             }
+            // Whatever the polls queued: bytes a full buffer refused
+            // earlier, which a poll hands the stream again. Nothing to
+            // write in the usual pass.
+            streams
+                .end_sends(index)
+                .map_err(|e| format!("client {id}: {e}"))?;
             in_flight += client.in_flight();
         }
         if let Some(deadline) = drain_deadline {
@@ -209,6 +225,10 @@ fn authenticate<S: Streams>(
             {
                 return Err(format!("client {index}: {frame:?} before any request"));
             }
+            // The challenge response a poll queued.
+            streams
+                .end_sends(index)
+                .map_err(|e| format!("client {index}: {e}"))?;
             ready += usize::from(client.connection.is_ready());
         }
         if ready == clients.len() {
@@ -233,7 +253,12 @@ pub fn nanos(d: Duration) -> u64 {
 mod tests {
     use super::*;
     use crate::app::AppKind;
+    use crate::batched::Batched;
+    use crate::batched::testing::Counting;
     use melin_client::BufferStream;
+    use melin_client::framing::{PREFIX_LEN, split_frame};
+    use melin_wire_protocol::control::TransportResponse;
+    use melin_wire_protocol::control_codec::{TAG_APP, TAG_LEN, encode_transport_response};
 
     /// A node played by hand: each client's stream is a buffer the test
     /// answers from.
@@ -254,6 +279,123 @@ mod tests {
         fn stream(&mut self, client: usize) -> &mut BufferStream {
             &mut self.streams[client]
         }
+
+        fn end_sends(&mut self, _client: usize) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// An echo node played from each stream's sent bytes, at the start of
+    /// every pass: the challenge, then the verdict once the response is
+    /// in, then a reply and a batch end per request. The client's side is
+    /// the kernel path's batching stream over a buffer that takes
+    /// everything.
+    struct EchoNode {
+        streams: Vec<Batched<Counting>>,
+        ready: Vec<bool>,
+        passes: usize,
+        origin: std::time::Instant,
+    }
+
+    impl EchoNode {
+        fn new(clients: usize, window: usize, frame_len: usize) -> Self {
+            let streams = (0..clients)
+                .map(|_| {
+                    let mut stream = Batched::new(Counting::default(), window, frame_len);
+                    let challenge = TransportResponse::Challenge { nonce: [0x5A; 32] };
+                    push_control(stream.inner_mut(), &challenge);
+                    stream
+                })
+                .collect();
+            Self {
+                streams,
+                ready: vec![false; clients],
+                passes: 0,
+                origin: std::time::Instant::now(),
+            }
+        }
+    }
+
+    fn push_control(stream: &mut Counting, response: &TransportResponse) {
+        let mut buf = [0u8; 64];
+        let n = encode_transport_response(response, &mut buf).unwrap();
+        stream.stream.push_received(&buf[..n]);
+    }
+
+    impl Streams for EchoNode {
+        type Stream<'a> = &'a mut Batched<Counting>;
+
+        fn now_ns(&self) -> u64 {
+            nanos(self.origin.elapsed())
+        }
+
+        fn service(&mut self, _now_ns: u64) {
+            self.passes += 1;
+            for (stream, ready) in self.streams.iter_mut().zip(&mut self.ready) {
+                assert_eq!(stream.held(), 0, "a pass's bytes held into the next");
+                let inner = stream.inner_mut();
+                let sent = inner.stream.sent().to_vec();
+                let mut at = 0;
+                while let Some(frame) = split_frame(&sent[at..]).unwrap() {
+                    at += frame.consumed();
+                    if !*ready {
+                        // The challenge response: the node's verdict.
+                        *ready = true;
+                        push_control(inner, &TransportResponse::ServerReady);
+                        continue;
+                    }
+                    let body = &frame.payload[TAG_LEN..];
+                    let mut reply = Vec::with_capacity(PREFIX_LEN + 2 + body.len());
+                    reply.extend_from_slice(&((2 + body.len()) as u32).to_le_bytes());
+                    reply.extend_from_slice(&[TAG_APP, echo_server::KIND_RESP_ECHO]);
+                    reply.extend_from_slice(body);
+                    inner.stream.push_received(&reply);
+                    push_control(inner, &TransportResponse::BatchEnd);
+                }
+                inner.stream.consume_sent(at);
+            }
+        }
+
+        fn stream(&mut self, client: usize) -> &mut Batched<Counting> {
+            &mut self.streams[client]
+        }
+
+        fn end_sends(&mut self, client: usize) -> std::io::Result<()> {
+            self.streams[client].write()
+        }
+    }
+
+    #[test]
+    fn a_pass_s_requests_leave_in_one_write() {
+        let (clients, window) = (3, 4);
+        let app = App::new(AppKind::Echo, 16).unwrap();
+        let frame_len = melin_client::REQUEST_HEADER_LEN + app.max_body();
+        let mut node = EchoNode::new(clients, window, frame_len);
+        let key = melin_client::SigningKey::from_bytes(&[7; 32]);
+        let plan = Plan {
+            window,
+            warmup: Duration::ZERO,
+            duration: Duration::from_millis(20),
+            cooldown: Duration::ZERO,
+            timeout: Duration::from_secs(1),
+        };
+        let connections = (0..clients).map(|_| PolledConnection::new(&key)).collect();
+        let outcome = run(&mut node, connections, app, plan).unwrap();
+
+        let writes: usize = node.streams.iter_mut().map(|s| s.inner_mut().sends).sum();
+        // At most one write per client per pass, and every write but the
+        // challenge response carrying a full window: the node answers a
+        // pass's requests by the next pass.
+        assert!(
+            writes <= clients * node.passes,
+            "{writes} writes in {} passes",
+            node.passes
+        );
+        assert_eq!(
+            outcome.completed,
+            ((writes - clients) * window) as u64,
+            "{writes} writes"
+        );
     }
 
     #[test]

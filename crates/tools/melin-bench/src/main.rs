@@ -10,11 +10,14 @@
 //! A run: dial and authenticate every client, then warm up, measure and
 //! cool down under the same load, and finally stop sending and wait for
 //! the requests still in flight. The latency of a request is from its
-//! send to its reply frame, not to the batch end after it.
+//! send to its reply frame, not to the batch end after it. On kernel TCP,
+//! the requests a connection sends in one pass of the loop leave in one
+//! write, not one each.
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
 mod app;
+mod batched;
 #[cfg(feature = "dpdk")]
 mod dpdk;
 mod load;
@@ -25,9 +28,12 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
-use melin_client::{DEFAULT_TIMEOUT, NonBlockingTcp, PolledConnection, SigningKey, key};
+use melin_client::{
+    DEFAULT_TIMEOUT, NonBlockingTcp, PolledConnection, REQUEST_HEADER_LEN, SigningKey, key,
+};
 
 use app::{App, AppKind};
+use batched::Batched;
 use load::{Outcome, Plan, Streams};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
@@ -155,7 +161,8 @@ fn run(cli: Cli) -> Result<(), Error> {
                 )
                 .into());
             }
-            let mut streams = Kernel::connect(cli.addr, cli.clients)?;
+            let frame_len = REQUEST_HEADER_LEN + app.max_body();
+            let mut streams = Kernel::connect(cli.addr, cli.clients, cli.window, frame_len)?;
             measure(&mut streams, &cli, &key, app, plan)?
         }
         #[cfg(feature = "dpdk")]
@@ -211,17 +218,28 @@ fn measure<S: Streams>(
     Ok(load::run(streams, connections, app, plan)?)
 }
 
-/// Kernel sockets, one per client, on a clock of the process's own.
+/// Kernel sockets, one per client, each writing a pass's requests at once,
+/// on a clock of the process's own.
 struct Kernel {
     // A `Vec` indexed by client: the loop visits every one in turn.
-    sockets: Vec<NonBlockingTcp>,
+    sockets: Vec<Batched<NonBlockingTcp>>,
     origin: Instant,
 }
 
 impl Kernel {
-    fn connect(addr: SocketAddr, clients: usize) -> Result<Self, Error> {
+    /// Dial `clients` sockets to `addr`, each holding up to `window`
+    /// requests of `frame_len` bytes between writes.
+    fn connect(
+        addr: SocketAddr,
+        clients: usize,
+        window: usize,
+        frame_len: usize,
+    ) -> Result<Self, Error> {
         let sockets = (0..clients)
-            .map(|_| NonBlockingTcp::connect(addr, DEFAULT_TIMEOUT))
+            .map(|_| {
+                NonBlockingTcp::connect(addr, DEFAULT_TIMEOUT)
+                    .map(|socket| Batched::new(socket, window, frame_len))
+            })
             .collect::<Result<_, _>>()
             .map_err(|e| format!("cannot connect to {addr}: {e}"))?;
         Ok(Self {
@@ -232,7 +250,7 @@ impl Kernel {
 }
 
 impl Streams for Kernel {
-    type Stream<'a> = &'a mut NonBlockingTcp;
+    type Stream<'a> = &'a mut Batched<NonBlockingTcp>;
 
     fn now_ns(&self) -> u64 {
         load::nanos(self.origin.elapsed())
@@ -240,8 +258,12 @@ impl Streams for Kernel {
 
     fn service(&mut self, _now_ns: u64) {}
 
-    fn stream(&mut self, client: usize) -> &mut NonBlockingTcp {
+    fn stream(&mut self, client: usize) -> &mut Batched<NonBlockingTcp> {
         &mut self.sockets[client]
+    }
+
+    fn end_sends(&mut self, client: usize) -> std::io::Result<()> {
+        self.sockets[client].write()
     }
 }
 

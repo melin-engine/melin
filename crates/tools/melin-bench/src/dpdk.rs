@@ -62,4 +62,10 @@ impl Streams for Nic {
     fn stream(&mut self, client: usize) -> NicStream<'_> {
         self.nic.stream(&self.streams[client])
     }
+
+    // A stream's sends wait in its socket's buffer until the next
+    // `service`, which sends every stream's at once.
+    fn end_sends(&mut self, _client: usize) -> std::io::Result<()> {
+        Ok(())
+    }
 }

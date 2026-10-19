@@ -42,6 +42,9 @@ melin-test-node = { path = "../../core/test-node" }
 melin-server-runtime = { workspace = true }
 melin-journal = { workspace = true }
 tempfile = "3"
+# The node's side of the handshake and the reply frames, for the loop's
+# unit tests to play an echo node over in-memory streams.
+melin-wire-protocol = { workspace = true }
 
 [features]
 default = []
