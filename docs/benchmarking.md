@@ -90,7 +90,7 @@ The load starts once both replicas are connected and none is catching
 up. A replica that has only just caught up can still be busy with what
 it received, and full load arriving within a second or two of that can
 evict it; at the default replication ring size it then cannot rejoin
-under that load, and the run is degraded. `SETTLE_SECS` waits that many
+under that load, and the run is unsteady. `SETTLE_SECS` waits that many
 seconds between the replicas going live and the load starting, 5 by
 default, which is enough on current hardware. `SETTLE_SECS=0` starts the
 load straight away, which is what a cluster taking traffic as soon as its
@@ -177,7 +177,7 @@ Each run leaves, in `bench-results/lan-<app>-<timestamp>/`:
 A latency is a full round trip as the client sees it, from the request
 leaving the client to its reply arriving. A run whose replicas were
 evicted, missing or catching up at any point is reported
-as degraded, and the suite exits non-zero, as it does when a cluster
+as `UNSTEADY`, and the suite exits non-zero, as it does when a cluster
 does not start or the load generator fails: a number measured on a
 cluster that was not whole is not the number it claims to be.
 

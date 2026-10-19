@@ -97,7 +97,7 @@
 #
 # Each run waits for both replicas to be live before the load starts,
 # and samples the primary's health metrics throughout: a replica
-# evicted, missing or catching up at any point marks the run degraded.
+# evicted, missing or catching up at any point marks the run unsteady.
 #
 # Snapshots are on by default, as in production: every node's shadow
 # saves one every SNAPSHOT_INTERVAL_MS to SNAPSHOT_DIR, which must be on
@@ -108,7 +108,7 @@
 # journal disks during the run go beside the verdict, in
 # <transport>-<workload>.snapshots; every setting goes in suite.conf.
 #
-# The suite exits non-zero if any run was degraded, could not start, or
+# The suite exits non-zero if any run was unsteady, could not start, or
 # failed its snapshot verdict.
 
 set -euo pipefail
@@ -241,7 +241,7 @@ HOSTS=("$SERVER" "$BENCH" "$REPLICA" "$REPLICA2")
 # command that also names a binary's path must not carry it either.
 BIN_PATTERN='[m]elin-bench/bin/'
 DPDK_RAN=0
-DEGRADED_RUNS=()
+FAILED_RUNS=()
 
 # `sample_metrics <file> <pattern>`: in the background, the primary's
 # /metrics lines matching `pattern` (an extended regex), every second
@@ -1027,7 +1027,7 @@ run_workload() {
 
     if (( rc != 0 )) || ! rscp "${BENCH}:${BENCH_JSON}" "${RESULTS_DIR}/${name}.json" 2>/dev/null; then
         echo "  FAILED: the load generator exited ${rc}"
-        DEGRADED_RUNS+=("${name}: the load generator failed")
+        FAILED_RUNS+=("${name}: the load generator failed")
         return
     fi
     RUN_LOADED=1
@@ -1036,7 +1036,7 @@ run_workload() {
         echo "  cluster ${verdict}"
     else
         echo "  cluster ${verdict}"
-        DEGRADED_RUNS+=("${name}: ${verdict}")
+        FAILED_RUNS+=("${name}: ${verdict}")
     fi
 }
 
@@ -1062,14 +1062,14 @@ judge_run() {
     if ! window=$(seq_window "${RESULTS_DIR}/${name}.health"); then
         echo "  snapshots ${window}"
         echo "$window" > "$out"
-        DEGRADED_RUNS+=("${name}: snapshots ${window}")
+        FAILED_RUNS+=("${name}: snapshots ${window}")
     else
         read -r first last <<< "$window"
         : > "$out"
         for node in "${NODES[@]}"; do
             if ! verdict=$(judge_snapshots "${RESULTS_DIR}/${name}.${node}.log" "$first" "$last" \
                 "${MEASURED_MS[$workload]}" "$SNAPSHOT_INTERVAL_MS" "$(node_snapshot "$node")"); then
-                DEGRADED_RUNS+=("${name}: ${node} snapshots ${verdict}")
+                FAILED_RUNS+=("${name}: ${node} snapshots ${verdict}")
             fi
             echo "  ${node} snapshots ${verdict}"
             echo "${node}: ${verdict}" >> "$out"
@@ -1093,7 +1093,7 @@ for transport in "${RUN_TRANSPORTS[@]}"; do
     for workload in "${REQ_WORKLOADS[@]}"; do
         # A fresh cluster per run: each run starts from an empty journal.
         if ! start_cluster "$transport"; then
-            DEGRADED_RUNS+=("${transport}-${workload}: the cluster did not start")
+            FAILED_RUNS+=("${transport}-${workload}: the cluster did not start")
             stop_nodes "${HOSTS[@]}"
             save_node_logs "${transport}-${workload}"
             continue
@@ -1127,9 +1127,9 @@ echo ""
 echo "=== Results (${RESULTS_DIR}) ==="
 summary_table "$RESULTS_DIR"
 
-if [[ ${#DEGRADED_RUNS[@]} -gt 0 ]]; then
+if [[ ${#FAILED_RUNS[@]} -gt 0 ]]; then
     echo ""
     echo "Runs that did not pass:"
-    for run in "${DEGRADED_RUNS[@]}"; do echo "  ${run}"; done
+    for run in "${FAILED_RUNS[@]}"; do echo "  ${run}"; done
     exit 1
 fi

@@ -71,14 +71,14 @@ echo "=== judge_health ==="
 check "two live replicas throughout pass" \
     "0 ok: 3 samples, 0 evictions, 0 short of replicas, 0 catching up" \
     "$(verdict 2 "$LIVE2" "$LIVE2" "$LIVE2")"
-check "a replica short in one sample degrades the run" \
-    "1 DEGRADED: 2 samples, 0 evictions, 1 short of replicas, 0 catching up" \
+check "a replica short in one sample makes the run unsteady" \
+    "1 UNSTEADY: 2 samples, 0 evictions, 1 short of replicas, 0 catching up" \
     "$(verdict 2 "$LIVE2" 'melin_replicas_connected 1;melin_replica_evictions_total 0')"
-check "a replica catching up in one sample degrades the run" \
-    "1 DEGRADED: 2 samples, 0 evictions, 0 short of replicas, 1 catching up" \
+check "a replica catching up in one sample makes the run unsteady" \
+    "1 UNSTEADY: 2 samples, 0 evictions, 0 short of replicas, 1 catching up" \
     "$(verdict 2 "$LIVE2" 'melin_replicas_connected 2;melin_replica_catching_up{slot="1"} 1')"
-check "an eviction degrades the run even once the replica is back" \
-    "1 DEGRADED: 2 samples, 3 evictions, 0 short of replicas, 0 catching up" \
+check "an eviction makes the run unsteady even once the replica is back" \
+    "1 UNSTEADY: 2 samples, 3 evictions, 0 short of replicas, 0 catching up" \
     "$(verdict 2 'melin_replicas_connected 2;melin_replica_evictions_total 3' "$LIVE2")"
 check "a sample the endpoint did not answer is not judged" \
     "0 ok: 1 samples, 0 evictions, 0 short of replicas, 0 catching up" \

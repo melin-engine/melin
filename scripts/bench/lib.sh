@@ -18,7 +18,9 @@ conf_value() {
 # `judge_health <samples file> <expected replicas>`: the verdict on a
 # run's health samples, each a `# sample` line followed by the primary's
 # replica metrics. A replica evicted, missing or catching up in any
-# sample degrades the run; a run with no sample to judge is unjudged.
+# sample makes the run unsteady; a run with no sample to judge is
+# unjudged. Not "degraded", which is the product's word for an ack only
+# the primary's disk backs.
 # Prints the verdict; fails unless it is `ok`.
 judge_health() {
     awk -v expected="$2" '
@@ -35,7 +37,7 @@ judge_health() {
             if (n) tally()
             judged = n - missing
             if (judged == 0) { print "UNJUDGED: no health samples"; exit 1 }
-            verdict = (evictions + short + behind > 0) ? "DEGRADED" : "ok"
+            verdict = (evictions + short + behind > 0) ? "UNSTEADY" : "ok"
             printf "%s: %d samples, %d evictions, %d short of replicas, %d catching up\n",
                 verdict, judged, evictions, short, behind
             exit verdict != "ok"

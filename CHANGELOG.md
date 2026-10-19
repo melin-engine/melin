@@ -89,6 +89,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   replica that has only just caught up evicted it into a rejoin loop for
   the rest of the run, as on the Exchange Core; `SETTLE_SECS=0` restores
   the old behaviour.
+- **The LAN bench suite calls a run whose replicas were evicted, missing
+  or catching up `UNSTEADY`**, where it said `DEGRADED`, which read as
+  degraded acks, a different thing.
 
 ### Removed
 
