@@ -125,6 +125,11 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   settings through the rule and reads them back, failing the setup when
   they did not land. `nr_requests` asks for 4, the kernel's minimum,
   rather than a 2 it silently raised.
+- **The LAN bench suite runs under a locale with a decimal comma.** Its
+  snapshot verdicts read and printed save times in the caller's number
+  format: a save of 12.25 ms counted as 12, printed as `12,000`, and the
+  closing summary failed to parse it, failing the suite. It now runs in
+  the C locale throughout.
 
 ## [0.20.0] - 2026-10-19
 

@@ -214,6 +214,21 @@ check "a window bound that is not a count is unjudged" \
     "1 UNJUDGED: '' is not a count" \
     "$(snapshots "" 1000 30000 10000 "$SNAP" "$(saved 500)")"
 
+# A caller whose locale writes decimals with a comma: sourcing lib.sh must
+# put the numbers back in C's format, or a save's time reads as its whole
+# milliseconds and prints with a comma the summary cannot parse. Needs
+# such a locale installed to mean anything.
+COMMA_LOCALE=$(locale -a 2>/dev/null | grep -m1 -E '^(fr_FR|de_DE)\.(utf8|UTF-8)$')
+if [[ -z "$COMMA_LOCALE" ]]; then
+    echo "  skipped — no fr_FR or de_DE locale installed to judge saves under"
+else
+    printf '%s\n' "$(saved 500 "$SNAP" 12.25)" > "${TMP_ROOT}/node.log"
+    check "a decimal-comma locale in the caller's environment does not reach the verdict" \
+        "ok: 1 saves in window (at least 1), 0 outside, 0 failed, 0 to another path, 0 unreadable; slowest 12.250 ms, largest 79 bytes, most attempts 1" \
+        "$(LC_ALL="$COMMA_LOCALE" bash -c 'source "$1/lib.sh"; judge_snapshots "$2" 100 1000 10000 10000 "$3"' \
+            _ "$SCRIPT_DIR" "${TMP_ROOT}/node.log" "$SNAP")"
+fi
+
 echo ""
 echo "=== mount_source ==="
 check "a disk's filesystem gives its device" \

@@ -1,6 +1,14 @@
 # The LAN suite's logic that needs no host: sourced by lan-bench-suite.sh
 # and by test-lan-bench-suite.sh, which runs it against fixtures.
 
+# The C locale, for the suite and everything it runs. mawk reads and
+# prints decimals in LC_NUMERIC's format: under a locale with a decimal
+# comma, a save's `elapsed_ms=12.25` reads as 12 and prints as `12,000`,
+# which the summary then cannot parse. LC_ALL rather than LC_NUMERIC,
+# which an LC_ALL already in the environment would override. ssh forwards
+# it, so the hosts run in C too rather than in a locale they may lack.
+export LC_ALL=C
+
 # `conf_value <conf text> <key>`: a value of /etc/melin-dpdk.conf, its
 # surrounding double quotes stripped (multi-word values are quoted).
 conf_value() {
