@@ -67,6 +67,7 @@ cargo +nightly miri test -p melin-pipeline -- "${FILTER[@]}"
 SKIPS=(
     --skip health::
     --skip snapshot::
+    --skip node_store::
     --skip shadow::
     --skip journaled_app::
     --skip journal_disk::

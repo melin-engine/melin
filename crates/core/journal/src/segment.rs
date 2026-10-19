@@ -10,6 +10,8 @@
 //! `rename(2)` regardless of how many archives already exist, and the
 //! sort order matches the chronological order of rotations.
 
+use std::num::NonZeroU64;
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -351,11 +353,7 @@ fn parse_archive_index(live: &Path, candidate: &Path) -> Option<u32> {
 /// disambiguate which segment's hash anchors the next, so we refuse to
 /// proceed rather than risk a non-deterministic walk order.
 pub fn list_archives(live: &Path) -> std::io::Result<Vec<(u32, PathBuf)>> {
-    let dir = match live.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-        _ => PathBuf::from("."),
-    };
-    let read_dir = match std::fs::read_dir(&dir) {
+    let read_dir = match std::fs::read_dir(parent_dir(live)) {
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
@@ -462,17 +460,94 @@ pub fn compact_archive(archived: &Path, valid_end: u64) {
 /// pair that has reached the page cache may be lost on power loss even
 /// though both file contents are durable.
 ///
-/// Treats a missing parent directory as a no-op (the rename would have
-/// already failed in that case).
+/// A missing parent directory is an error (`NotFound`), as in
+/// [`fsync_dir`]; the rename into it would have failed first.
 pub fn fsync_parent_dir(live: &Path) -> std::io::Result<()> {
-    let dir = match live.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-        _ => PathBuf::from("."),
-    };
+    fsync_dir(parent_dir(live))
+}
+
+/// Fsync the directory `dir` itself, durably committing the dirent
+/// changes made inside it (renames into it, files created in it).
+pub fn fsync_dir(dir: &Path) -> std::io::Result<()> {
     // Open with read-only — fsync(2) on a directory fd flushes its
     // metadata regardless of open mode.
-    let f = std::fs::File::open(&dir)?;
-    f.sync_all()
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// The directory a file at `path` lives in. A bare file name has
+/// `Some("")` as its parent, not `None`, and an empty path names no
+/// directory (`Path::new("").is_dir()` is false), so both are taken as
+/// the current directory.
+pub fn parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    }
+}
+
+/// Start writeback of the dirty pages in `[offset, offset + len)` of
+/// `file` without waiting for it to complete
+/// (`sync_file_range(SYNC_FILE_RANGE_WRITE)`). It can still block, for
+/// as long as the device's request queue is full.
+///
+/// Not a durability point: it writes neither metadata nor the device's
+/// cache, so a caller that needs the data durable still calls `fsync`.
+/// `len` is non-zero because `sync_file_range` reads a zero length as
+/// "to the end of the file", which no caller here means.
+pub fn start_writeback(file: &impl AsFd, offset: u64, len: NonZeroU64) -> std::io::Result<()> {
+    sync_file_range(file, offset, len, libc::SYNC_FILE_RANGE_WRITE)
+}
+
+/// Write back the dirty pages in `[offset, offset + len)` of `file` and
+/// wait until all of them are on the device
+/// (`SYNC_FILE_RANGE_WAIT_BEFORE | WRITE | WAIT_AFTER`): the first wait
+/// covers pages whose writeback was already started, by
+/// [`start_writeback`] or by the kernel's flusher, which the write alone
+/// would skip; the write submits the rest; the second wait covers those.
+/// When it returns, none of the range's pages are dirty or under
+/// writeback, unless something wrote to it meanwhile.
+///
+/// Not a durability point either (see [`start_writeback`]).
+pub fn writeback_and_wait(file: &impl AsFd, offset: u64, len: NonZeroU64) -> std::io::Result<()> {
+    sync_file_range(
+        file,
+        offset,
+        len,
+        libc::SYNC_FILE_RANGE_WAIT_BEFORE
+            | libc::SYNC_FILE_RANGE_WRITE
+            | libc::SYNC_FILE_RANGE_WAIT_AFTER,
+    )
+}
+
+/// `sync_file_range(2)`, its error returned. Linux-only, as the journal
+/// is as a whole (it already relies on Linux-only calls); a port would
+/// need an equivalent here, not a no-op, since callers use it to bound
+/// the dirty memory they leave behind.
+fn sync_file_range(
+    file: &impl AsFd,
+    offset: u64,
+    len: NonZeroU64,
+    flags: libc::c_uint,
+) -> std::io::Result<()> {
+    // `off64_t` is signed: an offset or length past `i64::MAX` is not a
+    // range of any file, so refuse it rather than let a cast wrap it.
+    let to_off = |v: u64| {
+        libc::off64_t::try_from(v).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("sync_file_range: {v} is past the largest file offset"),
+            )
+        })
+    };
+    let (offset, len) = (to_off(offset)?, to_off(len.get())?);
+    // SAFETY: a plain syscall on a file descriptor the borrow keeps open
+    // for the call's duration; no memory is passed to the kernel.
+    let rc = unsafe { libc::sync_file_range(file.as_fd().as_raw_fd(), offset, len, flags) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 /// Pacing for [`DirFsyncRetry`]: coarse enough not to hammer a failing
@@ -1032,5 +1107,51 @@ mod tests {
         let archives = list_archives(&live).unwrap();
         assert_eq!(archives.len(), 1);
         assert_eq!(archives[0].0, 1);
+    }
+
+    /// Both writeback calls accept a range of a written file, and one
+    /// past its end (the kernel takes a range with no pages as done).
+    #[test]
+    fn writeback_of_a_file_range_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::File::create(dir.path().join("f")).unwrap();
+        file.write_all_at(&[7u8; 10_000], 0).unwrap();
+        let len = NonZeroU64::new(5_000).unwrap();
+        start_writeback(&file, 5_000, len).unwrap();
+        writeback_and_wait(&file, 0, len).unwrap();
+        writeback_and_wait(&file, 5_000, len).unwrap();
+        writeback_and_wait(&file, 1 << 40, len).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    /// The kernel's refusal comes back to the caller rather than being
+    /// dropped: a pipe has no pages to write back (ESPIPE).
+    #[test]
+    fn writeback_errors_are_returned() {
+        let (_reader, writer) = std::io::pipe().unwrap();
+        let len = NonZeroU64::new(1).unwrap();
+        for result in [
+            start_writeback(&writer, 0, len),
+            writeback_and_wait(&writer, 0, len),
+        ] {
+            assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ESPIPE));
+        }
+    }
+
+    /// An offset or length `off64_t` cannot hold is refused before the
+    /// syscall, not wrapped into a negative one.
+    #[test]
+    fn writeback_refuses_a_range_past_the_largest_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::File::create(dir.path().join("f")).unwrap();
+        let past = u64::try_from(i64::MAX).unwrap() + 1;
+        for result in [
+            start_writeback(&file, past, NonZeroU64::new(1).unwrap()),
+            writeback_and_wait(&file, 0, NonZeroU64::new(past).unwrap()),
+        ] {
+            let err = result.unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("past the largest file offset"));
+        }
     }
 }

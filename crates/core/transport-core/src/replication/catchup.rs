@@ -440,22 +440,18 @@ fn publish_chunked_body(
 /// segment still contains the snapshot boundary. Reads at most the
 /// largest snapshot header (`MAX_HEADER_SIZE`) plus segment headers —
 /// never a body.
-pub fn preflight_snapshot_transfer(journal_path: &std::path::Path) -> io::Result<()> {
+///
+/// The snapshot served is the store's, wherever `--snapshot-path` put it.
+pub fn preflight_snapshot_transfer(store: &crate::node_store::NodeStore) -> io::Result<()> {
     use std::io::Read as _;
 
-    let snap_path = journal_path.with_extension("snapshot");
-    if !snap_path.exists() {
-        return Err(io::Error::other(
-            "snapshot transfer required but no snapshot available \
-             — set --snapshot-interval-ms to a non-zero value so the shadow stage writes snapshots",
-        ));
-    }
+    let snap_path = servable_snapshot(store)?;
 
     // Fixed stack buffer the size of the largest header version:
     // reading the whole file here would pull a potentially huge body
     // that snapshot_transfer_with reads again.
     let mut head = [0u8; crate::snapshot::MAX_HEADER_SIZE];
-    let mut file = std::fs::File::open(&snap_path)
+    let mut file = std::fs::File::open(snap_path)
         .map_err(|e| io::Error::other(format!("open snapshot {}: {e}", snap_path.display())))?;
     let mut filled = 0;
     while filled < head.len() {
@@ -478,31 +474,46 @@ pub fn preflight_snapshot_transfer(journal_path: &std::path::Path) -> io::Result
         ))
     })?;
 
-    let files = discover_journal_files(journal_path);
+    let files = discover_journal_files(store.journal());
     if containing_segment(&files, header.sequence + 1)?.is_none() {
-        return Err(io::Error::other(format!(
-            "no on-disk segment contains the snapshot boundary {} — archives pruned past \
-             the serving snapshot; retain segments at least as far back as the snapshot",
-            header.sequence + 1
-        )));
+        return Err(boundary_pruned(header.sequence + 1));
     }
     Ok(())
 }
 
+/// The store's snapshot, or the error that says there is none to serve.
+fn servable_snapshot(store: &crate::node_store::NodeStore) -> io::Result<&std::path::Path> {
+    let snap_path = store.snapshot();
+    if snap_path.try_exists()? {
+        Ok(snap_path)
+    } else {
+        Err(io::Error::other(format!(
+            "snapshot transfer required but no snapshot available at {} \
+             — set --snapshot-interval-ms to a non-zero value so the shadow stage writes snapshots",
+            snap_path.display()
+        )))
+    }
+}
+
+/// No segment on disk holds `boundary`, the entry after the snapshot.
+fn boundary_pruned(boundary: u64) -> io::Error {
+    io::Error::other(format!(
+        "no on-disk segment contains the snapshot boundary {boundary} — archives pruned past \
+         the serving snapshot; retain segments at least as far back as the snapshot",
+    ))
+}
+
+/// Stream the store's snapshot, the segment seed and the catch-up that
+/// follows it to a replica (see [`preflight_snapshot_transfer`]).
 pub fn snapshot_transfer_with<E: AppEvent>(
-    journal_path: &std::path::Path,
+    store: &crate::node_store::NodeStore,
     publisher: CatchUpPublisher<'_>,
     shutdown: &AtomicBool,
 ) -> io::Result<CatchUpResult> {
     use super::protocol::{encode_segment_seed_begin, encode_snapshot_begin, encode_stream_start};
 
-    let snap_path = journal_path.with_extension("snapshot");
-    if !snap_path.exists() {
-        return Err(io::Error::other(
-            "snapshot transfer required but no snapshot available \
-             — set --snapshot-interval-ms to a non-zero value so the shadow stage writes snapshots",
-        ));
-    }
+    let journal_path = store.journal();
+    let snap_path = servable_snapshot(store)?;
 
     let mut send_buf = Vec::with_capacity(64 * 1024 + 128);
 
@@ -511,7 +522,7 @@ pub fn snapshot_transfer_with<E: AppEvent>(
     // `snapshot::load` would reject (after it already wiped its local state
     // for the rebase) must fail here, on the primary, with the path in the
     // error. v1 files (pre-fencing) parse with epoch 0.
-    let snap_data = std::fs::read(&snap_path)
+    let snap_data = std::fs::read(snap_path)
         .map_err(|e| io::Error::other(format!("read snapshot {}: {e}", snap_path.display())))?;
     let header = crate::snapshot::SnapshotHeader::parse(&snap_data).map_err(|e| {
         io::Error::other(format!(
@@ -558,11 +569,7 @@ pub fn snapshot_transfer_with<E: AppEvent>(
     // seeding to keep it near that.
     let files = discover_journal_files(journal_path);
     let Some((seed_idx, seed_info)) = containing_segment(&files, snap_sequence + 1)? else {
-        return Err(io::Error::other(format!(
-            "no on-disk segment contains the snapshot boundary {} — archives pruned past \
-             the serving snapshot; retain segments at least as far back as the snapshot",
-            snap_sequence + 1
-        )));
+        return Err(boundary_pruned(snap_sequence + 1));
     };
     let seed_path = &files[seed_idx];
     let seed_bytes = melin_journal::segment::read_segment_prefix(seed_path, snap_sequence)
@@ -1198,7 +1205,8 @@ mod tests {
             }
         }
         drop(w);
-        let snap_path = live.with_extension("snapshot");
+        let store = crate::node_store::NodeStore::resolve(live.clone(), None).unwrap();
+        let snap_path = store.snapshot();
         crate::snapshot::save::<TestApp>(
             &TestApp::new(),
             WireSeq::new(4),
@@ -1208,7 +1216,7 @@ mod tests {
                 ack_policy: None,
             },
             Some(2),
-            &snap_path,
+            snap_path,
         )
         .unwrap();
 
@@ -1219,7 +1227,7 @@ mod tests {
             frames.push(buf.to_vec());
             Ok(())
         };
-        let res = snapshot_transfer_with::<TestEvent>(&live, &mut publish, &shutdown).unwrap();
+        let res = snapshot_transfer_with::<TestEvent>(&store, &mut publish, &shutdown).unwrap();
         assert_eq!(res, CatchUpResult::Ok(5), "catch-up must reach the tip");
 
         // Walk the frame sequence, reassembling the two chunked bodies.
@@ -1302,6 +1310,122 @@ mod tests {
         );
         assert_eq!(replica_writer.segment_starting_sequence(), 3);
         assert_eq!(replica_writer.next_sequence(), 5);
+    }
+
+    /// A primary journal of entries `1..=5` in `dir`, one segment.
+    fn journal_of_five(dir: &std::path::Path) -> std::path::PathBuf {
+        let live = dir.join("p.journal");
+        let mut w = melin_journal::BufferedWriter::<TestEvent>::create(&live).unwrap();
+        for v in 1..=5u64 {
+            w.append(&JournalEvent::App(TestEvent::Add(v))).unwrap();
+        }
+        live
+    }
+
+    /// A snapshot of sequence `seq` saved at `path`.
+    fn save_snapshot_at(path: &std::path::Path, seq: u64) {
+        crate::snapshot::save::<crate::test_support::TestApp>(
+            &crate::test_support::TestApp::new(),
+            crate::cursors::WireSeq::new(seq),
+            [0; 32],
+            crate::lineage::Lineage::GENESIS,
+            None,
+            path,
+        )
+        .unwrap();
+    }
+
+    /// The sequence the transfer's `SnapshotBegin` announces, and how the
+    /// transfer ended.
+    fn served_sequence(store: &crate::node_store::NodeStore) -> (u64, CatchUpResult) {
+        use super::super::protocol::{PrimaryMessage, decode_primary_message};
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        let mut publish = |buf: &[u8]| -> io::Result<()> {
+            frames.push(buf.to_vec());
+            Ok(())
+        };
+        let res = snapshot_transfer_with::<TestEvent>(store, &mut publish, &AtomicBool::new(false))
+            .unwrap();
+        match decode_primary_message(&frames[0][4..]).unwrap() {
+            PrimaryMessage::SnapshotBegin { snap_sequence, .. } => (snap_sequence, res),
+            other => panic!("expected SnapshotBegin, got {other:?}"),
+        }
+    }
+
+    /// The snapshot only at an explicit path in another directory: the
+    /// preflight passes and the transfer serves it. With a stale file also
+    /// at the derived `<journal>.snapshot`, the explicit one is served.
+    #[test]
+    fn the_snapshot_served_is_the_one_at_the_explicit_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_dir = tempfile::tempdir().unwrap();
+        let live = journal_of_five(dir.path());
+        let store = crate::node_store::NodeStore::resolve(
+            live.clone(),
+            Some(snapshot_dir.path().join("node.snapshot")),
+        )
+        .unwrap();
+        save_snapshot_at(store.snapshot(), 3);
+
+        preflight_snapshot_transfer(&store).unwrap();
+        assert_eq!(served_sequence(&store), (3, CatchUpResult::Ok(5)));
+
+        // A stale snapshot at the derived path, of another sequence.
+        save_snapshot_at(&live.with_extension("snapshot"), 1);
+        preflight_snapshot_transfer(&store).unwrap();
+        assert_eq!(
+            served_sequence(&store).0,
+            3,
+            "the explicit snapshot is served"
+        );
+    }
+
+    /// No snapshot at the store's path: both refuse, naming the path,
+    /// even with one at the derived path.
+    #[test]
+    fn no_snapshot_at_the_store_path_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_dir = tempfile::tempdir().unwrap();
+        let live = journal_of_five(dir.path());
+        let store = crate::node_store::NodeStore::resolve(
+            live.clone(),
+            Some(snapshot_dir.path().join("node.snapshot")),
+        )
+        .unwrap();
+        save_snapshot_at(&live.with_extension("snapshot"), 3);
+
+        let err = preflight_snapshot_transfer(&store).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(&store.snapshot().display().to_string()),
+            "{err}"
+        );
+        let mut publish = |_: &[u8]| -> io::Result<()> { panic!("nothing may be sent") };
+        assert!(
+            snapshot_transfer_with::<TestEvent>(&store, &mut publish, &AtomicBool::new(false))
+                .is_err()
+        );
+    }
+
+    /// A snapshot whose boundary segment was pruned cannot be served: the
+    /// preflight says so before any verdict goes out.
+    #[test]
+    fn a_pruned_boundary_fails_the_preflight() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("p.journal");
+        let mut w = melin_journal::BufferedWriter::<TestEvent>::create(&live).unwrap();
+        for v in 1..=5u64 {
+            w.append(&JournalEvent::App(TestEvent::Add(v))).unwrap();
+            if v == 2 {
+                w.rotate_segment().unwrap();
+            }
+        }
+        drop(w);
+        std::fs::remove_file(melin_journal::segment::archive_path(&live, 1)).unwrap();
+        let store = crate::node_store::NodeStore::resolve(live, None).unwrap();
+        save_snapshot_at(store.snapshot(), 1);
+        let err = preflight_snapshot_transfer(&store).unwrap_err();
+        assert!(err.to_string().contains("snapshot boundary 2"), "{err}");
     }
 
     /// The boundary re-announce must be judged from the segment header

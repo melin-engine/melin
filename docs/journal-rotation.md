@@ -162,7 +162,7 @@ Replica journals are byte-for-byte mirrors of the primary's: segment boundaries 
 | Flag | Default | Description |
 |---|---|---|
 | `--journal <path>` | `melin.journal` | Path to the live journal segment. Archives use the same prefix with a `.NNNNNN` suffix. |
-| `--snapshot <path>` | (derived: `<journal>.snapshot`) | Explicit snapshot path. If unset, the server uses `<journal-path-with-.snapshot-extension>`. |
+| `--snapshot-path <path>` | (derived: `<journal>.snapshot`) | The node's one snapshot file: read at boot, served to a replica that needs a resync, and written by the shadow stage. If unset, the journal path with a `.snapshot` extension. Its directory must exist. |
 | `--max-journal-mib <N>` | `256` | Rotate when the live segment exceeds N MiB at the next fsync boundary. Set to `0` to disable size-driven rotation. |
 | `--journal-staging-mode <mode>` | `zero-fill` | How the next segment is staged. `zero-fill` pre-writes it (metadata-free flushes, one extra pass of device bandwidth per segment); `allocate` only reserves it (no staging bandwidth, periodic metadata commit on the flush path). See "Segment staging cost". |
 | `--admin-bind <addr>` | (unset) | TCP address for the operator admin endpoint. Authenticated with operator keys; accepts `ROTATE\n` (effective on primaries; segmentation no-op on replicas) and `PROMOTE\n` (replica nodes). |
@@ -173,5 +173,5 @@ Replica journals are byte-for-byte mirrors of the primary's: segment boundaries 
 - **Archived segments are kept indefinitely.** Set up retention separately if disk usage matters.
 - **`ROTATE` does not block on the snapshot stage.** The admin command sets a flag and returns; the actual rotation happens at the next fsync boundary (typically within a few milliseconds under load).
 - **Send `ROTATE` to the primary.** Replicas adopt the primary's announced boundaries, so one command to the primary's admin endpoint rotates the whole deployment. A replica's `--admin-bind` endpoint still serves `PROMOTE`.
-- **Snapshot + segments must be on the same filesystem** for the atomic rename to work. Cross-filesystem `--snapshot` paths fall back to a copy that is not crash-safe.
+- **The snapshot may be on another filesystem than the journal.** Its temporary file (`.tmp`), its previous copy (`.prev`) and its resync archive all stay in the snapshot's own directory, so every rename that touches a snapshot is atomic wherever `--snapshot-path` puts it. Rotation never touches the snapshot.
 - **Legacy `.1`, `.2` archives** from pre-monotonic builds are still discoverable by recovery — they are visible in the archive listing for forensic replay, though new rotations always use the monotonic naming scheme.

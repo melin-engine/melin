@@ -39,6 +39,10 @@ pub mod health;
 pub mod journal_disk;
 pub mod journaled_app;
 pub mod lineage;
+/// Where a node keeps its journal and its snapshot: the one resolver of
+/// both paths, shared by every role that reads, writes, serves or
+/// archives the snapshot.
+pub mod node_store;
 pub mod pipeline;
 pub mod replica_presence;
 /// Replication wire protocol, journal-file catch-up, ack queueing,
@@ -52,6 +56,11 @@ pub mod replication_wire;
 /// journal fsync. Generic over `A: Application`.
 pub mod shadow;
 pub mod snapshot;
+/// Test-only discovery of a directory on a second filesystem, for tests
+/// that must cross one (a rename that would fail with EXDEV). For this
+/// crate's tests and, under `test-utils`, any crate's.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_fs;
 /// Test-only allocation of localhost listen addresses safe against the
 /// reserve-and-drop port race. For integration tests of any crate in the
 /// workspace; activate via `[dev-dependencies]` only.
@@ -71,3 +80,4 @@ pub use cursors::{
     SlotAcked, WireSeq,
 };
 pub use journaled_app::{JournaledApp, JournaledAppError};
+pub use node_store::{NodeStore, NodeStoreError};

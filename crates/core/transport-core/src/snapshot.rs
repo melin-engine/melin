@@ -44,6 +44,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 
 use melin_app::Application;
@@ -109,17 +110,17 @@ const CRC_SIZE: usize = 4;
 const MAX_SNAPSHOT_SIZE: u64 = 256 * 1024 * 1024;
 
 /// Suffix appended to the snapshot path for the one-deep rollback file.
-const PREV_SUFFIX: &str = ".prev";
+pub(crate) const PREV_SUFFIX: &str = ".prev";
 
 /// Suffix used for the in-progress write before the atomic publish rename.
-const TMP_SUFFIX: &str = ".tmp";
+pub(crate) const TMP_SUFFIX: &str = ".tmp";
 
 /// Append `suffix` to a snapshot path. Keeps the full filename intact
 /// (e.g. `melin.snapshot` → `melin.snapshot.prev`) so operators can run
 /// `mv melin.snapshot.prev melin.snapshot` to roll back. Using
 /// [`Path::with_extension`] is wrong here — it would replace the existing
 /// extension instead of appending, which breaks multi-dot filenames.
-fn with_suffix(path: &Path, suffix: &str) -> std::path::PathBuf {
+pub(crate) fn with_suffix(path: &Path, suffix: &str) -> std::path::PathBuf {
     let mut buf = path.as_os_str().to_owned();
     buf.push(suffix);
     std::path::PathBuf::from(buf)
@@ -350,7 +351,9 @@ impl SnapshotHeader {
 /// Save a snapshot of the current application state to `path`. Writes
 /// to `<path>.tmp` first and atomically renames on success — on crash
 /// the partial tmp file is discarded on recovery and the previous
-/// snapshot (if any) is untouched.
+/// snapshot (if any) is untouched. The file is written back as it is
+/// written, a few MiB at a time, so a large snapshot never leaves more
+/// than that dirty in the page cache.
 ///
 /// `journal_sequence` is the recovery resume point — typed [`WireSeq`]
 /// because recording any other space (e.g. a ring position) here would
@@ -362,6 +365,10 @@ impl SnapshotHeader {
 /// `genesis_entries` is the lineage's genesis length from the journal
 /// header. A lineage that knows neither it nor an ack policy writes a v2
 /// file, which has a field for neither; any other a v4 file.
+///
+/// Returns the size of the file written, in bytes: the shadow stage logs
+/// it with each save, so an operator sees what a save costs. `u64`, the
+/// type of a file length and of the size cap.
 pub fn save<A: Application>(
     app: &A,
     journal_sequence: WireSeq,
@@ -369,7 +376,7 @@ pub fn save<A: Application>(
     lineage: Lineage,
     genesis_entries: Option<u64>,
     path: &Path,
-) -> Result<(), SnapshotError> {
+) -> Result<u64, SnapshotError> {
     save_with_limit::<A>(
         app,
         journal_sequence,
@@ -377,12 +384,115 @@ pub fn save<A: Application>(
         lineage,
         genesis_entries,
         path,
-        MAX_SNAPSHOT_SIZE,
+        SaveLimits::DEFAULT,
     )
 }
 
-/// Internal form of [`save`] taking an explicit size cap. Factored out so
-/// tests can exercise the cap without allocating a 256 MiB payload.
+/// How much of a snapshot's write may be dirty in the page cache at once.
+///
+/// 4 MiB: large enough that the two `sync_file_range` calls a chunk
+/// costs are noise beside the chunk's own device time, and that the
+/// chunk in flight spans several of the block layer's largest requests,
+/// so the device sees a deep sequential stream; small enough that the
+/// two chunks a save leaves dirty or under writeback at once (see
+/// [`write_bounded`]) sit far below any sane `vm.dirty_background_bytes`
+/// (the LAN bench's hosts run at 32 MiB, with a 64 MiB hard limit). A
+/// multiple of every page size Linux uses, so chunks start on page
+/// boundaries and no page is in two chunks.
+const WRITEBACK_CHUNK: NonZeroUsize = NonZeroUsize::new(4 * 1024 * 1024).expect("non-zero");
+
+/// The bounds [`save_with_limit`] writes under. Parameters rather than
+/// constants so tests can reach the size cap and cross chunk boundaries
+/// with small payloads.
+#[derive(Debug, Clone, Copy)]
+struct SaveLimits {
+    /// The largest file a save writes, in bytes: `load`'s cap.
+    max_size: u64,
+    /// The writeback chunk. `NonZeroUsize`: a zero chunk splits nothing,
+    /// and `slice::chunks` panics on it.
+    chunk: NonZeroUsize,
+}
+
+impl SaveLimits {
+    const DEFAULT: Self = Self {
+        max_size: MAX_SNAPSHOT_SIZE,
+        chunk: WRITEBACK_CHUNK,
+    };
+}
+
+/// What [`write_bounded`] writes to: a file whose byte ranges it can push
+/// to the device. A trait, statically dispatched, so a test can record
+/// the writeback calls a save makes, which no in-process test could
+/// otherwise see; [`File`] is the one production implementation.
+trait WritebackTarget: Write {
+    /// Start writing back `[offset, offset + len)` without waiting.
+    fn start_writeback(&self, offset: u64, len: NonZeroU64) -> std::io::Result<()>;
+    /// Write back `[offset, offset + len)` and wait until it is on the device.
+    fn writeback_and_wait(&self, offset: u64, len: NonZeroU64) -> std::io::Result<()>;
+}
+
+impl WritebackTarget for File {
+    fn start_writeback(&self, offset: u64, len: NonZeroU64) -> std::io::Result<()> {
+        melin_journal::segment::start_writeback(self, offset, len)
+    }
+
+    fn writeback_and_wait(&self, offset: u64, len: NonZeroU64) -> std::io::Result<()> {
+        melin_journal::segment::writeback_and_wait(self, offset, len)
+    }
+}
+
+/// Write `buf` to the start of `file` (opened empty) with no more than two
+/// chunks of it dirty or under writeback at any moment, so a large
+/// snapshot cannot fill the page cache with dirty pages and push every
+/// other writer on the host, the journal included, into the kernel's
+/// dirty-page throttling.
+///
+/// After writing chunk N it starts chunk N's writeback without waiting
+/// (`SYNC_FILE_RANGE_WRITE`), then waits for chunk N-1's to finish
+/// (`WAIT_BEFORE | WRITE | WAIT_AFTER`, which also writes and waits for
+/// any of its pages the first call skipped because they were already
+/// under writeback). Starting N before waiting on N-1 keeps the device
+/// busy across the wait, so the save streams rather than stopping at
+/// every chunk. While chunk N+1 is written, only N (under writeback) and
+/// N+1 (dirty) are outstanding.
+///
+/// The save is still device-bound, as it was with one `write_all` and a
+/// `sync_all` that wrote everything at the end; what bounding adds is two
+/// syscalls a chunk and a shallower device queue (one chunk in flight
+/// rather than the whole file). That is the right trade even though the
+/// shadow stalls ingress if a save outlasts the input ring's headroom:
+/// an unbounded save makes the journal thread, on the hot path, wait in
+/// `balance_dirty_pages` once global dirty memory passes the limit,
+/// which costs every in-flight request its latency, where a slightly
+/// longer save costs nothing unless it outlasts that headroom.
+///
+/// Not a durability point: the caller's `sync_all` still writes the
+/// metadata and flushes the device's cache.
+fn write_bounded<F: WritebackTarget>(
+    file: &mut F,
+    buf: &[u8],
+    chunk: NonZeroUsize,
+) -> std::io::Result<()> {
+    // The chunk written before this one: its offset and length.
+    let mut previous: Option<(u64, NonZeroU64)> = None;
+    let mut offset: u64 = 0;
+    for piece in buf.chunks(chunk.get()) {
+        // `write_all`: a short write is retried, never taken for the chunk.
+        file.write_all(piece)?;
+        let len = NonZeroU64::new(piece.len() as u64).expect("`chunks` yields no empty slice");
+        file.start_writeback(offset, len)?;
+        if let Some((prev_offset, prev_len)) = previous {
+            file.writeback_and_wait(prev_offset, prev_len)?;
+        }
+        previous = Some((offset, len));
+        offset += len.get();
+    }
+    Ok(())
+}
+
+/// Internal form of [`save`] taking explicit [`SaveLimits`]. Factored out
+/// so tests can exercise the cap without allocating a 256 MiB payload,
+/// and the writeback chunking with a payload of a few bytes.
 fn save_with_limit<A: Application>(
     app: &A,
     journal_sequence: WireSeq,
@@ -390,8 +500,8 @@ fn save_with_limit<A: Application>(
     lineage: Lineage,
     genesis_entries: Option<u64>,
     path: &Path,
-    max_size: u64,
-) -> Result<(), SnapshotError> {
+    limits: SaveLimits,
+) -> Result<u64, SnapshotError> {
     let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     let v4 = genesis_entries.is_some() || lineage.ack_policy.is_some();
     let transport_version = if v4 {
@@ -446,8 +556,9 @@ fn save_with_limit<A: Application>(
     // Refuse to write a file the matching `load` would reject. Without
     // this guard a runaway `Application::snapshot` produces a file that
     // every subsequent recovery fails on.
-    if buf.len() as u64 > max_size {
-        return Err(SnapshotError::TooLarge(buf.len() as u64));
+    let size = buf.len() as u64;
+    if size > limits.max_size {
+        return Err(SnapshotError::TooLarge(size));
     }
 
     let tmp_path = with_suffix(path, TMP_SUFFIX);
@@ -458,7 +569,7 @@ fn save_with_limit<A: Application>(
             .write(true)
             .truncate(true)
             .open(&tmp_path)?;
-        file.write_all(&buf)?;
+        write_bounded(&mut file, &buf, limits.chunk)?;
         file.sync_all()?;
     }
 
@@ -466,11 +577,9 @@ fn save_with_limit<A: Application>(
     // but the directory entries they create/remove are not durable until
     // the parent's metadata is fsynced — without that, a crash can lose
     // the rename on ext4/xfs. Empty parent ("snap" with no separator)
-    // denotes CWD; use "." so the open succeeds rather than ENOENT.
-    let parent = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-        _ => std::path::PathBuf::from("."),
-    };
+    // denotes CWD (see `parent_dir`).
+    use melin_journal::segment::{fsync_dir, parent_dir};
+    let parent = parent_dir(path);
 
     // Rotate the previous snapshot to `<path>.prev` before clobbering it.
     // Operators rely on this as a one-deep rollback target — see
@@ -503,13 +612,13 @@ fn save_with_limit<A: Application>(
     // when no rotation happened (first save) to avoid a syscall on the
     // common path.
     if rotated {
-        File::open(&parent)?.sync_all()?;
+        fsync_dir(parent)?;
     }
 
     std::fs::rename(&tmp_path, path)?;
-    File::open(&parent)?.sync_all()?;
+    fsync_dir(parent)?;
 
-    Ok(())
+    Ok(size)
 }
 
 /// Load a snapshot from `path`. Returns the restored application with the
@@ -920,7 +1029,7 @@ mod tests {
         let app = populated_app();
 
         // First save — no previous snapshot exists; `.prev` is not created.
-        save::<TestApp>(
+        let first_size = save::<TestApp>(
             &app,
             WireSeq::new(1),
             [0x11; 32],
@@ -935,10 +1044,17 @@ mod tests {
             "no .prev file should be created on first save"
         );
         let first_bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            first_size,
+            first_bytes.len() as u64,
+            "save returns the size of the file it wrote"
+        );
 
         // Second save — previous snapshot must be rotated to .prev verbatim.
-        save::<TestApp>(
-            &app,
+        // A smaller state, so the returned size is the new file's, not
+        // the one it replaced.
+        let second_size = save::<TestApp>(
+            &TestApp::new(),
             WireSeq::new(2),
             [0x22; 32],
             at_epoch(0),
@@ -947,6 +1063,11 @@ mod tests {
         )
         .unwrap();
         assert!(path.exists());
+        assert_eq!(second_size, std::fs::metadata(&path).unwrap().len());
+        assert!(
+            second_size < first_size,
+            "an empty state's snapshot is smaller than a populated one's"
+        );
         assert!(prev_path.exists(), "second save must produce a .prev file");
         assert_eq!(
             std::fs::read(&prev_path).unwrap(),
@@ -1226,7 +1347,7 @@ mod tests {
             at_epoch(0),
             Some(0),
             &path,
-            /* max_size */ 16,
+            capped_at(16),
         ) {
             Err(SnapshotError::TooLarge(_)) => {}
             other => panic!("expected TooLarge, got {other:?}"),
@@ -1243,6 +1364,320 @@ mod tests {
             !tmp.exists(),
             "save_with_limit must not leave a .tmp on size-check failure"
         );
+    }
+
+    /// A snapshot of exactly the cap is written (the cap is inclusive,
+    /// as `load`'s is), and the size returned is the file's: the
+    /// header, the application payload and the CRC.
+    #[test]
+    fn save_at_exactly_the_cap_returns_the_file_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snap");
+        let app = populated_app();
+        let expected = (HEADER_SIZE + payload_of(&app).len() + CRC_SIZE) as u64;
+
+        let size = save_with_limit::<TestApp>(
+            &app,
+            WireSeq::new(3),
+            [0x5A; 32],
+            at_epoch(1),
+            Some(0),
+            &path,
+            capped_at(expected),
+        )
+        .unwrap();
+        assert_eq!(size, expected);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), expected);
+        let (restored, header) = load::<TestApp>(&path).unwrap();
+        assert_eq!(restored, app);
+        assert_eq!(header.sequence, 3);
+
+        // One byte under it refuses, and leaves the saved file alone.
+        match save_with_limit::<TestApp>(
+            &app,
+            WireSeq::new(4),
+            [0x5A; 32],
+            at_epoch(1),
+            Some(0),
+            &path,
+            capped_at(expected - 1),
+        ) {
+            Err(SnapshotError::TooLarge(size)) => assert_eq!(size, expected),
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+        assert_eq!(load::<TestApp>(&path).unwrap().1.sequence, 3);
+    }
+
+    /// The default limits with the size cap at `max_size`.
+    fn capped_at(max_size: u64) -> SaveLimits {
+        SaveLimits {
+            max_size,
+            ..SaveLimits::DEFAULT
+        }
+    }
+
+    /// An application with no state: its snapshot payload is empty, so
+    /// the file is the header and the CRC alone.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct Stateless;
+
+    impl Application for Stateless {
+        type Event = crate::test_support::TestEvent;
+        type Report = crate::test_support::TestReport;
+        type QueryResponse = crate::test_support::TestQuery;
+        type Sizing = ();
+
+        const APP_VERSION: u16 = 1;
+
+        fn apply(
+            &mut self,
+            _event: Self::Event,
+            _ctx: &melin_app::ApplyCtx,
+            _out: &mut Vec<Self::Report>,
+        ) {
+        }
+
+        fn build_reject(_event: &Self::Event, _reason: melin_app::RejectReason) -> Self::Report {
+            crate::test_support::TestReport { total_after: 0 }
+        }
+
+        fn snapshot<W: Write>(&self, _w: &mut W) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn restore<R: Read>(_r: &mut R) -> std::io::Result<Self> {
+            Ok(Self)
+        }
+    }
+
+    /// Save `app` to a fresh path twice (sequences 1 and 2) with every
+    /// interesting chunk size: the whole file in exactly one chunk, one
+    /// chunk plus one byte, several chunks with a short last one, and a
+    /// byte at a time. Each save must write the same bytes as one at the
+    /// default chunk (where the file is a single chunk), return the
+    /// file's length, round-trip through `load`, and rotate the first
+    /// save to `.prev` intact.
+    fn assert_chunked_saves_round_trip<A>(app: &A, label: &str)
+    where
+        A: Application + PartialEq + std::fmt::Debug,
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let save_at = |seq: u64, path: &Path, chunk: NonZeroUsize| {
+            save_with_limit::<A>(
+                app,
+                WireSeq::new(seq),
+                [seq as u8; 32],
+                at_epoch(seq),
+                Some(seq),
+                path,
+                SaveLimits {
+                    chunk,
+                    ..SaveLimits::DEFAULT
+                },
+            )
+            .unwrap()
+        };
+        let reference = |seq: u64| {
+            let path = dir.path().join(format!("reference.{seq}"));
+            save_at(seq, &path, WRITEBACK_CHUNK);
+            std::fs::read(&path).unwrap()
+        };
+        let (first_ref, second_ref) = (reference(1), reference(2));
+        let size = first_ref.len();
+        assert!(size < WRITEBACK_CHUNK.get(), "{label}: one default chunk");
+
+        for chunk in [size, size - 1, 16, 1] {
+            let label = format!("{label}, {size}-byte file in {chunk}-byte chunks");
+            let chunk = NonZeroUsize::new(chunk).unwrap();
+            let path = dir.path().join(format!("snap.{chunk}"));
+            let prev_path = with_suffix(&path, PREV_SUFFIX);
+            for (seq, expected) in [(1, &first_ref), (2, &second_ref)] {
+                let written = save_at(seq, &path, chunk);
+                let bytes = std::fs::read(&path).unwrap();
+                assert_eq!(written, bytes.len() as u64, "{label}: size returned");
+                assert_eq!(&bytes, expected, "{label}: bytes of save {seq}");
+                let (restored, header) = load::<A>(&path).unwrap();
+                assert_eq!(&restored, app, "{label}");
+                assert_eq!(header.sequence, seq, "{label}");
+            }
+            assert_eq!(std::fs::read(&prev_path).unwrap(), first_ref, "{label}");
+            assert_eq!(load::<A>(&prev_path).unwrap().1.sequence, 1, "{label}");
+            assert!(!with_suffix(&path, TMP_SUFFIX).exists(), "{label}");
+        }
+    }
+
+    #[test]
+    fn chunked_save_round_trips_at_every_chunk_boundary() {
+        assert_chunked_saves_round_trip(&populated_app(), "populated");
+    }
+
+    #[test]
+    fn chunked_save_of_an_empty_app_payload_round_trips() {
+        let mut payload = Vec::new();
+        Stateless.snapshot(&mut payload).unwrap();
+        assert!(payload.is_empty());
+        assert_chunked_saves_round_trip(&Stateless, "empty payload");
+    }
+
+    /// A payload of several default chunks, not a multiple of one: the
+    /// chunk size a real save uses, at the size it exists for.
+    #[test]
+    fn save_spanning_several_default_chunks_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snap");
+        let mut app = TestApp::new();
+        // 16 bytes an entry: a little over two and a half chunks.
+        let entries = (WRITEBACK_CHUNK.get() * 5 / 2) / 16 + 7;
+        app.per_key_total = (1..=entries as u64).map(|k| (k, k * 3)).collect();
+        let size =
+            save::<TestApp>(&app, WireSeq::new(8), [1; 32], at_epoch(0), None, &path).unwrap();
+        assert!(size > 2 * WRITEBACK_CHUNK.get() as u64);
+        assert_ne!(size % WRITEBACK_CHUNK.get() as u64, 0);
+        assert_eq!(size, std::fs::metadata(&path).unwrap().len());
+        let (restored, header) = load::<TestApp>(&path).unwrap();
+        assert_eq!(restored, app);
+        assert_eq!(header.sequence, 8);
+    }
+
+    /// One call [`write_bounded`] makes on its target, in order.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Call {
+        /// Bytes written: their offset and length.
+        Write(u64, usize),
+        Start(u64, u64),
+        Wait(u64, u64),
+    }
+
+    /// A [`WritebackTarget`] that records every call and fails the
+    /// writeback call numbered `fail_at` (counting both kinds from zero).
+    #[derive(Default)]
+    struct Recorder {
+        // `RefCell`: the writeback methods take `&self`, like `File`'s.
+        calls: std::cell::RefCell<Vec<Call>>,
+        written: Vec<u8>,
+        fail_at: Option<usize>,
+    }
+
+    impl Recorder {
+        fn writeback(&self, call: Call) -> std::io::Result<()> {
+            let mut calls = self.calls.borrow_mut();
+            let n = calls
+                .iter()
+                .filter(|c| !matches!(c, Call::Write(..)))
+                .count();
+            calls.push(call);
+            if self.fail_at == Some(n) {
+                return Err(std::io::Error::other("injected writeback failure"));
+            }
+            Ok(())
+        }
+    }
+
+    impl Write for Recorder {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            // A short write every time, so `write_all` must loop.
+            let n = buf.len().min(3);
+            self.calls
+                .get_mut()
+                .push(Call::Write(self.written.len() as u64, n));
+            self.written.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl WritebackTarget for Recorder {
+        fn start_writeback(&self, offset: u64, len: NonZeroU64) -> std::io::Result<()> {
+            self.writeback(Call::Start(offset, len.get()))
+        }
+
+        fn writeback_and_wait(&self, offset: u64, len: NonZeroU64) -> std::io::Result<()> {
+            self.writeback(Call::Wait(offset, len.get()))
+        }
+    }
+
+    /// Each chunk's writeback starts once all of it is written, and the
+    /// previous chunk's is waited on right after, so no more than two
+    /// chunks are ever outstanding; the last chunk is left to `sync_all`.
+    #[test]
+    fn write_bounded_starts_each_chunk_then_waits_on_the_previous() {
+        let buf: Vec<u8> = (0..20u8).collect();
+        let mut rec = Recorder::default();
+        write_bounded(&mut rec, &buf, NonZeroUsize::new(8).unwrap()).unwrap();
+        assert_eq!(rec.written, buf);
+        let writeback: Vec<Call> = rec
+            .calls
+            .take()
+            .into_iter()
+            .filter(|c| !matches!(c, Call::Write(..)))
+            .collect();
+        assert_eq!(
+            writeback,
+            [
+                Call::Start(0, 8),
+                Call::Start(8, 8),
+                Call::Wait(0, 8),
+                Call::Start(16, 4),
+                Call::Wait(8, 8),
+            ]
+        );
+    }
+
+    /// Every byte of a chunk is written before its writeback starts, and
+    /// no byte of the next chunk is written before the previous chunk's
+    /// wait returns.
+    #[test]
+    fn write_bounded_interleaves_writes_and_writeback_per_chunk() {
+        let buf = [7u8; 10];
+        let mut rec = Recorder::default();
+        write_bounded(&mut rec, &buf, NonZeroUsize::new(5).unwrap()).unwrap();
+        assert_eq!(
+            rec.calls.take(),
+            [
+                Call::Write(0, 3),
+                Call::Write(3, 2),
+                Call::Start(0, 5),
+                Call::Write(5, 3),
+                Call::Write(8, 2),
+                Call::Start(5, 5),
+                Call::Wait(0, 5),
+            ]
+        );
+    }
+
+    /// An empty buffer writes nothing and asks for no writeback.
+    #[test]
+    fn write_bounded_of_nothing_makes_no_calls() {
+        let mut rec = Recorder::default();
+        write_bounded(&mut rec, &[], NonZeroUsize::new(4).unwrap()).unwrap();
+        assert!(rec.calls.take().is_empty());
+    }
+
+    /// A failed writeback call, of either kind, ends the write with its
+    /// error and writes nothing more.
+    #[test]
+    fn write_bounded_propagates_writeback_errors() {
+        let buf = [1u8; 12];
+        // Calls: Start(0) #0, Start(4) #1, Wait(0) #2, Start(8) #3, Wait(4) #4.
+        for (fail_at, written) in [(0, 4), (2, 8), (4, 12)] {
+            let mut rec = Recorder {
+                fail_at: Some(fail_at),
+                ..Recorder::default()
+            };
+            let err = write_bounded(&mut rec, &buf, NonZeroUsize::new(4).unwrap()).unwrap_err();
+            assert_eq!(err.to_string(), "injected writeback failure");
+            assert_eq!(rec.written.len(), written, "failing call {fail_at}");
+        }
+    }
+
+    /// The default chunk is page-aligned under every page size Linux
+    /// uses (4, 16 and 64 KiB), so no page straddles two chunks.
+    #[test]
+    fn default_chunk_is_page_aligned() {
+        assert_eq!(WRITEBACK_CHUNK.get() % (64 * 1024), 0);
     }
 
     #[test]

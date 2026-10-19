@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 # Run the LAN suite against four podman containers on this machine: a
 # rehearsal of the whole suite (sysroot, cross build, deploy, cluster,
-# health verdict, summary) without bench hosts. The figures it prints
-# measure nothing; whether it gets to print them is the test.
+# health and snapshot verdicts, summary) without bench hosts. The figures
+# it prints measure nothing; whether it gets to print them is the test.
+#
+# Snapshots are on, every 2 s so that each 5 s phase is judged on at
+# least one save per node, in the suite's default SNAPSHOT_DIR, which the
+# suite creates and cleans in the containers. Their filesystem is an
+# overlay, which the suite's disk guard cannot resolve to a disk, so the
+# rig sets SNAPSHOT_SHARED_DISK_OK=1: the guard warns instead of refusing,
+# and the runs record their disks' writes as `-`.
 #
 # The containers run Debian, as the bench hosts do, on this machine's
 # architecture (so the build is for that architecture, not x86_64), on
@@ -67,7 +74,8 @@ ssh-keygen -q -t ed25519 -N '' -f "${WORK_DIR}/id_ed25519"
 echo "=== Building the host image ==="
 # What server-setup.sh installs that the suite uses, without the host
 # tuning, which a container cannot do: build-essential for the sysroot,
-# curl for the health samples, procps for pkill.
+# curl for the health samples, procps for pkill. The disk guard's findmnt
+# and lsblk are util-linux's, in the base image.
 podman build "${PLATFORM_ARGS[@]}" -q -t "$IMAGE" -f - "$WORK_DIR" <<'EOF' >/dev/null
 FROM docker.io/library/debian:bookworm
 RUN apt-get update -qq \
@@ -132,6 +140,8 @@ SINGLE_DURATION="${SINGLE_DURATION:-5s}" \
 WARMUP_DURATION="${WARMUP_DURATION:-1s}" \
 COOLDOWN_DURATION="${COOLDOWN_DURATION:-1s}" \
 BENCH_CORE="${BENCH_CORE:-0}" \
+SNAPSHOT_INTERVAL_MS="${SNAPSHOT_INTERVAL_MS:-2000}" \
+SNAPSHOT_SHARED_DISK_OK=1 \
 SERVER_EXTRA_ARGS="${SERVER_EXTRA_ARGS:-$NODE_ARGS}" \
 REPLICA_EXTRA_ARGS="${REPLICA_EXTRA_ARGS:-$NODE_ARGS}" \
     "${SCRIPT_DIR}/lan-bench-suite.sh" "$APP" \

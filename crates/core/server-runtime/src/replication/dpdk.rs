@@ -37,6 +37,7 @@ use super::{
     teardown_replica_pipeline,
 };
 use melin_app::auth::AuthorizedKeys;
+use melin_transport_core::node_store::NodeStore;
 use melin_transport_core::replica_presence::{FirstAck, ReplicaPresence};
 use melin_transport_core::replication::PersistWatch;
 use melin_transport_core::replication::catchup::CatchUpPublisher;
@@ -642,7 +643,9 @@ impl<A: Application> DpdkReplicationDriver<A> {
     pub fn new(
         repl_consumers: [ReplicationConsumer; 2],
         replica_slots: Arc<melin_transport_core::ReplicaSlotCursors>,
-        journal_path: std::path::PathBuf,
+        // The node's journal, streamed to replicas, and its snapshot, sent
+        // to one that needs a resync.
+        store: NodeStore,
         replica_ready: Arc<AtomicBool>,
         replicas_connected: Arc<ReplicaPresence>,
         evict_flags: [Arc<AtomicBool>; 2],
@@ -666,7 +669,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
         let [validator_0, validator_1] = [0usize, 1].map(|idx| {
             ValidationWorker::spawn(
                 format!("repl-validate-{idx}"),
-                journal_path.clone(),
+                store.journal().to_path_buf(),
                 validate_replica_handshake_settled,
             )
         });
@@ -677,7 +680,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
         // The join workers, likewise spawned here and never from `tick`.
         let [joiner_0, joiner_1] = [0usize, 1].map(|idx| {
             let ctx = JoinContext {
-                journal_path: journal_path.clone(),
+                store: store.clone(),
                 fence_state: Arc::clone(&fence_state),
             };
             JoinWorker::spawn(
@@ -1557,13 +1560,13 @@ pub fn run_receiver_dpdk<A>(
     primary_ip: std::net::Ipv4Addr,
     primary_port: u16,
     signing_key: &ed25519_dalek::SigningKey,
-    journal_path: &std::path::Path,
+    // As the kernel-TCP `run_receiver`'s.
+    store: &NodeStore,
     shutdown: &AtomicBool,
     // The handles this loop shares with the admin endpoint and the
     // control-plane raft driver — see [`super::ReplicaControlPlane`].
     control: &super::ReplicaControlPlane,
     snapshot_interval_ms: u64,
-    snapshot_path: std::path::PathBuf,
     cores: crate::layout::PipelineCores,
     // Passed straight to the replica's journal stage; see
     // `build_replica_pipeline_with_threads`.
@@ -1586,8 +1589,7 @@ where
     // See `recover_replica_state` for the lineage rules.
     let (mut app, mut journal_writer, mut last_sequence, mut chain_hash) =
         recover_replica_state::<A, BufferedWriter<A::Event>>(
-            journal_path,
-            &snapshot_path,
+            store,
             &fence_state,
             &control.lineage_ack_policy,
             sizing,
@@ -1671,8 +1673,7 @@ where
                         &mut divergence_resyncs,
                         &mut backoff,
                         last_sequence,
-                        journal_path,
-                        &snapshot_path,
+                        store,
                         &fence_state,
                         lineage_ack_policy,
                         shutdown,
@@ -1976,8 +1977,7 @@ where
                                 &mut pipeline,
                                 &mut app,
                                 &mut journal_writer,
-                                journal_path,
-                                &snapshot_path,
+                                store,
                                 &fence_state,
                                 control,
                                 &mut last_sequence,
@@ -2052,7 +2052,7 @@ where
         // promotion check (see the kernel-TCP receiver).
         if pipeline.is_none() && journal_writer.is_none() {
             let writer = match BufferedWriter::create_continuing(
-                journal_path,
+                store.journal(),
                 lineage_start,
                 lineage_anchor,
                 lineage_genesis,
@@ -2101,7 +2101,7 @@ where
                 cores,
                 staging_mode,
                 snapshot_interval_ms,
-                snapshot_path.clone(),
+                store,
                 group_commit_delay,
                 Arc::clone(&fence_state),
                 lineage_ack_policy,
@@ -2163,8 +2163,7 @@ where
             &mut divergence_resyncs,
             &mut backoff,
             last_sequence,
-            journal_path,
-            &snapshot_path,
+            store,
             &fence_state,
             lineage_ack_policy,
             shutdown,

@@ -12,6 +12,112 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ## [Unreleased]
 
+### Added
+
+- **`melin_transport_core::NodeStore`**, the one resolver of a node's
+  journal and snapshot paths, and **`ServerConfig::store()`**, which
+  builds it from `--journal` and `--snapshot-path`. Every role that
+  reads, writes, serves or archives the snapshot takes its path from it.
+- **`melin_journal::segment::parent_dir` and `fsync_dir`**: the directory
+  a file lives in (a bare name's is `.`), and a sync of a directory itself.
+- **`melin_journal::segment::start_writeback` and `writeback_and_wait`**:
+  `sync_file_range` over a range of a file, starting its writeback or
+  waiting for it to finish, with the error returned and the length
+  non-zero by type (`sync_file_range` reads a zero length as "to the end
+  of the file").
+
+### Changed
+
+- **`--snapshot-path` is the node's one snapshot location**: read at
+  boot by a primary and a replica, served to a replica that needs a
+  resync, and written by the shadow stage. It defaults, as before, to the
+  journal path with a `.snapshot` extension.
+- **A node refuses to start on a snapshot location it cannot use**: when
+  the snapshot path names no file or names a directory, when the
+  snapshot's directory does not exist (or is not a directory), when the
+  snapshot path is the journal path, or when `--snapshot-path` names
+  nothing while a snapshot exists at the derived `<journal>.snapshot` and
+  the node has no journal (move that snapshot to `--snapshot-path`).
+- **A resync archives `<snapshot>.prev` with the snapshot.** The old
+  history's `.prev` used to stay beside the new history's snapshot, where
+  rolling the snapshot back to it would have restored a snapshot of
+  another history. A snapshot in another directory than the journal is
+  archived beside itself, in `<snapshot-name>.<reason>.<n>/`, with the
+  same `<n>` as the journal's archive.
+- **The library takes a `NodeStore`** (source-breaking):
+  `archive_local_lineage`, `preflight_snapshot_transfer` and
+  `snapshot_transfer_with` take the store instead of paths, and
+  `archive_local_lineage` returns both archive directories
+  (`ArchivedLineage`). In `melin_server_runtime::replication`,
+  `run_receiver`, `run_receiver_dpdk` and `DpdkReplicationDriver::new`
+  take the store in place of their journal and snapshot paths, and
+  `Sender`'s `journal_path` field is now `store`.
+- **`melin_transport_core::snapshot::save` returns the size it wrote**
+  (`Result<u64, SnapshotError>`; it returned `Result<(), _>`).
+  Source-breaking where the result was used as a `Result<(), _>` (matched
+  on `Ok(())`, returned as a function's tail, or passed on as one);
+  callers that apply `?` or discard the value are unaffected.
+- **A snapshot save leaves at most 8 MiB of unwritten data in the page
+  cache.** It writes in 4 MiB pieces, each sent to disk as soon as it is
+  written, and waits for one piece to reach the disk before writing the
+  one after next. A large snapshot used to sit in the page cache whole
+  until its final `fsync`, which could carry the host past its
+  dirty-page limit and make the kernel throttle every writer, the
+  journal's thread included, for the length of the save. The final
+  `fsync` remains the durability point.
+- **The LAN benchmark suite takes snapshots in every run, on the OS
+  disk.** Every node saves one every `SNAPSHOT_INTERVAL_MS` (10 s by
+  default; `0` turns them off) to `SNAPSHOT_DIR`
+  (`/var/lib/melin-bench/snapshots` by default), which the suite refuses
+  to run with when it cannot show it is on another disk than the
+  journal. A run passes only if every node saved enough snapshots during
+  the load, all to its own path; each run records the verdict and the
+  writes to both disks in `<transport>-<workload>.snapshots`, and the
+  suite records its settings in `suite.conf`. Before, the nodes ran at
+  the 50-minute default interval and no run ever took a snapshot. Node
+  arguments carrying a snapshot flag are now refused, and the files of
+  earlier runs are removed by exact name before each run, resync archive
+  directories included. See [docs/benchmarking.md](docs/benchmarking.md).
+
+### Removed
+
+- **`--snapshot`** (breaking). A command line that still carries it is
+  refused at parse time. It was read once, at a primary's boot, while the
+  shadow stage went on writing elsewhere. To migrate:
+  - with `--snapshot-path` already set, drop `--snapshot` and leave the
+    file at `--snapshot-path` alone: it is the freshest snapshot, and a
+    `<journal>.snapshot`, if any, is a stale leftover;
+  - with `--snapshot X` alone, the shadow stage kept writing the derived
+    `<journal>.snapshot`, so that file, not X, is the freshest snapshot.
+    If `--snapshot` was a one-off restore, drop it: the derived path is
+    already the live location. To keep a custom location, move the
+    current `<journal>.snapshot` there first, then set `--snapshot-path`;
+  - to restore from a backup, copy it to the snapshot path.
+- **`ServerConfig::snapshot` and `ServerConfig::shadow_snapshot_path`**.
+  Use `ServerConfig::store()`.
+
+### Fixed
+
+- **A snapshot deferred under load is retried, not skipped for an
+  interval.** The shadow stage saves only at a journal fsync boundary,
+  and tried once per `--snapshot-interval-ms`: under sustained load it
+  could miss the boundary at every tick and go several intervals without
+  a snapshot, logging nothing. A due save is now attempted until it
+  lands; a save still waiting at the next interval logs a warning, and a
+  failed save is retried at the next interval rather than continuously.
+  The `shadow snapshot saved` line now carries `bytes`, `elapsed_ms` and
+  `attempts`, and `shadow snapshot failed` carries `attempts`.
+- **A primary with `--snapshot-path` recovers from, and serves, its own
+  snapshot** (the location half of findings 21 and 22 of the
+  determinism audit). It used to ignore that snapshot at boot and when a
+  replica needed a resync, and could serve a stale `<journal>.snapshot`.
+- **A replica whose `--snapshot-path` is on another filesystem than its
+  journal no longer fails every resync** with EXDEV: its snapshot is
+  archived beside itself, on its own filesystem.
+- **A re-seeded replica's temporary snapshot is `<snapshot>.tmp`**, the
+  shadow stage's own temporary name, and its directory is synced once
+  the received snapshot is in place.
+
 ## [0.20.0] - 2026-10-19
 
 ### Added

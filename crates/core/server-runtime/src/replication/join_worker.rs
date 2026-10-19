@@ -41,6 +41,7 @@ use melin_transport_core::replication::catchup::CatchUpPublisher;
 use {
     melin_app::AppEvent,
     melin_transport_core::fence::FenceState,
+    melin_transport_core::node_store::NodeStore,
     melin_transport_core::replication::catchup::{
         CatchUpResult, can_catch_up_from_journal, catch_up_from_journal_with,
         handoff_pass_from_journal, lineage_origin, preflight_snapshot_transfer,
@@ -49,7 +50,6 @@ use {
     melin_transport_core::replication::protocol::{
         encode_hash_mismatch, encode_need_snapshot, encode_stream_start,
     },
-    std::path::PathBuf,
 };
 
 use super::validation_worker::{WorkerGone, spawn_unpinned};
@@ -393,7 +393,9 @@ impl JoinStallWatch {
 // so leaves this out.
 #[cfg(any(feature = "dpdk", not(feature = "no-persist")))]
 pub(crate) struct JoinContext {
-    pub(crate) journal_path: PathBuf,
+    /// The node's journal, which a join streams, and its snapshot, which
+    /// a resync sends.
+    pub(crate) store: NodeStore,
     /// Read when the `StreamStart` is encoded, as the inline join did.
     pub(crate) fence_state: Arc<FenceState>,
 }
@@ -419,7 +421,7 @@ pub(crate) fn stream_join<E: AppEvent>(
     publish: CatchUpPublisher<'_>,
     cancel: &AtomicBool,
 ) -> io::Result<u64> {
-    let journal_path = ctx.journal_path.as_path();
+    let journal_path = ctx.store.journal();
     let (last_sequence, divergent) = match *request {
         JoinRequest::Replica {
             last_sequence,
@@ -454,9 +456,9 @@ pub(crate) fn stream_join<E: AppEvent>(
         } else {
             encode_need_snapshot(&mut frame);
         }
-        preflight_snapshot_transfer(journal_path)?;
+        preflight_snapshot_transfer(&ctx.store)?;
         publish(&frame)?;
-        snapshot_transfer_with::<E>(journal_path, publish, cancel)?
+        snapshot_transfer_with::<E>(&ctx.store, publish, cancel)?
     };
     match result {
         CatchUpResult::Ok(end) => Ok(end),
@@ -807,14 +809,14 @@ mod tests {
         use melin_journal::{BufferedWriter, JournalEvent, JournalWrite};
         use melin_transport_core::replication::protocol::{PrimaryMessage, decode_primary_message};
 
-        fn ctx(journal_path: PathBuf) -> JoinContext {
+        fn ctx(journal_path: std::path::PathBuf) -> JoinContext {
             JoinContext {
-                journal_path,
+                store: NodeStore::resolve(journal_path, None).expect("store"),
                 fence_state: Arc::new(FenceState::new(3)),
             }
         }
 
-        fn journal(dir: &std::path::Path, events: u64) -> PathBuf {
+        fn journal(dir: &std::path::Path, events: u64) -> std::path::PathBuf {
             let path = dir.join("primary.journal");
             let mut w = BufferedWriter::<CounterEvent>::create(&path).expect("create");
             for _ in 0..events {
