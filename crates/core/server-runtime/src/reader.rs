@@ -43,6 +43,7 @@ use melin_app::decoder::ErasedDecoder;
 pub type RequestDecoderArc<A> = Arc<dyn ErasedDecoder<<A as Application>::Event>>;
 use melin_app::unix_epoch_nanos;
 use melin_pipeline::ring;
+use melin_transport_core::health::IngressMetrics;
 use melin_transport_core::pipeline::InputSlot;
 use melin_transport_core::tick::TickSchedule;
 
@@ -236,7 +237,9 @@ pub(crate) fn wake_reader(event_fd: &OwnedFd) {
 /// Every request it does not publish — one the application's decoder
 /// filters or refuses, a write refused while `halt` refuses writes, one
 /// shed on a full input ring — the reader answers through
-/// `early_replies` — see [`crate::halt`].
+/// `early_replies` — see [`crate::halt`]. It counts those it sheds,
+/// filters and refuses into `metrics`, with the connections it parks, for
+/// the health endpoint.
 ///
 /// The reader also journals the admin `ACK-POLICY` command's requests: it
 /// attaches `ack_policy` with its wakeup eventfd, so a request posted while
@@ -255,6 +258,7 @@ pub fn spawn_reader<A: Application, R: AsRawFd + Send + 'static>(
     decoder: RequestDecoderArc<A>,
     halt: HaltGate,
     early_replies: EarlyReplySender<A::Report>,
+    metrics: Arc<IngressMetrics>,
     ack_policy: BootedClaim,
     control_tx: mpsc::Sender<ControlEvent>,
     core: usize,
@@ -309,6 +313,7 @@ where
             &*decoder,
             &halt,
             early_replies,
+            &metrics,
             ack_policy,
             &control_tx,
             connection_timeout,
@@ -696,6 +701,7 @@ fn reader_loop<A: Application, R: AsRawFd>(
     decoder: &dyn ErasedDecoder<A::Event>,
     halt: &HaltGate,
     mut early_replies: EarlyReplySender<A::Report>,
+    metrics: &IngressMetrics,
     mut ack_policy: AckPolicyPublisher,
     control_tx: &mpsc::Sender<ControlEvent>,
     connection_timeout: Option<Duration>,
@@ -1217,6 +1223,7 @@ fn reader_loop<A: Application, R: AsRawFd>(
                 decoder,
                 halt,
                 &mut early_replies,
+                metrics,
                 batch_wall_ns,
                 recv_ts,
                 #[cfg(feature = "latency-trace")]
@@ -1226,8 +1233,11 @@ fn reader_loop<A: Application, R: AsRawFd>(
             );
             let (recv, step) = entry.recv.after_frames(action, batch_now);
             entry.recv = recv;
+            // A new park: a parked connection's bytes are kept, not
+            // processed (`CqeStep::Keep`), so none was parked before this.
             if matches!(recv, RecvState::Parked { .. }) {
                 any_parked = true;
+                metrics.record_park();
                 debug!(connection_id = entry.connection_id, "connection parked");
             }
             apply_frames_step(
@@ -1242,9 +1252,13 @@ fn reader_loop<A: Application, R: AsRawFd>(
 
         // Retry every parked connection's buffer: on the park-retry
         // timer, and on any other wake. One that comes back processed is
-        // read again; one that parks again stays parked.
+        // read again; one that parks again stays parked. The pass counts
+        // those still parked for the gauge: it runs whenever one may be
+        // (see `any_parked`), so a gauge left above zero is corrected by
+        // the next pass, and one that finds none sets it to zero.
         if any_parked {
             any_parked = false;
+            let mut still_parked = 0u64;
             let mut long_parked = 0usize;
             #[allow(clippy::let_unit_value)] // ZST when latency-trace is off
             let recv_ts = melin_transport_core::trace::mono_trace_ns();
@@ -1270,6 +1284,7 @@ fn reader_loop<A: Application, R: AsRawFd>(
                     decoder,
                     halt,
                     &mut early_replies,
+                    metrics,
                     batch_wall_ns,
                     recv_ts,
                     #[cfg(feature = "latency-trace")]
@@ -1283,6 +1298,7 @@ fn reader_loop<A: Application, R: AsRawFd>(
                     // Still parked, since it first parked.
                     FrameAction::Park => {
                         any_parked = true;
+                        still_parked += 1;
                         if LongParkReport::parked_long(since, batch_now) {
                             long_parked += 1;
                         }
@@ -1298,6 +1314,7 @@ fn reader_loop<A: Application, R: AsRawFd>(
                 }
                 apply_frames_step(&mut ring, &mut slab, &mut fd_to_slab, control_tx, idx, step);
             }
+            metrics.set_parked(still_parked);
             long_park_report.report(long_parked, batch_now);
         }
 
@@ -1759,6 +1776,7 @@ fn process_frames<A: Application, R>(
     decoder: &dyn ErasedDecoder<A::Event>,
     halt: &HaltGate,
     early_replies: &mut EarlyReplySender<A::Report>,
+    metrics: &IngressMetrics,
     batch_wall_ns: u64,
     recv_ts: melin_transport_core::trace::MonoTraceInstant,
     #[cfg(feature = "latency-trace")] publish_rec: &mut melin_transport_core::trace::StageRecorder,
@@ -1777,6 +1795,7 @@ fn process_frames<A: Application, R>(
         decoder,
         halt,
         early_replies,
+        metrics,
         batch_wall_ns,
         recv_ts,
         #[cfg(feature = "latency-trace")]
@@ -1804,6 +1823,7 @@ mod tests {
     use melin_app::{AppEvent, Application, ApplyCtx, CodecError, QueryCtx, RejectReason};
     use melin_journal::JournalEvent;
     use melin_pipeline::ring::DisruptorBuilder;
+    use melin_transport_core::health::IngressTally;
     use melin_transport_core::pipeline::RequestId;
     use melin_wire_protocol::control::RefusalKind;
     use melin_wire_protocol::control_codec::{
@@ -2209,6 +2229,7 @@ mod tests {
             Arc::new(ByteDecoder),
             halt,
             early_channel().0,
+            Arc::new(IngressMetrics::default()),
             claim,
             control_tx,
             0,
@@ -2248,6 +2269,18 @@ mod tests {
         halt: &HaltGate,
         early: &mut EarlyReplySender<TestReport>,
     ) -> FrameAction {
+        run_process_frames_counting(conn, producer, halt, early, &IngressMetrics::default())
+    }
+
+    /// [`run_process_frames_with`], counting what it answers early into
+    /// `metrics`.
+    fn run_process_frames_counting(
+        conn: &mut ConnectionEntry<UnixStream>,
+        producer: &mut ring::Producer<InputSlot<TestEvent>>,
+        halt: &HaltGate,
+        early: &mut EarlyReplySender<TestReport>,
+        metrics: &IngressMetrics,
+    ) -> FrameAction {
         #[cfg(feature = "latency-trace")]
         let mut publish_rec = melin_transport_core::trace::register_stage("test: publish");
         #[cfg(feature = "tick-to-trade")]
@@ -2262,6 +2295,7 @@ mod tests {
             &ByteDecoder,
             halt,
             early,
+            metrics,
             0xDEAD_BEEF,
             recv_ts,
             #[cfg(feature = "latency-trace")]
@@ -2269,6 +2303,22 @@ mod tests {
             #[cfg(feature = "tick-to-trade")]
             &mut ingest_rec,
         )
+    }
+
+    /// The counts `answers` should leave on the ingress metrics: a busy
+    /// is shed, a filtered request filtered, a refusal refused as its
+    /// kind. A halt refusal is not among them: the halt gate counts it.
+    fn ingress_counts_of(answers: &[EarlyReply<TestReport>]) -> IngressTally {
+        let mut tally = IngressTally::default();
+        for reply in answers {
+            match reply.kind {
+                EarlyKind::Busy => tally.shed += 1,
+                EarlyKind::Filtered => tally.filtered += 1,
+                EarlyKind::Refused { kind, .. } => tally.refused(kind),
+                EarlyKind::Rejected(_) => {}
+            }
+        }
+        tally
     }
 
     /// Drain `consumer` into a Vec of `(seq, slot)` until it yields `None`.
@@ -2565,13 +2615,20 @@ mod tests {
 
             let counted = Arc::new(AtomicU64::new(0));
             let halt = gate_counting_into(halted.then_some(0), false, Arc::clone(&counted));
-            let action = run_process_frames_with(&mut conn, &mut producer, &halt, &mut early);
+            let metrics = IngressMetrics::default();
+            let action =
+                run_process_frames_counting(&mut conn, &mut producer, &halt, &mut early, &metrics);
 
             assert_eq!(action, FrameAction::Park, "byte {byte:#04x}");
             assert_eq!(
                 refused_count(&counted),
                 0,
                 "byte {byte:#04x}: a write parked on is not refused yet"
+            );
+            assert_eq!(
+                metrics.counts(),
+                IngressTally::default(),
+                "byte {byte:#04x}: nor is anything else counted"
             );
             let published: Vec<_> = drain(&mut consumer)
                 .into_iter()
@@ -2598,8 +2655,14 @@ mod tests {
 
             // The queue has room again (and so does the ring): the retry
             // takes no new bytes.
-            let action = run_process_frames_with(&mut conn, &mut producer, &halt, &mut early);
+            let action =
+                run_process_frames_counting(&mut conn, &mut producer, &halt, &mut early, &metrics);
             assert_eq!(action, FrameAction::Continue, "byte {byte:#04x}");
+            assert_eq!(
+                metrics.counts(),
+                ingress_counts_of(&answers),
+                "byte {byte:#04x}: each answer counted once, as its kind"
+            );
             assert_eq!(released(&mut queue), answers, "byte {byte:#04x}");
             let published: Vec<_> = drain(&mut consumer)
                 .into_iter()
@@ -2771,6 +2834,7 @@ mod tests {
             &ByteDecoder,
             &gate(None, false),
             &mut early,
+            &IngressMetrics::default(),
             0xDEAD_BEEF,
             RECV_TS,
             &mut publish_rec,
@@ -3328,6 +3392,7 @@ mod tests {
                     make_fixture(ring_capacity);
                 let (mut early, mut queue) = early_channel_of(queue_capacity);
                 let halt = gate(None, false);
+                let metrics = IngressMetrics::default();
                 let mut published: Vec<u64> = Vec::new();
                 let mut answered: Vec<EarlyReply<TestReport>> = Vec::new();
                 // Per receive (an episode: the call after it and the
@@ -3363,13 +3428,18 @@ mod tests {
                     } else {
                         break;
                     }
-                    action = run_process_frames_with(&mut conn, &mut producer, &halt, &mut early);
+                    action = run_process_frames_counting(
+                        &mut conn, &mut producer, &halt, &mut early, &metrics,
+                    );
                     prop_assert_ne!(action, FrameAction::Disconnect);
                     take(&mut consumer, &mut queue, &mut published, &mut answered, false);
                 }
                 take(&mut consumer, &mut queue, &mut published, &mut answered, true);
                 prop_assert!(conn.ingress.bytes().is_empty());
                 prop_assert_eq!(conn.ingress.shed_remaining(), 0);
+                // Each early answer counted once, as its kind, however
+                // many parks its frame was retried through.
+                prop_assert_eq!(metrics.counts(), ingress_counts_of(&answered));
 
                 // Every request exactly once: published, or answered as its
                 // decoder outcome says, or busy.
@@ -3694,6 +3764,7 @@ mod tests {
             Arc::new(ByteDecoder),
             gate(None, false),
             early_channel().0,
+            Arc::new(IngressMetrics::default()),
             policy_claim(),
             control_tx,
             0,    // "do not pin" sentinel
@@ -3811,6 +3882,7 @@ mod tests {
             Arc::new(ByteDecoder),
             gate(None, false),
             early_channel().0,
+            Arc::new(IngressMetrics::default()),
             policy_claim(),
             control_tx,
             0,    // "do not pin" sentinel
@@ -3890,6 +3962,7 @@ mod tests {
             Arc::new(ByteDecoder),
             gate(None, false),
             early_channel().0,
+            Arc::new(IngressMetrics::default()),
             policy_claim(),
             control_tx,
             0,
@@ -4028,6 +4101,7 @@ mod tests {
             queue: EarlyReplyQueue<TestReport>,
             control_rx: mpsc::Receiver<ControlEvent>,
             fence: Arc<FenceState>,
+            metrics: Arc<IngressMetrics>,
         }
 
         impl Rig {
@@ -4043,11 +4117,13 @@ mod tests {
                 let fence = Arc::new(FenceState::new(0));
                 let halt = HaltGate::new(None, Arc::clone(&fence), Arc::new(AtomicU64::new(0)));
                 let (early, queue) = early_channel_of(2);
+                let metrics = Arc::new(IngressMetrics::default());
                 let handle = spawn_reader::<TestApp, UnixStream>(
                     producer,
                     Arc::new(ByteDecoder),
                     halt,
                     early,
+                    Arc::clone(&metrics),
                     policy_claim(),
                     control_tx,
                     0,
@@ -4063,6 +4139,22 @@ mod tests {
                     queue,
                     control_rx,
                     fence,
+                    metrics,
+                }
+            }
+
+            /// Wait until the parked gauge reads `parked`; panics after ten
+            /// seconds. The gauge is set at the end of the reader's retry
+            /// pass, which may come just after what the test saw.
+            fn wait_for_parked(&self, parked: u64) {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while self.metrics.parked() != parked {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the parked gauge stayed at {}, not {parked}",
+                        self.metrics.parked()
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
                 }
             }
 
@@ -4196,6 +4288,11 @@ mod tests {
                 rig.take_published().is_empty(),
                 "nothing read past the park"
             );
+            // Counted as parked, once, however many retries it has been
+            // through; the two filtered requests answered so far counted.
+            rig.wait_for_parked(1);
+            assert_eq!(rig.metrics.parks(), 1);
+            assert_eq!(rig.metrics.counts().filtered, 2);
 
             let (mut published, mut replies) = (Vec::new(), Vec::new());
             rig.wait_for(&mut published, &mut replies, |p, _| p.len() == 9);
@@ -4205,6 +4302,11 @@ mod tests {
                 (1..=3).map(RequestId).collect::<Vec<_>>()
             );
             assert!(rig.disconnects().is_empty(), "the connection is kept");
+            // Resumed: no longer parked, and still parked only once; the
+            // request it parked on counted once, when answered.
+            rig.wait_for_parked(0);
+            assert_eq!(rig.metrics.parks(), 1);
+            assert_eq!(rig.metrics.counts().filtered, 3);
 
             // Read again normally once resumed.
             client
@@ -4300,6 +4402,7 @@ mod tests {
             let mut rig = Rig::start(64, None);
             let (mut client, _dup) = rig.connect(1);
             park(&mut rig, &mut client);
+            rig.wait_for_parked(1);
             // Its cancel has landed by now: torn down with nothing owed.
             rig.fence.fence();
             let deadline = Instant::now() + Duration::from_secs(10);
@@ -4313,6 +4416,9 @@ mod tests {
             disconnects.extend(rig.disconnects());
             assert_eq!(disconnects, [1], "torn down once");
             assert!(rig.take_published().is_empty());
+            // Gone, so no longer counted as parked.
+            rig.wait_for_parked(0);
+            assert_eq!(rig.metrics.parks(), 1);
             rig.stop();
         }
 
@@ -4432,6 +4538,7 @@ mod tests {
             Arc::new(ByteDecoder),
             gate(None, false),
             early_channel().0,
+            Arc::new(IngressMetrics::default()),
             policy_claim(),
             control_tx,
             0,

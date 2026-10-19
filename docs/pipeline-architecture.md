@@ -197,7 +197,7 @@ The `MultiProducer` is `Clone + Send + Sync` -- each reader thread holds its own
 - **Consumer 1**: Matching stage
 - **Consumer 2**: Shadow stage, on by default (`--snapshot-interval-ms 0` disables it). Gated on the journal cursor — it only processes events after they are durable. Takes periodic snapshots on a dedicated thread without pausing the matching stage.
 
-Because the journal and matching consumers are gated only on the producer, they can process events concurrently. The journal stage does not block the matching stage, and vice versa. Backpressure is applied by the producer checking the minimum progress of all terminal consumers before claiming new slots.
+Because the journal and matching consumers are gated only on the producer, they can process events concurrently. The journal stage does not block the matching stage, and vice versa. Backpressure is applied by the producer checking the minimum progress of all terminal consumers before claiming new slots. A client reader does not wait out that backpressure: see [A full ring](#a-full-ring).
 
 **`InputSlot` layout** (padded to whole cache lines):
 
@@ -211,6 +211,12 @@ Because the journal and matching consumers are gated only on the producer, they 
 | `event: JournalEvent` | An application event, or one the runtime journals itself (a tick, an epoch bump, an ack-policy change) |
 | `publish_ts: TraceTimestamp` | Disruptor publish timestamp (zero-sized when `latency-trace` disabled) |
 | `recv_ts: TraceTimestamp` | Wire receive timestamp (zero-sized when `latency-trace` disabled) |
+
+### A full ring
+
+A reader never waits for room. A client request that finds the ring full is shed: answered `ServerBusy` at once, naming the request, and so is every complete request already received behind it on that connection, read only as far as its identifier. None of them is applied, the connection stays open, and nothing the client pipelined behind a shed request in the same burst is applied ahead of its resend; a request that arrives later may be. Shed requests are counted in `melin_requests_shed_total`.
+
+The reader hands this answer, and every other it gives without publishing a request (a halt refusal, a decoder's refusal or filter), to the response stage through a bounded queue, which the response stage drains between every two requests' replies. Should that queue fill, which happens only while the response stage is not taking answers, the reader parks the connection rather than drop or reorder anything: it stops reading it, leaving the request whose answer had nowhere to go and everything behind it unread, and retries until the queue has room. The client's sends back up under TCP flow control meanwhile. A parked connection is not dropped as idle, nor, on DPDK, for the bytes it holds. A connection parked for over a second is degraded operation, reported at `warn` at most once a second while any stays parked; `melin_connections_parked` counts those parked now, and `melin_connection_parks_total` every time one parked.
 
 ## Journal Stage
 
@@ -332,7 +338,7 @@ The check is made **per response**, not once per batch. A response is released a
 
 A primary halted for want of a replica has a second, weaker release condition once the halt has lasted a grace period: a response whose event is fsynced on the primary's own journal is released, and its request ends in `BatchEndDegraded` instead of `BatchEnd`. The policy is still checked first on every response, and a release on the weaker condition never moves the acked position, so no later response is taken for confirmed on its account. See "Degraded acks" in [replication](replication.md).
 
-The one reply exempt from the wait is the refusal of a write while the node is halted. The write is refused before it enters the pipeline, so there is no event to wait on; the refusal is sent once the replies to everything received before it have gone out, keeping replies in request order, and it always ends in a plain batch end.
+Some requests are answered without ever entering the pipeline, and those answers are exempt from the wait: a write refused while the node is halted, a request the application's decoder refuses or filters, and one shed on a full input ring (see [A full ring](#a-full-ring)). There is no event to wait on. Every answer names the request it is for, so these go out at the first point between two requests' replies, without waiting for the replies to requests the client sent before them, even a write the ack policy is still holding; they never land inside another request's reply. Replies to the requests the node accepted keep their order. A halt refusal always ends in a plain batch end.
 
 A reply still waiting when the node stops, whether an operator stopped it or a newer primary superseded it, is dropped: the policy never confirmed the event, so the node cannot acknowledge it. The client sees the connection close, as it would on a crash, and reconciles on reconnect. The event itself is journaled and applied, so a retry of the same request is applied a second time unless the application recognises it as a repeat — a client that retries needs an application that deduplicates.
 

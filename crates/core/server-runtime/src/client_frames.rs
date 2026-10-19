@@ -35,6 +35,7 @@ use melin_app::auth::{ClientRole, RoleId};
 use melin_app::decoder::{Decoded, ErasedDecoder};
 use melin_app::{AppEvent, Application};
 use melin_pipeline::ring;
+use melin_transport_core::health::{IngressMetrics, IngressTally};
 use melin_transport_core::pipeline::{ClientOrigin, InputSlot, RequestId};
 use melin_transport_core::trace::MonoTraceInstant;
 #[cfg(any(feature = "latency-trace", feature = "tick-to-trade"))]
@@ -220,7 +221,8 @@ impl ClientIngress {
 /// input ring full with `ServerBusy`, as is every complete frame buffered
 /// behind it (the shed tail, see the module docs). The halt is sampled
 /// once per call, so one receive is judged as a whole, and the writes it
-/// refused are counted into `halt` once, at the end. On a superseded node
+/// refused are counted into `halt` once, at the end, as the requests it
+/// shed, filtered and refused are into `ingress`. On a superseded node
 /// nothing is read: the call returns [`FrameAction::Disconnect`] before
 /// the first frame.
 ///
@@ -252,6 +254,7 @@ pub(crate) fn process_client_frames<A: Application>(
     decoder: &dyn ErasedDecoder<A::Event>,
     halt: &HaltGate,
     early_replies: &mut EarlyReplySender<A::Report>,
+    metrics: &IngressMetrics,
     batch_wall_ns: u64,
     recv_ts: MonoTraceInstant,
     #[cfg(feature = "latency-trace")] publish_rec: &mut melin_transport_core::trace::StageRecorder,
@@ -266,6 +269,7 @@ pub(crate) fn process_client_frames<A: Application>(
         decoder,
         halt,
         early_replies,
+        metrics,
         batch_wall_ns,
         recv_ts,
         #[cfg(feature = "latency-trace")]
@@ -293,6 +297,7 @@ fn process_frames_unflushed<A: Application>(
     decoder: &dyn ErasedDecoder<A::Event>,
     halt: &HaltGate,
     early_replies: &mut EarlyReplySender<A::Report>,
+    metrics: &IngressMetrics,
     batch_wall_ns: u64,
     recv_ts: MonoTraceInstant,
     #[cfg(feature = "latency-trace")] publish_rec: &mut melin_transport_core::trace::StageRecorder,
@@ -309,8 +314,10 @@ fn process_frames_unflushed<A: Application>(
     // a tail, then set when a request finds the ring full.
     let mut shed_end = *shed_remaining;
     let mut result = FrameAction::Continue;
-    // Requests shed in this call, for its one log line.
-    let mut shed: u64 = 0;
+    // Requests answered early in this call, counted into `metrics` once at
+    // the end rather than with an atomic add each; the shed count is also
+    // the call's one log line.
+    let mut tally = IngressTally::default();
 
     // Batch publishes into a single Release store on the input ring's
     // producer cursor. Bounded at COMMIT_EVERY to cap consumer-
@@ -374,7 +381,7 @@ fn process_frames_unflushed<A: Application>(
                 result = FrameAction::Park;
                 break;
             }
-            shed += 1;
+            tally.shed += 1;
             continue;
         }
 
@@ -426,7 +433,7 @@ fn process_frames_unflushed<A: Application>(
                         result = FrameAction::Park;
                         break;
                     }
-                    shed += 1;
+                    tally.shed += 1;
                     continue;
                 }
             },
@@ -443,15 +450,21 @@ fn process_frames_unflushed<A: Application>(
         // every poll iteration.
         match early {
             EarlyKind::Rejected(_) => refused += 1,
-            EarlyKind::Refused {
-                kind: RefusalKind::PermissionDenied,
-                reason,
-            } => debug!(connection_id, reason, "permission denied, refusing request"),
-            EarlyKind::Refused {
-                kind: RefusalKind::Malformed,
-                reason,
-            } => debug!(connection_id, reason, "decode error, refusing request"),
-            EarlyKind::Filtered | EarlyKind::Busy => {}
+            EarlyKind::Refused { kind, reason } => {
+                tally.refused(kind);
+                match kind {
+                    RefusalKind::PermissionDenied => {
+                        debug!(connection_id, reason, "permission denied, refusing request")
+                    }
+                    RefusalKind::Malformed => {
+                        debug!(connection_id, reason, "decode error, refusing request")
+                    }
+                }
+            }
+            EarlyKind::Filtered => tally.filtered += 1,
+            // A busy is queued and counted where the ring is found full,
+            // never through here.
+            EarlyKind::Busy => {}
         }
     }
 
@@ -460,8 +473,13 @@ fn process_frames_unflushed<A: Application>(
     if refused > 0 {
         halt.record_refused(refused);
     }
-    if shed > 0 {
-        debug!(connection_id, shed, "input ring full, requests shed");
+    metrics.record(&tally);
+    if tally.shed > 0 {
+        debug!(
+            connection_id,
+            shed = tally.shed,
+            "input ring full, requests shed"
+        );
     }
 
     // What is left of the tail: nothing once the call has passed its end.

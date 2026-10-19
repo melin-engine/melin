@@ -395,7 +395,10 @@ unless marked accepted.
 - Pre-existing (untouched by this branch): on `PipelineFull` the
   reader drops the triggering frame and strands any later frames
   already buffered in `parse_buf` — they re-parse only on the next
-  recv from that client. Deserves its own ticket.
+  recv from that client. Deserves its own ticket. (Fixed since by
+  request IDs: the frames behind a shed one are shed with it, and a full
+  early-reply queue parks the connection and retries without new bytes;
+  see [request-ids-2026-10.md](request-ids-2026-10.md), decision 7.)
 - Legacy `ProvideBuffers` fallback mode only (hosts that filter
   `PBUF_RING`): a failed re-provision CQE permanently leaks its buffer
   id.

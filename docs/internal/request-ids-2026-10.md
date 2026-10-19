@@ -1,8 +1,13 @@
 # Request IDs on the client protocol (plan)
 
-Status: **proposed** (2026-10), revised after review: every reference
-below has been checked against `main`, and the questions the first draft
-left open are settled (see "Settled in review" at the end).
+Status: **built in melin** (steps 1 to 6: the slots' request ID, client
+protocol 1, early replies released at batch boundaries, the shed tail and
+parking on both transports, the metrics and the docs); **step 7, the
+Exchange Core's migration, is open**, as is the Aeron benchmark harness's
+Java rig, which frames requests itself (decision 9). The design below is
+the one reviewed before the work began, with the questions the first
+draft left open settled (see "Settled in review" at the end); "What the
+code shows" describes the code as it was then.
 
 Closes finding 18 of the [determinism audit](determinism-audit-2026-09.md)
 ("A ServerBusy reply can overtake replies to earlier requests"), S1 of the

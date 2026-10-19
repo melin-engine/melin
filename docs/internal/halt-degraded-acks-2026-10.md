@@ -49,7 +49,10 @@ way, and refusals stop waiting behind either.
   `two-disks`, the first slot in flight when the last replica leaves
   parks the stage until a replica returns or the policy is swapped.
   Every refusal (`RefusalQueue`) and every query reply queued after
-  it waits for the whole halt.
+  it waits for the whole halt. (Refusals no longer do since request IDs
+  landed: they are early replies, released between two events' replies
+  and during a gate wait at a boundary, in no input-sequence order; see
+  [request-ids-2026-10.md](request-ids-2026-10.md), decision 6.)
 - **Every slot is gated, queries included.** `slot_needs_gate` compares
   the slot's `wire_seq` with the durable position. A query's slot
   carries the last sequenced event's `wire_seq` (`pipeline.rs`:

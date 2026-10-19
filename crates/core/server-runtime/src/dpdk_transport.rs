@@ -45,6 +45,7 @@ use melin_app::auth::{AuthorizedKeys, ClientRole, KeyRole, RoleId};
 use melin_app::unix_epoch_nanos;
 use melin_dpdk::transport::DpdkTransport;
 use melin_pipeline::ring;
+use melin_transport_core::health::IngressMetrics;
 use melin_transport_core::pipeline::InputSlot;
 use melin_transport_core::tick::TickSchedule;
 #[cfg(feature = "latency-trace")]
@@ -170,6 +171,9 @@ pub fn run_dpdk_poll<A: Application>(
     // answered through `early_replies` — see `crate::halt`.
     halt: HaltGate,
     mut early_replies: EarlyReplySender<A::Report>,
+    // What this thread sheds, filters and refuses, and the connections it
+    // parks, counted for the health endpoint.
+    metrics: Arc<IngressMetrics>,
     // The admin `ACK-POLICY` command's requests, journaled by this thread
     // as the ring's one producer — see `crate::policy_control`.
     mut ack_policy: AckPolicyPublisher,
@@ -468,6 +472,9 @@ pub fn run_dpdk_poll<A: Application>(
         // the connections found parked past `LONG_PARK` on this pass.
         let slow_check_now = do_slow_checks.then(Instant::now);
         let mut long_parked = 0usize;
+        // Connections parked after this pass, for the gauge: every parked
+        // connection is retried on every pass, so the count is whole.
+        let mut parked_now = 0u64;
 
         // Per-connection batching with a visibility-delay cap happens
         // inside `process_trading_frames`. The previous design opened a
@@ -700,6 +707,7 @@ pub fn run_dpdk_poll<A: Application>(
                         &*decoder,
                         &halt,
                         &mut early_replies,
+                        &metrics,
                         *batch_wall_ns.get_or_insert_with(unix_epoch_nanos),
                         recv_ts,
                         #[cfg(feature = "latency-trace")]
@@ -733,9 +741,11 @@ pub fn run_dpdk_poll<A: Application>(
                         // since it first parked, past `LONG_PARK`, is
                         // counted for the report below.
                         FrameAction::Park => {
+                            parked_now += 1;
                             match *parked {
                                 None => {
                                     *parked = Some(Instant::now());
+                                    metrics.record_park();
                                     debug!(
                                         connection_id = conn.connection_id.0,
                                         "DPDK: connection parked"
@@ -774,6 +784,8 @@ pub fn run_dpdk_poll<A: Application>(
                 active_connections.fetch_add(1, Ordering::Relaxed);
             }
         }
+        // A load and no store while the count is unchanged.
+        metrics.set_parked(parked_now);
         if let Some(now) = slow_check_now {
             long_park_report.report(long_parked, now);
         }
@@ -1315,6 +1327,8 @@ mod tests {
             /// poll thread counts each up, the stage down when it drains
             /// its `Disconnected`.
             active: Arc<AtomicU64>,
+            /// What the poll thread counts for the health endpoint.
+            metrics: Arc<IngressMetrics>,
             shutdown: Arc<AtomicBool>,
             threads: Vec<JoinHandle<()>>,
             /// Dropped after the threads have returned, the transport with
@@ -1383,6 +1397,7 @@ mod tests {
                 let fence = Arc::new(FenceState::new(0));
                 let halt = HaltGate::new(None, Arc::clone(&fence), Arc::new(AtomicU64::new(0)));
                 let active = Arc::new(AtomicU64::new(0));
+                let metrics = Arc::new(IngressMetrics::default());
                 let shutdown = Arc::new(AtomicBool::new(false));
                 let mut threads = Vec::new();
 
@@ -1442,10 +1457,11 @@ mod tests {
                     );
                 }));
 
-                let (sd, poll_shared, poll_active) = (
+                let (sd, poll_shared, poll_active, poll_metrics) = (
                     Arc::clone(&shutdown),
                     Arc::clone(&shared),
                     Arc::clone(&active),
+                    Arc::clone(&metrics),
                 );
                 threads.push(std::thread::spawn(move || {
                     // Built on the thread that polls it, as a node's is.
@@ -1457,6 +1473,7 @@ mod tests {
                         Arc::new(RequestDecoder),
                         halt,
                         early_tx,
+                        poll_metrics,
                         ack_policy,
                         control_tx,
                         tx_rx,
@@ -1477,6 +1494,7 @@ mod tests {
                     hold,
                     fence,
                     active,
+                    metrics,
                     shutdown,
                     threads,
                     shared: Some(shared),
@@ -1765,9 +1783,29 @@ mod tests {
                 "answered while the stage is held"
             );
             assert_eq!(client.conn.unsent(), 0, "the burst is the node's");
+            // Parked once, and counted parked; the refusals queued before
+            // the park counted, the one it parked on not yet.
+            assert_eq!((rig.metrics.parked(), rig.metrics.parks()), (1, 1));
+            assert_eq!(
+                rig.metrics.counts().refused_as(RefusalKind::Malformed),
+                EARLY_CAPACITY as u64
+            );
 
             rig.hold.release();
             client.finish();
+            // Resumed: no longer parked (the gauge is set at the end of the
+            // pass that resumed it, which may trail the answers), parked
+            // only the once, and every refusal counted once.
+            let deadline = Instant::now() + PATIENCE;
+            while rig.metrics.parked() != 0 {
+                assert!(Instant::now() < deadline, "still counted as parked");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(rig.metrics.parks(), 1);
+            assert_eq!(
+                rig.metrics.counts().refused_as(RefusalKind::Malformed),
+                EARLY_CAPACITY as u64 + 1
+            );
             // The idle drop closes without a word to the client: a request
             // is what finds the connection gone, reset by the node's stack.
             still_up(&mut client, TIMEOUT / 2);

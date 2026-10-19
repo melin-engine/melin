@@ -86,9 +86,16 @@
 //!
 //! # Counted
 //!
-//! A refused write leaves no other trace — nothing is journaled — so the
-//! reader counts them ([`HaltGate::record_refused`]) and the health
-//! endpoint exports the count as `melin_writes_refused_total`.
+//! An early reply's request leaves no other trace — nothing is journaled
+//! — so the reader counts each kind once per receive, once its answer is
+//! queued (a request parked on is counted when it is finally answered),
+//! and the health endpoint exports the counts: halt refusals through
+//! [`HaltGate::record_refused`] as `melin_writes_refused_total`; shed,
+//! filtered and refused requests through
+//! [`IngressMetrics`](melin_transport_core::health::IngressMetrics) as
+//! `melin_requests_shed_total`, `melin_requests_filtered_total` and
+//! `melin_requests_refused_total` (by kind), beside the connections
+//! parked on a full queue.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

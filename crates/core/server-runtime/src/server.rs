@@ -1829,8 +1829,10 @@ where
     let (control_tx, control_rx) = std::sync::mpsc::channel();
 
     // Client writes a halted node refuses at ingress, reader → response
-    // stage, counted for the health endpoint. See `crate::halt`.
+    // stage, counted for the health endpoint. See `crate::halt`. Beside
+    // them, the reader's other early answers and its parks.
     let refused_writes = Arc::new(AtomicU64::new(0));
+    let ingress_metrics = Arc::new(melin_transport_core::health::IngressMetrics::default());
     let halt_gate = crate::halt::HaltGate::new(
         replicas_connected.clone(),
         Arc::clone(&fence_state),
@@ -2159,6 +2161,7 @@ where
         &active_connections,
         &events_processed,
         &refused_writes,
+        &ingress_metrics,
         &cursors,
         input_cursor,
         &pipeline_healthy,
@@ -2237,6 +2240,7 @@ where
         decoder,
         halt_gate,
         early_tx,
+        ingress_metrics,
         ack_policy_claim,
         control_tx.clone(),
         config.cores.reader.core,
@@ -3025,7 +3029,9 @@ where
 
     // Client writes a halted node refuses at ingress, poll thread →
     // response stage, counted for the health endpoint. See `crate::halt`.
+    // Beside them, the poll thread's other early answers and its parks.
     let refused_writes = Arc::new(AtomicU64::new(0));
+    let ingress_metrics = Arc::new(melin_transport_core::health::IngressMetrics::default());
     let halt_gate = crate::halt::HaltGate::new(
         replicas_connected.clone(),
         Arc::clone(&fence_state),
@@ -3321,6 +3327,7 @@ where
         &active_connections,
         &events_processed,
         &refused_writes,
+        &ingress_metrics,
         &cursors,
         input_cursor,
         &pipeline_healthy,
@@ -3359,6 +3366,7 @@ where
         decoder,
         halt_gate,
         early_tx,
+        ingress_metrics,
         ack_policy,
         control_tx,
         tx_rx_0,
@@ -3947,6 +3955,7 @@ fn spawn_health_endpoint(
     active_connections: &Arc<AtomicU64>,
     events_processed: &Arc<AtomicU64>,
     refused_writes: &Arc<AtomicU64>,
+    ingress_metrics: &Arc<melin_transport_core::health::IngressMetrics>,
     cursors: &melin_transport_core::PipelineCursors,
     input_cursor: Box<dyn melin_pipeline::ring::QueueCursor>,
     pipeline_healthy: &Arc<AtomicBool>,
@@ -3986,6 +3995,7 @@ fn spawn_health_endpoint(
             active_connections: Arc::clone(active_connections),
             events_processed: Arc::clone(events_processed),
             refused_writes: Arc::clone(refused_writes),
+            ingress: Arc::clone(ingress_metrics),
             cursors: cursors.clone(),
             input_cursor,
             pipeline_healthy: Arc::clone(pipeline_healthy),

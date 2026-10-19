@@ -40,6 +40,7 @@ use tracing::{debug, error, info};
 use crate::cursors::{PipelineCursors, RingPos, WireSeq};
 use crate::pipeline::{INPUT_RING_CAPACITY, StageUtilization};
 use crate::replica_presence::ReplicaPresence;
+use melin_wire_protocol::control::RefusalKind;
 
 /// Shared monitoring state passed to the health loop.
 /// Bundles all the atomics/cursors into one struct to avoid parameter explosion.
@@ -55,6 +56,10 @@ pub struct HealthState {
     /// replica). A plain `AtomicU64`, not cache-padded: a single writer,
     /// off the hot path, and a monotonic count that cannot wrap.
     pub refused_writes: Arc<AtomicU64>,
+    /// What the client reader answered without publishing (shed,
+    /// refused, filtered requests) and the connections it parked. Stays
+    /// at zero on a replica, which takes no client requests.
+    pub ingress: Arc<IngressMetrics>,
     /// Journal-progress cursors, space-typed. The `journal_seq` gauge reads
     /// `durable_wire_seq` (wire-seq); the ring positions drive queue-depth, and
     /// the replica quorum cursor drives replication lag. See [`PipelineCursors`].
@@ -131,6 +136,7 @@ impl HealthState {
             active_connections: Arc::new(AtomicU64::new(0)),
             events_processed: Arc::new(AtomicU64::new(0)),
             refused_writes: Arc::new(AtomicU64::new(0)),
+            ingress: Arc::new(IngressMetrics::default()),
             cursors: PipelineCursors::new(
                 WireSeq::new(0),
                 Arc::new(Sequence::new(AtomicU64::new(0))),
@@ -151,6 +157,197 @@ impl HealthState {
             response_utilization: Arc::new(StageUtilization::new()),
             raft,
         }
+    }
+}
+
+/// Every kind of decoder refusal, in the order `/metrics` lists them: the
+/// `kind` labels of `melin_requests_refused_total`. A kind added to
+/// [`RefusalKind`] breaks [`refusal_index`]'s exhaustive match, and a test
+/// checks that every kind the wire knows is listed here.
+const REFUSAL_KINDS: [RefusalKind; 2] = [RefusalKind::PermissionDenied, RefusalKind::Malformed];
+
+/// A refusal kind's position in [`REFUSAL_KINDS`] and its `kind` label on
+/// `/metrics`: the one mapping both the count and the exposition use.
+const fn refusal_index(kind: RefusalKind) -> (usize, &'static str) {
+    match kind {
+        RefusalKind::PermissionDenied => (0, "permission_denied"),
+        RefusalKind::Malformed => (1, "malformed"),
+    }
+}
+
+/// What the client readers answered without publishing, as one receive
+/// tallies it: plain integers, added to [`IngressMetrics`] once per
+/// receive ([`IngressMetrics::record`]), as the halt's refused writes are,
+/// so a receive that answers many requests early costs a handful of
+/// atomic adds, not one each. Halt refusals are not here: they are
+/// `melin_writes_refused_total` ([`HealthState::refused_writes`]).
+///
+/// `u64`s, as the counters they add to: a receive's count never comes
+/// near the limit. The refusals are an array indexed by kind rather than
+/// a field per kind, so the add, the read and the exposition each walk
+/// the list of refusal kinds once instead of naming every kind.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct IngressTally {
+    /// Requests answered `ServerBusy` because the input ring was full,
+    /// with the requests buffered behind them.
+    pub shed: u64,
+    /// Requests the application's decoder filtered (answered with an
+    /// empty batch).
+    pub filtered: u64,
+    /// Requests the application's decoder refused, by kind, indexed as
+    /// [`REFUSAL_KINDS`]: counted through [`IngressTally::refused`].
+    refused: [u64; REFUSAL_KINDS.len()],
+}
+
+impl IngressTally {
+    /// Count one request the decoder refused as `kind`.
+    #[inline]
+    pub fn refused(&mut self, kind: RefusalKind) {
+        self.refused[refusal_index(kind).0] += 1;
+    }
+
+    /// The requests counted as refused as `kind`.
+    pub fn refused_as(&self, kind: RefusalKind) -> u64 {
+        self.refused[refusal_index(kind).0]
+    }
+}
+
+/// Counts of what the client readers did with requests they answered
+/// without publishing, and of the connections they stopped reading:
+/// `/metrics`' `melin_requests_shed_total`,
+/// `melin_requests_refused_total{kind}`, `melin_requests_filtered_total`,
+/// `melin_connections_parked` and `melin_connection_parks_total`. None of
+/// these requests is journaled, so this is the only trace they leave.
+///
+/// Written by the node's one client reader (the io_uring reader or the
+/// DPDK poll thread), never on the steady-state path: a receive that
+/// answers something early adds its tally once, a connection that parks
+/// adds one, and the parked gauge is stored only when it changes. Plain
+/// `AtomicU64`s, not cache-padded, for the same reasons as
+/// [`HealthState::refused_writes`]: one writer, off the hot path, and
+/// counts that cannot wrap.
+#[derive(Debug, Default)]
+pub struct IngressMetrics {
+    shed: AtomicU64,
+    filtered: AtomicU64,
+    /// Indexed as [`REFUSAL_KINDS`].
+    refused: [AtomicU64; REFUSAL_KINDS.len()],
+    /// A gauge: connections parked now.
+    parked: AtomicU64,
+    /// Times a connection parked.
+    parks: AtomicU64,
+}
+
+impl IngressMetrics {
+    /// Add one receive's tally. Fields at zero cost nothing.
+    #[inline]
+    pub fn record(&self, tally: &IngressTally) {
+        add_nonzero(&self.shed, tally.shed);
+        add_nonzero(&self.filtered, tally.filtered);
+        for (counter, &count) in self.refused.iter().zip(&tally.refused) {
+            add_nonzero(counter, count);
+        }
+    }
+
+    /// Count a connection that has just parked: the early-reply queue had
+    /// no room for an answer, so its reader stopped reading it.
+    #[inline]
+    pub fn record_park(&self) {
+        self.parks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Set the number of connections parked now. Stored only when it
+    /// changes, so a reader may call it on every pass without writing a
+    /// line the health thread reads. One writer, so the load and the store
+    /// cannot race another update.
+    #[inline]
+    pub fn set_parked(&self, parked: u64) {
+        if self.parked.load(Ordering::Relaxed) != parked {
+            self.parked.store(parked, Ordering::Relaxed);
+        }
+    }
+
+    /// The requests shed, filtered and refused so far, as one tally.
+    pub fn counts(&self) -> IngressTally {
+        IngressTally {
+            shed: self.shed.load(Ordering::Relaxed),
+            filtered: self.filtered.load(Ordering::Relaxed),
+            refused: self
+                .refused
+                .each_ref()
+                .map(|counter| counter.load(Ordering::Relaxed)),
+        }
+    }
+
+    /// Connections parked now.
+    pub fn parked(&self) -> u64 {
+        self.parked.load(Ordering::Relaxed)
+    }
+
+    /// Times a connection has parked so far.
+    pub fn parks(&self) -> u64 {
+        self.parks.load(Ordering::Relaxed)
+    }
+
+    /// Point-in-time copy for the formatter.
+    fn snapshot(&self) -> IngressSnapshot {
+        IngressSnapshot {
+            counts: self.counts(),
+            parked: self.parked(),
+            parks: self.parks(),
+        }
+    }
+}
+
+/// One relaxed add, skipped for zero: most receives answer nothing early.
+#[inline]
+fn add_nonzero(counter: &AtomicU64, count: u64) {
+    if count > 0 {
+        counter.fetch_add(count, Ordering::Relaxed);
+    }
+}
+
+/// Point-in-time copy of [`IngressMetrics`] for the formatter.
+struct IngressSnapshot {
+    counts: IngressTally,
+    parked: u64,
+    parks: u64,
+}
+
+impl IngressSnapshot {
+    /// Write the families' exposition. Best-effort like the formatter's
+    /// other blocks: a write error only means the fixed buffer filled.
+    fn write_prometheus(&self, c: &mut Cursor<&mut [u8]>) {
+        let _ = write!(
+            c,
+            "# HELP melin_requests_shed_total Client requests answered ServerBusy because the input ring was full, every request already received behind each on its connection included. Never applied; the client may resend them, and the connection stays open.\n\
+             # TYPE melin_requests_shed_total counter\n\
+             melin_requests_shed_total {}\n\
+             # HELP melin_requests_refused_total Client requests the application's decoder refused, answered with a Refused frame naming the request and the decoder's reason. Never applied. kind: permission_denied (the key's role may not make the request), malformed (not a request the application understands).\n\
+             # TYPE melin_requests_refused_total counter\n",
+            self.counts.shed,
+        );
+        for kind in REFUSAL_KINDS {
+            let _ = writeln!(
+                c,
+                "melin_requests_refused_total{{kind=\"{}\"}} {}",
+                refusal_index(kind).1,
+                self.counts.refused_as(kind),
+            );
+        }
+        let _ = write!(
+            c,
+            "# HELP melin_requests_filtered_total Client requests the application's decoder filtered out, answered with an empty batch. Never applied.\n\
+             # TYPE melin_requests_filtered_total counter\n\
+             melin_requests_filtered_total {}\n\
+             # HELP melin_connections_parked Client connections the node has stopped reading because it had no room to queue an answer for them; read again once there is. Zero in steady state: a connection parks only while the response stage is not taking answers.\n\
+             # TYPE melin_connections_parked gauge\n\
+             melin_connections_parked {}\n\
+             # HELP melin_connection_parks_total Times a client connection was parked (see melin_connections_parked).\n\
+             # TYPE melin_connection_parks_total counter\n\
+             melin_connection_parks_total {}\n",
+            self.counts.filtered, self.parked, self.parks,
+        );
     }
 }
 
@@ -260,6 +457,9 @@ struct HealthSnapshot {
     /// Writes refused at ingress while halted — see
     /// [`HealthState::refused_writes`].
     refused_writes: u64,
+    /// The client reader's early answers and parks — see
+    /// [`HealthState::ingress`].
+    ingress: IngressSnapshot,
     /// Number of replicas currently streaming. 0 in standalone mode.
     replicas_connected: u32,
     /// Per-replica lag: journal_seq - acked_sequence (0 if no ack yet).
@@ -537,6 +737,7 @@ impl HealthSnapshot {
             input_queue_depth,
             trading,
             refused_writes: state.refused_writes.load(Ordering::Relaxed),
+            ingress: state.ingress.snapshot(),
             replicas_connected: replicas_connected_val,
             per_replica_lag,
             per_replica_bytes_sent,
@@ -668,7 +869,7 @@ impl HealthSnapshot {
              # HELP melin_trading_active Whether the node is accepting client writes (1) or halted (0).\n\
              # TYPE melin_trading_active gauge\n\
              melin_trading_active {}\n\
-             # HELP melin_writes_refused_total Client writes turned away at ingress while the node was halted (replication configured, no replica connected). A refused write is never journaled; the client is told ReplicaDisconnected, or ServerBusy when the refusal queue is full.\n\
+             # HELP melin_writes_refused_total Client writes turned away at ingress while the node was halted (replication configured, no replica connected). A refused write is never journaled; the client gets the application's rejection for ReplicaDisconnected, naming the request.\n\
              # TYPE melin_writes_refused_total counter\n\
              melin_writes_refused_total {}\n\
              # HELP melin_replicas_connected Number of replicas currently streaming (authenticated and handshake accepted: catching up or live). The write halt counts these.\n\
@@ -802,6 +1003,7 @@ impl HealthSnapshot {
             if self.response_policy_degraded { 1 } else { 0 },
             self.response_policy_degraded_nanos as f64 / 1e9,
         );
+        self.ingress.write_prometheus(&mut c);
         // The two policy gauges exist only while their value is known —
         // a node with no response gate (a replica) has no policy in
         // force, a lineage with no change has none journaled — rather
@@ -1342,6 +1544,7 @@ mod tests {
             active_connections: active,
             events_processed: Arc::clone(&events),
             refused_writes: Arc::new(AtomicU64::new(0)),
+            ingress: Arc::new(IngressMetrics::default()),
             // The gauge reads `durable_wire_seq`; the ring cursors only feed
             // queue depth. Seed all three from `journal_seq` so "fully caught
             // up, empty queue" holds for most tests (depth = input − matching
@@ -1474,6 +1677,7 @@ mod tests {
                 active_connections: Arc::clone(&active),
                 events_processed: Arc::clone(&events),
                 refused_writes: Arc::new(AtomicU64::new(0)),
+                ingress: Arc::new(IngressMetrics::default()),
                 cursors: test_cursors(99, 99, 99, u64::MAX),
                 input_cursor: Box::new(MockCursor(AtomicU64::new(99))),
                 pipeline_healthy: Arc::clone(&healthy),
@@ -1510,6 +1714,7 @@ mod tests {
                 active_connections: Arc::new(AtomicU64::new(0)),
                 events_processed: Arc::new(AtomicU64::new(0)),
                 refused_writes: Arc::new(AtomicU64::new(0)),
+                ingress: Arc::new(IngressMetrics::default()),
                 cursors: test_cursors(0, 0, 0, u64::MAX),
                 input_cursor: Box::new(MockCursor(AtomicU64::new(0))),
                 pipeline_healthy: Arc::new(AtomicBool::new(true)),
@@ -1672,6 +1877,7 @@ mod tests {
             active_connections: Arc::new(AtomicU64::new(0)),
             events_processed: Arc::new(AtomicU64::new(0)),
             refused_writes: Arc::new(AtomicU64::new(0)),
+            ingress: Arc::new(IngressMetrics::default()),
             cursors: test_cursors(1_000_000, 3, 1, u64::MAX),
             input_cursor: Box::new(MockCursor(AtomicU64::new(5))),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
@@ -1724,21 +1930,25 @@ mod tests {
         handle.join().unwrap();
     }
 
-    /// The refusal counter is exported, and a node that has never halted
-    /// exports it at zero rather than omitting the series.
+    /// The ingress counters (halt refusals, and the requests the reader
+    /// answered without publishing, and its parks) are exported, read
+    /// live, and a node that has never had any exports each at zero rather
+    /// than omitting the series; every refusal kind has its own label.
     #[test]
-    fn refused_writes_in_metrics() {
+    fn ingress_counters_in_metrics() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let addr = listener.local_addr().unwrap();
         let shutdown = Arc::new(AtomicBool::new(false));
         let s = Arc::clone(&shutdown);
         let refused = Arc::new(AtomicU64::new(0));
+        let ingress = Arc::new(IngressMetrics::default());
 
         let state = HealthState {
             active_connections: Arc::new(AtomicU64::new(0)),
             events_processed: Arc::new(AtomicU64::new(0)),
             refused_writes: Arc::clone(&refused),
+            ingress: Arc::clone(&ingress),
             cursors: test_cursors(0, 0, 0, u64::MAX),
             input_cursor: Box::new(MockCursor(AtomicU64::new(0))),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
@@ -1758,20 +1968,125 @@ mod tests {
         });
 
         let response = http_request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
-        assert!(
-            response.contains("melin_writes_refused_total 0\n"),
-            "series present at zero: {response}"
-        );
+        for (series, kind) in [
+            ("melin_writes_refused_total 0\n", "counter"),
+            ("melin_requests_shed_total 0\n", "counter"),
+            (
+                "melin_requests_refused_total{kind=\"permission_denied\"} 0\n",
+                "counter",
+            ),
+            (
+                "melin_requests_refused_total{kind=\"malformed\"} 0\n",
+                "counter",
+            ),
+            ("melin_requests_filtered_total 0\n", "counter"),
+            ("melin_connections_parked 0\n", "gauge"),
+            ("melin_connection_parks_total 0\n", "counter"),
+        ] {
+            assert!(
+                response.contains(series),
+                "series present at zero: {series} in {response}"
+            );
+            let name = series
+                .split(['{', ' '])
+                .next()
+                .expect("a series has a name");
+            assert!(
+                response.contains(&format!("# TYPE {name} {kind}\n")),
+                "{name} typed {kind}: {response}"
+            );
+            assert!(
+                response.contains(&format!("# HELP {name} ")),
+                "{name} explained: {response}"
+            );
+        }
 
         refused.store(12, Ordering::Relaxed);
+        let mut tally = IngressTally {
+            shed: 5,
+            filtered: 3,
+            ..IngressTally::default()
+        };
+        tally.refused(RefusalKind::Malformed);
+        tally.refused(RefusalKind::Malformed);
+        tally.refused(RefusalKind::PermissionDenied);
+        ingress.record(&tally);
+        ingress.record_park();
+        ingress.record_park();
+        ingress.set_parked(1);
         let response = http_request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
-        assert!(
-            response.contains("melin_writes_refused_total 12\n"),
-            "counter read live: {response}"
-        );
+        for series in [
+            "melin_writes_refused_total 12\n",
+            "melin_requests_shed_total 5\n",
+            "melin_requests_refused_total{kind=\"permission_denied\"} 1\n",
+            "melin_requests_refused_total{kind=\"malformed\"} 2\n",
+            "melin_requests_filtered_total 3\n",
+            "melin_connections_parked 1\n",
+            "melin_connection_parks_total 2\n",
+        ] {
+            assert!(
+                response.contains(series),
+                "read live: {series} in {response}"
+            );
+        }
 
         shutdown.store(true, Ordering::Relaxed);
         handle.join().unwrap();
+    }
+
+    /// A receive's tally adds to the counters, each to its own; a tally
+    /// of zeros changes nothing; the parked gauge is set, not added to.
+    #[test]
+    fn a_tally_adds_to_its_own_counters() {
+        let metrics = IngressMetrics::default();
+        metrics.record(&IngressTally::default());
+        assert_eq!(
+            metrics.counts(),
+            IngressTally::default(),
+            "an empty tally counts nothing"
+        );
+
+        let mut tally = IngressTally {
+            shed: 7,
+            filtered: 1,
+            ..IngressTally::default()
+        };
+        tally.refused(RefusalKind::PermissionDenied);
+        metrics.record(&tally);
+        metrics.record(&tally);
+        let counts = metrics.counts();
+        assert_eq!((counts.shed, counts.filtered), (14, 2));
+        assert_eq!(counts.refused_as(RefusalKind::PermissionDenied), 2);
+        assert_eq!(counts.refused_as(RefusalKind::Malformed), 0);
+        assert_eq!((metrics.parked(), metrics.parks()), (0, 0));
+
+        metrics.record_park();
+        metrics.set_parked(3);
+        metrics.set_parked(3);
+        assert_eq!((metrics.parked(), metrics.parks()), (3, 1));
+        metrics.set_parked(0);
+        assert_eq!((metrics.parked(), metrics.parks()), (0, 1));
+    }
+
+    /// Every refusal kind the wire knows has a counter and a label of its
+    /// own: `REFUSAL_KINDS` lists each kind once, at the index its mapping
+    /// gives, and no two share a label.
+    #[test]
+    fn every_refusal_kind_is_exported_under_its_own_label() {
+        let wire_kinds: Vec<RefusalKind> =
+            (0..=u8::MAX).filter_map(RefusalKind::from_byte).collect();
+        assert_eq!(wire_kinds.len(), REFUSAL_KINDS.len(), "{wire_kinds:?}");
+        for kind in wire_kinds {
+            let (index, _) = refusal_index(kind);
+            assert_eq!(REFUSAL_KINDS[index], kind, "{kind:?} listed at its index");
+        }
+        let mut labels: Vec<&str> = REFUSAL_KINDS
+            .iter()
+            .map(|&kind| refusal_index(kind).1)
+            .collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), REFUSAL_KINDS.len(), "{labels:?}");
     }
 
     #[test]
@@ -1825,6 +2140,7 @@ mod tests {
             active_connections: Arc::new(AtomicU64::new(0)),
             events_processed: Arc::new(AtomicU64::new(0)),
             refused_writes: Arc::new(AtomicU64::new(0)),
+            ingress: Arc::new(IngressMetrics::default()),
             cursors: test_cursors(1000, 1000, 900, u64::MAX),
             input_cursor: Box::new(MockCursor(AtomicU64::new(1000))),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
@@ -1893,6 +2209,7 @@ mod tests {
             active_connections: Arc::new(AtomicU64::new(0)),
             events_processed: Arc::new(AtomicU64::new(0)),
             refused_writes: Arc::new(AtomicU64::new(0)),
+            ingress: Arc::new(IngressMetrics::default()),
             cursors: test_cursors(0, 0, 0, u64::MAX),
             input_cursor: Box::new(MockCursor(AtomicU64::new(0))),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
@@ -1970,6 +2287,7 @@ mod tests {
             active_connections: Arc::new(AtomicU64::new(0)),
             events_processed: Arc::new(AtomicU64::new(0)),
             refused_writes: Arc::new(AtomicU64::new(0)),
+            ingress: Arc::new(IngressMetrics::default()),
             // The engaged slot at acked 4990 drives the fastest-replica
             // gauge, which must decode back to the acked wire seq.
             cursors: test_cursors(5000, 5000, 5000, 4990),
@@ -2025,6 +2343,7 @@ mod tests {
             active_connections: Arc::new(AtomicU64::new(0)),
             events_processed: Arc::new(AtomicU64::new(0)),
             refused_writes: Arc::new(AtomicU64::new(0)),
+            ingress: Arc::new(IngressMetrics::default()),
             cursors: test_cursors(0, 0, 0, u64::MAX),
             input_cursor: Box::new(MockCursor(AtomicU64::new(0))),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
@@ -2277,6 +2596,7 @@ mod tests {
             active_connections: Arc::new(AtomicU64::new(0)),
             events_processed: Arc::new(AtomicU64::new(0)),
             refused_writes: Arc::new(AtomicU64::new(0)),
+            ingress: Arc::new(IngressMetrics::default()),
             // Quorum cursor = slowest acked (slot 1's 800), consistent with
             // the per-slot metrics above.
             cursors: test_cursors(1000, 1000, 1000, 800),
@@ -2363,6 +2683,7 @@ mod tests {
             active_connections: Arc::new(AtomicU64::new(0)),
             events_processed: Arc::new(AtomicU64::new(0)),
             refused_writes: Arc::new(AtomicU64::new(0)),
+            ingress: Arc::new(IngressMetrics::default()),
             cursors: test_cursors(1_000, 1_000, 1_000, 0),
             input_cursor: Box::new(MockCursor(AtomicU64::new(1_000))),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
@@ -2443,6 +2764,7 @@ mod tests {
             active_connections: Arc::new(AtomicU64::new(0)),
             events_processed: Arc::new(AtomicU64::new(0)),
             refused_writes: Arc::new(AtomicU64::new(0)),
+            ingress: Arc::new(IngressMetrics::default()),
             cursors: cursors.clone(),
             input_cursor: Box::new(MockCursor(AtomicU64::new(0))),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
@@ -2617,6 +2939,7 @@ mod tests {
             active_connections: Arc::new(AtomicU64::new(0)),
             events_processed: Arc::new(AtomicU64::new(0)),
             refused_writes: Arc::new(AtomicU64::new(0)),
+            ingress: Arc::new(IngressMetrics::default()),
             cursors: test_cursors(0, 0, 0, u64::MAX),
             input_cursor: Box::new(MockCursor(AtomicU64::new(0))),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),

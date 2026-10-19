@@ -20,6 +20,7 @@
 //! on DPDK with this crate's `dpdk` feature, under
 //! `scripts/dpdk/netns-runner.sh` (see `docs/internal/dpdk-testing.md`).
 
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,7 +37,9 @@ use melin_client::{Connection, Frame, RefusalKind, RequestId, SigningKey, Stream
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
+use melin_test_node::probe::wait_for_gauge;
 use melin_transport_core::pipeline::INPUT_RING_CAPACITY;
+use melin_transport_core::test_ports::free_addr;
 
 /// The writer's key, and the reader's.
 const WRITER: [u8; 32] = [0xA1; 32];
@@ -146,7 +149,13 @@ fn authorized_keys(dir: &Path) -> std::path::PathBuf {
     auth_path
 }
 
-/// A standalone node's configuration on `dir`, its journal named `name`.
+/// Port range for the health endpoint's `free_addr`, shared with the
+/// other cluster tests (`halt_cluster.rs`): safe only because this binary
+/// is in nextest's `cluster-serial` group with them.
+const PORT_BASE: u16 = 10_000;
+
+/// A standalone node's configuration on `dir`, its journal named `name`,
+/// with the health endpoint the tests read its counters through.
 fn config(dir: &Path, name: &str) -> ServerConfig {
     ServerConfig {
         journal: dir.join(name),
@@ -157,15 +166,18 @@ fn config(dir: &Path, name: &str) -> ServerConfig {
         cores: PipelineCores::unpinned(),
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,
-        health_bind: None,
+        health_bind: Some(free_addr(PORT_BASE)),
         ..melin_test_node::config()
     }
 }
 
-/// A standalone counter node on `dir`, with a writer and a reader key.
-fn start(dir: &Path) -> melin_test_node::Node {
-    melin_test_node::start::<Counter>(
-        config(dir, "counter.journal"),
+/// A standalone counter node on `dir`, with a writer and a reader key,
+/// and its health endpoint.
+fn start(dir: &Path) -> (melin_test_node::Node, SocketAddr) {
+    let config = config(dir, "counter.journal");
+    let health = config.health_bind.expect("set by `config`");
+    let node = melin_test_node::start::<Counter>(
+        config,
         StartupEvents {
             genesis: Vec::new(),
             on_primary: Vec::new(),
@@ -173,14 +185,17 @@ fn start(dir: &Path) -> melin_test_node::Node {
         (),
         FilteringDecoder,
         ResponseEncoder,
-    )
+    );
+    (node, health)
 }
 
 /// A standalone node of the latched counter, applying as many writes as
-/// `leave` says.
-fn start_latched(dir: &Path, leave: &Arc<AtomicU64>) -> melin_test_node::Node {
-    melin_test_node::start::<Latched>(
-        config(dir, "latched.journal"),
+/// `leave` says, and its health endpoint.
+fn start_latched(dir: &Path, leave: &Arc<AtomicU64>) -> (melin_test_node::Node, SocketAddr) {
+    let config = config(dir, "latched.journal");
+    let health = config.health_bind.expect("set by `config`");
+    let node = melin_test_node::start::<Latched>(
+        config,
         StartupEvents {
             genesis: Vec::new(),
             on_primary: Vec::new(),
@@ -188,7 +203,29 @@ fn start_latched(dir: &Path, leave: &Arc<AtomicU64>) -> melin_test_node::Node {
         Arc::clone(leave),
         RequestDecoder,
         ResponseEncoder,
-    )
+    );
+    (node, health)
+}
+
+/// The counters a node's health endpoint reports for the requests it
+/// answered without applying, and the connections it parked, in the
+/// order: shed, refused as permission denied, refused as malformed,
+/// filtered, parked now.
+const EARLY_ANSWER_COUNTERS: [&str; 5] = [
+    "melin_requests_shed_total",
+    "melin_requests_refused_total{kind=\"permission_denied\"}",
+    "melin_requests_refused_total{kind=\"malformed\"}",
+    "melin_requests_filtered_total",
+    "melin_connections_parked",
+];
+
+/// Wait until the node's early-answer counters read `expected`, in
+/// [`EARLY_ANSWER_COUNTERS`]' order. Each is counted when its answer is
+/// queued, which may trail the answer the client has read.
+fn wait_for_counters(health: SocketAddr, expected: [u64; 5]) {
+    for (name, value) in EARLY_ANSWER_COUNTERS.into_iter().zip(expected) {
+        wait_for_gauge(health, name, value);
+    }
 }
 
 /// What a request was answered with: the application frames of its batch
@@ -270,7 +307,7 @@ fn pipelined(
 #[test]
 fn every_pipelined_request_is_answered_and_paired_by_id() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let node = start(dir.path());
+    let (node, health) = start(dir.path());
 
     let mut writer = melin_test_node::connect(node.addr(), &SigningKey::from_bytes(&WRITER));
     writer
@@ -343,6 +380,10 @@ fn every_pipelined_request_is_answered_and_paired_by_id() {
         7
     );
 
+    // Counted on the health endpoint, each once and as its kind: none
+    // shed, one denied, two malformed, two filtered, nothing parked.
+    wait_for_counters(health, [0, 1, 2, 2, 0]);
+
     drop((writer, reader));
     node.stop();
 }
@@ -381,7 +422,7 @@ fn a_full_input_ring_answers_busy_and_keeps_the_connection() {
     melin_test_node::logs::capture_if_requested();
     let dir = tempfile::tempdir().expect("tempdir");
     let leave = Arc::new(AtomicU64::new(0));
-    let node = start_latched(dir.path(), &leave);
+    let (node, health) = start_latched(dir.path(), &leave);
     let key = SigningKey::from_bytes(&WRITER);
     // Up and serving: the handshake goes through.
     drop(melin_test_node::connect(node.addr(), &key));
@@ -466,6 +507,10 @@ fn a_full_input_ring_answers_busy_and_keeps_the_connection() {
         u64::from_le_bytes(ack[1..9].try_into().expect("8 bytes")),
         applied.len() as u64 + 5
     );
+
+    // Every busy answer counted as shed, once; nothing refused, filtered
+    // or parked now.
+    wait_for_counters(health, [busy.len() as u64, 0, 0, 0, 0]);
 
     drop(conn);
     node.stop();

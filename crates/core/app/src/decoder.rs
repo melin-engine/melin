@@ -24,7 +24,10 @@
 //! encodes exactly the four outcomes the runtime acts on (answer with an
 //! empty batch, publish, refuse as not permitted, refuse as malformed).
 //! Every request is answered: the client is told which of its requests
-//! each answer is for.
+//! each answer is for. The requests a decoder filters or refuses are
+//! journaled nowhere, so the node counts them on its health endpoint
+//! (`melin_requests_filtered_total`, `melin_requests_refused_total` by
+//! kind).
 
 use tracing::error;
 
