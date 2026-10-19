@@ -12,6 +12,8 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-10-19
+
 ### Added
 
 - **`melin_ack_policy_journaled` and `melin_ack_policy_in_force`**, two
@@ -1914,7 +1916,8 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 - A rotation that committed is no longer reported as failed when the directory
   fsync errors afterwards.
 
-[Unreleased]: https://github.com/melin-engine/melin/compare/v0.19.0...HEAD
+[Unreleased]: https://github.com/melin-engine/melin/compare/v0.20.0...HEAD
+[0.20.0]: https://github.com/melin-engine/melin/releases/tag/v0.20.0
 [0.19.0]: https://github.com/melin-engine/melin/releases/tag/v0.19.0
 [0.18.0]: https://github.com/melin-engine/melin/releases/tag/v0.18.0
 [0.17.0]: https://github.com/melin-engine/melin/releases/tag/v0.17.0
