@@ -13,11 +13,14 @@ fails there is either a divergence between the transports
 From the repository root, with libdpdk and libclang installed:
 
 ```sh
-CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$PWD/scripts/dpdk/netns-runner.sh" cargo nextest run --profile dpdk -p melin-server-runtime --features dpdk -E 'kind(test)'
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$PWD/scripts/dpdk/netns-runner.sh" cargo nextest run --profile dpdk -p melin-server-runtime --features dpdk -E 'kind(test) | (kind(lib) & test(dpdk))'
 ```
 
 The runner variable names the target triple: on an aarch64 host it is
-`CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER`, with the same value.
+`CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER`, with the same value. The
+filter takes the integration suites and, of the library's unit tests,
+those whose path names DPDK: they compile only with the feature, and
+some run a DPDK transport (see "A node's NIC without a node" below).
 
 The examples run the same way with their own feature
 (`-p melin-example-echo --features melin-example-echo/dpdk`). The `dpdk`
@@ -157,6 +160,14 @@ own `dpdk` feature switches its tests over the same way.
   `dpdk_client_process_eal_args(file_prefix)` for it instead, and then
   opens no handle of its own: the launcher panics on either call after the
   other.
+- **A node's NIC without a node.** `dpdk_node_nic()` (DPDK only) takes
+  the first free slot, attaches its device, and hands back the slot's
+  `NicConfig` and address, for a test that builds a node's DPDK
+  transport and runs its pieces itself. The runtime's unit tests of the
+  poll loop's parking do (`dpdk_transport.rs`): they hold the DPDK
+  response stage at a `cfg(test)` seam, which exists only in the
+  runtime's own test build, not in the copy of the runtime a launched
+  node runs. The slot is freed when the value drops, after the transport.
 
 ## Several nodes in one process
 

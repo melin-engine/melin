@@ -33,6 +33,10 @@
 //! process-wide EAL as the nodes. The peer MAC is the test's to pass
 //! (`mac_of`), as a replica's is the launcher's.
 //!
+//! A test that builds a node's DPDK transport itself, to run its pieces
+//! with test seams a launched node does not have, takes a slot's NIC with
+//! `dpdk_node_nic` (DPDK only).
+//!
 //! A test that checks the context a node's threads start in uses
 //! [`sched`]: the node is started from a thread at `SCHED_BATCH`, and its
 //! placed threads must not be found at it.
@@ -242,6 +246,60 @@ pub fn open_dpdk_client(config: melin_dpdk::NicConfig) -> melin_dpdk::NicHandle 
 #[cfg(feature = "dpdk")]
 pub fn dpdk_client_process_eal_args(file_prefix: &str) -> Vec<String> {
     dpdk::client_process_eal_args(file_prefix)
+}
+
+/// A node slot's NIC, held for a test that builds a node's DPDK transport
+/// itself rather than starting a node ([`dpdk_node_nic`]).
+#[cfg(feature = "dpdk")]
+#[derive(Debug)]
+pub struct DpdkNodeNic {
+    nic: melin_dpdk::NicConfig,
+    addr: SocketAddr,
+    slot: usize,
+}
+
+#[cfg(feature = "dpdk")]
+impl DpdkNodeNic {
+    /// The NIC's configuration, as a node on the slot is given it: the
+    /// slot's device as its one port, the slot's IP and the runner's
+    /// prefix, no EAL arguments (the process-wide EAL is up), and the
+    /// defaults for the rest.
+    pub fn nic(&self) -> &melin_dpdk::NicConfig {
+        &self.nic
+    }
+
+    /// Where a client reaches a transport listening on the slot: the
+    /// slot's IP and the port a node there listens on.
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+}
+
+#[cfg(feature = "dpdk")]
+impl Drop for DpdkNodeNic {
+    /// Detach the slot's device and free the slot. Never panics, as it
+    /// may run during a failing test's unwind: a device that cannot be
+    /// detached (its port still open) keeps the slot held.
+    fn drop(&mut self) {
+        if let Err(e) = dpdk::try_release(self.slot) {
+            eprintln!("melin-test-node: {e}; the slot stays held");
+        }
+    }
+}
+
+/// Take the first free node slot and attach its device on the
+/// process-wide EAL (initialized here if no node has done it yet), for a
+/// test that runs the DPDK transport's pieces itself rather than a whole
+/// node: a unit test of the runtime, whose test seams exist only in its own
+/// test build, which the nodes this crate starts do not run.
+///
+/// The slot is held until the value drops, which detaches its device, so
+/// drop it after every transport built on it, whose port must be closed
+/// first. Panics when every slot holds a node or the process is not under
+/// the runner.
+#[cfg(feature = "dpdk")]
+pub fn dpdk_node_nic() -> DpdkNodeNic {
+    dpdk::node_nic()
 }
 
 /// A node running on its own thread of this process.
@@ -842,6 +900,38 @@ mod dpdk {
         start_claimed::<A>(claim, addrs, config, startup, sizing, decoder, encoder)
     }
 
+    /// Attach the device of the slot `claim` holds, on the process-wide
+    /// EAL. Returns the slot, from here held until [`release`] frees it
+    /// (which detaches the device too), and the device's port.
+    fn attach(claim: SlotClaim) -> (usize, u16) {
+        let slot = claim.slot();
+        let (device, device_args) = layout::vdev(slot, &layout().slot(slot).iface);
+        let port = eal()
+            .attach_vdev(&device, &device_args)
+            .unwrap_or_else(|e| panic!("attach {device} for node slot {slot}: {e}"));
+        (claim.into_node(), port)
+    }
+
+    /// The first free slot's NIC; see [`super::dpdk_node_nic`].
+    pub(super) fn node_nic() -> super::DpdkNodeNic {
+        let claim = claim_first_free();
+        let addrs = addrs(claim.slot());
+        let (slot, port) = attach(claim);
+        let layout = layout();
+        super::DpdkNodeNic {
+            nic: NicConfig {
+                // The process-wide EAL: a port, not arguments, as a node's.
+                eal_args: Vec::new(),
+                port_ids: vec![port],
+                ip_addr: layout.slot(slot).ip,
+                prefix_len: layout.prefix_len,
+                ..NicConfig::default()
+            },
+            addr: addrs.client,
+            slot,
+        }
+    }
+
     /// Start a node on `addrs`' slot, which `claim` holds.
     pub(super) fn start_claimed<A>(
         claim: SlotClaim,
@@ -886,13 +976,7 @@ mod dpdk {
             .to_owned()
         });
 
-        let (device, device_args) = layout::vdev(addrs.slot, &slot.iface);
-        let port = eal()
-            .attach_vdev(&device, &device_args)
-            .unwrap_or_else(|e| panic!("attach {device} for node slot {}: {e}", addrs.slot));
-        // Attached: from here the slot is the node's, freed by `release`
-        // when it returns (which detaches the device too).
-        let slot_id = claim.into_node();
+        let (slot_id, port) = attach(claim);
 
         config.bind = addrs.client;
         // The node shares the process-wide EAL: it takes a port, not

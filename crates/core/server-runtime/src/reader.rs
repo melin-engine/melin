@@ -63,7 +63,7 @@ const BUF_SIZE: usize = 4096;
 /// Buffer group ID for the provided recv buffer pool.
 const BUF_GROUP_ID: u16 = 0;
 
-use crate::client_frames::{ClientIngress, FrameAction, LONG_PARK, LongParkReport, MAX_FRAME_SIZE};
+use crate::client_frames::{ClientIngress, FrameAction, LongParkReport, MAX_FRAME_SIZE};
 use crate::connection_limit::{RingSizing, await_startup, ring_setup_error};
 
 /// User data sentinel for the eventfd read SQE.
@@ -1283,7 +1283,7 @@ fn reader_loop<A: Application, R: AsRawFd>(
                     // Still parked, since it first parked.
                     FrameAction::Park => {
                         any_parked = true;
-                        if batch_now.duration_since(since) > LONG_PARK {
+                        if LongParkReport::parked_long(since, batch_now) {
                             long_parked += 1;
                         }
                     }
@@ -1298,13 +1298,7 @@ fn reader_loop<A: Application, R: AsRawFd>(
                 }
                 apply_frames_step(&mut ring, &mut slab, &mut fd_to_slab, control_tx, idx, step);
             }
-            if long_park_report.due(long_parked, batch_now) {
-                tracing::warn!(
-                    connections = long_parked,
-                    "client connections parked for over a second: the response stage \
-                     is not taking early replies, and these clients are not read"
-                );
-            }
+            long_park_report.report(long_parked, batch_now);
         }
 
         // Scan for idle connections that have exceeded the timeout.

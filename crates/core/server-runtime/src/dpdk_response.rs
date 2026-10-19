@@ -141,6 +141,12 @@ pub fn run<A: Application>(
     // Release of held replies on this node's own fsync while halted;
     // `None` when off. See `crate::halt::DegradedRelease`.
     degraded_release: Option<crate::halt::DegradedRelease>,
+    // Test seam, the kernel stage's `Response::pause_after_control_drain`:
+    // called once per iteration right after the control channel has been
+    // drained, so a test can hold the stage there, and with it every early
+    // reply, as the poll thread's parking tests do. `None` runs the stage
+    // as production does; compiled out of non-test builds.
+    #[cfg(test)] mut pause_after_control_drain: Option<Box<dyn FnMut() + Send>>,
 ) {
     // The ack policy in force and the durability gate — the same state
     // machine the kernel response stage runs. See `DurabilityGate`.
@@ -255,6 +261,13 @@ pub fn run<A: Application>(
                 Instant::now,
             )
         });
+
+        // Test seam: hold the stage right after the drain — see the
+        // parameter.
+        #[cfg(test)]
+        if let Some(pause) = pause_after_control_drain.as_mut() {
+            pause();
+        }
 
         if slots.is_empty() {
             // Between two events only: an empty read is not a boundary in
@@ -950,6 +963,7 @@ mod tests {
                     Arc::new(ResponseEncoder),
                     early_replies,
                     None,
+                    None,
                 )
             });
 
@@ -1090,6 +1104,7 @@ mod tests {
                             presence: Arc::new(ReplicaPresence::new()),
                             grace: Duration::ZERO,
                         }),
+                        None,
                     )
                 });
 
@@ -1242,6 +1257,7 @@ mod tests {
                     WaitStrategy::SpinThenYield,
                     Arc::new(ResponseEncoder),
                     early_replies,
+                    None,
                     None,
                 )
             });

@@ -3147,6 +3147,8 @@ where
                 encoder,
                 early_rx,
                 degraded_release,
+                #[cfg(test)]
+                None,
             );
         })
         .map_err(|e| format!("spawn response thread: {e}"))?,

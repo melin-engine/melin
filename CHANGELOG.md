@@ -139,16 +139,20 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   nothing a client pipelined behind a shed request in the same burst is
   applied ahead of its resend; a request on a later receive may be.
   When the early-reply queue is full (the response stage has stopped
-  taking answers), the kernel transport no longer closes the
-  connection: it stops reading it, leaving the request and everything
-  behind it unread, and retries every millisecond until the queue has
-  room, while the client's sends back up under TCP flow control. A
-  connection parked for over a second is degraded operation, reported
-  at `warn` once a second while any stays parked. On a host that
-  filters io_uring's cancel operation, a parked connection would go on
-  being read, so after a second it is closed instead, with a `warn`
-  naming the cause. The DPDK transport
-  still closes the connection on a full queue. In
+  taking answers), neither transport closes the connection: it stops
+  reading it, leaving the request and everything behind it unread, and
+  retries until the queue has room (the kernel transport every
+  millisecond, the DPDK transport on every poll), while the client's
+  sends back up under TCP flow control. A parked connection is not
+  dropped as idle, and on DPDK not for the bytes it holds either: one
+  receive can take a connection past the 64 KiB a DPDK node otherwise
+  lets it buffer before it parks, and those bytes are the node's
+  backlog. A connection parked
+  for over a second is degraded operation, reported at `warn` at most
+  once a second while any stays parked. On a host that filters
+  io_uring's cancel operation, a parked connection would go on being
+  read by the kernel transport, so after a second it is closed instead,
+  with a `warn` naming the cause. In
   `melin-server-runtime`'s `halt` module, `early_reply_channel` takes the
   queue's capacity, and `EARLY_REPLY_QUEUE_CAPACITY`, the capacity a node
   gives it, is public.

@@ -95,10 +95,16 @@ pub(crate) struct LongParkReport {
 }
 
 impl LongParkReport {
+    /// Whether a connection parked `since` has been parked past
+    /// [`LONG_PARK`] at `now`, and so counts towards the report.
+    pub(crate) fn parked_long(since: Instant, now: Instant) -> bool {
+        now.saturating_duration_since(since) > LONG_PARK
+    }
+
     /// Whether to report `long_parked` connections parked past
     /// [`LONG_PARK`] at `now`: never for none, and at most once per
     /// [`LONG_PARK`] otherwise. A `true` starts the next interval.
-    pub(crate) fn due(&mut self, long_parked: usize, now: Instant) -> bool {
+    fn due(&mut self, long_parked: usize, now: Instant) -> bool {
         if long_parked == 0 {
             return false;
         }
@@ -110,6 +116,19 @@ impl LongParkReport {
         }
         self.last = Some(now);
         true
+    }
+
+    /// Report, at `warn`, `long_parked` connections parked past
+    /// [`LONG_PARK`] at `now`, when [`due`](Self::due): the one wording
+    /// both readers log.
+    pub(crate) fn report(&mut self, long_parked: usize, now: Instant) {
+        if self.due(long_parked, now) {
+            tracing::warn!(
+                connections = long_parked,
+                "client connections parked for over a second: the response stage is not taking \
+                 early replies, and these clients are not read"
+            );
+        }
     }
 }
 
@@ -362,20 +381,14 @@ fn process_frames_unflushed<A: Application>(
         // An answer decided here, or the event to publish.
         let early = match decoder.decode_erased(body, role) {
             Decoded::Filter => EarlyKind::Filtered,
-            Decoded::PermissionDenied(reason) => {
-                debug!(connection_id, reason, "permission denied, refusing request");
-                EarlyKind::Refused {
-                    kind: RefusalKind::PermissionDenied,
-                    reason,
-                }
-            }
-            Decoded::DecodeError(reason) => {
-                debug!(connection_id, reason, "decode error, refusing request");
-                EarlyKind::Refused {
-                    kind: RefusalKind::Malformed,
-                    reason,
-                }
-            }
+            Decoded::PermissionDenied(reason) => EarlyKind::Refused {
+                kind: RefusalKind::PermissionDenied,
+                reason,
+            },
+            Decoded::DecodeError(reason) => EarlyKind::Refused {
+                kind: RefusalKind::Malformed,
+                reason,
+            },
             Decoded::Permitted(event) => match refusal_reason {
                 Some(reason) if !event.is_query() => {
                     EarlyKind::Rejected(A::build_reject(&event, reason))
@@ -425,10 +438,20 @@ fn process_frames_unflushed<A: Application>(
             result = FrameAction::Park;
             break;
         }
-        // A halt refusal is counted once its answer is queued: a write
-        // parked on is counted when the next call answers it.
-        if matches!(early, EarlyKind::Rejected(_)) {
-            refused += 1;
+        // Counted and logged once its answer is queued: a request parked
+        // on is decoded again by every retry until then, which on DPDK is
+        // every poll iteration.
+        match early {
+            EarlyKind::Rejected(_) => refused += 1,
+            EarlyKind::Refused {
+                kind: RefusalKind::PermissionDenied,
+                reason,
+            } => debug!(connection_id, reason, "permission denied, refusing request"),
+            EarlyKind::Refused {
+                kind: RefusalKind::Malformed,
+                reason,
+            } => debug!(connection_id, reason, "decode error, refusing request"),
+            EarlyKind::Filtered | EarlyKind::Busy => {}
         }
     }
 
@@ -477,17 +500,16 @@ fn queue_early<R: Copy>(
     request_id: RequestId,
     kind: EarlyKind<R>,
 ) -> bool {
-    let queued = early_replies
+    // A full queue is not logged here: the reader logs the park it
+    // causes, once, where a line here would repeat on every retry of the
+    // parked connection.
+    early_replies
         .try_send(EarlyReply {
             connection_id,
             request_id,
             kind,
         })
-        .is_ok();
-    if !queued {
-        debug!(connection_id, "early-reply queue full");
-    }
-    queued
+        .is_ok()
 }
 
 /// Publish one client event into `batch`. `false` when the input ring is
@@ -548,6 +570,24 @@ mod tests {
         assert!(report.due(1, start + LONG_PARK), "the next interval");
         assert!(!report.due(0, start + LONG_PARK * 3), "none any more");
         assert!(report.due(1, start + LONG_PARK * 3), "a new one, later");
+    }
+
+    /// A connection counts towards the report only once parked past
+    /// `LONG_PARK`, and a clock read before the park (the slow checks'
+    /// read, taken ahead of the pass that parks it) counts as no time.
+    #[test]
+    fn a_park_is_long_past_the_interval_only() {
+        let since = Instant::now();
+        assert!(!LongParkReport::parked_long(since, since));
+        assert!(!LongParkReport::parked_long(since, since + LONG_PARK));
+        assert!(LongParkReport::parked_long(
+            since,
+            since + LONG_PARK + Duration::from_millis(1)
+        ));
+        assert!(!LongParkReport::parked_long(
+            since + Duration::from_secs(5),
+            since
+        ));
     }
 
     /// The tail covers whole frames only: up to a partial frame, an
