@@ -527,16 +527,14 @@ pub enum Reply<'a> {
     },
 }
 
-impl<'a> Reply<'a> {
-    /// The frame a connection hands over for this reply; `None` for a
-    /// heartbeat, which never surfaces.
-    fn frame(self) -> Option<Frame<'a>> {
+impl<'a> Frame<'a> {
+    /// This frame as [`classify`] reports it.
+    fn into_reply(self) -> Reply<'a> {
         match self {
-            Reply::Heartbeat => None,
-            Reply::Response(body) => Some(Frame::Response(body)),
-            Reply::BatchEnd { id, ack } => Some(Frame::BatchEnd { id, ack }),
-            Reply::ServerBusy { id } => Some(Frame::ServerBusy { id }),
-            Reply::Refused { id, kind, reason } => Some(Frame::Refused { id, kind, reason }),
+            Frame::Response(body) => Reply::Response(body),
+            Frame::BatchEnd { id, ack } => Reply::BatchEnd { id, ack },
+            Frame::ServerBusy { id } => Reply::ServerBusy { id },
+            Frame::Refused { id, kind, reason } => Reply::Refused { id, kind, reason },
         }
     }
 }
@@ -560,27 +558,45 @@ impl<'a> Reply<'a> {
 /// outstanding on the connection is the connection's to check, as
 /// [`Connection`] and [`PolledConnection`] do.
 pub fn classify(payload: &[u8]) -> Result<Reply<'_>, Error> {
+    if is_heartbeat(payload) {
+        return Ok(Reply::Heartbeat);
+    }
+    classify_answer(payload).map(Frame::into_reply)
+}
+
+/// Whether `payload` is a heartbeat, by its tag alone: whatever follows
+/// the tag, [`classify`] reports it as [`Reply::Heartbeat`]. A test that
+/// borrows nothing past the call, so a connection's loop can skip
+/// heartbeats and classify only the frame it stops on, once.
+#[inline]
+pub(crate) fn is_heartbeat(payload: &[u8]) -> bool {
+    payload.first() == Some(&TAG_RESPONSE_HEARTBEAT)
+}
+
+/// [`classify`] for a payload that is not a heartbeat ([`is_heartbeat`]
+/// said so): the frame a connection hands over. A heartbeat's tag is
+/// refused here like any tag no answer carries.
+pub(crate) fn classify_answer(payload: &[u8]) -> Result<Frame<'_>, Error> {
     let Some((&tag, body)) = payload.split_first() else {
         return Err(Error::Protocol("empty frame".into()));
     };
     match tag {
-        TAG_APP => Ok(Reply::Response(body)),
-        TAG_RESPONSE_HEARTBEAT => Ok(Reply::Heartbeat),
-        TAG_BATCH_END => Ok(Reply::BatchEnd {
+        TAG_APP => Ok(Frame::Response(body)),
+        TAG_BATCH_END => Ok(Frame::BatchEnd {
             id: id_frame(payload, "batch end")?,
             ack: Ack::Policy,
         }),
-        TAG_BATCH_END_DEGRADED => Ok(Reply::BatchEnd {
+        TAG_BATCH_END_DEGRADED => Ok(Frame::BatchEnd {
             id: id_frame(payload, "degraded batch end")?,
             ack: Ack::PrimaryOnly,
         }),
-        TAG_SERVER_BUSY => Ok(Reply::ServerBusy {
+        TAG_SERVER_BUSY => Ok(Frame::ServerBusy {
             id: id_frame(payload, "busy frame")?,
         }),
         TAG_REFUSED => {
             let refused = decode_refused(payload)
                 .map_err(|e| Error::Protocol(format!("{e} in a response frame")))?;
-            Ok(Reply::Refused {
+            Ok(Frame::Refused {
                 id: refused.id,
                 kind: refused.kind,
                 reason: refused.reason,
@@ -883,23 +899,20 @@ impl Connection {
         // wait can overshoot the timeout by up to one heartbeat gap —
         // the deadline is only checked when a frame arrives.
         let deadline = Instant::now() + self.read_timeout;
-        loop {
-            // Decide on the classification alone, then borrow the frame
-            // back to return it: a borrow that lives across the loop and
-            // is conditionally returned is what the borrow checker cannot
-            // follow.
-            let reply = classify(raw_frame(&mut self.reader, self.read_timeout)?)?;
-            self.outstanding.observe(&reply)?;
-            if !matches!(reply, Reply::Heartbeat) {
-                break;
-            }
+        // Skip heartbeats on their tag alone, then classify the frame the
+        // loop stopped on, once, after it: a borrow that lives across the
+        // loop and is conditionally returned is what the borrow checker
+        // cannot follow.
+        while is_heartbeat(raw_frame(&mut self.reader, self.read_timeout)?) {
             if Instant::now() >= deadline {
                 return Err(Error::NoReply {
                     timeout: self.read_timeout,
                 });
             }
         }
-        Ok(reclassified(self.reader.frame()))
+        let frame = classify_answer(self.reader.frame())?;
+        self.outstanding.observe(&frame)?;
+        Ok(frame)
     }
 
     /// Send one request and collect the application frames of its reply
@@ -960,19 +973,6 @@ fn raw_frame(
         Ok(None) => Err(Error::Disconnected),
         Err(e) => Err(io_error(e, timeout)),
     }
-}
-
-/// The frame a payload already classified, accounted for and found not
-/// to be a heartbeat holds, borrowed back for the caller: what both
-/// connections return once their loop over the payloads they read has
-/// decided on one (see [`Connection::next_frame`]). Classifying again is a
-/// few compares, a UTF-8 check for a refusal's reason, and spares a second
-/// description of every reply as positions.
-pub(crate) fn reclassified(payload: &[u8]) -> Frame<'_> {
-    classify(payload)
-        .ok()
-        .and_then(Reply::frame)
-        .expect("a payload classified as a frame moments ago")
 }
 
 /// A read that failed under a socket timeout of `timeout` is the node's
@@ -1237,7 +1237,8 @@ mod tests {
         /// As `Echo`, with every batch backed by the primary's disk
         /// alone: what a halted primary sends for a request it held.
         DegradedEcho,
-        /// A heartbeat before every reply, and two reply frames per batch.
+        /// Two reply frames per batch, a heartbeat before the first and
+        /// another between them, inside the batch.
         ChattyEcho,
         /// Read requests and never answer.
         Silent,
@@ -1412,6 +1413,7 @@ mod tests {
                 Behaviour::ChattyEcho => [
                     control(TransportResponse::Heartbeat),
                     app_frame(&body),
+                    control(TransportResponse::Heartbeat),
                     app_frame(b"again"),
                     control(TransportResponse::BatchEnd { id }),
                 ]
@@ -2388,6 +2390,41 @@ mod tests {
             assert!(
                 err.to_string().contains("unexpected tag"),
                 "{wrong:?}: {err}"
+            );
+        }
+    }
+
+    /// The connections skip heartbeats on `is_heartbeat` and classify the
+    /// rest with `classify_answer`: the two split every payload as
+    /// `classify` does, a heartbeat by its tag whatever follows it, and
+    /// nothing else is taken for one.
+    #[test]
+    fn heartbeats_and_answers_split_payloads_as_classify_does() {
+        let heartbeat = payload(TransportResponse::Heartbeat);
+        for beat in [heartbeat.clone(), [&heartbeat[..], b"trailing"].concat()] {
+            assert!(is_heartbeat(&beat));
+            assert_eq!(classify(&beat).unwrap(), Reply::Heartbeat);
+            let err = classify_answer(&beat).unwrap_err();
+            assert!(err.to_string().contains("unexpected tag"), "{err}");
+        }
+        let id = RequestId(9);
+        for answer in [
+            app_frame(b"x")[PREFIX_LEN..].to_vec(),
+            payload(TransportResponse::BatchEnd { id }),
+            payload(TransportResponse::BatchEndDegraded { id }),
+            payload(TransportResponse::ServerBusy { id }),
+            payload(TransportResponse::Refused {
+                id,
+                kind: RefusalKind::Malformed,
+                reason: "no",
+            }),
+            Vec::new(),
+            vec![0x00],
+        ] {
+            assert!(!is_heartbeat(&answer), "{answer:?}");
+            assert_eq!(
+                format!("{:?}", classify(&answer)),
+                format!("{:?}", classify_answer(&answer).map(Frame::into_reply)),
             );
         }
     }

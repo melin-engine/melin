@@ -37,8 +37,8 @@ use crate::framing::{PREFIX_LEN, RequestFrameError, request_payload_len, split_f
 use crate::outstanding::Outstanding;
 use crate::{
     Ack, Batch, Connection, DEFAULT_TIMEOUT, Error, Frame, Handshake, MAX_FRAME_SIZE,
-    MAX_HANDSHAKE_FRAME, MAX_REQUEST_BODY, REQUEST_HEADER_LEN, Reply, RequestId, SigningKey, Step,
-    VerifyingKey, classify, frame_request, reclassified,
+    MAX_HANDSHAKE_FRAME, MAX_REQUEST_BODY, REQUEST_HEADER_LEN, RequestId, SigningKey, Step,
+    VerifyingKey, classify_answer, frame_request, is_heartbeat,
 };
 
 // ---------------------------------------------------------------------------
@@ -348,12 +348,13 @@ const MAX_WIRE_FRAME: usize = PREFIX_LEN + MAX_FRAME_SIZE;
 /// its end always has room to complete after the buffer is compacted.
 const RECEIVE_BUFFER: usize = 16 * MAX_WIRE_FRAME;
 
-/// One frame found in the receive buffer, as the position of its payload,
-/// `rx[start..end]`, rather than a borrow: [`PolledConnection::poll`]
-/// decides on a frame in a loop and borrows it back only to return it,
-/// which the borrow checker cannot follow for a borrow held across the
-/// loop.
-#[derive(Clone, Copy, Debug)]
+/// One frame found in the receive buffer, past the handshake and not a
+/// heartbeat, as the position of its payload, `rx[start..end]`, rather
+/// than a borrow: [`PolledConnection::poll`] skips heartbeats in a loop
+/// and classifies the frame it stops on after it, which the borrow
+/// checker cannot follow for a borrow held across the loop. Neither
+/// `Clone` nor `Copy`: [`PolledConnection::answer`] consumes it, so no
+/// frame is classified and settled twice.
 struct Found {
     start: usize,
     end: usize,
@@ -688,13 +689,17 @@ impl PolledConnection {
         stream: &mut S,
         now_ns: u64,
     ) -> Result<Option<Frame<'_>>, Error> {
-        Ok(self
-            .poll_found(stream, now_ns, false)?
-            .map(|found| self.frame(found)))
+        match self.poll_found(stream, now_ns, false)? {
+            Some(found) => self.answer(found).map(Some),
+            None => Ok(None),
+        }
     }
 
-    /// [`poll`](Self::poll), without the borrow: `waiting` makes the wait
-    /// run even with nothing owed, as a blocking next-frame call does.
+    /// [`poll`](Self::poll) up to the frame it returns, without the
+    /// borrow: the next frame that is not a heartbeat, consumed and not
+    /// yet classified, for [`answer`](Self::answer). `waiting` makes the
+    /// wait run even with nothing owed, as a blocking next-frame call
+    /// does.
     fn poll_found<S: ByteStream>(
         &mut self,
         stream: &mut S,
@@ -726,23 +731,23 @@ impl PolledConnection {
                 self.handshake_frame(stream, start, end)?;
                 continue;
             }
-            // Each final frame settles the request it names, which ends
-            // its wait however it was answered: a busy or a refusal is
-            // the request's only frame, and the node keeps the connection.
-            let reply = classify(&self.rx[start..end])?;
-            self.outstanding.observe(&reply)?;
-            if matches!(reply, Reply::Heartbeat) {
+            if is_heartbeat(&self.rx[start..end]) {
                 continue;
             }
-            // An answer: the wait is over.
-            self.deadline_ns = None;
             return Ok(Some(Found { start, end }));
         }
     }
 
-    /// The frame `found` describes, borrowed back from the receive buffer.
-    fn frame(&self, found: Found) -> Frame<'_> {
-        reclassified(&self.rx[found.start..found.end])
+    /// The frame `found` describes, classified and borrowed back from the
+    /// receive buffer. Each final frame settles the request it names,
+    /// which ends its wait however it was answered: a busy or a refusal
+    /// is the request's only frame, and the node keeps the connection.
+    fn answer(&mut self, found: Found) -> Result<Frame<'_>, Error> {
+        let frame = classify_answer(&self.rx[found.start..found.end])?;
+        self.outstanding.observe(&frame)?;
+        // An answer: the wait is over.
+        self.deadline_ns = None;
+        Ok(frame)
     }
 
     /// A poll that found no frame: start the wait if a reply is owed and
@@ -1086,11 +1091,10 @@ impl<S: ByteStream> StreamConnection<S> {
                 .poll_found(&mut this.stream, now_ns, false)?
             {
                 // A reply before any request: the node is not keeping the
-                // protocol.
-                return Err(Error::Protocol(format!(
-                    "a {:?} frame before any request",
-                    this.connection.frame(found)
-                )));
+                // protocol. With nothing outstanding `answer` refuses
+                // every frame, each with the error that names it.
+                this.connection.answer(found)?;
+                return Err(Error::Protocol("a reply before any request".into()));
             }
             std::hint::spin_loop();
             now_ns = this.clock.tick();
@@ -1206,7 +1210,7 @@ impl<S: ByteStream> StreamConnection<S> {
         loop {
             self.stream.service(now_ns);
             if let Some(found) = self.connection.poll_found(&mut self.stream, now_ns, true)? {
-                return Ok(self.connection.frame(found));
+                return self.connection.answer(found);
             }
             std::hint::spin_loop();
             now_ns = self.clock.tick();

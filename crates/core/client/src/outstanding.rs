@@ -11,7 +11,7 @@
 
 use std::collections::VecDeque;
 
-use crate::{Error, Reply, RequestId};
+use crate::{Error, Frame, RequestId};
 
 /// The IDs a connection has allocated and sent, and whether the reply in
 /// progress has had `Response` frames.
@@ -75,18 +75,18 @@ impl Outstanding {
         self.ids.len()
     }
 
-    /// Account for one reply frame from the node, before it is handed to
-    /// the caller. A heartbeat changes nothing. A `Response` opens a batch
-    /// (nothing outstanding to attribute it to is [`Error::Protocol`]); a
-    /// final frame settles the request it names, which must be
-    /// outstanding, and a `ServerBusy` or `Refused` must not fall inside a
-    /// batch that holds `Response` frames. Each violation is
+    /// Account for one frame from the node, before it is handed to the
+    /// caller. Heartbeats never come here: they change nothing, and a
+    /// connection skips them before it classifies a frame. A `Response`
+    /// opens a batch (nothing outstanding to attribute it to is
+    /// [`Error::Protocol`]); a final frame settles the request it names,
+    /// which must be outstanding, and a `ServerBusy` or `Refused` must not
+    /// fall inside a batch that holds `Response` frames. Each violation is
     /// [`Error::Protocol`], loudly, not a reply paired with the wrong
     /// request.
-    pub(crate) fn observe(&mut self, reply: &Reply<'_>) -> Result<(), Error> {
-        match *reply {
-            Reply::Heartbeat => Ok(()),
-            Reply::Response(_) => {
+    pub(crate) fn observe(&mut self, frame: &Frame<'_>) -> Result<(), Error> {
+        match *frame {
+            Frame::Response(_) => {
                 if self.ids.is_empty() {
                     return Err(Error::Protocol(
                         "a response with no request outstanding".into(),
@@ -95,9 +95,9 @@ impl Outstanding {
                 self.mid_batch = true;
                 Ok(())
             }
-            Reply::BatchEnd { id, .. } => self.settle(id, "batch end"),
-            Reply::ServerBusy { id } => self.early(id, "busy"),
-            Reply::Refused { id, .. } => self.early(id, "refusal"),
+            Frame::BatchEnd { id, .. } => self.settle(id, "batch end"),
+            Frame::ServerBusy { id } => self.early(id, "busy"),
+            Frame::Refused { id, .. } => self.early(id, "refusal"),
         }
     }
 
@@ -142,23 +142,23 @@ mod tests {
     use super::*;
     use crate::{Ack, RefusalKind};
 
-    fn batch_end(id: u64) -> Reply<'static> {
-        Reply::BatchEnd {
+    fn batch_end(id: u64) -> Frame<'static> {
+        Frame::BatchEnd {
             id: RequestId(id),
             ack: Ack::Policy,
         }
     }
 
-    fn refused(id: u64) -> Reply<'static> {
-        Reply::Refused {
+    fn refused(id: u64) -> Frame<'static> {
+        Frame::Refused {
             id: RequestId(id),
             kind: RefusalKind::Malformed,
             reason: "no",
         }
     }
 
-    fn busy(id: u64) -> Reply<'static> {
-        Reply::ServerBusy { id: RequestId(id) }
+    fn busy(id: u64) -> Frame<'static> {
+        Frame::ServerBusy { id: RequestId(id) }
     }
 
     /// A tracker with requests 1..=n sent.
@@ -187,7 +187,7 @@ mod tests {
     #[test]
     fn in_order_answers_settle_the_front() {
         let mut outstanding = with_sent(3);
-        outstanding.observe(&Reply::Response(b"a")).unwrap();
+        outstanding.observe(&Frame::Response(b"a")).unwrap();
         outstanding.observe(&batch_end(1)).unwrap();
         outstanding.observe(&busy(2)).unwrap();
         outstanding.observe(&refused(3)).unwrap();
@@ -223,19 +223,19 @@ mod tests {
         // A response with nothing owed.
         let mut idle = Outstanding::default();
         assert!(matches!(
-            idle.observe(&Reply::Response(b"x")),
+            idle.observe(&Frame::Response(b"x")),
             Err(Error::Protocol(_))
         ));
     }
 
-    /// Only a batch terminator closes a batch that holds responses; a
-    /// heartbeat may fall anywhere.
+    /// Only a batch terminator closes a batch that holds responses. (A
+    /// heartbeat may fall anywhere, but never reaches the tracker: the
+    /// connections' tests pin one inside a batch.)
     #[test]
     fn a_busy_or_refusal_inside_a_batch_is_a_protocol_error() {
         for early in [busy(2), refused(2)] {
             let mut outstanding = with_sent(2);
-            outstanding.observe(&Reply::Response(b"part")).unwrap();
-            outstanding.observe(&Reply::Heartbeat).unwrap();
+            outstanding.observe(&Frame::Response(b"part")).unwrap();
             let err = outstanding.observe(&early).unwrap_err();
             assert!(
                 err.to_string().contains("inside another request's reply"),
@@ -243,8 +243,7 @@ mod tests {
             );
         }
         let mut outstanding = with_sent(2);
-        outstanding.observe(&Reply::Response(b"part")).unwrap();
-        outstanding.observe(&Reply::Heartbeat).unwrap();
+        outstanding.observe(&Frame::Response(b"part")).unwrap();
         outstanding.observe(&batch_end(1)).unwrap();
         // Closed: an early answer may follow.
         outstanding.observe(&busy(2)).unwrap();
@@ -289,7 +288,7 @@ mod tests {
             }
             for id in &late {
                 for _ in 0..responses[(id.0 - 1) as usize] {
-                    outstanding.observe(&Reply::Response(b"r")).unwrap();
+                    outstanding.observe(&Frame::Response(b"r")).unwrap();
                 }
                 outstanding.observe(&batch_end(id.0)).unwrap();
             }
