@@ -10,7 +10,7 @@ use melin_wire_protocol::control_codec::{
     self, BATCH_END_FRAME_LEN, MAX_CONTROL_FRAME_LEN, TAG_APP, TAG_LEN,
 };
 
-use crate::halt::{EarlyKind, EarlyReply};
+use crate::early_reply::{EarlyKind, EarlyReply};
 
 /// Bound on one application response body — what a `ResponseEncoder`
 /// may write for a single report or query response.

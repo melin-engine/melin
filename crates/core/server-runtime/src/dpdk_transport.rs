@@ -60,7 +60,8 @@ use melin_dpdk::SocketHandle;
 use tracing::{debug, warn};
 
 use crate::dpdk_response::{ControlEvent, TxFrame};
-use crate::halt::{EarlyReplySender, HaltGate};
+use crate::early_reply::EarlyReplySender;
+use crate::halt::HaltGate;
 use crate::policy_control::AckPolicyPublisher;
 
 use crate::client_auth::MAX_AUTH_FRAME;
@@ -1248,7 +1249,7 @@ mod tests {
         use crate::client_frames::MAX_REQUEST_BODY;
         use crate::dpdk_response::TxFrame;
         use crate::durability_gate::{GatePolicy, GateStart};
-        use crate::halt::early_reply_channel;
+        use crate::early_reply::early_reply_channel;
         use melin_transport_core::lineage::forced_policy_cell;
 
         /// The client's key, listed as a counter writer.

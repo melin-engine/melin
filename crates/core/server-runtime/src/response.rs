@@ -25,7 +25,7 @@ use crate::ack_policy::{Blocker, CursorView, EvalStatus, MAX_CLUSTER_SIZE, Polic
 use crate::batch_boundary::{AtBoundary, BatchBoundary};
 use crate::durability_gate::{Admission, Backing, BatchEnds, DurabilityGate, GateInputs, GateWait};
 pub use crate::durability_gate::{GatePolicy, GateStart};
-use crate::halt::{EarlyReply, EarlyReplyQueue, Registered};
+use crate::early_reply::{EarlyReply, EarlyReplyQueue, Registered};
 use crate::replication::ReplicationMetrics;
 use melin_app::Application;
 use melin_app::amortized_timer::AmortizedTimer;
@@ -3748,7 +3748,7 @@ pub(crate) mod tests {
         use super::flush_sends::{entry_for, fill_socket};
         use super::refusal_order::{Seen, early, early_id, frames_of, read_frame};
         use crate::batch_boundary::BatchBoundary;
-        use crate::halt::{EARLY_REPLY_QUEUE_CAPACITY, EarlyKind, early_reply_channel};
+        use crate::early_reply::{EARLY_REPLY_QUEUE_CAPACITY, EarlyKind, early_reply_channel};
         use crate::response::{Egress, MAX_SEND_BUF};
         use crate::response_frame::{EarlyReplyBuf, MAX_EARLY_REPLY};
 
@@ -3792,7 +3792,8 @@ pub(crate) mod tests {
         /// then flush as the idle path does.
         fn drain_burst(egress: &mut Egress) -> usize {
             assert!(BURST as usize <= EARLY_REPLY_QUEUE_CAPACITY);
-            let (mut tx, mut rx) = early_reply_channel(crate::halt::EARLY_REPLY_QUEUE_CAPACITY);
+            let (mut tx, mut rx) =
+                early_reply_channel(crate::early_reply::EARLY_REPLY_QUEUE_CAPACITY);
             for n in 0..BURST {
                 tx.try_send(early(1, n, kind(n))).expect("queue has room");
             }
@@ -3932,7 +3933,7 @@ pub(crate) mod tests {
         use super::refusal_order::{Seen, connection, early, early_id, frames_of, read_frame};
         use crate::batch_boundary::BatchBoundary;
         use crate::durability_gate::GateWait;
-        use crate::halt::{EarlyKind, early_reply_channel};
+        use crate::early_reply::{EarlyKind, early_reply_channel};
         use crate::response::{Egress, GateWaitHook};
         use crate::response_frame::{EarlyReplyBuf, MAX_EARLY_REPLY};
 
@@ -3953,7 +3954,8 @@ pub(crate) mod tests {
                 melin_transport_core::trace::register_stage("test: egress"),
             );
             let (control_tx, control_rx) = mpsc::channel();
-            let (mut tx, mut rx) = early_reply_channel(crate::halt::EARLY_REPLY_QUEUE_CAPACITY);
+            let (mut tx, mut rx) =
+                early_reply_channel(crate::early_reply::EARLY_REPLY_QUEUE_CAPACITY);
             let mut registered = rx.register(|| {});
 
             let (event, client) = connection(1);
@@ -4105,8 +4107,8 @@ pub(crate) mod tests {
                 fence_state: Arc::new(FenceState::new(0)),
                 active_connections: Arc::new(AtomicU64::new(0)),
                 // No reader: nothing is ever answered early.
-                early_replies: crate::halt::early_reply_channel(
-                    crate::halt::EARLY_REPLY_QUEUE_CAPACITY,
+                early_replies: crate::early_reply::early_reply_channel(
+                    crate::early_reply::EARLY_REPLY_QUEUE_CAPACITY,
                 )
                 .1,
                 ring_sizing: crate::connection_limit::RingSizing::for_max_connections(1)
@@ -4194,7 +4196,7 @@ pub(crate) mod tests {
 
         use crate::ControlEvent;
         use crate::ack_policy::AckPolicy;
-        use crate::halt::{EarlyKind, EarlyReply, EarlyReplyQueue, early_reply_channel};
+        use crate::early_reply::{EarlyKind, EarlyReply, EarlyReplyQueue, early_reply_channel};
         use crate::response::{Response, run};
 
         /// Bounds a read that must succeed; generous for a loaded box.
@@ -4309,7 +4311,7 @@ pub(crate) mod tests {
             let (connected_2, mut client_2) = connection(2);
 
             let (mut refusals, refusal_rx) =
-                early_reply_channel(crate::halt::EARLY_REPLY_QUEUE_CAPACITY);
+                early_reply_channel(crate::early_reply::EARLY_REPLY_QUEUE_CAPACITY);
             let (control_tx, control_rx) = mpsc::channel();
             control_tx.send(connected_1).expect("channel open");
 
@@ -4457,7 +4459,9 @@ pub(crate) mod tests {
         };
         use crate::ControlEvent;
         use crate::ack_policy::AckPolicy;
-        use crate::halt::{EarlyKind, EarlyReplyQueue, EarlyReplySender, early_reply_channel};
+        use crate::early_reply::{
+            EarlyKind, EarlyReplyQueue, EarlyReplySender, early_reply_channel,
+        };
         use crate::replication::ReplicationMetrics;
         use crate::response::run;
 
@@ -4538,7 +4542,7 @@ pub(crate) mod tests {
                 .build(WaitStrategy::SpinThenYield);
             let consumer = consumers.pop().expect("one consumer was requested");
             let (early, early_replies) =
-                early_reply_channel(crate::halt::EARLY_REPLY_QUEUE_CAPACITY);
+                early_reply_channel(crate::early_reply::EARLY_REPLY_QUEUE_CAPACITY);
             let journal = DurableWireSeqCursor::detached(WireSeq::new(journal_at));
             let replication_metrics = Arc::new(ReplicationMetrics::default());
             replication_metrics.in_memory_sequence[0].store(1_000_000, Ordering::Relaxed);
@@ -5083,7 +5087,8 @@ pub(crate) mod tests {
 
         use super::refusal_order::{Seen, config, connection, early_id, read_frame, refusal};
         use crate::ack_policy::AckPolicy;
-        use crate::halt::{DegradedRelease, early_reply_channel};
+        use crate::early_reply::early_reply_channel;
+        use crate::halt::DegradedRelease;
         use crate::replication::ReplicationMetrics;
         use crate::response::run;
 
@@ -5100,7 +5105,7 @@ pub(crate) mod tests {
             let consumer = consumers.pop().expect("one consumer was requested");
             let (connected, mut client) = connection(1);
             let (mut refusals, refusal_rx) =
-                early_reply_channel(crate::halt::EARLY_REPLY_QUEUE_CAPACITY);
+                early_reply_channel(crate::early_reply::EARLY_REPLY_QUEUE_CAPACITY);
 
             let journal_cursor = DurableWireSeqCursor::detached(WireSeq::new(1));
             let mut config = config(
@@ -5212,7 +5217,7 @@ pub(crate) mod tests {
         use melin_wire_protocol::control_codec::TAG_BATCH_END;
 
         use super::refusal_order::{Seen, config, connection, read_frame};
-        use crate::halt::early_reply_channel;
+        use crate::early_reply::early_reply_channel;
         use crate::response::run;
 
         /// How long the stage gets to exit once told to; generous for a
@@ -5232,7 +5237,8 @@ pub(crate) mod tests {
             // The journal confirms the first event and never the second.
             let journal_cursor = DurableWireSeqCursor::detached(WireSeq::new(1));
             let fence = Arc::new(FenceState::new(0));
-            let early_replies = early_reply_channel(crate::halt::EARLY_REPLY_QUEUE_CAPACITY).1;
+            let early_replies =
+                early_reply_channel(crate::early_reply::EARLY_REPLY_QUEUE_CAPACITY).1;
             let config = config(journal_cursor, Arc::clone(&fence), early_replies, None);
             for wire_seq in [1, 2] {
                 producer.publish(OutputSlot {
@@ -5330,7 +5336,7 @@ pub(crate) mod tests {
 
         use super::refusal_order::{Seen, config, connection, read_frame};
         use crate::ack_policy::AckPolicy;
-        use crate::halt::early_reply_channel;
+        use crate::early_reply::early_reply_channel;
         use crate::response::run;
 
         /// How long the test waits for the stage to reach a state.
@@ -5384,7 +5390,8 @@ pub(crate) mod tests {
             // Everything up to the reply after the change is on disk; a
             // standalone stage cannot satisfy `two-disks` at all.
             let journal_cursor = DurableWireSeqCursor::detached(WireSeq::new(3));
-            let early_replies = early_reply_channel(crate::halt::EARLY_REPLY_QUEUE_CAPACITY).1;
+            let early_replies =
+                early_reply_channel(crate::early_reply::EARLY_REPLY_QUEUE_CAPACITY).1;
             let mut config = config(
                 journal_cursor.clone(),
                 Arc::new(FenceState::new(0)),
@@ -5480,7 +5487,7 @@ pub(crate) mod tests {
 
         use super::refusal_order::config;
         use crate::connection_limit::RingSizing;
-        use crate::halt::early_reply_channel;
+        use crate::early_reply::early_reply_channel;
         use crate::response::run;
 
         /// A zero-entry ring stands in for the locked-memory limit: both
@@ -5495,7 +5502,8 @@ pub(crate) mod tests {
                     .build(WaitStrategy::SpinThenYield);
             let consumer = consumers.pop().expect("one consumer was requested");
             let (_control_tx, control_rx) = mpsc::channel();
-            let early_replies = early_reply_channel(crate::halt::EARLY_REPLY_QUEUE_CAPACITY).1;
+            let early_replies =
+                early_reply_channel(crate::early_reply::EARLY_REPLY_QUEUE_CAPACITY).1;
             let (ready_tx, ready_rx) = mpsc::sync_channel(1);
             let mut config = config(
                 DurableWireSeqCursor::detached(WireSeq::new(0)),

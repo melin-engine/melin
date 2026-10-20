@@ -29,7 +29,8 @@ use tracing::{debug, error};
 
 use crate::ControlEvent;
 use crate::buf_ring::BufRing;
-use crate::halt::{EarlyReplySender, HaltGate};
+use crate::early_reply::EarlyReplySender;
+use crate::halt::HaltGate;
 use crate::policy_control::{AckPolicyPublisher, BootedClaim};
 use melin_app::Application;
 use melin_app::auth::{ClientRole, RoleId};
@@ -1817,7 +1818,7 @@ mod tests {
     //! disconnect" guarantees.
     use super::*;
     use crate::client_frames::MAX_REQUEST_BODY;
-    use crate::halt::{EarlyKind, EarlyReply};
+    use crate::early_reply::{EarlyKind, EarlyReply};
     use melin_app::auth::NoRoles;
     use melin_app::decoder::{Decoded, RequestDecoder};
     use melin_app::{AppEvent, Application, ApplyCtx, CodecError, QueryCtx, RejectReason};
@@ -2071,7 +2072,7 @@ mod tests {
     /// response stage would send, with no flush on the reader's side
     /// after the call that queued them.
     fn released(
-        queue: &mut crate::halt::EarlyReplyQueue<TestReport>,
+        queue: &mut crate::early_reply::EarlyReplyQueue<TestReport>,
     ) -> Vec<EarlyReply<TestReport>> {
         let boundary = crate::batch_boundary::BatchBoundary::new();
         let at = boundary.at_boundary().expect("between events");
@@ -2246,9 +2247,9 @@ mod tests {
     /// An early-reply queue, at a node's capacity.
     fn early_channel() -> (
         EarlyReplySender<TestReport>,
-        crate::halt::EarlyReplyQueue<TestReport>,
+        crate::early_reply::EarlyReplyQueue<TestReport>,
     ) {
-        early_channel_of(crate::halt::EARLY_REPLY_QUEUE_CAPACITY)
+        early_channel_of(crate::early_reply::EARLY_REPLY_QUEUE_CAPACITY)
     }
 
     /// An early-reply queue that fills at `capacity` (a power of two).
@@ -2256,9 +2257,9 @@ mod tests {
         capacity: usize,
     ) -> (
         EarlyReplySender<TestReport>,
-        crate::halt::EarlyReplyQueue<TestReport>,
+        crate::early_reply::EarlyReplyQueue<TestReport>,
     ) {
-        crate::halt::early_reply_channel(capacity)
+        crate::early_reply::early_reply_channel(capacity)
     }
 
     /// [`run_process_frames`] against a given halt gate and early-reply
@@ -3400,7 +3401,7 @@ mod tests {
                 let mut episodes: Vec<usize> = Vec::new();
                 let mut drains = drains.into_iter().cycle();
                 let mut take = |consumer: &mut ring::Consumer<InputSlot<TestEvent>>,
-                                queue: &mut crate::halt::EarlyReplyQueue<TestReport>,
+                                queue: &mut crate::early_reply::EarlyReplyQueue<TestReport>,
                                 published: &mut Vec<u64>,
                                 answered: &mut Vec<EarlyReply<TestReport>>,
                                 all: bool| {
@@ -4087,7 +4088,7 @@ mod tests {
     /// (`0xFC`) are the early replies that fill it.
     mod parking {
         use super::*;
-        use crate::halt::EarlyReplyQueue;
+        use crate::early_reply::EarlyReplyQueue;
         use melin_transport_core::fence::FenceState;
         use std::io::Write as _;
 

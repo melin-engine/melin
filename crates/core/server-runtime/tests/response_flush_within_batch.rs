@@ -28,7 +28,7 @@ use melin_pipeline::wait::WaitStrategy;
 use melin_server_runtime::ControlEvent;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::connection_limit::RingSizing;
-use melin_server_runtime::halt;
+use melin_server_runtime::early_reply;
 use melin_server_runtime::response::{self, Response};
 use melin_transport_core::fence::FenceState;
 use melin_transport_core::pipeline::{OutputPayload, OutputSlot, StageUtilization};
@@ -185,7 +185,7 @@ fn large_frame_batch_is_delivered_not_disconnected() {
         fence_state: Arc::new(FenceState::new(0)),
         active_connections: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         // No reader: nothing is ever answered early.
-        early_replies: halt::early_reply_channel(halt::EARLY_REPLY_QUEUE_CAPACITY).1,
+        early_replies: early_reply::early_reply_channel(early_reply::EARLY_REPLY_QUEUE_CAPACITY).1,
         ring_sizing: RingSizing::for_max_connections(1).expect("a supported cap"),
         ready: None,
         degraded_release: None,

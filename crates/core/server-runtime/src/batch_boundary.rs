@@ -70,7 +70,7 @@ impl BatchBoundary {
 
 /// A response stage's proof that it stands between two events' replies,
 /// from its [`BatchBoundary`]: what sending early replies takes
-/// ([`crate::halt::Registered::drain`]).
+/// ([`crate::early_reply::Registered::drain`]).
 #[derive(Debug)]
 pub(crate) struct AtBoundary<'t> {
     /// Ties the token to the tracker's borrow; a private field, so only

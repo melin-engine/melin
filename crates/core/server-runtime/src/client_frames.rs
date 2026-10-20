@@ -43,7 +43,8 @@ use melin_transport_core::trace::mono_trace_ns;
 use melin_wire_protocol::control::RefusalKind;
 use melin_wire_protocol::framing::{split_frame_limited, split_request};
 
-use crate::halt::{EarlyKind, EarlyReply, EarlyReplySender, HaltGate, Verdict};
+use crate::early_reply::{EarlyKind, EarlyReply, EarlyReplySender};
+use crate::halt::{HaltGate, Verdict};
 
 /// Bound on one client request frame, after the 4-byte length prefix:
 /// the wire protocol's, so a client library and a node agree on it by

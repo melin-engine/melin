@@ -167,8 +167,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   with a `warn` naming the cause. Shed, refused and filtered requests
   and parked connections are counted on `/metrics` (see Added).
 - **`melin-server-runtime`'s refusal queue is the early-reply queue,
-  and its readers count what they answer early.** Source-breaking. In
-  the `halt` module: `Refusal` is `EarlyReply` (a connection, the
+  and its readers count what they answer early.** Source-breaking. The
+  queue moves out of the `halt` module into a new `early_reply` module:
+  `halt::Refusal` is `early_reply::EarlyReply` (a connection, the
   request's ID and an `EarlyKind`: `Rejected`, `Filtered`, `Refused`,
   `Busy`), with no input sequence; `RefusalSender` and `RefusalQueue`
   are `EarlyReplySender` and `EarlyReplyQueue`;

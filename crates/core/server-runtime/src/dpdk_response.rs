@@ -24,7 +24,7 @@ use crate::batch_boundary::{AtBoundary, BatchBoundary};
 use crate::durability_gate::{
     Admission, Backing, BatchEnds, DurabilityGate, GateInputs, GatePolicy, GateWait,
 };
-use crate::halt::{EarlyReplyQueue, Registered};
+use crate::early_reply::{EarlyReplyQueue, Registered};
 use melin_app::Application;
 use melin_app::amortized_timer::AmortizedTimer;
 use melin_transport_core::DurableWireSeqCursor;
@@ -606,7 +606,7 @@ fn push_frame(
 /// durability gate: nothing was published. A connection that has gone
 /// away is skipped.
 fn push_early_reply<R: Copy, Q: Copy>(
-    reply: crate::halt::EarlyReply<R>,
+    reply: crate::early_reply::EarlyReply<R>,
     encoder: &dyn melin_app::encoder::ResponseEncoder<Report = R, Query = Q>,
     connections: &mut FxHashMap<u64, ConnectionHeartbeat>,
     tx_producers: &mut [spsc::Producer<TxFrame>],
@@ -894,7 +894,7 @@ mod tests {
 
         use crate::ack_policy::AckPolicy;
         use crate::durability_gate::GateStart;
-        use crate::halt::early_reply_channel;
+        use crate::early_reply::early_reply_channel;
 
         /// Bounds the wait for a frame that must arrive.
         const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -922,7 +922,7 @@ mod tests {
             .send(ControlEvent::Connected { connection_id: 1 })
             .expect("channel open");
         let (tx, mut rx) = spsc::channel::<TxFrame>(8, WaitStrategy::SpinThenYield);
-        let early_replies = early_reply_channel(crate::halt::EARLY_REPLY_QUEUE_CAPACITY).1;
+        let early_replies = early_reply_channel(crate::early_reply::EARLY_REPLY_QUEUE_CAPACITY).1;
 
         producer.publish(reply(1));
         producer.publish(OutputSlot {
@@ -1015,7 +1015,8 @@ mod tests {
 
         use crate::ack_policy::AckPolicy;
         use crate::durability_gate::GateStart;
-        use crate::halt::{DegradedRelease, EarlyKind, early_reply_channel};
+        use crate::early_reply::{EarlyKind, early_reply_channel};
+        use crate::halt::DegradedRelease;
         use crate::replication::ReplicationMetrics;
         use crate::response::tests::refusal_order::{Seen, early, early_id, frames_of};
 
@@ -1054,7 +1055,7 @@ mod tests {
                 .expect("channel open");
             let (tx, mut rx) = spsc::channel::<TxFrame>(8, WaitStrategy::SpinThenYield);
             let (mut early_tx, early_rx) =
-                early_reply_channel(crate::halt::EARLY_REPLY_QUEUE_CAPACITY);
+                early_reply_channel(crate::early_reply::EARLY_REPLY_QUEUE_CAPACITY);
 
             early_tx
                 .try_send(early(1, 0, kind))
@@ -1353,11 +1354,12 @@ mod tests {
         /// not. Returns the connections after the call and every frame
         /// handed to the poll thread.
         fn hook_turn(between_events: bool) -> (FxHashMap<u64, ConnectionHeartbeat>, Vec<Seen>) {
-            use crate::halt::{EarlyKind, early_reply_channel};
+            use crate::early_reply::{EarlyKind, early_reply_channel};
             use crate::response::tests::refusal_order::early;
 
             let (control_tx, control_rx) = mpsc::channel();
-            let (mut tx, mut rx) = early_reply_channel(crate::halt::EARLY_REPLY_QUEUE_CAPACITY);
+            let (mut tx, mut rx) =
+                early_reply_channel(crate::early_reply::EARLY_REPLY_QUEUE_CAPACITY);
             let mut registered = rx.register(|| {});
             let (producer, mut tx_ring) =
                 spsc::channel::<TxFrame>(1024, WaitStrategy::SpinThenYield);
@@ -1399,7 +1401,7 @@ mod tests {
 
         #[test]
         fn gate_wait_hook_between_events_registers_and_sends() {
-            use crate::halt::EarlyKind;
+            use crate::early_reply::EarlyKind;
             use crate::response::tests::refusal_order::{early_id, frames_of};
 
             let (connections, seen) = hook_turn(true);
