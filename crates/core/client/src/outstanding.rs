@@ -1,6 +1,7 @@
 //! The requests a connection has sent and not yet had answered, shared by
 //! the blocking and the polled connection so both apply the same rules
-//! from one implementation.
+//! from one implementation; and the lookup underneath, [`InFlight`],
+//! public for a caller that pairs answers with state of its own.
 //!
 //! A node answers every request exactly once, with a final frame naming
 //! it: a batch terminator, `ServerBusy` or `Refused`. A request the node
@@ -13,6 +14,108 @@ use std::collections::VecDeque;
 
 use crate::{Error, Frame, RequestId};
 
+/// Requests in flight on one connection, each with a value the caller
+/// keeps for it (when it was sent, what its reply is checked against),
+/// found again by the ID its final frame names.
+///
+/// The lookup the connections pair answers with, for a caller that keeps
+/// state of its own per request, such as a load generator timing round
+/// trips: a request the node did not accept may be answered ahead of the
+/// ones sent before it, so an answer is looked up by its ID, never assumed
+/// to be the oldest's.
+///
+/// A map from ID to value, built for how a connection's IDs behave: they
+/// are allocated in increasing order, so [`insert`](Self::insert) is a
+/// push at the back, and mostly answered in that order, so
+/// [`remove`](Self::remove) is mostly a pop at the front. An answer out
+/// of order is found by binary search. An ID inserted out of order is
+/// placed where it sorts, which moves up to half the entries: for IDs in
+/// no particular order (another client's, relayed), a hash map is the
+/// better fit.
+#[derive(Debug, Clone)]
+pub struct InFlight<T> {
+    /// Sorted by ID, without repeats. A `VecDeque` rather than a
+    /// `BTreeMap`: the in-order insert and remove are O(1) at the two ends
+    /// of one contiguous buffer, allocated once at the window's size; an
+    /// out-of-order removal moves at most the shorter side, a few entries
+    /// for a window of in-flight requests.
+    entries: VecDeque<(RequestId, T)>,
+}
+
+impl<T> Default for InFlight<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> InFlight<T> {
+    /// None in flight. Allocates nothing until the first insert.
+    pub fn new() -> Self {
+        Self {
+            entries: VecDeque::new(),
+        }
+    }
+
+    /// None in flight, with room for `capacity` before it reallocates: a
+    /// caller that keeps a window of requests in flight passes its width.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: VecDeque::with_capacity(capacity),
+        }
+    }
+
+    /// Request `id` is in flight, with `value`. Returns the value `id`
+    /// already held, replaced, as a map does; a connection never sends two
+    /// requests under one ID, so for IDs a connection returned it is
+    /// `None`.
+    pub fn insert(&mut self, id: RequestId, value: T) -> Option<T> {
+        // The common case: the newest ID, at the back.
+        if self.entries.back().is_none_or(|(last, _)| *last < id) {
+            self.entries.push_back((id, value));
+            return None;
+        }
+        match self.find(id) {
+            Ok(at) => Some(std::mem::replace(&mut self.entries[at].1, value)),
+            Err(at) => {
+                self.entries.insert(at, (id, value));
+                None
+            }
+        }
+    }
+
+    /// Take request `id` out of flight, answered: its value, or `None` if
+    /// it is not in flight. The front first, the in-order answer; never the
+    /// front in another's place.
+    pub fn remove(&mut self, id: RequestId) -> Option<T> {
+        let at = self.find(id).ok()?;
+        self.entries.remove(at).map(|(_, value)| value)
+    }
+
+    /// Whether request `id` is in flight.
+    pub fn contains(&self, id: RequestId) -> bool {
+        self.find(id).is_ok()
+    }
+
+    /// How many requests are in flight.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether no request is in flight.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Where `id` is, or where it would sort: the front checked first, as
+    /// the in-order answer, then a binary search.
+    fn find(&self, id: RequestId) -> Result<usize, usize> {
+        if self.entries.front().is_some_and(|(first, _)| *first == id) {
+            return Ok(0);
+        }
+        self.entries.binary_search_by_key(&id, |(entry, _)| *entry)
+    }
+}
+
 /// The IDs a connection has allocated and sent, and whether the reply in
 /// progress has had `Response` frames.
 #[derive(Debug)]
@@ -21,12 +124,9 @@ pub(crate) struct Outstanding {
     /// mistaken for a connection's first request; `u64`, as the wire's ID
     /// is, so it never wraps on a connection that lives for months.
     next: u64,
-    /// IDs sent and not yet answered, in send order, and so sorted: IDs
-    /// are allocated in increasing order. A `VecDeque` because the common
-    /// answer is in order, the front, popped in O(1); an answer out of
-    /// order is found by binary search and removed from the middle, which
-    /// moves at most the shorter side.
-    ids: VecDeque<RequestId>,
+    /// IDs sent and not yet answered. Nothing kept per request: the
+    /// connection only checks that each answer names one.
+    ids: InFlight<()>,
     /// Whether `Response` frames have come since the last final frame: the
     /// reply in progress belongs to the next batch terminator, and a
     /// `ServerBusy` or `Refused` there would split it.
@@ -37,7 +137,7 @@ impl Default for Outstanding {
     fn default() -> Self {
         Self {
             next: 1,
-            ids: VecDeque::new(),
+            ids: InFlight::new(),
             mid_batch: false,
         }
     }
@@ -59,7 +159,7 @@ impl Outstanding {
     pub(crate) fn sent(&mut self) -> RequestId {
         let id = RequestId(self.next);
         self.next += 1;
-        self.ids.push_back(id);
+        self.ids.insert(id, ());
         id
     }
 
@@ -112,23 +212,13 @@ impl Outstanding {
         self.settle(id, what)
     }
 
-    /// Settle `id`: the front first, the in-order fast path, else found
-    /// by binary search. Never the front in another's place.
+    /// Settle `id`, which must be outstanding.
     fn settle(&mut self, id: RequestId, what: &str) -> Result<(), Error> {
-        if self.ids.front() == Some(&id) {
-            self.ids.pop_front();
-        } else {
-            match self.ids.binary_search(&id) {
-                Ok(at) => {
-                    self.ids.remove(at);
-                }
-                Err(_) => {
-                    return Err(Error::Protocol(format!(
-                        "a {what} for request {}, which is not outstanding",
-                        id.0
-                    )));
-                }
-            }
+        if self.ids.remove(id).is_none() {
+            return Err(Error::Protocol(format!(
+                "a {what} for request {}, which is not outstanding",
+                id.0
+            )));
         }
         self.mid_batch = false;
         Ok(())
@@ -249,7 +339,55 @@ mod tests {
         outstanding.observe(&busy(2)).unwrap();
     }
 
+    #[test]
+    fn in_flight_pairs_each_answer_with_its_own_value() {
+        let mut in_flight = InFlight::with_capacity(4);
+        assert!(in_flight.is_empty());
+        for id in 1..=4 {
+            assert_eq!(in_flight.insert(RequestId(id), id * 10), None);
+        }
+        // An answer out of order takes its own value, not the front's.
+        assert_eq!(in_flight.remove(RequestId(3)), Some(30));
+        assert_eq!(in_flight.remove(RequestId(3)), None, "answered once");
+        assert_eq!(in_flight.remove(RequestId(1)), Some(10));
+        assert!(!in_flight.contains(RequestId(1)));
+        assert!(in_flight.contains(RequestId(2)) && in_flight.contains(RequestId(4)));
+        assert_eq!(in_flight.remove(RequestId(9)), None);
+        assert_eq!(in_flight.len(), 2);
+        // Inserted out of order, placed where it sorts; inserted again,
+        // replaced, as a map does.
+        assert_eq!(in_flight.insert(RequestId(3), 33), None);
+        assert_eq!(in_flight.insert(RequestId(2), 22), Some(20));
+        assert_eq!(in_flight.remove(RequestId(2)), Some(22));
+        assert_eq!(in_flight.remove(RequestId(3)), Some(33));
+        assert_eq!(in_flight.remove(RequestId(4)), Some(40));
+        assert!(in_flight.is_empty());
+    }
+
     proptest! {
+        /// Whatever the order of inserts and removals, `InFlight` answers
+        /// as a map does: the model is a `BTreeMap`.
+        #[test]
+        fn in_flight_behaves_as_a_map(
+            ops in prop::collection::vec((any::<bool>(), 0u64..24, any::<u32>()), 0..200),
+        ) {
+            let mut in_flight = InFlight::new();
+            let mut model = std::collections::BTreeMap::new();
+            for (insert, id, value) in ops {
+                let id = RequestId(id);
+                if insert {
+                    prop_assert_eq!(in_flight.insert(id, value), model.insert(id, value));
+                } else {
+                    prop_assert_eq!(in_flight.remove(id), model.remove(&id));
+                }
+                prop_assert_eq!(in_flight.len(), model.len());
+                prop_assert_eq!(in_flight.contains(id), model.contains_key(&id));
+            }
+            let entries: Vec<_> = in_flight.entries.iter().copied().collect();
+            let expected: Vec<_> = model.into_iter().collect();
+            prop_assert_eq!(entries, expected);
+        }
+
         /// Requests sent, answered in send order except for some answered
         /// early, ahead of the requests before them, with a batch
         /// terminator, a busy or a refusal (batch terminators among them,
@@ -281,9 +419,9 @@ mod tests {
                 outstanding.observe(&reply).unwrap();
                 // Only that one went: every request answered later, the
                 // front among them, is still owed.
-                prop_assert!(!outstanding.ids.contains(id));
+                prop_assert!(!outstanding.ids.contains(*id));
                 for owed in &late {
-                    prop_assert!(outstanding.ids.contains(owed));
+                    prop_assert!(outstanding.ids.contains(*owed));
                 }
             }
             for id in &late {

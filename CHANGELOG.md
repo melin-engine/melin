@@ -36,6 +36,11 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   terminators; `MAX_CONTROL_FRAME_LEN`; and `RETIRED_TAGS`, tags no frame
   may reuse. `melin-client` re-exports `RequestId`, `RefusalKind` and
   `CLIENT_PROTOCOL_VERSION`.
+- **`melin_client::InFlight<T>`**: the requests in flight on one
+  connection, each with a value of the caller's, found again by the ID a
+  final frame names. The lookup the connections pair answers with, for a
+  caller that keeps per-request state of its own (`melin-bench` keeps
+  each request's send time and sequence in one).
 - **Counters on `/metrics` for the requests a node answers without
   applying them, and for parked connections**, beside
   `melin_writes_refused_total`: `melin_requests_shed_total` (answered

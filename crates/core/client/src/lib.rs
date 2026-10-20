@@ -34,7 +34,10 @@
 //! reply batch — or the pair [`Connection::send`] and
 //! [`Connection::next_frame`], for callers that keep several requests in
 //! flight or want to time the reply frame itself: `send` returns the
-//! request's ID, and each final frame names the ID it answers.
+//! request's ID, and each final frame names the ID it answers. A caller
+//! that keeps state of its own per request in flight (when it was sent,
+//! what its reply is checked against) pairs it with the final frame
+//! through [`InFlight`], the lookup the connections use.
 //!
 //! Every reply batch ends by saying what backs it ([`Ack`]): the node's
 //! ack policy, or, from a primary halted for want of a replica, its own
@@ -193,6 +196,7 @@ pub mod key;
 mod outstanding;
 mod polled;
 
+pub use outstanding::InFlight;
 use outstanding::Outstanding;
 
 // A request's ID and a refusal's kind are the wire protocol's, re-exported

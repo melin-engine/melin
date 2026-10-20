@@ -2,11 +2,10 @@
 //! each keeping `window` requests in flight, over whichever streams carry
 //! them.
 
-use std::collections::VecDeque;
 use std::time::Duration;
 
 use hdrhistogram::Histogram;
-use melin_client::{Ack, ByteStream, Frame, PolledConnection, RequestId};
+use melin_client::{Ack, ByteStream, Frame, InFlight, PolledConnection, RequestId};
 
 use crate::app::App;
 
@@ -59,10 +58,9 @@ pub struct Outcome {
     pub shed: u64,
 }
 
-/// A request still owed its final frame.
+/// What the bench keeps for a request still owed its final frame.
 #[derive(Clone, Copy, Debug)]
 struct Owed {
-    id: RequestId,
     /// When it was sent, on the streams' clock.
     sent_ns: u64,
     /// The application sequence its reply is checked against.
@@ -72,13 +70,10 @@ struct Owed {
 /// One client: its connection and its requests in flight.
 struct Client {
     connection: PolledConnection,
-    /// The requests still owed their final frame, in send order, and so
-    /// sorted by ID (a connection allocates them in increasing order): a
-    /// final frame is looked up by the ID it names, the front first (the
-    /// in-order answer, O(1)), else by binary search, since a request the
-    /// node did not accept may be answered ahead of earlier ones. A
-    /// `VecDeque` for the push at the back and the pop at the front.
-    owed: VecDeque<Owed>,
+    /// The requests still owed their final frame, found by the ID it
+    /// names: a request the node did not accept may be answered ahead of
+    /// earlier ones.
+    owed: InFlight<Owed>,
     /// The reply of the batch in progress, which belongs to the next batch
     /// end: its bytes, copied (a reused buffer, allocated once), and when
     /// it arrived, which is when its round trip is timed.
@@ -94,20 +89,10 @@ impl Client {
     }
 
     /// Take the request `id` names off the owed ones.
-    ///
-    /// The same lookup as `melin-client`'s `Outstanding::settle` (front
-    /// first, else a binary search of the sorted deque), copied because
-    /// that type is crate-private and the bench keeps its own fields per
-    /// request.
     fn settle(&mut self, id: RequestId, client: u32) -> Result<Owed, String> {
-        let at = if self.owed.front().is_some_and(|owed| owed.id == id) {
-            0
-        } else {
-            self.owed
-                .binary_search_by_key(&id, |owed| owed.id)
-                .map_err(|_| format!("client {client}: an answer for request {}, not owed", id.0))?
-        };
-        Ok(self.owed.remove(at).expect("found above"))
+        self.owed
+            .remove(id)
+            .ok_or_else(|| format!("client {client}: an answer for request {}, not owed", id.0))
     }
 }
 
@@ -123,7 +108,7 @@ pub fn run<S: Streams>(
         .into_iter()
         .map(|connection| Client {
             connection,
-            owed: VecDeque::with_capacity(plan.window),
+            owed: InFlight::with_capacity(plan.window),
             reply: Vec::with_capacity(app.max_body()),
             replied_ns: None,
             next_seq: 1,
@@ -162,11 +147,14 @@ pub fn run<S: Streams>(
                         Ok::<_, melin_client::Error>(app.encode(out, id, seq))
                     })
                     .map_err(|e| format!("client {id}: {e}"))?;
-                client.owed.push_back(Owed {
-                    id: request,
-                    sent_ns: now_ns,
-                    seq,
-                });
+                // `None`: a connection never reuses an ID.
+                client.owed.insert(
+                    request,
+                    Owed {
+                        sent_ns: now_ns,
+                        seq,
+                    },
+                );
                 client.next_seq += 1;
             }
             loop {
