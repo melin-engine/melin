@@ -624,8 +624,7 @@ where
     // command) — they adopt the boundaries the primary announces over
     // the stream, which keeps segment boundaries (and with them chain
     // values and journal bytes) identical across nodes.
-    let stream_marks: melin_transport_core::pipeline::StreamMarkQueue =
-        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    let stream_marks = melin_transport_core::pipeline::StreamMarks::shared();
     journal_stage.set_stream_marks(Arc::clone(&stream_marks));
     cores.place_journal_children(&mut journal_stage);
     journal_stage.set_staging_mode(staging_mode);
@@ -2194,7 +2193,7 @@ mod tests {
             input_producer,
             journal_cursor: Arc::new(make_journal_cursor(0)),
             chain_hash_lock: fsync_state_at(0, 0).1,
-            stream_marks: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            stream_marks: melin_transport_core::pipeline::StreamMarks::shared(),
             genesis_entries: Some(5),
             journal_failed: Arc::new(AtomicBool::new(false)),
             pipeline_shutdown: Arc::new(AtomicBool::new(false)),
@@ -3669,7 +3668,7 @@ mod tests {
             input_producer,
             journal_cursor: Arc::new(make_journal_cursor(0)),
             chain_hash_lock,
-            stream_marks: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            stream_marks: melin_transport_core::pipeline::StreamMarks::shared(),
             genesis_entries: None,
             journal_failed: Arc::new(AtomicBool::new(false)),
             pipeline_shutdown: Arc::new(AtomicBool::new(false)),
@@ -3978,7 +3977,7 @@ mod tests {
             input_producer,
             journal_cursor: Arc::new(make_journal_cursor(0)),
             chain_hash_lock: fsync_state_at(0, 0).1,
-            stream_marks: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            stream_marks: melin_transport_core::pipeline::StreamMarks::shared(),
             genesis_entries: None,
             journal_failed: Arc::new(AtomicBool::new(true)),
             pipeline_shutdown: Arc::new(AtomicBool::new(false)),
@@ -4180,7 +4179,7 @@ mod tests {
             input_producer,
             journal_cursor: Arc::new(make_journal_cursor(0)),
             chain_hash_lock: fsync_state_at(0, 0).1,
-            stream_marks: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            stream_marks: melin_transport_core::pipeline::StreamMarks::shared(),
             genesis_entries: None,
             journal_failed: Arc::new(AtomicBool::new(false)),
             pipeline_shutdown: Arc::new(AtomicBool::new(false)),

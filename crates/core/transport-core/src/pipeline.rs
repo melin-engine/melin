@@ -26,7 +26,7 @@
 //! thread that performed the sync, after it returned.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -684,10 +684,6 @@ pub struct JournalStage<E: AppEvent> {
     /// `None` on primaries/standalone). Pushed by the replication
     /// receiver, popped here. See [`StreamMark`].
     stream_marks: Option<StreamMarkQueue>,
-    /// Front of the stream-mark queue — the next position this stage
-    /// must act at. Held locally so the steady-state cost is one
-    /// `Option` check, not a mutex lock.
-    pending_mark: Option<StreamMark>,
     /// Core the disk thread pins itself to; `0` = unpinned. Set via
     /// [`set_disk_core`](Self::set_disk_core) before [`start`](Self::start).
     disk_core: usize,
@@ -779,6 +775,10 @@ struct SequencerCore<E: AppEvent> {
     rotation_backoff_until: Option<Instant>,
     preparer: Option<SegmentPreparer>,
     stream_marks: Option<StreamMarkQueue>,
+    /// Front of the stream-mark queue — the next position this stage
+    /// must act at. Held locally so the steady-state cost is one
+    /// `Option` check, not a mutex lock. Only the running sequencer takes
+    /// marks, so it starts empty.
     pending_mark: Option<StreamMark>,
 }
 
@@ -840,11 +840,75 @@ impl StreamMark {
 /// Cross-thread hand-off of primary-announced stream marks: the
 /// replication receiver pushes (in stream order, before publishing any
 /// slot past the mark's position), the journal stage pops.
+///
 /// `Mutex<VecDeque>` rather than a lock-free queue: marks are strictly
 /// cold (rotations a few per gigabyte, chain checks one per
-/// `CHAIN_CHECK_INTERVAL_BATCHES` fsync batches), and the journal
-/// stage only locks at batch/sync boundaries — never per entry.
-pub type StreamMarkQueue = Arc<Mutex<VecDeque<StreamMark>>>;
+/// `CHAIN_CHECK_INTERVAL_BATCHES` fsync batches). Beside it, a mirror
+/// of the queue's length, kept by [`push`](Self::push) and `pop`
+/// themselves under the lock: the journal stage reads it on *every*
+/// loop iteration — one load, no lock — so a mark pushed while the
+/// stage idles (the primary rotated, then went quiet) is acted on at
+/// the stage's next iteration, however long the scheduler makes an
+/// iteration. An amortized poll ("every N idle iterations") is not a
+/// time bound once the stage yields: on a starved core N yields took
+/// tens of seconds. The mirror lives behind `push` and `pop`, so no
+/// producer can enqueue a mark the probe does not see.
+pub struct StreamMarks {
+    queue: Mutex<VecDeque<StreamMark>>,
+    // usize: a length, like `VecDeque::len`.
+    queued: AtomicUsize,
+}
+
+impl StreamMarks {
+    /// An empty queue, shared between the receiver and the journal stage.
+    pub fn shared() -> StreamMarkQueue {
+        Arc::new(Self {
+            queue: Mutex::new(VecDeque::new()),
+            queued: AtomicUsize::new(0),
+        })
+    }
+
+    /// Queue `mark` behind every mark pushed before it.
+    pub fn push(&self, mark: StreamMark) {
+        let mut q = self
+            .queue
+            .lock()
+            .expect("stream-mark queue poisoned (journal thread panicked)");
+        q.push_back(mark);
+        // Release, under the lock: a stage that observes the new length
+        // (Acquire) and then locks finds the mark queued.
+        self.queued.store(q.len(), Ordering::Release);
+    }
+
+    /// Whether a mark is queued — lock-free, for the per-iteration probe.
+    fn any_queued(&self) -> bool {
+        self.queued.load(Ordering::Acquire) != 0
+    }
+
+    fn pop(&self) -> Option<StreamMark> {
+        let mut q = self
+            .queue
+            .lock()
+            .expect("stream-mark queue poisoned (receiver thread panicked)");
+        let mark = q.pop_front();
+        self.queued.store(q.len(), Ordering::Release);
+        mark
+    }
+
+    /// The marks not yet taken by the journal stage, oldest first — for
+    /// tests and diagnostics; the stage itself never needs a copy.
+    pub fn queued(&self) -> Vec<StreamMark> {
+        self.queue
+            .lock()
+            .expect("stream-mark queue poisoned")
+            .iter()
+            .copied()
+            .collect()
+    }
+}
+
+/// The shared handle both sides hold.
+pub type StreamMarkQueue = Arc<StreamMarks>;
 
 /// Emit a live-stream `ChainCheck` after every N published replication
 /// batches. Count-based (not time-based) so emission is a pure function
@@ -937,7 +1001,6 @@ impl<E: AppEvent> JournalStage<E> {
             preparer_core: 0,
             staging_mode: StagingMode::default(),
             stream_marks: None,
-            pending_mark: None,
             disk_core: 0,
             disk_wait: wait,
         }
@@ -1147,7 +1210,7 @@ impl<E: AppEvent> JournalStage<E> {
                 rotation_backoff_until: self.rotation_backoff_until,
                 preparer: self.preparer,
                 stream_marks: self.stream_marks,
-                pending_mark: self.pending_mark,
+                pending_mark: None,
             },
         })
     }
@@ -1506,14 +1569,28 @@ impl<E: AppEvent> Sequencer<E> {
                 }
             } else {
                 idle_count += 1;
+                // A trailing mark (the primary rotated or checked, then
+                // went quiet) arrives after the last batch's sync-point
+                // check, so only this branch can apply it — on the very
+                // next iteration, not on the amortized flush below: an
+                // iteration count is no time bound once the waiter
+                // yields, and on a starved core 1024 yields left a
+                // rotation unadopted for tens of seconds, all of it a
+                // window in which promoting this replica makes a primary
+                // without the boundary its peers adopted, which each of
+                // them then diverges from at its next entry.
+                // The probe is one load; the lock is taken only when a
+                // mark is queued. A failed adoption's retry stays on the
+                // amortized path: its backoff is 30 s, and probing it
+                // per spin would finalize the chain hash per spin.
+                // `pending == 0` here (this is the no-pending branch),
+                // so the writer is quiesced.
+                if self.core.rotation_backoff_until.is_none() && self.core.marks_outstanding() {
+                    self.core.apply_stream_marks(true)?;
+                }
                 // Periodically flush utilization counters so the health
                 // endpoint has a reasonably fresh view without adding
-                // atomic stores on the busy path. Piggy-back the
-                // stream-mark check on the same amortization: a trailing
-                // mark (primary rotated or checked, then went quiet)
-                // must be applied while idle, but not at the cost of a
-                // mutex lock per idle spin. `pending == 0` here (this is
-                // the no-pending branch), so the writer is quiesced.
+                // atomic stores on the busy path.
                 if idle_count.is_multiple_of(1024) {
                     self.core
                         .utilization
@@ -1534,7 +1611,11 @@ impl<E: AppEvent> Sequencer<E> {
                         .utilization
                         .journal_disk_lag
                         .store(self.core.batches.in_flight(), Ordering::Relaxed);
-                    self.core.apply_stream_marks(true)?;
+                    // Retry of a backed-off trailing adoption (see the
+                    // per-iteration probe above).
+                    if self.core.marks_outstanding() {
+                        self.core.apply_stream_marks(true)?;
+                    }
                 }
                 // Hand buffered latency samples to the stats registry
                 // while quiesced — a recorder that stops recording keeps
@@ -2210,19 +2291,23 @@ impl<E: AppEvent> SequencerCore<E> {
     }
 
     /// Pull the next primary-announced stream mark off the queue into
-    /// `pending_mark`. One `Option` check in steady state; the mutex is
-    /// only touched when a mark is actually outstanding or the local
-    /// copy is empty at a batch/sync boundary.
+    /// `pending_mark`. One `Option` check and one load in steady state;
+    /// the mutex is only touched when a mark is actually queued.
     #[inline]
     fn refresh_pending_mark(&mut self) {
         if self.pending_mark.is_none()
             && let Some(q) = &self.stream_marks
+            && q.any_queued()
         {
-            self.pending_mark = q
-                .lock()
-                .expect("stream-mark queue poisoned (receiver thread panicked)")
-                .pop_front();
+            self.pending_mark = q.pop();
         }
+    }
+
+    /// Whether a stream mark is held or queued — the idle loop's probe,
+    /// cheap enough for every iteration (no lock).
+    #[inline]
+    fn marks_outstanding(&self) -> bool {
+        self.pending_mark.is_some() || self.stream_marks.as_ref().is_some_and(|q| q.any_queued())
     }
 
     /// Index of the first slot in `batch[start..count]` past the

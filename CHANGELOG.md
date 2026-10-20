@@ -41,6 +41,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   final frame names. The lookup the connections pair answers with, for a
   caller that keeps per-request state of its own (`melin-bench` keeps
   each request's send time and sequence in one).
+- **`melin_app::affinity::first_allowed_cpu`**: the lowest CPU the
+  calling thread may run on, a core that pinning to cannot fail on a
+  restricted host.
 - **Counters on `/metrics` for the requests a node answers without
   applying them, and for parked connections**, beside
   `melin_writes_refused_total`: `melin_requests_shed_total` (answered
@@ -187,6 +190,12 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   keep for the health endpoint. In `melin-transport-core`,
   `health::HealthState` gains an `ingress: Arc<IngressMetrics>` field,
   source-breaking for code that builds one with a struct literal.
+- **`melin_transport_core::pipeline::StreamMarkQueue` is
+  `Arc<StreamMarks>`**, no longer `Arc<Mutex<VecDeque<StreamMark>>>`.
+  Source-breaking: build one with `StreamMarks::shared()`, queue a mark
+  with `push`, and read what is queued with `queued()`. The queue keeps
+  a lock-free count of its marks, so the journal stage can look for one
+  on every idle iteration (see Fixed).
 
 ### Removed
 
@@ -224,6 +233,19 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   a client waiting for its replies never does, so they ended in its
   no-reply timeout. They are now shed with it (see Changed), on both
   transports.
+- **A replica adopts the primary's last rotation promptly when the
+  stream then goes quiet.** The rotation arrives after the entries it
+  closes, so with nothing behind it only the journal stage's idle loop
+  could apply it, and that looked once every 1024 idle iterations: on a
+  busy core, where each idle iteration yields, that took tens of
+  seconds. Nothing journaled was affected (an entry past the boundary
+  forces the adoption first), and a replica restarted in that window
+  adopts the rotation when it reconnects. A replica promoted in it,
+  though, became a primary without the boundary, and every replica that
+  had adopted it diverged at its first entry past it (chain values are
+  scoped to their segment), each answered with an archive and a full
+  re-seed. The idle loop now looks on every iteration, at the cost of
+  one atomic load.
 
 ## [0.20.0] - 2026-10-19
 

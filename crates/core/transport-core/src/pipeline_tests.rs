@@ -2345,15 +2345,11 @@ fn adopted_rotation_splits_batch_at_announced_boundary() {
         WaitStrategy::SpinThenYield,
     );
 
-    let rotations: crate::pipeline::StreamMarkQueue =
-        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
-    rotations
-        .lock()
-        .unwrap()
-        .push_back(StreamMark::Rotate(AdoptedRotation {
-            boundary_seq: 2,
-            tail_hash: tail_at_2,
-        }));
+    let rotations = crate::pipeline::StreamMarks::shared();
+    rotations.push(StreamMark::Rotate(AdoptedRotation {
+        boundary_seq: 2,
+        tail_hash: tail_at_2,
+    }));
     stage.set_stream_marks(Arc::clone(&rotations));
 
     // Everything pre-published, sentinel last: one read_batch spans the
@@ -2440,18 +2436,14 @@ fn mid_batch_barrier_commits_only_the_encoded_prefix() {
         MAX_JOURNAL_BATCH,
         WaitStrategy::SpinThenYield,
     );
-    let marks: crate::pipeline::StreamMarkQueue =
-        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
-    marks
-        .lock()
-        .unwrap()
-        .push_back(StreamMark::Rotate(AdoptedRotation {
-            boundary_seq: 2,
-            // Not the local tail: the barrier submits the prefix, then
-            // the quiesced resolve rejects the rotation and the stage
-            // exits, leaving the cursor where the barrier put it.
-            tail_hash: [0xEEu8; 32],
-        }));
+    let marks = crate::pipeline::StreamMarks::shared();
+    marks.push(StreamMark::Rotate(AdoptedRotation {
+        boundary_seq: 2,
+        // Not the local tail: the barrier submits the prefix, then
+        // the quiesced resolve rejects the rotation and the stage
+        // exits, leaving the cursor where the barrier put it.
+        tail_hash: [0xEEu8; 32],
+    }));
     stage.set_stream_marks(Arc::clone(&marks));
 
     // All three pre-published, so one `read_batch` spans the boundary
@@ -2554,18 +2546,14 @@ fn barrier_fsync_state_pair_is_self_consistent_for_the_shadow() {
     );
     let (fsync_writer, fsync_reader) = melin_pipeline::seqlock::split(FsyncState::default());
     stage.set_chain_hash_lock(fsync_writer);
-    let marks: crate::pipeline::StreamMarkQueue =
-        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
-    marks
-        .lock()
-        .unwrap()
-        .push_back(StreamMark::Rotate(AdoptedRotation {
-            boundary_seq: 2,
-            // Wrong tail: barrier submits the prefix, then the quiesced
-            // resolve rejects the rotation and the stage exits with the
-            // barrier's pair as the last thing published.
-            tail_hash: [0xEEu8; 32],
-        }));
+    let marks = crate::pipeline::StreamMarks::shared();
+    marks.push(StreamMark::Rotate(AdoptedRotation {
+        boundary_seq: 2,
+        // Wrong tail: barrier submits the prefix, then the quiesced
+        // resolve rejects the rotation and the stage exits with the
+        // barrier's pair as the last thing published.
+        tail_hash: [0xEEu8; 32],
+    }));
     stage.set_stream_marks(Arc::clone(&marks));
 
     // One read batch spanning the boundary: seqs 1,2 | 3.
@@ -2743,16 +2731,12 @@ fn fsync_state_pairs_stay_consistent_across_adopted_rotations() {
     );
     let (fsync_writer, fsync_reader) = melin_pipeline::seqlock::split(FsyncState::default());
     stage.set_chain_hash_lock(fsync_writer);
-    let marks: crate::pipeline::StreamMarkQueue =
-        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    let marks = crate::pipeline::StreamMarks::shared();
     for (boundary_seq, tail_hash) in BOUNDARIES.into_iter().zip(tails) {
-        marks
-            .lock()
-            .unwrap()
-            .push_back(StreamMark::Rotate(AdoptedRotation {
-                boundary_seq,
-                tail_hash,
-            }));
+        marks.push(StreamMark::Rotate(AdoptedRotation {
+            boundary_seq,
+            tail_hash,
+        }));
     }
     stage.set_stream_marks(Arc::clone(&marks));
 
@@ -2953,19 +2937,15 @@ fn adopted_rotation_honors_second_mark_in_same_batch() {
         WaitStrategy::SpinThenYield,
     );
 
-    let marks: crate::pipeline::StreamMarkQueue =
-        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
-    {
-        let mut q = marks.lock().unwrap();
-        q.push_back(StreamMark::Rotate(AdoptedRotation {
-            boundary_seq: 2,
-            tail_hash: tail_at_2,
-        }));
-        q.push_back(StreamMark::ChainCheck {
-            sequence: 4,
-            chain_hash: tail_at_4,
-        });
-    }
+    let marks = crate::pipeline::StreamMarks::shared();
+    marks.push(StreamMark::Rotate(AdoptedRotation {
+        boundary_seq: 2,
+        tail_hash: tail_at_2,
+    }));
+    marks.push(StreamMark::ChainCheck {
+        sequence: 4,
+        chain_hash: tail_at_4,
+    });
     stage.set_stream_marks(Arc::clone(&marks));
 
     // Everything pre-published, sentinel last: one read_batch spans
@@ -3022,15 +3002,11 @@ fn adopted_rotation_with_zero_tail_skips_chain_comparison() {
         WaitStrategy::SpinThenYield,
     );
 
-    let rotations: crate::pipeline::StreamMarkQueue =
-        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
-    rotations
-        .lock()
-        .unwrap()
-        .push_back(StreamMark::Rotate(AdoptedRotation {
-            boundary_seq: 2,
-            tail_hash: [0u8; 32], // chain-less primary's sentinel
-        }));
+    let rotations = crate::pipeline::StreamMarks::shared();
+    rotations.push(StreamMark::Rotate(AdoptedRotation {
+        boundary_seq: 2,
+        tail_hash: [0u8; 32], // chain-less primary's sentinel
+    }));
     stage.set_stream_marks(Arc::clone(&rotations));
 
     for seq in 1..=3u64 {
@@ -3073,15 +3049,11 @@ fn adopted_rotation_with_wrong_tail_hash_is_divergence() {
         WaitStrategy::SpinThenYield,
     );
 
-    let rotations: crate::pipeline::StreamMarkQueue =
-        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
-    rotations
-        .lock()
-        .unwrap()
-        .push_back(StreamMark::Rotate(AdoptedRotation {
-            boundary_seq: 2,
-            tail_hash: [0xBBu8; 32], // not the replica's tail at 2
-        }));
+    let rotations = crate::pipeline::StreamMarks::shared();
+    rotations.push(StreamMark::Rotate(AdoptedRotation {
+        boundary_seq: 2,
+        tail_hash: [0xBBu8; 32], // not the replica's tail at 2
+    }));
     stage.set_stream_marks(Arc::clone(&rotations));
 
     for seq in 1..=3u64 {
@@ -3158,9 +3130,8 @@ fn chain_check_mark_verifies_at_exact_position() {
             MAX_JOURNAL_BATCH,
             WaitStrategy::SpinThenYield,
         );
-        let marks: crate::pipeline::StreamMarkQueue =
-            Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
-        marks.lock().unwrap().push_back(StreamMark::ChainCheck {
+        let marks = crate::pipeline::StreamMarks::shared();
+        marks.push(StreamMark::ChainCheck {
             sequence: 2,
             chain_hash: expected,
         });
@@ -3366,8 +3337,7 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
         false,
         Arc::new(crate::fence::FenceState::new(0)),
     );
-    let rotations: crate::pipeline::StreamMarkQueue =
-        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    let rotations = crate::pipeline::StreamMarks::shared();
     replica
         .journal_stage
         .set_stream_marks(Arc::clone(&rotations));
@@ -3427,23 +3397,17 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
                         crate::replication::protocol::PrimaryMessage::Rotate {
                             boundary_seq,
                             tail_hash,
-                        } => relay_rotations
-                            .lock()
-                            .unwrap()
-                            .push_back(StreamMark::Rotate(AdoptedRotation {
-                                boundary_seq,
-                                tail_hash,
-                            })),
+                        } => relay_rotations.push(StreamMark::Rotate(AdoptedRotation {
+                            boundary_seq,
+                            tail_hash,
+                        })),
                         crate::replication::protocol::PrimaryMessage::ChainCheck {
                             sequence,
                             chain_hash,
-                        } => relay_rotations
-                            .lock()
-                            .unwrap()
-                            .push_back(StreamMark::ChainCheck {
-                                sequence,
-                                chain_hash,
-                            }),
+                        } => relay_rotations.push(StreamMark::ChainCheck {
+                            sequence,
+                            chain_hash,
+                        }),
                         other => panic!("unexpected control frame on ring: {other:?}"),
                     }
                 }
@@ -3668,6 +3632,177 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
     );
 }
 
+/// Regression: a stream mark pushed while the replica's journal stage
+/// idles — the primary rotated at the tail of a burst, then went quiet
+/// — is adopted on the stage's next loop iteration, however starved its
+/// core. The receiver queues the `Rotate` after the boundary's entries,
+/// so the stage has usually synced them before the mark lands, and only
+/// the idle loop can apply it. That loop once probed the queue every
+/// 1024 idle iterations: a count, not a time bound — once the waiter
+/// yields, each iteration is a trip through the scheduler, and on a
+/// shared, busy core the rotation sat unadopted for tens of seconds,
+/// every one of them a window in which a promotion of this replica
+/// leaves the new primary without the boundary its peers adopted
+/// (`primary_driven_rotation_mirrors_segmentation_on_replica` timed out
+/// on exactly this under load).
+///
+/// Both halves of the old failure are set up rather than hoped for:
+/// the stage runs on one CPU shared with busy spinners, so every yield
+/// costs a round of their slices, and the mark is pushed just as the
+/// stage's idle count crosses 1024, where an amortized probe is
+/// furthest from its next run.
+#[cfg(all(
+    feature = "hash-chain",
+    not(feature = "no-persist"),
+    target_os = "linux"
+))]
+#[test]
+fn trailing_stream_mark_is_adopted_promptly_on_a_starved_core() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+    // Each adoption that misses the preparer allocates synchronously;
+    // keep that cheap on the starved core.
+    let _prealloc_guard = melin_journal::test_utils::PreallocOverrideGuard::new(1024 * 1024);
+
+    /// Pin the calling thread to `cpu`, literally. Not
+    /// `melin_app::affinity::pin_to_core`: that one records the home mask
+    /// and treats the core as a pipeline core, which a test's spinners
+    /// are not.
+    fn pin_to(cpu: usize) {
+        // SAFETY: a zeroed `cpu_set_t` is a valid empty set, and
+        // `sched_setaffinity(0, ..)` only touches the calling thread.
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_SET(cpu, &mut set);
+            assert_eq!(
+                libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set),
+                0,
+                "pin to CPU {cpu}"
+            );
+        }
+    }
+    // The first CPU this process may run on, so the test works under a
+    // restricted mask (taskset, a CI cgroup) too.
+    let cpu = melin_app::affinity::first_allowed_cpu().expect("at least one CPU allowed");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("trailing_mark.journal");
+    let writer = Writer::create_continuing(&path, 1, [0x3Cu8; 32], Some(0)).unwrap();
+    let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
+        .add_consumer()
+        .build(WaitStrategy::SpinThenYield);
+    let mut stage = JournalStage::new(
+        writer,
+        consumers.pop().unwrap(),
+        Duration::ZERO,
+        MAX_JOURNAL_BATCH,
+        WaitStrategy::SpinThenYield,
+    );
+    let marks = crate::pipeline::StreamMarks::shared();
+    stage.set_stream_marks(Arc::clone(&marks));
+    let util = stage.utilization();
+    let (fsync_writer, fsync) =
+        melin_pipeline::seqlock::split(crate::pipeline::FsyncState::default());
+    stage.set_chain_hash_lock(fsync_writer);
+
+    // The burst is in the ring before the stage starts, so its first
+    // iteration reads it and its idle-iteration count starts after it,
+    // at zero: the old probe's phase is known (below).
+    const BOUNDARY: u64 = 3;
+    for seq in 1..=BOUNDARY {
+        producer.publish(add_slot_with_seq(seq, seq, 1_000_000_000 + seq));
+    }
+
+    /// Raises its flags when dropped, so a failed wait or assertion does
+    /// not leave the spinners pinned and the stage running for the rest
+    /// of the test binary.
+    struct StopOnDrop(Vec<Arc<AtomicBool>>);
+    impl Drop for StopOnDrop {
+        fn drop(&mut self) {
+            for flag in &self.0 {
+                flag.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let _stop_on_drop = StopOnDrop(vec![Arc::clone(&stop), Arc::clone(&shutdown)]);
+    let spinners: Vec<_> = (0..8)
+        .map(|_| {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                pin_to(cpu);
+                while !stop.load(Ordering::Relaxed) {
+                    std::hint::spin_loop();
+                }
+            })
+        })
+        .collect();
+    let stage_shutdown = Arc::clone(&shutdown);
+    let t_stage = std::thread::spawn(move || {
+        pin_to(cpu);
+        stage.run(&stage_shutdown)
+    });
+
+    /// Poll `done` (no fixed sleep stands in for progress); how long it
+    /// took, or a panic naming `what` after a minute.
+    fn wait_for(what: &str, mut done: impl FnMut() -> bool) -> Duration {
+        let start = std::time::Instant::now();
+        while !done() {
+            assert!(
+                start.elapsed() < Duration::from_secs(60),
+                "timed out waiting for {what}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        start.elapsed()
+    }
+    wait_for("the burst to sync", || {
+        fsync.load().journal_seq.get() >= BOUNDARY
+    });
+    // Idle for exactly 1024 iterations — the flush that publishes this
+    // counter — so the stage is past its spin budget and yielding, and
+    // the amortized probe, had it been the only one, would next run
+    // 1024 yields from now. A mark pushed now can only be applied by
+    // the idle loop: the burst's sync point has passed without one.
+    wait_for("the stage to idle into its yield phase", || {
+        util.idle.load(Ordering::Relaxed) >= 1024
+    });
+    // The announced tail is the local one: this test is about *when*
+    // the mark is acted on, not the divergence check.
+    marks.push(StreamMark::Rotate(AdoptedRotation {
+        boundary_seq: BOUNDARY,
+        tail_hash: fsync.load().chain_hash,
+    }));
+    let took = wait_for("the trailing rotation to be adopted", || {
+        util.rotations_fast_path.load(Ordering::Relaxed)
+            + util.rotations_sync_fallback.load(Ordering::Relaxed)
+            == 1
+    });
+    // A handful of yields plus the rotation's own I/O on the starved
+    // core, against ~1024 yields for an amortized probe — each a round
+    // of the spinners' slices, i.e. well past this bound.
+    let bound = Duration::from_secs(5);
+    assert!(
+        took < bound,
+        "trailing rotation adopted after {took:?} on a starved core (bound {bound:?}): \
+         the idle loop is not probing the mark queue every iteration"
+    );
+
+    shutdown.store(true, Ordering::Relaxed);
+    t_stage
+        .join()
+        .unwrap()
+        .expect("stage exits cleanly after the adoption");
+    stop.store(true, Ordering::Relaxed);
+    for s in spinners {
+        s.join().unwrap();
+    }
+    assert_eq!(util.rotations_failed.load(Ordering::Relaxed), 0);
+    let archives = melin_journal::segment::list_archives(&path).unwrap();
+    assert_eq!(archives.len(), 1, "the trailing boundary was adopted");
+}
+
 /// Size-threshold rotation: setting a small `max_journal_bytes`
 /// causes the stage to rotate without operator intervention. The
 /// threshold is engaged after the first batch crosses the limit.
@@ -3818,9 +3953,7 @@ fn preparer_arms_for_size_and_replica_modes_only() {
     );
 
     let mut replica = mk_stage("replica.journal");
-    replica.set_stream_marks(Arc::new(std::sync::Mutex::new(
-        std::collections::VecDeque::new(),
-    )));
+    replica.set_stream_marks(crate::pipeline::StreamMarks::shared());
     replica.enable_preparer();
     assert!(
         replica.preparer_enabled(),

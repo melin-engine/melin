@@ -1096,14 +1096,7 @@ mod dpdk {
     /// The first CPU this process may run on, for EAL's main lcore: CPU 0
     /// need not be in the set on a restricted host.
     fn first_allowed_cpu() -> usize {
-        // SAFETY: `cpu_set_t` is plain old data; all-zero is the empty set.
-        let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-        // SAFETY: `set` is a live, writable cpu_set_t of the size passed.
-        let rc = unsafe { libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &mut set) };
-        assert_eq!(rc, 0, "sched_getaffinity: {}", io::Error::last_os_error());
-        (0..libc::CPU_SETSIZE as usize)
-            // SAFETY: `c` is below CPU_SETSIZE, inside the set.
-            .find(|&c| unsafe { libc::CPU_ISSET(c, &set) })
-            .expect("this process may run on at least one CPU")
+        melin_app::affinity::first_allowed_cpu()
+            .expect("this process's CPU mask is readable and holds a CPU")
     }
 }

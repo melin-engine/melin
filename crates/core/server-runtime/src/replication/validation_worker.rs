@@ -329,7 +329,7 @@ mod tests {
             return;
         }
 
-        let core = first_cpu_in_mask().expect("at least one CPU in the mask");
+        let core = melin_app::affinity::first_allowed_cpu().expect("at least one CPU in the mask");
         let observed = Arc::new(AtomicUsize::new(0));
         // The pinned parent is a thread of its own, not the test's, so the
         // pin ends with it rather than outliving the test.
@@ -373,19 +373,6 @@ mod tests {
             (0..libc::CPU_SETSIZE as usize)
                 .filter(|&i| libc::CPU_ISSET(i, &set))
                 .count()
-        }
-    }
-
-    /// Lowest CPU the calling thread may run on — a core it is already
-    /// allowed to use, so pinning to it cannot fail on a restricted runner.
-    fn first_cpu_in_mask() -> Option<usize> {
-        // SAFETY: same contract as `cpu_count_in_mask`.
-        unsafe {
-            let mut set: libc::cpu_set_t = std::mem::zeroed();
-            if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
-                return None;
-            }
-            (0..libc::CPU_SETSIZE as usize).find(|&i| libc::CPU_ISSET(i, &set))
         }
     }
 }
