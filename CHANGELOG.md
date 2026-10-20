@@ -76,6 +76,13 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   names it**, a busy or a refusal included, and reports requests it did
   not track and answers it could not pair beside the requests never
   answered.
+- **`scripts/dpdk/dpdk-setup.sh` sets up SR-IOV on a port with no bond,
+  and on Broadcom NetXtreme-E (`bnxt_en`) NICs.** It takes a virtual
+  function of the first SR-IOV port that does not carry the default
+  route, gives it the VLAN of the kernel's VLAN interface on that port
+  and an address 100 above the kernel's, unless `--vlan` and `--ip` say
+  otherwise, and leaves the port and its VLAN interface to the kernel.
+  The LAN bench suite runs it on such a host unattended.
 
 ### Changed
 
@@ -377,6 +384,18 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   scoped to their segment), each answered with an archive and a full
   re-seed. The idle loop now looks on every iteration, at the cost of
   one atomic load.
+- **The LAN bench suite no longer tags SR-IOV traffic twice.** It passed
+  the setup's VLAN to the DPDK transport as `--dpdk-vlan` on every host,
+  while on SR-IOV the NIC already tags a virtual function's frames with
+  it.
+- **The LAN bench suite's second DPDK run on SR-IOV hosts finds its
+  virtual functions.** The reboot after an SR-IOV run removes them and
+  keeps `/etc/melin-dpdk.conf`, so the next run took the host as set up
+  and started on no port. It now sets them up again from that file.
+- **`scripts/dpdk/dpdk-setup.sh` no longer warns of a disabled IOMMU on
+  a host whose IOMMU is on.** It searched the kernel log in a pipeline
+  that failed whenever the search matched early; it now checks for the
+  IOMMU's device groups, which are what binding to `vfio-pci` needs.
 
 ## [0.20.0] - 2026-10-19
 

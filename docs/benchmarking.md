@@ -57,9 +57,14 @@ only with snapshots off.
 
 For the DPDK transport, each host also needs `/etc/melin-dpdk.conf`,
 written by `scripts/dpdk/dpdk-setup.sh`. The suite runs it on a host
-that has none, which is enough for SR-IOV on Intel NICs. A Mellanox
-(mlx5) NIC needs the address given, so run it on the host yourself:
-`DPDK_IP=10.0.0.101/24 ./dpdk-setup.sh [--vlan <id>]`.
+that has none, which is enough for SR-IOV on Intel and Broadcom NICs:
+behind an LACP bond, it creates a virtual function on each member; on a
+plain port, it creates one on the first port that does not carry the
+default route, joins the VLAN of the kernel's VLAN interface on that
+port (`eno2.2142`, say), and takes the address 100 above the kernel's
+there. SR-IOV must be enabled in the host's firmware, and the IOMMU on.
+A Mellanox (mlx5) NIC needs the address given, so run it on the host
+yourself: `DPDK_IP=10.0.0.101/24 ./dpdk-setup.sh [--vlan <id>]`.
 
 ## The machine running the suite
 
@@ -208,4 +213,5 @@ snapshots off.
 
 After a run on SR-IOV the hosts are rebooted, to release the NIC's
 virtual functions before the kernel transport uses it again; set
-`SKIP_REBOOT=1` when chaining DPDK runs.
+`SKIP_REBOOT=1` when chaining DPDK runs. The next DPDK run sets the
+virtual functions up again, with the addresses it used before.

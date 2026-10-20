@@ -93,7 +93,8 @@
 # them (the VLAN addresses). The DPDK transport also needs
 # /etc/melin-dpdk.conf on each host; a host without one gets
 # scripts/dpdk/dpdk-setup.sh run on it, which configures SR-IOV on its
-# own and needs DPDK_IP for mlx5 (run it by hand there).
+# own (behind a bond, or on a port with a kernel VLAN interface) and
+# needs DPDK_IP for mlx5 (run it by hand there).
 #
 # Each run waits for both replicas to be live before the load starts,
 # and samples the primary's health metrics throughout: a replica
@@ -848,7 +849,7 @@ stop_nodes() {
 # ---------------------------------------------------------------------------
 # Load `host`'s DPDK configuration into <PREFIX>_DPDK_{IP,PREFIX,PORTS,MAC,VLAN,EAL}.
 load_dpdk_config() {
-    local host="$1" prefix="$2" conf mode vfs ports eal
+    local host="$1" prefix="$2" conf mode vfs ports eal vlan
     if ! rssh "$host" "test -f /etc/melin-dpdk.conf"; then
         echo "  ${host}: no /etc/melin-dpdk.conf, running dpdk-setup.sh"
         rssh "$host" "${SUDO} bash ${REMOTE_DIR}/dpdk-setup.sh"
@@ -856,10 +857,23 @@ load_dpdk_config() {
     conf=$(rssh "$host" "cat /etc/melin-dpdk.conf")
     mode=$(conf_value "$conf" DPDK_MODE)
     ports=$(conf_value "$conf" DPDK_PORT)
-    # An SR-IOV host bonds two ports, a VF on each: both are the node's.
+    vlan=$(conf_value "$conf" VLAN_ID)
     if [[ "${mode:-sriov}" == sriov ]]; then
         vfs=$(rssh "$host" "ls -d /sys/bus/pci/drivers/vfio-pci/0000:* 2>/dev/null | wc -l")
+        # A reboot (the one after every SR-IOV run) removes the VFs and
+        # keeps the conf: set them up again, with the conf's own address
+        # and VLAN.
+        if (( vfs == 0 )); then
+            echo "  ${host}: no VF bound to vfio-pci, rerunning dpdk-setup.sh"
+            rssh "$host" "${SUDO} DPDK_IP=$(conf_value "$conf" DPDK_IP)/$(conf_value "$conf" DPDK_PREFIX) bash ${REMOTE_DIR}/dpdk-setup.sh ${vlan:+--vlan ${vlan}}"
+            vfs=$(rssh "$host" "ls -d /sys/bus/pci/drivers/vfio-pci/0000:* 2>/dev/null | wc -l")
+        fi
+        # An SR-IOV host behind a bond has a VF on each member: both are
+        # the node's.
         (( vfs >= 2 )) && ports="0,1"
+        # The PF tags the VF's frames with its port VLAN; the transport
+        # tagging them too would put a second tag on every frame.
+        vlan=""
     fi
     eal=$(conf_value "$conf" DPDK_EAL_ARGS)
     [[ -z "$eal" ]] && eal="--huge-dir=$(conf_value "$conf" HUGE_DIR)"
@@ -869,7 +883,7 @@ load_dpdk_config() {
     printf -v "${prefix}_DPDK_PREFIX" '%s' "$(conf_value "$conf" DPDK_PREFIX)"
     printf -v "${prefix}_DPDK_PORTS" '%s' "${ports:-0}"
     printf -v "${prefix}_DPDK_MAC" '%s' "$(conf_value "$conf" DPDK_MAC)"
-    printf -v "${prefix}_DPDK_VLAN" '%s' "$(conf_value "$conf" VLAN_ID)"
+    printf -v "${prefix}_DPDK_VLAN" '%s' "$vlan"
     printf -v "${prefix}_DPDK_EAL" '%s' "$eal"
     local ip_var="${prefix}_DPDK_IP" mac_var="${prefix}_DPDK_MAC"
     if [[ -z "${!ip_var}" || -z "${!mac_var}" ]]; then
