@@ -42,6 +42,8 @@ melin-test-node = { path = "../../core/test-node" }
 melin-server-runtime = { workspace = true }
 melin-journal = { workspace = true }
 tempfile = "3"
+# The unit tests' scripted node: the node's own encoding of its replies.
+melin-wire-protocol = { workspace = true }
 
 [features]
 default = []

@@ -103,6 +103,7 @@ pub fn load(dir: &Path, args: &[&str]) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stdout}\n{stderr}");
     assert!(stdout.contains("throughput:"), "{stdout}");
+    assert!(stdout.contains("shed: 0 requests"), "{stdout}");
     let json = std::fs::read_to_string(json).expect("read results");
     check_results(&json);
     json
@@ -129,6 +130,9 @@ fn check_results(json: &str) {
         field(json, "completed_requests") >= field(json, "measured_requests"),
         "{json}"
     );
+    // Reported, and nothing shed: a test node is never loaded past its
+    // input ring.
+    assert_eq!(field(json, "shed_requests"), 0, "{json}");
     for key in [
         "\"throughput_ops\":",
         "\"p99_us\":",

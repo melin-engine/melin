@@ -14,6 +14,8 @@ use std::io::{self, Read, Write};
 use melin_app::{AppEvent, Application, ApplyCtx, CodecError, QueryCtx, RejectReason};
 use melin_journal::{AckPolicyByte, AckPolicyChange, JournalEvent};
 
+use crate::pipeline::InputSlot;
+
 /// An ack-policy change entry carrying the policy byte `policy`, for any
 /// application's event type.
 pub fn ack_policy_change<E: AppEvent>(policy: u8, unwitnessed: bool) -> JournalEvent<E> {
@@ -21,6 +23,17 @@ pub fn ack_policy_change<E: AppEvent>(policy: u8, unwitnessed: bool) -> JournalE
         policy: AckPolicyByte(policy),
         unwitnessed,
     })
+}
+
+/// A slot carrying `Add(sequence)` and stamped with that journal
+/// sequence, as the journal stage hands slots to the replication rings
+/// on a primary and a replica's receiver decodes them: no connection,
+/// no request ID, no key, timestamp 0.
+pub fn sequenced_slot(sequence: u64) -> InputSlot<TestEvent> {
+    InputSlot {
+        sequence,
+        ..InputSlot::node_event(JournalEvent::App(TestEvent::Add(sequence)), 0)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -21,9 +21,10 @@ path = "src/main.rs"
 [dependencies]
 # Core pinning, and the clock the trace's calibration anchors to.
 melin-app = { workspace = true }
-# The protocol's tags, which are all the proxy ever reads of the bytes it
-# carries: an application frame on the way out is a request, a batch-end
-# on the way back closes a reply. Nothing of any application.
+# The protocol's tags and request IDs, which are all the proxy ever reads
+# of the bytes it carries (and only on `--trace`): a request on the way
+# out, the final frame naming it on the way back. Nothing of any
+# application.
 melin-wire-protocol = { workspace = true }
 clap = { workspace = true }
 # The link is a file mapped with mmap; nothing in std exposes that.
@@ -38,6 +39,8 @@ melin-dpdk = { workspace = true, optional = true, features = ["clap"] }
 
 [dev-dependencies]
 tempfile = "3"
+# The trace's frame scanner, fed the same frames in random pieces.
+proptest = "1"
 # The DPDK bridge test (`tests/dpdk_bridge.rs`): an echo node on DPDK,
 # started through the launcher under the netns runner, for the binary to
 # dial. Path-only, like every crate's dev-dependency on the launcher and

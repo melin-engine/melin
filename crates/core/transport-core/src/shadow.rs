@@ -393,8 +393,8 @@ fn save_aligned<A: Application>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cursors::RingPos;
-    use crate::pipeline::InputSlot;
+    use crate::cursors::{RingPos, WireSeq};
+    use crate::pipeline::{InputSlot, RequestId};
     use crate::test_support::{TestApp, TestEvent};
     use melin_journal::JournalEvent;
     use melin_pipeline::ring::DisruptorBuilder;
@@ -573,6 +573,7 @@ mod tests {
     fn add(n: u64) -> InputSlot<TestEvent> {
         InputSlot {
             connection_id: 0,
+            request_id: RequestId(0),
             key_hash: 0,
             sequence: 0,
             timestamp_ns: 0,
@@ -857,6 +858,7 @@ mod tests {
         // 50ms interval even without new events arriving.
         producer.publish(InputSlot {
             connection_id: 0,
+            request_id: RequestId(0),
             key_hash: 0,
             sequence: 0,
             timestamp_ns: 0,
@@ -866,6 +868,7 @@ mod tests {
         });
         producer.publish(InputSlot {
             connection_id: 0,
+            request_id: RequestId(0),
             key_hash: 0,
             sequence: 0,
             timestamp_ns: 0,
@@ -945,6 +948,7 @@ mod tests {
         // the clock, then a write no client submitted.
         producer.publish(InputSlot {
             connection_id: 1,
+            request_id: RequestId(0),
             key_hash: KEY,
             sequence: 0,
             timestamp_ns: 1_000,
@@ -954,6 +958,7 @@ mod tests {
         });
         producer.publish(InputSlot {
             connection_id: 0,
+            request_id: RequestId(0),
             key_hash: 0,
             sequence: 0,
             timestamp_ns: 0,
@@ -1077,6 +1082,7 @@ mod tests {
         // Phase 1: publish one event, wait for first snapshot.
         producer.publish(InputSlot {
             connection_id: 0,
+            request_id: RequestId(0),
             key_hash: 0,
             sequence: 0,
             timestamp_ns: 0,
@@ -1105,6 +1111,7 @@ mod tests {
         });
         producer.publish(InputSlot {
             connection_id: 0,
+            request_id: RequestId(0),
             key_hash: 0,
             sequence: 0,
             timestamp_ns: 0,
@@ -1183,6 +1190,7 @@ mod tests {
             for &n in batch {
                 producer.publish(InputSlot {
                     connection_id: 0,
+                    request_id: RequestId(0),
                     key_hash: 0,
                     sequence: 0,
                     timestamp_ns: 0,

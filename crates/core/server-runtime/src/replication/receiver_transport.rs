@@ -298,10 +298,7 @@ fn queue_stream_mark(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let position = mark.sequence();
     if position == pending_accum {
-        stream_marks
-            .lock()
-            .expect("stream-mark queue poisoned")
-            .push_back(mark);
+        stream_marks.push(mark);
         Ok(())
     } else if position < pending_accum {
         debug!(
@@ -1196,7 +1193,7 @@ mod tests {
     use melin_app::{AppEvent, CodecError};
     use melin_journal::JournalEvent;
     use melin_pipeline::ring::DisruptorBuilder;
-    use melin_transport_core::pipeline::InputSlot;
+    use melin_transport_core::pipeline::{InputSlot, RequestId};
     use melin_transport_core::replication::protocol::{encode_heartbeat, encode_input_batch};
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1223,6 +1220,7 @@ mod tests {
     fn slot(primary_seq: u64, tag: u64) -> InputSlot<TestEvent> {
         InputSlot {
             connection_id: 0,
+            request_id: RequestId(0),
             key_hash: tag,
             sequence: primary_seq,
             timestamp_ns: 0,
@@ -1454,7 +1452,7 @@ mod tests {
     /// Empty adopted-rotation queue for tests that don't exercise
     /// rotation adoption.
     fn no_marks() -> StreamMarkQueue {
-        std::sync::Arc::new(std::sync::Mutex::new(VecDeque::new()))
+        melin_transport_core::pipeline::StreamMarks::shared()
     }
 
     /// Throwaway control-plane bundle — these tests don't exercise
@@ -2295,7 +2293,7 @@ mod tests {
         assert_eq!(outcome.accum_end_sequence, 7);
         assert_eq!(drain(&mut consumer).len(), 2);
 
-        let queued: Vec<_> = rotations.lock().unwrap().iter().copied().collect();
+        let queued = rotations.queued();
         assert_eq!(queued.len(), 1);
         match queued[0] {
             StreamMark::Rotate(r) => {
@@ -2331,7 +2329,7 @@ mod tests {
         assert_eq!(outcome.accum_end_sequence, 6);
         assert_eq!(drain(&mut consumer).len(), 1);
 
-        let queued: Vec<_> = marks.lock().unwrap().iter().copied().collect();
+        let queued = marks.queued();
         assert_eq!(queued.len(), 1);
         match queued[0] {
             StreamMark::ChainCheck {
@@ -2370,7 +2368,7 @@ mod tests {
         assert!(outcome.frame_err.is_none(), "stale rotate is not fatal");
         assert_eq!(outcome.accum_end_sequence, 6);
         assert_eq!(drain(&mut consumer).len(), 1);
-        assert!(rotations.lock().unwrap().is_empty(), "stale rotate dropped");
+        assert!(rotations.queued().is_empty(), "stale rotate dropped");
     }
 
     /// A Rotate ahead of the stream position implies missing entries —
@@ -2401,7 +2399,7 @@ mod tests {
         );
         assert_eq!(outcome.accum_end_sequence, 6, "prefix still committed");
         assert_eq!(drain(&mut consumer).len(), 1);
-        assert!(rotations.lock().unwrap().is_empty());
+        assert!(rotations.queued().is_empty());
     }
 
     #[test]
@@ -3091,6 +3089,7 @@ mod tests {
 
         let lossy = |seq: u64, v: u8| InputSlot {
             connection_id: 0,
+            request_id: RequestId(0),
             key_hash: 0,
             sequence: seq,
             timestamp_ns: 0,

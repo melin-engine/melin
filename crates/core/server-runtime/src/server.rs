@@ -1839,15 +1839,18 @@ where
     let (control_tx, control_rx) = std::sync::mpsc::channel();
 
     // Client writes a halted node refuses at ingress, reader → response
-    // stage, counted for the health endpoint. See `crate::halt`.
+    // stage, counted for the health endpoint. See `crate::halt`. Beside
+    // them, the reader's other early answers and its parks.
     let refused_writes = Arc::new(AtomicU64::new(0));
+    let ingress_metrics = Arc::new(melin_transport_core::health::IngressMetrics::default());
     let halt_gate = crate::halt::HaltGate::new(
         replicas_connected.clone(),
         Arc::clone(&fence_state),
         Arc::clone(&refused_writes),
     );
-    let (refusal_tx, refusal_rx) =
-        crate::halt::refusal_channel::<A::Report>(Arc::clone(&matching_cursor));
+    let (early_tx, early_rx) = crate::early_reply::early_reply_channel::<A::Report>(
+        crate::early_reply::EARLY_REPLY_QUEUE_CAPACITY,
+    );
 
     // Spawn the io_uring reader thread. A single reader uses multishot RECV
     // to multiplex every TCP connection on the server. Pinned to
@@ -1993,7 +1996,7 @@ where
                     encoder,
                     fence_state: response_fence,
                     active_connections: active_connections_response,
-                    refusals: refusal_rx,
+                    early_replies: early_rx,
                     ring_sizing,
                     ready: Some(response_ready_tx),
                     degraded_release,
@@ -2170,6 +2173,7 @@ where
         &active_connections,
         &events_processed,
         &refused_writes,
+        &ingress_metrics,
         &cursors,
         input_cursor,
         &pipeline_healthy,
@@ -2247,7 +2251,8 @@ where
         input_producer,
         decoder,
         halt_gate,
-        refusal_tx,
+        early_tx,
+        ingress_metrics,
         ack_policy_claim,
         control_tx.clone(),
         config.cores.reader.core,
@@ -3043,14 +3048,17 @@ where
 
     // Client writes a halted node refuses at ingress, poll thread →
     // response stage, counted for the health endpoint. See `crate::halt`.
+    // Beside them, the poll thread's other early answers and its parks.
     let refused_writes = Arc::new(AtomicU64::new(0));
+    let ingress_metrics = Arc::new(melin_transport_core::health::IngressMetrics::default());
     let halt_gate = crate::halt::HaltGate::new(
         replicas_connected.clone(),
         Arc::clone(&fence_state),
         Arc::clone(&refused_writes),
     );
-    let (refusal_tx, refusal_rx) =
-        crate::halt::refusal_channel::<A::Report>(Arc::clone(&matching_cursor));
+    let (early_tx, early_rx) = crate::early_reply::early_reply_channel::<A::Report>(
+        crate::early_reply::EARLY_REPLY_QUEUE_CAPACITY,
+    );
 
     // TX SPSC: response stage → DPDK poll thread (encoded frames).
     // Lock-free, fixed-size slots — no heap allocation per frame.
@@ -3163,8 +3171,10 @@ where
                 response_utilization_thread,
                 wait,
                 encoder,
-                refusal_rx,
+                early_rx,
                 degraded_release,
+                #[cfg(test)]
+                None,
             );
         })
         .map_err(|e| format!("spawn response thread: {e}"))?,
@@ -3337,6 +3347,7 @@ where
         &active_connections,
         &events_processed,
         &refused_writes,
+        &ingress_metrics,
         &cursors,
         input_cursor,
         &pipeline_healthy,
@@ -3374,7 +3385,8 @@ where
         input_producer,
         decoder,
         halt_gate,
-        refusal_tx,
+        early_tx,
+        ingress_metrics,
         ack_policy,
         control_tx,
         tx_rx_0,
@@ -3953,6 +3965,7 @@ fn spawn_health_endpoint(
     active_connections: &Arc<AtomicU64>,
     events_processed: &Arc<AtomicU64>,
     refused_writes: &Arc<AtomicU64>,
+    ingress_metrics: &Arc<melin_transport_core::health::IngressMetrics>,
     cursors: &melin_transport_core::PipelineCursors,
     input_cursor: Box<dyn melin_pipeline::ring::QueueCursor>,
     pipeline_healthy: &Arc<AtomicBool>,
@@ -3992,6 +4005,7 @@ fn spawn_health_endpoint(
             active_connections: Arc::clone(active_connections),
             events_processed: Arc::clone(events_processed),
             refused_writes: Arc::clone(refused_writes),
+            ingress: Arc::clone(ingress_metrics),
             cursors: cursors.clone(),
             input_cursor,
             pipeline_healthy: Arc::clone(pipeline_healthy),
@@ -4272,8 +4286,7 @@ mod tests {
     use melin_app::decoder::{Decoded, RequestDecoder};
     use melin_wire_protocol::control::ConnectionId;
     use melin_wire_protocol::control_codec::{
-        TAG_AUTH_FAILED, TAG_CHALLENGE, TAG_CHALLENGE_RESPONSE, TAG_RESPONSE_HEARTBEAT,
-        TAG_SERVER_READY,
+        TAG_AUTH_FAILED, TAG_CHALLENGE_RESPONSE, TAG_RESPONSE_HEARTBEAT, TAG_SERVER_READY,
     };
 
     use super::authenticate_connection;
@@ -4568,15 +4581,17 @@ mod tests {
     }
 
     /// Read a length-prefixed Challenge frame and return its 32-byte
-    /// nonce. Frame layout: `[len:u32][TAG_CHALLENGE][nonce:32]`.
+    /// nonce. Frame layout: `[len:u32][TAG_CHALLENGE][version:u16][nonce:32]`
+    /// (see `decode_challenge`).
     fn read_challenge(stream: &mut UnixStream) -> [u8; 32] {
         let mut len_buf = [0u8; 4];
         stream.read_exact(&mut len_buf).unwrap();
         let len = u32::from_le_bytes(len_buf) as usize;
         let mut payload = vec![0u8; len];
         stream.read_exact(&mut payload).unwrap();
-        assert_eq!(payload[0], TAG_CHALLENGE, "expected Challenge");
-        payload[1..33].try_into().unwrap()
+        // The wire protocol's one parser of the challenge, which also
+        // checks the node speaks this build's client protocol.
+        melin_wire_protocol::control_codec::decode_challenge(&payload).expect("a Challenge")
     }
 
     /// Write a length-prefixed ChallengeResponse frame, matching the

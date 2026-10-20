@@ -26,7 +26,7 @@
 //! thread that performed the sync, after it returned.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -45,6 +45,10 @@ use melin_journal::segment_file::SegmentFile;
 use melin_journal::write_ring::{
     ClaimedChunk, JournalWriteMeta, JournalWriteProducer, build_journal_write_ring,
 };
+/// The client's identifier for a request, carried by both ring slots.
+/// Re-exported so code that builds or reads a slot needs no dependency
+/// on the wire-protocol crate to name it.
+pub use melin_wire_protocol::control::RequestId;
 
 use crate::journal_disk::{DiskControl, DurabilityCursors, JournalDisk, RotateRequest};
 use melin_journal::replication::{ReplicationConsumer, ReplicationProducer};
@@ -312,8 +316,9 @@ const MAX_MATCHING_BATCH: usize = 16;
 
 /// Slot in the input disruptor ring buffer.
 ///
-/// Carries a connection ID alongside the event so the response stage
-/// knows where to route the application's reports. `Copy` for zero-cost
+/// Carries a connection ID and the client's request ID alongside the
+/// event so the response stage knows where to route the application's
+/// reports and which request they answer. `Copy` for zero-cost
 /// ring buffer ops. Generic over `E: AppEvent`, the application's event
 /// type.
 ///
@@ -329,6 +334,14 @@ const MAX_MATCHING_BATCH: usize = 16;
 pub struct InputSlot<E: AppEvent> {
     /// Which client connection submitted this command.
     pub connection_id: u64,
+    /// The client's identifier for this request, which the matching stage
+    /// copies into every output slot of the event. Meaningful only with
+    /// `connection_id`, and only while that connection lives:
+    /// `RequestId(0)` on node events and on replicas, as `connection_id`
+    /// is 0 there. Never journaled or replicated: the journal entry is
+    /// built from `sequence`, `timestamp_ns`, `key_hash` and `event`
+    /// alone, and replication ships the journal's bytes.
+    pub request_id: RequestId,
     /// FxHash of the client's Ed25519 public key, journaled with the
     /// event and handed to the application as `ApplyCtx::key_hash`.
     /// 0 for seed/internal events.
@@ -365,6 +378,7 @@ impl<E: AppEvent> Default for InputSlot<E> {
         // value is never observed in steady state.
         Self {
             connection_id: 0,
+            request_id: RequestId(0),
             key_hash: 0,
             sequence: 0,
             timestamp_ns: 0,
@@ -383,12 +397,46 @@ impl<E: AppEvent> InputSlot<E> {
     pub fn node_event(event: melin_journal::JournalEvent<E>, timestamp_ns: u64) -> Self {
         Self {
             connection_id: 0,
+            request_id: RequestId(0),
             key_hash: 0,
             sequence: 0,
             timestamp_ns,
             event,
             publish_ts: mono_trace_ns(),
             recv_ts: mono_trace_ns(),
+        }
+    }
+
+    /// A request a client submitted, as a reader publishes it: `sequence`
+    /// 0, because the journal stage allocates it (see [`Self::sequence`]).
+    ///
+    /// The one place a client slot is built, and built whole, with a
+    /// struct literal: a field added to the slot is a compile error here
+    /// rather than a value left behind by the slot's previous occupant, as
+    /// a field-by-field write into a reused ring slot would leave it.
+    /// `#[inline]` so a reader's `*slot = InputSlot::client(..)` inside
+    /// the ring's in-place write still compiles to a store into the slot.
+    #[inline]
+    pub fn client(
+        origin: ClientOrigin,
+        event: E,
+        timestamp_ns: u64,
+        recv_ts: MonoTraceInstant,
+    ) -> Self {
+        let ClientOrigin {
+            connection_id,
+            request_id,
+            key_hash,
+        } = origin;
+        Self {
+            connection_id,
+            request_id,
+            key_hash,
+            sequence: 0,
+            timestamp_ns,
+            event: melin_journal::JournalEvent::App(event),
+            publish_ts: mono_trace_ns(),
+            recv_ts,
         }
     }
 
@@ -404,6 +452,22 @@ impl<E: AppEvent> InputSlot<E> {
             ..Self::default()
         }
     }
+}
+
+/// Who sent a client request: the input-slot fields a reader takes from
+/// the connection and the frame, for [`InputSlot::client`].
+///
+/// A struct with named fields rather than three positional arguments,
+/// two of them `u64`, so a call site cannot swap the connection ID and
+/// the key hash without it showing.
+#[derive(Debug, Clone, Copy)]
+pub struct ClientOrigin {
+    /// See [`InputSlot::connection_id`].
+    pub connection_id: u64,
+    /// See [`InputSlot::request_id`].
+    pub request_id: RequestId,
+    /// See [`InputSlot::key_hash`].
+    pub key_hash: u64,
 }
 
 /// Slot in the output SPSC queue (matching → response).
@@ -424,6 +488,11 @@ impl<E: AppEvent> InputSlot<E> {
 pub struct OutputSlot<R: Copy, Q: Copy> {
     /// Which client connection receives this response.
     pub connection_id: u64,
+    /// The client's identifier for the request this slot answers: the
+    /// originating input slot's [`InputSlot::request_id`], copied into
+    /// every output slot of the event. `RequestId(0)` wherever the input
+    /// slot's is (node events, replicas).
+    pub request_id: RequestId,
     /// Input disruptor sequence this output originated from.
     /// Retained for per-slot latency attribution and ordering invariants
     /// inside this process. The response stage's *durability* gate uses
@@ -485,8 +554,6 @@ pub enum OutputPayload<R: Copy, Q: Copy> {
     QueryResponse(Q),
     /// Signals the end of reports for one request.
     BatchEnd,
-    /// Internal error during matching.
-    EngineError,
     /// A journaled ack-policy change, at its exact position in the ring:
     /// the slot's `wire_seq` is the entry's. Carries no reply. The
     /// response stage switches policy here, for every slot after it, once
@@ -500,6 +567,7 @@ impl<R: Copy, Q: Copy> Default for OutputSlot<R, Q> {
     fn default() -> Self {
         Self {
             connection_id: 0,
+            request_id: RequestId(0),
             input_seq: 0,
             wire_seq: 0,
             payload: OutputPayload::BatchEnd,
@@ -616,10 +684,6 @@ pub struct JournalStage<E: AppEvent> {
     /// `None` on primaries/standalone). Pushed by the replication
     /// receiver, popped here. See [`StreamMark`].
     stream_marks: Option<StreamMarkQueue>,
-    /// Front of the stream-mark queue — the next position this stage
-    /// must act at. Held locally so the steady-state cost is one
-    /// `Option` check, not a mutex lock.
-    pending_mark: Option<StreamMark>,
     /// Core the disk thread pins itself to; `0` = unpinned. Set via
     /// [`set_disk_core`](Self::set_disk_core) before [`start`](Self::start).
     disk_core: usize,
@@ -711,6 +775,10 @@ struct SequencerCore<E: AppEvent> {
     rotation_backoff_until: Option<Instant>,
     preparer: Option<SegmentPreparer>,
     stream_marks: Option<StreamMarkQueue>,
+    /// Front of the stream-mark queue — the next position this stage
+    /// must act at. Held locally so the steady-state cost is one
+    /// `Option` check, not a mutex lock. Only the running sequencer takes
+    /// marks, so it starts empty.
     pending_mark: Option<StreamMark>,
 }
 
@@ -772,11 +840,75 @@ impl StreamMark {
 /// Cross-thread hand-off of primary-announced stream marks: the
 /// replication receiver pushes (in stream order, before publishing any
 /// slot past the mark's position), the journal stage pops.
+///
 /// `Mutex<VecDeque>` rather than a lock-free queue: marks are strictly
 /// cold (rotations a few per gigabyte, chain checks one per
-/// `CHAIN_CHECK_INTERVAL_BATCHES` fsync batches), and the journal
-/// stage only locks at batch/sync boundaries — never per entry.
-pub type StreamMarkQueue = Arc<Mutex<VecDeque<StreamMark>>>;
+/// `CHAIN_CHECK_INTERVAL_BATCHES` fsync batches). Beside it, a mirror
+/// of the queue's length, kept by [`push`](Self::push) and `pop`
+/// themselves under the lock: the journal stage reads it on *every*
+/// loop iteration — one load, no lock — so a mark pushed while the
+/// stage idles (the primary rotated, then went quiet) is acted on at
+/// the stage's next iteration, however long the scheduler makes an
+/// iteration. An amortized poll ("every N idle iterations") is not a
+/// time bound once the stage yields: on a starved core N yields took
+/// tens of seconds. The mirror lives behind `push` and `pop`, so no
+/// producer can enqueue a mark the probe does not see.
+pub struct StreamMarks {
+    queue: Mutex<VecDeque<StreamMark>>,
+    // usize: a length, like `VecDeque::len`.
+    queued: AtomicUsize,
+}
+
+impl StreamMarks {
+    /// An empty queue, shared between the receiver and the journal stage.
+    pub fn shared() -> StreamMarkQueue {
+        Arc::new(Self {
+            queue: Mutex::new(VecDeque::new()),
+            queued: AtomicUsize::new(0),
+        })
+    }
+
+    /// Queue `mark` behind every mark pushed before it.
+    pub fn push(&self, mark: StreamMark) {
+        let mut q = self
+            .queue
+            .lock()
+            .expect("stream-mark queue poisoned (journal thread panicked)");
+        q.push_back(mark);
+        // Release, under the lock: a stage that observes the new length
+        // (Acquire) and then locks finds the mark queued.
+        self.queued.store(q.len(), Ordering::Release);
+    }
+
+    /// Whether a mark is queued — lock-free, for the per-iteration probe.
+    fn any_queued(&self) -> bool {
+        self.queued.load(Ordering::Acquire) != 0
+    }
+
+    fn pop(&self) -> Option<StreamMark> {
+        let mut q = self
+            .queue
+            .lock()
+            .expect("stream-mark queue poisoned (receiver thread panicked)");
+        let mark = q.pop_front();
+        self.queued.store(q.len(), Ordering::Release);
+        mark
+    }
+
+    /// The marks not yet taken by the journal stage, oldest first — for
+    /// tests and diagnostics; the stage itself never needs a copy.
+    pub fn queued(&self) -> Vec<StreamMark> {
+        self.queue
+            .lock()
+            .expect("stream-mark queue poisoned")
+            .iter()
+            .copied()
+            .collect()
+    }
+}
+
+/// The shared handle both sides hold.
+pub type StreamMarkQueue = Arc<StreamMarks>;
 
 /// Emit a live-stream `ChainCheck` after every N published replication
 /// batches. Count-based (not time-based) so emission is a pure function
@@ -869,7 +1001,6 @@ impl<E: AppEvent> JournalStage<E> {
             preparer_core: 0,
             staging_mode: StagingMode::default(),
             stream_marks: None,
-            pending_mark: None,
             disk_core: 0,
             disk_wait: wait,
         }
@@ -1079,7 +1210,7 @@ impl<E: AppEvent> JournalStage<E> {
                 rotation_backoff_until: self.rotation_backoff_until,
                 preparer: self.preparer,
                 stream_marks: self.stream_marks,
-                pending_mark: self.pending_mark,
+                pending_mark: None,
             },
         })
     }
@@ -1438,14 +1569,28 @@ impl<E: AppEvent> Sequencer<E> {
                 }
             } else {
                 idle_count += 1;
+                // A trailing mark (the primary rotated or checked, then
+                // went quiet) arrives after the last batch's sync-point
+                // check, so only this branch can apply it — on the very
+                // next iteration, not on the amortized flush below: an
+                // iteration count is no time bound once the waiter
+                // yields, and on a starved core 1024 yields left a
+                // rotation unadopted for tens of seconds, all of it a
+                // window in which promoting this replica makes a primary
+                // without the boundary its peers adopted, which each of
+                // them then diverges from at its next entry.
+                // The probe is one load; the lock is taken only when a
+                // mark is queued. A failed adoption's retry stays on the
+                // amortized path: its backoff is 30 s, and probing it
+                // per spin would finalize the chain hash per spin.
+                // `pending == 0` here (this is the no-pending branch),
+                // so the writer is quiesced.
+                if self.core.rotation_backoff_until.is_none() && self.core.marks_outstanding() {
+                    self.core.apply_stream_marks(true)?;
+                }
                 // Periodically flush utilization counters so the health
                 // endpoint has a reasonably fresh view without adding
-                // atomic stores on the busy path. Piggy-back the
-                // stream-mark check on the same amortization: a trailing
-                // mark (primary rotated or checked, then went quiet)
-                // must be applied while idle, but not at the cost of a
-                // mutex lock per idle spin. `pending == 0` here (this is
-                // the no-pending branch), so the writer is quiesced.
+                // atomic stores on the busy path.
                 if idle_count.is_multiple_of(1024) {
                     self.core
                         .utilization
@@ -1466,7 +1611,11 @@ impl<E: AppEvent> Sequencer<E> {
                         .utilization
                         .journal_disk_lag
                         .store(self.core.batches.in_flight(), Ordering::Relaxed);
-                    self.core.apply_stream_marks(true)?;
+                    // Retry of a backed-off trailing adoption (see the
+                    // per-iteration probe above).
+                    if self.core.marks_outstanding() {
+                        self.core.apply_stream_marks(true)?;
+                    }
                 }
                 // Hand buffered latency samples to the stats registry
                 // while quiesced — a recorder that stops recording keeps
@@ -2142,19 +2291,23 @@ impl<E: AppEvent> SequencerCore<E> {
     }
 
     /// Pull the next primary-announced stream mark off the queue into
-    /// `pending_mark`. One `Option` check in steady state; the mutex is
-    /// only touched when a mark is actually outstanding or the local
-    /// copy is empty at a batch/sync boundary.
+    /// `pending_mark`. One `Option` check and one load in steady state;
+    /// the mutex is only touched when a mark is actually queued.
     #[inline]
     fn refresh_pending_mark(&mut self) {
         if self.pending_mark.is_none()
             && let Some(q) = &self.stream_marks
+            && q.any_queued()
         {
-            self.pending_mark = q
-                .lock()
-                .expect("stream-mark queue poisoned (receiver thread panicked)")
-                .pop_front();
+            self.pending_mark = q.pop();
         }
+    }
+
+    /// Whether a stream mark is held or queued — the idle loop's probe,
+    /// cheap enough for every iteration (no lock).
+    #[inline]
+    fn marks_outstanding(&self) -> bool {
+        self.pending_mark.is_some() || self.stream_marks.as_ref().is_some_and(|q| q.any_queued())
     }
 
     /// Index of the first slot in `batch[start..count]` past the
@@ -2542,6 +2695,10 @@ fn observe_live_lineage(
 /// client's reply batch. The response stages also never look a
 /// connection up for it (`DurabilityGate::admit` reports it as the
 /// gate's own).
+///
+/// The request ID is still the input slot's, as on every output slot of
+/// an event; for a node event, the only kind that carries a change, that
+/// is `RequestId(0)`, matching the connection.
 #[inline]
 fn ack_policy_change_slot<R: Copy, Q: Copy>(
     input: &InputSlot<impl AppEvent>,
@@ -2552,12 +2709,37 @@ fn ack_policy_change_slot<R: Copy, Q: Copy>(
 ) -> OutputSlot<R, Q> {
     OutputSlot {
         connection_id: 0,
+        request_id: input.request_id,
         input_seq,
         wire_seq,
         payload: OutputPayload::AckPolicyChange(change),
         match_complete_ts,
         recv_ts: input.recv_ts,
         is_last_in_request: true,
+    }
+}
+
+/// An output slot answering `input`'s client: its connection, its request
+/// ID and its receive timestamp, copied here and nowhere else, so the run
+/// loop and the shutdown drain cannot address a reply differently.
+#[inline]
+fn reply_slot<R: Copy, Q: Copy>(
+    input: &InputSlot<impl AppEvent>,
+    input_seq: u64,
+    wire_seq: u64,
+    payload: OutputPayload<R, Q>,
+    match_complete_ts: MonoTraceInstant,
+    is_last_in_request: bool,
+) -> OutputSlot<R, Q> {
+    OutputSlot {
+        connection_id: input.connection_id,
+        request_id: input.request_id,
+        input_seq,
+        wire_seq,
+        payload,
+        match_complete_ts,
+        recv_ts: input.recv_ts,
+        is_last_in_request,
     }
 }
 
@@ -2924,43 +3106,40 @@ impl<A: Application> MatchingStage<A> {
                     // no longer be met.
                     if slot.connection_id != 0 {
                         out_batch.push_with(|s| {
-                            *s = OutputSlot {
-                                connection_id: slot.connection_id,
+                            *s = reply_slot(
+                                slot,
                                 input_seq,
                                 wire_seq,
-                                payload: OutputPayload::BatchEnd,
+                                OutputPayload::BatchEnd,
                                 match_complete_ts,
-                                recv_ts: slot.recv_ts,
-                                is_last_in_request: true,
-                            };
+                                true,
+                            );
                         });
                     }
                 } else {
                     for (j, report) in reports.iter().enumerate() {
                         let is_last = j + 1 == report_count && !last_is_query && !last_is_change;
                         out_batch.push_with(|s| {
-                            *s = OutputSlot {
-                                connection_id: slot.connection_id,
+                            *s = reply_slot(
+                                slot,
                                 input_seq,
                                 wire_seq,
-                                payload: OutputPayload::Report(*report),
+                                OutputPayload::Report(*report),
                                 match_complete_ts,
-                                recv_ts: slot.recv_ts,
-                                is_last_in_request: is_last,
-                            };
+                                is_last,
+                            );
                         });
                     }
                     if let Some(qr) = query_report {
                         out_batch.push_with(|s| {
-                            *s = OutputSlot {
-                                connection_id: slot.connection_id,
+                            *s = reply_slot(
+                                slot,
                                 input_seq,
                                 wire_seq,
-                                payload: OutputPayload::QueryResponse(qr),
+                                OutputPayload::QueryResponse(qr),
                                 match_complete_ts,
-                                recv_ts: slot.recv_ts,
-                                is_last_in_request: true,
-                            };
+                                true,
+                            );
                         });
                     }
                     if let Some(change) = policy_change {
@@ -3070,27 +3249,25 @@ impl<A: Application> MatchingStage<A> {
             let policy_change = slot.event.ack_policy_change();
             let report_count = reports.len();
             if report_count == 0 && policy_change.is_none() {
-                self.output.publish(OutputSlot {
-                    connection_id: slot.connection_id,
+                self.output.publish(reply_slot(
+                    &slot,
                     input_seq,
                     wire_seq,
-                    payload: OutputPayload::BatchEnd,
+                    OutputPayload::BatchEnd,
                     match_complete_ts,
-                    recv_ts: slot.recv_ts,
-                    is_last_in_request: true,
-                });
+                    true,
+                ));
             } else {
                 for (j, report) in reports.iter().enumerate() {
                     let is_last = j + 1 == report_count && policy_change.is_none();
-                    self.output.publish(OutputSlot {
-                        connection_id: slot.connection_id,
+                    self.output.publish(reply_slot(
+                        &slot,
                         input_seq,
                         wire_seq,
-                        payload: OutputPayload::Report(*report),
+                        OutputPayload::Report(*report),
                         match_complete_ts,
-                        recv_ts: slot.recv_ts,
-                        is_last_in_request: is_last,
-                    });
+                        is_last,
+                    ));
                 }
                 if let Some(change) = policy_change {
                     self.output.publish(ack_policy_change_slot(

@@ -43,7 +43,7 @@
 //! going, so failover completes only if they notice the silence
 //! themselves (the replica end of a DPDK link's liveness deadline).
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
@@ -52,7 +52,7 @@ use counter_server::{
     Counter, CounterEvent, GET_VALUE_REQUEST, KIND_RESP_ACK, KIND_RESP_VALUE, RequestDecoder,
     ResponseEncoder, increment_request,
 };
-use ed25519_dalek::{Signer, SigningKey};
+use melin_client::{Connection, SigningKey};
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::layout::PipelineCores;
@@ -60,9 +60,7 @@ use melin_server_runtime::server::ServerConfig;
 use melin_test_node::Addrs;
 use melin_test_node::probe::{admin_until_ok, http_metrics, wait_for_gauge};
 use melin_transport_core::test_ports::free_addr;
-use melin_wire_protocol::control_codec::{
-    TAG_APP, TAG_BATCH_END, TAG_CHALLENGE, TAG_CHALLENGE_RESPONSE, TAG_LEN, TAG_SERVER_READY,
-};
+use melin_wire_protocol::control_codec::TAG_CHALLENGE;
 use serial_test::serial;
 
 /// Port range this file owns for `free_addr` (10000..15000);
@@ -92,98 +90,28 @@ const GENESIS: u64 = 1_000_000;
 const ON_PRIMARY: u64 = 1_000;
 
 // ---------------------------------------------------------------------------
-// Wire helpers (client and admin share the challenge-response handshake)
+// Client helpers, on `melin-client`
 // ---------------------------------------------------------------------------
 
-fn read_frame(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf)?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload)?;
-    Ok(payload)
-}
-
-fn write_frame(stream: &mut TcpStream, payload: &[u8]) {
-    let len = (payload.len() as u32).to_le_bytes();
-    stream.write_all(&len).expect("write frame length");
-    stream.write_all(payload).expect("write frame payload");
-    stream.flush().expect("flush");
-}
-
-/// Answer the server's Challenge on an already-connected stream and
-/// consume the ServerReady. Returns `None` if the handshake stalls or
-/// the frames are not the expected tags (e.g. the node is not serving
-/// yet) — callers retry.
-fn answer_challenge(stream: &mut TcpStream, key: &SigningKey) -> Option<()> {
-    let challenge = read_frame(stream).ok()?;
-    if challenge.first() != Some(&TAG_CHALLENGE) {
-        return None;
-    }
-    let nonce = &challenge[1..33];
-    let signature = key.sign(nonce);
-    let mut frame = Vec::with_capacity(97);
-    frame.push(TAG_CHALLENGE_RESPONSE);
-    frame.extend_from_slice(&signature.to_bytes());
-    frame.extend_from_slice(&key.verifying_key().to_bytes());
-    write_frame(stream, &frame);
-    let ready = read_frame(stream).ok()?;
-    (ready.first() == Some(&TAG_SERVER_READY)).then_some(())
-}
-
-/// Connect and authenticate a client, retrying until the node
-/// serves. The kernel backlog accepts the TCP SYN before the accept
-/// loop runs, so a successful `connect` alone proves nothing.
-fn connect_authenticated(addr: SocketAddr, key: &SigningKey) -> TcpStream {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(300)) {
-            stream
-                .set_read_timeout(Some(Duration::from_millis(500)))
-                .expect("set timeout");
-            if answer_challenge(&mut stream, key).is_some() {
-                // Generous post-auth timeout: acks under `ram`
-                // wait on a live replica round-trip, and CI machines
-                // schedule these three servers on shared cores.
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(30)))
-                    .expect("set timeout");
-                return stream;
-            }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for a serving node at {addr}"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
-/// Send `body` as an application frame.
-fn send_request(stream: &mut TcpStream, body: &[u8]) {
-    let mut frame = Vec::with_capacity(TAG_LEN + body.len());
-    frame.push(TAG_APP);
-    frame.extend_from_slice(body);
-    write_frame(stream, &frame);
-}
-
-/// The bodies of the application frames up to the batch end.
-fn read_until_batch_end(stream: &mut TcpStream) -> Vec<Vec<u8>> {
-    let mut responses = Vec::new();
-    loop {
-        let frame = read_frame(stream).expect("read response frame");
-        match frame.split_first() {
-            Some((&TAG_BATCH_END, _)) => break,
-            Some((&TAG_APP, body)) => responses.push(body.to_vec()),
-            other => panic!("unexpected frame in a reply batch: {other:02x?}"),
-        }
-    }
-    responses
+/// Connect and authenticate a client, retrying until the node serves:
+/// the kernel backlog accepts the TCP SYN before the accept loop runs,
+/// so a successful `connect` alone proves nothing, and `connect_by`
+/// retries what time can fix.
+fn connect_authenticated(addr: SocketAddr, key: &SigningKey) -> Connection {
+    let mut conn = Connection::connect_by(addr, key, Instant::now() + Duration::from_secs(30))
+        .unwrap_or_else(|e| panic!("timed out waiting for a serving node at {addr}: {e}"));
+    // Generous post-auth timeout: acks under `ram` wait on a live replica
+    // round-trip, and CI machines schedule these three servers on shared
+    // cores.
+    conn.set_read_timeout(Duration::from_secs(30))
+        .expect("set timeout");
+    conn
 }
 
 /// Whether a client connect to `addr` is answered with the auth
 /// Challenge — the definitive "this node serves as primary" signal (a
-/// replica's client listener never accepts).
+/// replica's client listener never accepts). Only the tag is looked at:
+/// any challenge counts, whatever protocol it speaks.
 fn serves_clients(addr: SocketAddr, patience: Duration) -> bool {
     let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(300)) else {
         return false;
@@ -191,7 +119,8 @@ fn serves_clients(addr: SocketAddr, patience: Duration) -> bool {
     if stream.set_read_timeout(Some(patience)).is_err() {
         return false;
     }
-    matches!(read_frame(&mut stream), Ok(f) if f.first() == Some(&TAG_CHALLENGE))
+    let mut head = [0u8; 5];
+    stream.read_exact(&mut head).is_ok() && head[4] == TAG_CHALLENGE
 }
 
 // ---------------------------------------------------------------------------
@@ -359,12 +288,13 @@ fn acked_events_survive_primary_death_under_ram_policy() {
     // adds 1 + 2 + 4 = 7.
     let acked_total = GENESIS + ON_PRIMARY + 7;
     {
-        let mut stream = connect_authenticated(primary.addr(), &client_key);
+        let mut conn = connect_authenticated(primary.addr(), &client_key);
         let mut expected_total = GENESIS + ON_PRIMARY;
         for amount in [1u64, 2, 4] {
             expected_total += amount;
-            send_request(&mut stream, &increment_request(amount));
-            let responses = read_until_batch_end(&mut stream);
+            let responses = conn
+                .request(&increment_request(amount))
+                .expect("the increment is answered");
             assert_eq!(responses.len(), 1);
             assert_eq!(responses[0][0], KIND_RESP_ACK, "increment must be acked");
             let value = u64::from_le_bytes(responses[0][1..9].try_into().unwrap());
@@ -439,9 +369,10 @@ fn acked_events_survive_primary_death_under_ram_policy() {
     // winner's own `on_primary`, journaled on promotion before it served,
     // while neither replica's genesis ever was. ---
     {
-        let mut stream = connect_authenticated(nodes[winner].addrs.client(), &client_key);
-        send_request(&mut stream, &GET_VALUE_REQUEST);
-        let responses = read_until_batch_end(&mut stream);
+        let mut conn = connect_authenticated(nodes[winner].addrs.client(), &client_key);
+        let responses = conn
+            .request(&GET_VALUE_REQUEST)
+            .expect("the query is answered");
         assert_eq!(responses.len(), 1);
         assert_eq!(responses[0][0], KIND_RESP_VALUE);
         let value = u64::from_le_bytes(responses[0][1..9].try_into().unwrap());

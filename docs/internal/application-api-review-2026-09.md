@@ -13,10 +13,11 @@ meets.
 
 **Status.**
 
-- Resolved: S2, S4, S5, S6, S9, F2, F8.
+- Resolved: S1, S2, S4, S5, S6, S9, F2, F8.
 - Partly resolved: F1 (defaults for `tick` and `query`, the latter
   asserting in debug builds that it is not handed a query; removing
-  `build_reject` remains open, with S1).
+  `build_reject`, which the `Refused` frame now makes possible, remains
+  open).
 - P1: the doc is corrected; routing query responses apart, so they stop
   widening every slot, remains open.
 - All other findings open.
@@ -65,8 +66,8 @@ S6's application-defined roles until they landed (see
 [application-defined-roles-2026-09.md](application-defined-roles-2026-09.md)); the
 `ApplyCtx::now_ns` item left in S9 belongs with "Monotonic sequencer
 time, derived from the journal". The runtime refactor that stripped out
-the exchange fixed the rest of S9. The new application guide
-(`docs/building-an-application.md`) takes a position on S1; see there.
+the exchange fixed the rest of S9. S1 was settled by request IDs on the
+client protocol (see its section).
 
 ---
 
@@ -108,6 +109,17 @@ per refused request (on the reader thread, off the sequenced path),
 and a client flooding garbage can still be disconnected. Worth settling
 explicitly either way; if silence stays, the guide should warn
 pipelining clients.
+
+**Status: resolved**, by the fix above and more:
+[request-ids-2026-10.md](request-ids-2026-10.md). Every request carries a
+client-chosen ID and every final frame names it, so pairing no longer
+depends on order. A decoder refusal is answered with a `Refused` frame
+carrying its kind (`PermissionDenied`, `Malformed`) and the decoder's
+reason; `Filter` stays and is answered with an empty batch. The client
+protocol carries a version in the node's challenge (protocol 1), and
+`melin-client` pairs every final frame by ID, reporting a refusal as
+`Error::Refused`. The guide's "gets no answer" is replaced by the
+ordering contract; refusals and filters are counted on `/metrics`.
 
 ### S2. `key_hash` is persistent identity derived from an unstable hash
 

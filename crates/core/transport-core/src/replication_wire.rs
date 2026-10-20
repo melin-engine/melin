@@ -63,7 +63,7 @@ use melin_journal::encoder::{MAX_ENTRY_SIZE, entry_size};
 use zerocopy::little_endian::{U16, U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
-use crate::pipeline::InputSlot;
+use crate::pipeline::{InputSlot, RequestId};
 
 // --- Constants ---
 
@@ -502,8 +502,11 @@ pub fn try_decode_input_batch_into<E: AppEvent>(
             });
         }
 
+        // A replica's input comes from no client: no connection, and so
+        // no request ID either (the wire never carried one).
         slots.push(InputSlot {
             connection_id: 0,
+            request_id: RequestId(0),
             key_hash,
             sequence,
             timestamp_ns,
@@ -683,6 +686,7 @@ mod tests {
     fn sample_slot<E: AppEvent>(sequence: u64, event: JournalEvent<E>) -> InputSlot<E> {
         InputSlot {
             connection_id: 0,
+            request_id: RequestId(0),
             key_hash: 0xabcd_ef00_1234_5678,
             sequence,
             timestamp_ns: 1_700_000_000_000_000_000,
@@ -1178,6 +1182,7 @@ mod tests {
     fn wire_format_is_byte_pinned() {
         let slot = InputSlot::<TestEvent> {
             connection_id: 0,
+            request_id: RequestId(0),
             key_hash: 0x0807_0605_0403_0201,
             sequence: 0x2827_2625_2423_2221,
             timestamp_ns: 0x3837_3635_3433_3231,

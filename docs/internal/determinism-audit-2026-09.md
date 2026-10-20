@@ -68,7 +68,7 @@ Severity is a judgement from code reading.
 | 15 | Promotion can drop a rotation boundary | Medium | Confirmed |
 | 16 | A torn, never-acknowledged final entry can block startup | Medium | Reproduced (fixed) |
 | 17 | The tick contract is untested and has no working example | Medium | Confirmed |
-| 18 | A ServerBusy reply can overtake replies to earlier requests | Medium | Confirmed |
+| 18 | A ServerBusy reply can overtake replies to earlier requests | Medium | Confirmed (fixed) |
 | 19 | Recovery trusts the page cache after a failed fsync | Medium | Reported |
 | 20 | A failed directory fsync after rotation does not hold back acks | Medium | Confirmed |
 | 21 | The resync archive is not atomic, and a lone snapshot is ignored | Medium | Confirmed (partially fixed: snapshot archived on its own filesystem) |
@@ -1003,6 +1003,22 @@ then applied twice unless the application deduplicates.
 queue as halt refusals, or close the connection as DPDK does. The
 roadmap's "Document the in-flight order contract on pipeline halt" should
 cover the client side.
+
+**Status: fixed**, by neither direction: by request IDs on the client
+protocol ([request-ids-2026-10.md](request-ids-2026-10.md)). Every
+request carries a client-chosen `RequestId` and every final frame names
+it, `ServerBusy` included, so a busy that arrives ahead of an earlier
+request's reply is paired with its own request, not W1. The busy goes
+through the early-reply queue like every other answer a reader decides
+on (`ControlEvent::PipelineBusy` is gone), and the response stages send
+early replies only between two events' replies (`AtBoundary`, in
+`batch_boundary.rs`), so it can no longer land inside a reply either.
+The halt refusals' sequence stamp went the other way: early replies are
+no longer ordered by input sequence at all, so a refusal no longer waits
+behind a write the ack policy holds. DPDK keeps the connection on a full
+ring and answers busy too. The client side is documented as the ordering
+contract (decision 10 of the plan) in `building-an-application.md` and
+`melin-client`'s crate docs.
 
 ## Durability edges
 

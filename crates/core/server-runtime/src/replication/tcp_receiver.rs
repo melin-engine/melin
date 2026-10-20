@@ -1189,7 +1189,7 @@ mod tests {
 
         // Re-export so the sibling test modules can name the generic
         // slot type without reaching into transport-core themselves.
-        pub(super) use melin_transport_core::pipeline::InputSlot;
+        pub(super) use melin_transport_core::pipeline::{InputSlot, RequestId};
 
         #[derive(Debug, Clone, Copy, PartialEq)]
         pub(super) struct EvtAdd(pub(super) u64);
@@ -1468,6 +1468,7 @@ mod tests {
             melin_transport_core::replication_wire::encode_input_batch(
                 &[InputSlot::<EvtAdd> {
                     connection_id: 0,
+                    request_id: RequestId(0),
                     key_hash: 0,
                     sequence: 1,
                     timestamp_ns: 1,
@@ -1702,6 +1703,7 @@ mod tests {
                 melin_transport_core::replication_wire::encode_input_batch(
                     &[InputSlot::<EvtAdd> {
                         connection_id: 0,
+                        request_id: RequestId(0),
                         key_hash: 0,
                         sequence: 1,
                         timestamp_ns: 1,
@@ -1919,6 +1921,7 @@ mod tests {
             melin_transport_core::replication_wire::encode_input_batch(
                 &[InputSlot::<EvtAdd> {
                     connection_id: 0,
+                    request_id: RequestId(0),
                     key_hash: 0,
                     sequence: 1,
                     timestamp_ns: 1,
@@ -1964,6 +1967,7 @@ mod tests {
             melin_transport_core::replication_wire::encode_input_batch(
                 &[InputSlot::<EvtAdd> {
                     connection_id: 0,
+                    request_id: RequestId(0),
                     key_hash: 0,
                     sequence: 6,
                     timestamp_ns: 6,
@@ -2209,6 +2213,7 @@ mod tests {
             melin_transport_core::replication_wire::encode_input_batch(
                 &[InputSlot::<EvtAdd> {
                     connection_id: 0,
+                    request_id: RequestId(0),
                     key_hash: 0,
                     sequence: 1,
                     timestamp_ns: 1,
@@ -2364,6 +2369,7 @@ mod tests {
         fn entry(sequence: u64) -> InputSlot<EvtAdd> {
             InputSlot::<EvtAdd> {
                 connection_id: 0,
+                request_id: RequestId(0),
                 key_hash: 0,
                 sequence,
                 timestamp_ns: sequence,
@@ -2989,6 +2995,7 @@ mod tests {
                 let slots: Vec<InputSlot<EvtAdd>> = range
                     .map(|v| InputSlot {
                         connection_id: 0,
+                        request_id: RequestId(0),
                         key_hash: 0,
                         sequence: v,
                         timestamp_ns: v,

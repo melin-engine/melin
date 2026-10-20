@@ -253,7 +253,7 @@ fn measure<S: Session>(node: &mut S, cli: &Cli) -> Result<Vec<u64>, Error> {
 /// reads frame by frame instead of asking the client for the batch.
 fn echo<S: Session>(node: &mut S, request: u64, payload: &[u8]) -> Result<Duration, Error> {
     let started = Instant::now();
-    node.send(payload)?;
+    let id = node.send(payload)?;
     let elapsed = match node.next_frame()? {
         Frame::Response(reply) => {
             let elapsed = started.elapsed();
@@ -270,21 +270,35 @@ fn echo<S: Session>(node: &mut S, request: u64, payload: &[u8]) -> Result<Durati
             }
             elapsed
         }
-        Frame::BatchEnd(_) => return Err("the server ended the batch without a reply".into()),
-        Frame::ServerBusy => return Err(melin_client::Error::ServerBusy.into()),
-        Frame::EngineError => return Err(melin_client::Error::EngineError.into()),
+        Frame::BatchEnd { .. } => {
+            return Err("the server ended the batch without a reply".into());
+        }
+        Frame::ServerBusy { .. } => return Err(melin_client::Error::ServerBusy.into()),
+        Frame::Refused { kind, reason, .. } => {
+            return Err(melin_client::Error::Refused {
+                kind,
+                reason: reason.to_string(),
+            }
+            .into());
+        }
     };
     match node.next_frame()? {
-        Frame::BatchEnd(Ack::Policy) => Ok(elapsed),
+        Frame::BatchEnd {
+            id: ended,
+            ack: Ack::Policy,
+        } if ended == id => Ok(elapsed),
         // A round trip the ack policy did not back is not the sequencer's
         // latency: the primary lost its replica mid-run. Say so rather
         // than count it.
-        Frame::BatchEnd(Ack::PrimaryOnly) => Err(format!(
+        Frame::BatchEnd {
+            id: ended,
+            ack: Ack::PrimaryOnly,
+        } if ended == id => Err(format!(
             "request {request} was answered by a primary that lost its replica: \
              only its own disk backs the reply"
         )
         .into()),
-        other => Err(format!("expected the batch to end, got {other:?}").into()),
+        other => Err(format!("expected request {request}'s batch to end, got {other:?}").into()),
     }
 }
 
@@ -353,6 +367,7 @@ fn ends_with_cause(parent: &str, cause: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use melin_client::RequestId;
 
     #[test]
     fn consecutive_requests_get_different_payloads() {
@@ -468,10 +483,28 @@ mod tests {
         pending: u8,
         /// Corrupt the echo, for the mismatch check.
         corrupt: bool,
+        /// The last request's ID: requests are numbered from 1, as a
+        /// connection numbers them.
+        id: u64,
+        /// End the batch under another request's ID, for the pairing
+        /// check.
+        wrong_id: bool,
+    }
+
+    impl Echoing {
+        fn new() -> Self {
+            Self {
+                reply: Vec::new(),
+                pending: 0,
+                corrupt: false,
+                id: 0,
+                wrong_id: false,
+            }
+        }
     }
 
     impl Session for Echoing {
-        fn send(&mut self, body: &[u8]) -> Result<(), melin_client::Error> {
+        fn send(&mut self, body: &[u8]) -> Result<RequestId, melin_client::Error> {
             self.reply.clear();
             self.reply.push(KIND_RESP_ECHO);
             self.reply.extend_from_slice(body);
@@ -481,13 +514,18 @@ mod tests {
                 *last ^= 0xff;
             }
             self.pending = 2;
-            Ok(())
+            self.id += 1;
+            Ok(RequestId(self.id))
         }
 
         fn next_frame(&mut self) -> Result<Frame<'_>, melin_client::Error> {
+            let id = RequestId(self.id + u64::from(self.wrong_id));
             let frame = match self.pending {
                 2 => Frame::Response(&self.reply),
-                1 => Frame::BatchEnd(Ack::Policy),
+                1 => Frame::BatchEnd {
+                    id,
+                    ack: Ack::Policy,
+                },
                 _ => return Err(melin_client::Error::Disconnected),
             };
             self.pending -= 1;
@@ -498,16 +536,21 @@ mod tests {
     #[test]
     fn the_loop_takes_one_sample_per_round_trip_over_any_session() {
         let cli = Cli::try_parse_from(["echo-client", "--key", "k.pem", "--count", "5"]).unwrap();
-        let mut session = Echoing {
-            reply: Vec::new(),
-            pending: 0,
-            corrupt: false,
-        };
+        let mut session = Echoing::new();
         assert_eq!(measure(&mut session, &cli).unwrap().len(), 5);
 
         session.corrupt = true;
         let error = measure(&mut session, &cli).unwrap_err().to_string();
         assert_eq!(error, "the reply to request 1 is not what was sent");
+
+        // A batch end naming another request is not this round trip's.
+        let mut session = Echoing::new();
+        session.wrong_id = true;
+        let error = measure(&mut session, &cli).unwrap_err().to_string();
+        assert!(
+            error.starts_with("expected request 1's batch to end"),
+            "{error}"
+        );
     }
 
     #[test]

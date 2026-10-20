@@ -284,6 +284,10 @@ impl Results {
             self.throughput(),
             self.measured_requests(),
         );
+        out.push_str(&format!(
+            "  shed: {} requests (answered busy, not applied)\n",
+            self.outcome.shed
+        ));
         out.push_str(&format!("  {:<8} {}\n", "min", micros(latency.min())));
         for (label, p) in PERCENTILES {
             out.push_str(&format!(
@@ -308,13 +312,15 @@ impl Results {
         percentiles.push_str(&format!(",\"max_us\":{}", us(latency.max())));
         let mut out = format!(
             "{{\"label\":\"{}\",\"clients\":{},\"window\":{},\"measured_requests\":{},\
-             \"completed_requests\":{},\"warmup_ms\":{},\"measured_ms\":{},\"cooldown_ms\":{},\"wall_ms\":{},\
+             \"completed_requests\":{},\"shed_requests\":{},\"warmup_ms\":{},\"measured_ms\":{},\
+             \"cooldown_ms\":{},\"wall_ms\":{},\
              \"throughput_ops\":{:.1},\"latency\":{{{percentiles}}}}}",
             self.app.name(),
             self.clients,
             self.window,
             self.measured_requests(),
             self.outcome.completed,
+            self.outcome.shed,
             self.plan.warmup.as_millis(),
             self.outcome.measured.as_millis(),
             self.plan.cooldown.as_millis(),

@@ -2,11 +2,10 @@
 //! each keeping `window` requests in flight, over whichever streams carry
 //! them.
 
-use std::collections::VecDeque;
 use std::time::Duration;
 
 use hdrhistogram::Histogram;
-use melin_client::{Ack, ByteStream, Frame, PolledConnection};
+use melin_client::{Ack, ByteStream, Frame, InFlight, PolledConnection, RequestId};
 
 use crate::app::App;
 
@@ -54,24 +53,46 @@ pub struct Outcome {
     /// Every request answered, timed or not: what the node has
     /// sequenced for this run.
     pub completed: u64,
+    /// Requests the node shed at ingress (`ServerBusy`): not applied, and
+    /// not resent. Load shedding is behaviour the benchmark measures.
+    pub shed: u64,
+}
+
+/// What the bench keeps for a request still owed its final frame.
+#[derive(Clone, Copy, Debug)]
+struct Owed {
+    /// When it was sent, on the streams' clock.
+    sent_ns: u64,
+    /// The application sequence its reply is checked against.
+    seq: u64,
 }
 
 /// One client: its connection and its requests in flight.
 struct Client {
     connection: PolledConnection,
-    /// When each request still owed its reply was sent, oldest first: a
-    /// connection's replies come in the order of its requests.
-    sent_ns: VecDeque<u64>,
-    /// Requests whose reply has come but whose batch has not ended: each
-    /// still holds its place in the window.
-    replied: usize,
+    /// The requests still owed their final frame, found by the ID it
+    /// names: a request the node did not accept may be answered ahead of
+    /// earlier ones.
+    owed: InFlight<Owed>,
+    /// The reply of the batch in progress, which belongs to the next batch
+    /// end: its bytes, copied (a reused buffer, allocated once), and when
+    /// it arrived, which is when its round trip is timed.
+    reply: Vec<u8>,
+    replied_ns: Option<u64>,
     /// The number of the next request.
     next_seq: u64,
 }
 
 impl Client {
     fn in_flight(&self) -> usize {
-        self.sent_ns.len() + self.replied
+        self.owed.len()
+    }
+
+    /// Take the request `id` names off the owed ones.
+    fn settle(&mut self, id: RequestId, client: u32) -> Result<Owed, String> {
+        self.owed
+            .remove(id)
+            .ok_or_else(|| format!("client {client}: an answer for request {}, not owed", id.0))
     }
 }
 
@@ -87,8 +108,9 @@ pub fn run<S: Streams>(
         .into_iter()
         .map(|connection| Client {
             connection,
-            sent_ns: VecDeque::with_capacity(plan.window),
-            replied: 0,
+            owed: InFlight::with_capacity(plan.window),
+            reply: Vec::with_capacity(app.max_body()),
+            replied_ns: None,
             next_seq: 1,
         })
         .collect();
@@ -103,8 +125,9 @@ pub fn run<S: Streams>(
     let measure_until = measure_from + nanos(plan.duration);
     let stop_sending = measure_until + nanos(plan.cooldown);
     let mut drain_deadline = None;
-    // `u64`: a count of requests, which no run comes near overflowing.
+    // `u64`: counts of requests, which no run comes near overflowing.
     let mut completed: u64 = 0;
+    let mut shed: u64 = 0;
 
     loop {
         let now_ns = streams.now_ns();
@@ -118,13 +141,20 @@ pub fn run<S: Streams>(
             let id = index as u32;
             while sending && client.in_flight() < plan.window {
                 let seq = client.next_seq;
-                client
+                let request = client
                     .connection
                     .send_with(&mut streams.stream(index), now_ns, app.max_body(), |out| {
                         Ok::<_, melin_client::Error>(app.encode(out, id, seq))
                     })
                     .map_err(|e| format!("client {id}: {e}"))?;
-                client.sent_ns.push_back(now_ns);
+                // `None`: a connection never reuses an ID.
+                client.owed.insert(
+                    request,
+                    Owed {
+                        sent_ns: now_ns,
+                        seq,
+                    },
+                );
                 client.next_seq += 1;
             }
             loop {
@@ -134,37 +164,59 @@ pub fn run<S: Streams>(
                     .map_err(|e| format!("client {id}: {e}"))?;
                 let Some(frame) = frame else { break };
                 match frame {
+                    // Timed as it arrives, attributed to its request at the
+                    // batch end, which names it.
                     Frame::Response(reply) => {
-                        let Some(sent) = client.sent_ns.pop_front() else {
-                            return Err(format!("client {id}: a reply to no request"));
-                        };
-                        let seq = client.next_seq - client.sent_ns.len() as u64 - 1;
-                        app.check(reply, id, seq)?;
-                        client.replied += 1;
+                        if client.replied_ns.is_some() {
+                            return Err(format!("client {id}: a batch with two replies"));
+                        }
+                        client.replied_ns = Some(streams.now_ns());
+                        client.reply.clear();
+                        client.reply.extend_from_slice(reply);
+                    }
+                    Frame::BatchEnd {
+                        id: request,
+                        ack: Ack::Policy,
+                    } => {
+                        let owed = client.settle(request, id)?;
+                        let received_ns = client.replied_ns.take().ok_or_else(|| {
+                            format!("client {id}: a batch ended with no reply in it")
+                        })?;
+                        app.check(&client.reply, id, owed.seq)?;
                         completed += 1;
-                        let received_ns = streams.now_ns();
                         if (measure_from..measure_until).contains(&received_ns) {
                             latency
-                                .record(received_ns.saturating_sub(sent).max(1))
+                                .record(received_ns.saturating_sub(owed.sent_ns).max(1))
                                 .map_err(|e| format!("histogram: {e}"))?;
                         }
                     }
-                    Frame::BatchEnd(Ack::Policy) => {
-                        client.replied = client.replied.checked_sub(1).ok_or_else(|| {
-                            format!("client {id}: a batch ended with no reply in it")
-                        })?;
-                    }
                     // Not the sequencer's latency: the primary lost its
                     // replica mid-run and answered on its own disk.
-                    Frame::BatchEnd(Ack::PrimaryOnly) => {
+                    Frame::BatchEnd {
+                        ack: Ack::PrimaryOnly,
+                        ..
+                    } => {
                         return Err(format!(
                             "client {id}: a reply backed by the primary's disk alone \
                              (the primary lost its replica mid-run)"
                         ));
                     }
-                    Frame::ServerBusy => return Err(format!("client {id}: the server is busy")),
-                    Frame::EngineError => {
-                        return Err(format!("client {id}: the application failed a request"));
+                    // Shed at ingress: not applied, counted, and its place
+                    // in the window freed. The connection stays open.
+                    Frame::ServerBusy { id: request } => {
+                        client.settle(request, id)?;
+                        shed += 1;
+                    }
+                    // The bench sends only well-formed requests: a refusal
+                    // is a key or a build that does not fit the node.
+                    Frame::Refused { kind, reason, .. } => {
+                        return Err(format!(
+                            "client {id}: {}",
+                            melin_client::Error::Refused {
+                                kind,
+                                reason: reason.to_string()
+                            }
+                        ));
                     }
                 }
             }
@@ -178,6 +230,7 @@ pub fn run<S: Streams>(
                     measured: plan.duration,
                     wall: Duration::from_nanos(end_ns - start_ns),
                     completed,
+                    shed,
                 });
             }
             if now_ns > deadline {
@@ -254,6 +307,246 @@ mod tests {
         fn stream(&mut self, client: usize) -> &mut BufferStream {
             &mut self.streams[client]
         }
+    }
+
+    use echo_server::KIND_RESP_ECHO;
+    use melin_client::framing::{FrameDecoder, split_request};
+    use melin_client::{RefusalKind, RequestId};
+    use melin_wire_protocol::control::TransportResponse;
+    use melin_wire_protocol::control_codec::{
+        CHALLENGE_RESPONSE_LEN, MAX_CONTROL_FRAME_LEN, TAG_APP, encode_transport_response,
+    };
+
+    /// How the scripted node answers a request.
+    #[derive(Clone, Copy, Debug)]
+    enum Answer {
+        Echo,
+        Busy,
+        Refuse,
+        /// A batch with no reply in it.
+        Empty,
+        /// A batch with the echo twice.
+        Twice,
+    }
+
+    /// An echo node played in process: each client's stream is a buffer,
+    /// and every service step answers what the clients sent, request `n`
+    /// (from 0, per client) as `script` says. Requests answered `Busy`
+    /// are answered ahead of the request before them when `overtake` is
+    /// set, as a node answers a request it did not accept.
+    struct ScriptedNode {
+        streams: Vec<BufferStream>,
+        decoders: Vec<FrameDecoder>,
+        /// Whether each client's challenge response has been taken.
+        answered_challenge: Vec<bool>,
+        seen: Vec<u64>,
+        script: fn(u64) -> Answer,
+        overtake: bool,
+        /// A request held for the next one to overtake: its ID and body.
+        held: Vec<Option<(RequestId, Vec<u8>)>>,
+        origin: std::time::Instant,
+    }
+
+    fn control(response: TransportResponse) -> Vec<u8> {
+        let mut buf = [0u8; MAX_CONTROL_FRAME_LEN];
+        let n = encode_transport_response(&response, &mut buf).unwrap();
+        buf[..n].to_vec()
+    }
+
+    impl ScriptedNode {
+        fn new(clients: usize, script: fn(u64) -> Answer, overtake: bool) -> Self {
+            let mut streams = Vec::new();
+            for _ in 0..clients {
+                let mut stream = BufferStream::new();
+                stream.push_received(&control(TransportResponse::Challenge { nonce: [1; 32] }));
+                stream.push_received(&control(TransportResponse::ServerReady));
+                streams.push(stream);
+            }
+            Self {
+                streams,
+                decoders: (0..clients).map(|_| FrameDecoder::new()).collect(),
+                answered_challenge: vec![false; clients],
+                seen: vec![0; clients],
+                script,
+                overtake,
+                held: vec![None; clients],
+                origin: std::time::Instant::now(),
+            }
+        }
+
+        fn echo(stream: &mut BufferStream, id: RequestId, body: &[u8]) {
+            Self::reply(stream, body);
+            stream.push_received(&control(TransportResponse::BatchEnd { id }));
+        }
+
+        /// The echo of `body`, with no batch end after it.
+        fn reply(stream: &mut BufferStream, body: &[u8]) {
+            let mut frame = ((2 + body.len()) as u32).to_le_bytes().to_vec();
+            frame.extend([TAG_APP, KIND_RESP_ECHO]);
+            frame.extend_from_slice(body);
+            stream.push_received(&frame);
+        }
+    }
+
+    impl Streams for ScriptedNode {
+        type Stream<'a> = &'a mut BufferStream;
+
+        fn now_ns(&self) -> u64 {
+            nanos(self.origin.elapsed())
+        }
+
+        fn service(&mut self, _now_ns: u64) {
+            for client in 0..self.streams.len() {
+                let stream = &mut self.streams[client];
+                let mut sent = stream.sent().to_vec();
+                stream.consume_sent(sent.len());
+                if !self.answered_challenge[client] && sent.len() >= 4 + CHALLENGE_RESPONSE_LEN {
+                    sent.drain(..4 + CHALLENGE_RESPONSE_LEN);
+                    self.answered_challenge[client] = true;
+                }
+                let decoder = &mut self.decoders[client];
+                decoder.push(&sent);
+                let held = &mut self.held[client];
+                while let Some(payload) = decoder.next().unwrap() {
+                    let (id, body) = split_request(payload).expect("a request");
+                    let n = self.seen[client];
+                    self.seen[client] += 1;
+                    let early = match (self.script)(n) {
+                        Answer::Echo => {
+                            // The echo held before goes out: nothing
+                            // overtook it.
+                            if let Some((held_id, held_body)) = held.take() {
+                                Self::echo(stream, held_id, &held_body);
+                            }
+                            if self.overtake {
+                                *held = Some((id, body.to_vec()));
+                            } else {
+                                Self::echo(stream, id, body);
+                            }
+                            continue;
+                        }
+                        Answer::Empty => TransportResponse::BatchEnd { id },
+                        Answer::Twice => {
+                            Self::reply(stream, body);
+                            Self::echo(stream, id, body);
+                            continue;
+                        }
+                        Answer::Busy => TransportResponse::ServerBusy { id },
+                        Answer::Refuse => TransportResponse::Refused {
+                            id,
+                            kind: RefusalKind::Malformed,
+                            reason: "unknown kind",
+                        },
+                    };
+                    // An early answer, ahead of the echo held before it.
+                    stream.push_received(&control(early));
+                    if let Some((held_id, held_body)) = held.take() {
+                        Self::echo(stream, held_id, &held_body);
+                    }
+                }
+                // Nothing is held past a service step: no later request
+                // would overtake it.
+                if let Some((held_id, held_body)) = held.take() {
+                    Self::echo(stream, held_id, &held_body);
+                }
+            }
+        }
+
+        fn stream(&mut self, client: usize) -> &mut BufferStream {
+            &mut self.streams[client]
+        }
+    }
+
+    /// A short run of `clients` clients against `node`.
+    fn run_against(node: &mut ScriptedNode, clients: usize) -> Result<Outcome, String> {
+        let key = melin_client::SigningKey::from_bytes(&[7; 32]);
+        let plan = Plan {
+            window: 4,
+            warmup: Duration::ZERO,
+            duration: Duration::from_millis(30),
+            cooldown: Duration::ZERO,
+            timeout: Duration::from_secs(5),
+        };
+        let app = App::new(AppKind::Echo, 16).unwrap();
+        let connections = (0..clients).map(|_| PolledConnection::new(&key)).collect();
+        run(node, connections, app, plan)
+    }
+
+    /// A busy is counted as shed and frees its place in the window; the
+    /// run goes on, and only echoes count as completed.
+    #[test]
+    fn a_shed_request_is_counted_and_the_run_goes_on() {
+        let mut node = ScriptedNode::new(
+            2,
+            |n| {
+                if n % 3 == 2 {
+                    Answer::Busy
+                } else {
+                    Answer::Echo
+                }
+            },
+            false,
+        );
+        let outcome = run_against(&mut node, 2).expect("the run completes");
+        let sent: u64 = node.seen.iter().sum();
+        assert!(outcome.shed > 0, "{outcome:?}");
+        assert!(outcome.completed > 0, "{outcome:?}");
+        assert_eq!(
+            outcome.completed + outcome.shed,
+            sent,
+            "every request answered once"
+        );
+        assert_eq!(outcome.shed, node.seen.iter().map(|n| n / 3).sum::<u64>());
+    }
+
+    /// A busy that overtakes the request before it is paired with its own
+    /// request by ID, and the request it overtook is still checked against
+    /// its own sequence when its echo comes.
+    #[test]
+    fn an_early_busy_is_paired_by_id_not_by_order() {
+        let mut node = ScriptedNode::new(
+            1,
+            |n| {
+                if n % 2 == 1 {
+                    Answer::Busy
+                } else {
+                    Answer::Echo
+                }
+            },
+            true,
+        );
+        let outcome = run_against(&mut node, 1).expect("every echo checks out");
+        assert!(outcome.shed > 0 && outcome.completed > 0, "{outcome:?}");
+        assert_eq!(outcome.completed + outcome.shed, node.seen[0]);
+    }
+
+    /// The bench sends only well-formed requests: a refusal fails the run,
+    /// with the node's reason.
+    #[test]
+    fn a_refusal_fails_the_run() {
+        let mut node = ScriptedNode::new(
+            1,
+            |n| if n == 3 { Answer::Refuse } else { Answer::Echo },
+            false,
+        );
+        let err = run_against(&mut node, 1).unwrap_err();
+        assert!(
+            err.contains("refused") && err.contains("unknown kind"),
+            "{err}"
+        );
+    }
+
+    /// An echo request's batch must hold exactly its echo: an empty one
+    /// and one with two replies both fail the run.
+    #[test]
+    fn a_batch_without_its_one_reply_fails_the_run() {
+        let mut node = ScriptedNode::new(1, |_| Answer::Empty, false);
+        let err = run_against(&mut node, 1).unwrap_err();
+        assert!(err.contains("no reply in it"), "{err}");
+
+        let mut node = ScriptedNode::new(1, |_| Answer::Twice, false);
+        let err = run_against(&mut node, 1).unwrap_err();
+        assert!(err.contains("two replies"), "{err}");
     }
 
     #[test]

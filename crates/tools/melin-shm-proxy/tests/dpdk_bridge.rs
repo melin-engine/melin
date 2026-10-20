@@ -34,7 +34,8 @@ use std::time::{Duration, Instant};
 use echo_server::{Echo, KIND_RESP_ECHO, MAX_PAYLOAD, RequestDecoder, ResponseEncoder};
 use melin_client::framing::split_frame;
 use melin_client::{
-    Ack, Handshake, Reply, RequestFrameError, SigningKey, Step, classify, frame_request, key,
+    Ack, Handshake, Reply, RequestFrameError, RequestId, SigningKey, Step, classify, frame_request,
+    key,
 };
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
@@ -501,9 +502,10 @@ fn the_proxy_bridges_a_client_to_a_dpdk_node_over_dpdk() {
 
     // Echoes of every size either side of the length's `u8` boundary, up
     // to the cap, several in flight at a time and enough of them that both
-    // rings wrap. A reply is matched to its request by order, as the node
-    // answers them, and the non-empty payloads all differ, so a reply out
-    // of place cannot pass for the right one.
+    // rings wrap. Each request carries an ID of the client's choosing (not
+    // in increasing order, as the Java rig's need not be), and its batch
+    // end must name it; the non-empty payloads all differ too, so a reply
+    // out of place cannot pass for the right one.
     let sizes = [0, 1, 7, 255, 256, MAX_PAYLOAD];
     let payloads: Vec<Vec<u8>> = (0..96)
         .map(|i: usize| {
@@ -513,18 +515,20 @@ fn the_proxy_bridges_a_client_to_a_dpdk_node_over_dpdk() {
                 .collect()
         })
         .collect();
+    let id_of = |i: usize| RequestId(0xC0DE_0000_0000 ^ (i as u64).wrapping_mul(0x9E37_79B9));
     let mut frame = vec![0u8; melin_client::REQUEST_HEADER_LEN + MAX_PAYLOAD];
-    for batch in payloads.chunks(sizes.len()) {
-        for payload in batch {
-            let n = frame_request(&mut frame, |body: &mut [u8]| {
+    for (b, batch) in payloads.chunks(sizes.len()).enumerate() {
+        let first = b * sizes.len();
+        for (i, payload) in batch.iter().enumerate() {
+            let n = frame_request(&mut frame, id_of(first + i), |body: &mut [u8]| {
                 body[..payload.len()].copy_from_slice(payload);
                 Ok::<_, RequestFrameError>(payload.len())
             })
             .expect("a request within the cap");
             write_all(&link, &mut proxy, &frame[..n]);
         }
-        for payload in batch {
-            let reply = next_reply(&mut link, &mut proxy);
+        for (i, payload) in batch.iter().enumerate() {
+            let reply = next_reply(&mut link, &mut proxy, id_of(first + i));
             assert_eq!(
                 reply,
                 [[KIND_RESP_ECHO].as_slice(), payload.as_slice()].concat(),
@@ -617,16 +621,19 @@ fn next_frame(link: &mut Link, proxy: &mut Proxy) -> Vec<u8> {
 }
 
 /// The one application frame of the next reply batch, through its batch
-/// end, heartbeats skipped.
-fn next_reply(link: &mut Link, proxy: &mut Proxy) -> Vec<u8> {
+/// end, which must name request `id`, heartbeats skipped.
+fn next_reply(link: &mut Link, proxy: &mut Proxy, id: RequestId) -> Vec<u8> {
     let mut frames = Vec::new();
     loop {
         let payload = next_frame(link, proxy);
         match classify(&payload) {
             Ok(Reply::Response(body)) => frames.push(body.to_vec()),
             Ok(Reply::Heartbeat) => {}
-            Ok(Reply::BatchEnd(Ack::Policy)) => break,
-            other => proxy.fail(&format!("a reply frame of {other:?}")),
+            Ok(Reply::BatchEnd {
+                id: ended,
+                ack: Ack::Policy,
+            }) if ended == id => break,
+            other => proxy.fail(&format!("a reply frame of {other:?} awaiting {id:?}")),
         }
     }
     assert_eq!(frames.len(), 1, "one frame in an echo's batch: {frames:?}");

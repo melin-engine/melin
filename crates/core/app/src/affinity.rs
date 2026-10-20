@@ -158,6 +158,17 @@ fn cpus_of(mask: &libc::cpu_set_t) -> impl Iterator<Item = usize> + '_ {
     (0..libc::CPU_SETSIZE as usize).filter(move |&cpu| unsafe { libc::CPU_ISSET(cpu, mask) })
 }
 
+/// The lowest CPU the calling thread may run on: one it is already
+/// allowed, so pinning to it cannot fail on a host that restricts the
+/// process (a cgroup cpuset, `taskset`), where CPU 0 need not be in the
+/// set. `None` when the mask cannot be read.
+pub fn first_allowed_cpu() -> Option<usize> {
+    // Dropped error: `None` is the answer for an unreadable mask, and a
+    // caller that needs a CPU fails on it with its own context.
+    let mask = current_mask().ok()?;
+    cpus_of(&mask).next()
+}
+
 /// How many CPUs a mask holds.
 fn count(mask: &libc::cpu_set_t) -> usize {
     cpus_of(mask).count()

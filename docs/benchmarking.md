@@ -175,7 +175,11 @@ Each run leaves, in `bench-results/lan-<app>-<timestamp>/`:
   snapshots and journal were found on.
 
 A latency is a full round trip as the client sees it, from the request
-leaving the client to its reply arriving. A run whose replicas were
+leaving the client to its reply arriving. A request the node shed under
+load (answered busy) is counted as shed by the echo and notary load
+generator, in its console output and in the JSON (`shed_requests`),
+rather than failing the run: a run that shed any measured a node past
+its capacity. A run whose replicas were
 evicted, missing or catching up at any point is reported
 as `UNSTEADY`, and the suite exits non-zero, as it does when a cluster
 does not start or the load generator fails: a number measured on a

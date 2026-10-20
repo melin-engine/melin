@@ -35,7 +35,7 @@ pub mod decoder;
 /// Response-encoder seam: `ResponseEncoder`. Mirror of [`decoder`]
 /// on the outbound path — application reports / query responses get
 /// encoded to wire bytes through this trait, while transport-shaped
-/// envelope variants (`BatchEnd`, `EngineError`) stay in runtime.
+/// envelope variant (`BatchEnd`) stays in runtime.
 pub mod encoder;
 
 use std::io::{self, Read, Write};

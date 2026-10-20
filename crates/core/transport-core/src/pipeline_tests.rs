@@ -42,7 +42,7 @@ use melin_journal::{AckPolicyByte, AckPolicyChange};
 use crate::pipeline::{AdoptedRotation, StreamMark};
 use crate::pipeline::{
     InputSlot, JournalStage, MAX_JOURNAL_BATCH, MatchingStage, OutputPayload, OutputSlot,
-    build_pipeline_with_replication, max_journal_batch,
+    RequestId, build_pipeline_with_replication, max_journal_batch,
 };
 use crate::test_support::{TestApp, TestEvent, TestQuery, TestReport, ack_policy_change};
 use crate::trace::mono_trace_ns;
@@ -102,15 +102,12 @@ const FIRST_SEQ: u64 = 1;
 /// encode time. Tests that simulate replica input pass a pre-assigned
 /// sequence via the builder method below.
 fn add_slot(n: u64, timestamp_ns: u64) -> TestInput {
-    InputSlot {
-        connection_id: 1,
-        key_hash: 0,
-        sequence: 0,
+    request_slot(
+        1,
+        RequestId(0),
+        JournalEvent::App(TestEvent::Add(n)),
         timestamp_ns,
-        event: JournalEvent::App(TestEvent::Add(n)),
-        publish_ts: mono_trace_ns(),
-        recv_ts: mono_trace_ns(),
-    }
+    )
 }
 
 /// Like `add_slot` but with a pre-assigned journal sequence — simulates
@@ -325,6 +322,7 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
     let mut publish = |event: JournalEvent<TestEvent>| {
         input_producer.publish(InputSlot {
             connection_id: conn_id,
+            request_id: RequestId(0),
             key_hash: 0,
             sequence: 0,
             timestamp_ns: 0,
@@ -380,7 +378,6 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
             OutputPayload::Report(_) => "Report",
             OutputPayload::QueryResponse(_) => "QueryResponse",
             OutputPayload::BatchEnd => "BatchEnd",
-            OutputPayload::EngineError => "EngineError",
             OutputPayload::AckPolicyChange(_) => "AckPolicyChange",
         })
         .collect();
@@ -414,6 +411,26 @@ struct MatchingRun {
 /// not 1, so a slot stamped from the input position instead would show.
 const POLICY_RUN_WIRE_SEQ: u64 = 10;
 
+/// An input slot for `event` from `connection_id`, naming `request_id`,
+/// stamped `timestamp_ns`, with no key.
+fn request_slot(
+    connection_id: u64,
+    request_id: RequestId,
+    event: JournalEvent<TestEvent>,
+    timestamp_ns: u64,
+) -> TestInput {
+    InputSlot {
+        connection_id,
+        request_id,
+        key_hash: 0,
+        sequence: 0,
+        timestamp_ns,
+        event,
+        publish_ts: mono_trace_ns(),
+        recv_ts: mono_trace_ns(),
+    }
+}
+
 /// Run a matching stage over `events` (connection, event, timestamp) and
 /// collect `expected` output slots. `on_shutdown` publishes everything
 /// with shutdown already requested, so the stage handles every event in
@@ -421,6 +438,27 @@ const POLICY_RUN_WIRE_SEQ: u64 = 10;
 fn run_matching_over<A>(
     app: A,
     events: &[(u64, JournalEvent<TestEvent>, u64)],
+    expected: usize,
+    on_shutdown: bool,
+) -> MatchingRun
+where
+    A: melin_app::Application<Event = TestEvent, Report = TestReport, QueryResponse = TestQuery>
+        + Send
+        + 'static,
+{
+    let slots: Vec<TestInput> = events
+        .iter()
+        .map(|&(connection_id, event, timestamp_ns)| {
+            request_slot(connection_id, RequestId(0), event, timestamp_ns)
+        })
+        .collect();
+    run_matching_over_slots(app, &slots, expected, on_shutdown)
+}
+
+/// [`run_matching_over`], over whole input slots.
+fn run_matching_over_slots<A>(
+    app: A,
+    slots: &[TestInput],
     expected: usize,
     on_shutdown: bool,
 ) -> MatchingRun
@@ -451,16 +489,8 @@ where
     let utilization = stage.utilization();
 
     let shutdown = Arc::new(AtomicBool::new(on_shutdown));
-    for &(connection_id, event, timestamp_ns) in events {
-        input_producer.publish(InputSlot {
-            connection_id,
-            key_hash: 0,
-            sequence: 0,
-            timestamp_ns,
-            event,
-            publish_ts: mono_trace_ns(),
-            recv_ts: mono_trace_ns(),
-        });
+    for &slot in slots {
+        input_producer.publish(slot);
     }
     let shutdown2 = Arc::clone(&shutdown);
     let handle = std::thread::spawn(move || stage.run(&shutdown2));
@@ -634,6 +664,158 @@ fn a_policy_change_closes_the_reports_its_clock_step_produced() {
     }
 }
 
+/// A client slot takes its connection, request ID and key from its
+/// origin, wraps the event as an application event, and leaves the
+/// sequence for the journal stage to allocate.
+#[test]
+fn a_client_slot_is_built_from_its_origin() {
+    let origin = crate::pipeline::ClientOrigin {
+        connection_id: 3,
+        request_id: RequestId(0x0102_0304_0506_0708),
+        key_hash: 0xFEED,
+    };
+    #[allow(clippy::let_unit_value)] // ZST when latency-trace is off
+    let recv_ts = mono_trace_ns();
+    let slot = TestInput::client(origin, TestEvent::Add(9), 1_234, recv_ts);
+    assert_eq!(slot.connection_id, 3);
+    assert_eq!(slot.request_id, RequestId(0x0102_0304_0506_0708));
+    assert_eq!(slot.key_hash, 0xFEED);
+    assert_eq!(slot.sequence, 0);
+    assert_eq!(slot.timestamp_ns, 1_234);
+    assert_eq!(slot.event, JournalEvent::App(TestEvent::Add(9)));
+}
+
+/// Every output slot of an event carries its input slot's request ID,
+/// whatever the event's replies: none (a bare terminator), several reports
+/// (the clock step's, then the write's), a query response, and an
+/// ack-policy change (its clock step's report, then its own slot), in the
+/// run loop and in the shutdown drain alike. The drain skips queries, so
+/// it emits nothing for one.
+#[test]
+fn every_output_slot_of_an_event_carries_its_request_id() {
+    for on_shutdown in [false, true] {
+        let slots = [
+            // Timestamp 0 fires no clock step: no report at all.
+            request_slot(1, RequestId(11), JournalEvent::EpochBump { epoch: 1 }, 0),
+            request_slot(2, RequestId(22), JournalEvent::App(TestEvent::Add(5)), 5),
+            request_slot(3, RequestId(33), JournalEvent::App(TestEvent::Query), 0),
+            // Never on a client connection in practice; a distinct ID here
+            // shows the change slot takes the input's like every other.
+            request_slot(4, RequestId(44), ack_policy_change(1, false), 9),
+        ];
+        let mut expected = vec![
+            (1, RequestId(11), true, "BatchEnd"),
+            (2, RequestId(22), false, "Report"),
+            (2, RequestId(22), true, "Report"),
+            (3, RequestId(33), true, "QueryResponse"),
+            (4, RequestId(44), false, "Report"),
+            (0, RequestId(44), true, "AckPolicyChange"),
+        ];
+        if on_shutdown {
+            expected.retain(|&(_, _, _, kind)| kind != "QueryResponse");
+        }
+        let run = run_matching_over_slots(
+            TickReportingApp(TestApp::new()),
+            &slots,
+            expected.len(),
+            on_shutdown,
+        );
+        let actual: Vec<_> = run
+            .outputs
+            .iter()
+            .map(|s| {
+                let kind = match s.payload {
+                    OutputPayload::Report(_) => "Report",
+                    OutputPayload::QueryResponse(_) => "QueryResponse",
+                    OutputPayload::BatchEnd => "BatchEnd",
+                    OutputPayload::AckPolicyChange(_) => "AckPolicyChange",
+                };
+                (s.connection_id, s.request_id, s.is_last_in_request, kind)
+            })
+            .collect();
+        assert_eq!(actual, expected, "on_shutdown = {on_shutdown}");
+    }
+}
+
+/// The request ID never reaches the journal or a replica: input slots
+/// that differ only in it journal to identical bytes, through the journal
+/// stage, and encode to identical replication frames.
+#[cfg(not(feature = "no-persist"))]
+#[test]
+fn input_slots_differing_only_in_request_id_journal_and_replicate_identically() {
+    let dir = tempfile::tempdir().unwrap();
+    let slots = |first_id: u64| -> [TestInput; 2] {
+        [
+            InputSlot {
+                key_hash: 0xFEED,
+                ..request_slot(
+                    1,
+                    RequestId(first_id),
+                    JournalEvent::App(TestEvent::Add(7)),
+                    1_000,
+                )
+            },
+            request_slot(
+                1,
+                RequestId(first_id + 1),
+                JournalEvent::App(TestEvent::Add(8)),
+                1_001,
+            ),
+        ]
+    };
+    let journal = |name: &str, first_id: u64| -> Vec<u8> {
+        let path = dir.path().join(name);
+        // A fixed anchor rather than `create`'s random salt, so the two
+        // files can be compared byte for byte, header and chain included.
+        let writer = Writer::create_continuing(&path, FIRST_SEQ, [0x5A; 32], Some(0)).unwrap();
+        let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
+        let stage = JournalStage::new(
+            writer,
+            consumers.pop().unwrap(),
+            Duration::ZERO,
+            MAX_JOURNAL_BATCH,
+            WaitStrategy::SpinThenYield,
+        );
+        for slot in slots(first_id) {
+            producer.publish(slot);
+        }
+        // The stage stops at the sentinel, with everything before it on disk.
+        producer.publish(InputSlot::shutdown_sentinel());
+        let shutdown = AtomicBool::new(false);
+        stage.start().unwrap().run(&shutdown).unwrap();
+        let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
+        let mut entries = 0;
+        while reader.next_entry().unwrap().is_some() {
+            entries += 1;
+        }
+        assert_eq!(entries, 2, "both slots journaled into {name}");
+        std::fs::read(&path).unwrap()
+    };
+    assert!(
+        journal("a.journal", 0) == journal("b.journal", 0xA5A5_0000_0000_0001),
+        "the journal bytes depend on the request ID"
+    );
+
+    // What the journal stage hands to replication: the same slots, now
+    // stamped with their sequences.
+    let replicated = |first_id: u64| -> Vec<u8> {
+        let mut stamped = slots(first_id);
+        for (slot, sequence) in stamped.iter_mut().zip(FIRST_SEQ..) {
+            slot.sequence = sequence;
+        }
+        let mut buf = Vec::new();
+        crate::replication_wire::encode_input_batch(&stamped, &mut buf).unwrap();
+        buf
+    };
+    assert_eq!(
+        replicated(0),
+        replicated(u64::MAX - 1),
+        "the replication frame depends on the request ID"
+    );
+}
+
 /// Regression tripwire for the pre-v14 durability-gate hole: the
 /// response gate compares `OutputSlot.wire_seq` (stamped by the
 /// matching stage) against `last_seq` (published by the journal stage
@@ -707,6 +889,7 @@ fn allocator_wire_seq_and_gate_cursor_agree_across_rotation() {
         published += 1;
         input_producer.publish(InputSlot {
             connection_id: 1,
+            request_id: RequestId(0),
             key_hash: 1,
             sequence: 0,
             timestamp_ns: 1_000_000_000 + published,
@@ -836,6 +1019,7 @@ fn recovery_resumes_allocator_wire_and_gate_agreement() {
         made += 1;
         InputSlot {
             connection_id: 1,
+            request_id: RequestId(0),
             key_hash: 1,
             sequence: 0,
             timestamp_ns: 1_000_000_000 + made,
@@ -1868,6 +2052,7 @@ fn primary_and_replica_journals_contiguous_and_chain_identical() {
                 for slot in slots {
                     replica_input.publish(InputSlot {
                         connection_id: 0,
+                        request_id: RequestId(0),
                         key_hash: slot.key_hash,
                         sequence: slot.sequence,
                         timestamp_ns: slot.timestamp_ns,
@@ -2050,6 +2235,7 @@ fn journal_stage_rotates_on_manual_request() {
         published += 1;
         producer.publish(InputSlot {
             connection_id: 1,
+            request_id: RequestId(0),
             key_hash: 1,
             sequence: 0,
             timestamp_ns: 1_000_000_000 + published,
@@ -2159,15 +2345,11 @@ fn adopted_rotation_splits_batch_at_announced_boundary() {
         WaitStrategy::SpinThenYield,
     );
 
-    let rotations: crate::pipeline::StreamMarkQueue =
-        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
-    rotations
-        .lock()
-        .unwrap()
-        .push_back(StreamMark::Rotate(AdoptedRotation {
-            boundary_seq: 2,
-            tail_hash: tail_at_2,
-        }));
+    let rotations = crate::pipeline::StreamMarks::shared();
+    rotations.push(StreamMark::Rotate(AdoptedRotation {
+        boundary_seq: 2,
+        tail_hash: tail_at_2,
+    }));
     stage.set_stream_marks(Arc::clone(&rotations));
 
     // Everything pre-published, sentinel last: one read_batch spans the
@@ -2254,18 +2436,14 @@ fn mid_batch_barrier_commits_only_the_encoded_prefix() {
         MAX_JOURNAL_BATCH,
         WaitStrategy::SpinThenYield,
     );
-    let marks: crate::pipeline::StreamMarkQueue =
-        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
-    marks
-        .lock()
-        .unwrap()
-        .push_back(StreamMark::Rotate(AdoptedRotation {
-            boundary_seq: 2,
-            // Not the local tail: the barrier submits the prefix, then
-            // the quiesced resolve rejects the rotation and the stage
-            // exits, leaving the cursor where the barrier put it.
-            tail_hash: [0xEEu8; 32],
-        }));
+    let marks = crate::pipeline::StreamMarks::shared();
+    marks.push(StreamMark::Rotate(AdoptedRotation {
+        boundary_seq: 2,
+        // Not the local tail: the barrier submits the prefix, then
+        // the quiesced resolve rejects the rotation and the stage
+        // exits, leaving the cursor where the barrier put it.
+        tail_hash: [0xEEu8; 32],
+    }));
     stage.set_stream_marks(Arc::clone(&marks));
 
     // All three pre-published, so one `read_batch` spans the boundary
@@ -2368,18 +2546,14 @@ fn barrier_fsync_state_pair_is_self_consistent_for_the_shadow() {
     );
     let (fsync_writer, fsync_reader) = melin_pipeline::seqlock::split(FsyncState::default());
     stage.set_chain_hash_lock(fsync_writer);
-    let marks: crate::pipeline::StreamMarkQueue =
-        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
-    marks
-        .lock()
-        .unwrap()
-        .push_back(StreamMark::Rotate(AdoptedRotation {
-            boundary_seq: 2,
-            // Wrong tail: barrier submits the prefix, then the quiesced
-            // resolve rejects the rotation and the stage exits with the
-            // barrier's pair as the last thing published.
-            tail_hash: [0xEEu8; 32],
-        }));
+    let marks = crate::pipeline::StreamMarks::shared();
+    marks.push(StreamMark::Rotate(AdoptedRotation {
+        boundary_seq: 2,
+        // Wrong tail: barrier submits the prefix, then the quiesced
+        // resolve rejects the rotation and the stage exits with the
+        // barrier's pair as the last thing published.
+        tail_hash: [0xEEu8; 32],
+    }));
     stage.set_stream_marks(Arc::clone(&marks));
 
     // One read batch spanning the boundary: seqs 1,2 | 3.
@@ -2557,16 +2731,12 @@ fn fsync_state_pairs_stay_consistent_across_adopted_rotations() {
     );
     let (fsync_writer, fsync_reader) = melin_pipeline::seqlock::split(FsyncState::default());
     stage.set_chain_hash_lock(fsync_writer);
-    let marks: crate::pipeline::StreamMarkQueue =
-        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    let marks = crate::pipeline::StreamMarks::shared();
     for (boundary_seq, tail_hash) in BOUNDARIES.into_iter().zip(tails) {
-        marks
-            .lock()
-            .unwrap()
-            .push_back(StreamMark::Rotate(AdoptedRotation {
-                boundary_seq,
-                tail_hash,
-            }));
+        marks.push(StreamMark::Rotate(AdoptedRotation {
+            boundary_seq,
+            tail_hash,
+        }));
     }
     stage.set_stream_marks(Arc::clone(&marks));
 
@@ -2767,19 +2937,15 @@ fn adopted_rotation_honors_second_mark_in_same_batch() {
         WaitStrategy::SpinThenYield,
     );
 
-    let marks: crate::pipeline::StreamMarkQueue =
-        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
-    {
-        let mut q = marks.lock().unwrap();
-        q.push_back(StreamMark::Rotate(AdoptedRotation {
-            boundary_seq: 2,
-            tail_hash: tail_at_2,
-        }));
-        q.push_back(StreamMark::ChainCheck {
-            sequence: 4,
-            chain_hash: tail_at_4,
-        });
-    }
+    let marks = crate::pipeline::StreamMarks::shared();
+    marks.push(StreamMark::Rotate(AdoptedRotation {
+        boundary_seq: 2,
+        tail_hash: tail_at_2,
+    }));
+    marks.push(StreamMark::ChainCheck {
+        sequence: 4,
+        chain_hash: tail_at_4,
+    });
     stage.set_stream_marks(Arc::clone(&marks));
 
     // Everything pre-published, sentinel last: one read_batch spans
@@ -2836,15 +3002,11 @@ fn adopted_rotation_with_zero_tail_skips_chain_comparison() {
         WaitStrategy::SpinThenYield,
     );
 
-    let rotations: crate::pipeline::StreamMarkQueue =
-        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
-    rotations
-        .lock()
-        .unwrap()
-        .push_back(StreamMark::Rotate(AdoptedRotation {
-            boundary_seq: 2,
-            tail_hash: [0u8; 32], // chain-less primary's sentinel
-        }));
+    let rotations = crate::pipeline::StreamMarks::shared();
+    rotations.push(StreamMark::Rotate(AdoptedRotation {
+        boundary_seq: 2,
+        tail_hash: [0u8; 32], // chain-less primary's sentinel
+    }));
     stage.set_stream_marks(Arc::clone(&rotations));
 
     for seq in 1..=3u64 {
@@ -2887,15 +3049,11 @@ fn adopted_rotation_with_wrong_tail_hash_is_divergence() {
         WaitStrategy::SpinThenYield,
     );
 
-    let rotations: crate::pipeline::StreamMarkQueue =
-        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
-    rotations
-        .lock()
-        .unwrap()
-        .push_back(StreamMark::Rotate(AdoptedRotation {
-            boundary_seq: 2,
-            tail_hash: [0xBBu8; 32], // not the replica's tail at 2
-        }));
+    let rotations = crate::pipeline::StreamMarks::shared();
+    rotations.push(StreamMark::Rotate(AdoptedRotation {
+        boundary_seq: 2,
+        tail_hash: [0xBBu8; 32], // not the replica's tail at 2
+    }));
     stage.set_stream_marks(Arc::clone(&rotations));
 
     for seq in 1..=3u64 {
@@ -2972,9 +3130,8 @@ fn chain_check_mark_verifies_at_exact_position() {
             MAX_JOURNAL_BATCH,
             WaitStrategy::SpinThenYield,
         );
-        let marks: crate::pipeline::StreamMarkQueue =
-            Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
-        marks.lock().unwrap().push_back(StreamMark::ChainCheck {
+        let marks = crate::pipeline::StreamMarks::shared();
+        marks.push(StreamMark::ChainCheck {
             sequence: 2,
             chain_hash: expected,
         });
@@ -3180,8 +3337,7 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
         false,
         Arc::new(crate::fence::FenceState::new(0)),
     );
-    let rotations: crate::pipeline::StreamMarkQueue =
-        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    let rotations = crate::pipeline::StreamMarks::shared();
     replica
         .journal_stage
         .set_stream_marks(Arc::clone(&rotations));
@@ -3225,6 +3381,7 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
                     for slot in slots {
                         replica_input.publish(InputSlot {
                             connection_id: 0,
+                            request_id: RequestId(0),
                             key_hash: slot.key_hash,
                             sequence: slot.sequence,
                             timestamp_ns: slot.timestamp_ns,
@@ -3240,23 +3397,17 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
                         crate::replication::protocol::PrimaryMessage::Rotate {
                             boundary_seq,
                             tail_hash,
-                        } => relay_rotations
-                            .lock()
-                            .unwrap()
-                            .push_back(StreamMark::Rotate(AdoptedRotation {
-                                boundary_seq,
-                                tail_hash,
-                            })),
+                        } => relay_rotations.push(StreamMark::Rotate(AdoptedRotation {
+                            boundary_seq,
+                            tail_hash,
+                        })),
                         crate::replication::protocol::PrimaryMessage::ChainCheck {
                             sequence,
                             chain_hash,
-                        } => relay_rotations
-                            .lock()
-                            .unwrap()
-                            .push_back(StreamMark::ChainCheck {
-                                sequence,
-                                chain_hash,
-                            }),
+                        } => relay_rotations.push(StreamMark::ChainCheck {
+                            sequence,
+                            chain_hash,
+                        }),
                         other => panic!("unexpected control frame on ring: {other:?}"),
                     }
                 }
@@ -3481,6 +3632,177 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
     );
 }
 
+/// Regression: a stream mark pushed while the replica's journal stage
+/// idles — the primary rotated at the tail of a burst, then went quiet
+/// — is adopted on the stage's next loop iteration, however starved its
+/// core. The receiver queues the `Rotate` after the boundary's entries,
+/// so the stage has usually synced them before the mark lands, and only
+/// the idle loop can apply it. That loop once probed the queue every
+/// 1024 idle iterations: a count, not a time bound — once the waiter
+/// yields, each iteration is a trip through the scheduler, and on a
+/// shared, busy core the rotation sat unadopted for tens of seconds,
+/// every one of them a window in which a promotion of this replica
+/// leaves the new primary without the boundary its peers adopted
+/// (`primary_driven_rotation_mirrors_segmentation_on_replica` timed out
+/// on exactly this under load).
+///
+/// Both halves of the old failure are set up rather than hoped for:
+/// the stage runs on one CPU shared with busy spinners, so every yield
+/// costs a round of their slices, and the mark is pushed just as the
+/// stage's idle count crosses 1024, where an amortized probe is
+/// furthest from its next run.
+#[cfg(all(
+    feature = "hash-chain",
+    not(feature = "no-persist"),
+    target_os = "linux"
+))]
+#[test]
+fn trailing_stream_mark_is_adopted_promptly_on_a_starved_core() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+    // Each adoption that misses the preparer allocates synchronously;
+    // keep that cheap on the starved core.
+    let _prealloc_guard = melin_journal::test_utils::PreallocOverrideGuard::new(1024 * 1024);
+
+    /// Pin the calling thread to `cpu`, literally. Not
+    /// `melin_app::affinity::pin_to_core`: that one records the home mask
+    /// and treats the core as a pipeline core, which a test's spinners
+    /// are not.
+    fn pin_to(cpu: usize) {
+        // SAFETY: a zeroed `cpu_set_t` is a valid empty set, and
+        // `sched_setaffinity(0, ..)` only touches the calling thread.
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_SET(cpu, &mut set);
+            assert_eq!(
+                libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set),
+                0,
+                "pin to CPU {cpu}"
+            );
+        }
+    }
+    // The first CPU this process may run on, so the test works under a
+    // restricted mask (taskset, a CI cgroup) too.
+    let cpu = melin_app::affinity::first_allowed_cpu().expect("at least one CPU allowed");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("trailing_mark.journal");
+    let writer = Writer::create_continuing(&path, 1, [0x3Cu8; 32], Some(0)).unwrap();
+    let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
+        .add_consumer()
+        .build(WaitStrategy::SpinThenYield);
+    let mut stage = JournalStage::new(
+        writer,
+        consumers.pop().unwrap(),
+        Duration::ZERO,
+        MAX_JOURNAL_BATCH,
+        WaitStrategy::SpinThenYield,
+    );
+    let marks = crate::pipeline::StreamMarks::shared();
+    stage.set_stream_marks(Arc::clone(&marks));
+    let util = stage.utilization();
+    let (fsync_writer, fsync) =
+        melin_pipeline::seqlock::split(crate::pipeline::FsyncState::default());
+    stage.set_chain_hash_lock(fsync_writer);
+
+    // The burst is in the ring before the stage starts, so its first
+    // iteration reads it and its idle-iteration count starts after it,
+    // at zero: the old probe's phase is known (below).
+    const BOUNDARY: u64 = 3;
+    for seq in 1..=BOUNDARY {
+        producer.publish(add_slot_with_seq(seq, seq, 1_000_000_000 + seq));
+    }
+
+    /// Raises its flags when dropped, so a failed wait or assertion does
+    /// not leave the spinners pinned and the stage running for the rest
+    /// of the test binary.
+    struct StopOnDrop(Vec<Arc<AtomicBool>>);
+    impl Drop for StopOnDrop {
+        fn drop(&mut self) {
+            for flag in &self.0 {
+                flag.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let _stop_on_drop = StopOnDrop(vec![Arc::clone(&stop), Arc::clone(&shutdown)]);
+    let spinners: Vec<_> = (0..8)
+        .map(|_| {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                pin_to(cpu);
+                while !stop.load(Ordering::Relaxed) {
+                    std::hint::spin_loop();
+                }
+            })
+        })
+        .collect();
+    let stage_shutdown = Arc::clone(&shutdown);
+    let t_stage = std::thread::spawn(move || {
+        pin_to(cpu);
+        stage.run(&stage_shutdown)
+    });
+
+    /// Poll `done` (no fixed sleep stands in for progress); how long it
+    /// took, or a panic naming `what` after a minute.
+    fn wait_for(what: &str, mut done: impl FnMut() -> bool) -> Duration {
+        let start = std::time::Instant::now();
+        while !done() {
+            assert!(
+                start.elapsed() < Duration::from_secs(60),
+                "timed out waiting for {what}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        start.elapsed()
+    }
+    wait_for("the burst to sync", || {
+        fsync.load().journal_seq.get() >= BOUNDARY
+    });
+    // Idle for exactly 1024 iterations — the flush that publishes this
+    // counter — so the stage is past its spin budget and yielding, and
+    // the amortized probe, had it been the only one, would next run
+    // 1024 yields from now. A mark pushed now can only be applied by
+    // the idle loop: the burst's sync point has passed without one.
+    wait_for("the stage to idle into its yield phase", || {
+        util.idle.load(Ordering::Relaxed) >= 1024
+    });
+    // The announced tail is the local one: this test is about *when*
+    // the mark is acted on, not the divergence check.
+    marks.push(StreamMark::Rotate(AdoptedRotation {
+        boundary_seq: BOUNDARY,
+        tail_hash: fsync.load().chain_hash,
+    }));
+    let took = wait_for("the trailing rotation to be adopted", || {
+        util.rotations_fast_path.load(Ordering::Relaxed)
+            + util.rotations_sync_fallback.load(Ordering::Relaxed)
+            == 1
+    });
+    // A handful of yields plus the rotation's own I/O on the starved
+    // core, against ~1024 yields for an amortized probe — each a round
+    // of the spinners' slices, i.e. well past this bound.
+    let bound = Duration::from_secs(5);
+    assert!(
+        took < bound,
+        "trailing rotation adopted after {took:?} on a starved core (bound {bound:?}): \
+         the idle loop is not probing the mark queue every iteration"
+    );
+
+    shutdown.store(true, Ordering::Relaxed);
+    t_stage
+        .join()
+        .unwrap()
+        .expect("stage exits cleanly after the adoption");
+    stop.store(true, Ordering::Relaxed);
+    for s in spinners {
+        s.join().unwrap();
+    }
+    assert_eq!(util.rotations_failed.load(Ordering::Relaxed), 0);
+    let archives = melin_journal::segment::list_archives(&path).unwrap();
+    assert_eq!(archives.len(), 1, "the trailing boundary was adopted");
+}
+
 /// Size-threshold rotation: setting a small `max_journal_bytes`
 /// causes the stage to rotate without operator intervention. The
 /// threshold is engaged after the first batch crosses the limit.
@@ -3512,6 +3834,7 @@ fn journal_stage_rotates_on_size_threshold() {
 
     producer.publish(InputSlot {
         connection_id: 1,
+        request_id: RequestId(0),
         key_hash: 1,
         sequence: 0,
         timestamp_ns: 1_000_000_000,
@@ -3630,9 +3953,7 @@ fn preparer_arms_for_size_and_replica_modes_only() {
     );
 
     let mut replica = mk_stage("replica.journal");
-    replica.set_stream_marks(Arc::new(std::sync::Mutex::new(
-        std::collections::VecDeque::new(),
-    )));
+    replica.set_stream_marks(crate::pipeline::StreamMarks::shared());
     replica.enable_preparer();
     assert!(
         replica.preparer_enabled(),
@@ -3993,6 +4314,7 @@ fn rotate_storm_collapses_to_single_rotation() {
         published += 1;
         producer.publish(InputSlot {
             connection_id: 1,
+            request_id: RequestId(0),
             key_hash: 1,
             sequence: 0,
             timestamp_ns: 1_000_000 + published,
@@ -4073,6 +4395,7 @@ fn post_rotation_events_land_in_live_not_archive() {
         published += 1;
         producer.publish(InputSlot {
             connection_id: 1,
+            request_id: RequestId(0),
             key_hash: 1,
             sequence: 0,
             timestamp_ns: 1_000_000 + published,
@@ -4176,6 +4499,7 @@ fn pipeline_journals_every_event_in_order() {
     for amount in [10u64, 20, 30, 40, 50] {
         producer.publish(InputSlot {
             connection_id: 1,
+            request_id: RequestId(0),
             key_hash: 0,
             sequence: 0,
             timestamp_ns: 1_000_000_000 + amount,
@@ -4222,6 +4546,7 @@ fn stats_query_reports_durable_wire_seq_across_recovery() {
     fn slot(event: JournalEvent<TestEvent>) -> TestInput {
         InputSlot {
             connection_id: 1,
+            request_id: RequestId(0),
             key_hash: 0,
             sequence: 0,
             timestamp_ns: 0,
@@ -4383,6 +4708,7 @@ fn a_query_changes_no_matching_stage_state() {
 
     let slot = |event, timestamp_ns| TestInput {
         connection_id: 1,
+        request_id: RequestId(0),
         key_hash: KEY,
         sequence: 0,
         timestamp_ns,

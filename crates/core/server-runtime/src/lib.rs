@@ -14,11 +14,13 @@
 
 pub mod ack_policy;
 pub mod admin;
+mod batch_boundary;
 mod buf_ring;
 pub mod client_auth;
 mod client_frames;
 pub mod connection_limit;
 mod durability_gate;
+pub mod early_reply;
 pub mod halt;
 pub mod layout;
 pub mod policy_control;
@@ -64,16 +66,6 @@ pub enum ControlEvent {
         writer: melin_wire_protocol::blocking::BlockingFrameWriter<Box<dyn std::io::Write + Send>>,
     },
     Disconnected {
-        connection_id: u64,
-    },
-    /// Reader → response: the input pipeline was full when this
-    /// connection's frame arrived; deliver a `ServerBusy` notice through
-    /// the normal egress path. Routed through the response stage so
-    /// exactly one thread ever writes a client socket — a reader-side
-    /// send could land between the two halves of a partially-flushed
-    /// response frame and permanently desync the client's length-prefix
-    /// framing (2026-08 io_uring audit, review finding F3).
-    PipelineBusy {
         connection_id: u64,
     },
 }

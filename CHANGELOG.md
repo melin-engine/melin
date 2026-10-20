@@ -25,6 +25,57 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   waiting for it to finish, with the error returned and the length
   non-zero by type (`sync_file_range` reads a zero length as "to the end
   of the file").
+- **`RequestId`**, in `melin-wire-protocol`'s `control` module (and
+  re-exported from `melin_transport_core::pipeline`): a request's
+  identifier, chosen by the client, which the ring slots now carry (see
+  Changed). In `melin-transport-core`, `InputSlot::client` and
+  `ClientOrigin` build a client request's slot whole, the way both of
+  the node's readers now publish one.
+- **Client protocol 1's pieces, in `melin-wire-protocol`** (see Changed):
+  `control_codec::CLIENT_PROTOCOL_VERSION`; the `Refused` frame
+  (`TransportResponse::Refused`, `TAG_REFUSED`, `decode_refused`) and
+  `control::RefusalKind`, with `control_codec::Refused` (a decoded
+  refusal), `BadRefusal` and `MAX_REFUSAL_REASON`; `REQUEST_ID_LEN`;
+  `TAG_REQUEST`, `framing::split_request` (the one parser of a request:
+  its ID and its body, or `NotARequest`), `framing::request_tag_and_id`
+  and `REQUEST_TAG_AND_ID_LEN`; `control_codec::terminal_request_id`
+  (the ID a final frame names); `control_codec::decode_challenge` (the
+  one parser of the node's challenge, or `BadChallenge`), with
+  `CHALLENGE_LEN`, `CHALLENGE_V0_LEN` and `CHALLENGE_NONCE_LEN`;
+  `RequestId` is ordered (`PartialOrd`, `Ord`); `BATCH_END_FRAME_LEN` and
+  `write_terminal_id`, for a stage that pre-encodes its batch
+  terminators; `MAX_CONTROL_FRAME_LEN`; and `RETIRED_TAGS`, tags no frame
+  may reuse. `melin-client` re-exports `RequestId`, `RefusalKind` and
+  `CLIENT_PROTOCOL_VERSION`.
+- **`melin_client::InFlight<T>`**: the requests in flight on one
+  connection, each with a value of the caller's, found again by the ID a
+  final frame names. The lookup the connections pair answers with, for a
+  caller that keeps per-request state of its own (`melin-bench` keeps
+  each request's send time and sequence in one).
+- **`melin_app::affinity::first_allowed_cpu`**: the lowest CPU the
+  calling thread may run on, a core that pinning to cannot fail on a
+  restricted host.
+- **Counters on `/metrics` for the requests a node answers without
+  applying them, and for parked connections**, beside
+  `melin_writes_refused_total`: `melin_requests_shed_total` (answered
+  `ServerBusy` on a full input ring, the requests buffered behind each
+  included), `melin_requests_refused_total` labelled
+  `kind="permission_denied"` or `kind="malformed"` (refused by the
+  application's decoder), `melin_requests_filtered_total` (filtered by
+  it), the gauge `melin_connections_parked` (connections the node has
+  stopped reading because it had no room to queue an answer for them)
+  and `melin_connection_parks_total`. None of these requests is
+  journaled, so the counters are their only trace; each is exported at
+  zero on a node that has had none, and on a replica. In
+  `melin-transport-core`'s `health` module, `IngressMetrics` holds them
+  and `IngressTally` is one receive's count of them.
+- **`melin-bench` reports shed requests**: a request the node answers
+  `ServerBusy` is counted as shed (`shed: N requests` in the summary,
+  `shed_requests` in the JSON results) instead of failing the run.
+- **`shm-proxy --trace` pairs each request with the final frame that
+  names it**, a busy or a refusal included, and reports requests it did
+  not track and answers it could not pair beside the requests never
+  answered.
 
 ### Changed
 
@@ -92,6 +143,134 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 - **The LAN bench suite calls a run whose replicas were evicted, missing
   or catching up `UNSTEADY`**, where it said `DEGRADED`, which read as
   degraded acks, a different thing.
+- **`InputSlot` and `OutputSlot` carry a `request_id: RequestId`**,
+  beside `connection_id`, in `melin-transport-core`. The matching stage
+  copies an input slot's ID into every output slot of its event, so an
+  event publisher sees it as it sees the connection. It is never
+  journaled or replicated, and is `RequestId(0)` on node events and
+  replicas; on a client's request it is the ID the request frame carries
+  (see client protocol 1 below). Source-breaking for code that builds either slot with a
+  struct literal: add the field, or build node events with
+  `InputSlot::node_event` and client requests with `InputSlot::client`.
+  A slot whose fixed fields grow by eight bytes can cross a cache-line
+  boundary: an `InputSlot` (padded to whole lines) grows by a line when
+  the application's event comes within eight bytes of one.
+- **Client protocol 1: every request carries an ID, and is answered once,
+  naming it.** Wire-breaking: upgrade clients with the nodes, admin tools
+  and the shm-proxy's client included. The node's challenge carries the
+  client protocol version ahead of its nonce; a client refuses a node of
+  another protocol before it signs anything (`Error::ProtocolVersion`,
+  which `Connection::connect_by` reports at once rather than retrying),
+  and a client of an earlier release refuses the new challenge. A request
+  is `[len][TAG_REQUEST][id: u64 LE][body]`; anything else after the
+  handshake (an empty frame, another tag, a request too short for its
+  ID) closes the connection, where it used to be dropped silently. Every
+  frame that ends a request's reply names the request: `BatchEnd` and
+  `BatchEndDegraded` carry its ID, and so does `ServerBusy`. A request the
+  application's decoder refuses is answered with a new `Refused` frame
+  carrying the refusal's kind (`PermissionDenied`, `Malformed`) and the
+  decoder's reason, cut to 255 bytes (the text is for people, may change
+  with any release, and reaches the authenticated client whose request
+  it was); one it filters is answered with an empty batch. A request
+  that finds the input ring full is answered `ServerBusy`, and the
+  connection is kept (on DPDK too, which used to close it). The
+  ordering contract: replies to requests the node accepted arrive in the
+  order the requests were sent; a request it did not accept (shed,
+  refused by the decoder, filtered, refused while halted) may be
+  answered before requests sent ahead of it, but never in the middle of
+  another request's reply (see below). A busy request was not applied,
+  but requests sent after it may have been, so a client whose requests
+  depend on each other's order stops on a busy, waits for the replies it
+  is owed, and resends from the busy request on. The sizes:
+  `REQUEST_HEADER_LEN` is 13, and
+  `MAX_REQUEST_BODY` 1015 (the ID comes out of the body; the frame limit
+  stays 1024), so an application that does not check its widest request
+  at build time fails at run time for a body between 1016 and 1023 bytes.
+  Source-breaking in `melin-wire-protocol`: `seal_request` and
+  `frame_request` take the request's ID; `TransportResponse::BatchEnd`,
+  `BatchEndDegraded` and `ServerBusy` carry a `RequestId`, and
+  `TransportResponse` gains `Refused` (exhaustive, so a new arm in every
+  match). In `melin-client`: `send` and `send_with` return the
+  request's `RequestId` on every surface (`Connection`,
+  `PolledConnection`, `StreamConnection` and the `Session` trait), each
+  connection numbering its requests from 1; `Frame` and `Reply` are
+  `Response`, `BatchEnd { id, ack }`, `ServerBusy { id }` and
+  `Refused { id, kind, reason }`; `Error::Refused` and
+  `Error::ProtocolVersion` are new variants of an exhaustive `Error`.
+  The connections check every final frame against the requests
+  outstanding: an answer for none, or a busy or refusal inside another
+  request's reply, is `Error::Protocol`. The convenience calls
+  (`request`, `request_batch`, `request_one`) refuse an answer for
+  another request as `Error::Protocol`, and report a refusal and a busy
+  as `Error::Refused` and `Error::ServerBusy`, which now leave the
+  connection usable (`ServerBusy` means resend, no longer reconnect).
+  `Error::NoReply` now means the node or the network stopped answering:
+  a node no longer drops a request silently.
+- **The shm-proxy's contract with the Aeron benchmark harness changes
+  with the protocol**: the harness's Java rig frames each request with
+  `TAG_REQUEST` and an ID, and reads the new final frames. The proxy's
+  flags and its `connected to` and `error:` lines on stderr are
+  unchanged; its `--trace` report gains two lines (see Added).
+- **A request the node answers without applying it no longer waits for
+  the replies to earlier requests, a request shed on a full input ring
+  takes the requests buffered behind it with it, and a reader that
+  cannot queue an answer parks the connection.** Every answer a reader
+  decides on without publishing the request (a write refused while
+  halted, a request the decoder refuses or filters, one shed on a full
+  input ring) goes to the response stage through one queue and out at
+  the first point between two requests' replies, even while the ack
+  policy holds a write the same client sent before it: its final frame
+  names it, so the client pairs it by ID. A refusal therefore no longer
+  waits behind a held write. Replies to requests the node accepted still
+  arrive in request order, and nothing falls inside another request's
+  reply. Every complete request already received behind a shed one is
+  answered `ServerBusy` too, read only as far as its ID, so nothing a
+  client pipelined behind a shed request in the same burst is applied
+  ahead of its resend; a request on a later receive may be. When the
+  queue is full (the response stage has stopped taking answers),
+  neither transport closes the connection, nor answers `ServerBusy` out
+  of band as a full refusal queue did (`melin_writes_refused_total`'s
+  help text no longer says so): it stops reading the connection,
+  leaving the request and everything behind it unread, and retries
+  until the queue has room (the kernel transport every millisecond, the
+  DPDK transport on every poll), while the client's sends back up under
+  TCP flow control. A parked connection is not dropped as idle, and on
+  DPDK not for the bytes it holds either: one receive can take a
+  connection past the 64 KiB a DPDK node otherwise lets it buffer before
+  it parks, and those bytes are the node's backlog. A connection parked
+  for over a second is degraded operation, reported at `warn` at most
+  once a second while any stays parked. On a host that filters
+  io_uring's cancel operation, a parked connection would go on being
+  read by the kernel transport, so after a second it is closed instead,
+  with a `warn` naming the cause. Shed, refused and filtered requests
+  and parked connections are counted on `/metrics` (see Added).
+- **`melin-server-runtime`'s refusal queue is the early-reply queue,
+  and its readers count what they answer early.** Source-breaking. The
+  queue moves out of the `halt` module into a new `early_reply` module:
+  `halt::Refusal` is `early_reply::EarlyReply` (a connection, the
+  request's ID and an `EarlyKind`: `Rejected`, `Filtered`, `Refused`,
+  `Busy`), with no input sequence; `RefusalSender` and `RefusalQueue`
+  are `EarlyReplySender` and `EarlyReplyQueue`;
+  `refusal_channel(matching_progress)` is
+  `early_reply_channel(capacity)`, taking the queue's capacity rather
+  than the matching stage's progress (`EARLY_REPLY_QUEUE_CAPACITY`, the
+  capacity a node gives it, is public); `RefusalQueue::idle_bound`,
+  `sync` and the bounded `release` are gone, as the response stages read
+  the queue through the crate's own types, which only send it between
+  two requests' replies. `response::Response`'s `refusals` field is
+  `early_replies`. `ControlEvent::PipelineBusy` is removed from the
+  crate-root `ControlEvent`: a busy no longer rides the control channel.
+  `reader::spawn_reader` and `dpdk_transport::run_dpdk_poll` take an
+  `Arc<IngressMetrics>` after the early-reply sender, the counters they
+  keep for the health endpoint. In `melin-transport-core`,
+  `health::HealthState` gains an `ingress: Arc<IngressMetrics>` field,
+  source-breaking for code that builds one with a struct literal.
+- **`melin_transport_core::pipeline::StreamMarkQueue` is
+  `Arc<StreamMarks>`**, no longer `Arc<Mutex<VecDeque<StreamMark>>>`.
+  Source-breaking: build one with `StreamMarks::shared()`, queue a mark
+  with `push`, and read what is queued with `queued()`. The queue keeps
+  a lock-free count of its marks, so the journal stage can look for one
+  on every idle iteration (see Fixed).
 
 ### Removed
 
@@ -109,6 +288,12 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   - to restore from a backup, copy it to the snapshot path.
 - **`ServerConfig::snapshot` and `ServerConfig::shadow_snapshot_path`**.
   Use `ServerConfig::store()`.
+- **`EngineError`**: `TransportResponse::EngineError`,
+  `control_codec::TAG_ENGINE_ERROR` (its value, `0x03`, is retired, in
+  `RETIRED_TAGS`), `melin_transport_core`'s `OutputPayload::EngineError`,
+  and `melin-client`'s `Frame::EngineError`, `Reply::EngineError` and
+  `Error::EngineError`. No node ever sent the frame, and the two client
+  surfaces disagreed on whether it ended a request.
 
 ### Fixed
 
@@ -144,6 +329,44 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   format: a save of 12.25 ms counted as 12, printed as `12,000`, and the
   closing summary failed to parse it, failing the suite. It now runs in
   the C locale throughout.
+- **A request the application's decoder refuses or filters is answered**
+  (S1 of the application API review). It used to be dropped without a
+  reply, so on a pipelining connection every later reply was paired with
+  the request before it.
+- **A `ServerBusy` no longer overtakes replies to earlier requests, nor
+  lands inside another request's reply** (finding 18 of the determinism
+  audit). It went out of band, on the response stage's control channel,
+  ahead of replies still in the output ring; it is now an early reply
+  like a halt refusal, naming its request, sent only between two
+  requests' replies.
+- **A refusal no longer waits behind a write the ack policy holds**
+  (finding 18 of the determinism audit). A halt refusal, and with request
+  IDs every other answer a node gives without applying a request, waited
+  for the replies to everything the client had sent before it; with
+  degraded acks off, behind a write held for a replica that had gone, it
+  waited until a replica came back or the operator swapped the policy.
+- **A DPDK node keeps a connection whose request finds the input ring
+  full**, answering it `ServerBusy` as the kernel transport does. It used
+  to close the connection, throwing away the replies to writes already
+  published.
+- **Requests pipelined behind one shed on a full input ring are
+  answered.** They waited unread until the client sent more bytes, which
+  a client waiting for its replies never does, so they ended in its
+  no-reply timeout. They are now shed with it (see Changed), on both
+  transports.
+- **A replica adopts the primary's last rotation promptly when the
+  stream then goes quiet.** The rotation arrives after the entries it
+  closes, so with nothing behind it only the journal stage's idle loop
+  could apply it, and that looked once every 1024 idle iterations: on a
+  busy core, where each idle iteration yields, that took tens of
+  seconds. Nothing journaled was affected (an entry past the boundary
+  forces the adoption first), and a replica restarted in that window
+  adopts the rotation when it reconnects. A replica promoted in it,
+  though, became a primary without the boundary, and every replica that
+  had adopted it diverged at its first entry past it (chain values are
+  scoped to their segment), each answered with an archive and a full
+  re-seed. The idle loop now looks on every iteration, at the cost of
+  one atomic load.
 
 ## [0.20.0] - 2026-10-19
 

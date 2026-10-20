@@ -367,6 +367,9 @@ kernel only when it has SQEs to hand over or an empty CQ, via
   clients: real p99. A per-CQE frame cap with a "pending parse" list is
   the same missing mechanism as the accepted `PipelineFull` strand issue
   in the io_uring audit — one fix covers both. Effort M, fairness only.
+  (The strand issue was fixed since, without such a list: request IDs
+  shed the stranded frames with the one that met the full ring. The
+  fairness half stands.)
 - 4 KiB provided buffers → one recv + task-work iteration + CQE + parse
   call + commit per 4 KiB when a backlog exists; 16 KiB buffers quarter
   the per-byte overhead in the falling-behind regime.

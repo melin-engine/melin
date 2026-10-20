@@ -11,9 +11,9 @@ off, no later event comes, and a write held for the signal is never answered.
 The audit looked for the same shape on the primary's replication sender, the
 replica's receiver, client ingress and the reply path, on both transports, and
 noted the other divergences it met on the way. Nothing below is in
-`transport-divergences-2026-10.md` or `halt-degraded-acks-2026-10.md`. Nothing
-here has a test yet, and nothing has been reproduced: every entry comes from
-reading the code.
+`transport-divergences-2026-10.md` or `halt-degraded-acks-2026-10.md`. Except
+where an entry says it is fixed, nothing here has a test yet, and nothing has
+been reproduced: every entry comes from reading the code.
 
 Each entry says which transports it affects, how sure we are, and a direction
 for the fix. **Verified** means the code path was traced end to end by a second
@@ -96,6 +96,17 @@ as "DPDK `PipelineFull` drops the client instead of sending ServerBusy").
 Direction: reparse the leftover once the ring has room, or decide that a
 ServerBusy ends the connection's pipeline and say so in the protocol.
 
+**Fixed**, by neither direction: by request IDs
+([request-ids-2026-10.md](request-ids-2026-10.md), step 4 on both
+transports). A request that finds the ring full is shed with every complete
+frame buffered behind it, each answered `ServerBusy { id }`, read only as far
+as its ID; nothing waits for more bytes. A full early-reply queue (the
+"refusal queue" above) parks the connection, and the reader retries its buffer
+without new bytes. The scenario is pinned by `reader.rs`'s
+`parking::a_parked_connection_resumes_without_new_bytes`, the shedding
+proptest, and `tests/request_ids.rs`'s
+`a_full_input_ring_answers_busy_and_keeps_the_connection` on both transports.
+
 ### The io_uring idle timeout is checked only when the reader wakes
 
 Reported; the scan's placement is verified. The `connection_timeout` scan in
@@ -147,6 +158,13 @@ reply is matched one request off.
 
 Direction: order ServerBusy behind the connection's pending replies, as
 refusals are, or end the connection on it as DPDK does.
+
+**Fixed**, as finding 18 of the determinism audit, by request IDs
+([request-ids-2026-10.md](request-ids-2026-10.md)): `ServerBusy` names its
+request, so a busy ahead of an earlier reply is paired with its own request
+(`melin-client` looks every final frame up by ID and no longer settles the
+oldest), and it goes through the early-reply queue, released only between two
+events' replies, never on the control channel.
 
 ### A leftover eviction flag evicts the next replica on a DPDK slot
 

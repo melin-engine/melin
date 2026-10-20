@@ -504,7 +504,7 @@ mod tests {
 
     use ed25519_dalek::{Signer, SigningKey};
     use melin_wire_protocol::control_codec::{
-        TAG_AUTH_FAILED, TAG_CHALLENGE, TAG_CHALLENGE_RESPONSE, TAG_SERVER_READY,
+        TAG_AUTH_FAILED, TAG_CHALLENGE_RESPONSE, TAG_SERVER_READY,
     };
 
     use crate::test_roles::desk_keys;
@@ -534,7 +534,9 @@ mod tests {
     /// `TAG_AUTH_FAILED`). Builds frames directly from the control-codec
     /// wire format so the test needs no application codec.
     fn client_authenticate(stream: &mut TcpStream, key: &SigningKey) -> u8 {
-        // Read the Challenge: [len:u32][TAG_CHALLENGE][nonce:32].
+        // Read the Challenge, through the wire protocol's one parser of
+        // it, which also checks the listener speaks this build's client
+        // protocol.
         let mut len_buf = [0u8; 4];
         stream.read_exact(&mut len_buf).expect("read challenge len");
         let frame_len = u32::from_le_bytes(len_buf) as usize;
@@ -542,12 +544,12 @@ mod tests {
         stream
             .read_exact(&mut frame_buf)
             .expect("read challenge payload");
-        assert_eq!(frame_buf[0], TAG_CHALLENGE, "expected Challenge");
-        let nonce = &frame_buf[1..33];
+        let nonce = melin_wire_protocol::control_codec::decode_challenge(&frame_buf)
+            .expect("expected Challenge");
 
         // Reply with a ChallengeResponse:
         // [len:u32][TAG_CHALLENGE_RESPONSE][sig:64][pubkey:32].
-        let signature = key.sign(nonce);
+        let signature = key.sign(&nonce);
         let mut frame = Vec::with_capacity(97);
         frame.push(TAG_CHALLENGE_RESPONSE);
         frame.extend_from_slice(&signature.to_bytes());

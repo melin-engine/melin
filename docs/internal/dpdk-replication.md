@@ -200,8 +200,9 @@ What else the poll thread does that could block for long:
   nonce), dropping a link: no I/O, no waits.
 - Closing every link on stop waits at most 100 ms, once, on the way out.
 - The client loop sharing the thread: every hand-off (the input ring, the
-  refusal queue, the tick, the response queue, the control channel) is a
-  non-blocking push or an unbounded send; nothing reads a file.
+  early-reply queue, the tick, the response queue, the control channel)
+  is a non-blocking push or an unbounded send (a full early-reply queue
+  parks the client connection rather than wait); nothing reads a file.
 - Logging: a log line on this thread is written by the application's
   subscriber, which the embedding binary chooses; lines here are
   lifecycle and per-connection events, not per-message.

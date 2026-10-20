@@ -44,6 +44,17 @@ the response stage (`ControlEvent::PipelineBusy`). The `client_frames.rs`
 contract ("signal backpressure, e.g. ServerBusy") matches io_uring. The DPDK
 `ControlEvent` has no `PipelineBusy` variant.
 
+**Fixed** by request IDs ([request-ids-2026-10.md](request-ids-2026-10.md)):
+`FrameAction::PipelineFull` and `ControlEvent::PipelineBusy` are gone, and a
+full ring is handled inside the shared `process_client_frames`, which sheds
+the request (and the complete frames buffered behind it) through the
+early-reply queue as `ServerBusy { id }` and returns `Continue`, so both
+transports keep the connection. A full early-reply queue parks the connection
+on both (`FrameAction::Park`). `tests/request_ids.rs`'s
+`a_full_input_ring_answers_busy_and_keeps_the_connection` runs on DPDK through
+the `dpdk` profile, and the poll loop's parking has its own netns cases in
+`dpdk_transport.rs`.
+
 ### Pipelined first request after auth can stall on DPDK
 
 `dpdk_transport.rs`. If the ChallengeResponse and the first request arrive in

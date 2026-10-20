@@ -239,6 +239,69 @@ fn a_dpdk_client_round_trips_through_a_dpdk_node() {
         let value = client.request_one(&GET_VALUE_REQUEST).expect("query");
         assert_eq!(value[0], KIND_RESP_VALUE);
         assert_eq!(value_of(&value), 42);
+
+        // Pipelined over the client NIC: each final frame names its
+        // request, a malformed one refused by the DPDK poll thread with
+        // the decoder's reason. The refusal is an early reply: sent
+        // between two batches, but in no order with the replies to
+        // requests sent before it, which it may overtake. So answers are
+        // paired by the ID they name, not by arrival, as the kernel-TCP
+        // twin of this check does (`server-runtime/tests/request_ids.rs`).
+        use melin_client::{Ack, Frame, RefusalKind, RequestId};
+        let sent = [
+            client.send(&GET_VALUE_REQUEST).expect("send"),
+            client.send(&[0x55]).expect("send"),
+            client.send(&GET_VALUE_REQUEST).expect("send"),
+        ];
+        // The connection's second to fourth requests: the query above
+        // took the first ID.
+        assert_eq!(sent, [RequestId(2), RequestId(3), RequestId(4)]);
+        #[derive(Debug, PartialEq)]
+        enum Answer {
+            Value(u64),
+            Refused,
+        }
+        let mut answers = Vec::new();
+        // The value of the batch in progress: its responses belong to
+        // the batch end that follows them.
+        let mut batch = Vec::new();
+        while answers.len() < sent.len() {
+            match client.next_frame().expect("an answer") {
+                Frame::Response(body) => {
+                    assert_eq!(body[0], KIND_RESP_VALUE);
+                    batch.push(value_of(body));
+                }
+                Frame::BatchEnd { id, ack } => {
+                    assert_eq!(ack, Ack::Policy, "{id:?}");
+                    let [value] = std::mem::take(&mut batch)[..] else {
+                        panic!("{id:?}: a query's batch holds its one value");
+                    };
+                    answers.push((id, Answer::Value(value)));
+                }
+                Frame::Refused { id, kind, reason } => {
+                    assert_eq!((kind, reason), (RefusalKind::Malformed, "unknown kind"));
+                    answers.push((id, Answer::Refused));
+                }
+                Frame::ServerBusy { id } => panic!("{id:?} shed: nothing fills the ring here"),
+            }
+        }
+        // The queries are sequenced, so their replies, unlike the
+        // refusal, keep the order they were sent in.
+        let queries: Vec<RequestId> = answers
+            .iter()
+            .filter(|(_, answer)| *answer != Answer::Refused)
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(queries, [sent[0], sent[2]], "the queries answered in order");
+        answers.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            answers,
+            [
+                (sent[0], Answer::Value(42)),
+                (sent[1], Answer::Refused),
+                (sent[2], Answer::Value(42)),
+            ]
+        );
     }
 
     drop(nic);

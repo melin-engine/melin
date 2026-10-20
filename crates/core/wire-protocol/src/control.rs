@@ -11,34 +11,95 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConnectionId(pub u64);
 
+/// A request's identifier, chosen by the client that sent it.
+///
+/// A transport correlation token: the node echoes it on the request's
+/// final reply frame and keeps no state about it, so it is never checked
+/// for uniqueness or order, and `0` is as valid as any other value. It
+/// means nothing outside its connection's lifetime, and is never
+/// journaled, replicated, or handed to the application.
+///
+/// A newtype so it cannot be swapped with the connection ID it travels
+/// beside. `u64` so a connection that lives for months at millions of
+/// requests a second never has to ask what happens when it wraps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RequestId(pub u64);
+
+/// The longest refusal reason a `Refused` frame carries, in bytes: its
+/// length goes on the wire as one byte.
+pub const MAX_REFUSAL_REASON: usize = u8::MAX as usize;
+
+/// Why the application's decoder refused a request, as a `Refused` frame
+/// says.
+///
+/// `#[repr(u8)]`, its discriminant the byte on the wire. `0` is no kind,
+/// so a zeroed byte is an error, not a refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum RefusalKind {
+    /// The key's role may not perform the request.
+    PermissionDenied = 1,
+    /// The request is not well-formed for the application the node runs.
+    Malformed = 2,
+}
+
+impl RefusalKind {
+    /// The kind's byte on the wire.
+    #[inline]
+    pub const fn to_byte(self) -> u8 {
+        self as u8
+    }
+
+    /// The kind a byte names, or `None` for a byte that names none
+    /// (`0` among them). A kind added to the enum is added here too; the
+    /// control codec's tests round-trip every kind and every byte.
+    #[inline]
+    pub const fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            1 => Some(Self::PermissionDenied),
+            2 => Some(Self::Malformed),
+            _ => None,
+        }
+    }
+}
+
 /// Transport-level response frames that the server runtime encodes
 /// directly, bypassing the application's `ResponseEncoder` trait.
 ///
 /// These are the pipeline-control and auth-handshake messages that
 /// every server sends regardless of the application it hosts.
+///
+/// Every frame that ends a request's reply names the request: the batch
+/// terminators, `ServerBusy` and `Refused` carry its [`RequestId`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportResponse {
     /// Periodic keep-alive sent to idle connections.
     Heartbeat,
-    /// Marks the end of a response batch for a single request, backed as
+    /// Marks the end of the response batch for request `id`, backed as
     /// the ack policy in force requires.
-    BatchEnd,
-    /// Marks the end of a response batch for a single request that only
+    BatchEnd { id: RequestId },
+    /// Marks the end of the response batch for request `id` that only
     /// the primary's own disk backs, a weaker guarantee than the ack
     /// policy in force. Sent by a primary halted for want of a replica
     /// for a request it had sequenced before the halt (or a query that
     /// may reflect such requests), once its own journal holds it. A
     /// client that needs the policy's guarantee treats the request as
     /// unconfirmed and reconciles.
-    BatchEndDegraded,
-    /// The matching stage encountered an internal error processing
-    /// the request. The client should not retry.
-    EngineError,
-    /// The server's accept queue is full; the client should back off
-    /// and reconnect.
-    ServerBusy,
+    BatchEndDegraded { id: RequestId },
+    /// Request `id` was shed at ingress: not applied, safe to resend.
+    /// The connection stays open.
+    ServerBusy { id: RequestId },
+    /// The application's decoder refused request `id`: not applied.
+    /// `reason` is the decoder's text, for people; the encoder truncates
+    /// it to [`MAX_REFUSAL_REASON`] bytes on a character boundary.
+    Refused {
+        id: RequestId,
+        kind: RefusalKind,
+        reason: &'static str,
+    },
     /// Auth handshake: server → client challenge carrying a 32-byte
-    /// random nonce.
+    /// random nonce. Encoded with the node's client protocol version in
+    /// front of the nonce.
     Challenge { nonce: [u8; 32] },
     /// Auth handshake: server → client rejection.
     AuthFailed,

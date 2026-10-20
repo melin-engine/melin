@@ -49,7 +49,10 @@ way, and refusals stop waiting behind either.
   `two-disks`, the first slot in flight when the last replica leaves
   parks the stage until a replica returns or the policy is swapped.
   Every refusal (`RefusalQueue`) and every query reply queued after
-  it waits for the whole halt.
+  it waits for the whole halt. (Refusals no longer do since request IDs
+  landed: they are early replies, released between two events' replies
+  and during a gate wait at a boundary, in no input-sequence order; see
+  [request-ids-2026-10.md](request-ids-2026-10.md), decision 6.)
 - **Every slot is gated, queries included.** `slot_needs_gate` compares
   the slot's `wire_seq` with the durable position. A query's slot
   carries the last sequenced event's `wire_seq` (`pipeline.rs`:
@@ -235,14 +238,16 @@ shadow stage's state) that the former item listed. That path gives a
 fully confirmed but stale answer at the cost of a second read path. The
 degraded answer is current, marked, and needs no new path.
 
-### 4. Refusals stop waiting as a consequence
+### 4. Refusals stop waiting
 
-Refusals keep their place in each connection's order. They no longer
-wait for the halt because the slots ahead of them now drain after one
-primary fsync instead of waiting for a replica. The per-connection
-release designs listed in the former item (a refusal released from inside
-the gate wait, or a stage that parks gated replies per connection) are
-then unnecessary.
+*Superseded by decision 6 of the [request-ID plan](request-ids-2026-10.md)
+(its step 3).* This decision kept refusals in each connection's order and
+argued they stopped waiting for the halt because the slots ahead of them
+now drained after one primary fsync. Since every final frame names its
+request, a refusal no longer keeps any place: it is an early reply, sent
+at the first point between two events' replies, including from inside a
+gate wait, so it never waits for a write the ack policy holds, with
+degraded release on or off.
 
 A refusal always ends in a plain `BatchEnd`, never `BatchEndDegraded`.
 It never enters the output ring and is never gated: it is a definite

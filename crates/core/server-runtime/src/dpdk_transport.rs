@@ -45,6 +45,7 @@ use melin_app::auth::{AuthorizedKeys, ClientRole, KeyRole, RoleId};
 use melin_app::unix_epoch_nanos;
 use melin_dpdk::transport::DpdkTransport;
 use melin_pipeline::ring;
+use melin_transport_core::health::IngressMetrics;
 use melin_transport_core::pipeline::InputSlot;
 use melin_transport_core::tick::TickSchedule;
 #[cfg(feature = "latency-trace")]
@@ -59,15 +60,29 @@ use melin_dpdk::SocketHandle;
 use tracing::{debug, warn};
 
 use crate::dpdk_response::{ControlEvent, TxFrame};
-use crate::halt::{HaltGate, RefusalSender};
+use crate::early_reply::EarlyReplySender;
+use crate::halt::HaltGate;
 use crate::policy_control::AckPolicyPublisher;
 
 use crate::client_auth::MAX_AUTH_FRAME;
-use crate::client_frames::MAX_FRAME_SIZE;
+use crate::client_frames::{ClientIngress, LongParkReport, MAX_FRAME_SIZE};
 
 /// Auth handshake timeout. Connections that don't complete auth within
 /// this window are dropped.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A connection whose buffer holds this many bytes before a receive is
+/// dropped: a bound on what one client can make the node hold. Not a
+/// parked connection, though: its buffer is the node's backlog, which a
+/// single receive can take past this bound before the park (the socket's
+/// receive buffer is sized apart, `--dpdk-client-rx-buf-kib`).
+///
+/// A connection that is read leaves less than one frame buffered (its
+/// frames are parsed until one is incomplete, or it parks or closes), so
+/// the one producer left is the receive that completes the auth frame:
+/// what a client pipelined behind it in that receive waits a poll
+/// iteration unparsed, and this bound drops it at that point.
+const MAX_PARSE_BUF: usize = 65536;
 
 /// Auth handshake state machine. Drives the Challenge → ChallengeResponse
 /// → ServerReady flow non-blockingly across poll iterations.
@@ -81,7 +96,16 @@ enum AuthState {
         accepted_at: Instant,
     },
     /// Auth completed successfully. Connection is ready for requests.
-    Authenticated { role: ClientRole<RoleId> },
+    Authenticated {
+        role: ClientRole<RoleId>,
+        /// Since when the connection has been parked (see `client_frames`):
+        /// an early reply had nowhere to go, so its buffer is retried every
+        /// `PARK_RETRY_INTERVAL` poll iterations and nothing more is read
+        /// from it until the retry gets through. `None` while it is read
+        /// as usual. Here rather than beside `auth`, so only an
+        /// authenticated connection can be parked.
+        parked: Option<Instant>,
+    },
     /// Auth failed and `AuthFailed` has been queued. Terminal: nothing
     /// the client sends is read any more, so it gets one attempt per
     /// connection, as on the io_uring path.
@@ -107,8 +131,10 @@ struct ConnectionState {
     /// copied into every InputSlot as the submitting key's identity.
     key_hash: u64,
     /// Incremental frame parsing state: accumulates bytes until a
-    /// complete length-prefixed frame is available.
-    parse_buf: Vec<u8>,
+    /// complete length-prefixed frame is available, and what is left of a
+    /// shed tail (see `client_frames`). The auth handshake reads its frame
+    /// from the same buffer, before any request.
+    ingress: ClientIngress,
     /// Last time data was received from this connection. Used for
     /// idle timeout (drops connections that stop sending).
     last_activity: Instant,
@@ -141,10 +167,14 @@ pub fn run_dpdk_poll<A: Application>(
     mut transport: DpdkTransport,
     mut producer: ring::Producer<InputSlot<A::Event>>,
     decoder: crate::reader::RequestDecoderArc<A>,
-    // While it refuses writes, they are answered through `refusals`
-    // instead of published — see `crate::halt`.
+    // Every request not published — filtered or refused by the decoder,
+    // refused while `halt` refuses writes, shed on a full input ring — is
+    // answered through `early_replies` — see `crate::halt`.
     halt: HaltGate,
-    mut refusals: RefusalSender<A::Report>,
+    mut early_replies: EarlyReplySender<A::Report>,
+    // What this thread sheds, filters and refuses, and the connections it
+    // parks, counted for the health endpoint.
+    metrics: Arc<IngressMetrics>,
     // The admin `ACK-POLICY` command's requests, journaled by this thread
     // as the ring's one producer — see `crate::policy_control`.
     mut ack_policy: AckPolicyPublisher,
@@ -248,6 +278,20 @@ pub fn run_dpdk_poll<A: Application>(
     // polls/sec) is still orders of magnitude tighter than the deadline.
     let mut slow_check_counter: u32 = 0;
     const SLOW_CHECK_INTERVAL: u32 = 1024 * 1024;
+    // A parked connection's buffer is retried on one poll iteration in
+    // this many, not on each: a retry decodes the frame it parked on
+    // again, and while the response stage is stalled every parked
+    // connection would otherwise cost the poll thread a decode per
+    // iteration. A resume waits at most this many iterations, the unit
+    // the loop's other timers are counted in, after a stall long enough
+    // to have filled the early-reply queue. A divisor of the slow
+    // checks' interval, so every slow-check pass is a retry pass and finds
+    // each parked connection's park time for the long-park report.
+    const PARK_RETRY_INTERVAL: u32 = 256;
+    const _: () = assert!(SLOW_CHECK_INTERVAL.is_multiple_of(PARK_RETRY_INTERVAL));
+    // Connections parked for longer than `LONG_PARK` are reported on the
+    // slow checks' cadence, at most once per `LONG_PARK`.
+    let mut long_park_report = LongParkReport::default();
     if tick_enabled {
         tracing::info!(
             cadence_ms = cadence.as_millis() as u64,
@@ -410,9 +454,11 @@ pub fn run_dpdk_poll<A: Application>(
                 key_hash: 0,
                 // Reuse a pre-allocated buffer from the pool, or allocate
                 // if the pool is exhausted (more connections than pre-allocated).
-                parse_buf: parse_buf_pool
-                    .pop()
-                    .unwrap_or_else(|| Vec::with_capacity(MAX_FRAME_SIZE + 4)),
+                ingress: ClientIngress::new(
+                    parse_buf_pool
+                        .pop()
+                        .unwrap_or_else(|| Vec::with_capacity(MAX_FRAME_SIZE + 4)),
+                ),
                 last_activity: Instant::now(),
             });
             connection_count += 1;
@@ -434,6 +480,16 @@ pub fn run_dpdk_poll<A: Application>(
 
         slow_check_counter = slow_check_counter.wrapping_add(1);
         let do_slow_checks = slow_check_counter.is_multiple_of(SLOW_CHECK_INTERVAL);
+        // The slow checks' one clock read for the long-park report, and
+        // the connections found parked past `LONG_PARK` on this pass.
+        let slow_check_now = do_slow_checks.then(Instant::now);
+        let mut long_parked = 0usize;
+        // Whether this pass retries parked connections' buffers.
+        let retry_parked = slow_check_counter.is_multiple_of(PARK_RETRY_INTERVAL);
+        // Connections parked after this pass, for the gauge: every parked
+        // connection is counted on every pass, retried or not, so the
+        // count is whole.
+        let mut parked_now = 0u64;
 
         // Per-connection batching with a visibility-delay cap happens
         // inside `process_trading_frames`. The previous design opened a
@@ -527,76 +583,34 @@ pub fn run_dpdk_poll<A: Application>(
                 continue;
             }
 
-            // Guard against unbounded buffer growth — check before recv.
-            const MAX_PARSE_BUF: usize = 65536;
-            if conn.parse_buf.len() >= MAX_PARSE_BUF {
-                debug!(
-                    connection_id = conn.connection_id.0,
-                    buf_len = conn.parse_buf.len(),
-                    "parse buffer exceeded limit, dropping connection"
-                );
-                transport.close(conn.handle);
-                let _ = control_tx.send(ControlEvent::Disconnected {
-                    connection_id: conn.connection_id.0,
-                });
-                id_to_handle.remove(&conn.connection_id.0);
-                release_slot(
-                    &mut connections,
-                    idx,
-                    &mut parse_buf_pool,
-                    &mut connection_count,
-                );
-                continue;
-            }
-
-            // Read directly into parse_buf, skipping the intermediate
-            // read_buf stack copy.
-            let n = transport.recv_into_vec(conn.handle, &mut conn.parse_buf);
-            if n > 0 {
-                conn.last_activity = Instant::now();
-                #[cfg(feature = "latency-trace")]
-                {
-                    work_done_this_iter = true;
+            // A parked connection is not read: what it has buffered is
+            // retried below, with no new bytes, on a retry pass
+            // (`PARK_RETRY_INTERVAL`), and only counted on the others; the
+            // client's bytes stay in the socket, whose receive window
+            // closes on it. This comes before the buffer cap: one receive
+            // can take the buffer past the cap before the connection
+            // parks, and those bytes are the node's backlog, not a
+            // client's abuse. And before the idle check: the client is not
+            // idle, the node is not reading it.
+            let parked = matches!(
+                conn.auth,
+                AuthState::Authenticated {
+                    parked: Some(_),
+                    ..
                 }
-            }
-            if n == 0 {
-                // Gone, or half-closed: the client's FIN leaves the socket
-                // in close-wait, which the stack still counts as active,
-                // and with its data drained the connection is over, as it
-                // is on kernel TCP at EOF. Without this the slot was held
-                // until the next heartbeat's RST, or for good with
-                // heartbeats off.
-                if !transport.is_active(conn.handle) || transport.peer_closed(conn.handle) {
+            );
+            if parked {
+                if !retry_parked {
+                    parked_now += 1;
+                    continue;
+                }
+            } else {
+                // Guard against unbounded buffer growth — check before recv.
+                if conn.ingress.len() >= MAX_PARSE_BUF {
                     debug!(
                         connection_id = conn.connection_id.0,
-                        addr = %conn.addr,
-                        "DPDK: connection closed"
-                    );
-                    if matches!(conn.auth, AuthState::Authenticated { .. }) {
-                        let _ = control_tx.send(ControlEvent::Disconnected {
-                            connection_id: conn.connection_id.0,
-                        });
-                    }
-                    transport.close(conn.handle);
-                    id_to_handle.remove(&conn.connection_id.0);
-                    release_slot(
-                        &mut connections,
-                        idx,
-                        &mut parse_buf_pool,
-                        &mut connection_count,
-                    );
-                }
-                // Check idle timeout when no data was received. Throttled
-                // to avoid a per-poll `Instant::now()` via `elapsed()`.
-                else if do_slow_checks
-                    && let Some(timeout) = connection_timeout
-                    && matches!(conn.auth, AuthState::Authenticated { .. })
-                    && conn.last_activity.elapsed() > timeout
-                {
-                    debug!(
-                        connection_id = conn.connection_id.0,
-                        addr = %conn.addr,
-                        "DPDK: idle timeout, dropping connection"
+                        buf_len = conn.ingress.len(),
+                        "parse buffer exceeded limit, dropping connection"
                     );
                     transport.close(conn.handle);
                     let _ = control_tx.send(ControlEvent::Disconnected {
@@ -609,13 +623,77 @@ pub fn run_dpdk_poll<A: Application>(
                         &mut parse_buf_pool,
                         &mut connection_count,
                     );
+                    continue;
                 }
-                continue;
+
+                // Read directly into parse_buf, skipping the intermediate
+                // read_buf stack copy.
+                let n = transport.recv_into_vec(conn.handle, conn.ingress.buf_mut());
+                if n == 0 {
+                    // Gone, or half-closed: the client's FIN leaves the
+                    // socket in close-wait, which the stack still counts
+                    // as active, and with its data drained the connection
+                    // is over, as it is on kernel TCP at EOF. Without this
+                    // the slot was held until the next heartbeat's RST, or
+                    // for good with heartbeats off.
+                    if !transport.is_active(conn.handle) || transport.peer_closed(conn.handle) {
+                        debug!(
+                            connection_id = conn.connection_id.0,
+                            addr = %conn.addr,
+                            "DPDK: connection closed"
+                        );
+                        if matches!(conn.auth, AuthState::Authenticated { .. }) {
+                            let _ = control_tx.send(ControlEvent::Disconnected {
+                                connection_id: conn.connection_id.0,
+                            });
+                        }
+                        transport.close(conn.handle);
+                        id_to_handle.remove(&conn.connection_id.0);
+                        release_slot(
+                            &mut connections,
+                            idx,
+                            &mut parse_buf_pool,
+                            &mut connection_count,
+                        );
+                    }
+                    // Check idle timeout when no data was received.
+                    // Throttled to avoid a per-poll `Instant::now()` via
+                    // `elapsed()`.
+                    else if do_slow_checks
+                        && let Some(timeout) = connection_timeout
+                        && matches!(conn.auth, AuthState::Authenticated { .. })
+                        && conn.last_activity.elapsed() > timeout
+                    {
+                        debug!(
+                            connection_id = conn.connection_id.0,
+                            addr = %conn.addr,
+                            "DPDK: idle timeout, dropping connection"
+                        );
+                        transport.close(conn.handle);
+                        let _ = control_tx.send(ControlEvent::Disconnected {
+                            connection_id: conn.connection_id.0,
+                        });
+                        id_to_handle.remove(&conn.connection_id.0);
+                        release_slot(
+                            &mut connections,
+                            idx,
+                            &mut parse_buf_pool,
+                            &mut connection_count,
+                        );
+                    }
+                    continue;
+                }
+                conn.last_activity = Instant::now();
+                #[cfg(feature = "latency-trace")]
+                {
+                    work_done_this_iter = true;
+                }
             }
 
             // Trace timestamp: the moment `recv_into_vec` handed us these
-            // bytes. Captured once per recv — not per frame — and stamped
-            // onto every InputSlot parsed below, so the reader-ingest and
+            // bytes, or that a parked connection's buffer is retried.
+            // Captured once per recv — not per frame — and stamped onto
+            // every InputSlot parsed below, so the reader-ingest and
             // server-e2e stages measure from true wire receipt (frame decode
             // included) rather than re-sampling after each decode.
             #[allow(clippy::let_unit_value)] // ZST when latency-trace is off
@@ -623,7 +701,7 @@ pub fn run_dpdk_poll<A: Application>(
 
             // Process frames based on auth state.
             let was_waiting = matches!(conn.auth, AuthState::WaitingForResponse { .. });
-            match &conn.auth {
+            match &mut conn.auth {
                 AuthState::WaitingForResponse { .. } => {
                     // Try to extract the ChallengeResponse frame.
                     process_auth_frame(
@@ -637,19 +715,20 @@ pub fn run_dpdk_poll<A: Application>(
                 }
                 // Terminal: whatever the client sends after a failed
                 // attempt is discarded unread.
-                AuthState::Rejected { .. } => conn.parse_buf.clear(),
-                AuthState::Authenticated { role } => {
+                AuthState::Rejected { .. } => conn.ingress.buf_mut().clear(),
+                AuthState::Authenticated { role, parked } => {
                     use crate::client_frames::{FrameAction, process_client_frames};
                     let role = *role;
                     let action = process_client_frames::<A>(
-                        &mut conn.parse_buf,
+                        &mut conn.ingress,
                         conn.connection_id.0,
                         conn.key_hash,
                         role,
                         &mut producer,
                         &*decoder,
                         &halt,
-                        &mut refusals,
+                        &mut early_replies,
+                        &metrics,
                         *batch_wall_ns.get_or_insert_with(unix_epoch_nanos),
                         recv_ts,
                         #[cfg(feature = "latency-trace")]
@@ -657,13 +736,54 @@ pub fn run_dpdk_poll<A: Application>(
                         #[cfg(feature = "tick-to-trade")]
                         &mut ingest_rec,
                     );
-                    if matches!(action, FrameAction::Disconnect | FrameAction::PipelineFull) {
-                        if matches!(action, FrameAction::PipelineFull) {
-                            debug!(
-                                connection_id = conn.connection_id.0,
-                                "DPDK: pipeline full, dropping connection"
-                            );
+                    // A full input ring is answered with a busy through
+                    // the early-reply queue, as is every frame buffered
+                    // behind the shed request, and the connection is kept
+                    // (`Continue`).
+                    let close = match action {
+                        FrameAction::Continue => {
+                            // A parked connection whose retry got through
+                            // is read again from the next iteration. Not
+                            // read while parked, its idle clock restarts
+                            // now, not at its last bytes.
+                            if parked.take().is_some() {
+                                conn.last_activity = Instant::now();
+                                debug!(
+                                    connection_id = conn.connection_id.0,
+                                    "DPDK: connection resumed"
+                                );
+                            }
+                            false
                         }
+                        FrameAction::Disconnect => true,
+                        // An answer with nowhere to go: stop reading the
+                        // connection, and retry its buffer on the retry
+                        // passes from here on (see `parked` above). One parked
+                        // since it first parked, past `LONG_PARK`, is
+                        // counted for the report below.
+                        FrameAction::Park => {
+                            parked_now += 1;
+                            match *parked {
+                                None => {
+                                    *parked = Some(Instant::now());
+                                    metrics.record_park();
+                                    debug!(
+                                        connection_id = conn.connection_id.0,
+                                        "DPDK: connection parked"
+                                    );
+                                }
+                                Some(since) => {
+                                    if let Some(now) = slow_check_now
+                                        && LongParkReport::parked_long(since, now)
+                                    {
+                                        long_parked += 1;
+                                    }
+                                }
+                            }
+                            false
+                        }
+                    };
+                    if close {
                         transport.close(conn.handle);
                         let _ = control_tx.send(ControlEvent::Disconnected {
                             connection_id: conn.connection_id.0,
@@ -684,6 +804,11 @@ pub fn run_dpdk_poll<A: Application>(
             if was_waiting && matches!(conn.auth, AuthState::Authenticated { .. }) {
                 active_connections.fetch_add(1, Ordering::Relaxed);
             }
+        }
+        // A load and no store while the count is unchanged.
+        metrics.set_parked(parked_now);
+        if let Some(now) = slow_check_now {
+            long_park_report.report(long_parked, now);
         }
 
         // Final drain + poll before the replication tick so fresh ACK
@@ -814,7 +939,7 @@ fn process_auth_frame(
     };
 
     let (role, public_key_bytes) = match evaluate_auth_frame(
-        &mut conn.parse_buf,
+        conn.ingress.buf_mut(),
         &nonce,
         authorized_keys,
         conn.connection_id.0,
@@ -824,7 +949,7 @@ fn process_auth_frame(
             send_auth_failed(conn, transport);
             // One attempt per connection: the poll loop closes it once
             // the peer has the AuthFailed frame.
-            conn.parse_buf.clear();
+            conn.ingress.buf_mut().clear();
             conn.auth = AuthState::Rejected { accepted_at };
             return;
         }
@@ -848,7 +973,7 @@ fn process_auth_frame(
     // Transition to authenticated state, under the identity the
     // application sees as `ApplyCtx::key_hash`.
     conn.key_hash = melin_app::key_hash(&public_key_bytes);
-    conn.auth = AuthState::Authenticated { role };
+    conn.auth = AuthState::Authenticated { role, parked: None };
 
     // Register with the response stage and ID map — before this thread
     // parses a single request of the connection, and keep it that way:
@@ -876,9 +1001,8 @@ fn release_slot(
     parse_buf_pool: &mut Vec<Vec<u8>>,
     connection_count: &mut usize,
 ) {
-    if let Some(mut removed) = connections[idx].take() {
-        removed.parse_buf.clear();
-        parse_buf_pool.push(removed.parse_buf);
+    if let Some(removed) = connections[idx].take() {
+        parse_buf_pool.push(removed.ingress.into_buf());
         *connection_count -= 1;
     }
 }
@@ -1097,6 +1221,769 @@ mod tests {
 
             let mut at_cap = (MAX_AUTH_FRAME as u32).to_le_bytes().to_vec();
             assert!(matches!(evaluate(&mut at_cap), AuthVerdict::Incomplete));
+        }
+    }
+
+    /// Parking on the poll loop: a connection whose early reply has
+    /// nowhere to go is not read, and its buffer is retried on every
+    /// `PARK_RETRY_INTERVAL`-th iteration until the response stage takes
+    /// early replies again.
+    ///
+    /// A running node never gets there on demand: its response stage takes
+    /// early replies between any two events. So these run the poll loop
+    /// on a node slot of the netns runner, with the DPDK response stage
+    /// held at its test seam (`pause_after_control_drain`) and a small
+    /// early-reply queue, and the test plays the matching stage, which
+    /// acknowledges every write. The client is a kernel one on the
+    /// runner's bridge, as a node test's is, whose send buffer is kept
+    /// small so that it stalls soon after the node stops reading.
+    ///
+    /// The shared shedding and parking logic (`client_frames`) is tested
+    /// on every host; what is left here is the poll loop's part: not
+    /// reading, the retry, the idle check and the buffer cap.
+    mod parking {
+        use super::*;
+
+        use std::net::TcpStream;
+        use std::os::fd::AsRawFd;
+        use std::sync::atomic::AtomicU64;
+        use std::sync::{Condvar, Mutex};
+        use std::thread::JoinHandle;
+
+        use counter_server::{
+            Counter, CounterQuery, CounterReport, CounterRole, KIND_RESP_ACK, RequestDecoder,
+            ResponseEncoder, increment_request,
+        };
+        use melin_client::{
+            Frame, NonBlockingTcp, PolledConnection, REQUEST_HEADER_LEN, RefusalKind, RequestId,
+            SigningKey, StreamConnection, key,
+        };
+        use melin_dpdk::{DpdkConfig, DpdkShared, SocketBuffers};
+        use melin_pipeline::ring::DisruptorBuilder;
+        use melin_pipeline::spsc;
+        use melin_pipeline::wait::WaitStrategy;
+        use melin_transport_core::fence::FenceState;
+        use melin_transport_core::pipeline::{OutputPayload, OutputSlot, StageUtilization};
+        use melin_transport_core::{DurableWireSeqCursor, WireSeq};
+
+        use crate::ack_policy::AckPolicy;
+        use crate::client_frames::MAX_REQUEST_BODY;
+        use crate::dpdk_response::TxFrame;
+        use crate::durability_gate::{GatePolicy, GateStart};
+        use crate::early_reply::early_reply_channel;
+        use melin_transport_core::lineage::forced_policy_cell;
+
+        /// The client's key, listed as a counter writer.
+        const WRITER: [u8; 32] = [0xA1; 32];
+
+        /// A request the counter's decoder refuses (an unknown kind), as
+        /// wide as a request goes, so that a few of them fill a buffer:
+        /// each is answered early, with a `Refused`.
+        const MALFORMED: [u8; MAX_REQUEST_BODY] = [0x55; MAX_REQUEST_BODY];
+
+        /// How long the client's backlog must stay put for the test to
+        /// take the node to have stopped reading: the poll loop reads a
+        /// connection on every iteration, microseconds apart.
+        const QUIET: Duration = Duration::from_millis(500);
+
+        /// Bounds every wait for something that must happen.
+        const PATIENCE: Duration = Duration::from_secs(30);
+
+        /// The client's socket send buffer, asked small so that the client
+        /// stalls soon after the node's receive buffer is full (the kernel
+        /// doubles what is asked).
+        const CLIENT_SNDBUF: libc::c_int = 32 * 1024;
+
+        /// The DPDK response stage's seam: held, or let through a number
+        /// of iterations, or let go for good. A `Mutex` and `Condvar`
+        /// rather than atomics: the stage sleeps while held, and the test
+        /// wakes it.
+        #[derive(Clone, Default)]
+        struct Hold(Arc<(Mutex<HoldState>, Condvar)>);
+
+        #[derive(Default)]
+        struct HoldState {
+            released: bool,
+            /// Iterations the stage may still take while held. `u64`, a
+            /// count no test approaches.
+            permits: u64,
+        }
+
+        impl Hold {
+            /// The seam's closure: wait while held with no permit.
+            fn pause(&self) {
+                let (lock, wake) = &*self.0;
+                let mut state = lock.lock().expect("hold lock");
+                while !state.released && state.permits == 0 {
+                    state = wake.wait(state).expect("hold lock");
+                }
+                state.permits = state.permits.saturating_sub(1);
+            }
+
+            /// Let the stage take one more iteration.
+            fn step(&self) {
+                let (lock, wake) = &*self.0;
+                lock.lock().expect("hold lock").permits += 1;
+                wake.notify_all();
+            }
+
+            /// Let the stage run on, as production does.
+            fn release(&self) {
+                let (lock, wake) = &*self.0;
+                lock.lock().expect("hold lock").released = true;
+                wake.notify_all();
+            }
+        }
+
+        /// The poll loop on a node slot, the DPDK response stage behind
+        /// it (held at first), and the test's matching stage between them.
+        /// Stopped and its slot freed when dropped, also on a failed
+        /// test's unwind.
+        struct Rig {
+            addr: SocketAddr,
+            hold: Hold,
+            /// The poll thread's halt gate's fence: fenced, it closes
+            /// every connection it reads.
+            fence: Arc<FenceState>,
+            /// Authenticated connections the response stage holds: the
+            /// poll thread counts each up, the stage down when it drains
+            /// its `Disconnected`.
+            active: Arc<AtomicU64>,
+            /// What the poll thread counts for the health endpoint.
+            metrics: Arc<IngressMetrics>,
+            shutdown: Arc<AtomicBool>,
+            threads: Vec<JoinHandle<()>>,
+            /// Dropped after the threads have returned, the transport with
+            /// them, and before `nic`: the port closes with the last
+            /// holder, and the slot's device can only be detached then.
+            shared: Option<Arc<DpdkShared>>,
+            _nic: melin_test_node::DpdkNodeNic,
+        }
+
+        impl Rig {
+            /// A rig with an early-reply queue of `early_capacity`, the
+            /// node's sockets receiving into `rx_buf_size` bytes, and
+            /// `connection_timeout` for the idle check.
+            fn start(
+                early_capacity: usize,
+                rx_buf_size: usize,
+                connection_timeout: Option<Duration>,
+            ) -> Self {
+                // Opt-in diagnostics: with RUST_LOG set, the poll loop says
+                // when it parks and resumes a connection, and why it closes
+                // one. No-op when RUST_LOG is unset.
+                melin_test_node::logs::capture_if_requested();
+                let nic = melin_test_node::dpdk_node_nic();
+                let addr = nic.addr();
+                let dpdk_config = DpdkConfig {
+                    nic: nic.nic().clone(),
+                    listen_port: addr.port(),
+                    client_buffers: SocketBuffers {
+                        rx_buf_size,
+                        ..SocketBuffers::DEFAULT
+                    },
+                    num_queues: 1,
+                };
+                let shared = DpdkShared::init(&dpdk_config).expect("bring the slot's NIC up");
+
+                // Rings sized so that nothing in these tests fills them:
+                // only the early-reply queue may.
+                let (mut producer, mut input) =
+                    DisruptorBuilder::<InputSlot<CounterEvent>>::new(1 << 12)
+                        .add_consumer()
+                        .build(WaitStrategy::SpinThenYield);
+                let mut input = input.pop().expect("one consumer");
+                let (mut output, mut consumers) =
+                    DisruptorBuilder::<OutputSlot<CounterReport, CounterQuery>>::new(1 << 12)
+                        .add_consumer()
+                        .build(WaitStrategy::SpinThenYield);
+                let consumer = consumers.pop().expect("one consumer");
+                let (early_tx, early_rx) = early_reply_channel::<CounterReport>(early_capacity);
+                let (control_tx, control_rx) = mpsc::channel();
+                let (tx_out, tx_rx) = spsc::channel::<TxFrame>(4096, WaitStrategy::SpinThenYield);
+                let ack_policy = crate::policy_control::test_support::attach(
+                    &crate::policy_control::test_support::replicated(AckPolicy::Disk),
+                    &mut producer,
+                );
+                let public = key::authorized_keys_line(
+                    "writer",
+                    &SigningKey::from_bytes(&WRITER).verifying_key(),
+                    "writer",
+                );
+                let keys = Arc::new(
+                    AuthorizedKeys::parse::<CounterRole>(&format!("{public}\n"))
+                        .expect("parse authorized_keys"),
+                );
+
+                let hold = Hold::default();
+                let fence = Arc::new(FenceState::new(0));
+                let halt = HaltGate::new(None, Arc::clone(&fence), Arc::new(AtomicU64::new(0)));
+                let active = Arc::new(AtomicU64::new(0));
+                let metrics = Arc::new(IngressMetrics::default());
+                let shutdown = Arc::new(AtomicBool::new(false));
+                let mut threads = Vec::new();
+
+                // The matching stage: every write acknowledged, in order,
+                // nothing held for durability.
+                let sd = Arc::clone(&shutdown);
+                threads.push(std::thread::spawn(move || {
+                    while !sd.load(Ordering::Relaxed) {
+                        let Some((seq, slot)) = input.try_consume() else {
+                            std::thread::yield_now();
+                            continue;
+                        };
+                        if slot.connection_id == 0 {
+                            continue;
+                        }
+                        output.publish(OutputSlot {
+                            connection_id: slot.connection_id,
+                            request_id: slot.request_id,
+                            input_seq: seq,
+                            wire_seq: seq + 1,
+                            payload: OutputPayload::Report(CounterReport::Ack {
+                                new_value: seq + 1,
+                            }),
+                            is_last_in_request: true,
+                            ..Default::default()
+                        });
+                    }
+                }));
+
+                let (sd, stage_hold, stage_active) =
+                    (Arc::clone(&shutdown), hold.clone(), Arc::clone(&active));
+                threads.push(std::thread::spawn(move || {
+                    crate::dpdk_response::run::<Counter>(
+                        consumer,
+                        control_rx,
+                        // Everything is on disk: the gate holds nothing.
+                        // Far past any wire seq the matching stage above
+                        // stamps, and short of `u64::MAX`, which the
+                        // policy's evaluation reads as "no cursor".
+                        DurableWireSeqCursor::detached(WireSeq::new(1 << 62)),
+                        GatePolicy {
+                            start: GateStart::settled(AckPolicy::Disk),
+                            forced: forced_policy_cell().1,
+                        },
+                        None,
+                        None,
+                        &sd,
+                        None,
+                        stage_active,
+                        vec![tx_out],
+                        Arc::new(StageUtilization::default()),
+                        WaitStrategy::SpinThenYield,
+                        Arc::new(ResponseEncoder),
+                        early_rx,
+                        None,
+                        Some(Box::new(move || stage_hold.pause())),
+                    );
+                }));
+
+                let (sd, poll_shared, poll_active, poll_metrics) = (
+                    Arc::clone(&shutdown),
+                    Arc::clone(&shared),
+                    Arc::clone(&active),
+                    Arc::clone(&metrics),
+                );
+                threads.push(std::thread::spawn(move || {
+                    // Built on the thread that polls it, as a node's is.
+                    let transport = DpdkTransport::from_shared(&poll_shared, &dpdk_config, 0)
+                        .expect("the transport listens");
+                    run_dpdk_poll::<Counter>(
+                        transport,
+                        producer,
+                        Arc::new(RequestDecoder),
+                        halt,
+                        early_tx,
+                        poll_metrics,
+                        ack_policy,
+                        control_tx,
+                        tx_rx,
+                        &sd,
+                        keys,
+                        connection_timeout,
+                        None,
+                        melin_test_node::MAX_CONNECTIONS,
+                        poll_active,
+                        0,
+                        None,
+                        0,
+                    );
+                }));
+
+                Rig {
+                    addr,
+                    hold,
+                    fence,
+                    active,
+                    metrics,
+                    shutdown,
+                    threads,
+                    shared: Some(shared),
+                    _nic: nic,
+                }
+            }
+
+            /// A client of the rig's node, authenticated, its send buffer
+            /// small. The node serves before this dials: the launcher's
+            /// client waits for it first, as the node tests' do.
+            fn client(&self) -> Client {
+                let key = SigningKey::from_bytes(&WRITER);
+                drop(melin_test_node::connect(self.addr, &key));
+                let stream = TcpStream::connect_timeout(&self.addr, PATIENCE).expect("dial");
+                // SAFETY: a live socket, owned by `stream`, and an option
+                // value of the size passed.
+                let rc = unsafe {
+                    libc::setsockopt(
+                        stream.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_SNDBUF,
+                        (&CLIENT_SNDBUF as *const libc::c_int).cast(),
+                        size_of::<libc::c_int>() as libc::socklen_t,
+                    )
+                };
+                assert_eq!(rc, 0, "SO_SNDBUF: {}", std::io::Error::last_os_error());
+                let stream = NonBlockingTcp::from_stream(stream).expect("non-blocking");
+                let (stream, mut conn) = StreamConnection::handshake(stream, &key, PATIENCE)
+                    .expect("the handshake")
+                    .into_parts();
+                // Replies are owed for as long as the stage is held.
+                conn.set_read_timeout(PATIENCE * 10);
+                Client {
+                    stream,
+                    conn,
+                    clock: Instant::now(),
+                    sent: Vec::new(),
+                    framed: 0,
+                    answers: Vec::new(),
+                    acked: false,
+                }
+            }
+        }
+
+        impl Drop for Rig {
+            fn drop(&mut self) {
+                self.hold.release();
+                self.shutdown.store(true, Ordering::Relaxed);
+                for thread in self.threads.drain(..) {
+                    // Dropped result: a thread that panicked has failed
+                    // the test already, whose own panic is the report.
+                    let _ = thread.join();
+                }
+                drop(self.shared.take());
+            }
+        }
+
+        /// What a request was answered with.
+        #[derive(Debug, PartialEq, Eq)]
+        enum Answer {
+            /// A write's batch: its acknowledgement, then `BatchEnd`.
+            Acked,
+            /// The decoder's refusal of [`MALFORMED`].
+            Malformed,
+        }
+
+        /// A pipelining client, on the polled connection so that a request
+        /// the stream does not take is queued rather than waited on: what
+        /// it has sent, by ID, and what has come back.
+        struct Client {
+            stream: NonBlockingTcp,
+            conn: PolledConnection,
+            /// The connection's clock starts here.
+            clock: Instant,
+            sent: Vec<(RequestId, Answer)>,
+            /// Bytes framed so far, the stream's or still the client's.
+            framed: usize,
+            answers: Vec<(RequestId, Answer)>,
+            /// Whether a write's acknowledgement has come since the last
+            /// final frame.
+            acked: bool,
+        }
+
+        impl Client {
+            /// Now, on the connection's clock.
+            fn now_ns(&self) -> u64 {
+                u64::try_from(self.clock.elapsed().as_nanos()).expect("within a test's span")
+            }
+
+            /// Send the next request of the burst: every fourth a write,
+            /// the rest refused.
+            fn send_next(&mut self) {
+                if self.sent.len() % 4 == 3 {
+                    self.send(&increment_request(1), Answer::Acked);
+                } else {
+                    self.send(&MALFORMED, Answer::Malformed);
+                }
+            }
+
+            /// Send `body`, to be answered as `answer` says.
+            fn send(&mut self, body: &[u8], answer: Answer) {
+                let now = self.now_ns();
+                let id = self.conn.send(&mut self.stream, now, body).expect("send");
+                self.framed += REQUEST_HEADER_LEN + body.len();
+                self.sent.push((id, answer));
+            }
+
+            /// Bytes the stream has taken: the node's, or on their way.
+            fn taken(&self) -> usize {
+                self.framed - self.conn.unsent()
+            }
+
+            /// Hand the stream what it takes, and take every answer that
+            /// has arrived, without waiting.
+            fn poll(&mut self) {
+                let now = self.now_ns();
+                while let Some(frame) = self
+                    .conn
+                    .poll(&mut self.stream, now)
+                    .expect("the connection stays up")
+                {
+                    match frame {
+                        Frame::Response(body) => {
+                            assert_eq!(body[0], KIND_RESP_ACK, "a write's acknowledgement");
+                            self.acked = true;
+                        }
+                        Frame::BatchEnd { id, .. } => {
+                            assert!(std::mem::take(&mut self.acked), "{id:?}: an empty batch");
+                            self.answers.push((id, Answer::Acked));
+                        }
+                        Frame::Refused { id, kind, reason } => {
+                            assert_eq!(
+                                (kind, reason),
+                                (RefusalKind::Malformed, "unknown kind"),
+                                "{id:?}"
+                            );
+                            self.answers.push((id, Answer::Malformed));
+                        }
+                        Frame::ServerBusy { id } => panic!("{id:?} shed: no ring fills here"),
+                    }
+                }
+            }
+
+            /// Whether the node has closed the connection, as far as the
+            /// client can tell now: its close sends nothing, so it shows
+            /// only as the reset a request since has drawn. Panics on an
+            /// answer: the stage is held while this is asked.
+            fn dropped_by_node(&mut self) -> bool {
+                let now = self.now_ns();
+                match self.conn.poll(&mut self.stream, now) {
+                    Ok(None) => false,
+                    Ok(Some(frame)) => panic!("answered while the stage is held: {frame:?}"),
+                    Err(melin_client::Error::Disconnected | melin_client::Error::Io(_)) => true,
+                    Err(e) => panic!("not a close: {e:?}"),
+                }
+            }
+
+            /// Pipeline requests until the node stops taking bytes: a
+            /// backlog the stream does not take, which stays put for
+            /// [`QUIET`]. Nothing is answered meanwhile: the response
+            /// stage is held.
+            fn send_until_stalled(&mut self) {
+                let deadline = Instant::now() + PATIENCE;
+                loop {
+                    self.top_up();
+                    let before = self.taken();
+                    let quiet_until = Instant::now() + QUIET;
+                    while Instant::now() < quiet_until {
+                        self.poll();
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    assert!(self.answers.is_empty(), "answered while the stage is held");
+                    if self.taken() == before {
+                        return;
+                    }
+                    assert!(Instant::now() < deadline, "the node never stopped reading");
+                }
+            }
+
+            /// Keep a backlog of a request frame's width or more that the
+            /// stream has not taken: the client always has more to send.
+            fn top_up(&mut self) {
+                /// Far past what the node and the client can buffer
+                /// between them, so a node still reading fails the test
+                /// rather than looping it.
+                const NEVER_STALLED: usize = 64 << 20;
+                while self.conn.unsent() < REQUEST_HEADER_LEN + MAX_REQUEST_BODY {
+                    assert!(
+                        self.framed < NEVER_STALLED,
+                        "the node never stopped reading"
+                    );
+                    self.send_next();
+                }
+            }
+
+            /// Take answers until every request sent has one, then check
+            /// that each was answered once, as its kind says, and the
+            /// writes in request order.
+            fn finish(&mut self) {
+                let deadline = Instant::now() + PATIENCE;
+                while self.answers.len() < self.sent.len() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "{} of {} requests answered",
+                        self.answers.len(),
+                        self.sent.len()
+                    );
+                    self.poll();
+                    std::thread::yield_now();
+                }
+                let acked = |list: &[(RequestId, Answer)]| -> Vec<RequestId> {
+                    list.iter()
+                        .filter(|(_, answer)| *answer == Answer::Acked)
+                        .map(|(id, _)| *id)
+                        .collect()
+                };
+                assert_eq!(acked(&self.answers), acked(&self.sent), "writes in order");
+                self.answers.sort_by_key(|(id, _)| *id);
+                assert_eq!(self.answers, self.sent, "every request answered once");
+            }
+        }
+
+        /// Keep polling `client` for `for_how_long`: panics if the node
+        /// closes the connection meanwhile and the client finds out. The
+        /// node's close sends nothing: a client with bytes still to send
+        /// finds out from the reset they draw, one with none only from its
+        /// next request's.
+        fn still_up(client: &mut Client, for_how_long: Duration) {
+            let until = Instant::now() + for_how_long;
+            while Instant::now() < until {
+                client.poll();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        /// A parked connection is not read: its client stalls once the
+        /// node's receive buffer and its own send buffer are full. Let go,
+        /// the node answers every request once, the writes in order, and
+        /// the connection serves the next request.
+        #[test]
+        fn a_parked_connection_is_not_read_and_completes_once_let_go() {
+            let rig = Rig::start(4, SocketBuffers::DEFAULT.rx_buf_size, None);
+            let mut client = rig.client();
+            client.send_until_stalled();
+            still_up(&mut client, QUIET);
+
+            rig.hold.release();
+            client.finish();
+            client.send(&increment_request(1), Answer::Acked);
+            client.finish();
+        }
+
+        /// The idle check skips a parked connection, however long it stays
+        /// parked: its client is not idle, the node is not reading it.
+        ///
+        /// The idle check is throttled, so the client surviving the park
+        /// proves nothing unless the check has run meanwhile. A witness
+        /// connection, idle the while, proves it: the client is let go only
+        /// once the node has dropped the witness as idle.
+        #[test]
+        fn a_parked_connection_is_not_dropped_as_idle() {
+            /// Short, so that a wait of a few of it outlasts the witness's
+            /// clock and the poll loop's throttled check alike.
+            const TIMEOUT: Duration = Duration::from_secs(1);
+            let rig = Rig::start(4, SocketBuffers::DEFAULT.rx_buf_size, Some(TIMEOUT));
+            let mut client = rig.client();
+            let mut witness = rig.client();
+            client.send_until_stalled();
+
+            // Probe the witness every two timeouts: a node that still holds
+            // it takes the write (and its clock restarts), one that has
+            // dropped it as idle resets the connection. The client, parked
+            // longer than the timeout, must be up throughout.
+            let deadline = Instant::now() + PATIENCE;
+            while !witness.dropped_by_node() {
+                assert!(Instant::now() < deadline, "the witness was never dropped");
+                still_up(&mut client, TIMEOUT * 2);
+                witness.send(&increment_request(1), Answer::Acked);
+                still_up(&mut client, QUIET);
+            }
+
+            rig.hold.release();
+            client.finish();
+        }
+
+        /// A connection resumed after a park longer than the idle timeout
+        /// is not dropped as idle at once, though nothing is read from it
+        /// after it resumes: its idle clock restarts when it resumes.
+        ///
+        /// The client sends one more refused request than the queue holds,
+        /// all of it in the node's buffer before the last one parks the
+        /// connection, and then nothing: no read after the resume restarts
+        /// the clock in its place.
+        ///
+        /// The idle check is throttled (it runs on the slow checks'
+        /// cadence), so the connection outliving the resume proves nothing
+        /// unless the check has run since. A witness connection proves it:
+        /// idle since a write it sends while the client is parked, it falls
+        /// due shortly after the resume, and the client is checked only
+        /// once the witness has been dropped.
+        #[test]
+        fn a_resumed_connection_restarts_its_idle_clock() {
+            /// The idle timeout. The slow check that drops the witness must
+            /// come round within `TIMEOUT - WITNESS_LEAD` of the witness
+            /// falling due, or it finds the client's restarted clock run
+            /// out too; asserted below, so a cadence too slow for it fails
+            /// with its cause named.
+            const TIMEOUT: Duration = Duration::from_secs(4);
+            /// How long the client stays parked: longer than the timeout,
+            /// so the last bytes it read are older than that when it
+            /// resumes.
+            const PARKED_FOR: Duration = Duration::from_secs(6);
+            /// How long after the resume the witness falls due: well
+            /// inside the timeout, which the resumed client's restarted
+            /// clock has from the resume on.
+            const WITNESS_LEAD: Duration = Duration::from_millis(500);
+            const EARLY_CAPACITY: usize = 4;
+            let rig = Rig::start(
+                EARLY_CAPACITY,
+                SocketBuffers::DEFAULT.rx_buf_size,
+                Some(TIMEOUT),
+            );
+            let mut client = rig.client();
+            let mut witness = rig.client();
+            for _ in 0..=EARLY_CAPACITY {
+                client.send(&MALFORMED, Answer::Malformed);
+            }
+            still_up(&mut client, PARKED_FOR - TIMEOUT + WITNESS_LEAD);
+            // A write: published at once (only the client is parked), its
+            // reply held with the stage. The witness's last bytes.
+            witness.send(&increment_request(1), Answer::Acked);
+            still_up(&mut client, TIMEOUT - WITNESS_LEAD);
+            assert!(
+                client.answers.is_empty(),
+                "answered while the stage is held"
+            );
+            assert_eq!(client.conn.unsent(), 0, "the burst is the node's");
+            // Parked once, and counted parked; the refusals queued before
+            // the park counted, the one it parked on not yet.
+            assert_eq!((rig.metrics.parked(), rig.metrics.parks()), (1, 1));
+            assert_eq!(
+                rig.metrics.counts().refused_as(RefusalKind::Malformed),
+                EARLY_CAPACITY as u64
+            );
+
+            let released_at = Instant::now();
+            rig.hold.release();
+            client.finish();
+            // Resumed: no longer parked (the gauge is set at the end of the
+            // pass that resumed it, which may trail the answers), parked
+            // only the once, and every refusal counted once.
+            let deadline = Instant::now() + PATIENCE;
+            while rig.metrics.parked() != 0 {
+                assert!(Instant::now() < deadline, "still counted as parked");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(rig.metrics.parks(), 1);
+            assert_eq!(
+                rig.metrics.counts().refused_as(RefusalKind::Malformed),
+                EARLY_CAPACITY as u64 + 1
+            );
+            // The stage, let go, drains the two probes' closes (one per
+            // `rig.client()`), leaving the client and the witness; the
+            // witness's idle drop takes the count to one. An idle check
+            // has run since the resume, then, and found the client inside
+            // its restarted clock. With a stale one, it would have been
+            // dropped by that check, or an earlier one.
+            let deadline = Instant::now() + PATIENCE;
+            while rig.active.load(Ordering::Relaxed) > 1 {
+                assert!(Instant::now() < deadline, "the witness was never dropped");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                released_at.elapsed() < TIMEOUT,
+                "the witness was dropped {:?} after the resume: the slow checks' \
+                 cadence is too slow for this test's TIMEOUT",
+                released_at.elapsed()
+            );
+            // The idle drop closes without a word to the client: a request
+            // is what finds the connection gone, reset by the node's stack.
+            client.send(&increment_request(1), Answer::Acked);
+            client.finish();
+            drop(witness);
+        }
+
+        /// A parked connection whose retry closes it (the node superseded
+        /// while it waits) is closed: its client sees the close at once,
+        /// with the response stage still held, and the stage, let go,
+        /// forgets it as it does any closed connection.
+        #[test]
+        fn a_parked_connection_closed_by_its_retry_is_closed() {
+            let rig = Rig::start(4, SocketBuffers::DEFAULT.rx_buf_size, None);
+            let mut client = rig.client();
+            client.send_until_stalled();
+            rig.fence.fence();
+
+            let deadline = Instant::now() + PATIENCE;
+            loop {
+                let now = client.now_ns();
+                match client.conn.poll(&mut client.stream, now) {
+                    Ok(None) => {}
+                    Ok(Some(frame)) => panic!("answered while the stage is held: {frame:?}"),
+                    Err(melin_client::Error::Disconnected | melin_client::Error::Io(_)) => break,
+                    Err(e) => panic!("not a close: {e:?}"),
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the parked connection was not closed"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+
+            // Both connections (the launcher's probe, then the client's)
+            // counted in, and out once the stage drains their closes.
+            rig.hold.release();
+            while rig.active.load(Ordering::Relaxed) != 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "the stage still holds a connection"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        /// A connection that parks holding more than the buffer cap
+        /// (`MAX_PARSE_BUF`) is kept: those bytes are the node's backlog.
+        ///
+        /// Two answers fill the queue (the smallest it is built with), so
+        /// each step of the stage lets the parked connection through two
+        /// requests at most. Stepped until it resumes, its next receive
+        /// takes the contiguous chunk of the node's receive ring (sized
+        /// well past the cap), and it parks again at once, holding all of
+        /// it. That chunk is nearly the whole buffer only because the ring
+        /// has not wrapped yet: the connection first parks a few KiB into
+        /// a fresh socket. The client sees that receive as room for as
+        /// much again: the node's window had been closed since the stall,
+        /// and only a receive opens it, and a connection resumed is read
+        /// once before it parks. So the pin is inferred from the client's
+        /// window, not observed on the node; if the traffic before the
+        /// first park ever grows to near the ring's size, the first chunk
+        /// could fall under the cap and this test pass without pinning it.
+        #[test]
+        fn a_connection_parked_past_the_buffer_cap_is_kept() {
+            const RX_BUF: usize = 4 * MAX_PARSE_BUF;
+            let rig = Rig::start(2, RX_BUF, None);
+            let mut client = rig.client();
+            client.send_until_stalled();
+
+            let stalled_at = client.taken();
+            let deadline = Instant::now() + PATIENCE;
+            while client.taken() - stalled_at <= 2 * MAX_PARSE_BUF {
+                assert!(
+                    Instant::now() < deadline,
+                    "the node never took its receive buffer: {} bytes since the stall",
+                    client.taken() - stalled_at
+                );
+                rig.hold.step();
+                std::thread::sleep(Duration::from_millis(2));
+                client.top_up();
+                client.poll();
+            }
+            // Parked past the cap now, which the buffer check, run on
+            // every iteration, would have dropped at once.
+            still_up(&mut client, QUIET);
+
+            rig.hold.release();
+            client.finish();
         }
     }
 }

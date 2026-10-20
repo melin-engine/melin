@@ -18,15 +18,15 @@ use std::time::{Duration, Instant};
 
 use std::io::{Read, Write};
 
-use melin_client::{Connection, SigningKey, key};
+use melin_client::{Connection, Error, RefusalKind, SigningKey, key};
 use melin_journal::{JournalEvent, JournalReader};
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
 use melin_test_node::Node as Server;
 use melin_wire_protocol::control_codec::{
-    TAG_APP, TAG_BATCH_END, TAG_CHALLENGE_RESPONSE, TAG_ENGINE_ERROR, TAG_RESPONSE_HEARTBEAT,
-    TAG_SERVER_BUSY,
+    RETIRED_TAGS, TAG_APP, TAG_BATCH_END, TAG_CHALLENGE_RESPONSE, TAG_REFUSED, TAG_REQUEST,
+    TAG_RESPONSE_HEARTBEAT, TAG_SERVER_BUSY,
 };
 
 use echo_server::{Echo, KIND_RESP_ECHO, MAX_PAYLOAD, Payload, RequestDecoder, ResponseEncoder};
@@ -42,9 +42,13 @@ fn exchange(node: &mut Connection, payload: &[u8]) -> (u8, Vec<u8>) {
     (reply[0], reply[1..].to_vec())
 }
 
-/// Send a request the server is expected to drop: no reply is read.
-fn send(node: &mut Connection, payload: &[u8]) {
-    node.send(payload).expect("send");
+/// Echo `payload`, which the node must refuse: the refusal's kind and
+/// reason.
+fn refused(node: &mut Connection, payload: &[u8]) -> (RefusalKind, String) {
+    match node.request(payload) {
+        Err(Error::Refused { kind, reason }) => (kind, reason),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
 }
 
 /// `len` bytes that no other length or seed produces, so a reply can only
@@ -57,9 +61,7 @@ fn bytes(len: usize, seed: u8) -> Vec<u8> {
 fn connect_authenticated(addr: SocketAddr, key: &SigningKey) -> Connection {
     let mut node = melin_test_node::connect(addr, key);
     // Generous: the suite shares the machine, and how fast a node answers
-    // under full-suite load is not what these tests check. A refused
-    // request still surfaces — as a 30 s `NoReply` rather than a 5 s one:
-    // the node's idle-connection heartbeats do not push the timeout back.
+    // under full-suite load is not what these tests check.
     node.set_read_timeout(Duration::from_secs(30))
         .expect("set timeout");
     node
@@ -180,11 +182,15 @@ fn an_oversized_payload_is_refused_without_dropping_the_connection() {
     let (_tmp, server) = start_server();
     let mut stream = connect_authenticated(server.addr(), &writer_key());
 
-    // One byte past the cap. The runtime drops the frame at the decoder
-    // without a response and keeps the connection, so the refusal is
-    // observable only as the next reply answering the next request rather
-    // than this one.
-    send(&mut stream, &bytes(MAX_PAYLOAD + 1, 1));
+    // One byte past the cap. The decoder refuses it as malformed, with
+    // its reason, and the connection is kept.
+    assert_eq!(
+        refused(&mut stream, &bytes(MAX_PAYLOAD + 1, 1)),
+        (
+            RefusalKind::Malformed,
+            "payload longer than MAX_PAYLOAD".to_string()
+        )
+    );
 
     let sent = bytes(MAX_PAYLOAD, 2);
     assert_eq!(exchange(&mut stream, &sent), (KIND_RESP_ECHO, sent));
@@ -197,11 +203,19 @@ fn an_oversized_payload_is_refused_without_dropping_the_connection() {
 fn a_reader_key_cannot_echo() {
     let (tmp, server) = start_server();
 
-    // Refused at the decoder: no reply, connection kept — there is no
-    // request a reader key can make that would be answered, so the
-    // refusal is observable only in the journal afterwards.
+    // Refused at the decoder as not permitted, with the decoder's reason,
+    // and the connection kept: the refusal is answered, and nothing is
+    // journaled.
     let mut watcher = connect_authenticated(server.addr(), &reader_key());
-    send(&mut watcher, b"not mine to journal");
+    assert_eq!(
+        refused(&mut watcher, b"not mine to journal"),
+        (
+            RefusalKind::PermissionDenied,
+            "echoing requires a writing role".to_string()
+        )
+    );
+    // And again on the same connection: still usable.
+    assert_eq!(refused(&mut watcher, b"").0, RefusalKind::PermissionDenied);
 
     let sent = bytes(MAX_PAYLOAD, 9);
     let mut stream = connect_authenticated(server.addr(), &writer_key());
@@ -231,10 +245,13 @@ fn a_payload_that_looks_like_a_protocol_frame_is_echoed() {
         vec![0x00],
         vec![TAG_RESPONSE_HEARTBEAT],
         vec![TAG_BATCH_END, 0xAA],
-        vec![TAG_ENGINE_ERROR],
+        // The retired engine-error tag.
+        vec![RETIRED_TAGS[0]],
         vec![TAG_SERVER_BUSY],
         vec![TAG_CHALLENGE_RESPONSE; 97],
         vec![TAG_APP, TAG_APP],
+        vec![TAG_REQUEST, 1, 0, 0, 0, 0, 0, 0, 0],
+        vec![TAG_REFUSED, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0],
     ];
     for sent in &payloads {
         assert_eq!(
@@ -249,48 +266,94 @@ fn a_payload_that_looks_like_a_protocol_frame_is_echoed() {
     assert_eq!(journaled_echoes(tmp.path()), payloads);
 }
 
-/// A frame that is not an application frame is dropped before the
-/// application sees it, and the connection kept: a request framed the way
-/// a pre-release build did (an application tag in the protocol's place),
-/// one of the protocol's own tags, and an empty frame. Only the
-/// application frame after them is answered, and only it is journaled.
+/// A frame that is not a request closes the connection before the
+/// application sees it: a request framed by a client of an earlier release
+/// (the application tag, no ID), one framed the way a pre-release build did
+/// (an application tag in the protocol's place), one of the protocol's own
+/// tags, an empty frame, and a request too short for its ID. One such frame
+/// per connection, each behind a request that is published (and
+/// journaled) first, and ahead of one that is never read.
 #[test]
-fn a_frame_that_is_not_an_application_frame_is_dropped() {
+fn a_frame_that_is_not_a_request_closes_the_connection() {
     let (tmp, server) = start_server();
-    // The raw socket, authenticated: `melin-client` only sends
-    // application frames, and these are the frames it cannot send.
-    let mut stream = connect_authenticated(server.addr(), &writer_key()).into_stream();
 
     let raw_frame = |payload: &[u8]| -> Vec<u8> {
         [&(payload.len() as u32).to_le_bytes()[..], payload].concat()
     };
-    let sent = bytes(16, 7);
-    let wire = [
+    let request = |id: u64, body: &[u8]| -> Vec<u8> {
+        raw_frame(&[&[TAG_REQUEST][..], &id.to_le_bytes(), body].concat())
+    };
+    let not_requests = [
+        raw_frame(&[&[TAG_APP][..], &bytes(16, 3)].concat()),
         raw_frame(&[&[0x10][..], &bytes(8, 1)].concat()),
         raw_frame(&[TAG_RESPONSE_HEARTBEAT]),
         raw_frame(&[]),
-        raw_frame(&[&[TAG_APP][..], &sent].concat()),
-    ]
-    .concat();
-    stream.write_all(&wire).expect("write frames");
+        raw_frame(&[TAG_REQUEST, 1, 2, 3]),
+    ];
+    let mut journaled = Vec::new();
+    for (i, bad) in not_requests.iter().enumerate() {
+        // The raw socket, authenticated: `melin-client` only sends
+        // requests, and these are the frames it cannot send.
+        let mut stream = connect_authenticated(server.addr(), &writer_key()).into_stream();
+        let before = bytes(16, i as u8);
+        let wire = [request(1, &before), bad.clone(), request(2, b"never read")].concat();
+        stream.write_all(&wire).expect("write frames");
+        journaled.push(before);
 
-    let mut read_payload = || {
-        let mut len = [0u8; 4];
-        stream.read_exact(&mut len).expect("read length");
-        let mut payload = vec![0u8; u32::from_le_bytes(len) as usize];
-        stream.read_exact(&mut payload).expect("read payload");
-        payload
-    };
-    assert_eq!(
-        read_payload(),
-        [&[TAG_APP, KIND_RESP_ECHO][..], &sent].concat(),
-        "the first reply answers the application frame"
-    );
-    assert_eq!(read_payload(), [TAG_BATCH_END]);
+        // The probe is no request either, so a node that had not closed
+        // yet would not take it for one.
+        assert_closed(&mut stream, &raw_frame(&[]), i);
+    }
 
-    drop(stream);
     server.stop();
-    assert_eq!(journaled_echoes(tmp.path()), [sent]);
+    assert_eq!(
+        journaled_echoes(tmp.path()),
+        journaled,
+        "the request before each bad frame is published, nothing after it"
+    );
+}
+
+/// The node has closed `stream`. Whatever it sent before the close (the
+/// first request's reply may or may not beat it) is read off. On kernel
+/// TCP the close is the end of the stream. On DPDK the node closes a
+/// client connection without telling the peer (see "DPDK closes a client
+/// connection without telling the peer" in
+/// `docs/internal/transport-divergences-2026-10.md`), so the stream goes
+/// quiet instead, and a `probe` sent on it draws the reset that shows the
+/// connection is gone.
+fn assert_closed(stream: &mut std::net::TcpStream, probe: &[u8], frame: usize) {
+    stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .expect("set timeout");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut buf = [0u8; 256];
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "frame {frame}: the node did not close"
+        );
+        match stream.read(&mut buf) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => return,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                // Quiet: a closed DPDK connection, or a node still
+                // deciding. A send on a connection the node has dropped is
+                // answered with a reset; dropped here because the reset is
+                // what the next read reports, and a send that fails has
+                // already shown it.
+                if stream.write_all(probe).is_err() {
+                    return;
+                }
+            }
+            Err(e) => panic!("frame {frame}: {e}"),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -715,7 +778,19 @@ fn drive_streams(
                 match frame {
                     None => break,
                     Some(Frame::Response(body)) => stream.replies.push(body.to_vec()),
-                    Some(Frame::BatchEnd(Ack::Policy)) => stream.answered += 1,
+                    Some(Frame::BatchEnd {
+                        id,
+                        ack: Ack::Policy,
+                    }) => {
+                        // Each stream numbers its requests from 1, and the
+                        // node answers them in order, naming each.
+                        stream.answered += 1;
+                        assert_eq!(
+                            id,
+                            melin_client::RequestId(stream.answered as u64),
+                            "stream {index}: a batch end for another request"
+                        );
+                    }
                     Some(other) => panic!("stream {index}: {other:?}"),
                 }
             }

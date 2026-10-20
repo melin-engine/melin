@@ -180,11 +180,14 @@ than a TCP read timeout, and queries are still answered. A refused write
 never enters the pipeline: it is not applied, not journaled, and not
 replicated, so no replay or failover can bring it back. A rejection
 always ends in a plain batch end: it is a definite answer ("not applied,
-safe to resend"), with nothing on any disk to qualify. It keeps its place
-among the node's replies: it goes out after the replies to every request
-the node received before it. Because the journal never sees a refused
-write, the node counts them: the `melin_writes_refused_total` counter on
-`/metrics` says how many writes a halt cost.
+safe to resend"), with nothing on any disk to qualify. It names the
+request it answers, so it does not wait for the replies to requests the
+client sent before it: it goes out at the first point between two
+requests' replies, even while the ack policy still holds a write the same
+client sent earlier, and never inside another request's reply. Because
+the journal never sees a refused write, the node counts them: the
+`melin_writes_refused_total` counter on `/metrics` says how many writes a
+halt cost.
 
 A replica counts as connected from the moment the primary accepts its
 handshake (while it catches up, and then while it streams) until it
@@ -197,8 +200,8 @@ swap](#runtime-policy-swap)). The health endpoint reports `trading`
 while the override holds.
 
 Writes the node accepted just before the halt are applied as usual. Their
-replies wait on the ack policy, and so do the rejections and query
-replies that come after them, until a replica is back and confirms them
+replies wait on the ack policy, and so do the query replies that come
+after them (a rejection does not: see above), until a replica is back and confirms them
 in full, an operator forces `disk`, or the grace period runs out and the
 node answers them as degraded acks (see "Degraded acks"). They are never
 sent if the node is superseded or stopped first. A node stopped while
@@ -229,8 +232,8 @@ A primary that has had no replica connected for the grace period
 to confirm what it holds. Each held reply, to a write accepted before
 the halt or to a query, is sent as soon as the primary's own journal has
 the event fsynced, and its batch ends in **`BatchEndDegraded`** instead
-of `BatchEnd`. The rejections queued behind those replies then go out
-too, in their place. A query's answer may reflect writes that only the
+of `BatchEnd`. (The rejections of new writes never waited for them: see
+above.) A query's answer may reflect writes that only the
 primary's disk holds, so it is marked too, even when it reads only state
 that every replica had confirmed before it left. The one exception
 comes right after the last replica leaves: a reply covering only what
@@ -274,9 +277,9 @@ What a degraded ack means:
 `Ack::PrimaryOnly`, and the convenience calls that expect a full
 acknowledgement return an error that carries the reply instead (see
 [Building an application](building-an-application.md)). A client built
-on an older `melin-client` fails with a protocol error on the first
-degraded ack rather than reading it as a full one: upgrade clients
-before nodes.
+on an older `melin-client` cannot take a degraded ack for a full one: the
+client protocol changed in the same release, so it refuses the node at
+the handshake. Upgrade clients with the nodes.
 
 Under `disk` nothing is ever degraded: the primary's own fsync is what
 the policy asks for, so every reply is a full one. The policy itself
@@ -293,9 +296,9 @@ writes may be acked here and missing there, and each such ack is marked.
 
 An operator committed to strict fail-closed behaviour can switch degraded
 acks off with `--no-degraded-acks`. A halted node then holds every reply
-it holds, and every rejection and query reply behind it, until a replica
-returns or the operator swaps the policy; clients see nothing until then
-but their own read timeout.
+it holds, and every query reply behind it, until a replica returns or the
+operator swaps the policy; for those requests clients see nothing until
+then but their own read timeout. New writes are still refused at once.
 
 ### How a node notices that its peer has gone
 
@@ -1181,6 +1184,25 @@ normal-case post-recovery state.
   says how many writes it cost, which the gauge's duration cannot.
   Standalone nodes and replicas export the series at zero. Resets on
   process restart, like every counter here.
+- The other requests a node answers without applying them, none of
+  which is journaled either (Prometheus counters, exported at zero on a
+  node that has had none, and on a replica):
+  `melin_requests_shed_total`, requests answered `ServerBusy` because
+  the input ring was full, the ones buffered behind each included (see
+  "A full ring" in [pipeline-architecture.md](pipeline-architecture.md));
+  `melin_requests_refused_total`, labelled `kind="permission_denied"` or
+  `kind="malformed"`, requests the application's decoder refused; and
+  `melin_requests_filtered_total`, those it filtered. Sustained shedding
+  is a node past its capacity, or a stage stalled behind it; refusals
+  are clients sending what their key may not, or what the application
+  does not understand (often a client built for another version of it).
+- `melin_connections_parked` (Prometheus gauge) and
+  `melin_connection_parks_total` (counter) — client connections the node
+  has stopped reading because it had no room to queue an answer for
+  them, and how often that happened. Zero in steady state: a connection
+  parks only while the response stage is not taking answers. A non-zero
+  gauge that persists comes with a warn-level log line naming how many
+  are parked, and is worth an alert.
 - `melin_degraded_acks_total` (Prometheus counter) — replies a halted
   primary sent as degraded acks, backed by its own disk alone (see
   "Degraded acks"), one per request. Queries count too, including one
