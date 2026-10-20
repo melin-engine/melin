@@ -825,54 +825,157 @@ verify_journal_queue_tuning() {
     fi
 }
 
-# Pick the journal disk. Order of preference:
-#   1. JOURNAL_DISK=/dev/nvmeXn1 in the environment — explicit operator pick,
-#      used for benchmarking specific drives or any host where the auto-pick
-#      doesn't match the operator's intent. Validated for block-device-ness
-#      before we use it.
-#   2. Largest unpartitioned NVMe whole-disk device. Production sizing intent
-#      is "biggest data drive available" — more NAND = more endurance budget
-#      and capacity headroom. "First unpartitioned" (the previous heuristic)
-#      was enumeration-order dependent and silently grabbed whatever the BIOS
-#      enumerated first, which on hosts with mixed M.2 + U.3 drives often
-#      picked the smaller M.2 by accident.
-# If nothing matches, JOURNAL_DISK is left empty and the conditional below
-# skips journal setup with a clear log line — same behaviour as before.
-if [[ -n "${JOURNAL_DISK:-}" ]]; then
-    if [[ ! -b "${JOURNAL_DISK}" ]]; then
+# The UUID of the filesystem `fstab` mounts at `mount`, or nothing when it
+# mounts nothing there. An entry that names its source any other way is
+# refused: this script writes UUID entries only, and a kernel name cannot
+# say which drive it meant once the names have moved.
+fstab_journal_uuid() {
+    local fstab="$1" mount="$2" spec mnt rest
+    [[ -f "$fstab" ]] || return 0
+    while read -r spec mnt rest || [[ -n "$spec" ]]; do
+        if [[ "$spec" == \#* || "$mnt" != "$mount" ]]; then
+            continue
+        fi
+        if [[ "$spec" == UUID=* ]]; then
+            printf '%s' "${spec#UUID=}"
+            return 0
+        fi
+        echo "error: $fstab mounts $mount from $spec, not by filesystem UUID;" >&2
+        echo "  replace that line with a UUID=<uuid> one, or remove it, and re-run." >&2
+        return 1
+    done < "$fstab"
+}
+
+# Choose the journal disk. Prints its device, or nothing when there is no
+# drive to put it on, and returns 1 with the reason when the choice would
+# put the journal anywhere but where the host already keeps it.
+#
+#   explicit, explicit_uuid  JOURNAL_DISK, resolved to its device, and the
+#                            UUID of the filesystem on it (empty for none)
+#   fstab_uuid, fstab_dev    the UUID /etc/fstab mounts the journal by, and
+#                            the device that carries it now (empty for none)
+#   stdin                    the NVMe whole disks, one per line:
+#                            `<device> <bytes> <partitioned 0|1> <serial>`
+#
+# In order of preference:
+#   1. The operator's JOURNAL_DISK, unless /etc/fstab mounts another
+#      filesystem as the journal: the next boot would mount that one, not
+#      the disk this run formatted.
+#   2. The drive carrying the filesystem /etc/fstab mounts. NVMe kernel
+#      names follow probe order and change across reboots, so on a re-run
+#      the journal is wherever its filesystem is, whatever it is called
+#      now. A UUID no drive carries is refused rather than replaced:
+#      formatting another drive would start an empty journal without a word.
+#   3. On a host with no journal yet, the largest unpartitioned drive (a
+#      partitioned one holds the OS): more NAND is more endurance budget
+#      and headroom. Drives of one size are told apart by serial, lowest
+#      first, so the pick is the same physical drive whatever order the
+#      kernel probed them in; two the serial cannot tell apart are refused.
+pick_journal_disk() {
+    local explicit="$1" explicit_uuid="$2" fstab_uuid="$3" fstab_dev="$4"
+    local dev size parted serial best="" best_size=0 best_serial="" tied=0
+    if [[ -n "$explicit" ]]; then
+        if [[ -n "$fstab_uuid" && "$explicit_uuid" != "$fstab_uuid" ]]; then
+            echo "error: JOURNAL_DISK is $explicit, but /etc/fstab mounts the journal" >&2
+            echo "  from UUID=$fstab_uuid (${fstab_dev:-on no drive present}). Either:" >&2
+            echo "    - Re-run without JOURNAL_DISK to keep that journal, or" >&2
+            echo "    - Stop the server, unmount it, remove its /etc/fstab line, then re-run to move it." >&2
+            return 1
+        fi
+        echo "  Journal disk: $explicit (JOURNAL_DISK)" >&2
+        printf '%s' "$explicit"
+        return 0
+    fi
+    if [[ -n "$fstab_uuid" ]]; then
+        if [[ -z "$fstab_dev" ]]; then
+            echo "error: /etc/fstab mounts the journal from UUID=$fstab_uuid, which no drive" >&2
+            echo "  carries. Refusing to format another drive in its place: if the drive" >&2
+            echo "  was replaced, remove that /etc/fstab line and re-run." >&2
+            return 1
+        fi
+        echo "  Journal disk: $fstab_dev (carries the journal /etc/fstab mounts)" >&2
+        printf '%s' "$fstab_dev"
+        return 0
+    fi
+    while read -r dev size parted serial || [[ -n "$dev" ]]; do
+        [[ "$parted" == 0 ]] || continue
+        if (( size > best_size )); then
+            best=$dev best_size=$size best_serial=$serial tied=0
+        elif (( size > 0 && size == best_size )); then
+            if [[ "$serial" == "$best_serial" ]]; then
+                tied=1
+            elif [[ "$serial" < "$best_serial" ]]; then
+                best=$dev best_serial=$serial tied=0
+            fi
+        fi
+    done
+    if (( tied )); then
+        echo "error: the largest unpartitioned drives are the same size and their serials" >&2
+        echo "  cannot tell them apart; set JOURNAL_DISK to a /dev/disk/by-id path." >&2
+        return 1
+    fi
+    if [[ -n "$best" ]]; then
+        echo "  Journal disk: $best (largest unpartitioned, serial ${best_serial:-none})" >&2
+    fi
+    printf '%s' "$best"
+}
+
+# The NVMe whole disks, in the form pick_journal_disk reads.
+journal_disk_candidates() {
+    local dev parted size serial
+    for dev in /dev/nvme*n1; do
+        [[ -b "$dev" ]] || continue
+        parted=0
+        if ls "${dev}p"* &>/dev/null; then
+            parted=1
+        fi
+        size=$(blockdev --getsize64 "$dev" 2>/dev/null || echo 0)
+        # NVMe pads the serial with spaces.
+        serial=""
+        if [[ -r "/sys/block/${dev#/dev/}/device/serial" ]]; then
+            serial=$(tr -d '[:space:]' < "/sys/block/${dev#/dev/}/device/serial")
+        fi
+        printf '%s %s %s %s\n' "$dev" "$size" "$parted" "$serial"
+    done
+}
+
+JOURNAL_DISK="${JOURNAL_DISK:-}"
+EXPLICIT_UUID=""
+if [[ -n "$JOURNAL_DISK" ]]; then
+    if [[ ! -b "$JOURNAL_DISK" ]]; then
         echo "error: JOURNAL_DISK=${JOURNAL_DISK} is not a block device" >&2
         exit 1
     fi
-    echo "  Journal disk: ${JOURNAL_DISK} (from JOURNAL_DISK env var)"
-else
-    # Walk the NVMe whole-disks and keep the largest unpartitioned one.
-    # `blockdev --getsize64` returns bytes; we compare numerically. No
-    # subshell pipeline — keeps state in this shell so we can also report
-    # what we considered vs. picked if anyone adds debug logging later.
-    # Initialise to empty so `set -u` is happy when no NVMe matches —
-    # the existing "if [[ -n "$JOURNAL_DISK" ]]" below depends on it.
-    JOURNAL_DISK=""
-    BEST_SIZE=0
-    for dev in /dev/nvme*n1; do
-        [[ -e "$dev" ]] || continue
-        # Skip if it has partitions (OS disk).
-        ls "${dev}p"* &>/dev/null && continue
-        size=$(blockdev --getsize64 "$dev" 2>/dev/null || echo 0)
-        if (( size > BEST_SIZE )); then
-            BEST_SIZE=$size
-            JOURNAL_DISK=$dev
-        fi
-    done
+    # A /dev/disk/by-id path names the same drive at every boot, as a kernel
+    # name does not. Resolved here: the mount check below compares device
+    # paths, and the read-back finds the disk's sysfs by its kernel name.
+    JOURNAL_DISK=$(readlink -f -- "$JOURNAL_DISK")
+    # blkid exits 2 for a drive with no filesystem: no UUID is the answer.
+    EXPLICIT_UUID=$(blkid -s UUID -o value "$JOURNAL_DISK") || EXPLICIT_UUID=""
 fi
+FSTAB_UUID=$(fstab_journal_uuid /etc/fstab "$JOURNAL_MOUNT") || exit 1
+FSTAB_DEV=""
+if [[ -n "$FSTAB_UUID" ]]; then
+    # blkid exits 2 when no drive carries the UUID, which pick_journal_disk
+    # refuses with the reason.
+    FSTAB_DEV=$(blkid -U "$FSTAB_UUID") || FSTAB_DEV=""
+fi
+# Listed first rather than piped: pick_journal_disk stops reading once
+# JOURNAL_DISK or /etc/fstab has decided, and under pipefail the lister's
+# SIGPIPE would fail the pick, ending the run without a word.
+JOURNAL_CANDIDATES=$(journal_disk_candidates)
+# Empty when there is no drive to put the journal on: the conditional
+# below then skips journal setup with a log line.
+JOURNAL_DISK=$(pick_journal_disk "$JOURNAL_DISK" "$EXPLICIT_UUID" "$FSTAB_UUID" "$FSTAB_DEV" \
+    <<< "$JOURNAL_CANDIDATES") || exit 1
 
 # Safety net for re-runs: if $JOURNAL_MOUNT is already mounted from a
-# *different* block device than the one we just selected, refuse rather
-# than silently formatting the new pick and leaving it unmounted while
-# the old disk keeps serving the journal. The most common way to hit
-# this is a host that was provisioned with the older "first
-# unpartitioned NVMe" heuristic and is now being re-deployed — the new
-# size-ranked picker chooses a different drive. Operators get an
-# explicit choice: pin JOURNAL_DISK to the existing mount to keep it,
+# *different* block device than the one just picked, refuse rather than
+# format the pick and leave it unmounted while the other disk keeps
+# serving the journal. The pick follows /etc/fstab when it has an entry,
+# so this catches a mount it does not record: a run that failed between
+# mounting and writing the entry, or a mount made by hand. Operators get
+# an explicit choice: pin JOURNAL_DISK to the existing mount to keep it,
 # or unmount + re-run to migrate.
 if [[ -n "${JOURNAL_DISK:-}" ]] && mountpoint -q "$JOURNAL_MOUNT"; then
     current=$(findmnt -n -o SOURCE "$JOURNAL_MOUNT" || true)
@@ -912,6 +1015,7 @@ if [[ -n "$JOURNAL_DISK" ]]; then
         mkfs.xfs -f -q "$JOURNAL_DISK"
         # Drop any stale ext4 fstab entry; we re-add the xfs one below.
         sed -i "\| $JOURNAL_MOUNT |d" /etc/fstab
+        FSTAB_UUID=""
     fi
 
     mkdir -p "$JOURNAL_MOUNT"
@@ -952,8 +1056,9 @@ if [[ -n "$JOURNAL_DISK" ]]; then
     # Add to fstab if not present. Before the udev rule, so that a failure
     # from there on cannot leave the disk mounted for this boot only: after
     # a reboot the nodes would journal to $JOURNAL_MOUNT on the OS disk,
-    # and nothing would say so.
-    if ! grep -q "$JOURNAL_MOUNT" /etc/fstab; then
+    # and nothing would say so. An entry already present names this disk's
+    # filesystem: pick_journal_disk refuses any other.
+    if [[ -z "$FSTAB_UUID" ]]; then
         echo "UUID=$JOURNAL_UUID $JOURNAL_MOUNT xfs $JOURNAL_MOUNT_OPTS 0 2" >> /etc/fstab
         echo "  Added to /etc/fstab (UUID=$JOURNAL_UUID)"
     fi

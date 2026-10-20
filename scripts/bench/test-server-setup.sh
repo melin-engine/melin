@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Tests for server-setup.sh's kernel-parameter verification, and for the
-# udev rule that tunes the journal disk and the read-back that checks it.
+# Tests for server-setup.sh's kernel-parameter verification, for the
+# choice of the journal disk, and for the udev rule that tunes it and the
+# read-back that checks it.
 #
 # This is the half of the setup script that has no other safety net: it
 # is what stands between "the params were applied" and the silent no-op
@@ -53,12 +54,15 @@ FN_FILE="${TMP_ROOT}/fns.sh"
     extract_fn verify_kernel_params
     extract_fn write_journal_udev_rule
     extract_fn verify_journal_queue_tuning
+    extract_fn fstab_journal_uuid
+    extract_fn pick_journal_disk
     extract_array JOURNAL_QUEUE_TUNING
 } > "$FN_FILE"
 
 for fn in kernel_param_live kernel_param_in_cfg kernel_param_values_in_cfg \
     resolve_physical_cores write_grub_dropin verify_kernel_params \
-    write_journal_udev_rule verify_journal_queue_tuning; do
+    write_journal_udev_rule verify_journal_queue_tuning \
+    fstab_journal_uuid pick_journal_disk; do
     if ! grep -q "^${fn}() {" "$FN_FILE"; then
         echo "error: failed to extract ${fn} from server-setup.sh — has it been" >&2
         echo "  renamed or reformatted? These tests are now vacuous; fix the" >&2
@@ -422,6 +426,187 @@ if out=$(verify_journal_queue_tuning "$QUEUE" 2>&1) \
     ok "an attribute the kernel lacks is reported and skipped"
 else
     bad "a missing attribute should be reported, not fail the disk" "$out"
+fi
+
+echo ""
+echo "=== server-setup.sh journal disk choice ==="
+
+# ---------------------------------------------------------------------
+# The hosts this was found on: an OS drive, a second drive of its size,
+# and two identical larger ones, neither partitioned. Their kernel names
+# swapped across the setup's own reboot, so a pick by name took the empty
+# one on the re-run and the setup refused. `pick` runs pick_journal_disk
+# on `drives` and prints its exit status, then what it printed.
+# ---------------------------------------------------------------------
+SAMSUNG=1920383410176
+MICRON=960197124096
+pick() {
+    local drives="$1" got rc
+    shift
+    got=$(printf '%s' "$drives" | pick_journal_disk "$@" 2>/dev/null)
+    rc=$?
+    printf '%s %s' "$rc" "$got"
+}
+FIRST_BOOT="/dev/nvme0n1 $MICRON 1 182510B71596
+/dev/nvme1n1 $MICRON 0 182510B74ABA
+/dev/nvme2n1 $SAMSUNG 0 S7RHNG0YA05380
+/dev/nvme3n1 $SAMSUNG 0 S7RHNG0YA05292
+"
+# The same drives after the reboot: the two Samsungs swapped names.
+SWAPPED="/dev/nvme0n1 $MICRON 1 182510B71596
+/dev/nvme1n1 $MICRON 0 182510B74ABA
+/dev/nvme3n1 $SAMSUNG 0 S7RHNG0YA05380
+/dev/nvme2n1 $SAMSUNG 0 S7RHNG0YA05292
+"
+
+got=$(pick "$FIRST_BOOT" "" "" "" "")
+if [[ "$got" == "0 /dev/nvme3n1" ]]; then
+    ok "a tie in size goes to the lowest serial, not the first name"
+else
+    bad "expected the Samsung with the lower serial, nvme3n1" "got: [${got}]"
+fi
+got=$(pick "$SWAPPED" "" "" "" "")
+if [[ "$got" == "0 /dev/nvme2n1" ]]; then
+    ok "the tie-break follows the drive when the names swap"
+else
+    bad "expected the same serial under its new name, nvme2n1" "got: [${got}]"
+fi
+got=$(pick "$(printf '%s' "$FIRST_BOOT" | tac)" "" "" "" "")
+if [[ "$got" == "0 /dev/nvme3n1" ]]; then
+    ok "the pick does not depend on the order the drives are listed in"
+else
+    bad "listing order changed the pick" "got: [${got}]"
+fi
+
+# A re-run keeps the journal it has, wherever its filesystem now is, even
+# when the size ranking or the tie-break would choose another drive.
+JOURNAL_UUID_NOW="ab33eea2-58ba-41c4-88f9-78513aef44e1"
+got=$(pick "$SWAPPED" "" "" "$JOURNAL_UUID_NOW" "/dev/nvme3n1")
+if [[ "$got" == "0 /dev/nvme3n1" ]]; then
+    ok "an existing journal is kept over the drive the tie-break prefers"
+else
+    bad "the drive carrying fstab's filesystem must be kept" "got: [${got}]"
+fi
+got=$(pick "$FIRST_BOOT" "" "" "$JOURNAL_UUID_NOW" "/dev/nvme1n1")
+if [[ "$got" == "0 /dev/nvme1n1" ]]; then
+    ok "an existing journal is kept over a larger drive"
+else
+    bad "the drive carrying fstab's filesystem must be kept" "got: [${got}]"
+fi
+
+# A journal whose drive is gone must not be replaced by a fresh one.
+if out=$(printf '%s' "$SWAPPED" | pick_journal_disk "" "" "$JOURNAL_UUID_NOW" "" 2>&1); then
+    bad "a UUID no drive carries must be refused" "printed: [${out}]"
+elif grep -q "which no drive" <<< "$out" && grep -q "remove that /etc/fstab line" <<< "$out" \
+    && ! grep -q '^/dev/' <<< "$out"; then
+    ok "a journal whose drive is gone is refused, not replaced"
+else
+    bad "the refusal should name the missing UUID and the way out" "$out"
+fi
+
+# JOURNAL_DISK wins on a fresh host, and on one whose journal it names.
+got=$(pick "$FIRST_BOOT" "/dev/nvme1n1" "" "" "")
+if [[ "$got" == "0 /dev/nvme1n1" ]]; then
+    ok "JOURNAL_DISK is taken on a host with no journal yet"
+else
+    bad "JOURNAL_DISK must win over the size ranking" "got: [${got}]"
+fi
+got=$(pick "$SWAPPED" "/dev/nvme3n1" "$JOURNAL_UUID_NOW" "$JOURNAL_UUID_NOW" "/dev/nvme3n1")
+if [[ "$got" == "0 /dev/nvme3n1" ]]; then
+    ok "JOURNAL_DISK naming the existing journal is taken"
+else
+    bad "JOURNAL_DISK carrying fstab's filesystem must be accepted" "got: [${got}]"
+fi
+# Naming another drive than the journal fstab mounts would format it while
+# the next boot mounts the old one.
+if out=$(printf '%s' "$SWAPPED" \
+    | pick_journal_disk "/dev/nvme2n1" "" "$JOURNAL_UUID_NOW" "/dev/nvme3n1" 2>&1); then
+    bad "JOURNAL_DISK naming another drive than the journal must be refused" "printed: [${out}]"
+elif grep -q "UUID=$JOURNAL_UUID_NOW (/dev/nvme3n1)" <<< "$out" \
+    && grep -q "Re-run without JOURNAL_DISK" <<< "$out" \
+    && ! grep -q '^/dev/' <<< "$out"; then
+    ok "JOURNAL_DISK naming another drive than the journal is refused"
+else
+    bad "the refusal should name the journal's drive and both ways out" "$out"
+fi
+
+# Drives a serial cannot tell apart leave nothing to break the tie with.
+got=$(pick "/dev/nvme2n1 $SAMSUNG 0
+/dev/nvme3n1 $SAMSUNG 0
+" "" "" "" "")
+if [[ "$got" == "1 " ]]; then
+    ok "two drives of one size with no serial are refused, not guessed between"
+else
+    bad "a tie the serial cannot break must be refused" "got: [${got}]"
+fi
+# Such a tie below the largest drive does not matter.
+got=$(pick "/dev/nvme1n1 $MICRON 0
+/dev/nvme2n1 $MICRON 0
+/dev/nvme3n1 $SAMSUNG 0
+" "" "" "" "")
+if [[ "$got" == "0 /dev/nvme3n1" ]]; then
+    ok "a tie between smaller drives does not block the largest"
+else
+    bad "only a tie for the largest drive is ambiguous" "got: [${got}]"
+fi
+# And a later, lower serial resolves a tie between two higher ones.
+got=$(pick "/dev/nvme1n1 $SAMSUNG 0 S9
+/dev/nvme2n1 $SAMSUNG 0 S9
+/dev/nvme3n1 $SAMSUNG 0 S1
+" "" "" "" "")
+if [[ "$got" == "0 /dev/nvme3n1" ]]; then
+    ok "a lower serial settles a tie between two drives above it"
+else
+    bad "the lowest serial is unambiguous" "got: [${got}]"
+fi
+
+# Partitioned drives hold the OS; with nothing else, there is no journal
+# disk, which is not an error.
+got=$(pick "/dev/nvme0n1 $SAMSUNG 1 S1
+" "" "" "" "")
+if [[ "$got" == "0 " ]]; then
+    ok "a host with only partitioned drives has no journal disk, and no error"
+else
+    bad "expected an empty pick and success" "got: [${got}]"
+fi
+
+FSTAB="${TMP_ROOT}/fstab"
+cat > "$FSTAB" << 'EOF'
+# /mnt/journal was on /dev/nvme0n1 during installation
+UUID=2f5ca87d-e6d1-43f7-acad-702148ea8a74 /               ext4    errors=remount-ro 0       1
+UUID=A52E-1C69  /boot/efi       vfat    umask=0077      0       1
+UUID=ab33eea2-58ba-41c4-88f9-78513aef44e1 /mnt/journal xfs noatime,logbsize=256k,logbufs=8 0 2
+EOF
+if got=$(fstab_journal_uuid "$FSTAB" /mnt/journal) && [[ "$got" == "$JOURNAL_UUID_NOW" ]]; then
+    ok "fstab's journal UUID is read, comments mentioning the mount skipped"
+else
+    bad "expected the journal entry's UUID" "got: [${got}]"
+fi
+if got=$(fstab_journal_uuid "$FSTAB" /mnt/elsewhere) && [[ -z "$got" ]]; then
+    ok "no fstab entry for the mount reads as no journal"
+else
+    bad "an absent entry must print nothing and succeed" "got: [${got}]"
+fi
+if got=$(fstab_journal_uuid "${TMP_ROOT}/no-fstab" /mnt/journal) && [[ -z "$got" ]]; then
+    ok "a missing fstab reads as no journal"
+else
+    bad "a missing fstab must print nothing and succeed" "got: [${got}]"
+fi
+# A final line without its newline is still read.
+printf 'UUID=%s /mnt/journal xfs noatime 0 2' "$JOURNAL_UUID_NOW" > "$FSTAB"
+if got=$(fstab_journal_uuid "$FSTAB" /mnt/journal) && [[ "$got" == "$JOURNAL_UUID_NOW" ]]; then
+    ok "an entry on a last line with no newline is read"
+else
+    bad "the last line must be read without its newline" "got: [${got}]"
+fi
+# An entry by kernel name says nothing once the names have moved.
+printf '/dev/nvme2n1 /mnt/journal xfs noatime 0 2\n' > "$FSTAB"
+if out=$(fstab_journal_uuid "$FSTAB" /mnt/journal 2>&1); then
+    bad "an entry by kernel name must be refused" "printed: [${out}]"
+elif grep -q "from /dev/nvme2n1, not by filesystem UUID" <<< "$out"; then
+    ok "an fstab entry by kernel name is refused"
+else
+    bad "the refusal should name the entry's source" "$out"
 fi
 
 echo ""

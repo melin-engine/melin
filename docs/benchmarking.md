@@ -35,8 +35,19 @@ go in a GRUB drop-in, `/etc/default/grub.d/99-melin-ec-bench.cfg`, and
 take effect after the reboot the script performs; re-running the script
 verifies that every one reached the running kernel. The drop-in is
 rewritten on every run, so keep tuning of your own in a drop-in of
-another name. Set `JOURNAL_DISK=/dev/nvmeXn1` to choose the journal
-drive yourself.
+another name.
+
+The journal goes on the largest unpartitioned NVMe drive. Drives of
+the same size are told apart by serial number, because the kernel's
+names for them (`nvme2n1`, `nvme3n1`) can change from one boot to the
+next. Once the journal is set up, a re-run keeps it on the drive that
+holds its filesystem, whatever that drive is called now. To choose the
+drive yourself, set `JOURNAL_DISK`, preferably to a name that does not
+change, such as `/dev/disk/by-id/nvme-<model>_<serial>`. The script
+refuses to put the journal on another drive than the one `/etc/fstab`
+already mounts it from, and refuses to format a replacement when that
+drive is missing: to move the journal, unmount it and remove its line
+from `/etc/fstab` first.
 
 The nodes write their snapshots to the root filesystem (see "Snapshots"
 below), so on the server and replica hosts the root filesystem must be

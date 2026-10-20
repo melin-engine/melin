@@ -324,6 +324,16 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   settings through the rule and reads them back, failing the setup when
   they did not land. `nr_requests` asks for 4, the kernel's minimum,
   rather than a 2 it silently raised.
+- **Re-running `scripts/bench/server-setup.sh` keeps the journal on its
+  drive.** Between two drives of the same size it took the first by
+  kernel name, and NVMe names can change across a reboot: the re-run then
+  picked the empty drive and refused, the journal being mounted from the
+  other. A re-run now keeps the drive holding the filesystem `/etc/fstab`
+  mounts, a first run breaks a tie by serial number, and `JOURNAL_DISK`
+  takes a `/dev/disk/by-id` path. The script refuses a `JOURNAL_DISK`
+  other than the journal's drive (with the journal unmounted, it used to
+  format and mount that drive while `/etc/fstab` kept naming the old
+  one), and an fstab entry whose drive is missing.
 - **The LAN bench suite runs under a locale with a decimal comma.** Its
   snapshot verdicts read and printed save times in the caller's number
   format: a save of 12.25 ms counted as 12, printed as `12,000`, and the
