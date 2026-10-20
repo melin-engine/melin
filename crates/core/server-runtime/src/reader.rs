@@ -4256,13 +4256,14 @@ mod tests {
                 .collect()
         }
 
-        /// Park the connection: write the burst, give the reader time to
-        /// answer the first two (left in the queue, which they fill) and
-        /// park on the third, and check that nothing behind it was
-        /// published.
+        /// Park the connection: write the burst, wait until the reader has
+        /// answered the first two (left in the queue, which they fill) and
+        /// parked on the third, and check that nothing behind it was
+        /// published. The parked gauge is set at the end of a retry pass,
+        /// so by the time it reads one the park's cancel has landed.
         fn park(rig: &mut Rig, client: &mut UnixStream) {
             client.write_all(&burst()).expect("client write");
-            std::thread::sleep(Duration::from_millis(100));
+            rig.wait_for_parked(1);
             let published = rig.take_published();
             assert!(published.is_empty(), "published past a park: {published:?}");
         }
@@ -4291,7 +4292,7 @@ mod tests {
             );
             // Counted as parked, once, however many retries it has been
             // through; the two filtered requests answered so far counted.
-            rig.wait_for_parked(1);
+            assert_eq!(rig.metrics.parked(), 1);
             assert_eq!(rig.metrics.parks(), 1);
             assert_eq!(rig.metrics.counts().filtered, 2);
 
@@ -4402,9 +4403,9 @@ mod tests {
         fn a_parked_connection_closed_by_its_retry_is_torn_down_once() {
             let mut rig = Rig::start(64, None);
             let (mut client, _dup) = rig.connect(1);
+            // Parked, its cancel landed (see `park`): torn down with nothing
+            // owed.
             park(&mut rig, &mut client);
-            rig.wait_for_parked(1);
-            // Its cancel has landed by now: torn down with nothing owed.
             rig.fence.fence();
             let deadline = Instant::now() + Duration::from_secs(10);
             let mut disconnects = Vec::new();

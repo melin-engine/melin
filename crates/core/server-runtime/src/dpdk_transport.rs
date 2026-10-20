@@ -1660,6 +1660,20 @@ mod tests {
                 }
             }
 
+            /// Whether the node has closed the connection, as far as the
+            /// client can tell now: its close sends nothing, so it shows
+            /// only as the reset a request since has drawn. Panics on an
+            /// answer: the stage is held while this is asked.
+            fn dropped_by_node(&mut self) -> bool {
+                let now = self.now_ns();
+                match self.conn.poll(&mut self.stream, now) {
+                    Ok(None) => false,
+                    Ok(Some(frame)) => panic!("answered while the stage is held: {frame:?}"),
+                    Err(melin_client::Error::Disconnected | melin_client::Error::Io(_)) => true,
+                    Err(e) => panic!("not a close: {e:?}"),
+                }
+            }
+
             /// Pipeline requests until the node stops taking bytes: a
             /// backlog the stream does not take, which stays put for
             /// [`QUIET`]. Nothing is answered meanwhile: the response
@@ -1757,15 +1771,32 @@ mod tests {
 
         /// The idle check skips a parked connection, however long it stays
         /// parked: its client is not idle, the node is not reading it.
+        ///
+        /// The idle check is throttled, so the client surviving the park
+        /// proves nothing unless the check has run meanwhile. A witness
+        /// connection, idle the while, proves it: the client is let go only
+        /// once the node has dropped the witness as idle.
         #[test]
         fn a_parked_connection_is_not_dropped_as_idle() {
-            /// Short, so that the wait parked spans many of it and the
-            /// poll loop's throttled check comes round several times.
+            /// Short, so that a wait of a few of it outlasts the witness's
+            /// clock and the poll loop's throttled check alike.
             const TIMEOUT: Duration = Duration::from_secs(1);
             let rig = Rig::start(4, SocketBuffers::DEFAULT.rx_buf_size, Some(TIMEOUT));
             let mut client = rig.client();
+            let mut witness = rig.client();
             client.send_until_stalled();
-            still_up(&mut client, TIMEOUT * 5);
+
+            // Probe the witness every two timeouts: a node that still holds
+            // it takes the write (and its clock restarts), one that has
+            // dropped it as idle resets the connection. The client, parked
+            // longer than the timeout, must be up throughout.
+            let deadline = Instant::now() + PATIENCE;
+            while !witness.dropped_by_node() {
+                assert!(Instant::now() < deadline, "the witness was never dropped");
+                still_up(&mut client, TIMEOUT * 2);
+                witness.send(&increment_request(1), Answer::Acked);
+                still_up(&mut client, QUIET);
+            }
 
             rig.hold.release();
             client.finish();
@@ -1779,14 +1810,29 @@ mod tests {
         /// all of it in the node's buffer before the last one parks the
         /// connection, and then nothing: no read after the resume restarts
         /// the clock in its place.
+        ///
+        /// The idle check is throttled (it runs on the slow checks'
+        /// cadence), so the connection outliving the resume proves nothing
+        /// unless the check has run since. A witness connection proves it:
+        /// idle since a write it sends while the client is parked, it falls
+        /// due shortly after the resume, and the client is checked only
+        /// once the witness has been dropped.
         #[test]
         fn a_resumed_connection_restarts_its_idle_clock() {
-            /// Long enough for the poll loop's throttled check (every
-            /// 2^20 iterations) to come round within half of it, with
-            /// room to spare on a slower runner:
-            /// the wait after the answers relies on that to tell a
-            /// restarted clock from a stale one.
+            /// The idle timeout. The slow check that drops the witness must
+            /// come round within `TIMEOUT - WITNESS_LEAD` of the witness
+            /// falling due, or it finds the client's restarted clock run
+            /// out too; asserted below, so a cadence too slow for it fails
+            /// with its cause named.
             const TIMEOUT: Duration = Duration::from_secs(4);
+            /// How long the client stays parked: longer than the timeout,
+            /// so the last bytes it read are older than that when it
+            /// resumes.
+            const PARKED_FOR: Duration = Duration::from_secs(6);
+            /// How long after the resume the witness falls due: well
+            /// inside the timeout, which the resumed client's restarted
+            /// clock has from the resume on.
+            const WITNESS_LEAD: Duration = Duration::from_millis(500);
             const EARLY_CAPACITY: usize = 4;
             let rig = Rig::start(
                 EARLY_CAPACITY,
@@ -1794,12 +1840,15 @@ mod tests {
                 Some(TIMEOUT),
             );
             let mut client = rig.client();
+            let mut witness = rig.client();
             for _ in 0..=EARLY_CAPACITY {
                 client.send(&MALFORMED, Answer::Malformed);
             }
-            // Parked for longer than the timeout, the last bytes it read
-            // older than that by the time it resumes.
-            still_up(&mut client, TIMEOUT * 3 / 2);
+            still_up(&mut client, PARKED_FOR - TIMEOUT + WITNESS_LEAD);
+            // A write: published at once (only the client is parked), its
+            // reply held with the stage. The witness's last bytes.
+            witness.send(&increment_request(1), Answer::Acked);
+            still_up(&mut client, TIMEOUT - WITNESS_LEAD);
             assert!(
                 client.answers.is_empty(),
                 "answered while the stage is held"
@@ -1813,6 +1862,7 @@ mod tests {
                 EARLY_CAPACITY as u64
             );
 
+            let released_at = Instant::now();
             rig.hold.release();
             client.finish();
             // Resumed: no longer parked (the gauge is set at the end of the
@@ -1828,11 +1878,28 @@ mod tests {
                 rig.metrics.counts().refused_as(RefusalKind::Malformed),
                 EARLY_CAPACITY as u64 + 1
             );
+            // The stage, let go, drains the two probes' closes (one per
+            // `rig.client()`), leaving the client and the witness; the
+            // witness's idle drop takes the count to one. An idle check
+            // has run since the resume, then, and found the client inside
+            // its restarted clock. With a stale one, it would have been
+            // dropped by that check, or an earlier one.
+            let deadline = Instant::now() + PATIENCE;
+            while rig.active.load(Ordering::Relaxed) > 1 {
+                assert!(Instant::now() < deadline, "the witness was never dropped");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                released_at.elapsed() < TIMEOUT,
+                "the witness was dropped {:?} after the resume: the slow checks' \
+                 cadence is too slow for this test's TIMEOUT",
+                released_at.elapsed()
+            );
             // The idle drop closes without a word to the client: a request
             // is what finds the connection gone, reset by the node's stack.
-            still_up(&mut client, TIMEOUT / 2);
             client.send(&increment_request(1), Answer::Acked);
             client.finish();
+            drop(witness);
         }
 
         /// A parked connection whose retry closes it (the node superseded
