@@ -510,7 +510,8 @@ hold, so the bookkeeping below is written once.
   between events, to shorten a path that is degraded by definition: a
   park happens only while the stage is not draining. And the DPDK side
   needs nothing of the kind, since its poll loop retries a parked
-  connection every iteration, so the wake would be io_uring's alone. The
+  connection itself, every `PARK_RETRY_INTERVAL` iterations, so the
+  wake would be io_uring's alone. The
   cost of the timer is a resume delay of at most `PARK_RETRY` after the
   stage resumes, on a connection the client is already being pushed back
   on. Each `PARK_RETRY` expiry, or any other wake of the reader, retries
@@ -519,7 +520,8 @@ hold, so the bookkeeping below is written once.
   is not idle, the node is not reading it.
 - **Parking on DPDK** (`dpdk_transport.rs`). A parked connection is not
   read from: the poll loop skips
-  its `recv_into_vec` and retries its `parse_buf` on each iteration.
+  its `recv_into_vec` and retries its `parse_buf` on one iteration in
+  `PARK_RETRY_INTERVAL`.
   smoltcp keeps unread bytes in the socket's receive buffer and advertises
   only its free space, so the client is pushed back the same way; a netns
   test pins it (step 5). The parked branch comes **before** the

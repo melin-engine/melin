@@ -447,8 +447,7 @@ fn process_frames_unflushed<A: Application>(
             break;
         }
         // Counted and logged once its answer is queued: a request parked
-        // on is decoded again by every retry until then, which on DPDK is
-        // every poll iteration.
+        // on is decoded again by every retry until then.
         match early {
             EarlyKind::Rejected(_) => refused += 1,
             EarlyKind::Refused { kind, reason } => {

@@ -99,11 +99,11 @@ enum AuthState {
     Authenticated {
         role: ClientRole<RoleId>,
         /// Since when the connection has been parked (see `client_frames`):
-        /// an early reply had nowhere to go, so its buffer is retried on
-        /// every poll iteration and nothing more is read from it until the
-        /// retry gets through. `None` while it is read as usual. Here
-        /// rather than beside `auth`, so only an authenticated connection
-        /// can be parked.
+        /// an early reply had nowhere to go, so its buffer is retried every
+        /// `PARK_RETRY_INTERVAL` poll iterations and nothing more is read
+        /// from it until the retry gets through. `None` while it is read
+        /// as usual. Here rather than beside `auth`, so only an
+        /// authenticated connection can be parked.
         parked: Option<Instant>,
     },
     /// Auth failed and `AuthFailed` has been queued. Terminal: nothing
@@ -278,6 +278,17 @@ pub fn run_dpdk_poll<A: Application>(
     // polls/sec) is still orders of magnitude tighter than the deadline.
     let mut slow_check_counter: u32 = 0;
     const SLOW_CHECK_INTERVAL: u32 = 1024 * 1024;
+    // A parked connection's buffer is retried on one poll iteration in
+    // this many, not on each: a retry decodes the frame it parked on
+    // again, and while the response stage is stalled every parked
+    // connection would otherwise cost the poll thread a decode per
+    // iteration. A resume waits at most this many iterations, the unit
+    // the loop's other timers are counted in, after a stall long enough
+    // to have filled the early-reply queue. A divisor of the slow
+    // checks' interval, so every slow-check pass is a retry pass and finds
+    // each parked connection's park time for the long-park report.
+    const PARK_RETRY_INTERVAL: u32 = 256;
+    const _: () = assert!(SLOW_CHECK_INTERVAL.is_multiple_of(PARK_RETRY_INTERVAL));
     // Connections parked for longer than `LONG_PARK` are reported on the
     // slow checks' cadence, at most once per `LONG_PARK`.
     let mut long_park_report = LongParkReport::default();
@@ -473,8 +484,11 @@ pub fn run_dpdk_poll<A: Application>(
         // the connections found parked past `LONG_PARK` on this pass.
         let slow_check_now = do_slow_checks.then(Instant::now);
         let mut long_parked = 0usize;
+        // Whether this pass retries parked connections' buffers.
+        let retry_parked = slow_check_counter.is_multiple_of(PARK_RETRY_INTERVAL);
         // Connections parked after this pass, for the gauge: every parked
-        // connection is retried on every pass, so the count is whole.
+        // connection is counted on every pass, retried or not, so the
+        // count is whole.
         let mut parked_now = 0u64;
 
         // Per-connection batching with a visibility-delay cap happens
@@ -570,7 +584,8 @@ pub fn run_dpdk_poll<A: Application>(
             }
 
             // A parked connection is not read: what it has buffered is
-            // retried below, with no new bytes, on every iteration, and the
+            // retried below, with no new bytes, on a retry pass
+            // (`PARK_RETRY_INTERVAL`), and only counted on the others; the
             // client's bytes stay in the socket, whose receive window
             // closes on it. This comes before the buffer cap: one receive
             // can take the buffer past the cap before the connection
@@ -584,7 +599,12 @@ pub fn run_dpdk_poll<A: Application>(
                     ..
                 }
             );
-            if !parked {
+            if parked {
+                if !retry_parked {
+                    parked_now += 1;
+                    continue;
+                }
+            } else {
                 // Guard against unbounded buffer growth — check before recv.
                 if conn.ingress.len() >= MAX_PARSE_BUF {
                     debug!(
@@ -737,8 +757,8 @@ pub fn run_dpdk_poll<A: Application>(
                         }
                         FrameAction::Disconnect => true,
                         // An answer with nowhere to go: stop reading the
-                        // connection, and retry its buffer from the next
-                        // iteration on (see `parked` above). One parked
+                        // connection, and retry its buffer on the retry
+                        // passes from here on (see `parked` above). One parked
                         // since it first parked, past `LONG_PARK`, is
                         // counted for the report below.
                         FrameAction::Park => {
@@ -1205,8 +1225,9 @@ mod tests {
     }
 
     /// Parking on the poll loop: a connection whose early reply has
-    /// nowhere to go is not read, and its buffer is retried each iteration
-    /// until the response stage takes early replies again.
+    /// nowhere to go is not read, and its buffer is retried on every
+    /// `PARK_RETRY_INTERVAL`-th iteration until the response stage takes
+    /// early replies again.
     ///
     /// A running node never gets there on demand: its response stage takes
     /// early replies between any two events. So these run the poll loop
