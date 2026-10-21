@@ -6,12 +6,25 @@
 //! this crate. See `docs/replication.md` ("Limitations") for the operator
 //! contract this implements and `docs/internal/raft-control-plane.md` for
 //! the design.
+//!
+//! The server runtime is the crate's only consumer, so its public surface
+//! is just what starting the driver takes: [`spawn`] with its
+//! configuration, the node's journal tip it votes on, and the
+//! supersession policy that steps a superseded primary down. The RPC
+//! server, wire format, authentication and file store stay private.
 
-pub mod auth;
-pub mod driver;
-pub mod network;
-pub mod recency;
-pub mod rpc_server;
-pub mod storage;
-pub mod types;
-pub mod wire;
+mod auth;
+mod driver;
+mod network;
+mod recency;
+mod rpc_server;
+mod storage;
+mod types;
+mod wire;
+
+#[cfg(test)]
+mod tests;
+
+pub use driver::{RaftConfig, RaftHandles, RaftPeer, spawn};
+pub use recency::{JournalTip, PeerTips, TipSource};
+pub use rpc_server::SupersessionPolicy;

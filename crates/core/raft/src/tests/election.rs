@@ -7,11 +7,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::driver::{RaftConfig, RaftHandles, RaftPeer, spawn};
+use crate::recency::TipSource;
 use base64::Engine;
 use ed25519_dalek::SigningKey;
 use melin_app::auth::{AuthorizedKeys, NoRoles};
-use melin_raft::driver::{RaftConfig, RaftHandles, RaftPeer, spawn};
-use melin_raft::recency::TipSource;
 use melin_transport_core::cursors::AdvertisedJournalTip;
 use melin_transport_core::fence::FenceState;
 use melin_transport_core::health::RaftStatus;
@@ -228,7 +228,7 @@ fn single_voter_elects_itself() {
 /// still inflate its term (openraft has no pre-vote), and sustained
 /// leadership churn legitimately opens the escape — best-effort steering,
 /// with promotion-time checks staying authoritative (see
-/// `melin_raft::recency`).
+/// `crate::recency`).
 #[test]
 fn behind_node_never_wins_an_election() {
     // Nodes 1–4 hold seq 100; node 5 is behind at seq 10. Node 5 can only

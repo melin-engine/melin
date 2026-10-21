@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use melin_raft::recency::{JournalTip, PeerTips};
+use melin_raft::{JournalTip, PeerTips};
 use melin_transport_core::health::RaftStatus;
 use tracing::{info, warn};
 

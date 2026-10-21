@@ -9,13 +9,13 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use crate::network::RaftClientFactory;
+use crate::recency::{PeerTips, TipSource};
+use crate::rpc_server::{RaftApi, RpcServerConfig, SupersessionPolicy, serve};
+use crate::types::{NodeId, TypeConfig};
 use base64::Engine;
 use ed25519_dalek::SigningKey;
 use melin_app::auth::{AuthorizedKeys, NoRoles};
-use melin_raft::network::RaftClientFactory;
-use melin_raft::recency::TipSource;
-use melin_raft::rpc_server::{RaftApi, RpcServerConfig, SupersessionPolicy, serve};
-use melin_raft::types::{NodeId, TypeConfig};
 use melin_transport_core::cursors::AdvertisedJournalTip;
 use melin_transport_core::fence::FenceState;
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
@@ -93,7 +93,7 @@ async fn start_server() -> Harness {
         authorized_keys,
         peer_ids,
         tip: tip_at(0, 0),
-        peer_tips: Arc::new(melin_raft::recency::PeerTips::new()),
+        peer_tips: Arc::new(PeerTips::new()),
         supersession: None,
         vote_filter: std::sync::Mutex::new(Default::default()),
     });
@@ -112,7 +112,7 @@ async fn client_for(h: &Harness, key: &SigningKey) -> impl RaftNetwork<TypeConfi
     let mut factory = RaftClientFactory::new(
         Arc::new(key.clone()),
         tip_at(0, 0),
-        Arc::new(melin_raft::recency::PeerTips::new()),
+        Arc::new(PeerTips::new()),
     );
     factory
         .new_client(
@@ -223,7 +223,7 @@ async fn oversized_frame_is_refused() {
     let h = start_server().await;
     // Authenticate a raw connection, then send a pathological length prefix.
     let mut stream = tokio::net::TcpStream::connect(&h.addr).await.unwrap();
-    melin_raft::auth::authenticate_outbound(&mut stream, &h.client_key)
+    crate::auth::authenticate_outbound(&mut stream, &h.client_key)
         .await
         .unwrap();
     stream.write_all(&u32::MAX.to_le_bytes()).await.unwrap();
@@ -274,7 +274,7 @@ async fn votes_are_dropped_until_the_tip_is_ready() {
             seq: AdvertisedJournalTip::new(melin_transport_core::WireSeq::new(0)),
             ready: Arc::clone(&ready),
         }),
-        peer_tips: Arc::new(melin_raft::recency::PeerTips::new()),
+        peer_tips: Arc::new(PeerTips::new()),
         supersession: None,
         vote_filter: std::sync::Mutex::new(Default::default()),
     });
@@ -283,7 +283,7 @@ async fn votes_are_dropped_until_the_tip_is_ready() {
     let mut factory = RaftClientFactory::new(
         Arc::new(client_key.clone()),
         tip_at(0, 0),
-        Arc::new(melin_raft::recency::PeerTips::new()),
+        Arc::new(PeerTips::new()),
     );
     let node = BasicNode { addr };
 
@@ -344,7 +344,7 @@ async fn serving_node_fences_on_higher_peer_epoch() {
             seq: AdvertisedJournalTip::new(melin_transport_core::WireSeq::new(0)),
             ready: Arc::new(AtomicBool::new(true)),
         }),
-        peer_tips: Arc::new(melin_raft::recency::PeerTips::new()),
+        peer_tips: Arc::new(PeerTips::new()),
         supersession: Some(SupersessionPolicy {
             fence: Arc::clone(&fence),
             shutdown: Arc::clone(&process_shutdown),
@@ -358,7 +358,7 @@ async fn serving_node_fences_on_higher_peer_epoch() {
     let mut factory = RaftClientFactory::new(
         Arc::new(client_key.clone()),
         tip_at(7, 100),
-        Arc::new(melin_raft::recency::PeerTips::new()),
+        Arc::new(PeerTips::new()),
     );
     let mut client = factory.new_client(1, &BasicNode { addr }).await;
     // The RPC itself may succeed or fail (the server may begin shutting
