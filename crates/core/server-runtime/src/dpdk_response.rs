@@ -103,6 +103,28 @@ pub enum ControlEvent {
     Disconnected { connection_id: u64 },
 }
 
+/// Bit offset of the owning poll thread's index in a connection ID: the
+/// thread sits in bits 56..63, the per-thread sequence in bits 0..55, so a
+/// reply is routed to its TX ring without a lookup. `u32` because that is
+/// what the shift operators take.
+const LANE_SHIFT: u32 = 56;
+
+// The thread's index fills the bits above the shift exactly, so the doc
+// above is checked rather than asserted.
+const _: () = assert!(LANE_SHIFT + u8::BITS == u64::BITS);
+
+/// The ID of the `seq`th connection accepted by poll thread `thread_id`.
+/// `thread_id` is a `u8` so that no index can spill past the top byte.
+pub(crate) fn lane_connection_id(thread_id: u8, seq: u64) -> u64 {
+    u64::from(thread_id) << LANE_SHIFT | seq
+}
+
+/// The TX ring, out of `lanes`, owned by the poll thread that accepted
+/// `connection_id`.
+fn tx_lane(connection_id: u64, lanes: usize) -> usize {
+    (connection_id >> LANE_SHIFT) as usize % lanes
+}
+
 /// Run the DPDK response stage loop. Blocks the calling thread until shutdown.
 ///
 /// Identical to the TCP response stage except:
@@ -470,7 +492,7 @@ pub fn run<A: Application>(
             // encoded) while still letting the DPDK poll thread drain
             // Report + BatchEnd in a single consume cycle for low-rate
             // workloads (consumer-side win for single-request p99).
-            let tid = (conn_id >> 56) as usize % tx_producers.len();
+            let tid = tx_lane(conn_id, tx_producers.len());
 
             // Frame 1: application payload (Report / Query via encoder).
             // BatchEnd payloads carry no body — the terminator below
@@ -604,7 +626,7 @@ fn push_early_reply<R: Copy, Q: Copy>(
         );
         return;
     };
-    let tid = (conn_id >> 56) as usize % tx_producers.len();
+    let tid = tx_lane(conn_id, tx_producers.len());
     let written = encode_early_reply(&reply, encoder, early_buf);
     push_frame(
         Some(Ok(written)),
@@ -748,7 +770,7 @@ fn send_due_heartbeats(
             ..Default::default()
         };
         frame.data[..heartbeat.len()].copy_from_slice(heartbeat);
-        let tid = (conn_id >> 56) as usize % tx_producers.len();
+        let tid = tx_lane(conn_id, tx_producers.len());
         if tx_producers[tid].try_publish(frame).is_ok() {
             state.last_send = now;
         }
@@ -893,6 +915,21 @@ mod tests {
         assert_eq!(reads.get(), 1);
         assert_eq!(connections[&1].last_send, at_drain);
         assert_eq!(connections[&2].last_send, at_drain);
+    }
+
+    /// A connection ID routes back to the poll thread that minted it,
+    /// whatever its sequence, so a reply reaches the TX ring of the thread
+    /// that owns its socket.
+    #[test]
+    fn a_connection_id_routes_to_the_lane_that_minted_it() {
+        for lanes in [1usize, 2, 4] {
+            for thread_id in 0..lanes as u8 {
+                for seq in [1, 2, (1 << LANE_SHIFT) - 1] {
+                    let id = lane_connection_id(thread_id, seq);
+                    assert_eq!(tx_lane(id, lanes), usize::from(thread_id));
+                }
+            }
+        }
     }
 
     /// A heartbeat that finds its TX ring full is retried on the next

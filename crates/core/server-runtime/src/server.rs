@@ -3065,8 +3065,8 @@ where
     // 4096 slots × ~140 bytes = ~560 KiB. Enough to buffer a burst
     // without backpressuring the response stage.
     // One SPSC channel per DPDK poll thread (one: see `transport`). The
-    // response stage routes frames to the correct thread based on
-    // thread_id encoded in connection_id bits 56..63. A `Vec` because
+    // response stage routes frames to the thread that owns the connection,
+    // which its ID names (`dpdk_response::tx_lane`). A `Vec` because
     // that is the response stage's interface.
     // The response thread produces into it, so it waits its way.
     let wait = config.cores.response.wait;
