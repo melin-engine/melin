@@ -16,8 +16,10 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 - **`melin_transport_core::NodeStore`**, the one resolver of a node's
   journal and snapshot paths, and **`ServerConfig::store()`**, which
-  builds it from `--journal` and `--snapshot-path`. Every role that
-  reads, writes, serves or archives the snapshot takes its path from it.
+  builds it from `--journal` and `--snapshot-path`, or says with a
+  `NodeStoreError` why the layout is unusable (see Changed). Every role
+  that reads, writes, serves or archives the snapshot takes its path from
+  it.
 - **`melin_journal::segment::parent_dir` and `fsync_dir`**: the directory
   a file lives in (a bare name's is `.`), and a sync of a directory itself.
 - **`melin_journal::segment::start_writeback` and `writeback_and_wait`**:
@@ -156,8 +158,8 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   event publisher sees it as it sees the connection. It is never
   journaled or replicated, and is `RequestId(0)` on node events and
   replicas; on a client's request it is the ID the request frame carries
-  (see client protocol 1 below). Source-breaking for code that builds either slot with a
-  struct literal: add the field, or build node events with
+  (see client protocol 1 below). Source-breaking for code that builds
+  either slot with a struct literal: add the field, or build node events with
   `InputSlot::node_event` and client requests with `InputSlot::client`.
   A slot whose fixed fields grow by eight bytes can cross a cache-line
   boundary: an `InputSlot` (padded to whole lines) grows by a line when
@@ -189,8 +191,8 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   but requests sent after it may have been, so a client whose requests
   depend on each other's order stops on a busy, waits for the replies it
   is owed, and resends from the busy request on. The sizes:
-  `REQUEST_HEADER_LEN` is 13, and
-  `MAX_REQUEST_BODY` 1015 (the ID comes out of the body; the frame limit
+  `REQUEST_HEADER_LEN` is 13, and `MAX_REQUEST_BODY` 1015 (the ID comes
+  out of the body; the frame limit
   stays 1024), so an application that does not check its widest request
   at build time fails at run time for a body between 1016 and 1023 bytes.
   Source-breaking in `melin-wire-protocol`: `seal_request` and
@@ -305,7 +307,7 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 ### Fixed
 
 - **A snapshot deferred under load is retried, not skipped for an
-  interval.** The shadow stage saves only at a journal fsync boundary,
+  interval** (finding 35 of the determinism audit). The shadow stage saves only at a journal fsync boundary,
   and tried once per `--snapshot-interval-ms`: under sustained load it
   could miss the boundary at every tick and go several intervals without
   a snapshot, logging nothing. A due save is now attempted until it
