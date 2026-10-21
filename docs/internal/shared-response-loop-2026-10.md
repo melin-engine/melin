@@ -1,6 +1,6 @@
 # One response loop for both transports (plan, 2026-10)
 
-Status: plan, revised after one review, names and test retirement decided.
+Status: plan, revised after two reviews, names and test retirement decided.
 
 The seam table below describes the code as it is today, under today's
 names; the kernel stage's `Egress` struct becomes `UringEgress` in step 2.
@@ -24,10 +24,16 @@ ordering rules the stage's correctness depends on:
 - `GateWait::before_wait` runs at most once per admit, before its first
   wait, and `while_waiting` sends early replies only for a slot that is the
   first of its event;
+- the batch's early-reply snapshot is released at each event's first slot
+  *before* that slot's `gate.admit`, which is why a refusal never waits
+  behind a held write;
+- the batch's clock is read once per batch (`batch_now`), while early
+  replies read it lazily, only when there is one to send;
 - the admit's `Shutdown` arm drops the slot's reply and the rest of the
   batch, and goes back to the top of the loop, which exits; it is safe only
   because `wait_durable` read the flag itself (`durability_gate.rs`), so the
-  top of the loop exits before reading the ring again;
+  top of the loop exits before reading the ring again (step 2 makes it a
+  `break`, see there);
 - the consumer commits only after every slot of the batch cleared the gate,
   which is what the event publisher, chained behind it, relies on;
 - after the commit, the kernel's `drop_overflowed`, then `gate.after_batch`;
@@ -87,14 +93,16 @@ What differs between the stages, and so belongs to the egress:
 | Concern | Kernel TCP (`response.rs`) | DPDK (`dpdk_response.rs`) |
 |---|---|---|
 | Control event type, and draining it | `crate::ControlEvent`, with the socket writer; `Egress::drain_control` | `dpdk_response::ControlEvent`, ID only; `process_control_events` |
-| Deliver one slot's reply (payload + trailer) | `append_frames` into `send_buf`; overflow queued for removal | `push_frame` into the connection's lane, then that lane's `flush` |
+| Deliver one slot's reply (payload + trailer) | `append_frames` into `send_buf`; overflow queued for removal | `push_frame` into the connection's lane |
 | Stamp `last_send` | inside `append_frames`, only when bytes were appended without overflow | after every slot to a known connection, even when `push_frame` pushed nothing |
-| After every slot, known connection or not | `Egress::flush_if_due` | nothing (the lane was flushed in the send) |
+| After every slot, known connection or not | `Egress::flush_if_due` | flush the lane the slot pushed to, if it reached a known connection |
 | Server end-to-end sample | queued after a clean append of a request's last slot, closed at the next flush | recorded right after the lane flush, for a request's last slot |
+| Traced encode sample (`encode_rec`, `tick-to-trade`) | wraps `append_frames` | wraps `push_frame`, not the lane flush |
 | Deliver early replies | `Egress::release_early_replies` (appends; can overflow) | `release_early_replies` (one TX frame each) |
 | Before a gate wait | `Egress::flush` | nothing |
 | After early replies sent during a wait | `drop_overflowed`, then `flush` | nothing |
-| Idle, after early replies | `drop_overflowed`, then `flush` | nothing |
+| Idle, after early replies were released (at a boundary only) | `drop_overflowed` | nothing |
+| Idle, every iteration | `flush`: the steady-state flush, which ships whatever the last batch appended | nothing |
 | Heartbeat to a due connection | skip if blocked or over `MAX_SEND_BUF`; append, flush, tear down failures | `try_publish`; on a full ring, keep it due and record the stall |
 | After the commit | `drop_overflowed` | nothing |
 | Idle stats flush | `server_e2e_rec`, and `egress_rec` under `tick-to-trade` | `server_e2e_rec` |
@@ -128,9 +136,13 @@ pub(crate) trait Egress {
                  now: Instant, shutdown: &AtomicBool) -> Sent;
     /// After every slot, sent or not.
     fn after_slot(&mut self);
-    fn release_early_replies<R: Copy, Q: Copy>(&mut self, /* … */) -> usize;
+    fn release_early_replies<R: Copy, Q: Copy>(&mut self, /* …, */
+                                               shutdown: &AtomicBool) -> usize;
     fn before_wait(&mut self);
+    /// After a release of early replies, during a wait or on the idle path.
     fn after_early_replies(&mut self);
+    /// Every idle iteration, after any release: the kernel's steady-state
+    /// flush.
     fn on_idle(&mut self);
     fn send_heartbeats(&mut self, frame: &[u8], now: Instant, interval: Duration);
     fn after_commit(&mut self);
@@ -170,6 +182,24 @@ Names, decided:
   in the loop is the follow-up under "After this plan". `recv_ts` is not
   feature-gated on the slot, so `SlotReply` needs no `cfg` of its own.
 
+Two consequences of `SlotReply`, accepted and stated in the step 2 and 3
+commits:
+
+- **The encode moves ahead of the connection lookup.** Both loops look the
+  connection up first today, so a reply to an unknown connection is never
+  encoded. Handing `send_slot` the encode result encodes it anyway. Only
+  misses pay: a connection gone mid-batch, and connection 0's
+  server-originated events, which are rare.
+- **The traced encode sample.** The loop wraps `send_slot` in `encode_rec`
+  and records it only on `Sent::Delivered`, so a miss is not sampled, as
+  today. For DPDK to keep sampling `push_frame` alone, `DpdkEgress` does
+  not flush in `send_slot`: it remembers the lane it pushed to (and the
+  slot's `recv_ts` and `is_last_in_request`), and `after_slot` flushes that
+  lane and records the end-to-end sample, which is exactly today's order.
+  The kernel sample gains the end-to-end queue push and the flush-cadence
+  counter `append_frames` is followed by today: a `Vec` push and an add,
+  in traced builds only.
+
 The two `GateWaitHook`s become one, generic over the egress: it borrows
 `&mut E`, the `Registered` snapshot and `&Receiver<E::Control>` exactly as
 today's hooks do, and `admit` already takes `impl GateWait`. The latency
@@ -208,12 +238,36 @@ Loop-level coverage today, by suite:
 
 Extend the harness first:
 
-- `StageInputs` gains the `pause_after_control_drain` seam, which both `run`
-  functions already accept and both `start_*` functions pass as `None`.
-  `registration_race` and `refusal_order` need it.
-- `StageHarness` gains a `stopped_within(Duration)` probe. `stop_while_gated`
-  catches a hang, so it polls the stage thread rather than joining it; the
-  harness's join on drop would hang on exactly the failure it looks for.
+- **The drain pause.** `StageInputs` gains the `pause_after_control_drain`
+  seam, which both `run` functions already accept and both `start_*`
+  functions pass as `None`. `rig()` builds `StageInputs` itself and
+  connects every connection right after the stage starts, so it gains the
+  pause as a parameter and lets a test start with no connection.
+  `registration_race` needs both: it parks the stage, then connects
+  connection 1 itself. `refusal_order` needs only the pause (connection 1
+  is registered by the second iteration either way).
+- **The forced-policy cell.** `start_uring` and `start_dpdk` build
+  `forced_policy_cell()` internally and keep neither half. `StageInputs`
+  carries the reader half, and the test keeps the writer, so the
+  forced-change port can force a policy.
+- **A stop probe.** `StageHarness` gains `stopped_within(Duration) -> bool`.
+  `stop_while_gated` catches a hang, and both harnesses' `Drop` joins the
+  stage thread, so a probe that timed out and then failed its assertion
+  would hang in `Drop` on exactly the wedge it exists to catch. The probe
+  sets the harness's `shutdown` flag, takes the thread handle, polls
+  `is_finished()` until the deadline, and on a timeout drops the handle
+  (detaching the thread) before returning `false`; `Drop` then has nothing
+  to join.
+- **A full TX ring** needs no new knob for step 4's test: the DPDK harness's
+  TX ring holds 1024 frames, and the output ring commits per batch, so
+  publishing past the TX ring's capacity with nothing reading it blocks the
+  stage on its next push.
+
+The DPDK side of every port runs only in the `dpdk` feature build
+(`dpdk_response` is compiled under that feature), so never in the default
+suite or on a host without libdpdk. That is where the DPDK stage's tests
+already run; the transport-independent pin is step 2's recording-egress
+test, which is ungated.
 
 Then port to `StageHarness`, so they run on both stages before either loop
 changes:
@@ -248,7 +302,8 @@ Three changes to `dpdk_response::run`, in place, one commit each:
    inside the gate, so its cadence does not change; only the clock reads
    it costs do. The constant moves to a place both stages import.
 2. **`pipeline-stats` utilization print at shutdown**, which the kernel
-   stage has and DPDK lacks. A one-line commit, so step 3 adds nothing.
+   stage has and DPDK lacks. A one-line commit (plus `print_utilization`
+   becoming `pub(crate)`), so step 3 adds nothing.
 3. **A shared `heartbeat_due(last_send, now, interval)`** free function,
    which DPDK's scan calls. The kernel's `heartbeat_due` becomes that rule
    plus its blocked-peer and buffer-cap guards, and its doc comment goes
@@ -275,27 +330,46 @@ Two commits.
    startup (io_uring, ready signal), its signature and its return value,
    and calls the loop. DPDK is untouched.
 
-Structural. Besides the rename, the only test change is
-`gate_wait_hook::one_turn`, which builds the hook: it builds the generic
-one, and the tests that call it do not change.
+**One exit.** Today the admit's `Shutdown` arm goes back to the top of the
+loop (`continue 'run`), which exits only because `wait_durable` read the
+flag before returning: if it ever returned `Shutdown` with the flag clear,
+the loop would read the same uncommitted batch again and resend every reply
+already sent. The shared loop gives every exit one path instead: the top's
+shutdown check, the admit's `Shutdown` and, from step 4, `Sent::Stopped`
+all `break 'run` to one epilogue after the loop (the kernel's fenced flush,
+the utilization counters, the `pipeline-stats` print). Today the flag is
+set in every case that reaches the admit's arm, so this changes nothing
+observable; it removes the dependency on who read the flag.
+
+Structural. Besides the rename, the test changes are:
+
+- `gate_wait_hook::one_turn`, which builds the hook: it builds the generic
+  one, and the tests that call it do not change;
+- `early_drain::drain_burst` calls `release_early_replies`, which becomes a
+  trait method, so the module gains a `use` of the trait.
 
 Also add a test-only recording egress in `response_loop.rs`'s tests that
-logs every hook call. It pins the ordering rules above as a sequence (the
-drain after the read, `before_wait` once per held admit, `boundary.handled`
-before the send, `send_slot` only after the admit, `after_slot` for every
-slot, the commit after the last slot, `after_commit` before `after_batch`),
-so they are stated in one place, independent of either transport.
+logs every hook call. It pins the ordering rules above as a sequence: the
+drain after the read; the early-reply release at an event's first slot
+before its admit; `before_wait` once per held admit; `boundary.handled`
+before the send; `send_slot` only after the admit; `after_slot` for every
+slot; the commit after the last slot; `after_commit` before `after_batch`;
+and no commit, and no further hook but the epilogue's, after any exit. They
+are then stated once, independent of either transport, and the test runs
+in every build.
 
 ### Step 3: DPDK on the shared loop
 
 Gather the DPDK stage's egress state into `DpdkEgress` and implement
-`Egress` for it. `send_slot` pushes and flushes
-the slot's lane, stamps `last_send` and records the e2e sample, as the loop
-does today; `after_slot` does nothing. `dpdk_response::run` keeps its
-signature and calls the loop. Its own loop and `GateWaitHook` go.
+`Egress` for it. `send_slot` pushes into the slot's lane, stamps
+`last_send` and remembers the lane; `after_slot` flushes it and records the
+end-to-end sample, which is today's order (see `SlotReply` above).
+`dpdk_response::run` keeps its signature and calls the loop. Its own loop
+and `GateWaitHook` go.
 
 Structural. The only test change is `early_release::hook_turn`, as in step
-2. The DPDK `StageHarness` suites, step 0's ports, the degraded-release
+2. Its callers assert on the connection map it returns, so it keeps
+returning that map (now the egress's), and they do not change. The DPDK `StageHarness` suites, step 0's ports, the degraded-release
 suite, the change-slot test and the heartbeat tests all drive
 `dpdk_response::run` and must pass unchanged under the netns runner.
 
@@ -306,18 +380,29 @@ check `shutdown`: the reply push in `send_slot`, and the early-reply push,
 which runs on the idle path and inside the gate's `while_waiting`. A wedged
 poll thread holds the stage past a shutdown request.
 
-- `send_slot` already takes `shutdown`. The DPDK egress pushes with a wait
-  that checks it, and returns `Sent::Stopped` if it is set while the ring is
-  full. The loop treats `Stopped` as the exit: it **breaks to the shutdown
-  epilogue**, without committing and without going back to the top of the
-  loop. Going back would be wrong if an egress ever returned `Stopped`
-  with the flag clear: the loop would read the same uncommitted batch again
-  and resend every slot already delivered. The `Sent` variant gives an
-  egress a way to report a stop, not an obligation to check; the DPDK
-  egress is the one that must.
-- The early-reply release takes `shutdown` the same way and stops releasing
-  when it is set; the loop checks the flag after it and exits. Inside
-  `while_waiting`, the gate's own wait reads the flag on its next turn.
+- **The wait lives in the SPSC producer.** `push_with` already waits for
+  room, flushing its pending writes as it spins so a consumer that has
+  drained everything published can see them and free a slot. A second wait
+  loop in `DpdkEgress` with a shutdown check added would be a copy of that
+  logic. Instead `spsc.rs` gains `Producer::push_with_unless(f, stop:
+  &AtomicBool) -> Result<u64, Stopped>`: `push_with`'s wait, checking `stop`
+  on each turn, with its own unit tests (it pushes when there is room, it
+  waits while the ring is full, it returns `Stopped` without writing once
+  the flag is set). Both DPDK pushes already go through `push_frame`, which
+  becomes the one caller.
+- **The reply push.** `send_slot` already takes `shutdown`, and returns
+  `Sent::Stopped` when the push was stopped. Step 2's single exit handles
+  it: the loop breaks to the epilogue, without committing and without
+  reading the ring again. The `Sent` variant gives an egress a way to report
+  a stop, not an obligation to check; `DpdkEgress` is the one that must.
+- **The early-reply push.** `release_early_replies` takes `shutdown` too.
+  `Registered::drain` cannot be cut short by the closure it calls, so a
+  stop does not end the drain: once the flag is set, each remaining reply
+  of the snapshot is handed to a push that returns `Stopped` at once, and is
+  dropped, as a shutdown drops every unsent reply. On the idle path the loop
+  reaches the top's shutdown check next and exits. Inside `while_waiting`,
+  the gate's own wait reads the flag on its next turn and returns
+  `Shutdown`, which exits the same way.
 
 Test: a DPDK stage whose TX ring is full and never drained returns from
 `run` after `shutdown` is set, once with a reply pending and once with an
