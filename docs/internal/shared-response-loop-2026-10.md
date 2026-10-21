@@ -1,7 +1,7 @@
 # One response loop for both transports (plan, 2026-10)
 
-Status: plan, revised after four reviews, names, test retirement and the
-shutdown check decided.
+Status: plan, revised after five reviews, names, test retirement, the
+shutdown check and the degraded-ack count decided.
 
 The seam table below describes the code as it is today, under today's
 names; the kernel stage's `Egress` struct becomes `UringEgress` in step 2.
@@ -98,7 +98,7 @@ What differs between the stages, and so belongs to the egress:
 | Stamp `last_send` | inside `append_frames`, only when bytes were appended without overflow | after every slot to a known connection, even when `push_frame` pushed nothing |
 | After every slot, known connection or not | `Egress::flush_if_due` | flush the lane the slot pushed to, if it reached a known connection |
 | Server end-to-end sample | queued after a clean append of a request's last slot, closed at the next flush | recorded right after the lane flush, for a request's last slot |
-| Encode the payload, build the trailer (`gate.batch_end`, which counts degraded acks) | after the connection lookup, before the encode sample | after the connection lookup, before the encode sample |
+| Encode the payload, build the trailer (`gate.batch_end`, which also counts degraded acks today) | after the connection lookup, before the encode sample | after the connection lookup, before the encode sample |
 | Traced encode sample (`encode_rec`, `tick-to-trade`) | wraps `append_frames`, not the encode | wraps `push_frame`, not the encode or the lane flush |
 | Deliver early replies | `Egress::release_early_replies` (appends; can overflow) | `release_early_replies` (one TX frame each) |
 | Before a gate wait | `Egress::flush` | nothing |
@@ -107,7 +107,7 @@ What differs between the stages, and so belongs to the egress:
 | Idle, every iteration | `flush`: the steady-state flush, which ships whatever the last batch appended | nothing |
 | Heartbeat to a due connection | skip if blocked or over `MAX_SEND_BUF`; append, flush, tear down failures | `try_publish`; on a full ring, keep it due and record the stall |
 | After the commit | `drop_overflowed` | nothing |
-| Idle stats flush, of the recorders the egress owns | `server_e2e_rec`; under `tick-to-trade`, `encode_rec` and `egress_rec` | `server_e2e_rec`; under `tick-to-trade`, `encode_rec` |
+| Idle stats flush, of the recorders the egress will own (today the loop flushes them all) | `server_e2e_rec`; under `tick-to-trade`, `encode_rec` and `egress_rec` | `server_e2e_rec`; under `tick-to-trade`, `encode_rec` |
 | Shutdown | unless fenced (it holds the `FenceState`), `send_dirty` and the close of the queued end-to-end samples, not `flush` (which would also tear down flush failures); `pipeline-stats` utilization print | nothing; no utilization print |
 | Names in logs and stats | gate label `"response"`; trace stages "socket write", "response flush" | gate label `"dpdk response"`; trace stages "SPSC publish", "response SPSC publish" |
 | Startup | io_uring setup, then the ready signal; returns whether it ran | none; returns `()` |
@@ -135,10 +135,11 @@ pub(crate) trait Egress {
     fn names() -> StageNames;
     fn drain_control(&mut self, rx: &mpsc::Receiver<Self::Control>);
     /// One slot's reply to its connection, if this egress holds it: look it
-    /// up, encode (`SlotReply::encode`), build the trailer
-    /// (`SlotReply::trailer`), append or push under the encode sample,
-    /// stamp its own `last_send`. `Unknown` makes the loop log the miss;
-    /// nothing is encoded for it and no trailer built.
+    /// up, turn the reply into frames (`SlotReply::into_frames`, which
+    /// encodes the payload and builds the trailer), append or push them
+    /// under the encode sample, stamp its own `last_send`. `Unknown` makes
+    /// the loop log the miss; nothing is encoded for it and no trailer
+    /// built.
     fn send_slot<R: Copy, Q: Copy>(&mut self, connection_id: u64,
                                    reply: SlotReply<'_, R, Q>, now: Instant,
                                    /* step 4: */ shutdown: &AtomicBool) -> Sent;
@@ -166,12 +167,25 @@ pub(crate) trait Egress {
 }
 
 /// What `send_slot` hands over: what encoding the payload needs (the
-/// payload, the encoder, the encode buffer), what building the trailer
-/// needs (`&DurabilityGate`, `&mut BatchEnds`, the slot's backing and
-/// request ID, `is_last_in_request`), and what the e2e sample needs
-/// (`recv_ts`). The egress calls `encode()` and `trailer()` after its
-/// lookup, never before.
+/// payload, the encoder, `&mut` the encode buffer), what building the
+/// trailer needs (`&mut BatchEnds`, the slot's backing and request ID,
+/// `is_last_in_request`), and what the e2e sample needs (`recv_ts`). No
+/// reference to the gate.
 struct SlotReply<'a, R: Copy, Q: Copy> { /* … */ }
+
+impl<'a, R: Copy, Q: Copy> SlotReply<'a, R, Q> {
+    /// Encode the payload into the buffer and build the trailer from
+    /// `BatchEnds`, once: consuming, so a reply becomes frames at most
+    /// once, and only where an egress calls it, after its lookup. The
+    /// buffer and `BatchEnds` are disjoint fields, so both borrows leave
+    /// with lifetime `'a` side by side, as `append_frames` and `push_frame`
+    /// take them.
+    fn into_frames(self) -> SlotFrames<'a>;
+}
+
+/// The encode result, the encoded bytes, the trailer, and the sample
+/// inputs.
+struct SlotFrames<'a> { /* … */ }
 
 enum Sent { Delivered, Unknown, /* step 4: */ Stopped }
 ```
@@ -197,15 +211,9 @@ Names, decided:
   than an encode result, so each egress encodes after its own lookup, as
   both stages do today: a reply to an unknown connection, connection 0's
   server-originated events among them (every tick, on a node with a tick
-  interval), is never encoded. The same goes for the trailer:
-  `gate.batch_end` counts each degraded terminator for
-  `melin_degraded_acks_total` ("called once per request"), so building it
-  for a miss would count, under a degraded release, every tick and every
-  reply to a connection gone mid-batch, with no frame sent, against a
-  metric `tests/degraded_acks.rs` pins. `trailer()` on `SlotReply` is the
-  only way to `batch_end`, and only an egress that found the connection
-  calls it. (`batch_end` takes `&self`, so `SlotReply` can borrow the gate
-  once `admit` has returned.) Each stage also handles an encode error
+  interval), is never encoded. The same goes for the trailer, which no
+  longer counts anything (step 1's fourth commit): building it is pure, and
+  the degraded-ack count is the loop's (below). Each stage also handles an encode error
   itself today (log it, still send the terminator), with tests on it;
   resolving it once in the loop is the follow-up under "After this plan".
   `recv_ts` is not feature-gated on the slot, so `SlotReply` needs no
@@ -220,6 +228,23 @@ with the slot's `recv_ts` and `is_last_in_request`, in an `Option`, and
 which is today's order. Taken, not read: `after_slot` also runs after a
 later miss or a change slot, which must neither flush again nor record the
 sample a second time with a stale `recv_ts`.
+
+**The degraded-ack count belongs to the loop, by type.** Today
+`gate.batch_end` both builds the terminator and counts a degraded one for
+`melin_degraded_acks_total` ("called once per request"), and both loops
+call it only after a successful lookup. Built for a miss, it would count,
+under a degraded release, every tick and every reply to a connection gone
+mid-batch, with no frame sent, against a metric `tests/degraded_acks.rs`
+pins. Keeping it behind `SlotReply` would be a convention, not a
+guarantee: `batch_end` is `pub(crate)`, and Rust has no visibility that
+narrows it to one sibling module. So the two jobs separate (step 1's
+fourth commit): `BatchEnds` builds the terminator for a backing and counts
+nothing, and the shared loop counts on an exhaustive `match` of what
+`send_slot` returned: `Sent::Delivered`, on a request's last slot, backed
+by the primary alone. An egress cannot miscount, because it has nothing to
+count with, and `SlotReply` needs no reference to the gate. `Delivered`
+means "the connection was found", which is when today's count happens,
+before the append, whether or not the append then overflows.
 
 The two `GateWaitHook`s become one, generic over the egress: it borrows
 `&mut E`, the `Registered` snapshot and `&Receiver<E::Control>` exactly as
@@ -313,9 +338,12 @@ found a divergence: it is recorded in `transport-divergences-2026-10.md`,
 left out of the `dpdk` profile under the entry's name (the doc's existing
 rule), and fixed before step 3.
 
-### Step 1: bring the DPDK idle path in line (behaviour change, DPDK only)
+### Step 1: prepare both loops in place
 
-Three changes to `dpdk_response::run`, in place, one commit each:
+Four commits, before any code moves. The first three bring the DPDK idle
+path in line with the kernel's (behaviour changes, DPDK only); the fourth
+separates the degraded-ack count from the terminator (both stages, no
+behaviour change).
 
 1. **Housekeeping cadence.** Today the policy re-check reads the clock on
    every idle iteration, and the heartbeat timer, `tick(1 s,
@@ -334,11 +362,22 @@ Three changes to `dpdk_response::run`, in place, one commit each:
    which DPDK's scan calls. The kernel's `heartbeat_due` becomes that rule
    plus its blocked-peer and buffer-cap guards, and its doc comment goes
    back on it (it currently sits above `mark_dirty`).
+4. **The degraded-ack count leaves `batch_end`** (see "The degraded-ack
+   count belongs to the loop" above). `BatchEnds` gains the backing match
+   `batch_end` does today and builds the terminator alone; `batch_end`
+   goes. Each loop increments `utilization.degraded_acks` itself, at the
+   spot it calls `batch_end` today, so the count happens exactly when it
+   does now. Step 2 then moves it onto the shared loop's `match` of `Sent`.
+   Kept out of the structural steps because tests change: the gate's unit
+   tests that call `batch_end` and assert the counter
+   (`durability_gate.rs`) keep their byte assertions against `BatchEnds`,
+   and the count is pinned by `tests/degraded_acks.rs`, which runs on both
+   transports, and from step 2 by the recording egress.
 
-Tests: the existing heartbeat tests and the degraded-release suite stay
-green; a unit test pins the shared due rule and one pins the scan's
-due-ness from the housekeeping timer. The cadence change itself is not
-observable from outside except through heartbeat timing.
+Tests, commits 1 to 3: the existing heartbeat tests and the degraded-release
+suite stay green; a unit test pins the shared due rule and one pins the
+scan's due-ness from the housekeeping timer. The cadence change itself is
+not observable from outside except through heartbeat timing.
 
 Closes the divergence "DPDK idle path reads the clock every iteration".
 
@@ -367,6 +406,12 @@ the utilization counters, the `pipeline-stats` print). Today the flag is
 set in every case that reaches the admit's arm, so this changes nothing
 observable; it removes the dependency on who read the flag.
 
+**The degraded-ack count** moves from the spot step 1 left it onto the
+loop's `match` of `send_slot`'s result: `Sent::Delivered` on a request's
+last slot backed by the primary alone counts one. Same condition, same
+count; it now happens just after the append instead of just before, which
+nothing observes.
+
 Structural. Besides the rename, the test changes are:
 
 - `gate_wait_hook::one_turn`, which builds the hook: it builds the generic
@@ -380,7 +425,8 @@ drain after the read; `release_early_replies` only between events, and at
 an event's first slot before its admit; `before_wait` once per held admit;
 `send_slot` only after the admit; `after_slot` for every slot;
 `after_wait_release` only after a release during a wait that sent any;
-the commit after the last slot; `after_commit` before `after_batch`; and no
+one degraded ack counted per `Delivered` last slot backed by the primary
+alone, and none for `Unknown`; the commit after the last slot; `after_commit` before `after_batch`; and no
 commit, and no further hook but the epilogue's, after any exit. They are
 then stated once, independent of either transport, and the test runs in
 every build. (`boundary.handled` is the loop's own state, not a hook, so
@@ -429,14 +475,14 @@ poll thread holds the stage past a shutdown request.
   logic. Instead `spsc.rs` gains `Producer::push_with_unless(f, stop:
   &AtomicBool) -> Result<u64, Stopped>`: it tries the push first, and only
   while the ring is full spins, flushing as `push_with` does and reading
-  `stop` on each turn, at the top of the turn, before the waiter idles (as
-  `wait_durable` does). Read after the idle, every push that finds the
-  ring full once the flag is set would pay a fresh waiter's spin budget
-  before returning, and a stopped early-reply drain makes one such push
-  per reply left in its snapshot. `push_with` becomes a wrapper over the
-  same wait (a stop that never fires), so the wait is written once. Unit
-  tests: it
-  pushes when there is room, even with the flag set; it waits while the
+  `stop` on each turn. Within a turn the read sits after the room check,
+  so a push with room is never refused, and before the flush and the
+  waiter's idle, so a stopped push returns without one more pause or
+  yield. (This is not `wait_durable`'s order, which reads its flag before
+  testing readiness: there, shutdown wins even over a durable slot.)
+  `push_with` becomes a wrapper over the same wait (a stop that never
+  fires), so the wait is written once. Unit tests: it pushes when there is
+  room, even with the flag set; it waits while the
   ring is full; it returns `Stopped`, having written nothing, when the flag
   is set while it waits; `push_with`'s own tests stay as they are. Both
   DPDK pushes already go through `push_frame`, which becomes the one
@@ -544,8 +590,9 @@ Not touched, because they are in other code:
   already durable is admitted without reading it. So once `shutdown` is set,
   replies the gate already cleared can still go out, on both transports.
   On kernel TCP, three paths ship them:
-  - the pre-wait flush, the largest: the first slot that has to wait runs
-    `before_wait` (`hook.starting()` in `admit_slot`) *before*
+  - the pre-wait flush, the largest: the first wait of an admit, for a
+    pending policy change (`admit_pending`) or for the slot itself
+    (`admit_slot`), runs `before_wait` (`hook.starting()`) *before*
     `wait_durable` reads the flag, and so sends everything buffered, this
     batch's cleared slots and, under load, earlier ones not yet flushed;
   - the byte-threshold flush between slots;
@@ -553,19 +600,25 @@ Not touched, because they are in other code:
 
   On DPDK, every cleared slot is pushed as it is handled. A fence co-sets
   `shutdown`, so a superseded ex-primary can do the same. The question is
-  whether that can acknowledge
-  an event the new primary does not hold, settled against the failover
-  guarantee. If it can, it is a correctness bug on both transports today,
-  to fix for its own sake and ahead of other work. The candidate fixes,
-  each a both-transport change in the shared loop, with its own test and
-  the hot-path bench, and either one placed at the top of each slot,
-  *before* `gate.admit`, since a check after it comes too late for the
-  pre-wait flush:
-  - check `shutdown` once per slot: a prompt, uniform stop, at the price of
-    dropping replies the gate already cleared on every graceful shutdown;
-  - check the fence once per slot: a fenced node stops mid-batch, a
-    graceful shutdown still finishes its cleared batch. The kernel egress
-    holds the fence state already; the DPDK stage would need it passed in.
+  whether that can acknowledge an event the new primary does not hold,
+  settled against the failover guarantee. If it can, it is a correctness
+  bug on both transports today, to fix for its own sake and ahead of other
+  work. The candidate fixes, each with its own test and the hot-path bench:
+  - check `shutdown` once per slot, at the top of the slot, *before*
+    `gate.admit` (a check after it comes too late for the pre-wait flush):
+    a prompt, uniform stop, at the price of dropping replies the gate
+    already cleared on every graceful shutdown;
+  - check the fence once per slot, at the same place: a fenced node stops
+    mid-batch, a graceful shutdown still finishes its cleared batch. The
+    kernel egress holds the fence state already; the DPDK stage would need
+    it passed in;
+  - check the fence in the kernel egress's `before_wait`, which already
+    holds it: it closes the pre-wait path exactly where it fires. A check
+    at the top of the slot only narrows that path, since a fence that lands
+    between the check and `before_wait` still flushes; this one does not
+    have that gap. It covers the pre-wait flush only, so it would pair with
+    one of the per-slot checks or with a fence check on the between-slot
+    flushes.
 
   A per-slot check stops only what the stage has yet to send: on kernel
   TCP, replies an earlier slot's flush already handed to the kernel are
