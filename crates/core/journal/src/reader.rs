@@ -704,7 +704,7 @@ impl RawJournalScanner {
     /// unconsumed for the next call. Used by chain validation, which
     /// must absorb the raw bytes of exactly the entries up to a target
     /// sequence.
-    pub fn read_raw_batch_until(
+    pub(crate) fn read_raw_batch_until(
         &mut self,
         out: &mut Vec<u8>,
         max_bytes: usize,

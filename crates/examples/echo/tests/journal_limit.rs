@@ -17,9 +17,9 @@
 
 use echo_server::{MAX_PAYLOAD, Payload};
 use melin_app::AppEvent;
+use melin_journal::JournalEvent;
 use melin_journal::codec;
 use melin_journal::encoder::{MAX_ENTRY_SIZE, entry_size};
-use melin_journal::event::JournalEvent;
 use melin_transport_core::pipeline::{MAX_JOURNAL_BATCH, max_journal_batch};
 
 fn echo_of(len: usize) -> Payload {

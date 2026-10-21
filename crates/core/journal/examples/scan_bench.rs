@@ -15,9 +15,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use melin_app::{AppEvent, CodecError};
-use melin_journal::buffered_writer::BufferedWriter;
-use melin_journal::write::JournalWrite;
-use melin_journal::{JournalEvent, JournalReader};
+use melin_journal::{BufferedWriter, JournalEvent, JournalReader, JournalWrite};
 
 // 40 bytes — sized like a compact fixed-width application event (a few
 // numeric fields) so the read buffer / decode ratio resembles real-world

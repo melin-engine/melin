@@ -388,7 +388,7 @@ pub fn list_archives(live: &Path) -> std::io::Result<Vec<(u32, PathBuf)>> {
 
 /// Path of the next archive slot for `live` (one past the current max).
 /// Returns `<live>.000001` when no archives exist.
-pub fn next_archive_path(live: &Path) -> std::io::Result<PathBuf> {
+pub(crate) fn next_archive_path(live: &Path) -> std::io::Result<PathBuf> {
     let archives = list_archives(live)?;
     let next_n = archives.last().map(|(n, _)| *n + 1).unwrap_or(1);
     Ok(archive_path(live, next_n))
@@ -440,7 +440,7 @@ pub fn archive_live(live: &Path) -> std::io::Result<PathBuf> {
 /// bitwise archive comparison until re-compacted by hand) is accepted
 /// — it requires a crash inside the writeback window, and entry data
 /// is unaffected.
-pub fn compact_archive(archived: &Path, valid_end: u64) {
+pub(crate) fn compact_archive(archived: &Path, valid_end: u64) {
     let result = std::fs::OpenOptions::new()
         .write(true)
         .open(archived)
@@ -578,7 +578,7 @@ const DIR_FSYNC_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 /// [`Self::poll`]. Retrying shrinks the crash-exposure window from
 /// "until kernel background writeback or the next rotation" to "until
 /// the transient fault clears".
-pub struct DirFsyncRetry {
+pub(crate) struct DirFsyncRetry {
     /// Live path whose parent directory still needs a durable fsync.
     /// `Option<PathBuf>` rather than a bool so retries don't depend on
     /// callers re-supplying the path; `None` (the steady state) makes

@@ -166,7 +166,7 @@ impl<E: AppEvent> JournalEncoder<E> {
     /// threaded in from the recovery walk. (Reading those bytes is the
     /// one place this half touches a file, and it is a one-shot read at
     /// startup, not ownership of the descriptor.)
-    pub fn resume(
+    pub(crate) fn resume(
         path: &Path,
         starting_sequence: u64,
         anchor_hash: [u8; 32],
@@ -326,7 +326,7 @@ impl<E: AppEvent> JournalEncoder<E> {
 
     /// The pending batch's bytes, read back out of the destination the
     /// caller has been encoding into — what the disk half writes.
-    pub fn pending_batch_bytes<'a>(&self, dst: &'a [u8]) -> &'a [u8] {
+    pub(crate) fn pending_batch_bytes<'a>(&self, dst: &'a [u8]) -> &'a [u8] {
         &dst[..self.batch_len]
     }
 

@@ -36,7 +36,7 @@ use melin_pipeline::padding::Sequence;
 use melin_pipeline::ring;
 use melin_pipeline::wait::WaitStrategy;
 
-pub use melin_pipeline::ring::Full;
+use melin_pipeline::ring::Full;
 
 /// Bytes per slot.
 ///

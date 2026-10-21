@@ -15,21 +15,23 @@
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
-pub mod buffered_writer;
+// The writer, its trait, the event type and the segment file are
+// reached at the crate root only; their modules hold nothing else.
+mod buffered_writer;
 #[cfg(feature = "hash-chain")]
 pub(crate) mod chain;
 pub mod codec;
 pub mod encoder;
 pub mod error;
-pub mod event;
+mod event;
 pub(crate) mod le;
 pub(crate) mod prealloc;
 pub mod preparer;
 pub mod reader;
 pub mod replication;
 pub mod segment;
-pub mod segment_file;
-pub mod write;
+mod segment_file;
+mod write;
 pub mod write_ring;
 
 #[cfg(feature = "test-utils")]
