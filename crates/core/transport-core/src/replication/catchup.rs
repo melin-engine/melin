@@ -17,10 +17,10 @@ use std::time::{Duration, Instant};
 use melin_app::AppEvent;
 use tracing::{debug, info, warn};
 
-use super::protocol::{
-    encode_input_batch_from_journal, encode_rotate, peek_first_sequence, peek_frame_tag,
+use super::protocol::encode_rotate;
+use crate::replication_wire::{
+    MSG_INPUT_BATCH, encode_input_batch_from_journal, peek_first_sequence, peek_frame_tag,
 };
-use crate::replication_wire::MSG_INPUT_BATCH;
 
 /// Upper bound on how long the catch-up→live handoff waits for the
 /// disk to catch up to the ring (see [`drain_into_contiguity`]). The
@@ -79,7 +79,7 @@ pub enum CatchUpResult {
 /// segment. Uses the same discovery as recovery
 /// ([`melin_journal::segment::list_archives`]), so catch-up sees exactly
 /// the segments a local replay would.
-pub fn discover_journal_files(journal_path: &std::path::Path) -> Vec<std::path::PathBuf> {
+pub(crate) fn discover_journal_files(journal_path: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut files: Vec<std::path::PathBuf> =
         match melin_journal::segment::list_archives(journal_path) {
             Ok(archives) => archives.into_iter().map(|(_, p)| p).collect(),

@@ -9,7 +9,7 @@
 //!    sender thread via a bounded channel, *before* handing it to the disk
 //!    thread, so replicas never wait on local storage either. The bytes are
 //!    identical to what is written to disk — same sequences, timestamps
-//!    and CRC checksums. See [`crate::journal_disk`].
+//!    and CRC checksums. See `crate::journal_disk`.
 //! 2. **Matching stage**: applies events to the application, publishes responses
 //!    to the output SPSC. Runs concurrently with the journal — no waiting for sync.
 //!
@@ -39,9 +39,9 @@ use crate::trace::{MonoTraceInstant, mono_trace_ns};
 use melin_app::{AppEvent, Application, ApplyCtx, QueryCtx};
 use melin_journal::BufferedWriter;
 use melin_journal::JournalError;
+use melin_journal::SegmentFile;
 use melin_journal::encoder::JournalEncoder;
 use melin_journal::preparer::{SegmentPreparer, StagingMode};
-use melin_journal::segment_file::SegmentFile;
 use melin_journal::write_ring::{
     ClaimedChunk, JournalWriteMeta, JournalWriteProducer, build_journal_write_ring,
 };
@@ -591,7 +591,7 @@ impl<R: Copy, Q: Copy> Default for OutputSlot<R, Q> {
 /// thread writes, syncs, and publishes the cursors that mean durable.
 /// The response stage reads those cursors to know when events are
 /// durable, so persist-before-ack is preserved by *where* they are
-/// published (see [`crate::journal_disk`]).
+/// published (see `crate::journal_disk`).
 ///
 /// When replication is enabled, the stage also sends a copy of each
 /// encoded batch to the replication sender thread via a bounded

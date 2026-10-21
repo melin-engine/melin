@@ -105,7 +105,7 @@ const LINEAGE_FLAGS: u8 =
 
 /// The largest header any version has — what a reader that wants the
 /// header alone must read.
-pub const MAX_HEADER_SIZE: usize = HEADER_SIZE;
+pub(crate) const MAX_HEADER_SIZE: usize = HEADER_SIZE;
 const CRC_SIZE: usize = 4;
 /// The largest snapshot a save writes and a load reads, in bytes: 1 TiB.
 /// Set far above any real application's state, so that the cap never

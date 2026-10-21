@@ -50,8 +50,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use melin_journal::JournalError;
+use melin_journal::SegmentFile;
 use melin_journal::preparer::PreparedSegment;
-use melin_journal::segment_file::SegmentFile;
 use melin_journal::write_ring::{JournalWriteConsumer, JournalWriteMeta};
 use melin_pipeline::padding::Sequence;
 use melin_pipeline::seqlock::SeqLockWriter;

@@ -33,7 +33,7 @@ use melin_pipeline::ring;
 /// `last_now_ns == 0` is the initial-state sentinel — the first tick is
 /// stamped with `raw_now_ns` (or `1` if even the wall clock returns 0,
 /// which only happens on a pre-epoch system clock).
-pub fn clamp_monotonic(raw_now_ns: u64, last_now_ns: u64) -> u64 {
+pub(crate) fn clamp_monotonic(raw_now_ns: u64, last_now_ns: u64) -> u64 {
     if last_now_ns == 0 {
         raw_now_ns.max(1)
     } else if raw_now_ns > last_now_ns {
@@ -49,7 +49,7 @@ pub fn clamp_monotonic(raw_now_ns: u64, last_now_ns: u64) -> u64 {
 /// On a full ring the publish drops; the next successful tick still
 /// carries the latest wall-clock time, so a missed tick only delays
 /// scheduler firings by one cadence at worst.
-pub fn publish_tick<E: AppEvent>(producer: &mut ring::Producer<InputSlot<E>>, now_ns: u64) {
+pub(crate) fn publish_tick<E: AppEvent>(producer: &mut ring::Producer<InputSlot<E>>, now_ns: u64) {
     // try_publish drop is intentional: on a full ring we'd rather skip a
     // tick than block the ingress thread (see fn doc).
     let _ = producer.try_publish(InputSlot::node_event(JournalEvent::Tick { now_ns }, now_ns));
@@ -95,7 +95,7 @@ impl TickSchedule {
     /// previous tick. `wall_ns` is called only once a tick is due, so a
     /// poll that finds nothing due costs no clock read. Returns whether a
     /// tick was published (or dropped on a full ring — see
-    /// [`publish_tick`]), so the caller can re-arm any timer it keyed on
+    /// `publish_tick`), so the caller can re-arm any timer it keyed on
     /// the old deadline.
     #[inline]
     pub fn publish_if_due<E: AppEvent>(

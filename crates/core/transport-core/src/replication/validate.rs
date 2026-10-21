@@ -107,7 +107,7 @@ fn chain_at_sequence(journal_path: &std::path::Path, seq: u64) -> io::Result<Cha
     }
 }
 
-/// [`validate_replica_handshake`] with bounded revalidation before a
+/// `validate_replica_handshake` with bounded revalidation before a
 /// `Divergent` verdict is final. Two transient effects can mimic
 /// divergence against a live journal:
 ///
@@ -156,7 +156,7 @@ pub fn validate_replica_handshake_settled(
 /// chain comparison is skipped for such peers rather than judging the
 /// mixed-feature pair divergent on every reconnect, but `AheadOfTip`
 /// is still enforced — it is a sequence property, not a chain one.
-pub fn validate_replica_handshake(
+pub(crate) fn validate_replica_handshake(
     journal_path: &std::path::Path,
     handshake: &Handshake,
 ) -> io::Result<HandshakeValidation> {
