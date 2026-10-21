@@ -1,9 +1,9 @@
 //! Operator-facing ack policy.
 //!
-//! The generic policy types — [`Level`], [`Clause`], [`Policy`],
-//! [`CursorView`], [`EvalStatus`], [`PolicyError`], [`MAX_CLUSTER_SIZE`]
-//! — live in `melin_transport_core::ack_policy`. They're re-exported
-//! here so call sites (`crate::ack_policy::*`) reach both the enum and
+//! The generic policy types — `Level`, `Clause`, `Policy`, `CursorView`,
+//! `EvalStatus`, `MAX_CLUSTER_SIZE` — live in
+//! `melin_transport_core::ack_policy`. They're imported here for the
+//! crate, so call sites (`crate::ack_policy::*`) reach both the enum and
 //! the machinery it compiles to, and the response stage's ack gate is
 //! built on them.
 //!
@@ -21,8 +21,8 @@
 
 use std::fmt;
 
-pub use melin_transport_core::ack_policy::{
-    Blocker, Clause, CursorView, EvalStatus, Level, MAX_CLUSTER_SIZE, Policy, PolicyError,
+pub(crate) use melin_transport_core::ack_policy::{
+    Blocker, Clause, CursorView, EvalStatus, Level, MAX_CLUSTER_SIZE, Policy,
 };
 
 /// Operator-facing ack policy: which copies of an event must exist
@@ -71,7 +71,7 @@ impl AckPolicy {
     /// Build the underlying [`Policy`]. Every variant's clause list is
     /// hand-constructed from in-range counts, so [`Policy::new`] cannot
     /// fail — any regression would surface in the unit tests below.
-    pub fn to_policy(self) -> Policy {
+    pub(crate) fn to_policy(self) -> Policy {
         let clauses = match self {
             AckPolicy::Disk => vec![Clause {
                 count: 1,

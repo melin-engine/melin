@@ -12,6 +12,42 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ## [Unreleased]
 
+### Removed
+
+- **Runtime internals no longer public** (breaking for code that reached
+  into them; nothing an application implements or a binary configures
+  changes). Every item below was used only inside its own crate, or by
+  the runtime crate built on it:
+  - `melin-raft`: every module. The crate root exports what starting the
+    driver takes: `spawn`, `RaftConfig`, `RaftHandles`, `RaftPeer`,
+    `TipSource`, `JournalTip`, `PeerTips` and `SupersessionPolicy`.
+  - `melin-server-runtime`: the modules `admin`, `connection_limit`,
+    `early_reply`, `halt`, `policy_control`, `process`, `promotion`,
+    `reader`, `response`, `dpdk_response` and `dpdk_transport`;
+    `ControlEvent`; the root `MAX_FRAME_SIZE` (`melin-client` exports
+    the same bound); `ReplicaControlPlane`'s fields (build it with
+    `new()`); `AckPolicy::to_policy`; and the re-exports of
+    `melin-transport-core`'s ack-policy and replication types (only
+    `replication::ReplicationMetrics` remains).
+  - `melin-transport-core`: the `journal_disk` module; `SlotAcked`; the
+    `replication::protocol` re-exports of the `replication_wire`
+    functions; `replication_wire`'s incremental frame builders and
+    peeks. `encode_input_batch` and `try_decode_input_batch` are now
+    behind `test-utils`.
+  - `melin-journal`: the `buffered_writer`, `event`, `segment_file` and
+    `write` module paths (their types stay at the crate root);
+    `codec::encode_file_header`; `segment::{next_archive_path,
+    compact_archive, DirFsyncRetry}`; `write_ring::Full` (use
+    `melin_pipeline::ring::Full`); `ReplicationProducer::try_publish_timeout`;
+    and `test_utils::set_prealloc_chunk_bytes_override` (use
+    `PreallocOverrideGuard`).
+  - `melin-dpdk`: the `mac`, `peer_liveness`, `arp`, `rx_checksum`,
+    `transport` and `nic_handle` module paths (their public types stay
+    at the crate root); `DpdkTransport::{init, connect_to, recv}`, which
+    nothing called; `DpdkTransport::seed_neighbor`;
+    `DpdkDevice::{collect_rx_batch, take_learned_neighbors}` and
+    `RxBatch`; and `DpdkShared`'s fields other than `num_queues`.
+
 ## [0.21.0] - 2026-10-21
 
 ### Added

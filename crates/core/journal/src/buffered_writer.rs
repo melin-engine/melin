@@ -227,7 +227,8 @@ impl<E: AppEvent> BufferedWriter<E> {
     /// [`valid_end`](Self::valid_end) on the buffered writer — there's
     /// no in-memory partial sector, so the on-disk end and the logical
     /// end coincide.
-    pub fn write_pos(&self) -> u64 {
+    #[cfg(test)]
+    pub(crate) fn write_pos(&self) -> u64 {
         self.segment.valid_end()
     }
 
@@ -265,9 +266,9 @@ impl<E: AppEvent> BufferedWriter<E> {
     }
 
     /// Encoded bytes that have been appended to the batch buffer but
-    /// not yet flushed. Used by the journal stage to snapshot the
-    /// pending bytes for replication.
-    pub fn pending_batch_bytes(&self) -> &[u8] {
+    /// not yet flushed.
+    #[cfg(test)]
+    pub(crate) fn pending_batch_bytes(&self) -> &[u8] {
         self.encoder.pending_batch_bytes(&self.batch_buf)
     }
 

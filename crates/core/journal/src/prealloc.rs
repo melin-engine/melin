@@ -4,10 +4,10 @@
 //!
 //! Resolution order, highest precedence first:
 //!
-//! 1. Runtime override set via `test_utils::set_prealloc_chunk_bytes_override`
-//!    (only callable when the `test-utils` feature is enabled). Used by
-//!    library tests that recover/append in tight loops where the 256 MiB
-//!    `fallocate` dominates wall time.
+//! 1. Runtime override held by a `test_utils::PreallocOverrideGuard`
+//!    (only constructible when the `test-utils` feature is enabled). Used
+//!    by library tests that recover/append in tight loops where the
+//!    256 MiB `fallocate` dominates wall time.
 //! 2. Environment variable `MELIN_JOURNAL_PREALLOC_MIB`. Used by
 //!    integration tests that spawn the server binary and can't reach a
 //!    Rust API. Floored at 1 MiB.
@@ -43,9 +43,9 @@ pub(crate) fn prealloc_chunk_bytes() -> u64 {
         .unwrap_or(DEFAULT_PREALLOC_CHUNK)
 }
 
-/// Internal hook for `test_utils::set_prealloc_chunk_bytes_override`
-/// and in-crate tests that need to engineer specific prealloc-boundary
-/// scenarios (notably `ensure_allocated`'s zero-range invariant).
+/// Internal hook for [`PreallocOverrideGuard`] and in-crate tests that
+/// need to engineer specific prealloc-boundary scenarios (notably
+/// `ensure_allocated`'s zero-range invariant).
 /// `None` clears the override; `Some(0)` is treated as "clear".
 #[cfg(any(test, feature = "test-utils"))]
 pub(crate) fn set_override(bytes: Option<u64>) {

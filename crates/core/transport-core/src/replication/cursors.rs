@@ -106,7 +106,7 @@ pub struct ReplicaCursors {
 
 impl ReplicaCursors {
     /// Wrap the shared per-slot cursors created at server startup,
-    /// parking every slot at [`SlotAcked::DISENGAGED`] so a (re)started
+    /// parking every slot at `SlotAcked::DISENGAGED` so a (re)started
     /// sender begins from a clean no-replica state.
     pub fn new(slots: Arc<ReplicaSlotCursors>, metrics: Arc<ReplicationMetrics>) -> Self {
         for slot in 0..ReplicaSlotCursors::SLOTS {
@@ -184,7 +184,7 @@ impl ReplicaCursors {
     }
 
     /// Disengage a slot on disconnect or eviction: zero the gauge pair
-    /// and park the slot cursor at [`SlotAcked::DISENGAGED`] (not
+    /// and park the slot cursor at `SlotAcked::DISENGAGED` (not
     /// gating). The derived quorum view immediately re-forms over the
     /// surviving slot — without the park, the quorum would stay frozen
     /// at the departed replica's last ack and the primary would stop

@@ -69,7 +69,7 @@ impl RingPos {
 /// store/load boundaries.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct SlotAcked(u64);
+pub(crate) struct SlotAcked(u64);
 
 impl SlotAcked {
     /// Parking value for a slot with no engaged replica. `min`/`max` over
@@ -111,7 +111,7 @@ impl SlotAcked {
     }
 }
 
-/// Shared per-slot replica progress cursors, in [`SlotAcked`] space.
+/// Shared per-slot replica progress cursors, in `SlotAcked` space.
 ///
 /// The single source of truth for replica-progress monitoring: the
 /// replication sender (`ReplicaCursors`, the sole production writer)
@@ -142,7 +142,7 @@ impl ReplicaSlotCursors {
     /// topology cap (see `ReplicationMetrics` for the same rationale).
     pub const SLOTS: usize = 2;
 
-    /// Fresh cursors with every slot parked at [`SlotAcked::DISENGAGED`].
+    /// Fresh cursors with every slot parked at `SlotAcked::DISENGAGED`.
     pub fn new() -> Self {
         Self {
             slots: [

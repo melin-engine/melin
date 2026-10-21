@@ -36,7 +36,7 @@ pub mod fence;
 /// Prometheus text exposition body to `GET /metrics`. The state struct
 /// holds only atomics/cursors; the endpoint is fully transport-shaped.
 pub mod health;
-pub mod journal_disk;
+mod journal_disk;
 pub mod journaled_app;
 pub mod lineage;
 /// Where a node keeps its journal and its snapshot: the one resolver of
@@ -77,7 +77,7 @@ mod pipeline_tests;
 
 pub use cursors::{
     AdvertisedJournalTip, DurableWireSeqCursor, PipelineCursors, ReplicaSlotCursors, RingPos,
-    SlotAcked, WireSeq,
+    WireSeq,
 };
 pub use journaled_app::{JournaledApp, JournaledAppError};
 pub use node_store::{NodeStore, NodeStoreError};

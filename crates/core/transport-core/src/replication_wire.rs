@@ -59,7 +59,7 @@ use std::io;
 
 use melin_app::AppEvent;
 use melin_journal::codec::{self, CRC_SIZE, ENTRY_MAGIC, ENTRY_MAGIC_SIZE, ENTRY_META_SIZE};
-use melin_journal::encoder::{MAX_ENTRY_SIZE, entry_size};
+use melin_journal::encoder::MAX_ENTRY_SIZE;
 use zerocopy::little_endian::{U16, U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
@@ -238,7 +238,7 @@ impl From<InputBatchError> for io::Error {
 /// The journal stage then appends each entry's replication slice (see
 /// `JournalEncoder::last_user_entry_replication_slice`) and back-fills
 /// the header with [`finalize_input_batch`] before publishing.
-pub fn init_input_batch(buf: &mut Vec<u8>) {
+pub(crate) fn init_input_batch(buf: &mut Vec<u8>) {
     buf.clear();
     buf.extend_from_slice(&[0u8; FRAME_HEADER_LEN]);
 }
@@ -259,7 +259,8 @@ pub fn init_input_batch(buf: &mut Vec<u8>) {
 /// `init_input_batch` was called, or this is being called inside
 /// `encode_input_batch`). The debug assertion catches the bare-empty
 /// `Vec` misuse in tests.
-pub fn append_input_slot<E: AppEvent>(
+#[cfg(any(test, feature = "test-utils"))]
+fn append_input_slot<E: AppEvent>(
     buf: &mut Vec<u8>,
     slot: &InputSlot<E>,
     seq: u64,
@@ -276,7 +277,7 @@ pub fn append_input_slot<E: AppEvent>(
     }
 
     let start = buf.len();
-    buf.resize(start + entry_size::<E>(), 0);
+    buf.resize(start + melin_journal::encoder::entry_size::<E>(), 0);
     let written = match codec::encode(
         seq,
         slot.timestamp_ns,
@@ -301,7 +302,7 @@ pub fn append_input_slot<E: AppEvent>(
 /// Back-fill the frame header so `buf` is wire-ready (length-prefixed,
 /// type-tagged, count populated). `slot_count` is the number of slots
 /// appended since the last [`init_input_batch`].
-pub fn finalize_input_batch(buf: &mut [u8], slot_count: u16) {
+pub(crate) fn finalize_input_batch(buf: &mut [u8], slot_count: u16) {
     debug_assert!(buf.len() >= FRAME_HEADER_LEN);
     let payload_len = u32::try_from(buf.len() - 4).expect("InputBatch payload exceeds u32");
     let header = FrameHeader::mut_from_bytes(&mut buf[..FRAME_HEADER_LEN])
@@ -311,7 +312,7 @@ pub fn finalize_input_batch(buf: &mut [u8], slot_count: u16) {
     header.count = U16::new(slot_count);
 }
 
-// --- One-shot encode (tests and tooling that already have a slot vec) ---
+// --- One-shot encode (tests that already have a slot vec) ---
 
 /// Encode a complete length-prefixed `InputBatch` frame into `buf`,
 /// appending after whatever `buf` already holds. Equivalent to
@@ -322,6 +323,11 @@ pub fn finalize_input_batch(buf: &mut [u8], slot_count: u16) {
 /// exist only in memory. Entries that already exist as journal bytes
 /// ship with [`encode_input_batch_from_journal`], which does not
 /// re-encode them. On error `buf` is left as it was.
+///
+/// Test-only: the journal stage builds its frames incrementally, so this
+/// is for a test standing in for a primary (`test-utils` for another
+/// crate's tests).
+#[cfg(any(test, feature = "test-utils"))]
 pub fn encode_input_batch<E: AppEvent>(
     slots: &[InputSlot<E>],
     buf: &mut Vec<u8>,
@@ -364,7 +370,7 @@ pub fn encode_input_batch<E: AppEvent>(
 /// Every entry is decoded first, so an entry whose on-disk CRC fails, or
 /// whose event the codec refuses, stops the catch-up here instead of
 /// being shipped. On error `buf` is left as it was.
-pub fn encode_input_batch_from_journal<E: AppEvent>(
+pub(crate) fn encode_input_batch_from_journal<E: AppEvent>(
     journal_bytes: &[u8],
     buf: &mut Vec<u8>,
 ) -> io::Result<u16> {
@@ -551,6 +557,11 @@ fn refused(sequence: u64, slot_body: &[u8], shipped_crc: u32, reason: String) ->
 /// starting with the type byte), with the same verification as
 /// [`try_decode_input_batch_into`]. Returns the reconstructed `InputSlot`
 /// vector with `connection_id`, `publish_ts`, `recv_ts` reset to defaults.
+///
+/// Test-only: a replica decodes into a reused buffer with
+/// [`try_decode_input_batch_into`], so this is for a test standing in for
+/// a replica (`test-utils` for another crate's tests).
+#[cfg(any(test, feature = "test-utils"))]
 pub fn try_decode_input_batch<E: AppEvent>(
     payload: &[u8],
 ) -> Result<Vec<InputSlot<E>>, InputBatchError> {
@@ -573,7 +584,7 @@ pub fn try_decode_input_batch<E: AppEvent>(
 ///
 /// Errors if the frame is too short, isn't an `InputBatch`, or carries
 /// no slots.
-pub fn peek_first_sequence(frame: &[u8]) -> io::Result<u64> {
+pub(crate) fn peek_first_sequence(frame: &[u8]) -> io::Result<u64> {
     let (header, rest) = FrameHeader::ref_from_prefix(frame)
         .map_err(|_| io::Error::other("InputBatch frame too short for header"))?;
     if header.msg_type != MSG_INPUT_BATCH {
@@ -594,7 +605,7 @@ pub fn peek_first_sequence(frame: &[u8]) -> io::Result<u64> {
 /// 4-byte length). Lets ring consumers distinguish `InputBatch` chunks
 /// from in-stream control frames (e.g. `Rotate`) before committing to
 /// an `InputBatch`-shaped parse.
-pub fn peek_frame_tag(frame: &[u8]) -> io::Result<u8> {
+pub(crate) fn peek_frame_tag(frame: &[u8]) -> io::Result<u8> {
     frame
         .get(4)
         .copied()

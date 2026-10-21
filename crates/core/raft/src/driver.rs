@@ -122,7 +122,7 @@ pub struct RaftHandles {
     /// timeout-driven elections (openraft's `enable_elect` runtime
     /// toggle). Cleared by the promotion policy on a replica that can
     /// see a fresh peer journal tip ahead of its own — the electoral
-    /// dual of the vote filter in [`crate::recency`]: that filter says
+    /// dual of the vote filter in `crate::recency`: that filter says
     /// "don't vote for someone less caught up", this says "don't stand
     /// while someone more caught up is alive" — and restored the moment
     /// the condition no longer holds. The explicit nudge

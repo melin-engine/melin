@@ -80,8 +80,8 @@ pub struct ReplicationProducer {
     buffers: Arc<SharedBuffers>,
 }
 
-/// Error returned by [`ReplicationProducer::try_publish_timeout`] when
-/// the ring remained full for the entire timeout duration.
+/// Error returned by [`ReplicationProducer::try_publish`] when the ring
+/// is full.
 #[derive(Debug)]
 pub struct BackpressureTimeout;
 
@@ -172,48 +172,6 @@ impl ReplicationProducer {
                 Ok(())
             }
             Err(_) => Err(BackpressureTimeout),
-        }
-    }
-
-    /// Publish with a timeout. Returns `Ok(())` on success,
-    /// `Err(BackpressureTimeout)` if the ring remained full for longer
-    /// than `timeout`. Only calls
-    /// `Instant::now()` when the ring is full (backpressure path), so the
-    /// normal fast path has zero overhead.
-    pub fn try_publish_timeout(
-        &mut self,
-        data: &[u8],
-        end_sequence: u64,
-        timeout: std::time::Duration,
-    ) -> Result<(), BackpressureTimeout> {
-        assert!(
-            data.len() <= CHUNK_SIZE,
-            "replication batch too large: {} > {CHUNK_SIZE}",
-            data.len()
-        );
-
-        // Fast path: try once before touching the clock.
-        if let Ok(seq) = self.inner.try_claim() {
-            self.write_and_publish(seq, data, end_sequence);
-            return Ok(());
-        }
-
-        // Slow path: ring is full, wait with timeout.
-        let deadline = std::time::Instant::now() + timeout;
-        let mut waiter = self.inner.wait_strategy().waiter();
-        loop {
-            match self.inner.try_claim() {
-                Ok(seq) => {
-                    self.write_and_publish(seq, data, end_sequence);
-                    return Ok(());
-                }
-                Err(_) => {
-                    if std::time::Instant::now() >= deadline {
-                        return Err(BackpressureTimeout);
-                    }
-                    waiter.idle();
-                }
-            }
         }
     }
 
@@ -594,38 +552,5 @@ mod tests {
         for (i, val) in received.iter().enumerate() {
             assert_eq!(*val, i as u64);
         }
-    }
-
-    #[test]
-    fn try_publish_timeout_succeeds_when_ring_has_space() {
-        let (mut producer, mut consumers) =
-            build_replication_ring(1, REPLICATION_RING_CAPACITY, WaitStrategy::SpinThenYield);
-        let consumer = &mut consumers[0];
-
-        let result = producer.try_publish_timeout(b"data", 1, std::time::Duration::from_millis(10));
-        assert!(result.is_ok());
-
-        let batch = consumer.peek().unwrap();
-        assert_eq!(batch.meta().end_sequence, 1);
-        assert_eq!(batch.data(), b"data");
-        batch.commit();
-    }
-
-    #[test]
-    fn try_publish_timeout_fails_when_ring_full() {
-        // Capacity 2: fill both slots without consuming → ring is full.
-        let (mut producer, _consumers) = build_replication_ring(1, 2, WaitStrategy::SpinThenYield);
-
-        producer.publish(b"a", 1);
-        producer.publish(b"b", 2);
-
-        // Ring is full — timeout should fire quickly.
-        let start = std::time::Instant::now();
-        let result = producer.try_publish_timeout(b"c", 3, std::time::Duration::from_millis(50));
-        let elapsed = start.elapsed();
-
-        assert!(result.is_err());
-        assert!(elapsed >= std::time::Duration::from_millis(50));
-        assert!(elapsed < std::time::Duration::from_millis(200));
     }
 }

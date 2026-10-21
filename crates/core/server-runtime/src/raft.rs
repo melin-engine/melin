@@ -3,14 +3,14 @@
 //!
 //! The consensus machinery lives in `melin-raft` (with its confined tokio
 //! runtime); this module is the glue between `ServerConfig` and
-//! `melin_raft::driver::spawn`, shared by the kernel-TCP and DPDK paths.
+//! `melin_raft::spawn`, shared by the kernel-TCP and DPDK paths.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
 use melin_app::auth::AuthorizedKeys;
-use melin_raft::driver::{RaftConfig, RaftHandles, RaftPeer};
+use melin_raft::{RaftConfig, RaftHandles, RaftPeer};
 use tracing::info;
 
 use crate::server::ServerConfig;
@@ -137,7 +137,7 @@ pub(crate) struct RaftDriverGuard {
 /// the driver, returned by [`RaftDriverGuard::promotion_wiring`].
 pub(crate) struct PromotionWiring {
     pub(crate) status: Arc<melin_transport_core::health::RaftStatus>,
-    pub(crate) peer_tips: Arc<melin_raft::recency::PeerTips>,
+    pub(crate) peer_tips: Arc<melin_raft::PeerTips>,
     pub(crate) peer_ids: Vec<u64>,
     pub(crate) elect_requested: Arc<AtomicBool>,
     pub(crate) elect_enabled: Arc<AtomicBool>,
@@ -215,7 +215,7 @@ impl Drop for RaftDriverGuard {
 /// and survives a replica → primary promotion untouched: the guard is
 /// dropped (stopping the driver) only after `run_as_primary` (or its DPDK
 /// twin) returns.
-#[allow(clippy::too_many_arguments)] // driver assembly point, same as melin_raft::driver::spawn
+#[allow(clippy::too_many_arguments)] // driver assembly point, same as melin_raft::spawn
 pub(crate) fn spawn_raft_driver(
     raft_config: RaftConfig,
     // `--raft-auto-promote`: arms the raft mesh as a fencing channel
@@ -239,7 +239,7 @@ pub(crate) fn spawn_raft_driver(
         dir = %raft_config.dir.display(),
         "starting control-plane raft driver"
     );
-    let tip = Arc::new(melin_raft::recency::TipSource {
+    let tip = Arc::new(melin_raft::TipSource {
         fence: Arc::clone(fence_state),
         seq: journal_tip,
         ready: tip_ready,
@@ -247,7 +247,7 @@ pub(crate) fn spawn_raft_driver(
     // The raft mesh doubles as a fencing channel only under
     // auto-promotion: without automation, a serving node's fencing
     // stays a data-plane-contact concern exactly as documented.
-    let supersession = auto_promote.then(|| melin_raft::rpc_server::SupersessionPolicy {
+    let supersession = auto_promote.then(|| melin_raft::SupersessionPolicy {
         fence: Arc::clone(fence_state),
         shutdown: Arc::clone(shutdown),
         serving: serving_claim,
@@ -259,7 +259,7 @@ pub(crate) fn spawn_raft_driver(
         .map(|p| p.id)
         .filter(|&id| id != raft_config.node_id)
         .collect();
-    let handles = melin_raft::driver::spawn(
+    let handles = melin_raft::spawn(
         raft_config,
         Arc::new(signing_key.clone()),
         Arc::clone(authorized_keys),

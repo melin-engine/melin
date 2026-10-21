@@ -103,23 +103,20 @@ pub(crate) fn log_replica_live(slot: usize, sent: &SentHighWater) {
 }
 
 // Wire-protocol types, auth, catch-up, ack queueing, dual-track
-// cursor management, and per-replica metrics now live in
-// `melin_transport_core::replication`. Re-export the public types
-// here so the module's public API surface (e.g.
-// `melin_server_runtime::replication::Ack` / `::ReplicationMetrics`) is
-// unchanged for downstream consumers and tests.
-pub use melin_transport_core::replication::ack_queue::{
-    PendingAck, PendingAckQueue, try_flush_dual_track, wait_for_journal_cursor,
+// cursor management, and per-replica metrics live in
+// `melin_transport_core::replication`, imported here for the submodules.
+// Only the metrics are public: a program running a sender reads them.
+pub use melin_transport_core::replication::ReplicationMetrics;
+pub(crate) use melin_transport_core::replication::ack_queue::{
+    PendingAckQueue, try_flush_dual_track,
 };
-pub use melin_transport_core::replication::protocol::{
-    Ack, Handshake, PrimaryMessage, ReplicaMessage,
-};
-pub use melin_transport_core::replication::{ReplicaCursors, ReplicationMetrics, SentHighWater};
+pub(crate) use melin_transport_core::replication::protocol::PrimaryMessage;
+pub(crate) use melin_transport_core::replication::{ReplicaCursors, SentHighWater};
 
 #[cfg(feature = "dpdk")]
 pub(crate) use dpdk::REPL_DISPATCH_BURST;
 #[cfg(feature = "dpdk")]
-pub use dpdk::{DpdkReplicationDriver, run_receiver_dpdk};
+pub(crate) use dpdk::{DpdkReplicationDriver, run_receiver_dpdk};
 pub use tcp_receiver::{ReceiverResult, run_receiver};
 pub use tcp_sender::{ReplicationListener, Sender, run_sender};
 
@@ -133,21 +130,21 @@ pub use tcp_sender::{ReplicationListener, Sender, run_sender};
 pub struct ReplicaControlPlane {
     /// Promotion request: polled by the receive loop; filed by the
     /// admin `PROMOTE` command or the raft driver (auto-promotion).
-    pub promote: crate::promotion::PromotionRequest,
+    pub(crate) promote: crate::promotion::PromotionRequest,
     /// Flipped `true` once journal recovery has seeded the fence epoch,
     /// so the raft driver can trust this node's advertised tip — see
-    /// `melin_raft::recency::TipSource`.
-    pub tip_ready: std::sync::Arc<AtomicBool>,
+    /// `melin_raft::TipSource`.
+    pub(crate) tip_ready: std::sync::Arc<AtomicBool>,
     /// Sequence half of the advertised journal tip — see
     /// [`melin_transport_core::AdvertisedJournalTip`].
-    pub journal_tip: melin_transport_core::AdvertisedJournalTip,
+    pub(crate) journal_tip: melin_transport_core::AdvertisedJournalTip,
     /// `true` while this replica holds an authenticated replication
     /// connection to its primary. The raft driver refuses to
     /// auto-promote while set: a live link means the primary is
     /// demonstrably alive, and winning a control-plane election (e.g.
     /// because a *different* node's raft died) must not depose a
     /// healthy primary.
-    pub primary_link_up: std::sync::Arc<AtomicBool>,
+    pub(crate) primary_link_up: std::sync::Arc<AtomicBool>,
     /// Set once a primary's `StreamStart` has been accepted since this
     /// process booted, and never cleared: the auto-promotion rule's
     /// "a primary has been seen" input, which tells a blank genesis node
@@ -179,7 +176,7 @@ pub struct ReplicaControlPlane {
     /// `journal_failed` latch cannot be handed to the endpoint):
     /// `true` from boot, latched `false` by the journal stage's failure
     /// wrapper, reset `true` when a fresh pipeline is built.
-    pub pipeline_healthy: std::sync::Arc<AtomicBool>,
+    pub(crate) pipeline_healthy: std::sync::Arc<AtomicBool>,
 }
 
 impl ReplicaControlPlane {
@@ -1730,15 +1727,16 @@ mod tests {
     use counter_server::CounterEvent;
     type InputSlot = melin_transport_core::pipeline::InputSlot<CounterEvent>;
     use melin_transport_core::replication::protocol::{
-        MAX_CONTROL_FRAME, MAX_DATA_FRAME, MSG_AUTH_OK, MSG_CHALLENGE_RESPONSE, MSG_SNAPSHOT_BEGIN,
-        MSG_SNAPSHOT_CHUNK, MSG_SNAPSHOT_END, decode_auth_result, decode_challenge,
-        decode_challenge_response, decode_primary_message, decode_replica_message, encode_ack,
-        encode_auth_failed, encode_auth_ok, encode_chain_check, encode_challenge,
-        encode_challenge_response, encode_handshake, encode_hash_mismatch, encode_heartbeat,
-        encode_input_batch, encode_need_snapshot, encode_rotate, encode_segment_seed_begin,
+        Ack, Handshake, MAX_CONTROL_FRAME, MAX_DATA_FRAME, MSG_AUTH_OK, MSG_CHALLENGE_RESPONSE,
+        MSG_SNAPSHOT_BEGIN, MSG_SNAPSHOT_CHUNK, MSG_SNAPSHOT_END, ReplicaMessage,
+        decode_auth_result, decode_challenge, decode_challenge_response, decode_primary_message,
+        decode_replica_message, encode_ack, encode_auth_failed, encode_auth_ok, encode_chain_check,
+        encode_challenge, encode_challenge_response, encode_handshake, encode_hash_mismatch,
+        encode_heartbeat, encode_need_snapshot, encode_rotate, encode_segment_seed_begin,
         encode_snapshot_begin, encode_snapshot_chunk, encode_snapshot_end, encode_stream_start,
-        read_frame, try_decode_input_batch,
+        read_frame,
     };
+    use melin_transport_core::replication_wire::{encode_input_batch, try_decode_input_batch};
 
     /// Build a wire-ready `InputBatch` frame containing a single `Tick`
     /// slot at the given sequence — the protocol-level tests don't need

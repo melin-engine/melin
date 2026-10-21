@@ -103,7 +103,7 @@ otherwise never re-arm. Two openraft-specific consequences:
   safety checks live at promotion time (`auto_promotion_decision`),
   never at the ballot box. Tests that assert "behind node never wins"
   must give the caught-up side a quorum that does not need the behind
-  node's cooperation (see `tests/election.rs`).
+  node's cooperation (see `src/tests/election.rs`).
 
 ## Auto-promotion policy (`raft_promotion.rs`)
 

@@ -14,17 +14,14 @@ use smoltcp::socket::tcp::{self, OpaqueFrameHandle};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 
-use crate::config::{NicConfig, SOCKET_RX_BUF_SIZE, SocketBuffers};
+use crate::config::DpdkConfig;
+use crate::config::{NicConfig, SocketBuffers};
 use crate::device::DpdkDevice;
 use crate::eal::Eal;
 use crate::listen_backlog::{ListenerConfig, Listeners, MAX_LISTENING_SOCKETS, tune_socket};
 use crate::mempool::Mempool;
 use crate::peer_liveness::{self, PeerLiveness, StackClock};
 use crate::port::{ChecksumOffloads, Port};
-
-// Defined outside the `dpdk-sys` gate (`crate::config`); re-exported here so
-// `melin_dpdk::transport::DpdkConfig` still names it.
-pub use crate::config::DpdkConfig;
 
 /// Maximum concurrent TCP connections. Exposed so callers can pre-size
 /// per-connection state vectors that parallel the smoltcp socket set.
@@ -66,18 +63,11 @@ fn mbuf_to_handle(mbuf: *mut ffi::rte_mbuf) -> OpaqueFrameHandle {
 }
 
 /// Maximum TX queue size per connection (bytes) for a socket opened
-/// without sizes of its own: a dialled stream (`connect_to`, the client
-/// NIC handle's). If the peer falls behind and the queue exceeds this, the
-/// connection is dropped. The client port has its own limit, in
+/// without sizes of its own: a dialled stream (the client NIC handle's).
+/// If the peer falls behind and the queue exceeds this, the connection is
+/// dropped. The client port has its own limit, in
 /// [`SocketBuffers::DEFAULT`].
 const MAX_TX_QUEUE_SIZE: usize = 64 * 1024;
-
-/// smoltcp TCP TX buffer size of a socket opened without sizes of its own
-/// (`connect_to`). Smaller values reduce per-socket egress burst size
-/// (fewer segments serialized per egress pass). 16 KiB ≈ 11 segments at
-/// 1500 MTU vs 43 segments with 64 KiB. The client port has its own, in
-/// [`SocketBuffers::DEFAULT`].
-const SOCKET_TX_BUF_SIZE: usize = 16 * 1024;
 
 /// How often to refresh the smoltcp timestamp (in poll iterations).
 /// smoltcp only needs millisecond-precision timestamps for TCP timers
@@ -150,12 +140,12 @@ pub struct DpdkShared {
     _mempool: Mempool,
     _eal: NodeEal,
     /// Intersection of all ports' checksum offload capabilities.
-    pub offloads: ChecksumOffloads,
+    pub(crate) offloads: ChecksumOffloads,
     /// MAC address of the first port (used for all smoltcp interfaces).
-    pub mac: [u8; 6],
+    pub(crate) mac: [u8; 6],
     /// Raw mempool pointer for DpdkDevice creation. Thread-safe — DPDK
     /// mempools use per-lcore caches for lock-free alloc/free.
-    pub mempool_raw: *mut crate::ffi::rte_mempool,
+    pub(crate) mempool_raw: *mut crate::ffi::rte_mempool,
     /// Actual number of queue pairs configured (may be less than requested
     /// if the NIC doesn't support that many).
     pub num_queues: u16,
@@ -588,37 +578,15 @@ impl DpdkTransport {
         Ok(transport)
     }
 
-    /// Open an outbound TCP connection to a remote endpoint.
+    /// Open an outbound TCP connection to a remote endpoint, with its
+    /// buffer sizes, TX queue limit and egress burst limit (replication
+    /// connections need larger RX/TX buffers than client ones).
     ///
     /// Creates a new smoltcp TCP socket, calls `socket.connect()` to
     /// initiate the TCP handshake, and returns the socket handle. The
     /// caller must poll the transport until `is_connected(handle)` returns
-    /// true before sending data.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::connect_to_with_buffers`].
-    pub fn connect_to(
-        &mut self,
-        remote_ip: std::net::Ipv4Addr,
-        remote_port: u16,
-        local_port: u16,
-    ) -> Result<SocketHandle, tcp::ConnectError> {
-        self.connect_to_with_buffers(
-            remote_ip,
-            remote_port,
-            local_port,
-            SOCKET_RX_BUF_SIZE,
-            SOCKET_TX_BUF_SIZE,
-            MAX_TX_QUEUE_SIZE,
-            tcp::DEFAULT_DISPATCH_BURST_LIMIT,
-        )
-    }
-
-    /// Like `connect_to` but with custom buffer sizes, TX queue limit and
-    /// egress burst limit. Used for replication connections that need larger
-    /// RX/TX buffers. See [`Self::add_listener_with_buffers`] for what
-    /// `dispatch_burst_limit` controls.
+    /// true before sending data. See [`Self::add_listener_with_buffers`]
+    /// for what `dispatch_burst_limit` controls.
     ///
     /// # Errors
     ///
@@ -724,7 +692,7 @@ impl DpdkTransport {
     /// Unlike [`Self::is_active`], false once the peer has closed its
     /// half (its FIN), as soon as the bytes it sent before are read: the
     /// test for a link that needs both directions. See `link_up` in
-    /// [`crate::peer_liveness`].
+    /// `crate::peer_liveness`.
     pub fn is_connected(&mut self, handle: SocketHandle) -> bool {
         match self.sockets.try_get_mut::<tcp::Socket>(handle) {
             Some(socket) => peer_liveness::link_up(socket),
@@ -737,13 +705,6 @@ impl DpdkTransport {
                 false
             }
         }
-    }
-
-    /// Convenience: initialize shared resources + create a single-queue transport.
-    /// Equivalent to `DpdkShared::init(config)` + `DpdkTransport::from_shared(..., 0)`.
-    pub fn init(config: &DpdkConfig) -> Result<Self, Box<dyn std::error::Error>> {
-        let shared = DpdkShared::init(config)?;
-        Self::from_shared(&shared, config, 0)
     }
 
     /// Run one poll iteration.
@@ -1034,20 +995,6 @@ impl DpdkTransport {
         std::mem::take(&mut self.accepted)
     }
 
-    /// Read available data from a connection into an external buffer.
-    /// A stale handle (closed/removed concurrently) reads as "nothing
-    /// available" — never panic on the caller's behalf.
-    pub fn recv(&mut self, handle: SocketHandle, buf: &mut [u8]) -> usize {
-        let Some(socket) = self.sockets.try_get_mut::<tcp::Socket>(handle) else {
-            tracing::warn!(handle = ?handle, site = "recv", "DPDK: stale SocketHandle observed");
-            return 0;
-        };
-        if !socket.can_recv() {
-            return 0;
-        }
-        socket.recv_slice(buf).unwrap_or(0)
-    }
-
     /// Append available data from a connection directly into a Vec.
     /// Uses zero-copy RX: reads directly from DPDK mbuf memory, then
     /// releases the mbuf via the registered release callback. Stale
@@ -1186,7 +1133,7 @@ impl DpdkTransport {
     /// frame to deliver waits on [`Self::tx_drained`] first.
     ///
     /// Idempotent like `close`. See `abort_announced` in
-    /// [`crate::peer_liveness`].
+    /// `crate::peer_liveness`.
     pub fn reset(&mut self, handle: SocketHandle) {
         // Whatever is still queued above the socket would never be sent:
         // the socket is aborted below. Drop it first so the egress pass
@@ -1268,7 +1215,7 @@ impl DpdkTransport {
     ///
     /// Call this for any peer IP that smoltcp needs to reach (e.g., bench
     /// clients, gateways) when running on an SR-IOV VF.
-    pub fn seed_neighbor(&mut self, ip: Ipv4Addr, mac: [u8; 6]) {
+    pub(crate) fn seed_neighbor(&mut self, ip: Ipv4Addr, mac: [u8; 6]) {
         let our_mac = self._shared.mac;
         let our_ip = self.iface.ipv4_addr().expect("interface has IPv4 address");
 

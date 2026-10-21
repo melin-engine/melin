@@ -13,37 +13,39 @@
 //! crate — see the examples under `crates/examples/`.
 
 pub mod ack_policy;
-pub mod admin;
+mod admin;
 mod batch_boundary;
 mod buf_ring;
 pub mod client_auth;
 mod client_frames;
-pub mod connection_limit;
+mod connection_limit;
 mod durability_gate;
-pub mod early_reply;
-pub mod halt;
+mod early_reply;
+mod halt;
 pub mod layout;
-pub mod policy_control;
-pub mod process;
-pub mod promotion;
+mod policy_control;
+mod process;
+mod promotion;
 mod raft;
 mod raft_promotion;
-pub mod reader;
+mod reader;
 pub mod replication;
-pub mod response;
+mod response;
 mod response_frame;
 pub mod server;
 mod startup;
 #[cfg(test)]
 mod test_roles;
+#[cfg(test)]
+mod tests;
 mod uring_teardown;
 
 pub use startup::StartupEvents;
 
 #[cfg(feature = "dpdk")]
-pub mod dpdk_response;
+mod dpdk_response;
 #[cfg(feature = "dpdk")]
-pub mod dpdk_transport;
+mod dpdk_transport;
 
 // The two wire bounds an application's codecs have to fit: the widest
 // request body the readers hand a decoder, and the widest response body
@@ -51,15 +53,14 @@ pub mod dpdk_transport;
 // protocol's framing, which the runtime reads and writes itself.
 // Re-exported here so an application can assert against them at compile
 // time, next to the bounds it declares (`AppEvent::MAX_ENCODED_SIZE` is
-// the journal's; these are the wire's). `MAX_FRAME_SIZE` is the whole
-// request frame, for a program that reads client frames itself.
-pub use client_frames::{MAX_FRAME_SIZE, MAX_REQUEST_BODY};
+// the journal's; these are the wire's).
+pub use client_frames::MAX_REQUEST_BODY;
 pub use response_frame::MAX_RESPONSE_BODY;
 
 /// Control-plane event the accept loop, reader, and response stage
 /// exchange. Transport-agnostic — the payload is a socket fd + writer,
 /// not an app event — so both build modes refer to the same type.
-pub enum ControlEvent {
+pub(crate) enum ControlEvent {
     Connected {
         connection_id: u64,
         fd: std::os::unix::io::RawFd,

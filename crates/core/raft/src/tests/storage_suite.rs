@@ -9,10 +9,10 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
-use melin_raft::storage;
-use melin_raft::storage::FileLogStore;
-use melin_raft::storage::FileStateMachine;
-use melin_raft::types::TypeConfig;
+use crate::storage;
+use crate::storage::FileLogStore;
+use crate::storage::FileStateMachine;
+use crate::types::TypeConfig;
 use openraft::CommittedLeaderId;
 use openraft::Entry;
 use openraft::EntryPayload;

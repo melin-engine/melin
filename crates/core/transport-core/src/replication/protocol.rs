@@ -8,15 +8,9 @@ use std::io::{self, Read};
 use zerocopy::little_endian::{U16, U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
-// Wire format for `MSG_INPUT_BATCH` lives alongside in
-// `crate::replication_wire` so the journal stage can encode directly
-// into the replication ring without depending on this submodule.
-// Re-export the helpers at replication scope so existing
-// `replication::protocol::{...}` imports keep working.
-pub use crate::replication_wire::{
-    InputBatchError, encode_input_batch, encode_input_batch_from_journal, peek_first_sequence,
-    peek_frame_tag, try_decode_input_batch, try_decode_input_batch_into,
-};
+// The wire format for `MSG_INPUT_BATCH` lives in `crate::replication_wire`,
+// so the journal stage can encode directly into the replication ring
+// without depending on this submodule.
 
 // --- Wire protocol message tags ---
 
@@ -36,7 +30,7 @@ pub const MSG_SNAPSHOT_END: u8 = 0x15;
 pub const MSG_ROTATE: u8 = 0x16;
 pub const MSG_CHAIN_CHECK: u8 = 0x17;
 pub const MSG_SEGMENT_SEED_BEGIN: u8 = 0x18;
-// `MSG_INPUT_BATCH` (0x21) — re-exported above; carries `InputSlot`
+// `MSG_INPUT_BATCH` (0x21) — in `crate::replication_wire`; carries `InputSlot`
 // records on the wire. Replaces the old `MSG_DATA_BATCH = 0x20` (removed
 // in phase 3 of feat/unified-pipeline).
 pub const MSG_HEARTBEAT: u8 = 0x30;

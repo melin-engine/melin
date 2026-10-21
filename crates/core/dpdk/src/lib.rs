@@ -21,10 +21,12 @@
 //! libdpdk installed (and libclang, for the generated bindings). Without
 //! the feature the crate holds only what needs no libdpdk: the
 //! configuration ([`DpdkConfig`], [`NicConfig`]), MAC parsing and the
-//! peer-MAC convention ([`mac`]), the ARP frames ([`arp`]), and the
-//! policies tested on any host ([`rx_checksum`], [`peer_liveness`]). A
-//! binary maps its flags onto the configuration in any build, and the
-//! crate lives in the workspace without requiring system dependencies.
+//! peer-MAC convention ([`try_parse_mac`], [`resolve_peer_mac`]), and the
+//! peer-liveness policy ([`PeerLiveness`]). A binary maps its flags onto
+//! the configuration in any build, and the crate lives in the workspace
+//! without requiring system dependencies. The NIC-free logic the
+//! transport is built on (ARP frames, receive checksum screening, TCP
+//! liveness, listen backlogs) is tested on any host.
 //!
 //! The `clap` feature, independent of `dpdk-sys` and also needing no
 //! libdpdk, adds `DpdkArgs`: the `--dpdk-*` flags as one clap argument
@@ -35,27 +37,31 @@
 // Ungated: MAC parsing and the peer-MAC convention are pure logic with
 // no libdpdk dependency, and operators configure them through the same
 // CLI whether or not this build has the transport compiled in.
-pub mod mac;
+mod mac;
 pub use mac::{
     MacAddr, MacParseError, PeerMacSource, fmt_mac, parse_mac, resolve_peer_mac, try_parse_mac,
 };
-// Ungated for the same reason: which received frames may reach the TCP
-// stack is decided from offload flags and frame bytes alone, so the
-// policy is tested on any host, with or without libdpdk.
-pub mod rx_checksum;
+// Which received frames may reach the TCP stack is decided from offload
+// flags and frame bytes alone, so the policy is tested on any host, with
+// or without libdpdk; only the gated device calls it, so it is compiled
+// for that and for the tests.
+#[cfg(any(test, feature = "dpdk-sys"))]
+mod rx_checksum;
 // What a node does differently on a process-wide EAL is decided from its
 // configuration alone, so it is tested on any host; only the gated
 // transport calls it, so it is compiled for that and for the tests.
 #[cfg(any(test, feature = "dpdk-sys"))]
 mod eal_sharing;
-// Ungated for the same reason as `rx_checksum`: when a long-lived link's
-// peer counts as gone is TCP-stack logic, tested over an in-memory wire.
-// What in it acts on a socket is compiled for the transport and the tests.
-pub mod peer_liveness;
+// Ungated: when a long-lived link's peer counts as gone is TCP-stack
+// logic, tested over an in-memory wire, and its policy is configured in
+// any build. What in it acts on a socket is compiled for the transport
+// and the tests.
+mod peer_liveness;
 pub use peer_liveness::PeerLiveness;
-// Ungated for the same reason: the ARP frames a transport sends and
-// injects are a fixed byte layout, tested on any host.
-pub mod arp;
+// The ARP frames a transport sends and injects are a fixed byte layout,
+// tested on any host; only the gated transport sends them.
+#[cfg(any(test, feature = "dpdk-sys"))]
+mod arp;
 // Ungated: configuration is plain data, mapped from the same flags whether
 // or not this build has the transport compiled in.
 mod config;
@@ -87,5 +93,12 @@ mod test_wire;
 
 #[cfg(feature = "dpdk-sys")]
 mod dpdk;
+// Named rather than globbed, so the public surface reads off this list.
 #[cfg(feature = "dpdk-sys")]
-pub use dpdk::*;
+pub use dpdk::{
+    AcceptedConnection, DpdkShared, DpdkTransport, Eal, EalError, MAX_CONNECTIONS, Mempool,
+    MempoolError, NextHop, NicClock, NicHandle, NicStream, Port, PortError, SocketHandle, StreamId,
+    device, eal, mempool, port,
+};
+#[cfg(feature = "dpdk-sys")]
+pub(crate) use dpdk::{ffi, transport};

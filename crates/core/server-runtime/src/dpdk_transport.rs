@@ -43,7 +43,7 @@ use rustc_hash::FxHashMap;
 use melin_app::Application;
 use melin_app::auth::{AuthorizedKeys, ClientRole, KeyRole, RoleId};
 use melin_app::unix_epoch_nanos;
-use melin_dpdk::transport::DpdkTransport;
+use melin_dpdk::DpdkTransport;
 use melin_pipeline::ring;
 use melin_transport_core::health::IngressMetrics;
 use melin_transport_core::pipeline::InputSlot;

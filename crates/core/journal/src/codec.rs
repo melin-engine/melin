@@ -116,7 +116,7 @@ pub const FORMAT_VERSION: u16 = 16;
 
 /// The previous format version, read alongside [`FORMAT_VERSION`]: its
 /// header lacks `genesis_entries` and its entries are identical. Written
-/// only to continue a lineage begun under it (see [`encode_file_header`]).
+/// only to continue a lineage begun under it.
 pub const FORMAT_VERSION_V15: u16 = 15;
 
 /// Entry magic bytes for corruption/misalignment detection.
@@ -377,7 +377,7 @@ const ACK_POLICY_FLAG_UNWITNESSED: u8 = 0x01;
 /// that is how a lineage begun under v15 continues, segment after
 /// segment and replica after replica, with the header its first segment
 /// has — byte for byte what the release that began it would write.
-pub fn encode_file_header(
+pub(crate) fn encode_file_header(
     buf: &mut [u8],
     sector_size: usize,
     starting_sequence: u64,

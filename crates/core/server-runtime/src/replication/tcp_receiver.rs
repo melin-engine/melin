@@ -2337,7 +2337,11 @@ mod tests {
         /// return its handshake with the open stream.
         fn next_handshake(
             listener: &std::net::TcpListener,
-        ) -> (TcpStream, TcpStream, crate::replication::Handshake) {
+        ) -> (
+            TcpStream,
+            TcpStream,
+            melin_transport_core::replication::protocol::Handshake,
+        ) {
             let mut s = accept_within(listener, 30);
             let mut sr = s.try_clone().expect("clone");
             authenticate_replica(&mut sr, &replica_auth()).expect("auth");

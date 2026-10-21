@@ -125,7 +125,7 @@ impl FenceState {
 /// ([`FenceState::observe_epoch`]) and the replay dispatches cannot
 /// diverge on `EpochBump` semantics.
 #[inline]
-pub fn observe_into(current: &mut u64, observed: u64) {
+pub(crate) fn observe_into(current: &mut u64, observed: u64) {
     *current = (*current).max(observed);
 }
 
