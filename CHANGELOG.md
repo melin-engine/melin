@@ -12,6 +12,16 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A DPDK client connection is no longer dropped from the reply path when
+  a heartbeat cannot be queued** (finding 27 of the determinism audit).
+  The connection stayed open with its requests still applied, but every
+  later reply was discarded and its `max_connections` slot freed. The
+  heartbeat is now retried on the next scan. The node logs a warning when
+  a poll thread's heartbeats start being held back by its full TX ring,
+  again once per heartbeat interval while they are, and when they resume.
+
 ## [0.22.0] - 2026-10-21
 
 ### Removed
@@ -346,13 +356,6 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Fixed
 
-- **A DPDK client connection is no longer dropped from the reply path when
-  a heartbeat cannot be queued** (finding 27 of the determinism audit).
-  The connection stayed open with its requests still applied, but every
-  later reply was discarded and its `max_connections` slot freed. The
-  heartbeat is now retried on the next scan. The node logs a warning when
-  a poll thread's heartbeats start being held back by its full TX ring,
-  again once per heartbeat interval while they are, and when they resume.
 - **A snapshot deferred under load is retried, not skipped for an
   interval** (finding 35 of the determinism audit). The shadow stage saves only at a journal fsync boundary,
   and tried once per `--snapshot-interval-ms`: under sustained load it
