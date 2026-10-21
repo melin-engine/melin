@@ -17,6 +17,22 @@ Four x86_64 machines on one private network:
 | bench   | the load generator                       |
 | replica, replica2 | the replicas                   |
 
+**Use machines you can wipe.** Preparing a host rebuilds it for
+benchmarking and nothing else, and there is no script to undo it:
+
+- **It erases a drive.** The journal goes on the largest NVMe drive
+  without a partition table. An empty one is formatted; one holding a
+  filesystem other than XFS is wiped and reformatted, whatever is on it.
+  On a host that keeps data on a whole, unpartitioned drive, name the
+  journal drive with `JOURNAL_DISK` (below), or that data is lost.
+- **It reboots the host** without asking, to apply kernel parameters.
+- **It takes the CPU.** From that boot on, every core but core 0 is
+  kept from the scheduler, so anything else the host runs shares one
+  core, and the power-saving and watchdog features below stay off.
+
+The suite also reboots the hosts after each DPDK run on SR-IOV (see
+"Results").
+
 Each needs root over SSH (or a user with passwordless `sudo`), the same
 Linux distribution and release, and a dedicated NVMe drive for the
 journal if one is available. Prepare each once:
