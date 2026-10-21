@@ -298,30 +298,13 @@ pub fn run<A: Application>(
                     .tick(Duration::from_secs(1), waiter.spinning())
                     .is_some()
             {
-                let now = Instant::now();
-                let mut failed: Vec<u64> = Vec::new();
-                for (&conn_id, state) in connections.iter_mut() {
-                    if now.duration_since(state.last_send) >= interval {
-                        let mut frame = TxFrame {
-                            connection_id: conn_id,
-                            len: heartbeat_len as u16,
-                            ..Default::default()
-                        };
-                        frame.data[..heartbeat_len]
-                            .copy_from_slice(&heartbeat_frame[..heartbeat_len]);
-                        let tid = (conn_id >> 56) as usize % tx_producers.len();
-                        if tx_producers[tid].try_publish(frame).is_err() {
-                            // SPSC full — DPDK poll thread fell behind.
-                            failed.push(conn_id);
-                            continue;
-                        }
-                        state.last_send = now;
-                    }
-                }
-                for conn_id in failed {
-                    connections.remove(&conn_id);
-                    active_connections.fetch_sub(1, Ordering::Relaxed);
-                }
+                send_due_heartbeats(
+                    &mut connections,
+                    &mut tx_producers,
+                    &heartbeat_frame[..heartbeat_len],
+                    Instant::now(),
+                    interval,
+                );
             }
 
             // Re-evaluate the policy on a slow timer so the
@@ -738,6 +721,40 @@ fn process_control_events(
     }
 }
 
+/// Queue a heartbeat for every connection that has had nothing sent for
+/// `interval`.
+///
+/// A connection whose TX ring is full (its poll thread fell behind) keeps
+/// its entry and its `last_send`, so the next scan retries it. Dropping
+/// the entry instead would leave the socket open with every later reply
+/// discarded as unregistered, since only the poll thread can close it,
+/// and would release its `max_connections` permit while it is still
+/// connected.
+fn send_due_heartbeats(
+    connections: &mut FxHashMap<u64, ConnectionHeartbeat>,
+    tx_producers: &mut [spsc::Producer<TxFrame>],
+    heartbeat: &[u8],
+    now: Instant,
+    interval: Duration,
+) {
+    for (&conn_id, state) in connections.iter_mut() {
+        if now.duration_since(state.last_send) < interval {
+            continue;
+        }
+        let mut frame = TxFrame {
+            connection_id: conn_id,
+            // Lossless: a heartbeat is a few bytes.
+            len: heartbeat.len() as u16,
+            ..Default::default()
+        };
+        frame.data[..heartbeat.len()].copy_from_slice(heartbeat);
+        let tid = (conn_id >> 56) as usize % tx_producers.len();
+        if tx_producers[tid].try_publish(frame).is_ok() {
+            state.last_send = now;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -876,6 +893,67 @@ mod tests {
         assert_eq!(reads.get(), 1);
         assert_eq!(connections[&1].last_send, at_drain);
         assert_eq!(connections[&2].last_send, at_drain);
+    }
+
+    /// A heartbeat that finds its TX ring full is retried on the next
+    /// scan, and the connection stays registered: the stage cannot close
+    /// the socket, so dropping it would leave the client connected with
+    /// every later reply discarded. Its `max_connections` permit is
+    /// released only by the poll thread's `Disconnected`.
+    #[test]
+    fn a_heartbeat_on_a_full_tx_ring_is_retried_and_keeps_the_connection() {
+        let counter = AtomicU64::new(0);
+        let (control_tx, control_rx) = mpsc::channel();
+        let mut connections = FxHashMap::default();
+        let interval = std::time::Duration::from_secs(1);
+        let start = Instant::now();
+        let heartbeat = [0xAB; 5];
+
+        counter.fetch_add(1, Ordering::Relaxed);
+        control_tx
+            .send(ControlEvent::Connected { connection_id: 7 })
+            .unwrap();
+        process_control_events(&control_rx, &mut connections, &counter, || start);
+
+        let (tx, mut rx) = spsc::channel::<TxFrame>(8, WaitStrategy::SpinThenYield);
+        let mut producers = vec![tx];
+        let mut filler = 0;
+        while producers[0].try_publish(TxFrame::default()).is_ok() {
+            filler += 1;
+        }
+
+        // Due, but the ring is full: nothing is queued, nothing changes.
+        let due = start + interval;
+        send_due_heartbeats(&mut connections, &mut producers, &heartbeat, due, interval);
+        assert_eq!(
+            connections[&7].last_send, start,
+            "a failed heartbeat is still due"
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+
+        // The poll thread drains the ring; the next scan sends it.
+        for _ in 0..filler {
+            rx.try_consume().expect("filler frame");
+        }
+        let later = due + std::time::Duration::from_millis(1);
+        send_due_heartbeats(
+            &mut connections,
+            &mut producers,
+            &heartbeat,
+            later,
+            interval,
+        );
+        let (_, frame) = rx.try_consume().expect("the retried heartbeat");
+        assert_eq!(frame.connection_id, 7);
+        assert_eq!(frame.as_bytes(), heartbeat);
+        assert_eq!(connections[&7].last_send, later);
+
+        // Only the poll thread's close releases the permit.
+        control_tx
+            .send(ControlEvent::Disconnected { connection_id: 7 })
+            .unwrap();
+        process_control_events(&control_rx, &mut connections, &counter, || later);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
     }
 
     /// A journaled policy change addressed to a registered client's own

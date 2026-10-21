@@ -77,7 +77,7 @@ Severity is a judgement from code reading.
 | 24 | The shutdown drain skips a failed encode after allocating its sequence | Low | Confirmed (fixed) |
 | 25 | A crash inside a snapshot save leaves no snapshot under its name | Low | Confirmed |
 | 26 | The application codec contract is unenforced | Low | Confirmed |
-| 27 | The DPDK response stage drops a connection without closing it | Low | Reported |
+| 27 | The DPDK response stage drops a connection without closing it | Low | Reported (fixed) |
 | 28 | A half-open replica slot can count one replica twice | Low | Reported |
 | 29 | Tightening the ack policy lags the in-flight batch | Low | Reported (fixed) |
 | 30 | `no-persist` fakes durability without a signal | Low | Reported |
@@ -1208,6 +1208,10 @@ every build.
     connection from its reply map but leaves the socket open, so requests
     keep being applied and every reply is discarded. The client reads an
     applied write as refused. Reported.
+    **Status: fixed.** A heartbeat that finds its TX ring full leaves the
+    connection registered and still due, so the next scan retries it; only
+    the poll thread's `Disconnected` removes a connection. Pinned by
+    `a_heartbeat_on_a_full_tx_ring_is_retried_and_keeps_the_connection`.
 28. **A half-open replica slot can count one replica twice.** A dead
     connection keeps its slot active with frozen acks while the same host
     reconnects on the other slot, so `two-disks` can be satisfied by one
