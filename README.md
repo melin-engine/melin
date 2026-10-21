@@ -14,7 +14,7 @@ Melin is a low-latency durable replication layer for your state machine. It is t
 
 **Nothing is acknowledged before it is safe.** Every event is journaled and synchronously replicated before the client sees a response. The ack policy chooses what "safe" means. By default (`disk+ram`) it is one fsynced copy plus a second copy in another node's memory, so a slow disk or a dead node costs neither latency nor data. A stricter `two-disks` policy and a faster `ram` policy are available. See [replication](docs/replication.md).
 
-**Fast.** p99 of 245 µs at 1M events/sec on kernel TCP, and 40 µs with DPDK kernel bypass, full round trip including persistence and replication on commodity datacenter hardware. See [Benchmarks](#benchmarks).
+**Fast.** At a million events per second, p99 in the low hundreds of microseconds on kernel TCP and in the tens with DPDK kernel bypass, full round trip including persistence and replication on commodity datacenter hardware. See [Benchmarks](#benchmarks).
 
 **Deterministic replay.** Given the same journal, the application reaches the same state and emits the same output, on every node and after every restart. Melin supplies the total order and the timestamps, so your logic never reads a clock. Keeping it pure is the only rule left to you.
 
@@ -28,23 +28,21 @@ Melin is a low-latency durable replication layer for your state machine. It is t
 
 Every figure is a full round trip as the client sees it: the request leaves the client, the primary journals and replicates it, the application executes it, and the response arrives back. The application is [the Melin Exchange Core](https://github.com/melin-engine/exchange-core), the reference application built on this sequencer.
 
-**Setup.** Four bare-metal AMD EPYC 9275F servers over LAN: one benchmark client, one primary, two replicas. 24-core Zen 5 with SMT off, Micron 7450 PRO NVMe with power-loss protection, Mellanox ConnectX-6 Dx 100 Gb/s. Default ack policy (`disk+ram`): one fsynced copy plus a second copy in another node's memory. For the DPDK rows, the client and all three server nodes run on DPDK kernel bypass. Measured August 2026.
+**Setup.** Four bare-metal AMD EPYC 9255 servers over LAN: one benchmark client, one primary, two replicas. 24-core Zen 5 with SMT off, Micron 7450 PRO NVMe with power-loss protection, Intel E810 25 Gb/s. The client, the primary and the first replica share a switch pair; the second replica is on another. Default ack policy (`disk+ram`): one fsynced copy plus a second copy in another node's memory. For the DPDK rows, the client and all three server nodes run on DPDK kernel bypass, each on an SR-IOV virtual function of its NIC. Each figure is the median of three runs. Measured October 2026. See [Benchmarking across a LAN](docs/benchmarking.md) for more details about the benchmarking process.
 
-**Under load.** 1M events/s over four connections. In flight is per connection: the queue depth each transport needs to sustain the rate.
+**Under load.** About 1M events/s over four connections, each a closed loop: it keeps a fixed number of requests in flight and sends the next one as each answer arrives. In flight is that number per connection, the depth each transport needs to sustain the rate. A closed loop sends nothing while it waits, so a stall delays only the requests already in flight: the high percentiles are those of a client that waits for its answers, not of traffic that arrives at a fixed rate whatever the latency.
 
 | Transport | In flight | p50 | p99 | p99.9 | p99.99 | p99.999 |
 |-----------|-----------|-----|-----|-------|--------|---------|
-| Kernel TCP | 32 | 100 µs | 245 µs | 299 µs | 346 µs | 395 µs |
-| DPDK kernel bypass | 8 | 28 µs | 40 µs | 61 µs | 76 µs | 87 µs |
+| Kernel TCP | 25 | 90 µs | 182 µs | 248 µs | 302 µs | 357 µs |
+| DPDK kernel bypass | 10 | 38 µs | 50 µs | 63 µs | 78 µs | 195 µs |
 
 **Single event.** One client, one request in flight. The rate is what the closed loop sustains at that latency.
 
 | Transport | Rate | p50 | p99 | p99.9 | p99.99 |
 |-----------|------|-----|-----|-------|--------|
-| Kernel TCP | 25K/s | 38 µs | 62 µs | 73 µs | 104 µs |
-| DPDK kernel bypass | 48K/s | 20 µs | 45 µs | 47 µs | 49 µs |
-
-The harness that runs these, and the host tuning they assume, are in this repository: [Benchmarking across a LAN](docs/benchmarking.md). It drives the Exchange Core, or the echo and notary examples here.
+| Kernel TCP | 22K/s | 44 µs | 67 µs | 108 µs | 177 µs |
+| DPDK kernel bypass | 33K/s | 30 µs | 49 µs | 53 µs | 55 µs |
 
 ## Building an application on Melin
 
