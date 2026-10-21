@@ -51,10 +51,10 @@ use crate::halt::{HaltGate, Verdict};
 /// construction.
 ///
 /// A frame declaring more is not read: both readers treat it as a
-/// protocol violation and drop the connection. Public for a program that
-/// reads client frames itself; an application sizes its requests against
-/// [`MAX_REQUEST_BODY`].
-pub const MAX_FRAME_SIZE: usize = melin_wire_protocol::blocking::MAX_FRAME_SIZE;
+/// protocol violation and drop the connection. A program that reads
+/// client frames itself takes the same bound from `melin-client`; an
+/// application sizes its requests against [`MAX_REQUEST_BODY`].
+pub(crate) const MAX_FRAME_SIZE: usize = melin_wire_protocol::blocking::MAX_FRAME_SIZE;
 
 /// Bound on one request body — what an application's `RequestDecoder`
 /// is handed after the runtime has read the tag and the request's ID.

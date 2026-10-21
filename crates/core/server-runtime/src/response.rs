@@ -23,8 +23,8 @@ use melin_pipeline::wait::WaitStrategy;
 
 use crate::ack_policy::{Blocker, CursorView, EvalStatus, MAX_CLUSTER_SIZE, Policy};
 use crate::batch_boundary::{AtBoundary, BatchBoundary};
+pub(crate) use crate::durability_gate::GatePolicy;
 use crate::durability_gate::{Admission, Backing, BatchEnds, DurabilityGate, GateInputs, GateWait};
-pub use crate::durability_gate::{GatePolicy, GateStart};
 use crate::early_reply::{EarlyReply, EarlyReplyQueue, Registered};
 use crate::replication::ReplicationMetrics;
 use melin_app::Application;
@@ -136,7 +136,7 @@ impl FlushCadence {
 /// indefinitely.
 const BLOCKED_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub use crate::ControlEvent;
+pub(crate) use crate::ControlEvent;
 
 /// Encoder type alias: response encoder bound to the application's
 /// `Report` / `QueryResponse` types. Hides the long
@@ -4095,7 +4095,7 @@ pub(crate) mod tests {
                 // is open and delivery hinges on registration alone.
                 journal_persisted_wire_seq: DurableWireSeqCursor::detached(WireSeq::new(1)),
                 policy: crate::response::GatePolicy {
-                    start: crate::response::GateStart::settled(AckPolicy::Disk),
+                    start: crate::durability_gate::GateStart::settled(AckPolicy::Disk),
                     forced: melin_transport_core::lineage::forced_policy_cell().1,
                 },
                 replication_metrics: None,
@@ -4406,7 +4406,7 @@ pub(crate) mod tests {
             Response::<Counter> {
                 journal_persisted_wire_seq: journal_cursor,
                 policy: crate::response::GatePolicy {
-                    start: crate::response::GateStart::settled(AckPolicy::Disk),
+                    start: crate::durability_gate::GateStart::settled(AckPolicy::Disk),
                     forced: melin_transport_core::lineage::forced_policy_cell().1,
                 },
                 replication_metrics: None,
@@ -4987,7 +4987,7 @@ pub(crate) mod tests {
                 inputs.early_replies,
                 None,
             );
-            config.policy.start = crate::response::GateStart::settled(AckPolicy::DiskAndRam);
+            config.policy.start = crate::durability_gate::GateStart::settled(AckPolicy::DiskAndRam);
             config.replication_metrics = Some(inputs.replication_metrics);
             config.replica_active = Some(inputs.replica_active);
             config.utilization = inputs.utilization;
@@ -5115,7 +5115,7 @@ pub(crate) mod tests {
                 None,
             );
             config.policy = crate::response::GatePolicy {
-                start: crate::response::GateStart::settled(AckPolicy::DiskAndRam),
+                start: crate::durability_gate::GateStart::settled(AckPolicy::DiskAndRam),
                 forced: melin_transport_core::lineage::forced_policy_cell().1,
             };
             config.replication_metrics = Some(Arc::new(ReplicationMetrics::default()));

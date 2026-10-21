@@ -21,15 +21,15 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
+use crate::ControlEvent;
+use crate::ack_policy::AckPolicy;
+use crate::connection_limit::RingSizing;
+use crate::early_reply;
+use crate::response::{self, Response};
 use melin_app::encoder::ResponseEncoder;
 use melin_app::{AppEvent, Application, ApplyCtx, CodecError, QueryCtx, RejectReason};
 use melin_pipeline::ring::DisruptorBuilder;
 use melin_pipeline::wait::WaitStrategy;
-use melin_server_runtime::ControlEvent;
-use melin_server_runtime::ack_policy::AckPolicy;
-use melin_server_runtime::connection_limit::RingSizing;
-use melin_server_runtime::early_reply;
-use melin_server_runtime::response::{self, Response};
 use melin_transport_core::fence::FenceState;
 use melin_transport_core::pipeline::{OutputPayload, OutputSlot, StageUtilization};
 use melin_transport_core::{DurableWireSeqCursor, WireSeq};
@@ -43,7 +43,7 @@ const BODY_LEN: usize = 395;
 /// inside one 1024-slot batch — while staying under the stage's
 /// per-response body bound.
 const FRAME_LEN: usize = 4 + 1 + BODY_LEN;
-const _: () = assert!(BODY_LEN <= melin_server_runtime::MAX_RESPONSE_BODY);
+const _: () = assert!(BODY_LEN <= crate::MAX_RESPONSE_BODY);
 
 /// Enough slots to cross `MAX_SEND_BUF` in one batch several times
 /// over (400 × 400 B = 160 KiB), while fitting one ring/batch.
@@ -173,7 +173,7 @@ fn large_frame_batch_is_delivered_not_disconnected() {
     let config = Response::<PadApp> {
         journal_persisted_wire_seq: journal_cursor.clone(),
         policy: response::GatePolicy {
-            start: response::GateStart::settled(AckPolicy::Disk),
+            start: crate::durability_gate::GateStart::settled(AckPolicy::Disk),
             forced: melin_transport_core::lineage::forced_policy_cell().1,
         },
         replication_metrics: None,
@@ -189,6 +189,7 @@ fn large_frame_batch_is_delivered_not_disconnected() {
         ring_sizing: RingSizing::for_max_connections(1).expect("a supported cap"),
         ready: None,
         degraded_release: None,
+        pause_after_control_drain: None,
     };
 
     thread::scope(|scope| {

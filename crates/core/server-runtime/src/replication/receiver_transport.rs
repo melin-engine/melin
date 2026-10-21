@@ -20,9 +20,9 @@ use melin_pipeline::wait::WaitStrategy;
 use melin_transport_core::lineage::SharedLineagePolicy;
 use melin_transport_core::pipeline::{AdoptedRotation, InputSlot, StreamMark, StreamMarkQueue};
 use melin_transport_core::replication::protocol::{
-    Ack, InputBatchError, MAX_DATA_FRAME, PrimaryMessage, decode_primary_message,
-    try_decode_input_batch_into,
+    Ack, MAX_DATA_FRAME, PrimaryMessage, decode_primary_message,
 };
+use melin_transport_core::replication_wire::{InputBatchError, try_decode_input_batch_into};
 use melin_wire_protocol::framing::{PREFIX_LEN, split_frame_limited};
 
 use super::{PendingAckQueue, try_flush_dual_track};
@@ -1194,7 +1194,8 @@ mod tests {
     use melin_journal::JournalEvent;
     use melin_pipeline::ring::DisruptorBuilder;
     use melin_transport_core::pipeline::{InputSlot, RequestId};
-    use melin_transport_core::replication::protocol::{encode_heartbeat, encode_input_batch};
+    use melin_transport_core::replication::protocol::encode_heartbeat;
+    use melin_transport_core::replication_wire::encode_input_batch;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct TestEvent(u8);

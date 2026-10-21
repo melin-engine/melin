@@ -1532,7 +1532,7 @@ fn load_replication_key(
 ///
 /// Control event for the response stage. The io_uring response path reads
 /// `fd` for I/O; the `writer` keeps the fd alive via ownership.
-pub use crate::ControlEvent;
+pub(crate) use crate::ControlEvent;
 
 /// Joinable handles for every long-lived thread a primary spawns,
 /// gathered as each one starts.

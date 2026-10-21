@@ -20,14 +20,14 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
+use crate::ControlEvent;
+use crate::ack_policy::AckPolicy;
+use crate::connection_limit::RingSizing;
+use crate::early_reply;
+use crate::response::{self, Response};
 use counter_server::{Counter, CounterQuery, CounterReport, KIND_RESP_ACK, ResponseEncoder};
 use melin_pipeline::ring::DisruptorBuilder;
 use melin_pipeline::wait::WaitStrategy;
-use melin_server_runtime::ControlEvent;
-use melin_server_runtime::ack_policy::AckPolicy;
-use melin_server_runtime::connection_limit::RingSizing;
-use melin_server_runtime::early_reply;
-use melin_server_runtime::response::{self, Response};
 use melin_transport_core::fence::FenceState;
 use melin_transport_core::pipeline::{OutputPayload, OutputSlot, StageUtilization};
 use melin_transport_core::{DurableWireSeqCursor, WireSeq};
@@ -85,7 +85,7 @@ fn config_for(journal_cursor: DurableWireSeqCursor) -> Response<Counter> {
     Response::<Counter> {
         journal_persisted_wire_seq: journal_cursor,
         policy: response::GatePolicy {
-            start: response::GateStart::settled(AckPolicy::Disk),
+            start: crate::durability_gate::GateStart::settled(AckPolicy::Disk),
             forced: melin_transport_core::lineage::forced_policy_cell().1,
         },
         replication_metrics: None,
@@ -101,6 +101,7 @@ fn config_for(journal_cursor: DurableWireSeqCursor) -> Response<Counter> {
         ring_sizing: RingSizing::for_max_connections(1).expect("a supported cap"),
         ready: None,
         degraded_release: None,
+        pause_after_control_drain: None,
     }
 }
 
