@@ -91,7 +91,7 @@ Severity is a judgement from code reading.
 | 38 | Filesystem edge cases in the journal | Low | Reported |
 | 39 | Archive bookkeeping edge cases | Low | Reported |
 | 40 | Races that cost a reconnect or a failed resync | Low | Reported |
-| 41 | The notary accepts trailing bytes after its head query | Low | Reported |
+| 41 | The notary accepts trailing bytes after its head query | Low | Reported (fixed) |
 
 Availability defects found on the way, and documentation that no longer
 matches the code, follow the findings.
@@ -1294,6 +1294,10 @@ every build.
 41. **The notary accepts trailing bytes after its head query.** Its decoder
     maps `[0x11, anything]` to the head query. It is never journaled, but a
     malformed request is answered rather than refused. Reported.
+    **Status: fixed.** Both the request decoder and `NotaryEvent::decode`
+    refuse a head query with any byte after its kind. Pinned by
+    `decoder_rejects_trailing_bytes_after_the_head_query` and
+    `event_decode_rejects_trailing_bytes_after_the_head_query`.
 
 ## Availability defects found on the way
 

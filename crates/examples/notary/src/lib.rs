@@ -155,7 +155,11 @@ impl AppEvent for NotaryEvent {
             KIND_NOTARIZE => Ok(NotaryEvent::Notarize {
                 leaf: leaf_from(rest)?,
             }),
-            KIND_GET_HEAD => Ok(NotaryEvent::GetHead),
+            // The head query has no fields: a trailing byte means the
+            // sender's encoding is not this one, so it is refused rather
+            // than read as a query.
+            KIND_GET_HEAD if rest.is_empty() => Ok(NotaryEvent::GetHead),
+            KIND_GET_HEAD => Err(CodecError::InvalidField),
             kind => Err(CodecError::UnknownTag(kind)),
         }
     }
@@ -411,7 +415,8 @@ impl RequestDecoderTrait for RequestDecoder {
                 }
             }
             // Queries are readable by every authenticated role.
-            KIND_GET_HEAD => Decoded::Permitted(NotaryEvent::GetHead),
+            KIND_GET_HEAD if fields.is_empty() => Decoded::Permitted(NotaryEvent::GetHead),
+            KIND_GET_HEAD => Decoded::DecodeError("the head query has no fields"),
             _ => Decoded::DecodeError("unknown kind"),
         }
     }
@@ -568,6 +573,14 @@ mod tests {
             "an over-long leaf must be refused, not truncated — truncating \
              would commit to something the client did not send"
         );
+    }
+
+    #[test]
+    fn event_decode_rejects_trailing_bytes_after_the_head_query() {
+        assert!(matches!(
+            NotaryEvent::decode(&[KIND_GET_HEAD, 0]),
+            Err(CodecError::InvalidField)
+        ));
     }
 
     #[test]
@@ -793,6 +806,20 @@ mod tests {
                 RequestDecoder.decode(&[KIND_GET_HEAD], role),
                 Decoded::Permitted(NotaryEvent::GetHead)
             ));
+        }
+    }
+
+    #[test]
+    fn decoder_rejects_trailing_bytes_after_the_head_query() {
+        for fields in [vec![0u8], vec![0u8; LEAF_LEN]] {
+            assert!(
+                matches!(
+                    RequestDecoder.decode(&request(KIND_GET_HEAD, &fields), ClientRole::Operator),
+                    Decoded::DecodeError(_)
+                ),
+                "{} trailing bytes",
+                fields.len()
+            );
         }
     }
 

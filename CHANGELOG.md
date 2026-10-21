@@ -297,6 +297,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Fixed
 
+- **The notary example refuses a head query with trailing bytes**
+  (finding 41 of the determinism audit). It used to answer one as a head
+  query; it now answers it as a malformed request.
 - **A snapshot deferred under load is retried, not skipped for an
   interval.** The shadow stage saves only at a journal fsync boundary,
   and tried once per `--snapshot-interval-ms`: under sustained load it
