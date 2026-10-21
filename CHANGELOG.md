@@ -297,6 +297,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Fixed
 
+- **A journal write interrupted by a signal is retried** (part of
+  finding 38 of the determinism audit). It used to fail with `EINTR`,
+  as a journal I/O error.
 - **A snapshot deferred under load is retried, not skipped for an
   interval.** The shadow stage saves only at a journal fsync boundary,
   and tried once per `--snapshot-interval-ms`: under sustained load it

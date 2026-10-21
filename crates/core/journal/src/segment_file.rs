@@ -527,6 +527,10 @@ fn fallocate_chunk(file: &File, from: u64) -> Result<u64, JournalError> {
 /// wrong would silently duplicate or skip journal bytes, which is why
 /// the write call is a parameter: the test drives this loop with a
 /// writer that deliberately writes only a few bytes at a time.
+///
+/// A write interrupted by a signal before writing anything (`EINTR`) is
+/// retried, as std's `write_all_at` does: nothing was written, so the
+/// journal is unchanged and failing it would halt the node for a signal.
 fn write_all_vectored_at(
     bufs: &mut [IoSlice<'_>],
     offset: u64,
@@ -535,7 +539,11 @@ fn write_all_vectored_at(
     let mut remaining = &mut *bufs;
     let mut offset = offset;
     while !remaining.is_empty() {
-        let n = write(remaining, offset).map_err(JournalError::Io)?;
+        let n = match write(remaining, offset) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(JournalError::Io(e)),
+        };
         if n == 0 {
             return Err(JournalError::Io(std::io::Error::new(
                 std::io::ErrorKind::WriteZero,
@@ -548,25 +556,11 @@ fn write_all_vectored_at(
     Ok(())
 }
 
-/// Write `buf` in full at `offset`, retrying short writes. `pwrite`
-/// can return fewer bytes than requested on signal interruption or
-/// when the kernel decides to split a large write; we loop until the
-/// whole buffer is on its way.
+/// Write `buf` in full at `offset`. std's `write_all_at` resumes short
+/// writes and retries `EINTR`, and fails with `WriteZero` on a write
+/// that accepts nothing.
 fn write_all_at(file: &File, buf: &[u8], offset: u64) -> Result<(), JournalError> {
-    let mut written = 0;
-    while written < buf.len() {
-        let n = file
-            .write_at(&buf[written..], offset + written as u64)
-            .map_err(JournalError::Io)?;
-        if n == 0 {
-            return Err(JournalError::Io(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "buffered journal write returned 0",
-            )));
-        }
-        written += n;
-    }
-    Ok(())
+    file.write_all_at(buf, offset).map_err(JournalError::Io)
 }
 
 #[cfg(test)]
@@ -779,6 +773,50 @@ mod tests {
         let err = write_all_vectored_at(&mut bufs, 0, |_, _| Ok(0))
             .expect_err("a zero-byte write must not loop forever");
         assert!(err.to_string().contains("returned 0"), "got: {err}");
+    }
+
+    /// A write interrupted by a signal wrote nothing, so it is retried
+    /// rather than failed: failing it would halt the node for a signal.
+    /// Interrupted before the first byte and again mid-run, so the retry
+    /// resumes from wherever the previous write left off.
+    #[test]
+    fn an_interrupted_vectored_write_is_retried() {
+        let parts: [&[u8]; 2] = [b"alpha", b"bravo"];
+        let mut bufs: Vec<IoSlice<'_>> = parts.iter().map(|p| IoSlice::new(p)).collect();
+        let mut sink = Vec::new();
+        let mut calls = 0usize;
+
+        write_all_vectored_at(&mut bufs, 0, |slices, offset| {
+            calls += 1;
+            if calls == 1 || calls == 3 {
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            assert_eq!(offset as usize, sink.len());
+            // Accept one slice per call, so the run takes two writes.
+            sink.extend_from_slice(&slices[0]);
+            Ok(slices[0].len())
+        })
+        .expect("an interrupted write must be retried");
+
+        assert_eq!(sink, parts.concat());
+        assert_eq!(calls, 4);
+    }
+
+    /// Any other error still fails the write: only `EINTR` means nothing
+    /// happened.
+    #[test]
+    fn a_vectored_write_error_other_than_eintr_fails() {
+        let mut bufs = [IoSlice::new(b"data")];
+        let err = write_all_vectored_at(&mut bufs, 0, |_, _| {
+            Err(std::io::Error::from_raw_os_error(
+                rustix::io::Errno::NOSPC.raw_os_error(),
+            ))
+        })
+        .expect_err("ENOSPC must not be retried");
+        assert!(
+            matches!(&err, JournalError::Io(e) if e.raw_os_error() == Some(rustix::io::Errno::NOSPC.raw_os_error())),
+            "got: {err}"
+        );
     }
 
     /// Batches written vectored must land as the plain concatenation —

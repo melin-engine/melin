@@ -88,7 +88,7 @@ Severity is a judgement from code reading.
 | 35 | Shadow snapshots can slip by an interval under load | Low | Reported |
 | 36 | The mark barrier aliases released ring slots, and `RingBuffer` is too loosely `Sync` | Low | Reported |
 | 37 | Journal invariants are checked only in debug builds | Low | Confirmed in part (sequence checks fixed) |
-| 38 | Filesystem edge cases in the journal | Low | Reported |
+| 38 | Filesystem edge cases in the journal | Low | Reported (partially fixed: segment writes retry `EINTR`) |
 | 39 | Archive bookkeeping edge cases | Low | Reported |
 | 40 | Races that cost a reconnect or a failed resync | Low | Reported |
 | 41 | The notary accepts trailing bytes after its head query | Low | Reported |
@@ -1281,6 +1281,11 @@ every build.
     headerless live file that blocks boot, a case `install_prepared` avoids
     and `install_fresh`, snapshot-only boot and missing-live synthesis do
     not. Segment writes do not retry `EINTR`. Reported.
+    **Status: partially fixed.** Segment writes retry `EINTR`: the
+    vectored loop retries an interrupted `pwritev`, and the single-buffer
+    path uses std's `write_all_at`, which does. Pinned by
+    `an_interrupted_vectored_write_is_retried`. The rest of the finding
+    is open.
 39. **Archive bookkeeping edge cases.** Archive numbering restarts at
     `.000001` after local archives are trimmed, and diverges from the
     primary's after a resync, although the docs promise matching numbering.
