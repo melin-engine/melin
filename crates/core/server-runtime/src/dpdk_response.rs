@@ -896,12 +896,14 @@ mod tests {
     }
 
     /// A heartbeat that finds its TX ring full is retried on the next
-    /// scan, and the connection stays registered: the stage cannot close
-    /// the socket, so dropping it would leave the client connected with
-    /// every later reply discarded. Its `max_connections` permit is
-    /// released only by the poll thread's `Disconnected`.
+    /// scan, and every connection on that ring stays registered: the stage
+    /// cannot close the socket, so dropping one would leave the client
+    /// connected with every later reply discarded, and a full ring says
+    /// nothing about the other connections sharing it. Each connection's
+    /// `max_connections` permit is released only by the poll thread's
+    /// `Disconnected`.
     #[test]
-    fn a_heartbeat_on_a_full_tx_ring_is_retried_and_keeps_the_connection() {
+    fn a_heartbeat_on_a_full_tx_ring_is_retried_and_keeps_the_connections() {
         let counter = AtomicU64::new(0);
         let (control_tx, control_rx) = mpsc::channel();
         let mut connections = FxHashMap::default();
@@ -909,10 +911,12 @@ mod tests {
         let start = Instant::now();
         let heartbeat = [0xAB; 5];
 
-        counter.fetch_add(1, Ordering::Relaxed);
-        control_tx
-            .send(ControlEvent::Connected { connection_id: 7 })
-            .unwrap();
+        for connection_id in [7, 8] {
+            counter.fetch_add(1, Ordering::Relaxed);
+            control_tx
+                .send(ControlEvent::Connected { connection_id })
+                .unwrap();
+        }
         process_control_events(&control_rx, &mut connections, &counter, || start);
 
         let (tx, mut rx) = spsc::channel::<TxFrame>(8, WaitStrategy::SpinThenYield);
@@ -922,16 +926,15 @@ mod tests {
             filler += 1;
         }
 
-        // Due, but the ring is full: nothing is queued, nothing changes.
+        // Due, but the ring is full: both fail, both stay due and registered.
         let due = start + interval;
         send_due_heartbeats(&mut connections, &mut producers, &heartbeat, due, interval);
-        assert_eq!(
-            connections[&7].last_send, start,
-            "a failed heartbeat is still due"
-        );
-        assert_eq!(counter.load(Ordering::Relaxed), 1);
+        assert_eq!(connections[&7].last_send, start, "still due");
+        assert_eq!(connections[&8].last_send, start, "still due");
+        assert_eq!(counter.load(Ordering::Relaxed), 2);
 
-        // The poll thread drains the ring; the next scan sends it.
+        // The poll thread drains the ring; the next scan sends one heartbeat
+        // to each connection, and nothing more.
         for _ in 0..filler {
             rx.try_consume().expect("filler frame");
         }
@@ -943,14 +946,35 @@ mod tests {
             later,
             interval,
         );
-        let (_, frame) = rx.try_consume().expect("the retried heartbeat");
-        assert_eq!(frame.connection_id, 7);
-        assert_eq!(frame.as_bytes(), heartbeat);
+        let mut sent = Vec::new();
+        while let Some((_, frame)) = rx.try_consume() {
+            assert_eq!(frame.as_bytes(), heartbeat);
+            sent.push(frame.connection_id);
+        }
+        sent.sort_unstable();
+        assert_eq!(sent, [7, 8], "one heartbeat per connection, no duplicates");
         assert_eq!(connections[&7].last_send, later);
+        assert_eq!(connections[&8].last_send, later);
 
-        // Only the poll thread's close releases the permit.
+        // Sent just now, so not due again until a full interval has passed.
+        send_due_heartbeats(
+            &mut connections,
+            &mut producers,
+            &heartbeat,
+            later + std::time::Duration::from_millis(1),
+            interval,
+        );
+        assert!(rx.try_consume().is_none(), "not yet due: nothing queued");
+
+        // Only the poll thread's close releases a permit.
         control_tx
             .send(ControlEvent::Disconnected { connection_id: 7 })
+            .unwrap();
+        process_control_events(&control_rx, &mut connections, &counter, || later);
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+        assert!(connections.contains_key(&8));
+        control_tx
+            .send(ControlEvent::Disconnected { connection_id: 8 })
             .unwrap();
         process_control_events(&control_rx, &mut connections, &counter, || later);
         assert_eq!(counter.load(Ordering::Relaxed), 0);
