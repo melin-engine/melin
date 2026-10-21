@@ -1,6 +1,6 @@
 # One response loop for both transports (plan, 2026-10)
 
-Status: plan, for review before any code.
+Status: plan, revised after one review, for review before any code.
 
 Paths are relative to `crates/core/server-runtime/src/`.
 
@@ -16,12 +16,19 @@ ordering rules the stage's correctness depends on:
 - the control channel is drained after the output ring is read, never
   before, so every slot's and early reply's `Connected` is seen;
 - early replies go out only between two events' replies;
-- a slot's reply is sent only once `gate.admit` has released it, and the
-  shutdown arm of the admit drops the slot's reply and the rest of the batch;
+- per slot: `gate.admit` first, then `boundary.handled`, then the send; a
+  slot's reply is sent only once the admit has released it;
+- `GateWait::before_wait` runs at most once per admit, before its first
+  wait, and `while_waiting` sends early replies only for a slot that is the
+  first of its event;
+- the admit's `Shutdown` arm drops the slot's reply and the rest of the
+  batch, and goes back to the top of the loop, which exits; it is safe only
+  because `wait_durable` read the flag itself (`durability_gate.rs`), so the
+  top of the loop exits before reading the ring again;
 - the consumer commits only after every slot of the batch cleared the gate,
   which is what the event publisher, chained behind it, relies on;
-- `gate.after_batch` runs after dispatch, and `gate.idle_recheck` on the
-  idle path.
+- after the commit, the kernel's `drop_overflowed`, then `gate.after_batch`;
+  `gate.idle_recheck` on the idle path.
 
 The DPDK copy keeps these by comments that say "see `response::run`". The
 copies have drifted: `transport-divergences-2026-10.md` lists three
@@ -33,6 +40,9 @@ rules, and a narrow trait for what really differs: where the bytes go.
 
 - Changing what either transport puts on the wire, or when, except in the
   steps marked as behaviour changes below, each its own commit.
+- Changing any log or stats text. Where the two stages name things
+  differently (trace stages, the gate's label), the egress supplies the
+  name, so the shared loop logs what each stage logs today.
 - Touching client ingress, replication or primary startup. The divergences
   listed there live in other code (see the last section).
 - A runtime choice of transport (`dyn`). The loop stays monomorphized per
@@ -45,10 +55,12 @@ rules, and a narrow trait for what really differs: where the bytes go.
    the kernel one *in place*, as its own small commit with its own test.
    The commits that move code into the shared loop are then purely
    structural.
-2. **Structural commits change no test.** In the commits that introduce and
-   adopt the shared loop, no test body changes. Only a `use` path changes,
-   and only where an item moved. A test that has to change in substance
-   means the commit changed behaviour, and is split out.
+2. **Structural commits change no test assertion.** In the commits that
+   introduce and adopt the shared loop, no test's assertions change. What
+   may change is a `use` path where an item moved, and the two test helpers
+   that build a `GateWaitHook` (below), whose callers do not change. A test
+   that has to change in substance means the commit changed behaviour, and
+   is split out.
 3. **Entry points stay put.** `response::run` and `dpdk_response::run` keep
    their signatures and become thin wrappers: build the transport's egress,
    run the shared loop. Every loop-level test, the `StageHarness` suites
@@ -67,24 +79,32 @@ rules, and a narrow trait for what really differs: where the bytes go.
 
 ## The seam
 
-What differs between the stages, and so becomes a trait method:
+What differs between the stages, and so belongs to the egress:
 
-| Hook | Kernel TCP (`response.rs`) | DPDK (`dpdk_response.rs`) |
+| Concern | Kernel TCP (`response.rs`) | DPDK (`dpdk_response.rs`) |
 |---|---|---|
 | Control event type, and draining it | `crate::ControlEvent`, with the socket writer; `Egress::drain_control` | `dpdk_response::ControlEvent`, ID only; `process_control_events` |
-| Is a connection known; stamp its last send | `ConnectionEntry` in `Egress::connections` | `ConnectionHeartbeat` in the map |
-| Deliver one slot's reply (payload + trailer) | `append_frames` into `send_buf`; overflow queued for removal | `push_frame` into the lane's TX ring |
-| After each slot | `Egress::flush_if_due` | flush the lane's ring |
-| Deliver an early reply | `Egress::release_early_replies` | `release_early_replies` |
-| Before a gate wait (`GateWait::before_wait`) | `Egress::flush` | nothing |
+| Deliver one slot's reply (payload + trailer) | `append_frames` into `send_buf`; overflow queued for removal | `push_frame` into the connection's lane, then that lane's `flush` |
+| Stamp `last_send` | inside `append_frames`, only when bytes were appended without overflow | after every slot to a known connection, even when `push_frame` pushed nothing |
+| After every slot, known connection or not | `Egress::flush_if_due` | nothing (the lane was flushed in the send) |
+| Server end-to-end sample | queued after a clean append of a request's last slot, closed at the next flush | recorded right after the lane flush, for a request's last slot |
+| Deliver early replies | `Egress::release_early_replies` (appends; can overflow) | `release_early_replies` (one TX frame each) |
+| Before a gate wait | `Egress::flush` | nothing |
 | After early replies sent during a wait | `drop_overflowed`, then `flush` | nothing |
 | Idle, after early replies | `drop_overflowed`, then `flush` | nothing |
 | Heartbeat to a due connection | skip if blocked or over `MAX_SEND_BUF`; append, flush, tear down failures | `try_publish`; on a full ring, keep it due and record the stall |
-| End of a batch, after commit | `drop_overflowed` | nothing |
-| Shutdown | best-effort flush unless fenced | nothing |
-| Server end-to-end latency sample | queued at append, closed at flush | recorded at push |
-| Idle stats flush | its egress recorder as well | none of its own |
-| Startup | io_uring setup, then the ready signal | none |
+| After the commit | `drop_overflowed` | nothing |
+| Idle stats flush | `server_e2e_rec`, and `egress_rec` under `tick-to-trade` | `server_e2e_rec` |
+| Shutdown | best-effort flush unless fenced (it holds the `FenceState`); `pipeline-stats` utilization print | nothing; no utilization print |
+| Names in logs and stats | gate label `"response"`; trace stages "socket write", "response flush" | gate label `"dpdk response"`; trace stages "SPSC publish", "response SPSC publish" |
+| Startup | io_uring setup, then the ready signal; returns whether it ran | none; returns `()` |
+
+Shared, and so in the loop: reading the ring, the control drain and the
+`pause_after_control_drain` test seam, the early-reply snapshot and boundary,
+the admit and its outcome, the miss's debug line and its connection-0
+exception, payload encoding and the trailer, the spsc-wakeup, dispatch,
+journal-wait, replica-wait and encode samples, the commit, `after_batch`,
+the idle housekeeping timer, `idle_recheck`, the utilization counters.
 
 A sketch of the trait (names open to review):
 
@@ -95,25 +115,40 @@ A sketch of the trait (names open to review):
 pub(crate) trait ResponseEgress {
     type Control;
 
+    /// The stage's name in the gate's log lines and the trace stages.
+    fn names() -> StageNames;
     fn drain_control(&mut self, rx: &mpsc::Receiver<Self::Control>);
-    fn send_slot(&mut self, connection_id: u64, payload: Option<Result<usize, &'static str>>,
-                 encode_buf: &[u8], trailer: &[u8], now: Instant) -> Sent;
+    /// One slot's frames to `slot`'s connection, if this egress holds it,
+    /// with its own `last_send` stamp and e2e sample. `Unknown` makes the
+    /// loop log the miss.
+    fn send_slot(&mut self, connection_id: u64, slot: SlotFrames<'_>,
+                 now: Instant, shutdown: &AtomicBool) -> Sent;
+    /// After every slot, sent or not.
     fn after_slot(&mut self);
     fn release_early_replies<R: Copy, Q: Copy>(&mut self, /* … */) -> usize;
     fn before_wait(&mut self);
     fn after_early_replies(&mut self);
     fn on_idle(&mut self);
     fn send_heartbeats(&mut self, frame: &[u8], now: Instant, interval: Duration);
-    fn after_batch(&mut self);
-    fn on_shutdown(&mut self, fenced: bool);
+    fn after_commit(&mut self);
+    fn flush_idle_stats(&mut self);
+    /// The kernel egress decides from its own fence state.
+    fn on_shutdown(&mut self);
 }
+
+/// What `send_slot` hands over: the encode result, the encode buffer, the
+/// trailer, and what the e2e sample needs (`recv_ts`,
+/// `is_last_in_request`).
+struct SlotFrames<'a> { /* … */ }
+
+enum Sent { Delivered, Unknown, /* step 5: */ Stopped }
 ```
 
-`Sent` says whether the connection was known, so the shared loop keeps the
-one "reply dropped: connection not registered" debug line and its
-connection-0 exception. The two `GateWaitHook`s become one, generic over the
-egress. Latency-trace and tick-to-trade hooks that only one side has stay
-inside that side's egress, under the same `cfg`s as today.
+The two `GateWaitHook`s become one, generic over the egress: it borrows
+`&mut E`, the `Registered` snapshot and `&Receiver<E::Control>` exactly as
+today's hooks do, and `admit` already takes `impl GateWait`. The latency
+recorders only one side has stay inside that side's egress, under the same
+`cfg`s as today.
 
 The shared loop goes in a new module, `response_loop.rs`, which owns the
 ordering comments now spread across both files. Each comment is written
@@ -121,7 +156,7 @@ once there, and the "see `response::run`" pointers go.
 
 ## Steps
 
-### Step 0: pin both stages before touching them
+### Step 0: pin both stages before touching them (tests only)
 
 Loop-level coverage today, by suite:
 
@@ -129,100 +164,134 @@ Loop-level coverage today, by suite:
   written against `StageHarness` and run on DPDK from
   `dpdk_response::tests::early_release` (the proptest included).
 - **On both stages, as two separate bodies:** the degraded release
-  (`degraded_release` in each file) and the change slot
-  (`a_change_slot_sends_nothing_and_a_forced_one_waits_for_its_entry` and
-  `a_change_slot_queues_no_frame_for_its_connection`).
+  (`degraded_release` in each file).
+- **Partly on both:** the change slot. Both stages pin that a change slot
+  sends nothing to its connection
+  (`a_change_slot_sends_nothing_and_a_forced_one_waits_for_its_entry`,
+  `a_change_slot_queues_no_frame_for_its_connection`); only the kernel test
+  also pins that a forced change waits for its own entry.
 - **On kernel TCP only:** `registration_race` (a reply that lands with its
   connection's `Connected`), `refusal_order` (a refusal is not released
   ahead of its connection) and `stop_while_gated` (a stopped or fenced stage
   leaves the gate and drops the held reply).
+- **The wait hook, per stage:** `response::tests::gate_wait_hook` and the
+  `gate_wait_hook_*` tests in `dpdk_response::tests::early_release`. Each
+  builds its hook in one helper (`one_turn`, `hook_turn`).
 - **io_uring-specific, stays kernel-only:** `startup_report` (a ring that
   cannot be created).
 
-Port the three kernel-only suites to `StageHarness`, so they run on both
-stages before either loop changes. `stop_while_gated`'s fenced case has no
-DPDK meaning (the DPDK stage has no flush to suppress) and keeps only its
-stopped case on DPDK. Fold the two-body suites into one `StageHarness` body
-each only if that is mechanical; otherwise leave them, since both already
-run.
+Extend the harness first:
 
-This step adds tests and changes no production code. A ported test that
-fails on DPDK has found a divergence: it is recorded in
-`transport-divergences-2026-10.md`, left out of the `dpdk` profile under the
-entry's name (the doc's existing rule), and fixed before step 3.
+- `StageInputs` gains the `pause_after_control_drain` seam, which both `run`
+  functions already accept and both `start_*` functions pass as `None`.
+  `registration_race` and `refusal_order` need it.
+- `StageHarness` gains a `stopped_within(Duration)` probe. `stop_while_gated`
+  catches a hang, so it polls the stage thread rather than joining it; the
+  harness's join on drop would hang on exactly the failure it looks for.
+
+Then port to `StageHarness`, so they run on both stages before either loop
+changes:
+
+- `registration_race`, `refusal_order` and `stop_while_gated`, as new
+  `StageHarness` bodies beside the kernel originals, which stay for this
+  change. `registration_race` asserts the reply's value through its socket
+  today (`new_value == 7`); the harness sees an application frame, not its
+  value, which still pins what the race is about (the reply arrives).
+  `stop_while_gated`'s fenced case has no DPDK meaning (the DPDK stage has
+  no flush to suppress) and keeps only its stopped case there.
+- the forced change waiting for its own entry, so the DPDK stage pins it
+  too.
+
+This step changes no production code. A ported test that fails on DPDK has
+found a divergence: it is recorded in `transport-divergences-2026-10.md`,
+left out of the `dpdk` profile under the entry's name (the doc's existing
+rule), and fixed before step 3.
 
 ### Step 1: bring the DPDK idle path in line (behaviour change, DPDK only)
 
-The DPDK idle path reads the clock on every iteration for the policy
-re-check. Its heartbeat timer also omits `past_spin_budget()`, which the
-kernel stage needs so the heartbeat scan is not stretched to minutes on a
-nearly saturated stage. Rework it, in place, into the kernel's shape:
-`IDLE_HOUSEKEEPING_INTERVAL` gates one clock read, which feeds the
-heartbeat scan's one-second cadence, `idle_recheck` and the stats flush.
-The constant moves to a place both stages import.
+Three changes to `dpdk_response::run`, in place, one commit each:
 
-Test: the idle-path cadence is not observable from outside except through
-heartbeats and `/healthz`. The existing heartbeat tests and the degraded
-release suite must stay green. A unit test pins the shared "is the scan
-due" rule both stages now use.
+1. **Housekeeping cadence.** Today the policy re-check reads the clock on
+   every idle iteration, and the heartbeat timer, `tick(1 s,
+   waiter.spinning())`, masks its read whenever the waiter is spinning, so
+   on a nearly saturated stage, which spins only briefly between batches,
+   the heartbeat scan can stretch to many seconds. Take the kernel's
+   shape: one `IDLE_HOUSEKEEPING_INTERVAL` timer, masked only when spinning
+   and past the spin budget, feeding a one-second heartbeat scan,
+   `idle_recheck` and the stats flush. `idle_recheck` is rate-limited
+   inside the gate, so its cadence does not change; only the clock reads
+   it costs do. The constant moves to a place both stages import.
+2. **`pipeline-stats` utilization print at shutdown**, which the kernel
+   stage has and DPDK lacks. A one-line commit, so step 3 adds nothing.
+3. **A shared `heartbeat_due(last_send, now, interval)`** free function,
+   which DPDK's scan calls. The kernel's `heartbeat_due` becomes that rule
+   plus its blocked-peer and buffer-cap guards, and its doc comment goes
+   back on it (it currently sits above `mark_dirty`).
+
+Tests: the existing heartbeat tests and the degraded-release suite stay
+green; a unit test pins the shared due rule and one pins the scan's
+due-ness from the housekeeping timer. The cadence change itself is not
+observable from outside except through heartbeat timing.
 
 Closes the divergence "DPDK idle path reads the clock every iteration".
 
 ### Step 2: the shared loop, kernel TCP on it
 
 Add `response_loop.rs` with `ResponseEgress` and the loop, a straight lift
-of `response::run`'s body. Implement the trait for the kernel `Egress`.
-`response::run` keeps its startup (io_uring, ready signal) and its
-signature, and calls the loop. DPDK is untouched.
+of `response::run`'s body. Implement the trait for the kernel `Egress`,
+which takes the `FenceState`. `response::run` keeps its startup (io_uring,
+ready signal), its signature and its return value, and calls the loop. DPDK
+is untouched.
 
-Structural: no test changes. Also add a test-only recording egress in
-`response_loop.rs`'s tests that logs every hook call. It pins the ordering
-rules above as a sequence (the drain after the read, `before_wait` before a
-held slot, `send_slot` only after admit, commit after the last slot,
-`after_batch` after commit), so they are stated in one place, independent
-of either transport.
+Structural. The only test change is `gate_wait_hook::one_turn`, which builds
+the hook: it builds the generic one, and the tests that call it do not
+change.
+
+Also add a test-only recording egress in `response_loop.rs`'s tests that
+logs every hook call. It pins the ordering rules above as a sequence (the
+drain after the read, `before_wait` once per held admit, `boundary.handled`
+before the send, `send_slot` only after the admit, `after_slot` for every
+slot, the commit after the last slot, `after_commit` before `after_batch`),
+so they are stated in one place, independent of either transport.
 
 ### Step 3: DPDK on the shared loop
 
-Implement `ResponseEgress` for the DPDK side. `dpdk_response::run` keeps its
+Implement `ResponseEgress` for the DPDK side. `send_slot` pushes and flushes
+the slot's lane, stamps `last_send` and records the e2e sample, as the loop
+does today; `after_slot` does nothing. `dpdk_response::run` keeps its
 signature and calls the loop. Its own loop and `GateWaitHook` go.
 
-Structural: no test changes. The DPDK `StageHarness` suites, the
-degraded-release suite, the change-slot test and the heartbeat tests all
-drive `dpdk_response::run` and must pass unchanged under the netns runner.
+Structural. The only test change is `early_release::hook_turn`, as in step
+2. The DPDK `StageHarness` suites, step 0's ports, the degraded-release
+suite, the change-slot test and the heartbeat tests all drive
+`dpdk_response::run` and must pass unchanged under the netns runner.
 
-Two small things the DPDK loop does differently today, decided here and not
-silently: it prints no utilization under `pipeline-stats` at shutdown (the
-kernel does; the shared loop will, for both), and it records the
-end-to-end sample at push rather than at flush (kept, through its egress
-hook).
+### Step 4: DPDK pushes observe shutdown (behaviour change, DPDK only)
 
-### Step 4: heartbeat scheduling in the shared loop
+Both DPDK pushes block in `push_with` until the TX ring has room and never
+check `shutdown`: the reply push in `send_slot`, and the early-reply push,
+which runs on the idle path and inside the gate's `while_waiting`. A wedged
+poll thread holds the stage past a shutdown request.
 
-The due rule (`now - last_send >= interval`) and the scan cadence move into
-the loop. The egress decides only how to deliver a due heartbeat and what a
-failure means: the kernel keeps its blocked-peer and buffer-cap guards and
-teardown, DPDK keeps its retry and stall reporting. Puts `heartbeat_due`'s
-doc comment back on `heartbeat_due` (it currently sits above `mark_dirty`).
-
-Tests: the kernel `heartbeat` unit tests and the DPDK heartbeat and stall
-tests stay, against their egress. One shared test pins the due rule.
-
-### Step 5: DPDK reply push observes shutdown (behaviour change, DPDK only)
-
-`push_frame` blocks in `push_with` until the TX ring has room and never
-checks `shutdown`, so a wedged poll thread holds the stage past a shutdown
-request. With the shared loop, `send_slot` can return a shutdown outcome
-the loop must handle: the loop treats it as the gate's `Shutdown` arm (the
-slot's reply and the rest of the batch are dropped, the batch is not
-committed). Making it a variant of `Sent` means no egress can block without
-the loop handling it.
+- `send_slot` already takes `shutdown`. The DPDK egress pushes with a wait
+  that checks it, and returns `Sent::Stopped` if it is set while the ring is
+  full. The loop treats `Stopped` as the exit: it **breaks to the shutdown
+  epilogue**, without committing and without going back to the top of the
+  loop. Going back would be wrong if an egress ever returned `Stopped`
+  with the flag clear: the loop would read the same uncommitted batch again
+  and resend every slot already delivered. The `Sent` variant gives an
+  egress a way to report a stop, not an obligation to check; the DPDK
+  egress is the one that must.
+- The early-reply release takes `shutdown` the same way and stops releasing
+  when it is set; the loop checks the flag after it and exits. Inside
+  `while_waiting`, the gate's own wait reads the flag on its next turn.
 
 Test: a DPDK stage whose TX ring is full and never drained returns from
-`run` after `shutdown` is set, through the `StageHarness` shape. Closes
-"DPDK reply push blocks without observing shutdown".
+`run` after `shutdown` is set, once with a reply pending and once with an
+early reply, through the `StageHarness` shape and its `stopped_within`
+probe. Closes "DPDK reply push blocks without observing shutdown".
 
-### Step 6: docs
+### Step 5: docs
 
 Update `transport-divergences-2026-10.md` for the entries closed, and move
 the "Deliberate differences" bullets on the response stage into the
@@ -245,12 +314,12 @@ hook should compile to the code it replaces. That is checked, not assumed:
 Response stage, which this plan touches:
 
 - **DPDK heartbeat SPSC-full drops the connection:** already fixed (finding
-  27). Step 4 keeps the fix, now as the DPDK egress's heartbeat delivery.
+  27). The fix stays in the DPDK egress's heartbeat delivery.
 - **DPDK reply push blocks without observing shutdown:** not fixed by the
-  merge alone. Step 5 fixes it, and the shared loop makes the fix a type:
-  a send that can give up on shutdown has to be handled by the loop.
+  merge alone. Step 4 fixes it, for the reply push and the early-reply
+  push both.
 - **DPDK idle path reads the clock every iteration:** fixed by step 1, and
-  kept fixed structurally after step 3, since there is one idle path.
+  kept fixed after step 3, since there is one idle path.
 - **Deliberate differences** (no flush cadence or pre-gate flush on DPDK,
   no fenced-shutdown flush, no buffer checks on DPDK heartbeats) stay, as
   the DPDK egress's no-op or simpler hooks instead of comments.
@@ -267,12 +336,17 @@ Not touched, because they are in other code:
   publisher. That one stops a node that has a publisher configured, and is
   worth fixing on its own, ahead of this plan.
 
+## After this plan
+
+A byte-level egress: the loop encodes early replies itself, with the shared
+`encode_early_reply`, and resolves an encode error once, handing the egress
+only bytes. That would fold the duplicated "early reply dropped" and
+"encode error" lines into the loop. It changes the `append_early_reply` and
+`push_frame` tests, so it is a follow-up after step 3, not part of it.
+
 ## Open questions for review
 
-- Trait name and module (`ResponseEgress` in `response_loop.rs`), and
-  whether `send_slot` takes the encoded payload or the encode result.
-- Whether step 0's ported tests replace the kernel-only originals or sit
-  beside them. Beside them is safer for this change; the originals can go
-  later.
-- Whether step 1 is wanted at all: it changes the DPDK idle path's clock
-  cadence, which the latency floor is measured through.
+- Trait name and module (`ResponseEgress` in `response_loop.rs`), and the
+  shape of `SlotFrames`.
+- Step 0's ported tests sit beside the kernel-only originals. Whether to
+  retire the originals afterwards.
