@@ -1,6 +1,6 @@
 # One response loop for both transports (plan, 2026-10)
 
-Status: plan, revised after six reviews, names, test retirement, the
+Status: plan, revised after seven reviews, names, test retirement, the
 shutdown check and the degraded-ack count decided.
 
 The seam table below describes the code as it is today, under today's
@@ -139,12 +139,15 @@ pub(crate) trait Egress {
     /// encodes the payload and builds the trailer), append or push them
     /// under the encode sample, stamp its own `last_send`. `Unknown` makes
     /// the loop log the miss; nothing is encoded for it and no trailer
-    /// built.
+    /// built. Called only for `Admission::Reply`: a change slot
+    /// (`Admission::GateOnly`) has no destination and is not offered to
+    /// the egress, so it is never logged as a miss, as today.
     fn send_slot<R: Copy, Q: Copy>(&mut self, connection_id: u64,
                                    reply: SlotReply<'_, R, Q>, now: Instant,
                                    /* step 4: */ shutdown: &AtomicBool)
                                    -> SlotOutcome;
-    /// After every slot, sent or not.
+    /// After every slot the loop finishes, sent or not (a reply, a miss, a
+    /// change slot); not after an exit.
     fn after_slot(&mut self);
     fn release_early_replies<R: Copy, Q: Copy>(&mut self, /* …, */
                                                /* step 4: */ shutdown: &AtomicBool)
@@ -451,10 +454,16 @@ Structural. Besides the rename, the test changes are:
 - `early_drain::drain_burst` calls `release_early_replies`, which becomes a
   trait method, so the module gains a `use` of the trait.
 
-One test is added beside the recording egress, against the real
-`UringEgress`, because the fake cannot exercise it: a last slot backed by
-the primary alone whose append overflows `MAX_SEND_BUF` returns `Known`,
-so the loop still counts its degraded ack and logs no miss.
+One test is added against the real `UringEgress`, because the recording
+egress is a fake and cannot exercise it: a last slot whose append
+overflows `MAX_SEND_BUF` returns `Known`, with the connection queued for
+removal. It lives in `response.rs`'s tests beside `early_drain`, building
+its egress as `early_drain::egress_over` does (a real `IoUring`, which
+runs ungated today) and its connection with `flush_sends::entry_for`,
+since both are private to that module. It asserts only what the egress
+can show; that a `Known` last slot backed by the primary alone counts one
+degraded ack and logs no miss is the loop's part, pinned by the recording
+egress.
 
 Also add a test-only recording egress in `response_loop.rs`'s tests that
 logs every hook call. It pins the ordering rules above as a sequence: the
@@ -523,9 +532,13 @@ poll thread holds the stage past a shutdown request.
   `Stopped`, and `push_with` passes a source that never stops, whose error
   is `Infallible`. So `push_with` is `let Ok(seq) = …;`, with no
   impossible error to discard (CLAUDE.md rules out `unwrap`, `let _` and an
-  `unreachable!` there alike), and the compiler proves the never-stopping
-  source costs nothing: its check is a constant `false`, folded away, so
-  `push_with`'s hot path is as today. Unit tests: it pushes when there is
+  `unreachable!` there alike). That type is the reason for the shape:
+  speed is not at stake, since the stop check sits after the room check
+  and a push with room never reaches it, whatever the source; an
+  `Option<&AtomicBool>` would cost the same, but leave `push_with` an
+  impossible `Err` to discard. The stop-source trait stays private to
+  `spsc.rs`: `push_with_unless(f, &AtomicBool)` is the only new public
+  method. Unit tests: it pushes when there is
   room, even with the flag set; it waits while the ring is full; it returns
   `Stopped`, having written nothing, when the flag is set while it waits;
   `push_with`'s own tests stay as they are. Both
@@ -533,10 +546,11 @@ poll thread holds the stage past a shutdown request.
   caller.
 - **The `shutdown` parameter arrives here**, on `send_slot` and
   `release_early_replies` together, as `SlotOutcome::Stopped` does, so steps 2 and
-  3 stay structural. Three test helpers that call them directly gain the
-  argument, a signature-only edit with no assertion changed:
+  3 stay structural. Four tests that call them directly gain the argument,
+  a signature-only edit with no assertion changed: the helpers
   `gate_wait_hook::one_turn`, `early_release::hook_turn` (through the
-  generic hook) and `early_drain::drain_burst`.
+  generic hook) and `early_drain::drain_burst`, and step 2's `UringEgress`
+  overflow test, which calls `send_slot`.
 - **The reply push.** `send_slot` returns `SlotOutcome::Stopped` when the
   push was stopped. Step 2's single exit handles it: the loop breaks to the
   epilogue, without committing and without reading the ring again. The
@@ -672,8 +686,12 @@ Not touched, because they are in other code:
   A reader can see the fence and not yet `shutdown`, so a wait that
   follows a fenced check is not guaranteed to see the shutdown on its first
   turn, and a slot that becomes durable meanwhile is admitted, appended and
-  flushed by the between-slot triggers. A fix built on reading the fence
-  must say which flag it reads where, and what it relies on the other for.
+  flushed by the between-slot triggers. The reverse direction is not
+  guaranteed either: the stages load `shutdown` with relaxed ordering,
+  which does not pair with that release store, so a stage that has seen
+  `shutdown` is not guaranteed to see the fence (the next item). A fix
+  built on reading the fence must say which flag it reads where, and what
+  it relies on the other for.
 
   A per-slot check stops only what the stage has yet to send: on kernel
   TCP, replies an earlier slot's flush already handed to the kernel are
@@ -681,6 +699,26 @@ Not touched, because they are in other code:
 
   If it cannot, nothing changes: the batch in hand is legitimately
   acknowledged.
+- **The kernel stage's shutdown branch must see the fence (independent of
+  this plan; can land before it).** `fence_if_superseded` sets the fence,
+  then stores `shutdown` with release ordering, whose comment says it
+  "pairs with the Acquire/Relaxed shutdown polls in the stage loops". A
+  relaxed poll pairs with nothing, and the response stages' polls are
+  relaxed (the top of `response::run`'s loop, and `wait_durable`). So the
+  kernel stage's shutdown branch, which reads `shutdown` and then
+  `is_fenced()` to decide whether to do the best-effort flush, is not
+  guaranteed by the memory model to see the fence: a fenced node could do
+  the very flush the fence exists to suppress. Harmless on x86, whose
+  ordering is strong enough; a real gap on a weakly ordered CPU such as
+  ARM. The fix: the shutdown path reads `shutdown` with acquire ordering
+  before it reads the fence, whichever way it got there (the top's check,
+  or an admit that returned `Shutdown` after `wait_durable`'s relaxed
+  read), so the release store's fence is visible. One acquire load on the
+  shutdown path only, nothing on the hot path. Test: a unit test cannot
+  observe a missing barrier on x86, so the fix is argued from the memory
+  model, and the comment in `fence.rs` says which load pairs with its
+  store. With this plan, it is the shared loop's epilogue that does the
+  acquire read; before it, `response::run`'s shutdown branch.
 
 ## Open questions for review
 
