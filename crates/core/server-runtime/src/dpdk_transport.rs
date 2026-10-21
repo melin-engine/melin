@@ -59,7 +59,7 @@ use rand::RngExt;
 use melin_dpdk::SocketHandle;
 use tracing::{debug, warn};
 
-use crate::dpdk_response::{ControlEvent, TxFrame};
+use crate::dpdk_response::{ControlEvent, TxFrame, lane_connection_id};
 use crate::early_reply::EarlyReplySender;
 use crate::halt::HaltGate;
 use crate::policy_control::AckPolicyPublisher;
@@ -416,9 +416,7 @@ pub fn run_dpdk_poll<A: Application>(
                 continue;
             }
 
-            // Encode thread_id in bits 56..63 of connection_id for O(1)
-            // response routing. Bits 0..55 are the per-thread sequence.
-            let conn_id = ConnectionId((thread_id as u64) << 56 | next_connection_id);
+            let conn_id = ConnectionId(lane_connection_id(thread_id, next_connection_id));
             next_connection_id += 1;
 
             debug!(

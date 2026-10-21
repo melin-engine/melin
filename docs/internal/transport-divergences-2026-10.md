@@ -94,6 +94,20 @@ told to close the socket. As a result:
 
 io_uring calls `teardown_dropped`, which `shutdown(2)`s the socket.
 
+**Fixed** (finding 27 of the
+[determinism audit](determinism-audit-2026-09.md)): a heartbeat that finds
+the ring full is skipped and retried on the next scan, and the connection
+stays registered until the poll thread's `Disconnected`. Heartbeats are
+best effort, so there is nothing to close. Pinned by
+`a_heartbeat_on_a_full_tx_ring_is_retried_and_keeps_the_connections` in
+`dpdk_response.rs`. A lane whose heartbeats start finding the ring full
+logs a `warn!` when they start, once per heartbeat interval while they
+keep finding it full, and when they get through again or the lane has no
+connections left
+(`a_heartbeat_stall_is_reported_at_its_edges_and_while_it_lasts`,
+`a_stalled_lane_left_without_connections_closes_its_stall`), since a poll
+thread that falls behind otherwise leaves no trace.
+
 ### DPDK reply push blocks without observing shutdown
 
 `dpdk_response.rs`, `push_frame` uses `push_with`, which blocks until the TX
