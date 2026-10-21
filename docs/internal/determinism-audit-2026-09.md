@@ -1211,7 +1211,7 @@ every build.
     **Status: fixed.** A heartbeat that finds its TX ring full leaves the
     connection registered and still due, so the next scan retries it; only
     the poll thread's `Disconnected` removes a connection. Pinned by
-    `a_heartbeat_on_a_full_tx_ring_is_retried_and_keeps_the_connection`.
+    `a_heartbeat_on_a_full_tx_ring_is_retried_and_keeps_the_connections`.
 28. **A half-open replica slot can count one replica twice.** A dead
     connection keeps its slot active with frozen acks while the same host
     reconnects on the other slot, so `two-disks` can be satisfied by one

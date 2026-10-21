@@ -213,6 +213,7 @@ pub fn run<A: Application>(
     // the clock every ~1 M idle iterations while spinning; heartbeat
     // interval is seconds, so this is plenty.
     let mut heartbeat_timer = AmortizedTimer::new();
+    let mut heartbeat_stalls = HeartbeatStalls::new(tx_producers.len());
     let mut waiter = wait.waiter();
     let mut busy_count: u64 = 0;
     let mut idle_count: u64 = 0;
@@ -320,13 +321,16 @@ pub fn run<A: Application>(
                     .tick(Duration::from_secs(1), waiter.spinning())
                     .is_some()
             {
+                let now = Instant::now();
                 send_due_heartbeats(
                     &mut connections,
                     &mut tx_producers,
                     &heartbeat_frame[..heartbeat_len],
-                    Instant::now(),
+                    now,
                     interval,
+                    &mut heartbeat_stalls,
                 );
+                heartbeat_stalls.finish_scan(now, interval, log_stall_change);
             }
 
             // Re-evaluate the policy on a slow timer so the
@@ -744,7 +748,7 @@ fn process_control_events(
 }
 
 /// Queue a heartbeat for every connection that has had nothing sent for
-/// `interval`.
+/// `interval`, recording in `stalls` which lanes' rings took them.
 ///
 /// A connection whose TX ring is full (its poll thread fell behind) keeps
 /// its entry and its `last_send`, so the next scan retries it. Dropping
@@ -758,9 +762,12 @@ fn send_due_heartbeats(
     heartbeat: &[u8],
     now: Instant,
     interval: Duration,
+    stalls: &mut HeartbeatStalls,
 ) {
     for (&conn_id, state) in connections.iter_mut() {
+        let tid = tx_lane(conn_id, tx_producers.len());
         if now.duration_since(state.last_send) < interval {
+            stalls.record(tid, Heartbeat::NotDue);
             continue;
         }
         let mut frame = TxFrame {
@@ -770,10 +777,207 @@ fn send_due_heartbeats(
             ..Default::default()
         };
         frame.data[..heartbeat.len()].copy_from_slice(heartbeat);
-        let tid = tx_lane(conn_id, tx_producers.len());
         if tx_producers[tid].try_publish(frame).is_ok() {
             state.last_send = now;
+            stalls.record(tid, Heartbeat::Sent);
+        } else {
+            stalls.record(tid, Heartbeat::Skipped);
         }
+    }
+}
+
+/// Per TX lane, whether its heartbeats are being skipped on a full ring,
+/// so that a stall is logged when it starts, once per heartbeat interval
+/// while it lasts, and when it ends, rather than on every scan. The scan
+/// runs only while the stage is idle, so a ring found full there is one
+/// the lane's poll thread is behind on: every idle client on that thread
+/// stops hearing from the node, and nothing else in the log says so.
+struct HeartbeatStalls {
+    /// Indexed by `tx_lane`. A `Vec` because the lane count is set at
+    /// startup; it holds one entry per poll thread, touched once per
+    /// connection per heartbeat scan, off the reply path.
+    lanes: Vec<LaneHeartbeats>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct LaneHeartbeats {
+    /// The stall in progress, if any.
+    stall: Option<Stall>,
+    /// This scan's connections on the lane, and of them the heartbeats
+    /// queued and skipped. `usize`: bounded by the connection count, like
+    /// the map they come from.
+    connections: usize,
+    sent: usize,
+    skipped: usize,
+}
+
+#[derive(Clone, Copy)]
+struct Stall {
+    since: Instant,
+    last_report: Instant,
+    /// Heartbeats skipped since `since`, retries included.
+    skipped: usize,
+}
+
+/// What one connection's heartbeat did in a scan.
+#[derive(Clone, Copy)]
+enum Heartbeat {
+    NotDue,
+    Sent,
+    Skipped,
+}
+
+/// A change in a lane's stall, for the log.
+#[derive(Debug, PartialEq, Eq)]
+enum StallChange {
+    /// The scan skipped `skipped` heartbeats on a lane that was not
+    /// stalled.
+    Started { skipped: usize },
+    /// The scan still skipped heartbeats on a lane stalled for
+    /// `stalled_for`, a heartbeat interval or more after the last report.
+    Continuing {
+        skipped: usize,
+        stalled_for: Duration,
+    },
+    /// The scan queued every heartbeat due on a stalled lane.
+    Ended {
+        skipped: usize,
+        stalled_for: Duration,
+    },
+    /// A stalled lane has no connections left, so nothing shows whether
+    /// its ring drained.
+    Emptied {
+        skipped: usize,
+        stalled_for: Duration,
+    },
+}
+
+impl HeartbeatStalls {
+    fn new(lanes: usize) -> Self {
+        HeartbeatStalls {
+            lanes: vec![LaneHeartbeats::default(); lanes],
+        }
+    }
+
+    fn record(&mut self, lane: usize, heartbeat: Heartbeat) {
+        let lane = &mut self.lanes[lane];
+        lane.connections += 1;
+        match heartbeat {
+            Heartbeat::NotDue => {}
+            Heartbeat::Sent => lane.sent += 1,
+            Heartbeat::Skipped => lane.skipped += 1,
+        }
+    }
+
+    /// Close the scan made at `now`: hand `report` each lane whose stall
+    /// began, ended, or has gone unreported for `report_every` in it, and
+    /// reset the counts for the next. A lane with connections but nothing
+    /// due keeps its state, having shown neither.
+    fn finish_scan(
+        &mut self,
+        now: Instant,
+        report_every: Duration,
+        mut report: impl FnMut(usize, StallChange),
+    ) {
+        for (index, lane) in self.lanes.iter_mut().enumerate() {
+            match lane.stall.as_mut() {
+                None if lane.skipped > 0 => {
+                    lane.stall = Some(Stall {
+                        since: now,
+                        last_report: now,
+                        skipped: lane.skipped,
+                    });
+                    report(
+                        index,
+                        StallChange::Started {
+                            skipped: lane.skipped,
+                        },
+                    );
+                }
+                None => {}
+                Some(stall) => {
+                    stall.skipped += lane.skipped;
+                    let skipped = stall.skipped;
+                    let stalled_for = now.duration_since(stall.since);
+                    if lane.connections == 0 {
+                        lane.stall = None;
+                        report(
+                            index,
+                            StallChange::Emptied {
+                                skipped,
+                                stalled_for,
+                            },
+                        );
+                    } else if lane.skipped == 0 && lane.sent > 0 {
+                        lane.stall = None;
+                        report(
+                            index,
+                            StallChange::Ended {
+                                skipped,
+                                stalled_for,
+                            },
+                        );
+                    } else if lane.skipped > 0
+                        && now.duration_since(stall.last_report) >= report_every
+                    {
+                        stall.last_report = now;
+                        report(
+                            index,
+                            StallChange::Continuing {
+                                skipped,
+                                stalled_for,
+                            },
+                        );
+                    }
+                }
+            }
+            lane.connections = 0;
+            lane.sent = 0;
+            lane.skipped = 0;
+        }
+    }
+}
+
+/// Log a lane's stall change at `warn`: degraded operation on the node's
+/// side, since the poll thread drains its ring whatever its clients do.
+/// The lane is the poll thread's `thread_id`, under which it logs.
+fn log_stall_change(thread_id: usize, change: StallChange) {
+    match change {
+        StallChange::Started { skipped } => tracing::warn!(
+            thread_id,
+            skipped,
+            "DPDK: a poll thread's TX ring was full at the heartbeat scan: heartbeats to its \
+             idle clients are held back and retried each scan until it catches up"
+        ),
+        StallChange::Continuing {
+            skipped,
+            stalled_for,
+        } => tracing::warn!(
+            thread_id,
+            skipped,
+            stalled_ms = stalled_for.as_millis() as u64,
+            "DPDK: a poll thread's TX ring is still full: heartbeats to its idle clients are \
+             still held back"
+        ),
+        StallChange::Ended {
+            skipped,
+            stalled_for,
+        } => tracing::warn!(
+            thread_id,
+            skipped,
+            stalled_ms = stalled_for.as_millis() as u64,
+            "DPDK: a poll thread's TX ring has room again: heartbeats to its idle clients resumed"
+        ),
+        StallChange::Emptied {
+            skipped,
+            stalled_for,
+        } => tracing::warn!(
+            thread_id,
+            skipped,
+            stalled_ms = stalled_for.as_millis() as u64,
+            "DPDK: a poll thread whose TX ring was full has no clients left: heartbeats no \
+             longer show whether it caught up"
+        ),
     }
 }
 
@@ -932,6 +1136,110 @@ mod tests {
         }
     }
 
+    /// How often the stall tests re-report a lasting stall.
+    const STALL_REPORT_EVERY: Duration = Duration::from_secs(5);
+
+    /// The stall changes the heartbeat scan made at `now` reports.
+    fn finish_scan(stalls: &mut HeartbeatStalls, now: Instant) -> Vec<(usize, StallChange)> {
+        let mut changes = Vec::new();
+        stalls.finish_scan(now, STALL_REPORT_EVERY, |lane, change| {
+            changes.push((lane, change))
+        });
+        changes
+    }
+
+    /// A lane's stall is reported when it starts, once per report interval
+    /// while scans keep skipping, and when a scan gets every due heartbeat
+    /// through; not on every scan. A scan that still skips some heartbeats
+    /// keeps it stalled even if others got through, and a scan with
+    /// nothing due on a lane says nothing about it either way. Each lane is
+    /// tracked on its own.
+    #[test]
+    fn a_heartbeat_stall_is_reported_at_its_edges_and_while_it_lasts() {
+        let start = Instant::now();
+        let at = |secs| start + Duration::from_secs(secs);
+        let mut stalls = HeartbeatStalls::new(2);
+
+        stalls.record(1, Heartbeat::Skipped);
+        stalls.record(1, Heartbeat::Skipped);
+        stalls.record(0, Heartbeat::Sent);
+        assert_eq!(
+            finish_scan(&mut stalls, at(0)),
+            [(1, StallChange::Started { skipped: 2 })]
+        );
+
+        // Still skipping some, within the report interval: no report.
+        stalls.record(1, Heartbeat::Sent);
+        stalls.record(1, Heartbeat::Skipped);
+        assert_eq!(finish_scan(&mut stalls, at(1)), []);
+
+        // Nothing due on the stalled lane: it stays stalled.
+        stalls.record(1, Heartbeat::NotDue);
+        stalls.record(0, Heartbeat::Sent);
+        assert_eq!(finish_scan(&mut stalls, at(2)), []);
+
+        // A report interval on, still skipping: reported again, with the
+        // total so far, and not again until the next interval.
+        stalls.record(1, Heartbeat::Skipped);
+        assert_eq!(
+            finish_scan(&mut stalls, at(5)),
+            [(
+                1,
+                StallChange::Continuing {
+                    skipped: 4,
+                    stalled_for: Duration::from_secs(5),
+                }
+            )]
+        );
+        stalls.record(1, Heartbeat::Skipped);
+        assert_eq!(finish_scan(&mut stalls, at(6)), []);
+
+        stalls.record(1, Heartbeat::Sent);
+        assert_eq!(
+            finish_scan(&mut stalls, at(7)),
+            [(
+                1,
+                StallChange::Ended {
+                    skipped: 5,
+                    stalled_for: Duration::from_secs(7),
+                }
+            )]
+        );
+
+        // Healthy again: sending is not news.
+        stalls.record(1, Heartbeat::Sent);
+        assert_eq!(finish_scan(&mut stalls, at(8)), []);
+    }
+
+    /// A stalled lane whose connections have all gone closes its stall
+    /// with a report of its own, rather than leaving it open until some
+    /// later connection on that lane first idles; a lane with no
+    /// connections that was never stalled says nothing.
+    #[test]
+    fn a_stalled_lane_left_without_connections_closes_its_stall() {
+        let start = Instant::now();
+        let mut stalls = HeartbeatStalls::new(2);
+
+        stalls.record(0, Heartbeat::Skipped);
+        assert_eq!(
+            finish_scan(&mut stalls, start),
+            [(0, StallChange::Started { skipped: 1 })]
+        );
+
+        let later = start + Duration::from_secs(1);
+        assert_eq!(
+            finish_scan(&mut stalls, later),
+            [(
+                0,
+                StallChange::Emptied {
+                    skipped: 1,
+                    stalled_for: Duration::from_secs(1),
+                }
+            )]
+        );
+        assert_eq!(finish_scan(&mut stalls, later), []);
+    }
+
     /// A heartbeat that finds its TX ring full is retried on the next
     /// scan, and every connection on that ring stays registered: the stage
     /// cannot close the socket, so dropping one would leave the client
@@ -963,15 +1271,29 @@ mod tests {
             filler += 1;
         }
 
-        // Due, but the ring is full: both fail, both stay due and registered.
+        let mut stalls = HeartbeatStalls::new(producers.len());
+
+        // Due, but the ring is full: both fail, both stay due and registered,
+        // and the lane's stall is reported once.
         let due = start + interval;
-        send_due_heartbeats(&mut connections, &mut producers, &heartbeat, due, interval);
+        send_due_heartbeats(
+            &mut connections,
+            &mut producers,
+            &heartbeat,
+            due,
+            interval,
+            &mut stalls,
+        );
         assert_eq!(connections[&7].last_send, start, "still due");
         assert_eq!(connections[&8].last_send, start, "still due");
         assert_eq!(counter.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            finish_scan(&mut stalls, due),
+            [(0, StallChange::Started { skipped: 2 })]
+        );
 
         // The poll thread drains the ring; the next scan sends one heartbeat
-        // to each connection, and nothing more.
+        // to each connection, and nothing more, and the stall is over.
         for _ in 0..filler {
             rx.try_consume().expect("filler frame");
         }
@@ -982,6 +1304,17 @@ mod tests {
             &heartbeat,
             later,
             interval,
+            &mut stalls,
+        );
+        assert_eq!(
+            finish_scan(&mut stalls, later),
+            [(
+                0,
+                StallChange::Ended {
+                    skipped: 2,
+                    stalled_for: later - due,
+                }
+            )]
         );
         let mut sent = Vec::new();
         while let Some((_, frame)) = rx.try_consume() {
@@ -994,14 +1327,17 @@ mod tests {
         assert_eq!(connections[&8].last_send, later);
 
         // Sent just now, so not due again until a full interval has passed.
+        let next = later + std::time::Duration::from_millis(1);
         send_due_heartbeats(
             &mut connections,
             &mut producers,
             &heartbeat,
-            later + std::time::Duration::from_millis(1),
+            next,
             interval,
+            &mut stalls,
         );
         assert!(rx.try_consume().is_none(), "not yet due: nothing queued");
+        assert_eq!(finish_scan(&mut stalls, next), []);
 
         // Only the poll thread's close releases a permit.
         control_tx
