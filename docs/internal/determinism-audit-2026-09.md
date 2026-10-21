@@ -85,7 +85,7 @@ Severity is a judgement from code reading.
 | 32 | Epoch uniqueness has holes | Low | Confirmed in part |
 | 33 | Divergence repair can hand a forked journal to a pending promotion | Low | Reported |
 | 34 | Two primaries can ack before the new epoch is visible | Low | Reported |
-| 35 | Shadow snapshots can slip by an interval under load | Low | Reported |
+| 35 | Shadow snapshots can slip by an interval under load | Low | Reported (fixed) |
 | 36 | The mark barrier aliases released ring slots, and `RingBuffer` is too loosely `Sync` | Low | Reported |
 | 37 | Journal invariants are checked only in debug builds | Low | Confirmed in part (sequence checks fixed) |
 | 38 | Filesystem edge cases in the journal | Low | Reported |
@@ -1249,6 +1249,16 @@ every build.
     (`shadow.rs:139-158`), so under sustained load a snapshot can wait a
     whole interval. The snapshot is never inconsistent, only stale.
     Reported.
+    **Status: fixed.** A due save stays due and is attempted on every
+    batch and idle pass until the shadow is at an fsync boundary, so a
+    deferred save lands at the next boundary, not the next interval. A
+    save still deferred when the next interval starts logs a warning, at
+    most once an interval; a failed save waits for the next interval.
+    What remains is by design: a shadow that never reaches a boundary
+    still takes no snapshot, but now says so every interval. Pinned by
+    the `schedule_*` unit tests, `deferred_save_lands_at_the_next_boundary_not_the_next_tick`
+    and `save_deferred_for_an_interval_warns_once_a_tick_and_still_lands`
+    in `shadow.rs`.
 36. **The mark barrier aliases released ring slots, and `RingBuffer` is
     too loosely `Sync`.** The mid-batch barrier keeps a live slice over
     slots it has already released to the producer (`pipeline.rs:1321-1351`);
