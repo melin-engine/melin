@@ -1,6 +1,9 @@
 # One response loop for both transports (plan, 2026-10)
 
-Status: plan, revised after one review, for review before any code.
+Status: plan, revised after one review, names and test retirement decided.
+
+The seam table below describes the code as it is today, under today's
+names; the kernel stage's `Egress` struct becomes `UringEgress` in step 2.
 
 Paths are relative to `crates/core/server-runtime/src/`.
 
@@ -106,22 +109,22 @@ exception, payload encoding and the trailer, the spsc-wakeup, dispatch,
 journal-wait, replica-wait and encode samples, the commit, `after_batch`,
 the idle housekeeping timer, `idle_recheck`, the utilization counters.
 
-A sketch of the trait (names open to review):
+A sketch of the trait:
 
 ```rust
 /// Where a response stage's frames go: the one part of the stage that
 /// differs by transport. Generic, never `dyn`: the loop is monomorphized
 /// per transport, so every hook inlines as the code it replaces.
-pub(crate) trait ResponseEgress {
+pub(crate) trait Egress {
     type Control;
 
     /// The stage's name in the gate's log lines and the trace stages.
     fn names() -> StageNames;
     fn drain_control(&mut self, rx: &mpsc::Receiver<Self::Control>);
-    /// One slot's frames to `slot`'s connection, if this egress holds it,
-    /// with its own `last_send` stamp and e2e sample. `Unknown` makes the
-    /// loop log the miss.
-    fn send_slot(&mut self, connection_id: u64, slot: SlotFrames<'_>,
+    /// One slot's reply to its connection, if this egress holds it, with
+    /// its own `last_send` stamp and e2e sample. `Unknown` makes the loop
+    /// log the miss.
+    fn send_slot(&mut self, connection_id: u64, reply: SlotReply<'_>,
                  now: Instant, shutdown: &AtomicBool) -> Sent;
     /// After every slot, sent or not.
     fn after_slot(&mut self);
@@ -139,10 +142,33 @@ pub(crate) trait ResponseEgress {
 /// What `send_slot` hands over: the encode result, the encode buffer, the
 /// trailer, and what the e2e sample needs (`recv_ts`,
 /// `is_last_in_request`).
-struct SlotFrames<'a> { /* … */ }
+struct SlotReply<'a> { /* … */ }
 
-enum Sent { Delivered, Unknown, /* step 5: */ Stopped }
+enum Sent { Delivered, Unknown, /* step 4: */ Stopped }
 ```
+
+Names, decided:
+
+- **`Egress`** for the trait, implemented by **`UringEgress`** (today's
+  kernel `Egress` struct, renamed) and **`DpdkEgress`** (new: the DPDK
+  stage's connection map, TX producers, heartbeat stall tracker and
+  connection counter, today loose locals in `dpdk_response::run`). The
+  symmetric pair says the two are interchangeable halves of one stage;
+  `ResponseEgress` beside a struct called `Egress` would have left the
+  kernel side looking like the default.
+- **`response_loop.rs`** for the loop, the trait and the generic
+  `GateWaitHook`. Putting the loop in `response.rs` would make it look
+  kernel-owned; turning `response/` into a directory with a file per
+  transport is tidier but moves both stage files, breaking their blame and
+  every test's `use` paths in one commit. That can follow later, once the
+  loop has settled.
+- **`SlotReply`** for `send_slot`'s argument, not the whole `OutputSlot`,
+  which would hand the egress the gate's inputs (`wire_seq`, the payload
+  kind) it has no business reading. It carries the encode result, not
+  resolved bytes, because each stage handles an encode error itself today
+  (log it, still send the terminator) with tests on it; resolving it once
+  in the loop is the follow-up under "After this plan". `recv_ts` is not
+  feature-gated on the slot, so `SlotReply` needs no `cfg` of its own.
 
 The two `GateWaitHook`s become one, generic over the egress: it borrows
 `&mut E`, the `Registered` snapshot and `&Receiver<E::Control>` exactly as
@@ -193,8 +219,8 @@ Then port to `StageHarness`, so they run on both stages before either loop
 changes:
 
 - `registration_race`, `refusal_order` and `stop_while_gated`, as new
-  `StageHarness` bodies beside the kernel originals, which stay for this
-  change. `registration_race` asserts the reply's value through its socket
+  `StageHarness` bodies beside the kernel originals, which stay until step
+  5. `registration_race` asserts the reply's value through its socket
   today (`new_value == 7`); the harness sees an application frame, not its
   value, which still pins what the race is about (the reply arrives).
   `stop_while_gated`'s fenced case has no DPDK meaning (the DPDK stage has
@@ -237,15 +263,21 @@ Closes the divergence "DPDK idle path reads the clock every iteration".
 
 ### Step 2: the shared loop, kernel TCP on it
 
-Add `response_loop.rs` with `ResponseEgress` and the loop, a straight lift
-of `response::run`'s body. Implement the trait for the kernel `Egress`,
-which takes the `FenceState`. `response::run` keeps its startup (io_uring,
-ready signal), its signature and its return value, and calls the loop. DPDK
-is untouched.
+Two commits.
 
-Structural. The only test change is `gate_wait_hook::one_turn`, which builds
-the hook: it builds the generic one, and the tests that call it do not
-change.
+1. **Rename** the kernel stage's `Egress` struct to `UringEgress`, and
+   nothing else, so the next commit's diff shows only the loop moving. The
+   tests that name it (`early_drain`, `gate_wait_hook`) change only the
+   identifier.
+2. **The loop.** Add `response_loop.rs` with the `Egress` trait and the
+   loop, a straight lift of `response::run`'s body. Implement the trait for
+   `UringEgress`, which takes the `FenceState`. `response::run` keeps its
+   startup (io_uring, ready signal), its signature and its return value,
+   and calls the loop. DPDK is untouched.
+
+Structural. Besides the rename, the only test change is
+`gate_wait_hook::one_turn`, which builds the hook: it builds the generic
+one, and the tests that call it do not change.
 
 Also add a test-only recording egress in `response_loop.rs`'s tests that
 logs every hook call. It pins the ordering rules above as a sequence (the
@@ -256,7 +288,8 @@ so they are stated in one place, independent of either transport.
 
 ### Step 3: DPDK on the shared loop
 
-Implement `ResponseEgress` for the DPDK side. `send_slot` pushes and flushes
+Gather the DPDK stage's egress state into `DpdkEgress` and implement
+`Egress` for it. `send_slot` pushes and flushes
 the slot's lane, stamps `last_send` and records the e2e sample, as the loop
 does today; `after_slot` does nothing. `dpdk_response::run` keeps its
 signature and calls the loop. Its own loop and `GateWaitHook` go.
@@ -291,7 +324,26 @@ Test: a DPDK stage whose TX ring is full and never drained returns from
 early reply, through the `StageHarness` shape and its `stopped_within`
 probe. Closes "DPDK reply push blocks without observing shutdown".
 
-### Step 5: docs
+### Step 5: retire the kernel-only originals (tests only)
+
+Through steps 1 to 4, the kernel-only originals are the strongest evidence
+that the structural steps are structural: they did not change. Once the
+refactor has landed, keeping them beside their step-0 ports is duplicated
+test logic, which drifts. Each original goes only if its port asserts at
+least everything it does on that transport:
+
+| Original | Decision |
+|---|---|
+| `refusal_order` | Retire: the port reads frames as `Seen`, as the original does. |
+| `stop_while_gated`, stopped case | Retire: the port covers it through `stopped_within`. |
+| `stop_while_gated`, fenced case | Keep, as a kernel-only test slimmed to that case: it has no DPDK meaning. |
+| `registration_race` | Retire, accepting the loss of its `new_value == 7` check: the race is about whether the reply arrives, which the port pins. |
+| The two change-slot tests | Fold into one `StageHarness` body, step 0's port of the forced half included, and retire both. |
+
+A separate commit from the refactor, so the history keeps "the loop moved"
+and "the tests were consolidated" apart.
+
+### Step 6: docs
 
 Update `transport-divergences-2026-10.md` for the entries closed, and move
 the "Deliberate differences" bullets on the response stage into the
@@ -346,7 +398,5 @@ only bytes. That would fold the duplicated "early reply dropped" and
 
 ## Open questions for review
 
-- Trait name and module (`ResponseEgress` in `response_loop.rs`), and the
-  shape of `SlotFrames`.
-- Step 0's ported tests sit beside the kernel-only originals. Whether to
-  retire the originals afterwards.
+None left: the names are under "The seam", and the originals' retirement
+is step 5.
