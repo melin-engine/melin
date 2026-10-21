@@ -296,7 +296,7 @@ impl DpdkDevice {
     /// After this call, `Device::receive()` returns `None` — the batch
     /// owns all received frames. Call `iface.poll()` after processing
     /// the batch for egress and maintenance (ingress will be a no-op).
-    pub fn collect_rx_batch(&mut self) -> RxBatch {
+    pub(crate) fn collect_rx_batch(&mut self) -> RxBatch {
         // Reuse pre-allocated buffers to avoid per-poll heap allocation.
         let mut mbufs = std::mem::take(&mut self.batch_mbufs);
         mbufs.clear();
@@ -431,7 +431,7 @@ impl DpdkDevice {
 
     /// Learned (source_mac, source_ip) pairs from incoming IPv4 frames.
     /// Drained by the transport to seed smoltcp's neighbor cache.
-    pub fn take_learned_neighbors(&mut self) -> Vec<([u8; 6], [u8; 4])> {
+    pub(crate) fn take_learned_neighbors(&mut self) -> Vec<([u8; 6], [u8; 4])> {
         std::mem::take(&mut self.learned_neighbors)
     }
 
@@ -816,7 +816,7 @@ fn screen_rx(policy: Option<&RxChecksumPolicy>, mbuf: *mut ffi::rte_mbuf, drops:
 /// Holds raw mbuf pointers (freed on drop) and injected frames. Frame
 /// data remains valid until the batch is dropped — callers can build
 /// `&[&[u8]]` slices for `Interface::poll_ingress_batch()`.
-pub struct RxBatch {
+pub(crate) struct RxBatch {
     /// NIC mbufs — data lives in hugepage memory until drop frees them.
     mbufs: Vec<*mut ffi::rte_mbuf>,
     /// Injected frames (ARP replies for neighbor seeding). Owned buffers.
@@ -828,28 +828,19 @@ unsafe impl Send for RxBatch {}
 
 impl RxBatch {
     /// Total number of frames (NIC + injected).
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.mbufs.len() + self.injected.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.mbufs.is_empty() && self.injected.is_empty()
-    }
-
-    /// Drain any newly injected frames from the device into this batch.
-    /// Used to include ARP replies seeded after `collect_rx_batch()` but
-    /// before `poll_ingress_batch()`, so smoltcp learns the neighbor
-    /// before processing the SYN in the same batch.
-    pub fn append_injected(&mut self, device: &mut DpdkDevice) {
-        self.injected.append(&mut device.inject_queue);
-    }
-
     /// Write frame slices into a caller-provided `MaybeUninit` array.
     /// Returns the number of slices written. Injected frames first (ARP),
-    /// then NIC frames. Zero heap allocation.
+    /// then NIC frames. Zero heap allocation. Test-only: the transport
+    /// ingests through [`Self::write_slices_with_handles`].
     ///
     /// # Safety
     /// The caller must ensure `out` has at least `self.len()` elements.
+    #[cfg(test)]
     pub fn write_slices<'a>(&'a self, out: &mut [std::mem::MaybeUninit<&'a [u8]>]) -> usize {
         let mut i = 0;
         for frame in &self.injected {
@@ -869,6 +860,18 @@ impl RxBatch {
             i += 1;
         }
         i
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.mbufs.is_empty() && self.injected.is_empty()
+    }
+
+    /// Drain any newly injected frames from the device into this batch.
+    /// Used to include ARP replies seeded after `collect_rx_batch()` but
+    /// before `poll_ingress_batch()`, so smoltcp learns the neighbor
+    /// before processing the SYN in the same batch.
+    pub fn append_injected(&mut self, device: &mut DpdkDevice) {
+        self.injected.append(&mut device.inject_queue);
     }
 
     /// Write (slice, handle) pairs for zero-copy ingress. Injected frames

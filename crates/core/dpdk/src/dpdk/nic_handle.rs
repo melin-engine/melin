@@ -31,7 +31,7 @@ use crate::nic::{
 };
 use crate::transport::{DpdkShared, DpdkTransport, MAX_CONNECTIONS, NodeEal};
 
-pub use crate::nic::{NextHop, NicClock};
+use crate::nic::{NextHop, NicClock};
 
 /// Tells handles apart, so that a [`StreamId`] is only honoured by the
 /// handle that dialed it. `u64`: one per handle opened in the process,
