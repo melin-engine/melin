@@ -502,9 +502,17 @@ pub fn run<A: Application>(
             // `BatchEndDegraded` as the slot is backed. Both are
             // transport-shaped and the same bytes every time but for the
             // request's ID, so they are encoded once at startup and the
-            // ID written in per request.
+            // ID written in per request. A degraded one counts for
+            // `melin_degraded_acks_total` here, after the lookup, as in
+            // `response::run`.
             let trailer: &[u8] = if slot.is_last_in_request {
-                gate.batch_end(backing, &mut batch_ends, slot.request_id)
+                match backing {
+                    Backing::Policy => {}
+                    Backing::PrimaryOnly => {
+                        utilization.degraded_acks.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                batch_ends.terminator(backing, slot.request_id)
             } else {
                 &[]
             };
