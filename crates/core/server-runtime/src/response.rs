@@ -26,7 +26,7 @@ use crate::batch_boundary::{AtBoundary, BatchBoundary};
 pub(crate) use crate::durability_gate::GatePolicy;
 use crate::durability_gate::{Admission, Backing, BatchEnds, DurabilityGate, GateInputs, GateWait};
 use crate::early_reply::{EarlyReply, EarlyReplyQueue, Registered};
-use crate::idle_housekeeping::IdleHousekeeping;
+use crate::idle_housekeeping::{self, IdleHousekeeping};
 use crate::replication::ReplicationMetrics;
 use melin_app::Application;
 use melin_transport_core::pipeline::{OutputSlot, StageUtilization};
@@ -1303,21 +1303,6 @@ enum AppendOutcome {
     ConnectionDropped,
 }
 
-/// Whether the idle-path heartbeat scan should append a frame to this
-/// connection: idle for a full interval — and able to receive it.
-///
-/// The two guards close the one append path that used to bypass
-/// `MAX_SEND_BUF`. A blocked peer's socket is full, so a heartbeat
-/// would only sit in `send_buf` — and an idle client that trickle-read
-/// a few bytes per interval kept resetting the blocked clock while
-/// unchecked heartbeat appends grew its buffer without bound, pinning
-/// its connection permit on ever-growing memory. Skipping blocked
-/// peers (they detect liveness by draining, not by new frames) and
-/// cap-checking the append bounds the buffer; a peer that never drains
-/// is then `BLOCKED_SEND_TIMEOUT`'s or `MAX_SEND_BUF`'s problem, as
-/// designed. Residual: a trickling client still holds its permit while
-/// it drains — bounded memory, and the reader's idle timeout covers
-/// clients that stop sending entirely.
 /// Put a connection on the dirty list if it isn't already there.
 /// Idempotent — the entry flag is the dedup that the old `HashSet`
 /// membership provided.
@@ -1336,13 +1321,29 @@ fn unmark_dirty(connection_id: u64, dirty: &mut Vec<u64>) {
     dirty.retain(|&id| id != connection_id);
 }
 
+/// Whether the idle-path heartbeat scan should append a frame to this
+/// connection: idle for a full interval (the due rule both stages share,
+/// `idle_housekeeping::heartbeat_due`) — and able to receive it.
+///
+/// The two guards close the one append path that used to bypass
+/// `MAX_SEND_BUF`. A blocked peer's socket is full, so a heartbeat
+/// would only sit in `send_buf` — and an idle client that trickle-read
+/// a few bytes per interval kept resetting the blocked clock while
+/// unchecked heartbeat appends grew its buffer without bound, pinning
+/// its connection permit on ever-growing memory. Skipping blocked
+/// peers (they detect liveness by draining, not by new frames) and
+/// cap-checking the append bounds the buffer; a peer that never drains
+/// is then `BLOCKED_SEND_TIMEOUT`'s or `MAX_SEND_BUF`'s problem, as
+/// designed. Residual: a trickling client still holds its permit while
+/// it drains — bounded memory, and the reader's idle timeout covers
+/// clients that stop sending entirely.
 fn heartbeat_due(
     entry: &ConnectionEntry,
     now: Instant,
     interval: Duration,
     frame_len: usize,
 ) -> bool {
-    now.duration_since(entry.last_send) >= interval
+    idle_housekeeping::heartbeat_due(entry.last_send, now, interval)
         && entry.blocked_since.is_none()
         && entry.send_buf.len() + frame_len <= MAX_SEND_BUF
 }

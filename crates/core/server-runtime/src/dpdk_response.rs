@@ -25,7 +25,7 @@ use crate::durability_gate::{
     Admission, Backing, BatchEnds, DurabilityGate, GateInputs, GatePolicy, GateWait,
 };
 use crate::early_reply::{EarlyReplyQueue, Registered};
-use crate::idle_housekeeping::IdleHousekeeping;
+use crate::idle_housekeeping::{IdleHousekeeping, heartbeat_due};
 use melin_app::Application;
 use melin_transport_core::DurableWireSeqCursor;
 use melin_transport_core::pipeline::{OutputSlot, StageUtilization};
@@ -761,7 +761,7 @@ fn send_due_heartbeats(
 ) {
     for (&conn_id, state) in connections.iter_mut() {
         let tid = tx_lane(conn_id, tx_producers.len());
-        if now.duration_since(state.last_send) < interval {
+        if !heartbeat_due(state.last_send, now, interval) {
             stalls.record(tid, Heartbeat::NotDue);
             continue;
         }

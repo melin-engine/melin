@@ -9,6 +9,10 @@
 //! that it has nothing to do, so one amortized timer decides when the idle
 //! path reads the clock at all, and each task keeps its own coarser
 //! interval on top of that one read.
+//!
+//! The heartbeat scan's per-connection due rule (`heartbeat_due`) lives
+//! here too, beside the cadence that paces the scan, so both stages apply
+//! the same one.
 
 use std::time::{Duration, Instant};
 
@@ -110,6 +114,21 @@ impl IdleHousekeeping {
     }
 }
 
+/// Whether a connection that last had bytes sent at `last_send` is due a
+/// heartbeat at `now`: nothing sent for a full `interval` or more. The one
+/// due rule both response stages' heartbeat scans apply, so the two cannot
+/// disagree on when an idle client is pinged; each stage adds only its own
+/// delivery guards around it (the kernel stage's blocked-peer and
+/// buffer-cap checks).
+///
+/// A `now` before `last_send` counts as nothing elapsed, never as a panic:
+/// the scan's clock read and a batch's `last_send` stamp are separate reads
+/// of the monotonic clock, and the scan should never be the one to fail.
+#[inline]
+pub(crate) fn heartbeat_due(last_send: Instant, now: Instant, interval: Duration) -> bool {
+    now.saturating_duration_since(last_send) >= interval
+}
+
 /// Whether `interval` has passed since `*last`, moving `*last` to `now`
 /// when it has.
 fn elapsed(last: &mut Instant, now: Instant, interval: Duration) -> bool {
@@ -206,6 +225,29 @@ mod tests {
                 .due_at(at + HEARTBEAT_SCAN_INTERVAL)
                 .heartbeat_scan
         );
+    }
+
+    /// A heartbeat is due once a full interval has passed since the last
+    /// send, and not a nanosecond before. A clock read earlier than the
+    /// stamp (two separate reads) is nothing elapsed, not a panic.
+    #[test]
+    fn a_heartbeat_is_due_from_exactly_one_interval_after_the_last_send() {
+        const INTERVAL: Duration = Duration::from_secs(10);
+        let last_send = Instant::now();
+        assert!(heartbeat_due(last_send, last_send + INTERVAL, INTERVAL));
+        assert!(heartbeat_due(
+            last_send,
+            last_send + INTERVAL + Duration::from_nanos(1),
+            INTERVAL
+        ));
+        assert!(!heartbeat_due(
+            last_send,
+            last_send + INTERVAL - Duration::from_nanos(1),
+            INTERVAL
+        ));
+        assert!(!heartbeat_due(last_send, last_send, INTERVAL));
+        let later_stamp = last_send + Duration::from_millis(1);
+        assert!(!heartbeat_due(later_stamp, last_send, INTERVAL));
     }
 
     /// The recorders' flush keeps its own interval, from the same reads.
