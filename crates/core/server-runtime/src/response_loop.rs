@@ -5,7 +5,8 @@
 //!
 //! What differs by transport is only where the bytes go, behind
 //! [`Egress`]: the kernel TCP stage's io_uring sends
-//! (`response::UringEgress`), the DPDK stage's TX rings. Everything the
+//! (`response::UringEgress`), the DPDK stage's TX rings
+//! (`dpdk_response::DpdkEgress`). Everything the
 //! stage's correctness depends on, the order of its steps, is here, once:
 //!
 //! - the control channel is drained after the output ring is read, never

@@ -1,5 +1,5 @@
-//! The response stages' idle housekeeping cadence, shared by the kernel
-//! TCP stage (`response::run`) and the DPDK one (`dpdk_response::run`).
+//! The response stages' idle housekeeping cadence, run by the loop both
+//! the kernel TCP stage and the DPDK one share (`response_loop::run`).
 //!
 //! Everything a response stage does while its output ring is empty, but
 //! for flushing and early replies, is periodic work on sub-second to
