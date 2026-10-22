@@ -254,6 +254,10 @@ pub fn run<A: Application>(
         if shutdown.load(Ordering::Relaxed) {
             utilization.busy.store(busy_count, Ordering::Relaxed);
             utilization.idle.store(idle_count, Ordering::Relaxed);
+            // Named "response", as the kernel stage's: the print says which
+            // pipeline stage it measures, not which transport carries it.
+            #[cfg(feature = "pipeline-stats")]
+            crate::response::print_utilization("response", busy_count, idle_count);
             return;
         }
 

@@ -29,6 +29,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   TCP one does: the scan runs once a second however briefly the stage
   idles, and the stage stops reading the clock on every idle pass once it
   has been idle for a while.
+- **A DPDK node built with `pipeline-stats` now reports the response
+  stage's utilization at shutdown**, as a kernel TCP node always has. It
+  printed the other stages' and left the response stage out.
 
 ## [0.22.0] - 2026-10-21
 

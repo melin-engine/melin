@@ -2022,9 +2022,10 @@ impl GateCrossTracker {
     }
 }
 
-/// Print busy/idle utilization for a pipeline stage on shutdown.
+/// Print busy/idle utilization for a pipeline stage on shutdown. Shared by
+/// both response stages (`dpdk_response::run` calls it too).
 #[cfg(feature = "pipeline-stats")]
-fn print_utilization(stage: &str, busy: u64, idle: u64) {
+pub(crate) fn print_utilization(stage: &str, busy: u64, idle: u64) {
     let total = busy + idle;
     if total == 0 {
         tracing::info!(stage, "no iterations recorded");
