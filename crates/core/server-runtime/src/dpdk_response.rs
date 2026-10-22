@@ -1357,7 +1357,9 @@ mod tests {
     /// connection queues no frame for it, not even a batch end: the
     /// replies on either side of it are the only frames on the TX ring.
     /// The kernel stage's counterpart is `response.rs`'s
-    /// `a_change_slot_sends_nothing_and_a_forced_one_waits_for_its_entry`.
+    /// `a_change_slot_sends_nothing_and_a_forced_one_waits_for_its_entry`,
+    /// whose harness port runs here too, forced half included
+    /// (`early_release`).
     #[test]
     fn a_change_slot_queues_no_frame_for_its_connection() {
         use counter_server::{Counter, CounterQuery, CounterReport, ResponseEncoder};
@@ -1674,17 +1676,21 @@ mod tests {
         use std::thread::JoinHandle;
 
         use counter_server::{Counter, ResponseEncoder};
-        use melin_transport_core::lineage::forced_policy_cell;
         use proptest::prelude::*;
 
         use super::degraded_release::wire_frames;
         use crate::ack_policy::AckPolicy;
         use crate::durability_gate::GateStart;
         use crate::response::tests::early_release::{
-            StageHarness, StageInputs, a_gate_held_inside_an_event_sends_no_early_reply,
+            StageHarness, StageInputs,
+            a_change_slot_sends_nothing_and_a_forced_one_waits_for_its_entry,
+            a_gate_held_inside_an_event_sends_no_early_reply,
+            a_refusal_is_not_released_ahead_of_its_connection,
+            a_reply_that_lands_with_its_connection_is_delivered,
+            a_stopped_stage_leaves_the_gate_and_drops_the_held_reply,
             an_early_reply_waits_out_an_event_split_across_reads,
             connection_first_seen_inside_a_gate_wait, early_replies_overtake_a_held_write,
-            every_kind, every_request_is_answered_once_and_whole, script,
+            every_kind, every_request_is_answered_once_and_whole, script, stopped_within,
         };
         use crate::response::tests::refusal_order::Seen;
 
@@ -1701,9 +1707,13 @@ mod tests {
             handle: Option<JoinHandle<()>>,
         }
 
+        /// The harness's TX ring, in frames. A test that fills it, with
+        /// nothing reading it, takes the count from here.
+        const TX_RING_SIZE: usize = 1024;
+
         fn start_dpdk(inputs: StageInputs) -> DpdkStage {
             let (control, control_rx) = mpsc::channel();
-            let (tx, tx_ring) = spsc::channel::<TxFrame>(1024, WaitStrategy::SpinThenYield);
+            let (tx, tx_ring) = spsc::channel::<TxFrame>(TX_RING_SIZE, WaitStrategy::SpinThenYield);
             let shutdown = Arc::clone(&inputs.shutdown);
             let StageInputs {
                 consumer,
@@ -1712,7 +1722,9 @@ mod tests {
                 replication_metrics,
                 replica_active,
                 utilization,
+                forced,
                 shutdown: stage_shutdown,
+                pause_after_control_drain,
             } = inputs;
             let handle = std::thread::spawn(move || {
                 run::<Counter>(
@@ -1721,7 +1733,7 @@ mod tests {
                     journal,
                     GatePolicy {
                         start: GateStart::settled(AckPolicy::DiskAndRam),
-                        forced: forced_policy_cell().1,
+                        forced,
                     },
                     Some(replication_metrics),
                     Some(replica_active),
@@ -1734,7 +1746,7 @@ mod tests {
                     Arc::new(ResponseEncoder),
                     early_replies,
                     None,
-                    None,
+                    pause_after_control_drain,
                 )
             });
             DpdkStage {
@@ -1777,6 +1789,10 @@ mod tests {
                     }
                 }
             }
+
+            fn stopped_within(&mut self, within: Duration) -> bool {
+                stopped_within(&self.shutdown, &mut self.handle, within)
+            }
         }
 
         impl Drop for DpdkStage {
@@ -1812,6 +1828,28 @@ mod tests {
         #[test]
         fn connection_first_seen_inside_a_gate_wait_dpdk() {
             connection_first_seen_inside_a_gate_wait(start_dpdk);
+        }
+
+        #[test]
+        fn a_reply_that_lands_with_its_connection_is_delivered_dpdk() {
+            a_reply_that_lands_with_its_connection_is_delivered(start_dpdk);
+        }
+
+        #[test]
+        fn a_refusal_is_not_released_ahead_of_its_connection_dpdk() {
+            a_refusal_is_not_released_ahead_of_its_connection(start_dpdk);
+        }
+
+        /// The stopped case only: the fenced one has no DPDK meaning (the
+        /// stage has no flush to suppress).
+        #[test]
+        fn a_stopped_stage_leaves_the_gate_and_drops_the_held_reply_dpdk() {
+            a_stopped_stage_leaves_the_gate_and_drops_the_held_reply(start_dpdk);
+        }
+
+        #[test]
+        fn a_change_slot_sends_nothing_and_a_forced_one_waits_for_its_entry_dpdk() {
+            a_change_slot_sends_nothing_and_a_forced_one_waits_for_its_entry(start_dpdk);
         }
 
         proptest! {

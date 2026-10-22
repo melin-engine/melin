@@ -4431,7 +4431,11 @@ pub(crate) mod tests {
     /// replies, without waiting for replies to earlier requests, and never
     /// inside an event's reply. The scenarios and their rig are shared
     /// with the DPDK stage, whose tests run each against its own harness
-    /// (`dpdk_response.rs`); the kernel stage's harness is here.
+    /// (`dpdk_response.rs`); the kernel stage's harness is here. So are
+    /// the ports of the kernel-only loop tests (`registration_race`,
+    /// `refusal_order`, `stop_while_gated`'s stopped case, and
+    /// `policy_change`), which pin both stages before their loops are
+    /// shared (`docs/internal/shared-response-loop-2026-10.md`).
     pub(crate) mod early_release {
         use std::collections::{BTreeMap, HashMap};
         use std::os::unix::net::UnixStream;
@@ -4443,9 +4447,13 @@ pub(crate) mod tests {
         use counter_server::{
             Counter, CounterQuery, CounterReport, KIND_RESP_ACK, KIND_RESP_REJECTED,
         };
+        use melin_journal::AckPolicyChange;
         use melin_pipeline::ring::{self, DisruptorBuilder};
         use melin_pipeline::wait::WaitStrategy;
         use melin_transport_core::fence::FenceState;
+        use melin_transport_core::lineage::{
+            ForcedPolicy, ForcedPolicyReader, ForcedPolicyWriter, forced_policy_cell,
+        };
         use melin_transport_core::pipeline::{
             OutputPayload, OutputSlot, RequestId, StageUtilization,
         };
@@ -4496,7 +4504,8 @@ pub(crate) mod tests {
         /// early-reply queue, and a gate under `disk+ram` over the journal
         /// cursor and one replica, whose in-memory cursor is far ahead,
         /// so the journal decides what is held until the replica is
-        /// marked gone.
+        /// marked gone. The forced-policy cell's reader goes to the stage;
+        /// the test keeps the writer ([`Rig::forced`]).
         pub(crate) struct StageInputs {
             pub(crate) consumer: ring::Consumer<Slot>,
             pub(crate) early_replies: EarlyReplyQueue<CounterReport>,
@@ -4504,7 +4513,11 @@ pub(crate) mod tests {
             pub(crate) replication_metrics: Arc<ReplicationMetrics>,
             pub(crate) replica_active: [Arc<AtomicBool>; 2],
             pub(crate) utilization: Arc<StageUtilization>,
+            pub(crate) forced: ForcedPolicyReader,
             pub(crate) shutdown: Arc<AtomicBool>,
+            /// The stage's test seam, called right after each control
+            /// drain; `None` runs it as production does.
+            pub(crate) pause_after_control_drain: Option<Box<dyn FnMut() + Send>>,
         }
 
         /// A running response stage, seen from its clients. Stops the
@@ -4517,26 +4530,78 @@ pub(crate) mod tests {
             /// The next frame the stage sent `connection_id`, waiting up
             /// to `within`; `None` if none came.
             fn next_frame(&mut self, connection_id: u64, within: Duration) -> Option<Seen>;
+            /// Tell the stage to stop, and whether its thread returned
+            /// within `within`. See [`stopped_within`].
+            fn stopped_within(&mut self, within: Duration) -> bool;
+        }
+
+        /// A harness's stop probe: set `shutdown`, take the stage's
+        /// thread and poll it until `within` has passed. A thread that
+        /// finished is joined, and a panic out of it is propagated, so a
+        /// stage that panicked out of the gate fails the test rather than
+        /// passing as stopped. A thread still running at the deadline is
+        /// detached, and `false` returned: the harness's `Drop` then has
+        /// nothing to join, and does not hang on the very wedge the probe
+        /// exists to catch.
+        pub(crate) fn stopped_within<T>(
+            shutdown: &AtomicBool,
+            handle: &mut Option<JoinHandle<T>>,
+            within: Duration,
+        ) -> bool {
+            shutdown.store(true, Ordering::Relaxed);
+            let handle = handle.take().expect("the stage is probed once");
+            let deadline = Instant::now() + within;
+            while !handle.is_finished() {
+                if Instant::now() >= deadline {
+                    // Detached: the thread may outlive the test, and dies
+                    // with the process.
+                    drop(handle);
+                    return false;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            if let Err(panic) = handle.join() {
+                std::panic::resume_unwind(panic);
+            }
+            true
         }
 
         /// The test's side of a stage under test: it plays the matching
-        /// stage, the reader, the journal and the replica.
+        /// stage, the reader, the journal, the replica and the operator
+        /// forcing a policy.
         pub(crate) struct Rig<H> {
+            /// The test's end of the drain seam, if the stage has one.
+            /// Declared first so it drops first: a test failing while the
+            /// stage is parked, or before its next hold, disconnects the
+            /// seam before `stage`'s `Drop` joins the stage, and the stage
+            /// carries on instead of waiting out [`SEAM_TIMEOUT`].
+            seam: Option<Seam>,
             pub(crate) producer: ring::Producer<Slot>,
             pub(crate) early: EarlyReplySender<CounterReport>,
             pub(crate) journal: DurableWireSeqCursor,
             pub(crate) replica_active: Arc<AtomicBool>,
             pub(crate) utilization: Arc<StageUtilization>,
+            pub(crate) forced: ForcedPolicyWriter,
             pub(crate) stage: H,
         }
 
-        /// Start a stage with `start`, the journal at `journal_at`, and
-        /// `connections` registered.
+        /// Start a stage with `start`, the journal at `journal_at`, a
+        /// drain seam holding it on its first `seam_holds` iterations
+        /// (none if zero; see [`Rig::seam`]), and `connections` registered
+        /// right after it starts (none if empty).
         pub(crate) fn rig<H: StageHarness>(
             start: fn(StageInputs) -> H,
             journal_at: u64,
             connections: &[u64],
+            seam_holds: usize,
         ) -> Rig<H> {
+            let (pause, seam) = match seam_holds {
+                0 => (None, None),
+                holds => {
+                    let (pause, seam) = seam(holds);
+                    (Some(pause), Some(seam))
+                }
+            };
             let (producer, mut consumers) = DisruptorBuilder::<Slot>::new(128)
                 .add_consumer()
                 .build(WaitStrategy::SpinThenYield);
@@ -4548,6 +4613,7 @@ pub(crate) mod tests {
             replication_metrics.in_memory_sequence[0].store(1_000_000, Ordering::Relaxed);
             let replica_active = Arc::new(AtomicBool::new(true));
             let utilization = Arc::new(StageUtilization::default());
+            let (forced, forced_reader) = forced_policy_cell();
             let mut stage = start(StageInputs {
                 consumer,
                 early_replies,
@@ -4558,22 +4624,92 @@ pub(crate) mod tests {
                     Arc::new(AtomicBool::new(false)),
                 ],
                 utilization: Arc::clone(&utilization),
+                forced: forced_reader,
                 shutdown: Arc::new(AtomicBool::new(false)),
+                pause_after_control_drain: pause,
             });
             for &id in connections {
                 stage.connect(id);
             }
             Rig {
+                seam,
                 producer,
                 early,
                 journal,
                 replica_active,
                 utilization,
+                forced,
                 stage,
             }
         }
 
+        /// The test's end of a stage's drain seam: the stage parks at the
+        /// seam on its first `holds` iterations, until the test resumes
+        /// it.
+        pub(crate) struct Seam {
+            parked: mpsc::Receiver<()>,
+            resume: mpsc::Sender<()>,
+        }
+
+        /// How long either side of a [`Seam`] waits for the other: a stage
+        /// that never parks, or a test that never resumes it, fails rather
+        /// than hangs (a stage parked forever would hang the harness's
+        /// `Drop`).
+        const SEAM_TIMEOUT: Duration = Duration::from_secs(10);
+
+        /// A seam that holds the stage on its first `holds` iterations,
+        /// and the pause to start the stage with.
+        fn seam(holds: usize) -> (Box<dyn FnMut() + Send>, Seam) {
+            let (parked_tx, parked) = mpsc::channel();
+            let (resume, resume_rx) = mpsc::channel();
+            let mut left = holds;
+            let pause = move || {
+                if left == 0 {
+                    return;
+                }
+                left -= 1;
+                // A test that has gone (failed and unwinding) is not
+                // waiting: its `Rig` drops the seam before the stage, so
+                // the stage carries on and is stopped by the harness's
+                // `Drop`.
+                if parked_tx.send(()).is_err() {
+                    return;
+                }
+                match resume_rx.recv_timeout(SEAM_TIMEOUT) {
+                    // Resumed, or the test has gone: carry on, as above.
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {}
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        panic!("the test never resumed the stage")
+                    }
+                }
+            };
+            (Box::new(pause), Seam { parked, resume })
+        }
+
+        impl Seam {
+            /// Wait for the stage to park at the seam.
+            pub(crate) fn parked(&self) {
+                self.parked
+                    .recv_timeout(SEAM_TIMEOUT)
+                    .expect("the stage reaches the seam");
+            }
+
+            /// Let the parked stage go on.
+            pub(crate) fn resume(&self) {
+                self.resume.send(()).expect("the stage is parked");
+            }
+        }
+
         impl<H: StageHarness> Rig<H> {
+            /// The test's end of the drain seam.
+            ///
+            /// # Panics
+            ///
+            /// If the rig was started without one.
+            pub(crate) fn seam(&self) -> &Seam {
+                self.seam.as_ref().expect("the rig was started with a seam")
+            }
+
             /// Queue an early reply, flushed, as a reader does.
             pub(crate) fn answer_early(
                 &mut self,
@@ -4639,7 +4775,7 @@ pub(crate) mod tests {
         pub(crate) fn an_early_reply_waits_out_an_event_split_across_reads<H: StageHarness>(
             start: fn(StageInputs) -> H,
         ) {
-            let mut rig = rig(start, 10, &[1]);
+            let mut rig = rig(start, 10, &[1], 0);
             rig.publish(1, 7, 1, false);
             assert_eq!(
                 rig.frames(1, 1),
@@ -4671,7 +4807,7 @@ pub(crate) mod tests {
             start: fn(StageInputs) -> H,
             kind: EarlyKind<CounterReport>,
         ) {
-            let mut rig = rig(start, 0, &[1, 2]);
+            let mut rig = rig(start, 0, &[1, 2], 0);
             rig.answer_early(1, 0, kind);
             rig.publish(1, 7, 1, true);
             let before = frames_of(kind, early_id(0));
@@ -4708,7 +4844,7 @@ pub(crate) mod tests {
         pub(crate) fn a_gate_held_inside_an_event_sends_no_early_reply<H: StageHarness>(
             start: fn(StageInputs) -> H,
         ) {
-            let mut rig = rig(start, 1, &[1]);
+            let mut rig = rig(start, 1, &[1], 0);
             rig.publish(1, 7, 1, false);
             assert_eq!(
                 rig.frames(1, 1),
@@ -4745,7 +4881,7 @@ pub(crate) mod tests {
         pub(crate) fn connection_first_seen_inside_a_gate_wait<H: StageHarness>(
             start: fn(StageInputs) -> H,
         ) {
-            let mut rig = rig(start, 0, &[1]);
+            let mut rig = rig(start, 0, &[1], 0);
             rig.publish(1, 7, 1, true);
             // Proof the stage has reached the held write: an early reply
             // for connection 1 queued after it is out.
@@ -4767,6 +4903,162 @@ pub(crate) mod tests {
 
             rig.journal.store(WireSeq::new(1));
             assert_eq!(rig.frames(1, 2), write_reply(7));
+        }
+
+        /// How long a stage gets to exit once told to, or to reach a
+        /// state the test waits for; generous for a loaded box.
+        pub(crate) const EXIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+        /// `registration_race` on any stage: a reply that lands with its
+        /// connection's `Connected`, both made visible while the stage is
+        /// held right after its control drain, is delivered. The drain
+        /// comes after the ring's read: drained first, the read would find
+        /// the slot with the connection still in the channel, and drop the
+        /// reply. The harness sees an application frame, not the counter's
+        /// value; what the race is about is that the reply arrives.
+        pub(crate) fn a_reply_that_lands_with_its_connection_is_delivered<H: StageHarness>(
+            start: fn(StageInputs) -> H,
+        ) {
+            // The journal is already past the one event, so the gate is
+            // open and delivery hinges on registration alone.
+            let mut rig = rig(start, 1, &[], 1);
+
+            rig.seam().parked();
+            rig.stage.connect(1);
+            // Not the last of its request: one frame, no terminator.
+            rig.publish(1, 7, 1, false);
+            rig.seam().resume();
+
+            assert_eq!(
+                rig.frames(1, 1),
+                [Seen::App(KIND_RESP_ACK)],
+                "the reply was dropped: the control channel was drained before the ring was read"
+            );
+        }
+
+        /// `refusal_order` on any stage: a refusal reaches the stage only
+        /// with its connection registered. The seam holds the stage after
+        /// its drain twice. The first hold lands connection 1's refusal,
+        /// which the next iteration's idle path is then due to release;
+        /// the second hold, in that iteration, lands connection 2 and its
+        /// refusal just ahead of the release.
+        pub(crate) fn a_refusal_is_not_released_ahead_of_its_connection<H: StageHarness>(
+            start: fn(StageInputs) -> H,
+        ) {
+            // Connection 1 is registered by the second iteration, whether
+            // or not the first drain saw it.
+            let mut rig = rig(start, 0, &[1], 2);
+            let refusal = EarlyKind::Rejected(CounterReport::Rejected);
+
+            rig.seam().parked();
+            rig.answer_early(1, 0, refusal);
+            rig.seam().resume();
+
+            rig.seam().parked();
+            rig.stage.connect(2);
+            rig.answer_early(2, 0, refusal);
+            rig.seam().resume();
+
+            for connection in [1, 2] {
+                assert_eq!(
+                    rig.frames(connection, 2),
+                    frames_of(refusal, early_id(0)),
+                    "connection {connection}'s refusal was dropped: \
+                     released before its connection registered"
+                );
+            }
+        }
+
+        /// `stop_while_gated`'s stopped case on any stage: a stage told
+        /// to stop while the gate holds a reply that may never be
+        /// confirmed leaves the gate, without sending it. (Its fenced case
+        /// stays kernel-only: the DPDK stage has no flush to suppress.)
+        pub(crate) fn a_stopped_stage_leaves_the_gate_and_drops_the_held_reply<H: StageHarness>(
+            start: fn(StageInputs) -> H,
+        ) {
+            // The journal confirms the first event and never the second.
+            let mut rig = rig(start, 1, &[1], 0);
+            rig.publish(1, 1, 1, true);
+            rig.publish(1, 2, 2, true);
+            assert_eq!(
+                rig.frames(1, 2),
+                write_reply(1),
+                "the confirmed reply goes out before the stage blocks on the gate"
+            );
+
+            assert!(
+                rig.stage.stopped_within(EXIT_TIMEOUT),
+                "the stage did not leave the gate on shutdown"
+            );
+            assert_eq!(
+                rig.quiet(1),
+                None,
+                "a reply the policy never confirmed was sent"
+            );
+        }
+
+        /// The change-slot test on any stage: a journaled policy change
+        /// sends nothing, and a forced change frees a held reply only once
+        /// its own entry is on disk.
+        pub(crate) fn a_change_slot_sends_nothing_and_a_forced_one_waits_for_its_entry<
+            H: StageHarness,
+        >(
+            start: fn(StageInputs) -> H,
+        ) {
+            // Everything up to the reply after the change is on disk; the
+            // rig's replica holds nothing on disk, so `two-disks` cannot
+            // be met.
+            let mut rig = rig(start, 3, &[1], 0);
+            rig.publish(1, 1, 1, true);
+            rig.producer.publish(Slot {
+                // Addressed to the client's own connection, which the
+                // matching stage never does: the change still sends it
+                // nothing, not even a batch end.
+                connection_id: 1,
+                input_seq: 1,
+                wire_seq: 2,
+                payload: OutputPayload::AckPolicyChange(AckPolicyChange {
+                    policy: AckPolicy::TwoDisks.to_byte(),
+                    unwitnessed: false,
+                }),
+                is_last_in_request: true,
+                ..Default::default()
+            });
+            rig.publish(1, 3, 3, true);
+
+            assert_eq!(
+                rig.frames(1, 2),
+                write_reply(1),
+                "the reply before the change"
+            );
+            let deadline = Instant::now() + EXIT_TIMEOUT;
+            while rig.utilization.ack_policy_in_force.load() != Some(AckPolicy::TwoDisks.to_byte())
+            {
+                assert!(Instant::now() < deadline, "the stage never took the change");
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(
+                rig.quiet(1),
+                None,
+                "a frame went out for the change slot, or the reply it holds"
+            );
+
+            // A forced swap back to `disk`, not yet on disk itself.
+            rig.forced.store(ForcedPolicy {
+                wire_seq: WireSeq::new(4),
+                policy: AckPolicy::Disk.to_byte(),
+            });
+            assert_eq!(
+                rig.quiet(1),
+                None,
+                "the forced swap applied before its entry was on disk"
+            );
+            rig.journal.store(WireSeq::new(4));
+            assert_eq!(
+                rig.frames(1, 2),
+                write_reply(3),
+                "the held reply, once the forced entry is on disk"
+            );
         }
 
         /// One step of a [`Script`].
@@ -4835,7 +5127,7 @@ pub(crate) mod tests {
             start: fn(StageInputs) -> H,
             script: &[Step],
         ) -> Result<(), TestCaseError> {
-            let mut rig = rig(start, 0, &SCRIPT_CONNECTIONS);
+            let mut rig = rig(start, 0, &SCRIPT_CONNECTIONS, 0);
             // Per connection: what each request is owed, and the order
             // of its published events.
             let mut owed: HashMap<RequestId, Owed> = HashMap::new();
@@ -4985,9 +5277,10 @@ pub(crate) mod tests {
                 inputs.journal,
                 Arc::new(FenceState::new(0)),
                 inputs.early_replies,
-                None,
+                inputs.pause_after_control_drain,
             );
             config.policy.start = crate::durability_gate::GateStart::settled(AckPolicy::DiskAndRam);
+            config.policy.forced = inputs.forced;
             config.replication_metrics = Some(inputs.replication_metrics);
             config.replica_active = Some(inputs.replica_active);
             config.utilization = inputs.utilization;
@@ -5016,6 +5309,10 @@ pub(crate) mod tests {
                     .set_read_timeout(Some(within))
                     .expect("set read timeout");
                 read_frame(client).ok()
+            }
+
+            fn stopped_within(&mut self, within: Duration) -> bool {
+                stopped_within(&self.shutdown, &mut self.handle, within)
             }
         }
 
@@ -5054,12 +5351,81 @@ pub(crate) mod tests {
             connection_first_seen_inside_a_gate_wait(start_uring);
         }
 
+        #[test]
+        fn a_reply_that_lands_with_its_connection_is_delivered_uring() {
+            a_reply_that_lands_with_its_connection_is_delivered(start_uring);
+        }
+
+        #[test]
+        fn a_refusal_is_not_released_ahead_of_its_connection_uring() {
+            a_refusal_is_not_released_ahead_of_its_connection(start_uring);
+        }
+
+        #[test]
+        fn a_stopped_stage_leaves_the_gate_and_drops_the_held_reply_uring() {
+            a_stopped_stage_leaves_the_gate_and_drops_the_held_reply(start_uring);
+        }
+
+        #[test]
+        fn a_change_slot_sends_nothing_and_a_forced_one_waits_for_its_entry_uring() {
+            a_change_slot_sends_nothing_and_a_forced_one_waits_for_its_entry(start_uring);
+        }
+
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(24))]
             #[test]
             fn every_request_is_answered_once_and_whole_uring(script in script()) {
                 every_request_is_answered_once_and_whole(start_uring, &script)?;
             }
+        }
+
+        /// The stop probe on a thread that returns once told to: it is
+        /// joined, and the handle is gone, so a `Drop` has nothing left
+        /// to join.
+        #[test]
+        fn the_stop_probe_joins_a_thread_that_stops() {
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&shutdown);
+            let mut handle = Some(thread::spawn(move || {
+                while !flag.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }));
+            assert!(stopped_within(&shutdown, &mut handle, EXIT_TIMEOUT));
+            assert!(handle.is_none());
+        }
+
+        /// The stop probe on a thread that panicked: the panic reaches
+        /// the test, rather than passing as a stop.
+        #[test]
+        #[should_panic(expected = "the stage panicked out of the gate")]
+        fn the_stop_probe_propagates_a_panic() {
+            let shutdown = AtomicBool::new(false);
+            let mut handle = Some(thread::spawn(|| {
+                panic!("the stage panicked out of the gate");
+            }));
+            stopped_within(&shutdown, &mut handle, EXIT_TIMEOUT);
+        }
+
+        /// The stop probe on a thread that ignores the flag: it gives up
+        /// at the deadline and detaches the thread, so a `Drop` that
+        /// joins would not hang on it.
+        #[test]
+        fn the_stop_probe_detaches_a_thread_that_does_not_stop() {
+            let shutdown = AtomicBool::new(false);
+            let (release, wedged) = mpsc::channel::<()>();
+            let mut handle = Some(thread::spawn(move || {
+                // Wedged until the test lets it go, whatever the flag.
+                wedged.recv().expect("the test releases the thread");
+            }));
+            assert!(!stopped_within(
+                &shutdown,
+                &mut handle,
+                Duration::from_millis(20)
+            ));
+            assert!(handle.is_none(), "the probe kept the handle");
+            assert!(shutdown.load(Ordering::Relaxed), "the probe set the flag");
+            release.send(()).expect("the detached thread is waiting");
         }
     }
 
@@ -5216,13 +5582,10 @@ pub(crate) mod tests {
         use melin_transport_core::{DurableWireSeqCursor, WireSeq};
         use melin_wire_protocol::control_codec::TAG_BATCH_END;
 
+        use super::early_release::EXIT_TIMEOUT;
         use super::refusal_order::{Seen, config, connection, read_frame};
         use crate::early_reply::early_reply_channel;
         use crate::response::run;
-
-        /// How long the stage gets to exit once told to; generous for a
-        /// loaded box.
-        const EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 
         fn stop_while_gated(fenced: bool) {
             let (mut producer, mut consumers) =
