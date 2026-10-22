@@ -262,7 +262,7 @@ struct ConnectionEntry {
     /// rather than set membership: the append path already holds the
     /// entry (and just wrote its `send_buf`), so the dedup test is a
     /// byte in a cache line that is hot, instead of a hash + probe on
-    /// every one of the ~2 frames per request. See `Egress::dirty`.
+    /// every one of the ~2 frames per request. See `UringEgress::dirty`.
     dirty: bool,
 }
 
@@ -274,7 +274,7 @@ struct ConnectionEntry {
 /// loop, the idle path, the flush before a gate wait, and the early
 /// replies sent during one ([`GateWaitHook`]), which runs inside the gate
 /// while the loop's own locals are borrowed.
-struct Egress {
+struct UringEgress {
     ring: IoUring,
     /// Connection table: maps connection IDs to their state.
     ///
@@ -356,7 +356,7 @@ struct Egress {
     egress_rec: trace::StageRecorder,
 }
 
-impl Egress {
+impl UringEgress {
     /// An empty table over `ring`, whose depth sizes the CQE buffer.
     fn new(
         ring: IoUring,
@@ -561,7 +561,7 @@ impl Egress {
 /// flush them. A slot held in the middle of an event sends nothing: an
 /// early reply there would split that event's reply.
 struct GateWaitHook<'a, 'q, R: Copy, Q: Copy> {
-    egress: &'a mut Egress,
+    egress: &'a mut UringEgress,
     at_boundary: Option<AtBoundary<'a>>,
     registered: &'a mut Registered<'q, R>,
     control_rx: &'a mpsc::Receiver<ControlEvent>,
@@ -747,7 +747,7 @@ pub fn run<A: Application>(
     #[cfg(feature = "tick-to-trade")]
     let egress_rec = trace::register_stage("response: egress (flush_sends elapsed)");
 
-    let mut egress = Egress::new(
+    let mut egress = UringEgress::new(
         ring,
         ring_entries,
         active_connections,
@@ -1181,7 +1181,7 @@ pub fn run<A: Application>(
                 );
             }
 
-            // Consumed-path flush (see `Egress::flush_if_due`). Runs
+            // Consumed-path flush (see `UringEgress::flush_if_due`). Runs
             // between slots, not after the batch, so `MAX_SEND_BUF` can
             // never trip on a healthy connection within a single batch.
             egress.flush_if_due();
@@ -3714,7 +3714,7 @@ pub(crate) mod tests {
         use super::refusal_order::{Seen, early, early_id, frames_of, read_frame};
         use crate::batch_boundary::BatchBoundary;
         use crate::early_reply::{EARLY_REPLY_QUEUE_CAPACITY, EarlyKind, early_reply_channel};
-        use crate::response::{Egress, MAX_SEND_BUF};
+        use crate::response::{MAX_SEND_BUF, UringEgress};
         use crate::response_frame::{EarlyReplyBuf, MAX_EARLY_REPLY};
 
         /// Replies in the burst: alternately a busy and a refusal with the
@@ -3736,9 +3736,9 @@ pub(crate) mod tests {
 
         /// A stage's egress holding one connection, 1, on `stream`, and
         /// the count of live connections it decrements.
-        fn egress_over(stream: UnixStream) -> (Egress, Arc<AtomicU64>) {
+        fn egress_over(stream: UnixStream) -> (UringEgress, Arc<AtomicU64>) {
             let active = Arc::new(AtomicU64::new(1));
-            let mut egress = Egress::new(
+            let mut egress = UringEgress::new(
                 IoUring::new(64).expect("an io_uring"),
                 64,
                 Arc::clone(&active),
@@ -3755,7 +3755,7 @@ pub(crate) mod tests {
 
         /// Queue the burst for connection 1 and release it in one drain,
         /// then flush as the idle path does.
-        fn drain_burst(egress: &mut Egress) -> usize {
+        fn drain_burst(egress: &mut UringEgress) -> usize {
             assert!(BURST as usize <= EARLY_REPLY_QUEUE_CAPACITY);
             let (mut tx, mut rx) =
                 early_reply_channel(crate::early_reply::EARLY_REPLY_QUEUE_CAPACITY);
@@ -3899,7 +3899,7 @@ pub(crate) mod tests {
         use crate::batch_boundary::BatchBoundary;
         use crate::durability_gate::GateWait;
         use crate::early_reply::{EarlyKind, early_reply_channel};
-        use crate::response::{Egress, GateWaitHook};
+        use crate::response::{GateWaitHook, UringEgress};
         use crate::response_frame::{EarlyReplyBuf, MAX_EARLY_REPLY};
 
         const BUSY: EarlyKind<CounterReport> = EarlyKind::Busy;
@@ -3908,8 +3908,8 @@ pub(crate) mod tests {
         /// connection 1's `Connected` and a busy for it, and call the
         /// hook's `while_waiting` once, between events or not. Returns the
         /// egress after the call and the client's end of the socket.
-        fn one_turn(between_events: bool) -> (Egress, UnixStream) {
-            let mut egress = Egress::new(
+        fn one_turn(between_events: bool) -> (UringEgress, UnixStream) {
+            let mut egress = UringEgress::new(
                 IoUring::new(64).expect("an io_uring"),
                 64,
                 Arc::new(AtomicU64::new(1)),
