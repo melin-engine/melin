@@ -221,8 +221,9 @@ pub struct Response<A: Application> {
     /// output ring is read, and the seam guards that order: were the
     /// drain moved back in front of the read, the seam would sit
     /// between the two, and a `Connected` landing there would be
-    /// missed by the read that follows — which `registration_race`
-    /// checks. `None` runs the stage as production does; the field
+    /// missed by the read that follows — which the tests'
+    /// `a_reply_that_lands_with_its_connection_is_delivered` checks, on
+    /// both stages. `None` runs the stage as production does; the field
     /// itself is compiled out of non-test builds, so the loop pays
     /// nothing.
     #[cfg(test)]
@@ -3392,8 +3393,8 @@ pub(crate) mod tests {
         use melin_wire_protocol::control::RefusalKind;
 
         use super::early_release::widest_reason;
+        use super::fixtures::{Seen, early, early_id, frames_of, read_frame};
         use super::flush_sends::{entry_for, fill_socket};
-        use super::refusal_order::{Seen, early, early_id, frames_of, read_frame};
         use crate::batch_boundary::BatchBoundary;
         use crate::early_reply::{EARLY_REPLY_QUEUE_CAPACITY, EarlyKind, early_reply_channel};
         use crate::response::{MAX_SEND_BUF, UringEgress};
@@ -3581,7 +3582,7 @@ pub(crate) mod tests {
         use melin_wire_protocol::control_codec::TAG_BATCH_END;
 
         use super::early_drain::egress_over;
-        use super::refusal_order::{Seen, read_frame};
+        use super::fixtures::{Seen, read_frame};
         use crate::durability_gate::{Backing, BatchEnds};
         use crate::response::{MAX_SEND_BUF, UringEgress};
         use crate::response_frame::{EncodeBuf, MAX_APP_FRAME};
@@ -3728,7 +3729,7 @@ pub(crate) mod tests {
         use counter_server::{CounterReport, ResponseEncoder};
         use io_uring::IoUring;
 
-        use super::refusal_order::{Seen, connection, early, early_id, frames_of, read_frame};
+        use super::fixtures::{Seen, connection, early, early_id, frames_of, read_frame};
         use crate::batch_boundary::BatchBoundary;
         use crate::durability_gate::GateWait;
         use crate::early_reply::{EarlyKind, early_reply_channel};
@@ -3813,182 +3814,24 @@ pub(crate) mod tests {
         }
     }
 
-    /// The stage learns of a connection from its control channel and of
-    /// that connection's replies from the output ring. A reply always
-    /// trails its `Connected`, so reading the ring before draining the
-    /// channel is enough for every slot read to find its connection.
-    /// Drained first, the stage could read the ring after a `Connected`
-    /// it had not seen — the accept loop queues that event only after
-    /// the client holds `ServerReady`, so a first request is often on
-    /// the wire before the stage has heard of its connection — and drop
-    /// the reply. Seen as a first reply lost on a fresh node under
-    /// full-suite load. The seam sits right
-    /// after the drain: with the drain after the read that is harmless,
-    /// with the drain before it the seam is the gap, and a `Connected`
-    /// landing there is missed by the read that follows. Holding the
-    /// stage at the seam makes the interleaving the test's rather than
-    /// the scheduler's.
-    mod registration_race {
+    /// What the stage tests are written in: a classifier for the frames a
+    /// client reads, builders for early replies and the frames each goes
+    /// out as, a registered connection, and a stage configuration. Shared
+    /// with the DPDK stage's tests (`dpdk_response.rs`) and the shared
+    /// loop's (`response_loop.rs`).
+    pub(crate) mod fixtures {
         use std::io::{Read, Write};
         use std::os::unix::io::AsRawFd;
         use std::os::unix::net::UnixStream;
-        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-        use std::sync::{Arc, mpsc};
-        use std::thread;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
         use std::time::Duration;
 
-        use counter_server::{
-            Counter, CounterQuery, CounterReport, KIND_RESP_ACK, ResponseEncoder,
-        };
-        use melin_pipeline::ring::DisruptorBuilder;
+        use counter_server::{Counter, CounterReport, KIND_RESP_REJECTED, ResponseEncoder};
         use melin_pipeline::wait::WaitStrategy;
+        use melin_transport_core::DurableWireSeqCursor;
         use melin_transport_core::fence::FenceState;
-        use melin_transport_core::pipeline::{OutputPayload, OutputSlot, StageUtilization};
-        use melin_transport_core::{DurableWireSeqCursor, WireSeq};
-        use melin_wire_protocol::blocking::BlockingFrameWriter;
-        use melin_wire_protocol::control_codec::TAG_APP;
-
-        use crate::ControlEvent;
-        use crate::ack_policy::AckPolicy;
-        use crate::response::{Response, run};
-
-        /// `CounterReport::Ack` on the wire: len(4) + tag(1), then the
-        /// counter's body, kind(1) + value(8).
-        const FRAME_LEN: usize = 14;
-        /// Long enough that a genuine loss is distinguishable from
-        /// scheduler noise on a loaded box, short enough to fail in
-        /// bounded time.
-        const READ_TIMEOUT: Duration = Duration::from_secs(5);
-
-        #[test]
-        fn a_reply_that_lands_with_its_connection_is_delivered() {
-            let (mut producer, mut consumers) =
-                DisruptorBuilder::<OutputSlot<CounterReport, CounterQuery>>::new(64)
-                    .add_consumer()
-                    .build(WaitStrategy::SpinThenYield);
-            let consumer = consumers.pop().expect("one consumer was requested");
-
-            let (server_sock, mut client_sock) = UnixStream::pair().expect("socketpair");
-            let server_fd = server_sock.as_raw_fd();
-            let writer = BlockingFrameWriter::new(Box::new(server_sock) as Box<dyn Write + Send>);
-            client_sock
-                .set_read_timeout(Some(READ_TIMEOUT))
-                .expect("set read timeout");
-
-            // The stage reports reaching the gap on `parked` and waits on
-            // `resume` — once, on its first iteration.
-            let (parked_tx, parked_rx) = mpsc::channel::<()>();
-            let (resume_tx, resume_rx) = mpsc::channel::<()>();
-            let mut held = false;
-            let pause = move || {
-                if !held {
-                    held = true;
-                    parked_tx.send(()).expect("the test is waiting");
-                    resume_rx.recv().expect("the test resumes the stage");
-                }
-            };
-
-            let (control_tx, control_rx) = mpsc::channel();
-            let shutdown = AtomicBool::new(false);
-            let config = Response::<Counter> {
-                // The journal is already past the one event, so the gate
-                // is open and delivery hinges on registration alone.
-                journal_persisted_wire_seq: DurableWireSeqCursor::detached(WireSeq::new(1)),
-                policy: crate::response::GatePolicy {
-                    start: crate::durability_gate::GateStart::settled(AckPolicy::Disk),
-                    forced: melin_transport_core::lineage::forced_policy_cell().1,
-                },
-                replication_metrics: None,
-                replica_active: None,
-                heartbeat_interval: None,
-                wait: WaitStrategy::SpinThenYield,
-                utilization: Arc::new(StageUtilization::default()),
-                encoder: Arc::new(ResponseEncoder),
-                fence_state: Arc::new(FenceState::new(0)),
-                active_connections: Arc::new(AtomicU64::new(0)),
-                // No reader: nothing is ever answered early.
-                early_replies: crate::early_reply::early_reply_channel(
-                    crate::early_reply::EARLY_REPLY_QUEUE_CAPACITY,
-                )
-                .1,
-                ring_sizing: crate::connection_limit::RingSizing::for_max_connections(1)
-                    .expect("a supported cap"),
-                ready: None,
-                degraded_release: None,
-                pause_after_control_drain: Some(Box::new(pause)),
-            };
-
-            thread::scope(|scope| {
-                let stage = scope.spawn(|| run::<Counter>(consumer, control_rx, config, &shutdown));
-
-                // The stage has drained an empty control channel and is
-                // held at the seam. Now both arrive: read after drain,
-                // the next iteration finds the slot and then its
-                // connection; drain after read, the read would find the
-                // slot and the connection would still be in the channel.
-                parked_rx.recv().expect("the stage reaches the seam");
-                control_tx
-                    .send(ControlEvent::Connected {
-                        connection_id: 1,
-                        fd: server_fd,
-                        writer,
-                    })
-                    .expect("stage is running");
-                producer.publish(OutputSlot {
-                    connection_id: 1,
-                    wire_seq: 1,
-                    payload: OutputPayload::Report(CounterReport::Ack { new_value: 7 }),
-                    // No trailing `BatchEnd`: one frame on the wire.
-                    is_last_in_request: false,
-                    ..Default::default()
-                });
-                resume_tx.send(()).expect("the stage is parked");
-
-                let mut frame = [0u8; FRAME_LEN];
-                let delivered = client_sock.read_exact(&mut frame);
-                shutdown.store(true, Ordering::Relaxed);
-                stage.join().expect("stage panicked");
-                delivered.expect(
-                    "the reply was dropped: the control channel was drained before the ring was read",
-                );
-                assert_eq!(
-                    frame[4..6],
-                    [TAG_APP, KIND_RESP_ACK],
-                    "an application frame carrying the counter's ack"
-                );
-                assert_eq!(
-                    u64::from_le_bytes(frame[6..].try_into().expect("8 bytes")),
-                    7,
-                    "the ack carries the counter's value"
-                );
-            });
-        }
-    }
-
-    /// An early reply (a write refused while halted, a request filtered or
-    /// refused by the decoder, one shed on a full ring) reaches the stage
-    /// only with its connection registered.
-    ///
-    /// Its frame classifier and early-reply builders are shared with the
-    /// other early-reply tests here and the DPDK stage's
-    /// (`dpdk_response.rs`).
-    pub(crate) mod refusal_order {
-        use std::io::{Read, Write};
-        use std::os::unix::io::AsRawFd;
-        use std::os::unix::net::UnixStream;
-        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-        use std::sync::{Arc, mpsc};
-        use std::thread;
-        use std::time::Duration;
-
-        use counter_server::{
-            Counter, CounterQuery, CounterReport, KIND_RESP_REJECTED, ResponseEncoder,
-        };
-        use melin_pipeline::ring::DisruptorBuilder;
-        use melin_pipeline::wait::WaitStrategy;
-        use melin_transport_core::fence::FenceState;
-        use melin_transport_core::pipeline::{OutputSlot, RequestId, StageUtilization};
-        use melin_transport_core::{DurableWireSeqCursor, WireSeq};
+        use melin_transport_core::pipeline::{RequestId, StageUtilization};
         use melin_wire_protocol::blocking::BlockingFrameWriter;
         use melin_wire_protocol::control_codec::{
             TAG_APP, TAG_BATCH_END, TAG_REFUSED, TAG_SERVER_BUSY, terminal_request_id,
@@ -3996,8 +3839,8 @@ pub(crate) mod tests {
 
         use crate::ControlEvent;
         use crate::ack_policy::AckPolicy;
-        use crate::early_reply::{EarlyKind, EarlyReply, EarlyReplyQueue, early_reply_channel};
-        use crate::response::{Response, run};
+        use crate::early_reply::{EarlyKind, EarlyReply, EarlyReplyQueue};
+        use crate::response::Response;
 
         /// Bounds a read that must succeed; generous for a loaded box.
         pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -4075,102 +3918,6 @@ pub(crate) mod tests {
             Ok(Seen::of(&payload))
         }
 
-        /// Read one frame into `seen`; false if none arrived.
-        fn read_into(sock: &mut UnixStream, seen: &mut Vec<Seen>) -> bool {
-            match read_frame(sock) {
-                Ok(frame) => {
-                    seen.push(frame);
-                    true
-                }
-                Err(_) => false,
-            }
-        }
-
-        /// A refusal reaches the stage only with its connection registered.
-        /// The reader refuses a new connection's first request as soon as
-        /// that connection's `Connected` is queued, so a refusal made
-        /// visible while the stage is past its control drain can belong to
-        /// a connection the stage has not heard of. Released in that
-        /// iteration it would be dropped, and the client left without a
-        /// reply.
-        ///
-        /// The seam holds the stage after its drain twice. The first hold
-        /// lands connection 1's refusal, which the next iteration's idle
-        /// path is then due to release; the second hold, in that iteration,
-        /// lands connection 2 and its refusal just ahead of the release.
-        /// The same inside a gate wait is `early_release`'s
-        /// `connection_first_seen_inside_a_gate_wait`.
-        #[test]
-        fn a_refusal_is_not_released_ahead_of_its_connection() {
-            let (_producer, mut consumers) =
-                DisruptorBuilder::<OutputSlot<CounterReport, CounterQuery>>::new(64)
-                    .add_consumer()
-                    .build(WaitStrategy::SpinThenYield);
-            let consumer = consumers.pop().expect("one consumer was requested");
-            let (connected_1, mut client_1) = connection(1);
-            let (connected_2, mut client_2) = connection(2);
-
-            let (mut refusals, refusal_rx) =
-                early_reply_channel(crate::early_reply::EARLY_REPLY_QUEUE_CAPACITY);
-            let (control_tx, control_rx) = mpsc::channel();
-            control_tx.send(connected_1).expect("channel open");
-
-            let (parked_tx, parked_rx) = mpsc::channel::<()>();
-            let (resume_tx, resume_rx) = mpsc::channel::<()>();
-            let mut holds = 0;
-            let pause = move || {
-                if holds < 2 {
-                    holds += 1;
-                    parked_tx.send(()).expect("the test is waiting");
-                    resume_rx.recv().expect("the test resumes the stage");
-                }
-            };
-            let shutdown = AtomicBool::new(false);
-            let config = config(
-                DurableWireSeqCursor::detached(WireSeq::new(0)),
-                Arc::new(FenceState::new(0)),
-                refusal_rx,
-                Some(Box::new(pause)),
-            );
-
-            thread::scope(|scope| {
-                let stage = scope.spawn(|| run::<Counter>(consumer, control_rx, config, &shutdown));
-
-                parked_rx.recv().expect("the stage reaches the seam");
-                refusals.try_send(refusal(1, 0)).expect("queue has room");
-                refusals.flush();
-                resume_tx.send(()).expect("the stage is parked");
-
-                parked_rx.recv().expect("the stage reaches the seam again");
-                control_tx.send(connected_2).expect("stage is running");
-                refusals.try_send(refusal(2, 0)).expect("queue has room");
-                refusals.flush();
-                resume_tx.send(()).expect("the stage is parked");
-
-                let mut seen_1 = Vec::new();
-                let mut seen_2 = Vec::new();
-                let got_1 = (0..2).all(|_| read_into(&mut client_1, &mut seen_1));
-                let got_2 = (0..2).all(|_| read_into(&mut client_2, &mut seen_2));
-                shutdown.store(true, Ordering::Relaxed);
-                stage.join().expect("stage panicked");
-
-                assert!(got_1, "connection 1's refusal never arrived: {seen_1:x?}");
-                assert!(
-                    got_2,
-                    "connection 2's refusal was dropped: released before its connection registered"
-                );
-                for seen in [seen_1, seen_2] {
-                    assert_eq!(
-                        seen,
-                        [
-                            Seen::App(KIND_RESP_REJECTED),
-                            Seen::Final(TAG_BATCH_END, early_id(0))
-                        ]
-                    );
-                }
-            });
-        }
-
         /// A registered connection: its `Connected` event, and the client's
         /// end of the socket.
         pub(super) fn connection(connection_id: u64) -> (ControlEvent, UnixStream) {
@@ -4232,10 +3979,11 @@ pub(crate) mod tests {
     /// inside an event's reply. The scenarios and their rig are shared
     /// with the DPDK stage, whose tests run each against its own harness
     /// (`dpdk_response.rs`); the kernel stage's harness is here. So are
-    /// the ports of the kernel-only loop tests (`registration_race`,
-    /// `refusal_order`, `stop_while_gated`'s stopped case, and
-    /// `policy_change`), which pin both stages before their loops are
-    /// shared (`docs/internal/shared-response-loop-2026-10.md`).
+    /// the rest of the loop's scenarios on both stages: a reply or a
+    /// refusal that lands with its connection, a stop while the gate
+    /// holds a reply, and a policy change slot. A fenced stop, which
+    /// only the kernel stage has a flush to suppress for, runs on the
+    /// kernel stage alone.
     pub(crate) mod early_release {
         use std::collections::{BTreeMap, HashMap};
         use std::os::unix::net::UnixStream;
@@ -4262,7 +4010,7 @@ pub(crate) mod tests {
         use melin_wire_protocol::control_codec::{TAG_BATCH_END, TAG_RESPONSE_HEARTBEAT};
         use proptest::prelude::*;
 
-        use super::refusal_order::{
+        use super::fixtures::{
             READ_TIMEOUT, Seen, config, connection, early, early_id, frames_of, read_frame,
         };
         use crate::ControlEvent;
@@ -4743,13 +4491,20 @@ pub(crate) mod tests {
         /// state the test waits for; generous for a loaded box.
         pub(crate) const EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 
-        /// `registration_race` on any stage: a reply that lands with its
-        /// connection's `Connected`, both made visible while the stage is
-        /// held right after its control drain, is delivered. The drain
-        /// comes after the ring's read: drained first, the read would find
-        /// the slot with the connection still in the channel, and drop the
-        /// reply. The harness sees an application frame, not the counter's
-        /// value; what the race is about is that the reply arrives.
+        /// A reply that lands with its connection's `Connected`, both made
+        /// visible while the stage is held right after its control drain,
+        /// is delivered. The stage learns of a connection from its control
+        /// channel and of that connection's replies from the output ring,
+        /// and a reply always trails its `Connected`, so reading the ring
+        /// before draining the channel is enough for every slot read to
+        /// find its connection. Drained first, the stage could read the
+        /// ring after a `Connected` it had not seen and drop the reply:
+        /// seen as a first reply lost on a fresh node under full-suite
+        /// load. With the drain after the read the seam is harmless; with
+        /// the drain before it the seam is the gap, and holding the stage
+        /// there makes the interleaving the test's rather than the
+        /// scheduler's. What the race is about is that the reply arrives,
+        /// so the frame's kind is checked, not the counter's value.
         pub(crate) fn a_reply_that_lands_with_its_connection_is_delivered<H: StageHarness>(
             start: fn(StageInputs) -> H,
         ) {
@@ -4770,10 +4525,18 @@ pub(crate) mod tests {
             );
         }
 
-        /// `refusal_order` on any stage: a refusal reaches the stage only
-        /// with its connection registered. The seam holds the stage after
-        /// its drain twice. The first hold lands connection 1's refusal,
-        /// which the next iteration's idle path is then due to release;
+        /// A refusal reaches the stage only with its connection
+        /// registered. The reader refuses a new connection's first
+        /// request as soon as that connection's `Connected` is queued, so
+        /// a refusal made visible while the stage is past its control
+        /// drain can belong to a connection the stage has not heard of.
+        /// Released in that iteration it would be dropped, and the client
+        /// left without a reply. The same inside a gate wait is
+        /// [`connection_first_seen_inside_a_gate_wait`].
+        ///
+        /// The seam holds the stage after its drain twice. The first hold
+        /// lands connection 1's refusal, which the next iteration's idle
+        /// path is then due to release;
         /// the second hold, in that iteration, lands connection 2 and its
         /// refusal just ahead of the release.
         pub(crate) fn a_refusal_is_not_released_ahead_of_its_connection<H: StageHarness>(
@@ -4803,14 +4566,25 @@ pub(crate) mod tests {
             }
         }
 
-        /// `stop_while_gated`'s stopped case on any stage: a stage told
-        /// to stop while the gate holds a reply that may never be
-        /// confirmed leaves the gate, without sending it. (Its fenced case
-        /// stays kernel-only: the DPDK stage has no flush to suppress.)
+        /// A stage told to stop while the gate holds a reply leaves the
+        /// gate, without sending it. The gate may never open (every
+        /// replica gone under a policy that needs one), and the node's
+        /// shutdown joins the stage without a timeout, so the stage must
+        /// leave the gate on shutdown; the held reply, which the policy
+        /// never confirmed, must not go out. A fence co-sets shutdown and
+        /// takes the same exit: that case is the kernel stage's alone
+        /// (`a_fenced_stage_leaves_the_gate_and_drops_the_held_reply_uring`),
+        /// the DPDK stage having no flush to suppress.
         pub(crate) fn a_stopped_stage_leaves_the_gate_and_drops_the_held_reply<H: StageHarness>(
             start: fn(StageInputs) -> H,
         ) {
-            // The journal confirms the first event and never the second.
+            let mut rig = held_at_the_gate(start);
+            leaves_the_gate_without_the_held_reply(&mut rig);
+        }
+
+        /// A stage that has sent the reply the journal confirms, and is
+        /// held at the gate on the next, which the journal never confirms.
+        fn held_at_the_gate<H: StageHarness>(start: fn(StageInputs) -> H) -> Rig<H> {
             let mut rig = rig(start, 1, &[1], 0);
             rig.publish(1, 1, 1, true);
             rig.publish(1, 2, 2, true);
@@ -4819,7 +4593,12 @@ pub(crate) mod tests {
                 write_reply(1),
                 "the confirmed reply goes out before the stage blocks on the gate"
             );
+            rig
+        }
 
+        /// Stop a stage [`held_at_the_gate`]: it returns, and sends
+        /// nothing more.
+        fn leaves_the_gate_without_the_held_reply<H: StageHarness>(rig: &mut Rig<H>) {
             assert!(
                 rig.stage.stopped_within(EXIT_TIMEOUT),
                 "the stage did not leave the gate on shutdown"
@@ -4831,9 +4610,13 @@ pub(crate) mod tests {
             );
         }
 
-        /// The change-slot test on any stage: a journaled policy change
-        /// sends nothing, and a forced change frees a held reply only once
-        /// its own entry is on disk.
+        /// A journaled policy change reaches the running stage as a slot
+        /// that sends nothing, even one addressed to a registered client's
+        /// connection, and a forced change frees a held reply only once
+        /// its own entry is on disk. The replies on either side of the
+        /// change are the only frames the client gets. The switch itself
+        /// is pinned by the gate's tests (`durability_gate.rs`), the
+        /// in-force gauge by `tests/ack_policy_changes.rs`.
         pub(crate) fn a_change_slot_sends_nothing_and_a_forced_one_waits_for_its_entry<
             H: StageHarness,
         >(
@@ -4893,6 +4676,7 @@ pub(crate) mod tests {
                 write_reply(3),
                 "the held reply, once the forced entry is on disk"
             );
+            assert_eq!(rig.quiet(1), None, "a frame went out after the held reply");
         }
 
         /// One step of a [`Script`].
@@ -5103,13 +4887,16 @@ pub(crate) mod tests {
             clients: HashMap<u64, UnixStream>,
             shutdown: Arc<AtomicBool>,
             handle: Option<JoinHandle<bool>>,
+            /// The stage's fence, for the kernel-only fenced stop.
+            fence: Arc<FenceState>,
         }
 
         pub(crate) fn start_uring(inputs: StageInputs) -> UringStage {
             let (control, control_rx) = mpsc::channel();
+            let fence = Arc::new(FenceState::new(0));
             let mut config = config(
                 inputs.journal,
-                Arc::new(FenceState::new(0)),
+                Arc::clone(&fence),
                 inputs.early_replies,
                 inputs.pause_after_control_drain,
             );
@@ -5128,6 +4915,7 @@ pub(crate) mod tests {
                 clients: HashMap::new(),
                 shutdown: inputs.shutdown,
                 handle: Some(handle),
+                fence,
             }
         }
 
@@ -5204,6 +4992,19 @@ pub(crate) mod tests {
         #[test]
         fn a_stopped_stage_leaves_the_gate_and_drops_the_held_reply_uring() {
             a_stopped_stage_leaves_the_gate_and_drops_the_held_reply(start_uring);
+        }
+
+        /// The stop above, with the stage fenced first: a fenced kernel
+        /// stage takes the same exit, its fence suppressing the
+        /// best-effort flush on the way out. The DPDK stage has no flush
+        /// to suppress, so this case is the kernel stage's alone. That
+        /// the fenced way out sends nothing buffered is `uring_egress`'s
+        /// `a_fenced_way_out_sends_nothing`.
+        #[test]
+        fn a_fenced_stage_leaves_the_gate_and_drops_the_held_reply_uring() {
+            let mut rig = held_at_the_gate(start_uring);
+            assert!(rig.stage.fence.fence(), "first latch");
+            leaves_the_gate_without_the_held_reply(&mut rig);
         }
 
         #[test]
@@ -5291,7 +5092,7 @@ pub(crate) mod tests {
         use melin_transport_core::{DurableWireSeqCursor, WireSeq};
         use melin_wire_protocol::control_codec::{TAG_BATCH_END, TAG_BATCH_END_DEGRADED};
 
-        use super::refusal_order::{Seen, config, connection, early_id, read_frame, refusal};
+        use super::fixtures::{Seen, config, connection, early_id, read_frame, refusal};
         use crate::ack_policy::AckPolicy;
         use crate::early_reply::early_reply_channel;
         use crate::halt::DegradedRelease;
@@ -5402,278 +5203,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// A node stopped while a reply is held by the ack policy. The gate
-    /// may never open — every replica gone under a policy that needs one —
-    /// and the shutdown sequence joins the stage without a timeout, so the
-    /// stage must leave the gate on shutdown. It leaves without sending
-    /// the held reply, which the policy never confirmed. A fence co-sets
-    /// shutdown and takes the same exit.
-    mod stop_while_gated {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::{Arc, mpsc};
-        use std::thread;
-        use std::time::{Duration, Instant};
-
-        use counter_server::{Counter, CounterQuery, CounterReport, KIND_RESP_ACK};
-        use melin_pipeline::ring::DisruptorBuilder;
-        use melin_pipeline::wait::WaitStrategy;
-        use melin_transport_core::fence::FenceState;
-        use melin_transport_core::pipeline::{OutputPayload, OutputSlot, RequestId};
-        use melin_transport_core::{DurableWireSeqCursor, WireSeq};
-        use melin_wire_protocol::control_codec::TAG_BATCH_END;
-
-        use super::early_release::EXIT_TIMEOUT;
-        use super::refusal_order::{Seen, config, connection, read_frame};
-        use crate::early_reply::early_reply_channel;
-        use crate::response::run;
-
-        fn stop_while_gated(fenced: bool) {
-            let (mut producer, mut consumers) =
-                DisruptorBuilder::<OutputSlot<CounterReport, CounterQuery>>::new(64)
-                    .add_consumer()
-                    .build(WaitStrategy::SpinThenYield);
-            let consumer = consumers.pop().expect("one consumer was requested");
-            let (connected, mut client) = connection(1);
-            let (control_tx, control_rx) = mpsc::channel();
-            control_tx.send(connected).expect("channel open");
-
-            // The journal confirms the first event and never the second.
-            let journal_cursor = DurableWireSeqCursor::detached(WireSeq::new(1));
-            let fence = Arc::new(FenceState::new(0));
-            let early_replies =
-                early_reply_channel(crate::early_reply::EARLY_REPLY_QUEUE_CAPACITY).1;
-            let config = config(journal_cursor, Arc::clone(&fence), early_replies, None);
-            for wire_seq in [1, 2] {
-                producer.publish(OutputSlot {
-                    connection_id: 1,
-                    request_id: RequestId(wire_seq),
-                    input_seq: wire_seq - 1,
-                    wire_seq,
-                    payload: OutputPayload::Report(CounterReport::Ack {
-                        new_value: wire_seq,
-                    }),
-                    is_last_in_request: true,
-                    ..Default::default()
-                });
-            }
-
-            // Not a scoped thread: a stage that never leaves the gate
-            // would hang a scoped join, and that hang is the failure this
-            // test exists to catch. The flag is leaked for the same
-            // reason — the thread may outlive the test, and dies with the
-            // process.
-            let shutdown: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
-            let stage =
-                thread::spawn(move || run::<Counter>(consumer, control_rx, config, shutdown));
-
-            // The confirmed reply goes out before the stage blocks on the
-            // gate.
-            let mut seen = Vec::new();
-            for _ in 0..2 {
-                seen.push(read_frame(&mut client).expect("the confirmed reply arrives"));
-            }
-            assert_eq!(
-                seen,
-                [
-                    Seen::App(KIND_RESP_ACK),
-                    Seen::Final(TAG_BATCH_END, RequestId(1))
-                ]
-            );
-
-            if fenced {
-                assert!(fence.fence(), "first latch");
-            }
-            shutdown.store(true, Ordering::Relaxed);
-            let deadline = Instant::now() + EXIT_TIMEOUT;
-            while !stage.is_finished() {
-                assert!(
-                    Instant::now() < deadline,
-                    "the stage did not leave the gate on shutdown"
-                );
-                thread::sleep(Duration::from_millis(10));
-            }
-            stage.join().expect("stage panicked");
-
-            // The held reply never went out: the stage closed the
-            // connection with nothing more on it.
-            assert!(
-                read_frame(&mut client).is_err(),
-                "a reply the policy never confirmed was sent"
-            );
-        }
-
-        #[test]
-        fn a_stopped_stage_leaves_the_gate_and_drops_the_held_reply() {
-            stop_while_gated(false);
-        }
-
-        #[test]
-        fn a_fenced_stage_leaves_the_gate_and_drops_the_held_reply() {
-            stop_while_gated(true);
-        }
-    }
-
-    /// A journaled policy change reaches the running stage as a slot that
-    /// sends nothing, and a forced change frees a held reply only once its
-    /// own entry is on disk. The switch itself is pinned by the gate's
-    /// tests (`durability_gate.rs`), the in-force gauge by
-    /// `tests/ack_policy_changes.rs`.
-    mod policy_change {
-        use std::io::ErrorKind;
-        use std::os::unix::io::AsRawFd;
-        use std::os::unix::net::UnixStream;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::{Arc, mpsc};
-        use std::thread;
-        use std::time::{Duration, Instant};
-
-        use counter_server::{Counter, CounterQuery, CounterReport, KIND_RESP_ACK};
-        use melin_journal::AckPolicyChange;
-        use melin_pipeline::ring::DisruptorBuilder;
-        use melin_pipeline::wait::WaitStrategy;
-        use melin_transport_core::fence::FenceState;
-        use melin_transport_core::lineage::{ForcedPolicy, forced_policy_cell};
-        use melin_transport_core::pipeline::{OutputPayload, OutputSlot, RequestId};
-        use melin_transport_core::{DurableWireSeqCursor, WireSeq};
-        use melin_wire_protocol::control_codec::TAG_BATCH_END;
-
-        use super::refusal_order::{Seen, config, connection, read_frame};
-        use crate::ack_policy::AckPolicy;
-        use crate::early_reply::early_reply_channel;
-        use crate::response::run;
-
-        /// How long the test waits for the stage to reach a state.
-        const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
-
-        /// How long a held reply is watched for: long enough that a stage
-        /// wrongly releasing it would have sent it.
-        const HOLD: Duration = Duration::from_millis(50);
-
-        fn reply(wire_seq: u64) -> OutputSlot<CounterReport, CounterQuery> {
-            OutputSlot {
-                connection_id: 1,
-                request_id: RequestId(wire_seq),
-                input_seq: wire_seq - 1,
-                wire_seq,
-                payload: OutputPayload::Report(CounterReport::Ack {
-                    new_value: wire_seq,
-                }),
-                is_last_in_request: true,
-                ..Default::default()
-            }
-        }
-
-        /// No frame waiting on the client's socket.
-        fn nothing_sent(client: &UnixStream) -> bool {
-            let mut byte = 0u8;
-            // Safety: a live socket fd and a one-byte buffer; MSG_PEEK
-            // leaves anything there for the reads that follow.
-            let n = unsafe {
-                libc::recv(
-                    client.as_raw_fd(),
-                    (&raw mut byte).cast(),
-                    1,
-                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
-                )
-            };
-            n < 0 && std::io::Error::last_os_error().kind() == ErrorKind::WouldBlock
-        }
-
-        #[test]
-        fn a_change_slot_sends_nothing_and_a_forced_one_waits_for_its_entry() {
-            let (mut producer, mut consumers) =
-                DisruptorBuilder::<OutputSlot<CounterReport, CounterQuery>>::new(64)
-                    .add_consumer()
-                    .build(WaitStrategy::SpinThenYield);
-            let consumer = consumers.pop().expect("one consumer was requested");
-            let (connected, mut client) = connection(1);
-            let (control_tx, control_rx) = mpsc::channel();
-            control_tx.send(connected).expect("channel open");
-
-            // Everything up to the reply after the change is on disk; a
-            // standalone stage cannot satisfy `two-disks` at all.
-            let journal_cursor = DurableWireSeqCursor::detached(WireSeq::new(3));
-            let early_replies =
-                early_reply_channel(crate::early_reply::EARLY_REPLY_QUEUE_CAPACITY).1;
-            let mut config = config(
-                journal_cursor.clone(),
-                Arc::new(FenceState::new(0)),
-                early_replies,
-                None,
-            );
-            let (mut forced_writer, forced) = forced_policy_cell();
-            config.policy.forced = forced;
-            let utilization = Arc::clone(&config.utilization);
-
-            producer.publish(reply(1));
-            producer.publish(OutputSlot {
-                // Addressed to the client's own connection, which the
-                // matching stage never does: the change still sends it
-                // nothing, not even a batch end.
-                connection_id: 1,
-                input_seq: 1,
-                wire_seq: 2,
-                payload: OutputPayload::AckPolicyChange(AckPolicyChange {
-                    policy: AckPolicy::TwoDisks.to_byte(),
-                    unwitnessed: false,
-                }),
-                is_last_in_request: true,
-                ..Default::default()
-            });
-            producer.publish(reply(3));
-
-            let shutdown = AtomicBool::new(false);
-            thread::scope(|scope| {
-                let stage = scope.spawn(|| run::<Counter>(consumer, control_rx, config, &shutdown));
-
-                // The reply before the change goes out; once the stage has
-                // taken the change, it has sent nothing for it (and the
-                // reply after it is held by `two-disks`).
-                let before = [read_frame(&mut client), read_frame(&mut client)];
-                let deadline = Instant::now() + SETTLE_TIMEOUT;
-                while utilization.ack_policy_in_force.load() != Some(AckPolicy::TwoDisks.to_byte())
-                    && Instant::now() < deadline
-                {
-                    thread::sleep(Duration::from_millis(1));
-                }
-                thread::sleep(HOLD);
-                let the_change_sent_nothing = nothing_sent(&client);
-
-                // A forced swap back to `disk`, not yet on disk itself.
-                forced_writer.store(ForcedPolicy {
-                    wire_seq: WireSeq::new(4),
-                    policy: AckPolicy::Disk.to_byte(),
-                });
-                thread::sleep(HOLD);
-                let held_until_the_entry_is_on_disk = nothing_sent(&client);
-                journal_cursor.store(WireSeq::new(4));
-                let after = [read_frame(&mut client), read_frame(&mut client)];
-
-                shutdown.store(true, Ordering::Relaxed);
-                stage.join().expect("stage panicked");
-
-                for (frames, id) in [(before, 1), (after, 3)] {
-                    let frames = frames.map(|frame| frame.expect("a reply arrived"));
-                    assert_eq!(
-                        frames,
-                        [
-                            Seen::App(KIND_RESP_ACK),
-                            Seen::Final(TAG_BATCH_END, RequestId(id))
-                        ]
-                    );
-                }
-                assert!(
-                    the_change_sent_nothing,
-                    "a frame went out for the change slot, or the reply it holds"
-                );
-                assert!(
-                    held_until_the_entry_is_on_disk,
-                    "the forced swap applied before its entry was on disk"
-                );
-            });
-        }
-    }
-
     /// The stage reports whether it holds its io_uring instance before it
     /// runs, so the node can refuse to start instead of losing the stage
     /// to a panic on a thread nobody is watching.
@@ -5688,7 +5217,7 @@ pub(crate) mod tests {
         use melin_transport_core::pipeline::OutputSlot;
         use melin_transport_core::{DurableWireSeqCursor, WireSeq};
 
-        use super::refusal_order::config;
+        use super::fixtures::config;
         use crate::connection_limit::RingSizing;
         use crate::early_reply::early_reply_channel;
         use crate::response::run;

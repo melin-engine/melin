@@ -1207,122 +1207,6 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), 0);
     }
 
-    /// A journaled policy change addressed to a registered client's own
-    /// connection queues no frame for it, not even a batch end: the
-    /// replies on either side of it are the only frames on the TX ring.
-    /// The kernel stage's counterpart is `response.rs`'s
-    /// `a_change_slot_sends_nothing_and_a_forced_one_waits_for_its_entry`,
-    /// whose harness port runs here too, forced half included
-    /// (`early_release`).
-    #[test]
-    fn a_change_slot_queues_no_frame_for_its_connection() {
-        use counter_server::{Counter, CounterQuery, CounterReport, ResponseEncoder};
-        use melin_journal::AckPolicyChange;
-        use melin_pipeline::ring::DisruptorBuilder;
-        use melin_transport_core::WireSeq;
-        use melin_transport_core::lineage::forced_policy_cell;
-        use melin_transport_core::pipeline::OutputPayload;
-
-        use crate::ack_policy::AckPolicy;
-        use crate::durability_gate::GateStart;
-        use crate::early_reply::early_reply_channel;
-
-        /// Bounds the wait for a frame that must arrive.
-        const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
-
-        fn reply(wire_seq: u64) -> OutputSlot<CounterReport, CounterQuery> {
-            OutputSlot {
-                connection_id: 1,
-                input_seq: wire_seq - 1,
-                wire_seq,
-                payload: OutputPayload::Report(CounterReport::Ack {
-                    new_value: wire_seq,
-                }),
-                is_last_in_request: true,
-                ..Default::default()
-            }
-        }
-
-        let (mut producer, mut consumers) =
-            DisruptorBuilder::<OutputSlot<CounterReport, CounterQuery>>::new(64)
-                .add_consumer()
-                .build(WaitStrategy::SpinThenYield);
-        let consumer = consumers.pop().expect("one consumer was requested");
-        let (control_tx, control_rx) = mpsc::channel();
-        control_tx
-            .send(ControlEvent::Connected { connection_id: 1 })
-            .expect("channel open");
-        let (tx, mut rx) = spsc::channel::<TxFrame>(8, WaitStrategy::SpinThenYield);
-        let early_replies = early_reply_channel(crate::early_reply::EARLY_REPLY_QUEUE_CAPACITY).1;
-
-        producer.publish(reply(1));
-        producer.publish(OutputSlot {
-            // Addressed to the client's own connection, which the matching
-            // stage never does: the change still queues nothing for it.
-            connection_id: 1,
-            input_seq: 1,
-            wire_seq: 2,
-            payload: OutputPayload::AckPolicyChange(AckPolicyChange {
-                policy: AckPolicy::Disk.to_byte(),
-                unwitnessed: false,
-            }),
-            is_last_in_request: true,
-            ..Default::default()
-        });
-        producer.publish(reply(3));
-
-        let shutdown = AtomicBool::new(false);
-        std::thread::scope(|scope| {
-            let stage = scope.spawn(|| {
-                run::<Counter>(
-                    consumer,
-                    control_rx,
-                    // Everything published is on disk: nothing is held.
-                    DurableWireSeqCursor::detached(WireSeq::new(3)),
-                    GatePolicy {
-                        start: GateStart::settled(AckPolicy::Disk),
-                        forced: forced_policy_cell().1,
-                    },
-                    None,
-                    None,
-                    &shutdown,
-                    None,
-                    Arc::new(AtomicU64::new(0)),
-                    vec![tx],
-                    Arc::new(StageUtilization::default()),
-                    WaitStrategy::SpinThenYield,
-                    Arc::new(ResponseEncoder),
-                    early_replies,
-                    None,
-                    None,
-                )
-            });
-
-            // The replies on either side of the change: once the second
-            // is queued, the stage has taken the change.
-            let mut frames = Vec::new();
-            let deadline = Instant::now() + SETTLE_TIMEOUT;
-            while frames.len() < 2 && Instant::now() < deadline {
-                match rx.try_consume() {
-                    Some((_, frame)) => frames.push(frame.connection_id),
-                    None => std::thread::yield_now(),
-                }
-            }
-            shutdown.store(true, Ordering::Relaxed);
-            stage.join().expect("stage panicked");
-            // Anything the stage queued before it stopped.
-            while let Some((_, frame)) = rx.try_consume() {
-                frames.push(frame.connection_id);
-            }
-
-            assert_eq!(
-                frames,
-                [1, 1],
-                "one frame per reply, and none for the policy change"
-            );
-        });
-    }
-
     /// A halted node past the grace period answers a held write once its
     /// own journal holds it, ending in `BatchEndDegraded`, and the
     /// refusals around it, which wait for nothing, end in a plain
@@ -1349,7 +1233,7 @@ mod tests {
         use crate::early_reply::{EarlyKind, early_reply_channel};
         use crate::halt::DegradedRelease;
         use crate::replication::ReplicationMetrics;
-        use crate::response::tests::refusal_order::{Seen, early, early_id, frames_of};
+        use crate::response::tests::fixtures::{Seen, early, early_id, frames_of};
 
         /// The held write's ID.
         const HELD: RequestId = RequestId(7);
@@ -1526,7 +1410,7 @@ mod tests {
     mod early_release {
         use super::*;
 
-        use std::collections::{HashMap, VecDeque};
+        use std::collections::{HashMap, HashSet, VecDeque};
         use std::thread::JoinHandle;
 
         use counter_server::{Counter, ResponseEncoder};
@@ -1548,7 +1432,7 @@ mod tests {
             early_replies_overtake_a_held_write, every_kind,
             every_request_is_answered_once_and_whole, rig, script, stopped_within,
         };
-        use crate::response::tests::refusal_order::{Seen, early_id, frames_of};
+        use crate::response::tests::fixtures::{Seen, early_id, frames_of};
 
         /// The DPDK stage under test, read off its TX ring the way the
         /// poll thread reads it, each frame filed under its connection.
@@ -1559,6 +1443,12 @@ mod tests {
             /// connection: the ring interleaves connections, a test reads
             /// one at a time.
             pending: HashMap<u64, VecDeque<Seen>>,
+            /// Every connection the test registered. A TX frame for any
+            /// other is a stray (the kernel stage, with no socket for it,
+            /// cannot even send one), so it fails the test however that
+            /// test reads. A `HashSet`: a handful of ids, looked up once
+            /// per frame, in no order.
+            connected: HashSet<u64>,
             shutdown: Arc<AtomicBool>,
             handle: Option<JoinHandle<()>>,
         }
@@ -1611,6 +1501,7 @@ mod tests {
                 control,
                 tx_ring,
                 pending: HashMap::new(),
+                connected: HashSet::new(),
                 shutdown,
                 handle: Some(handle),
             }
@@ -1621,6 +1512,7 @@ mod tests {
                 self.control
                     .send(ControlEvent::Connected { connection_id })
                     .expect("the stage is running");
+                self.connected.insert(connection_id);
             }
 
             fn next_frame(&mut self, connection_id: u64, within: Duration) -> Option<Seen> {
@@ -1635,6 +1527,19 @@ mod tests {
                     }
                     match self.tx_ring.try_consume() {
                         Some((_, frame)) => {
+                            // The stage never queues a frame with no
+                            // bytes, which would carry no wire frame for
+                            // a test to see.
+                            assert!(
+                                !frame.as_bytes().is_empty(),
+                                "an empty TX frame for connection {}",
+                                frame.connection_id
+                            );
+                            assert!(
+                                self.connected.contains(&frame.connection_id),
+                                "a TX frame for connection {}, which the test never registered",
+                                frame.connection_id
+                            );
                             let mut seen = Vec::new();
                             wire_frames(frame.as_bytes(), &mut seen);
                             self.pending
@@ -1797,7 +1702,7 @@ mod tests {
             use crate::batch_boundary::BatchBoundary;
             use crate::durability_gate::GateWait;
             use crate::early_reply::{EarlyKind, early_reply_channel};
-            use crate::response::tests::refusal_order::early;
+            use crate::response::tests::fixtures::early;
             use crate::response_loop::GateWaitHook;
 
             let (control_tx, control_rx) = mpsc::channel();
@@ -1845,7 +1750,7 @@ mod tests {
         #[test]
         fn gate_wait_hook_between_events_registers_and_sends() {
             use crate::early_reply::EarlyKind;
-            use crate::response::tests::refusal_order::{early_id, frames_of};
+            use crate::response::tests::fixtures::{early_id, frames_of};
 
             let (connections, seen) = hook_turn(true);
 
@@ -1876,7 +1781,7 @@ mod tests {
 
         use super::degraded_release::wire_frames;
         use crate::durability_gate::{Backing, BatchEnds};
-        use crate::response::tests::refusal_order::Seen;
+        use crate::response::tests::fixtures::Seen;
         use crate::response_frame::EncodeBuf;
 
         /// The request every slot here belongs to.
@@ -2109,7 +2014,7 @@ mod tests {
         fn a_stopped_release_drops_what_would_wait_and_sends_what_has_room() {
             use crate::batch_boundary::BatchBoundary;
             use crate::early_reply::{EARLY_REPLY_QUEUE_CAPACITY, EarlyKind, early_reply_channel};
-            use crate::response::tests::refusal_order::{early, early_id, frames_of};
+            use crate::response::tests::fixtures::{early, early_id, frames_of};
 
             let full = lane_connection_id(1, 1);
             let open = lane_connection_id(0, 1);

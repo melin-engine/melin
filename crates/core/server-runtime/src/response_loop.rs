@@ -565,9 +565,9 @@ pub(crate) fn run<E: Egress, R: Copy, Q: Copy>(
         // so their `Connected` was queued before that, and this drain sees
         // it. Drained first, the stage could read the ring after a
         // `Connected` it had not seen and drop the reply — which it did,
-        // now and then, on a fresh node under load. `registration_race`
-        // in the tests holds the stage right after this drain to pin the
-        // order.
+        // now and then, on a fresh node under load.
+        // `a_reply_that_lands_with_its_connection_is_delivered` in the
+        // tests holds the stage right after this drain to pin the order.
         let mut registered = early_replies.register(|| egress.drain_control(&control_rx));
 
         // Test seam: hold the stage right after the drain — see
@@ -921,7 +921,7 @@ mod tests {
     use crate::halt::DegradedRelease;
     use crate::replication::ReplicationMetrics;
     use crate::response::tests::early_release::{Seam, seam};
-    use crate::response::tests::refusal_order::early;
+    use crate::response::tests::fixtures::early;
 
     type Slot = OutputSlot<CounterReport, CounterQuery>;
 
