@@ -513,6 +513,18 @@ impl UringEgress {
     }
 }
 
+/// Replies are appended to a per-connection send buffer and handed to the
+/// kernel in batched io_uring SENDs. So the hooks the DPDK egress leaves
+/// empty (`dpdk_response::DpdkEgress`, whose impl says why it can) do
+/// work here: the flush before a gate wait ([`Self::before_wait`]) and on
+/// the idle path ([`Self::on_idle`]), dropping the connections an append
+/// overflowed ([`Self::after_idle_release`], [`Self::after_commit`]), and
+/// the best-effort flush at shutdown, suppressed when fenced
+/// ([`Self::on_shutdown`]). Two hooks both egresses implement do more
+/// here: the step after each slot runs a flush cadence
+/// ([`Self::after_slot`]) where the DPDK one flushes its lane every
+/// slot, and heartbeats are guarded against blocked peers and the
+/// send-buffer cap ([`Self::send_heartbeats`]).
 impl Egress for UringEgress {
     type Control = ControlEvent;
 
@@ -726,7 +738,8 @@ impl Egress for UringEgress {
     }
 
     /// Append the heartbeat to every connection it is due to
-    /// ([`heartbeat_due`]) and flush them at once.
+    /// ([`heartbeat_due`], which skips a blocked peer and one whose buffer
+    /// the frame would take past `MAX_SEND_BUF`) and flush them at once.
     ///
     /// No end-to-end samples to close here: the sample queue's invariant
     /// is that a queued entry implies a dirty connection, so the idle

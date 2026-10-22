@@ -199,13 +199,8 @@ pub fn run<A: Application>(
 
 /// The DPDK stage's connections and the TX rings every frame goes to: the
 /// stage's [`Egress`], which the shared loop ([`response_loop::run`])
-/// drives.
-///
-/// Simpler than the kernel's: the poll thread owns every socket, so a
-/// frame pushed is a frame handed over, and there is nothing to flush
-/// before a gate wait, on the idle path or at shutdown, no send buffer to
-/// overflow, and no fenced-shutdown flush to suppress. Those hooks are
-/// no-ops.
+/// drives. How it differs from the kernel's, on purpose: see the
+/// `impl Egress for DpdkEgress` block.
 ///
 /// No `egress` histogram, unlike the kernel's: DPDK egress lives in the
 /// poll thread (`dpdk_transport.rs`), which is where the actual TX
@@ -275,6 +270,23 @@ impl DpdkEgress {
     }
 }
 
+/// Simpler than the kernel's (`response::UringEgress`), and deliberately
+/// so: the poll thread owns every socket, so a frame pushed is a frame
+/// handed over, and there is no per-connection send buffer on this side.
+/// What follows from that, each a hook below rather than a comment:
+///
+/// - No flush cadence and no flush before a gate wait: each slot's lane
+///   is flushed as soon as the slot is pushed ([`Self::after_slot`]), so
+///   [`Self::before_wait`], [`Self::after_wait_release`] and
+///   [`Self::on_idle`] are no-ops.
+/// - No send buffer to overflow, so nothing to drop after a release or a
+///   commit ([`Self::after_idle_release`], [`Self::after_commit`]).
+/// - No shutdown flush to suppress when fenced ([`Self::on_shutdown`]):
+///   leaving the loop stops releasing reply frames, which is the whole ack
+///   gate.
+/// - Heartbeats skip the kernel's blocked-peer and send-buffer-cap checks
+///   ([`Self::send_heartbeats`]): with no send buffer there is nothing for
+///   them to guard; a full TX ring keeps the heartbeat due instead.
 impl Egress for DpdkEgress {
     type Control = ControlEvent;
 

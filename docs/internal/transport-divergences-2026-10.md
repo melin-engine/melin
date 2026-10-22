@@ -80,7 +80,12 @@ since accept).
 
 ## Response stage
 
-### DPDK heartbeat SPSC-full drops the connection without closing it (likely bug)
+Since the [shared response loop plan](shared-response-loop-2026-10.md), both
+transports run one response loop (`response_loop.rs`), and what still
+differs is only where the bytes go: each transport's egress
+(`UringEgress` in `response.rs`, `DpdkEgress` in `dpdk_response.rs`).
+
+### DPDK heartbeat SPSC-full drops the connection without closing it
 
 `dpdk_response.rs`, the heartbeat scan. When `try_publish` fails, the entry is
 removed and `active_connections` decremented, but the poll thread is never
@@ -110,8 +115,8 @@ thread that falls behind otherwise leaves no trace.
 
 ### DPDK reply push blocks without observing shutdown
 
-`dpdk_response.rs`, `push_frame` used `push_with`, which blocks until the TX
-ring has space and never checks `shutdown`. A wedged or dead poll thread would
+`dpdk_response.rs`, `push_frame` uses `push_with`, which blocks until the TX
+ring has space and never checks `shutdown`. A wedged or dead poll thread can
 hang the response stage past a shutdown request. The gate wait was
 specifically fixed to avoid exactly this.
 
@@ -147,7 +152,9 @@ minutes on a nearly saturated stage.
 now pace their idle housekeeping (heartbeat scan, policy re-check, stats
 flush) through the shared `IdleHousekeeping` cadence in
 `idle_housekeeping.rs`, one `IDLE_HOUSEKEEPING_INTERVAL` timer whose clock
-read is masked only while spinning past the spin budget. Pinned by
+read is masked only while spinning past the spin budget; since step 3
+both stages run that idle path in the one loop they share
+(`response_loop.rs`). Pinned by
 `a_brief_spin_finds_the_heartbeat_scan_due_on_the_first_tick`,
 `a_yielding_waiter_finds_the_heartbeat_scan_due_on_the_first_tick`,
 `a_sustained_busy_spin_masks_the_clock_read` and
@@ -199,8 +206,7 @@ startup as it was.
 
 ## Deliberate differences (no action)
 
-- DPDK response has no flush cadence or pre-gate flush: it flushes per slot.
-- DPDK response has no shutdown flush to suppress when fenced: exiting stops
-  releasing frames, which is the whole ack gate.
-- DPDK heartbeats skip the buffer-cap / blocked-peer checks: there is no
-  per-connection send buffer on that side.
+- Response stage: the DPDK egress's flush, overflow, heartbeat and
+  shutdown hooks are simpler than the kernel's, on purpose. The reasons
+  are in the doc comment on `impl Egress for DpdkEgress`
+  (`dpdk_response.rs`), next to the hooks they describe.

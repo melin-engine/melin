@@ -1,10 +1,36 @@
 # One response loop for both transports (plan, 2026-10)
 
-Status: plan, revised after seven reviews, names, test retirement, the
-shutdown check and the degraded-ack count decided.
+Status: implemented, steps 0 to 6, except the performance acceptance for
+steps 2 and 3, which is still owed (see "As implemented"). The plan below
+is kept as it was reviewed.
 
-The seam table below describes the code as it is today, under today's
-names; the kernel stage's `Egress` struct becomes `UringEgress` in step 2.
+The seam table below describes the code as it was before step 2, under
+the names of the time; the kernel stage's `Egress` struct became
+`UringEgress` in step 2.
+
+## As implemented
+
+Where the code departs from the plan below:
+
+- **Step 4's full-TX-ring test, reply case.** The plan blocks the stage
+  on its last reply push by publishing one more single-frame slot than
+  the TX ring holds. The DPDK harness's output ring is smaller than its
+  TX ring, so that many slots do not fit in it; the test instead fills
+  the TX ring with early replies (shed requests) released ahead of the
+  reply, which then blocks on its push. The early-reply case is as
+  planned.
+- **Step 4's `shutdown` argument** also reached three call sites in
+  `push_frame`'s unit tests (a helper the frame-shape tests share, and two
+  tests), a signature-only edit with no assertion changed, beside the four
+  callers the plan lists.
+- **`UringEgress::new` stays**, as the constructor the unit tests use (a
+  node that is never fenced), beside `UringEgress::for_stage`, which the
+  stage uses.
+- **The performance acceptance for steps 2 and 3 was not run**: no bench
+  hosts were available. The LAN bench comparison (echo closed-loop round
+  trip on kernel TCP and DPDK, p50, p99, p99.9, and the tick-to-trade
+  breakdown) is still owed before the branch can be taken as free of a
+  hot-path regression.
 
 Paths are relative to `crates/core/server-runtime/src/`.
 

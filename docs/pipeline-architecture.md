@@ -315,7 +315,7 @@ The node refuses to start with a layout in which threads would starve each other
 
 ## Response Stage
 
-The loop is defined in `crates/core/server-runtime/src/response_loop.rs`; the kernel TCP send path (io_uring-based SEND) in `crates/core/server-runtime/src/response.rs`.
+The loop is defined in `crates/core/server-runtime/src/response_loop.rs`; the kernel TCP send path (io_uring-based SEND) in `crates/core/server-runtime/src/response.rs`, and the DPDK one in `crates/core/server-runtime/src/dpdk_response.rs`. Both transports run the same loop, and so apply the same ack gating below.
 
 The response stage runs on a dedicated OS thread and is the final stage in the pipeline. It consumes from the output SPSC and writes encoded responses to client sockets.
 
@@ -344,32 +344,33 @@ A reply still waiting when the node stops, whether an operator stopped it or a n
 
 The acked position is cached across batches to avoid redundant atomic loads when the policy's cursors are running ahead of the response stage.
 
-### Per-connection send buffers
+### Sending: kernel TCP
 
-Connections are managed via a `HashMap<u64, ConnectionState>` containing:
-- A `BlockingFrameWriter<Box<dyn Write + Send>>` for length-prefixed framing
-- A `last_send: Instant` timestamp for heartbeat scheduling
+On kernel TCP the response stage holds a send buffer per connection and hands buffered replies to the kernel in batches, so that one system call carries many replies under load. Connections are registered and unregistered over a control channel beside the output ring, since connecting and disconnecting are rare and off the reply path.
 
-Connections are registered and unregistered via a `std::sync::mpsc` control channel (not the disruptor), since connect/disconnect is rare and not on the hot path.
+The buffers are flushed:
 
-### Adaptive flushing
+- once a connection has buffered about one TCP segment's worth of replies, or the stage has handled a fixed number of output slots since the last flush, whichever comes first. Under light load neither triggers, and replies are batched until the next point below;
+- immediately before the stage waits on the ack gate. Without this, a reply whose own event already satisfies the policy would sit in the buffer for the length of an unrelated event's fsync and replica round trip. The flush costs nothing in latency, since the stage is about to wait anyway;
+- whenever the output ring runs empty.
 
-The response stage uses an adaptive flush strategy:
+A connection whose buffered replies reach 64 KiB, or whose peer has accepted nothing for 5 seconds while replies are waiting, is dropped to bound memory: a client that stops reading cannot hold the node's memory or its connection slot.
 
-- Under high load, it processes many SPSC batches before the queue empties, accumulating buffered writes and amortizing syscall overhead across thousands of entries.
-- Under low load, the SPSC empties quickly, and the flush happens promptly.
-- Buffered writes are also flushed immediately before the stage blocks on an ack-gate wait. Without this, a response whose own gate has already opened would sit in the buffer for the length of an unrelated event's fsync and replica round-trip. The flush costs nothing in latency terms because it only happens when the stage is about to wait anyway.
+### Sending: DPDK
 
-**Operational note.** Both triggers — the lull and the pre-wait flush — fall silent while the output ring stays non-empty *and* durability keeps running ahead: no wait, no lull, no flush. A client that saturates the pipeline in that regime can accumulate 64 KiB of buffered responses, at which point the connection is dropped to bound memory. A size-based flush trigger on the consumed path would close this; it is not implemented yet.
+On DPDK nothing is buffered in the response stage: each reply is handed straight to the thread that polls the NIC for its connection, which alone touches the connection. When that thread's queue is full, the response stage waits for it to drain, or for the node to stop. A client that stops reading is still dropped, by the thread that polls the NIC, once its connection's send queue overflows; the response stage itself holds nothing per connection and drops none.
 
 ### Heartbeats
 
-When the SPSC is empty (idle period), the response stage scans connections for heartbeat timeouts. The scan runs at most once per second (coarse-gated by `Instant` comparison). Connections that have been idle longer than `heartbeat_interval` receive a pre-encoded heartbeat frame. Write errors during heartbeat cause the connection to be dropped.
+When the output ring is empty, the response stage scans connections for heartbeat timeouts, at most once per second. A connection that has had nothing sent to it for longer than the heartbeat interval is sent a heartbeat.
+
+- On kernel TCP, a connection whose peer is not reading is skipped, as is one whose buffer the heartbeat would push past the cap above; the peer detects liveness by the replies it is still draining. A send error drops the connection.
+- On DPDK, a heartbeat that finds its NIC poll thread's queue full is skipped and retried on the next scan, without dropping the connection. While the queue stays full, the node logs a warning once per heartbeat interval naming the poll thread, since every idle client on it has stopped hearing from the node.
 
 ### Connection lifecycle
 
-- **Connect**: The accept loop sends a `ControlEvent::Connected` with the `BlockingFrameWriter` via the mpsc channel.
-- **Disconnect**: Reader threads send `ControlEvent::Disconnected`. The response stage also drops connections on write errors. In both cases, the `active_connections` counter is decremented.
+- **Connect**: The accept path registers the connection with the response stage over the control channel.
+- **Disconnect**: The reader unregisters it the same way. On kernel TCP the response stage also drops connections on send errors and on the limits above. In every case the connection's slot under `--max-connections` is released.
 
 ## Output SPSC
 
