@@ -26,9 +26,9 @@ use crate::batch_boundary::{AtBoundary, BatchBoundary};
 pub(crate) use crate::durability_gate::GatePolicy;
 use crate::durability_gate::{Admission, Backing, BatchEnds, DurabilityGate, GateInputs, GateWait};
 use crate::early_reply::{EarlyReply, EarlyReplyQueue, Registered};
+use crate::idle_housekeeping::IdleHousekeeping;
 use crate::replication::ReplicationMetrics;
 use melin_app::Application;
-use melin_app::amortized_timer::AmortizedTimer;
 use melin_transport_core::pipeline::{OutputSlot, StageUtilization};
 #[cfg(feature = "latency-trace")]
 use melin_transport_core::trace;
@@ -714,13 +714,6 @@ pub fn run<A: Application>(
     // the stack all the same.
     let mut early_buf: EarlyReplyBuf = [0u8; MAX_EARLY_REPLY];
 
-    /// Cadence at which the idle spin does its housekeeping *clock read*.
-    /// The heartbeat scan, the policy re-check and the trace-stats flush
-    /// each keep their own (coarser) interval; this only bounds how
-    /// often the loop asks the clock what time it is, so it must stay at
-    /// or below the finest of them (`trace::IDLE_FLUSH_INTERVAL`, 100 ms).
-    const IDLE_HOUSEKEEPING_INTERVAL: Duration = Duration::from_millis(10);
-
     // Stage histograms registered with the global registry — see
     // `melin_transport_core::trace`. The four breakdown stages
     // (journal-wait, replica-wait, encode, egress) feed the bench's
@@ -753,11 +746,6 @@ pub fn run<A: Application>(
     let mut encode_rec = trace::register_stage("response: encode (per-kind wire encoding)");
     #[cfg(feature = "tick-to-trade")]
     let egress_rec = trace::register_stage("response: egress (flush_sends elapsed)");
-    // Paces the idle-path recorder flush. Without it, every sample this
-    // thread recorded stays in its thread-local buffer once traffic
-    // stops — which is exactly when the bench scrapes /stats-dump.
-    #[cfg(feature = "latency-trace")]
-    let mut last_stats_flush = Instant::now();
 
     let mut egress = Egress::new(
         ring,
@@ -788,14 +776,9 @@ pub fn run<A: Application>(
     // with its request's ID (`encode_early_reply`).
     let mut batch_ends = BatchEnds::new();
 
-    // Coarse timestamp for heartbeat scan — avoids Instant::now() on every spin.
-    let mut last_heartbeat_scan = Instant::now();
-
-    // Gates the idle path's housekeeping clock read. The idle spin used
-    // to call `Instant::now()` twice per iteration (heartbeat scan gate,
-    // policy re-check) to decide it had nothing to do — the same vDSO
-    // tax the DPDK stage removed with this timer.
-    let mut idle_housekeeping_timer = AmortizedTimer::new();
+    // Paces the idle path's clock read, and on it the heartbeat scan, the
+    // policy re-check and the recorders' flush. See `IdleHousekeeping`.
+    let mut housekeeping = IdleHousekeeping::new();
 
     let mut waiter = wait.waiter();
 
@@ -896,36 +879,10 @@ pub fn run<A: Application>(
             egress.flush();
 
             // Everything below is periodic housekeeping on
-            // sub-second-to-second cadences, and each check needs the
-            // current time only to discover it has nothing to do. One
-            // amortized tick per idle iteration replaces the two
-            // unconditional `Instant::now()` calls that decision used to
-            // cost; the inner intervals are unchanged, so cadences are
-            // the same (see `IDLE_HOUSEKEEPING_INTERVAL`).
-            //
-            // The timer's iteration mask is only engaged once the stage
-            // has been idle for a sustained stretch (the waiter resets
-            // on every consumed batch). That is deliberate: the mask
-            // trades cadence for clock reads, and it should only do so
-            // when clock reads are the loop's whole cost. A stage that
-            // is nearly saturated reaches this path a handful of times
-            // between batches — there the read is already rare, and
-            // masking it would stretch the one-second heartbeat scan
-            // into minutes. A yielding thread never masks either: the
-            // yield syscall dwarfs a vDSO read.
-            //
-            // "Busy-spinning, and has been for a while": under
-            // spin-then-yield a loop past its budget is no longer
-            // spinning, so the conjunction is only ever true under
-            // `BusySpin`.
-            if idle_housekeeping_timer
-                .tick(
-                    IDLE_HOUSEKEEPING_INTERVAL,
-                    waiter.spinning() && waiter.past_spin_budget(),
-                )
-                .is_some()
-            {
-                let now = Instant::now();
+            // sub-second-to-second cadences, read off one amortized
+            // clock read (see `IdleHousekeeping`).
+            if let Some(due) = housekeeping.tick(&waiter) {
+                let now = due.now;
 
                 // Send heartbeats to idle connections. Only checked
                 // during idle periods (SPSC empty) to avoid overhead on
@@ -938,10 +895,8 @@ pub fn run<A: Application>(
                 // empty. Anything dirtied from here on is heartbeat
                 // frames, which carry no samples.
                 if let Some(interval) = heartbeat_interval
-                    // Coarse gate: only scan at most once per second.
-                    && now.duration_since(last_heartbeat_scan) >= Duration::from_secs(1)
+                    && due.heartbeat_scan
                 {
-                    last_heartbeat_scan = now;
                     for (&conn_id, entry) in egress.connections.iter_mut() {
                         if heartbeat_due(entry, now, interval, heartbeat_wire_frame.len()) {
                             entry.send_buf.extend_from_slice(&heartbeat_wire_frame);
@@ -968,8 +923,7 @@ pub fn run<A: Application>(
                 // housekeeping clock read, so the spin path picks up no
                 // extra `clock_gettime`.
                 #[cfg(feature = "latency-trace")]
-                if now.duration_since(last_stats_flush) >= trace::IDLE_FLUSH_INTERVAL {
-                    last_stats_flush = now;
+                if due.stats_flush {
                     spsc_rec.flush();
                     dispatch_rec.flush();
                     egress.server_e2e_rec.flush();
@@ -4459,7 +4413,7 @@ pub(crate) mod tests {
         };
         use melin_transport_core::{DurableWireSeqCursor, WireSeq};
         use melin_wire_protocol::control::{MAX_REFUSAL_REASON, RefusalKind};
-        use melin_wire_protocol::control_codec::TAG_BATCH_END;
+        use melin_wire_protocol::control_codec::{TAG_BATCH_END, TAG_RESPONSE_HEARTBEAT};
         use proptest::prelude::*;
 
         use super::refusal_order::{
@@ -4518,6 +4472,9 @@ pub(crate) mod tests {
             /// The stage's test seam, called right after each control
             /// drain; `None` runs it as production does.
             pub(crate) pause_after_control_drain: Option<Box<dyn FnMut() + Send>>,
+            /// The stage's heartbeat interval; `None` sends none, so a
+            /// test that does not ask for heartbeats sees only replies.
+            pub(crate) heartbeat_interval: Option<Duration>,
         }
 
         /// A running response stage, seen from its clients. Stops the
@@ -4595,6 +4552,18 @@ pub(crate) mod tests {
             connections: &[u64],
             seam_holds: usize,
         ) -> Rig<H> {
+            rig_with_heartbeats(start, journal_at, connections, seam_holds, None)
+        }
+
+        /// [`rig`], with the stage sending heartbeats every
+        /// `heartbeat_interval` (none if `None`).
+        fn rig_with_heartbeats<H: StageHarness>(
+            start: fn(StageInputs) -> H,
+            journal_at: u64,
+            connections: &[u64],
+            seam_holds: usize,
+            heartbeat_interval: Option<Duration>,
+        ) -> Rig<H> {
             let (pause, seam) = match seam_holds {
                 0 => (None, None),
                 holds => {
@@ -4627,6 +4596,7 @@ pub(crate) mod tests {
                 forced: forced_reader,
                 shutdown: Arc::new(AtomicBool::new(false)),
                 pause_after_control_drain: pause,
+                heartbeat_interval,
             });
             for &id in connections {
                 stage.connect(id);
@@ -4766,6 +4736,24 @@ pub(crate) mod tests {
                 Seen::App(KIND_RESP_ACK),
                 Seen::Final(TAG_BATCH_END, RequestId(id)),
             ]
+        }
+
+        /// An idle connection is sent a heartbeat on each of the idle
+        /// path's heartbeat scans, which run off its housekeeping timer:
+        /// the wiring from `IdleHousekeeping`'s due scan to the stage's
+        /// heartbeat send. Two in a row, so a scan that fired once and
+        /// never again fails.
+        pub(crate) fn an_idle_connection_is_sent_heartbeats<H: StageHarness>(
+            start: fn(StageInputs) -> H,
+        ) {
+            let mut rig = rig_with_heartbeats(start, 0, &[1], 0, Some(Duration::from_millis(10)));
+            assert_eq!(
+                rig.frames(1, 2),
+                [
+                    Seen::Protocol(TAG_RESPONSE_HEARTBEAT),
+                    Seen::Protocol(TAG_RESPONSE_HEARTBEAT),
+                ]
+            );
         }
 
         /// An early reply for a connection whose event straddles two reads
@@ -5284,6 +5272,7 @@ pub(crate) mod tests {
             config.replication_metrics = Some(inputs.replication_metrics);
             config.replica_active = Some(inputs.replica_active);
             config.utilization = inputs.utilization;
+            config.heartbeat_interval = inputs.heartbeat_interval;
             let shutdown = Arc::clone(&inputs.shutdown);
             let consumer = inputs.consumer;
             let handle =
@@ -5327,6 +5316,11 @@ pub(crate) mod tests {
                     }
                 }
             }
+        }
+
+        #[test]
+        fn an_idle_connection_is_sent_heartbeats_uring() {
+            an_idle_connection_is_sent_heartbeats(start_uring);
         }
 
         #[test]

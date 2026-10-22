@@ -123,6 +123,17 @@ The DPDK heartbeat timer also omits the `past_spin_budget()` condition that
 `response.rs` explains is needed to keep the heartbeat scan from stretching to
 minutes on a nearly saturated stage.
 
+**Fixed** by step 1 of the
+[shared response loop plan](shared-response-loop-2026-10.md): both stages
+now pace their idle housekeeping (heartbeat scan, policy re-check, stats
+flush) through the shared `IdleHousekeeping` cadence in
+`idle_housekeeping.rs`, one `IDLE_HOUSEKEEPING_INTERVAL` timer whose clock
+read is masked only while spinning past the spin budget. Pinned by
+`a_brief_spin_finds_the_heartbeat_scan_due_on_the_first_tick`,
+`a_yielding_waiter_finds_the_heartbeat_scan_due_on_the_first_tick`,
+`a_sustained_busy_spin_masks_the_clock_read` and
+`the_heartbeat_scan_is_due_once_per_scan_interval` there.
+
 ## Replication
 
 ### DPDK sender `Handshaking` state has no deadline

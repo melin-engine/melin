@@ -21,6 +21,14 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   heartbeat is now retried on the next scan. The node logs a warning when
   a poll thread's heartbeats start being held back by its full TX ring,
   again once per heartbeat interval while they are, and when they resume.
+- **DPDK heartbeats are no longer delayed on a busy node.** On a node
+  whose response stage was nearly saturated, idling only briefly between
+  batches, the scan for idle connections due a heartbeat could be
+  postponed by many seconds, long enough for an idle client to time out.
+  The DPDK response stage now paces its idle housekeeping as the kernel
+  TCP one does: the scan runs once a second however briefly the stage
+  idles, and the stage stops reading the clock on every idle pass once it
+  has been idle for a while.
 
 ## [0.22.0] - 2026-10-21
 

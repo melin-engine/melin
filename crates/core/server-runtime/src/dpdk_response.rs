@@ -25,8 +25,8 @@ use crate::durability_gate::{
     Admission, Backing, BatchEnds, DurabilityGate, GateInputs, GatePolicy, GateWait,
 };
 use crate::early_reply::{EarlyReplyQueue, Registered};
+use crate::idle_housekeeping::IdleHousekeeping;
 use melin_app::Application;
-use melin_app::amortized_timer::AmortizedTimer;
 use melin_transport_core::DurableWireSeqCursor;
 use melin_transport_core::pipeline::{OutputSlot, StageUtilization};
 
@@ -208,11 +208,11 @@ pub fn run<A: Application>(
     )
     .expect("heartbeat encodes");
 
-    // Gate the heartbeat scan's clock read so the count==0 spin doesn't
-    // spend the response thread's CPU on `__vdso_clock_gettime`. Reads
-    // the clock every ~1 M idle iterations while spinning; heartbeat
-    // interval is seconds, so this is plenty.
-    let mut heartbeat_timer = AmortizedTimer::new();
+    // Paces the idle path's clock read, and on it the heartbeat scan, the
+    // policy re-check and the recorders' flush, as on the kernel stage.
+    // Without it, perf-annotate showed ~22 % of the response thread's CPU
+    // on `__vdso_clock_gettime`. See `IdleHousekeeping`.
+    let mut housekeeping = IdleHousekeeping::new();
     let mut heartbeat_stalls = HeartbeatStalls::new(tx_producers.len());
     let mut waiter = wait.waiter();
     let mut busy_count: u64 = 0;
@@ -243,9 +243,6 @@ pub fn run<A: Application>(
     );
     #[cfg(feature = "tick-to-trade")]
     let mut encode_rec = trace::register_stage("response: encode (per-kind wire encoding)");
-    // Paces the idle-path recorder flush — see `response::run`.
-    #[cfg(feature = "latency-trace")]
-    let mut last_stats_flush = Instant::now();
 
     'run: loop {
         // Fencing note: a superseded ex-primary exits through this same
@@ -307,46 +304,35 @@ pub fn run<A: Application>(
                 );
             }
 
-            idle_count += 1;
-            if idle_count.is_multiple_of(1024) {
-                utilization.busy.store(busy_count, Ordering::Relaxed);
-                utilization.idle.store(idle_count, Ordering::Relaxed);
-            }
+            // Periodic housekeeping, read off one amortized clock read,
+            // as on the kernel stage (see `IdleHousekeeping`).
+            if let Some(due) = housekeeping.tick(&waiter) {
+                let now = due.now;
 
-            // Heartbeat scan, gated by AmortizedTimer to keep the busy-
-            // spin path off `clock_gettime`. Without this, perf-annotate
-            // showed ~22 % of the response thread's CPU on the vDSO.
-            if let Some(interval) = heartbeat_interval
-                && heartbeat_timer
-                    .tick(Duration::from_secs(1), waiter.spinning())
-                    .is_some()
-            {
-                let now = Instant::now();
-                send_due_heartbeats(
-                    &mut connections,
-                    &mut tx_producers,
-                    &heartbeat_frame[..heartbeat_len],
-                    now,
-                    interval,
-                    &mut heartbeat_stalls,
-                );
-                heartbeat_stalls.finish_scan(now, interval, log_stall_change);
-            }
+                if let Some(interval) = heartbeat_interval
+                    && due.heartbeat_scan
+                {
+                    send_due_heartbeats(
+                        &mut connections,
+                        &mut tx_producers,
+                        &heartbeat_frame[..heartbeat_len],
+                        now,
+                        interval,
+                        &mut heartbeat_stalls,
+                    );
+                    heartbeat_stalls.finish_scan(now, interval, log_stall_change);
+                }
 
-            // Re-evaluate the policy on a slow timer so the
-            // `policy_degraded` flag and warn-log track the cluster
-            // state even when no batches are flowing. See response.rs
-            // for the rationale.
-            {
-                let now_ts = Instant::now();
-                gate.idle_recheck(now_ts);
+                // Re-evaluate the policy on a slow timer so the
+                // `policy_degraded` flag and warn-log track the cluster
+                // state even when no batches are flowing. See response.rs
+                // for the rationale.
+                gate.idle_recheck(now);
 
                 // Hand buffered latency samples to the stats registry
-                // while idle. Reuses the policy check's clock read —
-                // see `response::run` for why this must happen at all.
+                // while idle, off the same clock read.
                 #[cfg(feature = "latency-trace")]
-                if now_ts.duration_since(last_stats_flush) >= trace::IDLE_FLUSH_INTERVAL {
-                    last_stats_flush = now_ts;
+                if due.stats_flush {
                     spsc_rec.flush();
                     dispatch_rec.flush();
                     server_e2e_rec.flush();
@@ -359,6 +345,11 @@ pub fn run<A: Application>(
                 }
             }
 
+            idle_count += 1;
+            if idle_count.is_multiple_of(1024) {
+                utilization.busy.store(busy_count, Ordering::Relaxed);
+                utilization.idle.store(idle_count, Ordering::Relaxed);
+            }
             waiter.idle();
             continue;
         }
@@ -1689,8 +1680,9 @@ mod tests {
             a_reply_that_lands_with_its_connection_is_delivered,
             a_stopped_stage_leaves_the_gate_and_drops_the_held_reply,
             an_early_reply_waits_out_an_event_split_across_reads,
-            connection_first_seen_inside_a_gate_wait, early_replies_overtake_a_held_write,
-            every_kind, every_request_is_answered_once_and_whole, script, stopped_within,
+            an_idle_connection_is_sent_heartbeats, connection_first_seen_inside_a_gate_wait,
+            early_replies_overtake_a_held_write, every_kind,
+            every_request_is_answered_once_and_whole, script, stopped_within,
         };
         use crate::response::tests::refusal_order::Seen;
 
@@ -1725,6 +1717,7 @@ mod tests {
                 forced,
                 shutdown: stage_shutdown,
                 pause_after_control_drain,
+                heartbeat_interval,
             } = inputs;
             let handle = std::thread::spawn(move || {
                 run::<Counter>(
@@ -1738,7 +1731,7 @@ mod tests {
                     Some(replication_metrics),
                     Some(replica_active),
                     &stage_shutdown,
-                    None,
+                    heartbeat_interval,
                     Arc::new(AtomicU64::new(0)),
                     vec![tx],
                     utilization,
@@ -1806,6 +1799,11 @@ mod tests {
                     }
                 }
             }
+        }
+
+        #[test]
+        fn an_idle_connection_is_sent_heartbeats_dpdk() {
+            an_idle_connection_is_sent_heartbeats(start_dpdk);
         }
 
         #[test]
