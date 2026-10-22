@@ -1292,11 +1292,10 @@ fn unknown_key() -> SigningKey {
 /// The retries are load-bearing, and not only at startup, when nothing
 /// answers ARP until the port is up. A connection the node turns away at
 /// `max_connections` is accepted and then never challenged, and the one
-/// slot can stay taken for up to [`HEARTBEAT`] after an authorised client
-/// has closed: the node does not see a client's FIN, only the RST that
-/// answers its next heartbeat (pinned by
-/// `a_client_close_is_seen_only_at_the_next_heartbeat`). Every test that
-/// has called [`assert_slot_freed`] leaves such a connection behind.
+/// slot is freed only once the node has seen an authorised client's FIN
+/// (pinned by `a_client_close_frees_its_slot_at_once`), which a connect
+/// racing the close can beat. Every test that has called
+/// [`assert_slot_freed`] leaves such a connection behind.
 fn connect_for_challenge(node: SocketAddr) -> (TcpStream, Vec<u8>) {
     challenge_within(node, STARTUP_LIMIT)
         .unwrap_or_else(|e| panic!("no challenge from {node} within {STARTUP_LIMIT:?}: {e}"))
