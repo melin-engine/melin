@@ -110,10 +110,29 @@ thread that falls behind otherwise leaves no trace.
 
 ### DPDK reply push blocks without observing shutdown
 
-`dpdk_response.rs`, `push_frame` uses `push_with`, which blocks until the TX
+`dpdk_response.rs`, `push_frame` used `push_with`, which blocks until the TX
 ring has space and never checks `shutdown`. A wedged or dead poll thread would
 hang the response stage past a shutdown request. The gate wait was
 specifically fixed to avoid exactly this.
+
+**Fixed** by step 4 of the
+[shared response loop plan](shared-response-loop-2026-10.md), for the reply
+push and the early-reply push both: `push_frame` now waits through
+`spsc::Producer::push_with_unless`, which reads the shutdown flag only
+while the ring is full, so a push with room goes through as before and
+DPDK still finishes the batch in hand as kernel TCP does. A stopped reply
+push returns `SlotOutcome::Stopped`, which leaves the shared loop through
+its one epilogue, uncommitted; a stopped early-reply push drops that reply,
+and the drain finishes without waiting. Pinned by
+`a_reply_blocked_on_a_full_tx_ring_does_not_hold_the_stage_past_shutdown`
+and
+`an_early_reply_blocked_on_a_full_tx_ring_does_not_hold_the_stage_past_shutdown`
+in `dpdk_response.rs` (a TX ring never drained), the egress's
+`a_slot_on_a_full_lane_is_stopped_by_shutdown` and
+`a_stopped_release_drops_what_would_wait_and_sends_what_has_room`, the
+`push_with_unless_*` tests in `melin-pipeline`'s `spsc.rs`, and, for the
+loop's exit, `a_stopped_send_commits_nothing_and_runs_only_the_epilogue`
+in `response_loop.rs`.
 
 ### DPDK idle path reads the clock every iteration
 

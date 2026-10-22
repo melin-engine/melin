@@ -22,9 +22,9 @@
 //!   waits behind a held write;
 //! - the batch's clock is read once per batch (`batch_now`), while early
 //!   replies read it lazily, only when there is one to send;
-//! - every exit (the top's shutdown check, the admit's `Shutdown`) leaves
-//!   the loop to one epilogue, without committing and without reading the
-//!   ring again;
+//! - every exit (the top's shutdown check, the admit's `Shutdown`, a send
+//!   stopped while it waited for room) leaves the loop to one epilogue,
+//!   without committing and without reading the ring again;
 //! - the consumer commits only after every slot of the batch cleared the
 //!   gate, which is what the event publisher, chained behind it, relies on;
 //! - after the commit, [`Egress::after_commit`], then `gate.after_batch`;
@@ -110,11 +110,19 @@ pub(crate) trait Egress {
     /// `Admission::Reply`: a change slot (`Admission::GateOnly`) has no
     /// destination and is not offered to the egress, so it is never
     /// logged as a miss.
+    ///
+    /// An egress whose send can wait for room reads `shutdown` while it
+    /// waits, and only then, and returns `SlotOutcome::Stopped` (compiled
+    /// only where such an egress is, so not linked here) if the
+    /// flag ended the wait; one whose send never waits ignores it. A send
+    /// with room goes through whatever the flag says: the loop finishes
+    /// the batch in hand unless something has to wait.
     fn send_slot<R: Copy, Q: Copy>(
         &mut self,
         connection_id: u64,
         reply: SlotReply<'_, R, Q>,
         now: Instant,
+        shutdown: &AtomicBool,
     ) -> SlotOutcome;
 
     /// After every slot the loop finishes, sent or not (a reply, a miss, a
@@ -124,6 +132,13 @@ pub(crate) trait Egress {
     /// Send every early reply `registered` holds, between two events'
     /// replies (`at`), and return how many. `now` is read once, and only
     /// if there is one.
+    ///
+    /// The drain always runs to the end of the snapshot. An egress whose
+    /// send can wait for room reads `shutdown` while it waits: once the
+    /// flag is set, a reply that would have to wait is dropped, as a
+    /// shutdown drops every unsent reply, and one with room still goes.
+    /// The loop then leaves at its next shutdown check (the top of the
+    /// loop on the idle path, the gate's wait inside it).
     fn release_early_replies<R: Copy, Q: Copy>(
         &mut self,
         registered: &mut Registered<'_, R>,
@@ -131,6 +146,7 @@ pub(crate) trait Egress {
         encoder: &dyn ResponseEncoder<Report = R, Query = Q>,
         early_buf: &mut EarlyReplyBuf,
         now: impl Fn() -> Instant,
+        shutdown: &AtomicBool,
     ) -> usize;
 
     /// Before the gate's first wait on a slot (see
@@ -181,6 +197,16 @@ pub(crate) enum SlotOutcome {
     /// No such connection: nothing was encoded or built, and the loop
     /// logs the miss.
     Unknown,
+    /// The send had to wait for room and was stopped by shutdown while it
+    /// waited: nothing of the reply was handed on. The loop leaves to its
+    /// epilogue, without the slot's `after_slot`, without committing and
+    /// without reading the ring again. A way for an egress to report a
+    /// stop, not an obligation to check: one whose send never waits never
+    /// returns it. Only the DPDK egress's push waits, so the variant, and
+    /// the loop's arm for it, exist only under its feature (and for the
+    /// tests' recording egress).
+    #[cfg(any(feature = "dpdk", test))]
+    Stopped,
 }
 
 /// What [`Egress::send_slot`] hands over: what encoding the payload needs
@@ -287,6 +313,10 @@ pub(crate) struct GateWaitHook<'a, 'q, E: Egress, R: Copy, Q: Copy> {
     pub(crate) control_rx: &'a mpsc::Receiver<E::Control>,
     pub(crate) encoder: &'a dyn ResponseEncoder<Report = R, Query = Q>,
     pub(crate) early_buf: &'a mut EarlyReplyBuf,
+    /// The stage's shutdown flag, for an early reply's send that has to
+    /// wait for room (see [`Egress::release_early_replies`]). The gate's
+    /// own wait reads it on its next turn.
+    pub(crate) shutdown: &'a AtomicBool,
 }
 
 impl<E: Egress, R: Copy, Q: Copy> GateWait for GateWaitHook<'_, '_, E, R, Q> {
@@ -313,6 +343,7 @@ impl<E: Egress, R: Copy, Q: Copy> GateWait for GateWaitHook<'_, '_, E, R, Q> {
             self.encoder,
             self.early_buf,
             Instant::now,
+            self.shutdown,
         ) > 0
         {
             egress.after_wait_release();
@@ -495,12 +526,12 @@ pub(crate) fn run<E: Egress, R: Copy, Q: Copy>(
     let mut boundary = BatchBoundary::new();
 
     'run: loop {
-        // Every exit goes to the epilogue after the loop: this check, and
-        // the admit's `Shutdown` below. A fenced node takes it too: fencing
-        // always co-sets `shutdown` (`FenceState::fence_if_superseded`
-        // owns that invariant), so the steady-state loop pays nothing for
-        // the fence, and the egress decides on the way out what a fenced
-        // stage may still send.
+        // Every exit goes to the epilogue after the loop: this check, the
+        // admit's `Shutdown` and a stopped send below. A fenced node takes
+        // it too: fencing always co-sets `shutdown`
+        // (`FenceState::fence_if_superseded` owns that invariant), so the
+        // steady-state loop pays nothing for the fence, and the egress
+        // decides on the way out what a fenced stage may still send.
         if shutdown.load(Ordering::Relaxed) {
             break 'run;
         }
@@ -557,6 +588,7 @@ pub(crate) fn run<E: Egress, R: Copy, Q: Copy>(
                     &*encoder,
                     &mut early_buf,
                     Instant::now,
+                    shutdown,
                 );
                 egress.after_idle_release();
             }
@@ -682,6 +714,7 @@ pub(crate) fn run<E: Egress, R: Copy, Q: Copy>(
                     &*encoder,
                     &mut early_buf,
                     || batch_now,
+                    shutdown,
                 );
             }
 
@@ -730,6 +763,7 @@ pub(crate) fn run<E: Egress, R: Copy, Q: Copy>(
                     control_rx: &control_rx,
                     encoder: &*encoder,
                     early_buf: &mut early_buf,
+                    shutdown,
                 },
             );
             let reply = match admission {
@@ -770,7 +804,7 @@ pub(crate) fn run<E: Egress, R: Copy, Q: Copy>(
             if let Some((connection_id, backing)) = reply {
                 let reply =
                     SlotReply::new(slot, backing, &*encoder, &mut encode_buf, &mut batch_ends);
-                match egress.send_slot(connection_id, reply, batch_now) {
+                match egress.send_slot(connection_id, reply, batch_now, shutdown) {
                     SlotOutcome::Known => {
                         // A degraded terminator counts for
                         // `melin_degraded_acks_total`: once per request,
@@ -804,6 +838,13 @@ pub(crate) fn run<E: Egress, R: Copy, Q: Copy>(
                             );
                         }
                     }
+                    // Shutdown while the send waited for room: out of the
+                    // loop, as from the admit's `Shutdown` above, and for
+                    // the same reasons. This slot's reply was not handed
+                    // on, and the rest of the batch goes with it,
+                    // uncommitted.
+                    #[cfg(any(feature = "dpdk", test))]
+                    SlotOutcome::Stopped => break 'run,
                 }
             }
 
@@ -912,6 +953,10 @@ mod tests {
         OnShutdown,
     }
 
+    /// The connection whose sends never find room: see
+    /// [`Recording::send_slot`].
+    const FULL: u64 = 99;
+
     /// An egress that holds no bytes and logs every hook call. A
     /// connection is known once the control channel registered it.
     struct Recording {
@@ -957,11 +1002,14 @@ mod tests {
             }
         }
 
+        /// A send to [`FULL`] waits for room that never comes, until
+        /// `shutdown` stops it, as a push on a ring nobody drains does.
         fn send_slot<R: Copy, Q: Copy>(
             &mut self,
             connection_id: u64,
             reply: SlotReply<'_, R, Q>,
             _now: Instant,
+            shutdown: &AtomicBool,
         ) -> SlotOutcome {
             let known = self.known.contains(&connection_id);
             self.log(Call::SendSlot {
@@ -970,6 +1018,12 @@ mod tests {
                 known,
                 committed: self.committed(),
             });
+            if known && connection_id == FULL {
+                while !shutdown.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                return SlotOutcome::Stopped;
+            }
             if known {
                 let _frames = reply.into_frames();
                 SlotOutcome::Known
@@ -991,6 +1045,7 @@ mod tests {
             _encoder: &dyn ResponseEncoder<Report = R, Query = Q>,
             _early_buf: &mut EarlyReplyBuf,
             _now: impl Fn() -> Instant,
+            _shutdown: &AtomicBool,
         ) -> usize {
             let released = registered.drain(at, |_| {});
             if released > 0 {
@@ -1528,6 +1583,47 @@ mod tests {
             ]
         );
         assert_eq!(stage.committed(), base, "a held batch was committed");
+    }
+
+    /// A send stopped by shutdown while it waited for room leaves the
+    /// loop: no `after_slot` for it, the rest of its batch not sent,
+    /// nothing committed, the ring not read again, and no hook but the
+    /// epilogue's.
+    #[test]
+    fn a_stopped_send_commits_nothing_and_runs_only_the_epilogue() {
+        let mut stage = start(GateKind::Disk, 10);
+        let base = stage.committed();
+        stage.connect(1);
+        stage.connect(FULL);
+        assert_eq!(stage.step(), idle_then_drained(&[1, FULL]));
+        stage.publish(1, 1, 1, true);
+        stage.publish(FULL, 2, 2, true);
+        stage.publish(1, 3, 3, true);
+        assert_eq!(stage.step(), IDLE);
+
+        stage.seam().resume();
+        let stopped = Call::SendSlot {
+            connection_id: FULL,
+            request: 2,
+            known: true,
+            committed: base,
+        };
+        stage.wait_for(&stopped);
+        assert_eq!(
+            stage.stop(),
+            [
+                Call::SendSlot {
+                    connection_id: 1,
+                    request: 1,
+                    known: true,
+                    committed: base,
+                },
+                Call::AfterSlot { committed: base },
+                stopped,
+                Call::OnShutdown,
+            ]
+        );
+        assert_eq!(stage.committed(), base, "a stopped batch was committed");
     }
 
     /// Shutdown seen at the top of the loop: the epilogue, once, and the

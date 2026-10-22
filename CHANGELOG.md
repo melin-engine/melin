@@ -12,8 +12,24 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ## [Unreleased]
 
+### Added
+
+- **`melin_pipeline::spsc::Producer::push_with_unless`**: the blocking
+  push, given up with `Stopped`, having written nothing, if a stop flag is
+  set while it waits for room. A push with room never reads the flag.
+
 ### Fixed
 
+- **A DPDK node no longer hangs on shutdown when a poll thread stops
+  draining its replies.** The response stage waited for room on that poll
+  thread's full TX ring without checking whether the node was shutting
+  down (or had been fenced by a new primary), so a stalled poll thread
+  held the stage, and the shutdown with it, indefinitely. The wait now
+  ends on shutdown: the reply it was holding is not sent, nor the rest of
+  its batch, as when a shutdown interrupts a wait for durability, and an
+  early answer (a rejection, a refusal, a busy) that would have to wait is
+  dropped. Those clients reconcile on reconnect, as after any shutdown. A
+  reply that finds room is still sent, as on kernel TCP.
 - **A DPDK client connection is no longer dropped from the reply path when
   a heartbeat cannot be queued** (finding 27 of the determinism audit).
   The connection stayed open with its requests still applied, but every

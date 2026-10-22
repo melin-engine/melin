@@ -572,7 +572,8 @@ impl Egress for UringEgress {
     /// all before a flush would take a client that reads its replies past
     /// `MAX_SEND_BUF`. Flushing here is allowed because the drain holds
     /// `at`: no event's reply is half-buffered. Returns how many were
-    /// sent; `now` is read once, and only if there is one.
+    /// sent; `now` is read once, and only if there is one. An append
+    /// never waits for room, so `shutdown` is never read.
     fn release_early_replies<R: Copy, Q: Copy>(
         &mut self,
         registered: &mut Registered<'_, R>,
@@ -580,6 +581,7 @@ impl Egress for UringEgress {
         encoder: &dyn melin_app::encoder::ResponseEncoder<Report = R, Query = Q>,
         early_buf: &mut EarlyReplyBuf,
         now: impl Fn() -> Instant,
+        _shutdown: &AtomicBool,
     ) -> usize {
         let mut stamp = None;
         registered.drain(at, |reply| {
@@ -603,13 +605,17 @@ impl Egress for UringEgress {
     /// the flush cadence ([`FlushCadence`]), which [`Self::after_slot`]
     /// checks. An append that would overflow `MAX_SEND_BUF` queues the
     /// connection for removal, sends nothing, and is still
-    /// [`SlotOutcome::Known`].
+    /// [`SlotOutcome::Known`]. An append never waits for room, so
+    /// `shutdown` is never read and the outcome is never
+    /// `SlotOutcome::Stopped`: this stage notices a shutdown at a gate
+    /// wait or at the top of the loop.
     #[inline]
     fn send_slot<R: Copy, Q: Copy>(
         &mut self,
         connection_id: u64,
         reply: SlotReply<'_, R, Q>,
         now: Instant,
+        _shutdown: &AtomicBool,
     ) -> SlotOutcome {
         let Some(entry) = self.connections.get_mut(&connection_id) else {
             return SlotOutcome::Unknown;
@@ -3377,7 +3383,7 @@ pub(crate) mod tests {
         use std::os::unix::io::AsRawFd;
         use std::os::unix::net::UnixStream;
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
         use std::thread;
         use std::time::{Duration, Instant};
 
@@ -3449,6 +3455,7 @@ pub(crate) mod tests {
                 &ResponseEncoder,
                 &mut early_buf,
                 Instant::now,
+                &AtomicBool::new(false),
             );
             egress.drop_overflowed();
             egress.flush();
@@ -3565,7 +3572,7 @@ pub(crate) mod tests {
     mod uring_egress {
         use std::os::unix::net::UnixStream;
         use std::sync::Arc;
-        use std::sync::atomic::Ordering;
+        use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::{Duration, Instant};
 
         use counter_server::{CounterQuery, CounterReport, KIND_RESP_ACK, ResponseEncoder};
@@ -3611,6 +3618,7 @@ pub(crate) mod tests {
                     &mut batch_ends,
                 ),
                 Instant::now(),
+                &AtomicBool::new(false),
             )
         }
 
@@ -3713,7 +3721,7 @@ pub(crate) mod tests {
     mod gate_wait_hook {
         use std::os::unix::net::UnixStream;
         use std::sync::Arc;
-        use std::sync::atomic::AtomicU64;
+        use std::sync::atomic::{AtomicBool, AtomicU64};
         use std::sync::mpsc;
         use std::time::Duration;
 
@@ -3767,6 +3775,7 @@ pub(crate) mod tests {
                 control_rx: &control_rx,
                 encoder: &ResponseEncoder,
                 early_buf: &mut early_buf,
+                shutdown: &AtomicBool::new(false),
             }
             .while_waiting();
             (egress, client)

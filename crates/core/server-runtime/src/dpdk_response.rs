@@ -302,12 +302,18 @@ impl Egress for DpdkEgress {
     /// decides whether the connection is still known, and the same borrow
     /// stamps its heartbeat clock, even when nothing was pushed (an encode
     /// error on a slot that does not end its request).
+    ///
+    /// [`SlotOutcome::Stopped`] if the push waited for room on a full
+    /// lane and `shutdown` ended the wait: nothing was pushed, the clock
+    /// is not stamped, and no lane is kept, since the loop leaves without
+    /// this slot's `after_slot`.
     #[inline]
     fn send_slot<R: Copy, Q: Copy>(
         &mut self,
         connection_id: u64,
         reply: SlotReply<'_, R, Q>,
         now: Instant,
+        shutdown: &AtomicBool,
     ) -> SlotOutcome {
         // The loop pairs every send_slot with an after_slot, which takes
         // the lane: one still held here would go unflushed and lose its
@@ -324,13 +330,17 @@ impl Egress for DpdkEgress {
 
         #[cfg(feature = "tick-to-trade")]
         let encode_start = trace::mono_trace_ns();
-        push_frame(
+        let pushed = push_frame(
             frames.payload,
             connection_id,
             &mut self.tx_producers[lane],
             frames.encode_buf,
             frames.trailer,
+            shutdown,
         );
+        if let Err(spsc::Stopped) = pushed {
+            return SlotOutcome::Stopped;
+        }
         #[cfg(feature = "tick-to-trade")]
         self.encode_rec
             .record_elapsed(encode_start, trace::mono_trace_ns());
@@ -371,7 +381,9 @@ impl Egress for DpdkEgress {
     /// replies (`at`), each as its own TX frame ([`push_early_reply`]).
     /// Returns how many; `now` is read once, and only if there is one. No
     /// send buffer to overflow: each reply is handed to the poll thread as
-    /// it is encoded.
+    /// it is encoded. Once `shutdown` is set, a reply whose lane is full
+    /// is dropped rather than waited for ([`push_early_reply`]), so the
+    /// drain finishes without waiting.
     fn release_early_replies<R: Copy, Q: Copy>(
         &mut self,
         registered: &mut Registered<'_, R>,
@@ -379,6 +391,7 @@ impl Egress for DpdkEgress {
         encoder: &dyn melin_app::encoder::ResponseEncoder<Report = R, Query = Q>,
         early_buf: &mut EarlyReplyBuf,
         now: impl Fn() -> Instant,
+        shutdown: &AtomicBool,
     ) -> usize {
         let mut stamp = None;
         registered.drain(at, |reply| {
@@ -390,6 +403,7 @@ impl Egress for DpdkEgress {
                 &mut self.tx_producers,
                 early_buf,
                 now,
+                shutdown,
             );
         })
     }
@@ -451,6 +465,13 @@ impl Egress for DpdkEgress {
 /// but still ship the trailer, so a request that fails to encode one response
 /// is still terminated rather than leaving the client waiting.
 ///
+/// The one push of a reply or an early reply, and so the one place either
+/// waits for room: on a full ring it waits for the poll thread to drain it,
+/// unless `shutdown` is set meanwhile, and then returns `Err(Stopped)`
+/// having pushed nothing. A wedged poll thread cannot hold the stage past a
+/// shutdown. The flag is read only while waiting: a push with room goes
+/// through whatever it says.
+///
 /// # Panics
 ///
 /// If the payload and the trailer together exceed [`MAX_TX_FRAME`]: a bug
@@ -464,7 +485,8 @@ fn push_frame(
     tx: &mut spsc::Producer<TxFrame>,
     encode_buf: &[u8],
     trailer: &[u8],
-) {
+    shutdown: &AtomicBool,
+) -> Result<(), spsc::Stopped> {
     let written = match payload {
         Some(Ok(n)) => n,
         Some(Err(reason)) => {
@@ -474,7 +496,7 @@ fn push_frame(
         None => 0,
     };
     if written == 0 && trailer.is_empty() {
-        return;
+        return Ok(());
     }
     let total = written + trailer.len();
     assert!(
@@ -484,19 +506,25 @@ fn push_frame(
     );
     // Lossless: at most `MAX_TX_FRAME`, asserted above.
     let len = total as u16;
-    tx.push_with(|frame| {
-        frame.connection_id = conn_id;
-        frame.len = len;
-        frame.data[..written].copy_from_slice(&encode_buf[..written]);
-        frame.data[written..total].copy_from_slice(trailer);
-    });
+    tx.push_with_unless(
+        |frame| {
+            frame.connection_id = conn_id;
+            frame.len = len;
+            frame.data[..written].copy_from_slice(&encode_buf[..written]);
+            frame.data[written..total].copy_from_slice(trailer);
+        },
+        shutdown,
+    )?;
+    Ok(())
 }
 
 /// Queue an answer the poll thread decided on — a halt rejection, a
 /// filtered or refused request, a shed one — for the poll thread, every
 /// frame of it in one TX frame, encoded by [`encode_early_reply`]. No
 /// durability gate: nothing was published. A connection that has gone
-/// away is skipped.
+/// away is skipped, and so is a reply whose push was stopped by
+/// `shutdown` while it waited for room ([`push_frame`]): a shutdown drops
+/// every unsent reply.
 fn push_early_reply<R: Copy, Q: Copy>(
     reply: crate::early_reply::EarlyReply<R>,
     encoder: &dyn melin_app::encoder::ResponseEncoder<Report = R, Query = Q>,
@@ -504,6 +532,7 @@ fn push_early_reply<R: Copy, Q: Copy>(
     tx_producers: &mut [spsc::Producer<TxFrame>],
     early_buf: &mut EarlyReplyBuf,
     now: Instant,
+    shutdown: &AtomicBool,
 ) {
     let conn_id = reply.connection_id;
     let Some(conn_state) = connections.get_mut(&conn_id) else {
@@ -515,13 +544,20 @@ fn push_early_reply<R: Copy, Q: Copy>(
     };
     let tid = tx_lane(conn_id, tx_producers.len());
     let written = encode_early_reply(&reply, encoder, early_buf);
-    push_frame(
+    if let Err(spsc::Stopped) = push_frame(
         Some(Ok(written)),
         conn_id,
         &mut tx_producers[tid],
         early_buf,
         &[],
-    );
+        shutdown,
+    ) {
+        tracing::debug!(
+            connection_id = conn_id,
+            "early reply dropped: shutting down with the poll thread's ring full"
+        );
+        return;
+    }
     tx_producers[tid].flush();
     conn_state.last_send = now;
 }
@@ -1499,8 +1535,9 @@ mod tests {
         use super::degraded_release::wire_frames;
         use crate::ack_policy::AckPolicy;
         use crate::durability_gate::GateStart;
+        use crate::early_reply::EarlyKind;
         use crate::response::tests::early_release::{
-            StageHarness, StageInputs,
+            EXIT_TIMEOUT, Rig, StageHarness, StageInputs,
             a_change_slot_sends_nothing_and_a_forced_one_waits_for_its_entry,
             a_gate_held_inside_an_event_sends_no_early_reply,
             a_refusal_is_not_released_ahead_of_its_connection,
@@ -1509,9 +1546,9 @@ mod tests {
             an_early_reply_waits_out_an_event_split_across_reads,
             an_idle_connection_is_sent_heartbeats, connection_first_seen_inside_a_gate_wait,
             early_replies_overtake_a_held_write, every_kind,
-            every_request_is_answered_once_and_whole, script, stopped_within,
+            every_request_is_answered_once_and_whole, rig, script, stopped_within,
         };
-        use crate::response::tests::refusal_order::Seen;
+        use crate::response::tests::refusal_order::{Seen, early_id, frames_of};
 
         /// The DPDK stage under test, read off its TX ring the way the
         /// poll thread reads it, each frame filed under its connection.
@@ -1527,7 +1564,8 @@ mod tests {
         }
 
         /// The harness's TX ring, in frames. A test that fills it, with
-        /// nothing reading it, takes the count from here.
+        /// nothing reading it, takes the count from here
+        /// ([`blocked_on_a_full_tx_ring`]).
         const TX_RING_SIZE: usize = 1024;
 
         fn start_dpdk(inputs: StageInputs) -> DpdkStage {
@@ -1677,6 +1715,70 @@ mod tests {
             a_change_slot_sends_nothing_and_a_forced_one_waits_for_its_entry(start_dpdk);
         }
 
+        /// Busies `0..count` for connection 1, as the poll thread reads
+        /// them off its TX ring.
+        fn busies(count: usize) -> Vec<Seen> {
+            (0..count as u64)
+                .flat_map(|n| frames_of(EarlyKind::Busy, early_id(n)))
+                .collect()
+        }
+
+        /// Start a stage, held at its drain seam on its first two
+        /// iterations, with connection 1 registered, `early` busies for it
+        /// queued and, if `reply`, a write of request 7 whose event the
+        /// journal already holds; and let it go once its second iteration
+        /// has read them all. Past that seam nothing reads the shutdown
+        /// flag before the push that finds the TX ring full: the gate's
+        /// cached position already covers the write, so its admit does not
+        /// wait. Nothing ever drains the TX ring.
+        fn blocked_on_a_full_tx_ring(early: usize, reply: bool) -> Rig<DpdkStage> {
+            let mut rig = rig(start_dpdk, 1, &[1], 2);
+            rig.seam().parked();
+            for n in 0..early as u64 {
+                rig.answer_early(1, n, EarlyKind::Busy);
+            }
+            if reply {
+                rig.publish(1, 7, 1, true);
+            }
+            rig.seam().resume();
+            rig.seam().parked();
+            rig.seam().resume();
+            rig
+        }
+
+        /// A reply whose push finds the poll thread's TX ring full, the
+        /// early replies released ahead of it having just filled it, does
+        /// not hold the stage past a shutdown: the push gives up once the
+        /// flag is set, and the reply is not sent.
+        #[test]
+        fn a_reply_blocked_on_a_full_tx_ring_does_not_hold_the_stage_past_shutdown() {
+            let mut rig = blocked_on_a_full_tx_ring(TX_RING_SIZE, true);
+
+            assert!(
+                rig.stage.stopped_within(EXIT_TIMEOUT),
+                "the stage stayed blocked on its reply's push"
+            );
+            let filled = busies(TX_RING_SIZE);
+            assert_eq!(rig.frames(1, filled.len()), filled);
+            assert_eq!(rig.quiet(1), None, "the stopped reply was pushed");
+        }
+
+        /// An early reply whose push finds the TX ring full (one more than
+        /// it holds were released together) does not hold the stage past
+        /// a shutdown either: it is dropped, and the stage leaves.
+        #[test]
+        fn an_early_reply_blocked_on_a_full_tx_ring_does_not_hold_the_stage_past_shutdown() {
+            let mut rig = blocked_on_a_full_tx_ring(TX_RING_SIZE + 1, false);
+
+            assert!(
+                rig.stage.stopped_within(EXIT_TIMEOUT),
+                "the stage stayed blocked on an early reply's push"
+            );
+            let filled = busies(TX_RING_SIZE);
+            assert_eq!(rig.frames(1, filled.len()), filled);
+            assert_eq!(rig.quiet(1), None, "the stopped early reply was pushed");
+        }
+
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(24))]
             #[test]
@@ -1728,6 +1830,7 @@ mod tests {
                 control_rx: &control_rx,
                 encoder: &ResponseEncoder,
                 early_buf: &mut early_buf,
+                shutdown: &AtomicBool::new(false),
             }
             .while_waiting();
 
@@ -1814,6 +1917,27 @@ mod tests {
             now: Instant,
             encode_buf: &mut EncodeBuf,
         ) -> SlotOutcome {
+            send_slot_unless(
+                egress,
+                connection_id,
+                payload,
+                is_last_in_request,
+                now,
+                encode_buf,
+                &AtomicBool::new(false),
+            )
+        }
+
+        /// [`send_slot`], with the stage's shutdown flag at `shutdown`.
+        fn send_slot_unless(
+            egress: &mut DpdkEgress,
+            connection_id: u64,
+            payload: OutputPayload<CounterReport, CounterQuery>,
+            is_last_in_request: bool,
+            now: Instant,
+            encode_buf: &mut EncodeBuf,
+            shutdown: &AtomicBool,
+        ) -> SlotOutcome {
             let slot = OutputSlot {
                 connection_id,
                 request_id: REQUEST,
@@ -1833,7 +1957,17 @@ mod tests {
                     &mut batch_ends,
                 ),
                 now,
+                shutdown,
             )
+        }
+
+        /// Fill lane `lane` of `egress` to the brim, published, as a poll
+        /// thread that has stopped draining leaves it.
+        fn fill_lane(egress: &mut DpdkEgress, lane: usize) {
+            while egress.tx_producers[lane]
+                .try_publish(TxFrame::default())
+                .is_ok()
+            {}
         }
 
         const ACK: OutputPayload<CounterReport, CounterQuery> =
@@ -1935,6 +2069,86 @@ mod tests {
             assert!(visible(&mut rings[0]).is_empty());
             assert_eq!(egress.connections[&1].last_send, before);
         }
+
+        /// A slot whose lane is full, with shutdown set, is `Stopped`:
+        /// nothing pushed, no lane kept for `after_slot`, and the
+        /// connection's heartbeat clock left as it was.
+        #[test]
+        fn a_slot_on_a_full_lane_is_stopped_by_shutdown() {
+            let (mut egress, mut rings) = egress_holding(1, &[1]);
+            fill_lane(&mut egress, 0);
+            let before = egress.connections[&1].last_send;
+
+            let mut encode_buf: EncodeBuf = [0u8; MAX_APP_FRAME];
+            let outcome = send_slot_unless(
+                &mut egress,
+                1,
+                ACK,
+                true,
+                Instant::now() + Duration::from_secs(60),
+                &mut encode_buf,
+                &AtomicBool::new(true),
+            );
+
+            assert_eq!(outcome, SlotOutcome::Stopped);
+            assert!(egress.pushed.is_none(), "a lane was kept");
+            assert_eq!(egress.connections[&1].last_send, before);
+            let frames = visible(&mut rings[0]);
+            assert_eq!(frames.len(), 8, "only the frames that filled the lane");
+            assert!(
+                frames.iter().all(|(connection_id, _)| *connection_id == 0),
+                "the stopped reply was pushed"
+            );
+        }
+
+        /// Once shutdown is set, an early-reply release still drains the
+        /// whole snapshot without waiting: a reply whose lane is full is
+        /// dropped, its connection's clock left alone, and one whose lane
+        /// has room still goes.
+        #[test]
+        fn a_stopped_release_drops_what_would_wait_and_sends_what_has_room() {
+            use crate::batch_boundary::BatchBoundary;
+            use crate::early_reply::{EARLY_REPLY_QUEUE_CAPACITY, EarlyKind, early_reply_channel};
+            use crate::response::tests::refusal_order::{early, early_id, frames_of};
+
+            let full = lane_connection_id(1, 1);
+            let open = lane_connection_id(0, 1);
+            let (mut egress, mut rings) = egress_holding(2, &[full, open]);
+            fill_lane(&mut egress, 1);
+            let before = egress.connections[&full].last_send;
+
+            let (mut tx, mut rx) = early_reply_channel(EARLY_REPLY_QUEUE_CAPACITY);
+            for (n, connection_id) in [full, open].into_iter().enumerate() {
+                tx.try_send(early(connection_id, n as u64, EarlyKind::Busy))
+                    .expect("queue has room");
+            }
+            tx.flush();
+            let boundary = BatchBoundary::new();
+            let mut early_buf: EarlyReplyBuf = [0u8; MAX_EARLY_REPLY];
+            let now = Instant::now() + Duration::from_secs(60);
+            let released = egress.release_early_replies(
+                &mut rx.register(|| {}),
+                &boundary.at_boundary().expect("between events"),
+                &ResponseEncoder,
+                &mut early_buf,
+                || now,
+                &AtomicBool::new(true),
+            );
+
+            assert_eq!(released, 2, "the drain stopped short");
+            assert_eq!(egress.connections[&full].last_send, before);
+            assert_eq!(egress.connections[&open].last_send, now);
+            assert!(
+                visible(&mut rings[1])
+                    .iter()
+                    .all(|(connection_id, _)| *connection_id == 0),
+                "the reply on the full lane was pushed"
+            );
+            assert_eq!(
+                visible(&mut rings[0]),
+                [(open, frames_of(EarlyKind::Busy, early_id(1)))]
+            );
+        }
     }
 
     mod push_frame {
@@ -1953,7 +2167,15 @@ mod tests {
         ) -> Vec<(u64, Vec<u8>)> {
             let (mut tx, mut rx) = spsc::channel::<TxFrame>(8, WaitStrategy::SpinThenYield);
             let encode_buf = b"response-body";
-            super::super::push_frame(payload, 42, &mut tx, encode_buf, trailer);
+            super::super::push_frame(
+                payload,
+                42,
+                &mut tx,
+                encode_buf,
+                trailer,
+                &AtomicBool::new(false),
+            )
+            .expect("never stopped");
             tx.flush();
 
             let mut out = Vec::new();
@@ -2041,7 +2263,15 @@ mod tests {
             .expect("a terminator encodes");
             assert_eq!(written, BATCH_END_FRAME_LEN);
             let (mut tx, mut rx) = spsc::channel::<TxFrame>(8, WaitStrategy::SpinThenYield);
-            super::super::push_frame(Some(Ok(MAX_APP_FRAME)), 42, &mut tx, &response, &trailer);
+            super::super::push_frame(
+                Some(Ok(MAX_APP_FRAME)),
+                42,
+                &mut tx,
+                &response,
+                &trailer,
+                &AtomicBool::new(false),
+            )
+            .expect("never stopped");
             tx.flush();
             let (_, frame) = rx.try_consume().expect("one frame");
             assert_eq!(frame.len as usize, MAX_TX_FRAME);
@@ -2057,7 +2287,58 @@ mod tests {
             let response = [0xAB; MAX_APP_FRAME];
             let trailer = [0u8; BATCH_END_FRAME_LEN + 1];
             let (mut tx, _rx) = spsc::channel::<TxFrame>(8, WaitStrategy::SpinThenYield);
-            super::super::push_frame(Some(Ok(MAX_APP_FRAME)), 42, &mut tx, &response, &trailer);
+            super::super::push_frame(
+                Some(Ok(MAX_APP_FRAME)),
+                42,
+                &mut tx,
+                &response,
+                &trailer,
+                &AtomicBool::new(false),
+            )
+            .expect("never stopped");
+        }
+
+        /// A TX ring of 2, filled and published, with nothing draining it.
+        fn full_ring() -> (spsc::Producer<TxFrame>, spsc::Consumer<TxFrame>) {
+            let (mut tx, rx) = spsc::channel::<TxFrame>(2, WaitStrategy::SpinThenYield);
+            for _ in 0..2 {
+                tx.try_publish(TxFrame::default())
+                    .expect("the ring has room");
+            }
+            (tx, rx)
+        }
+
+        /// On a full ring with shutdown set, the push is stopped and
+        /// pushes nothing: the stage is not held by a poll thread that
+        /// has stopped draining.
+        #[test]
+        fn a_push_on_a_full_ring_is_stopped_by_shutdown() {
+            let (mut tx, mut rx) = full_ring();
+            let pushed = super::super::push_frame(
+                Some(Ok(8)),
+                42,
+                &mut tx,
+                b"response",
+                TRAILER,
+                &AtomicBool::new(true),
+            );
+            tx.flush();
+
+            assert_eq!(pushed, Err(spsc::Stopped));
+            assert_eq!(rx.try_consume().map(|(seq, _)| seq), Some(0));
+            assert_eq!(rx.try_consume().map(|(seq, _)| seq), Some(1));
+            assert!(rx.try_consume().is_none(), "a stopped push published");
+        }
+
+        /// Nothing to send never touches the ring, so it is not stopped
+        /// even on a full one.
+        #[test]
+        fn nothing_to_send_is_never_stopped() {
+            let (mut tx, _rx) = full_ring();
+            assert_eq!(
+                super::super::push_frame(None, 42, &mut tx, &[], &[], &AtomicBool::new(true)),
+                Ok(())
+            );
         }
     }
 }
