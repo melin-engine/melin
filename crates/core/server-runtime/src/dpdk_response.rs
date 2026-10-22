@@ -38,11 +38,10 @@ use crate::response_frame::{
     encode_slot_payload,
 };
 
+use crate::response_loop::MAX_BATCH;
+
 #[cfg(feature = "latency-trace")]
 use melin_transport_core::trace;
-
-/// Maximum number of output slots consumed per batch.
-const MAX_BATCH: usize = 1024;
 
 /// Maximum wire frame size: the largest framed application response, plus
 /// room for the batch terminator (`BatchEnd` or `BatchEndDegraded`, the

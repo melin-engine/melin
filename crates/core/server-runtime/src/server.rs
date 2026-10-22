@@ -2399,7 +2399,7 @@ where
         // reader, and keep it that way: the response stage reads its
         // output ring before it drains this channel, and relies on
         // `Connected` being queued before any request of the connection
-        // can be read — see the drain in `response::run`. Queued, not
+        // can be read — see the drain in `response_loop::run`. Queued, not
         // yet applied: the stage picks the event up on its next
         // iteration, which that order makes early enough.
         let fd = std_write.as_raw_fd();

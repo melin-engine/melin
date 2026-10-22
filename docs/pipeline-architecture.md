@@ -315,7 +315,7 @@ The node refuses to start with a layout in which threads would starve each other
 
 ## Response Stage
 
-Defined in `crates/core/server-runtime/src/response.rs` (io_uring-based SEND).
+The loop is defined in `crates/core/server-runtime/src/response_loop.rs`; the kernel TCP send path (io_uring-based SEND) in `crates/core/server-runtime/src/response.rs`.
 
 The response stage runs on a dedicated OS thread and is the final stage in the pipeline. It consumes from the output SPSC and writes encoded responses to client sockets.
 
@@ -492,7 +492,7 @@ Because the journal and matching consumers run in parallel (not chained), the ma
 | `INPUT_RING_CAPACITY` | `1 << 20` (1,048,576) | `crates/core/transport-core/src/pipeline.rs` |
 | `OUTPUT_RING_CAPACITY` | `1 << 20` (1,048,576) | `crates/core/transport-core/src/pipeline.rs` |
 | `MAX_JOURNAL_BATCH` | `4096` (ceiling; the effective cap is the lesser of this and what fills one ring slot) | `crates/core/transport-core/src/pipeline.rs` |
-| `MAX_BATCH` (response) | `1024` | `crates/core/server-runtime/src/response.rs` |
+| `MAX_BATCH` (response) | `1024` | `crates/core/server-runtime/src/response_loop.rs` |
 | `MAX_RESPONSE_BODY` | `512` bytes (one response body, framing excluded) | `crates/core/server-runtime/src/response_frame.rs` |
 
 The reader's and response writer's io_uring rings, and the reader's provided-buffer pool (two buffers per connection), are not constants: they are sized from `--max-connections` at startup (`RingSizing` in `crates/core/server-runtime/src/connection_limit.rs`). At the default cap the sizes match the former fixed ones.

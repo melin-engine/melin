@@ -22,11 +22,11 @@ use melin_pipeline::ring;
 use melin_pipeline::wait::WaitStrategy;
 
 use crate::ack_policy::{Blocker, CursorView, EvalStatus, MAX_CLUSTER_SIZE, Policy};
-use crate::batch_boundary::{AtBoundary, BatchBoundary};
+use crate::batch_boundary::AtBoundary;
+use crate::durability_gate::GateInputs;
 pub(crate) use crate::durability_gate::GatePolicy;
-use crate::durability_gate::{Admission, Backing, BatchEnds, DurabilityGate, GateInputs, GateWait};
 use crate::early_reply::{EarlyReply, EarlyReplyQueue, Registered};
-use crate::idle_housekeeping::{self, IdleHousekeeping};
+use crate::idle_housekeeping;
 use crate::replication::ReplicationMetrics;
 use melin_app::Application;
 use melin_transport_core::pipeline::{OutputSlot, StageUtilization};
@@ -34,17 +34,13 @@ use melin_transport_core::pipeline::{OutputSlot, StageUtilization};
 use melin_transport_core::trace;
 use melin_transport_core::{DurableWireSeqCursor, WireSeq};
 
-use melin_wire_protocol::control::TransportResponse;
-use melin_wire_protocol::control_codec;
-
 use crate::connection_limit::{RingSizing, ring_setup_error};
-use crate::response_frame::{
-    EarlyReplyBuf, EncodeBuf, MAX_APP_FRAME, MAX_EARLY_REPLY, encode_early_reply,
-    encode_slot_payload,
+use crate::response_frame::{EarlyReplyBuf, encode_early_reply};
+#[cfg(feature = "latency-trace")]
+use crate::response_loop::MAX_BATCH;
+use crate::response_loop::{
+    self, Egress, EgressRecorders, LoopInputs, SlotOutcome, SlotReply, StageNames,
 };
-
-/// Maximum number of output slots consumed per batch.
-const MAX_BATCH: usize = 1024;
 
 /// Maximum accumulated send buffer per connection (64 KiB). If a client
 /// falls behind and the buffer exceeds this, the connection is dropped.
@@ -272,8 +268,9 @@ struct ConnectionEntry {
 ///
 /// One struct because every place that sends needs all of it: the slot
 /// loop, the idle path, the flush before a gate wait, and the early
-/// replies sent during one ([`GateWaitHook`]), which runs inside the gate
-/// while the loop's own locals are borrowed.
+/// replies sent during one ([`response_loop::GateWaitHook`]), which runs inside the gate
+/// while the loop's own locals are borrowed. The kernel TCP stage's
+/// [`Egress`], which the shared loop ([`response_loop::run`]) drives.
 struct UringEgress {
     ring: IoUring,
     /// Connection table: maps connection IDs to their state.
@@ -312,6 +309,10 @@ struct UringEgress {
     /// See [`Response::active_connections`]: decremented here, as each
     /// entry leaves the table.
     active_connections: Arc<AtomicU64>,
+    /// See [`Response::fence_state`]: read once, on the way out
+    /// ([`Egress::on_shutdown`]), to decide whether the buffered bytes may
+    /// still go.
+    fence_state: Arc<melin_transport_core::fence::FenceState>,
     /// Server-side end-to-end samples awaiting a flush, tagged with the
     /// connection whose bytes they measure.
     ///
@@ -350,6 +351,9 @@ struct UringEgress {
     pending_e2e: Vec<(u64, trace::MonoTraceInstant)>,
     #[cfg(feature = "latency-trace")]
     server_e2e_rec: trace::StageRecorder,
+    /// Wall time around a slot's append (see [`EgressRecorders::encode`]).
+    #[cfg(feature = "tick-to-trade")]
+    encode_rec: trace::StageRecorder,
     /// One sample per io_uring flush that ships responses, batching many
     /// slots.
     #[cfg(feature = "tick-to-trade")]
@@ -357,12 +361,16 @@ struct UringEgress {
 }
 
 impl UringEgress {
-    /// An empty table over `ring`, whose depth sizes the CQE buffer.
-    fn new(
+    /// An empty table over `ring`, whose depth sizes the CQE buffer,
+    /// fenced by `fence_state`.
+    fn for_stage(
         ring: IoUring,
         ring_entries: u32,
         active_connections: Arc<AtomicU64>,
-        #[cfg(feature = "latency-trace")] server_e2e_rec: trace::StageRecorder,
+        fence_state: Arc<melin_transport_core::fence::FenceState>,
+        // Empty in untraced builds.
+        #[cfg_attr(not(feature = "latency-trace"), allow(unused_variables))]
+        recorders: EgressRecorders,
         #[cfg(feature = "tick-to-trade")] egress_rec: trace::StageRecorder,
     ) -> Self {
         Self {
@@ -373,13 +381,42 @@ impl UringEgress {
             cqes: Vec::with_capacity(ring_entries as usize),
             cadence: FlushCadence::default(),
             active_connections,
+            fence_state,
             #[cfg(feature = "latency-trace")]
             pending_e2e: Vec::with_capacity(MAX_BATCH),
             #[cfg(feature = "latency-trace")]
-            server_e2e_rec,
+            server_e2e_rec: recorders.server_e2e,
+            #[cfg(feature = "tick-to-trade")]
+            encode_rec: recorders.encode,
             #[cfg(feature = "tick-to-trade")]
             egress_rec,
         }
+    }
+
+    /// The egress the unit tests build: as [`Self::for_stage`], on a node
+    /// that is never fenced, with a test encode recorder of its own.
+    #[cfg(test)]
+    fn new(
+        ring: IoUring,
+        ring_entries: u32,
+        active_connections: Arc<AtomicU64>,
+        #[cfg(feature = "latency-trace")] server_e2e_rec: trace::StageRecorder,
+        #[cfg(feature = "tick-to-trade")] egress_rec: trace::StageRecorder,
+    ) -> Self {
+        Self::for_stage(
+            ring,
+            ring_entries,
+            active_connections,
+            Arc::new(melin_transport_core::fence::FenceState::new(0)),
+            EgressRecorders {
+                #[cfg(feature = "latency-trace")]
+                server_e2e: server_e2e_rec,
+                #[cfg(feature = "tick-to-trade")]
+                encode: trace::register_stage("test: encode"),
+            },
+            #[cfg(feature = "tick-to-trade")]
+            egress_rec,
+        )
     }
 
     /// Submit every dirty connection's buffer ([`flush_sends`]) and
@@ -473,9 +510,17 @@ impl UringEgress {
         self.drop_overflowed();
         self.flush();
     }
+}
 
-    /// Drain the control channel: register each new connection, forget
-    /// each closed one.
+impl Egress for UringEgress {
+    type Control = ControlEvent;
+
+    const NAMES: StageNames = StageNames {
+        gate: "response",
+        dispatch: "response: dispatch (consume → socket write)",
+        server_e2e: "server e2e (reader recv → response flush)",
+    };
+
     fn drain_control(&mut self, control_rx: &mpsc::Receiver<ControlEvent>) {
         while let Ok(event) = control_rx.try_recv() {
             match event {
@@ -552,24 +597,77 @@ impl UringEgress {
             self.flush_if_due();
         })
     }
-}
 
-/// The io_uring stage's [`GateWait`] hook, built for one slot's admit:
-/// flush what is buffered before the wait, and, if the held slot is the
-/// first of its event (`at_boundary`), send early replies during it —
-/// registering new connections first ([`Registered::reregister`]) — and
-/// flush them. A slot held in the middle of an event sends nothing: an
-/// early reply there would split that event's reply.
-struct GateWaitHook<'a, 'q, R: Copy, Q: Copy> {
-    egress: &'a mut UringEgress,
-    at_boundary: Option<AtBoundary<'a>>,
-    registered: &'a mut Registered<'q, R>,
-    control_rx: &'a mpsc::Receiver<ControlEvent>,
-    encoder: &'a dyn melin_app::encoder::ResponseEncoder<Report = R, Query = Q>,
-    early_buf: &'a mut EarlyReplyBuf,
-}
+    /// Append the slot's frames to its connection's send buffer
+    /// ([`append_frames`]), payload and terminator in one call, and feed
+    /// the flush cadence ([`FlushCadence`]), which [`Self::after_slot`]
+    /// checks. An append that would overflow `MAX_SEND_BUF` queues the
+    /// connection for removal, sends nothing, and is still
+    /// [`SlotOutcome::Known`].
+    #[inline]
+    fn send_slot<R: Copy, Q: Copy>(
+        &mut self,
+        connection_id: u64,
+        reply: SlotReply<'_, R, Q>,
+        now: Instant,
+    ) -> SlotOutcome {
+        let Some(entry) = self.connections.get_mut(&connection_id) else {
+            return SlotOutcome::Unknown;
+        };
+        let frames = reply.into_frames();
 
-impl<R: Copy, Q: Copy> GateWait for GateWaitHook<'_, '_, R, Q> {
+        #[cfg(feature = "tick-to-trade")]
+        let encode_start = trace::mono_trace_ns();
+        // Underscored: with both frames in one call there is no second
+        // append to skip, so the outcome is purely informational —
+        // `append_frames` has already queued an overflowing connection for
+        // removal. Only the traced build reads it, to avoid measuring
+        // bytes that were never buffered.
+        let _outcome = append_frames(
+            frames.payload,
+            frames.trailer,
+            connection_id,
+            entry,
+            frames.encode_buf,
+            now,
+            &mut self.dirty,
+            &mut self.to_remove,
+        );
+        #[cfg(feature = "tick-to-trade")]
+        self.encode_rec
+            .record_elapsed(encode_start, trace::mono_trace_ns());
+
+        // Queue the server-side end-to-end sample: reader recv -> response
+        // flush. Only a request's last slot carries this measurement;
+        // queued after the append so a dropped connection doesn't skew the
+        // metric, and closed by whichever flush ships the bytes.
+        #[cfg(feature = "latency-trace")]
+        if frames.is_last_in_request && matches!(_outcome, AppendOutcome::Continue) {
+            self.pending_e2e.push((connection_id, frames.recv_ts));
+        }
+
+        self.cadence.on_append(entry.send_buf.len());
+        SlotOutcome::Known
+    }
+
+    /// The consumed-path flush ([`Self::flush_if_due`]), between slots,
+    /// not after the batch, so `MAX_SEND_BUF` can never trip on a healthy
+    /// connection within a single batch.
+    ///
+    /// The cadence is fed at append time and checked after every slot, so
+    /// the flush runs *within* the batch. Deferring it to the end of the
+    /// batch would reopen the defect the byte threshold exists to close:
+    /// one `MAX_BATCH` batch of large frames (anything over ~64 bytes
+    /// average) can push a healthy connection from empty past
+    /// `MAX_SEND_BUF` before a batch-end flush ever ran, tearing it down
+    /// with nothing written. A flag written at append time rather than a
+    /// per-slot scan of the dirty set: the scan would cost a hash lookup
+    /// per dirty connection on the hot path.
+    #[inline]
+    fn after_slot(&mut self) {
+        self.flush_if_due();
+    }
+
     /// Drain buffered sends before blocking, never after.
     ///
     /// The steady-state flush happens on the `count == 0` path — once the
@@ -596,31 +694,88 @@ impl<R: Copy, Q: Copy> GateWait for GateWaitHook<'_, '_, R, Q> {
     /// drops are skipped by the table lookup after the admit, so removing
     /// here is safe.
     fn before_wait(&mut self) {
-        self.egress.flush();
+        self.flush();
     }
 
-    /// Early replies decided while the gate holds a write — a refusal, a
-    /// busy — go out now rather than behind it. Nothing to do, and no
-    /// clock read, on a turn with none; one cursor load and a control
-    /// channel poll is the cost of a turn.
-    fn while_waiting(&mut self) {
-        let Some(at) = &self.at_boundary else {
-            return;
-        };
-        let egress = &mut *self.egress;
-        let control_rx = self.control_rx;
-        self.registered
-            .reregister(|| egress.drain_control(control_rx));
-        if egress.release_early_replies(
-            self.registered,
-            at,
-            self.encoder,
-            self.early_buf,
-            Instant::now,
-        ) > 0
+    /// Ship the early replies a gate wait released, dropping first the
+    /// connections they overflowed, so the flush skips them.
+    fn after_wait_release(&mut self) {
+        self.drop_overflowed();
+        self.flush();
+    }
+
+    /// An early reply can overflow its connection's buffer; drop those
+    /// before the idle flush ([`Self::on_idle`]), as the batch end does.
+    fn after_idle_release(&mut self) {
+        self.drop_overflowed();
+    }
+
+    /// The output ring is empty: flush all dirty connections via
+    /// io_uring. This is the response-data egress path; heartbeat flushes
+    /// ([`Self::send_heartbeats`]) aren't sampled because they're admin
+    /// traffic, not on the client RTT path.
+    fn on_idle(&mut self) {
+        self.flush();
+    }
+
+    /// Append the heartbeat to every connection it is due to
+    /// ([`heartbeat_due`]) and flush them at once.
+    ///
+    /// No end-to-end samples to close here: the sample queue's invariant
+    /// is that a queued entry implies a dirty connection, so the idle
+    /// flush before this ([`Self::on_idle`]), which closes the queue
+    /// whenever anything was dirty, leaves it empty. Anything dirtied from
+    /// here on is heartbeat frames, which carry no samples.
+    fn send_heartbeats(&mut self, frame: &[u8], now: Instant, interval: Duration) {
+        for (&conn_id, entry) in self.connections.iter_mut() {
+            if heartbeat_due(entry, now, interval, frame.len()) {
+                entry.send_buf.extend_from_slice(frame);
+                entry.last_send = now;
+                mark_dirty(entry, conn_id, &mut self.dirty);
+            }
+        }
+        // Flush the heartbeat sends immediately. Unsampled: admin
+        // traffic, and no sample is queued (see above).
+        if !self.dirty.is_empty() {
+            self.send_dirty();
+            self.teardown_flush_failures();
+        }
+    }
+
+    /// Remove connections that exceeded the send buffer limit.
+    fn after_commit(&mut self) {
+        self.drop_overflowed();
+    }
+
+    #[cfg(feature = "latency-trace")]
+    fn flush_idle_stats(&mut self) {
+        self.server_e2e_rec.flush();
+        #[cfg(feature = "tick-to-trade")]
         {
-            egress.drop_overflowed();
-            egress.flush();
+            self.encode_rec.flush();
+            self.egress_rec.flush();
+        }
+    }
+
+    /// The best-effort flush before shutdown, unless fenced: a superseded
+    /// ex-primary must not acknowledge any further in-flight work, so the
+    /// flush is skipped and responses buffered for requests on the old
+    /// epoch are dropped (the client sees a connection reset and
+    /// reconciles on reconnect). Checked only here, not per slot: fencing
+    /// always co-sets `shutdown` (`FenceState::fence_if_superseded` owns
+    /// that invariant), and every exit of the loop leads here, so this is
+    /// the first place a fenced node reaches and the steady-state loop
+    /// pays nothing.
+    ///
+    /// `send_dirty` and the close of the queued samples, not
+    /// [`Self::flush`], which would also tear down the flush's failures:
+    /// the stage is going away with every connection.
+    fn on_shutdown(&mut self) {
+        let flush = !self.fence_state.is_fenced();
+        if flush && !self.dirty.is_empty() {
+            self.send_dirty();
+            #[cfg(feature = "latency-trace")]
+            close_e2e_samples(&mut self.pending_e2e, &mut self.server_e2e_rec);
         }
     }
 }
@@ -628,7 +783,8 @@ impl<R: Copy, Q: Copy> GateWait for GateWaitHook<'_, '_, R, Q> {
 /// Run the io_uring response stage loop. Blocks the calling thread until shutdown.
 ///
 /// Consumes from the output SPSC, waits for durability confirmation, and
-/// sends responses via io_uring SEND.
+/// sends responses via io_uring SEND: the shared loop
+/// ([`response_loop::run`]) over this stage's [`UringEgress`].
 ///
 /// Ack gating: every gate iteration reads the journal cursor (this
 /// node's persisted) plus per-slot replica cursors (in-memory and
@@ -640,7 +796,7 @@ impl<R: Copy, Q: Copy> GateWait for GateWaitHook<'_, '_, R, Q> {
 /// (reported through [`Response::ready`]), or nobody was left to report
 /// to.
 pub fn run<A: Application>(
-    mut consumer: ring::Consumer<OutputSlot<A::Report, A::QueryResponse>>,
+    consumer: ring::Consumer<OutputSlot<A::Report, A::QueryResponse>>,
     control_rx: mpsc::Receiver<ControlEvent>,
     config: Response<A>,
     shutdown: &AtomicBool,
@@ -656,12 +812,12 @@ pub fn run<A: Application>(
         encoder,
         fence_state,
         active_connections,
-        mut early_replies,
+        early_replies,
         ring_sizing,
         ready,
         degraded_release,
         #[cfg(test)]
-        mut pause_after_control_drain,
+        pause_after_control_drain,
     } = config;
     // SINGLE_ISSUER: created and submitted from this thread only — the
     // kernel skips SQ locking and rejects cross-thread submission with
@@ -691,527 +847,47 @@ pub fn run<A: Application>(
     {
         return false;
     }
-    // The ack policy in force and the durability gate. The gate owns the
-    // policy for the stage's lifetime and switches it at the slots of
-    // journaled changes. Built here — before the first batch — so a
-    // degraded startup shows on `/healthz` and in the journal
-    // immediately. See `DurabilityGate`.
-    let mut gate = DurabilityGate::new(
-        GateInputs {
-            journal_persisted_wire_seq,
-            replication_metrics,
-            replica_active,
-            utilization: Arc::clone(&utilization),
-            wait,
-            degraded_release,
-        },
-        policy,
-        "response",
-    );
-
-    let mut encode_buf: EncodeBuf = [0u8; MAX_APP_FRAME];
-    // An early reply's frames, encoded together: off the hot path, but on
-    // the stack all the same.
-    let mut early_buf: EarlyReplyBuf = [0u8; MAX_EARLY_REPLY];
-
-    // Stage histograms registered with the global registry — see
-    // `melin_transport_core::trace`. The four breakdown stages
-    // (journal-wait, replica-wait, encode, egress) feed the bench's
-    // tick-to-trade decomposition; spsc/dispatch/server-e2e are kept
-    // alongside as overall sanity checks.
-    #[cfg(feature = "latency-trace")]
-    let mut spsc_rec =
-        trace::register_stage("response: SPSC wakeup (matching publish → response consume)");
-    #[cfg(feature = "latency-trace")]
-    let mut dispatch_rec = trace::register_stage("response: dispatch (consume → socket write)");
-    #[cfg(feature = "latency-trace")]
-    let server_e2e_rec = trace::register_stage("server e2e (reader recv → response flush)");
-    // Tick-to-trade breakdown: per-slot wait observed for each
-    // durability path (recorded only when the gate actually held us
-    // up — cache-hit paths skip to avoid inflating the metric with
-    // crossings that happened before we noticed). Encode is wall-time
-    // around `encode_transport_response`. Egress wraps a `flush_sends`
-    // call (one sample per io_uring flush, batching many slots).
-    // Gated on `tick-to-trade`, not `latency-trace`, because these
-    // stages roughly double the hot-path mutex traffic vs the lighter
-    // 4-stage mode.
-    #[cfg(feature = "tick-to-trade")]
-    let mut journal_wait_rec =
-        trace::register_stage("response: journal-wait (match_complete → journal cursor crossed)");
-    #[cfg(feature = "tick-to-trade")]
-    let mut replica_wait_rec = trace::register_stage(
-        "response: replica-wait (match_complete → replication cursor crossed)",
-    );
-    #[cfg(feature = "tick-to-trade")]
-    let mut encode_rec = trace::register_stage("response: encode (per-kind wire encoding)");
+    // The loop's recorders and the egress's, then the one only this
+    // egress has: one sample per io_uring flush that ships responses,
+    // batching many slots.
+    let (loop_recorders, egress_recorders) = response_loop::register_recorders(&UringEgress::NAMES);
     #[cfg(feature = "tick-to-trade")]
     let egress_rec = trace::register_stage("response: egress (flush_sends elapsed)");
 
-    let mut egress = UringEgress::new(
+    let egress = UringEgress::for_stage(
         ring,
         ring_entries,
         active_connections,
-        #[cfg(feature = "latency-trace")]
-        server_e2e_rec,
+        fence_state,
+        egress_recorders,
         #[cfg(feature = "tick-to-trade")]
         egress_rec,
     );
 
-    // Pre-encode the heartbeat response frame once. Full wire frame
-    // (length prefix + tag) for direct append to send_buf.
-    let heartbeat_wire_frame = {
-        let mut buf = [0u8; 8];
-        let written =
-            control_codec::encode_transport_response(&TransportResponse::Heartbeat, &mut buf)
-                .expect("heartbeat encodes");
-        buf[..written].to_vec()
-    };
-
-    // Pre-encode the two request terminators once. Unlike the heartbeat
-    // these are on the hot path — every request ends with one — and only
-    // their request ID changes, so the stage writes the ID into one rather
-    // than encode a frame per request. An early reply's batch end is the
-    // plain one: it is a definite answer, with nothing on any disk to
-    // qualify. A busy, as every other early reply, is encoded per reply
-    // with its request's ID (`encode_early_reply`).
-    let mut batch_ends = BatchEnds::new();
-
-    // Paces the idle path's clock read, and on it the heartbeat scan, the
-    // policy re-check and the recorders' flush. See `IdleHousekeeping`.
-    let mut housekeeping = IdleHousekeeping::new();
-
-    let mut waiter = wait.waiter();
-
-    let mut busy_count: u64 = 0;
-    let mut idle_count: u64 = 0;
-
-    // Whether the stage stands between two events' replies, the only
-    // place early replies may go: told about every slot handled.
-    let mut boundary = BatchBoundary::new();
-
-    'run: loop {
-        if shutdown.load(Ordering::Relaxed) {
-            // Fence: a superseded ex-primary must not acknowledge any
-            // further in-flight work — skip the best-effort flush so
-            // responses buffered for requests on the old epoch are dropped
-            // (the client sees a connection reset and reconciles on
-            // reconnect). Checked only here, not per slot: fencing always
-            // co-sets `shutdown` (`FenceState::fence_if_superseded` owns
-            // that invariant), and the gate wait comes straight back here
-            // on shutdown, so this branch is the first one a fenced node
-            // reaches and the steady-state loop pays nothing.
-            let flush = !fence_state.is_fenced();
-            // Best-effort flush before shutdown.
-            if flush && !egress.dirty.is_empty() {
-                egress.send_dirty();
-                #[cfg(feature = "latency-trace")]
-                close_e2e_samples(&mut egress.pending_e2e, &mut egress.server_e2e_rec);
-            }
-            utilization.busy.store(busy_count, Ordering::Relaxed);
-            utilization.idle.store(idle_count, Ordering::Relaxed);
-            #[cfg(feature = "pipeline-stats")]
-            print_utilization("response", busy_count, idle_count);
-            return true;
-        }
-
-        // Borrow output slots from the matching stage in place.
-        //
-        // `read_contiguous` rather than `consume_batch`: the latter
-        // memcpy'd every ready slot into a stack array before the first
-        // one was touched, and `OutputSlot` embeds the application's
-        // largest query response (often hundreds of bytes), so the head
-        // slot of a deep batch paid for the whole copy before it could
-        // be encoded. Borrowing costs nothing and the loop below reads
-        // each slot exactly once anyway.
-        //
-        // The progress counter now moves *after* the batch instead of
-        // before it (`consume_batch` committed up front), so the
-        // matching stage cannot reclaim these slots until the loop —
-        // durability gate waits included — is done with them. That is
-        // at most `MAX_BATCH` of a 1 M-slot ring, and the ring fills at
-        // the same rate either way.
-        let slots = consumer.read_contiguous(MAX_BATCH);
-
-        // Take a snapshot of the early replies, then poll the control
-        // channel (non-blocking) for connect and disconnect — after the
-        // ring is read, never before. A reply always trails its
-        // connection's `Connected`: the accept loop queues that event
-        // before it registers the socket with the reader, so no request
-        // can be read, let alone answered, until the event is in the
-        // channel. Every slot in `slots` was published before the read
-        // above, and every early reply in the snapshot before the drain,
-        // so their `Connected` was queued before that, and this drain sees
-        // it. Drained first, the stage could read the ring after a
-        // `Connected` it had not seen and drop the reply — which it did,
-        // now and then, on a fresh node under load. `registration_race`
-        // in the tests holds the stage right after this drain to pin the
-        // order.
-        let mut registered = early_replies.register(|| egress.drain_control(&control_rx));
-
-        // Test seam: hold the stage right after the drain — see
-        // `Response::pause_after_control_drain`.
-        #[cfg(test)]
-        if let Some(pause) = pause_after_control_drain.as_mut() {
-            pause();
-        }
-
-        if slots.is_empty() {
-            // Between two events, the snapshot's early replies go with
-            // this flush. An empty read is not a boundary in itself: the
-            // matching stage may have published only part of an event.
-            if let Some(at) = boundary.at_boundary() {
-                egress.release_early_replies(
-                    &mut registered,
-                    &at,
-                    &*encoder,
-                    &mut early_buf,
-                    Instant::now,
-                );
-                // An early reply can overflow its connection's buffer;
-                // drop those before the flush, as the batch end does.
-                egress.drop_overflowed();
-            }
-
-            // SPSC is empty — flush all dirty connections via io_uring.
-            // This is the response-data egress path; heartbeat flushes
-            // below aren't sampled because they're admin traffic, not
-            // on the client RTT path.
-            egress.flush();
-
-            // Everything below is periodic housekeeping on
-            // sub-second-to-second cadences, read off one amortized
-            // clock read (see `IdleHousekeeping`).
-            if let Some(due) = housekeeping.tick(&waiter) {
-                let now = due.now;
-
-                // Send heartbeats to idle connections. Only checked
-                // during idle periods (SPSC empty) to avoid overhead on
-                // the hot path.
-                //
-                // No end-to-end samples to close here: the sample
-                // queue's invariant is that a queued entry implies a
-                // dirty connection, so the flush above — which closes
-                // the queue whenever anything was dirty — leaves it
-                // empty. Anything dirtied from here on is heartbeat
-                // frames, which carry no samples.
-                if let Some(interval) = heartbeat_interval
-                    && due.heartbeat_scan
-                {
-                    for (&conn_id, entry) in egress.connections.iter_mut() {
-                        if heartbeat_due(entry, now, interval, heartbeat_wire_frame.len()) {
-                            entry.send_buf.extend_from_slice(&heartbeat_wire_frame);
-                            entry.last_send = now;
-                            mark_dirty(entry, conn_id, &mut egress.dirty);
-                        }
-                    }
-                    // Flush the heartbeat sends immediately. Unsampled:
-                    // admin traffic, and no sample is queued (see above).
-                    if !egress.dirty.is_empty() {
-                        egress.send_dirty();
-                        egress.teardown_flush_failures();
-                    }
-                }
-
-                // Re-evaluate the ack policy on a slow timer so the
-                // `policy_degraded` flag and the periodic warn track the
-                // cluster's real state even on an idle / quiet node —
-                // the no-batch counterpart of `gate.after_batch()`.
-                gate.idle_recheck(now);
-
-                // Hand buffered latency samples to the stats registry
-                // while we have nothing better to do. Reuses the
-                // housekeeping clock read, so the spin path picks up no
-                // extra `clock_gettime`.
-                #[cfg(feature = "latency-trace")]
-                if due.stats_flush {
-                    spsc_rec.flush();
-                    dispatch_rec.flush();
-                    egress.server_e2e_rec.flush();
-                    #[cfg(feature = "tick-to-trade")]
-                    {
-                        journal_wait_rec.flush();
-                        replica_wait_rec.flush();
-                        encode_rec.flush();
-                        egress.egress_rec.flush();
-                    }
-                }
-            }
-
-            idle_count += 1;
-            if idle_count.is_multiple_of(1024) {
-                utilization.busy.store(busy_count, Ordering::Relaxed);
-                utilization.idle.store(idle_count, Ordering::Relaxed);
-            }
-            waiter.idle();
-            continue;
-        }
-        waiter.reset();
-        busy_count += 1;
-
-        #[cfg(feature = "latency-trace")]
-        let consume_ts = trace::mono_trace_ns();
-
-        // Wait for durability confirmation before sending responses.
-        //
-        // Gate on `wire_seq`, not `input_seq`. `input_seq` is in
-        // local-consumer space (the matching cursor on the input ring,
-        // starts at 0 in this process) while replica metrics and the
-        // primary's `journal_persisted_wire_seq` live in wire-seq space
-        // (allocated by the journal stage starting at
-        // `starting_sequence`). A `needed` derived from `input_seq` and
-        // compared against wire-seq cursors only works when
-        // `starting_sequence == 1`; a recovered primary (or any process
-        // whose journal already has prior content pushing
-        // `starting_sequence` above 1) would silently open the gate
-        // ahead of the replica's actual replicated state.
-        //
-        // Every cursor in the policy view (`journal_persisted_wire_seq`,
-        // `metrics.in_memory_sequence`, `metrics.acked_sequence`)
-        // carries "highest wire seq known to be in that state on node
-        // X". A slot's `wire_seq` is therefore the *exact* wire seq the
-        // gate must see — not `+1` — for that slot's event to be
-        // considered durable. The legacy `+1` was load-bearing only
-        // because `input_seq` was off by `starting_sequence - 1` from
-        // wire seq; with the wire-seq stamp it would over-shoot by one
-        // event and make the gate stall an extra round-trip per
-        // response.
-        //
-        // The gate is evaluated **per slot**, not once per batch against
-        // the batch's maximum `wire_seq`. Batch-max gating made every
-        // response in a batch wait for the newest event in it to become
-        // durable, so the oldest slot paid the durability latency of an
-        // event sequenced up to `MAX_BATCH` positions after it — a
-        // head-of-line block bounded only by the batch size, and one
-        // that bites hardest exactly when the stage has caught up to the
-        // durability frontier under load. Per-slot gating walks that
-        // frontier instead: each response is released as soon as its own
-        // event is durable.
-        //
-        // The extra waits are self-limiting. Slots arrive FIFO with
-        // monotonic `wire_seq`, and the journal publishes its cursor per
-        // fsync batch, so one wait typically advances the cursor past a
-        // whole run of following slots and they fall through without
-        // spinning. The number of waits (and so of flushes) tracks real
-        // durability boundaries, not the slot count. Correctness does
-        // not depend on that ordering — an unsorted batch would simply
-        // wait more often.
-        let batch_now = Instant::now();
-
-        // `flush` (see `FlushCadence`) is fed at append time and checked
-        // after every slot, so the flush runs *within* the batch.
-        // Deferring it to the end of the batch would reopen the defect
-        // the byte threshold exists to close: one MAX_BATCH batch of
-        // large frames (anything over ~64 bytes average) can push a
-        // healthy connection from empty past `MAX_SEND_BUF` before a
-        // batch-end flush ever ran, tearing it down with nothing
-        // written. A flag written at append time rather than a per-slot
-        // scan of the dirty set: the scan would cost a hash lookup per
-        // dirty connection on the hot path.
-        for slot in slots {
-            #[cfg(feature = "latency-trace")]
-            spsc_rec.record_elapsed(slot.match_complete_ts, consume_ts);
-
-            // The first slot of an event: the last one handled ended its
-            // event, so the snapshot's early replies go here, ahead of the
-            // gate, which holds this event, not them. The iteration's
-            // snapshot decides for the whole batch; the gate's hook takes
-            // fresh ones if this slot waits.
-            let at_boundary = boundary.at_boundary();
-            if let Some(at) = &at_boundary {
-                egress.release_early_replies(
-                    &mut registered,
-                    at,
-                    &*encoder,
-                    &mut early_buf,
-                    || batch_now,
-                );
-            }
-
-            // Per-slot journal-wait / replica-wait tracker. See
-            // `GateCrossTracker` for the rationale (only records cursors
-            // that were actually on the critical path). Both the
-            // tracker's replica cursor and the attribution counters
-            // below are derived from the policy in force rather than a
-            // fixed level, so "which subsystem to optimize" answers for
-            // the deployment the operator actually configured. A slot
-            // that never waits leaves the tracker unobserved, and an
-            // unobserved tracker reports no crossing — so the fast path
-            // records nothing rather than a zero-length sample.
-            #[cfg(feature = "tick-to-trade")]
-            let mut gate_tracker = GateCrossTracker::new(slot.wire_seq);
-
-            // Admit the slot: held until its event is durable under the
-            // policy in force, and for a policy change, the switch point.
-            // The hook flushes what is buffered if the slot has to wait,
-            // and sends early replies during the wait if the slot is the
-            // first of its event (`GateWaitHook`). What backs a reply
-            // decides its terminator: the policy, unless the gate released
-            // it on this node's own fsync while halted.
-            //
-            // Shutdown while the gate is closed: straight back to the
-            // top of the loop, where the shutdown branch decides what to
-            // flush. This slot's reply, which the policy never confirmed,
-            // is not appended, and the rest of the batch goes with it.
-            // Those clients see a reset, as after a crash, and reconcile
-            // on reconnect.
-            //
-            // A policy change slot is the gate's own: its frames go to no
-            // connection, whatever it is addressed to.
-            let admission = gate.admit(
-                slot,
-                shutdown,
-                #[cfg(feature = "tick-to-trade")]
-                &mut gate_tracker,
-                &mut GateWaitHook {
-                    egress: &mut egress,
-                    at_boundary,
-                    registered: &mut registered,
-                    control_rx: &control_rx,
-                    encoder: &*encoder,
-                    early_buf: &mut early_buf,
-                },
-            );
-            let (destination, backing) = match admission {
-                Admission::Reply {
-                    connection_id,
-                    backing,
-                } => (Some(connection_id), backing),
-                Admission::GateOnly => (None, Backing::Policy),
-                Admission::Shutdown => continue 'run,
-            };
-            // Handled from here on, whether or not its frames go
-            // anywhere: nothing between here and the next slot sends an
-            // early reply.
-            boundary.handled(slot.is_last_in_request);
-
-            // Per-slot durability-gate breakdown. Recorded only when the
-            // gate actually held us up (the tracker captured a cross).
-            // The cross timestamp is this slot's own `wire_seq`, so the
-            // sample measures the wait that slot really paid — under
-            // batch-max gating it was the batch maximum's crossing,
-            // which overstated every slot but the last by up to the
-            // batch's matching span.
-            #[cfg(feature = "tick-to-trade")]
-            if let Some(ts) = gate_tracker.journal_crossed() {
-                journal_wait_rec.record_elapsed(slot.match_complete_ts, ts);
-            }
-            #[cfg(feature = "tick-to-trade")]
-            if let Some(ts) = gate_tracker.replica_crossed() {
-                replica_wait_rec.record_elapsed(slot.match_complete_ts, ts);
-            }
-
-            // Each slot expands to at most two wire frames: the
-            // application payload (Report / Query) and an optional
-            // trailing `BatchEnd`, naming the slot's request, when
-            // `is_last_in_request` is set. Application-shaped
-            // payloads go through the encoder; the transport-shaped
-            // `BatchEnd` is the runtime's own.
-            if let Some((connection_id, entry)) =
-                destination.and_then(|id| egress.connections.get_mut(&id).map(|entry| (id, entry)))
-            {
-                // Frame 1: application payload (if any). BatchEnd
-                // payloads carry no body — the terminator below
-                // handles them via `is_last_in_request`.
-                let payload_result = encode_slot_payload(&slot.payload, &*encoder, &mut encode_buf);
-
-                // Frame 2: the pre-encoded terminator, `BatchEnd` or
-                // `BatchEndDegraded` as the slot is backed, with the
-                // request's ID written in, appended with the payload in
-                // one call. A degraded one counts for
-                // `melin_degraded_acks_total`: once per request, and only
-                // here, after the lookup, so a reply to a connection that
-                // is gone (a tick's among them) never counts.
-                let trailer: &[u8] = if slot.is_last_in_request {
-                    match backing {
-                        Backing::Policy => {}
-                        Backing::PrimaryOnly => {
-                            utilization.degraded_acks.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    batch_ends.terminator(backing, slot.request_id)
-                } else {
-                    &[]
-                };
-
-                #[cfg(feature = "tick-to-trade")]
-                let encode_start = trace::mono_trace_ns();
-                // Underscored: with both frames in one call there is no
-                // second append to skip, so the outcome is purely
-                // informational — `append_frames` has already queued an
-                // overflowing connection for removal. Only the traced
-                // build reads it, to avoid measuring bytes that were
-                // never buffered.
-                let _outcome = append_frames(
-                    payload_result,
-                    trailer,
-                    connection_id,
-                    entry,
-                    &encode_buf,
-                    batch_now,
-                    &mut egress.dirty,
-                    &mut egress.to_remove,
-                );
-                #[cfg(feature = "tick-to-trade")]
-                encode_rec.record_elapsed(encode_start, trace::mono_trace_ns());
-
-                // Queue the server-side end-to-end sample: reader recv ->
-                // response flush. Only a request's last slot carries this
-                // measurement; queued after the append so a dropped
-                // connection doesn't skew the metric, and closed by
-                // whichever flush ships the bytes.
-                #[cfg(feature = "latency-trace")]
-                if slot.is_last_in_request && matches!(_outcome, AppendOutcome::Continue) {
-                    egress.pending_e2e.push((connection_id, slot.recv_ts));
-                }
-
-                egress.cadence.on_append(entry.send_buf.len());
-            } else if let Some(connection_id) = destination.filter(|&id| id != 0) {
-                // A reply for a connection this stage does not hold: it
-                // was dropped earlier in this batch, or went away before
-                // its reply was encoded. The drain above runs after the
-                // ring is read, so a connection that is merely new is
-                // never a miss. Logged so a lost reply leaves a trace.
-                // Connection 0 is a server-originated event — a seed, a
-                // tick — whose reports have no client to go to, and is
-                // skipped without a word.
-                debug!(
-                    connection_id,
-                    wire_seq = slot.wire_seq,
-                    "reply dropped: connection not registered"
-                );
-            }
-
-            // Consumed-path flush (see `UringEgress::flush_if_due`). Runs
-            // between slots, not after the batch, so `MAX_SEND_BUF` can
-            // never trip on a healthy connection within a single batch.
-            egress.flush_if_due();
-        }
-
-        // The borrowed slots are dead here, so the batch can be handed
-        // back to the producer. Publishing progress is deliberately the
-        // last thing the iteration does with the ring: every slot has
-        // cleared its durability gate and been encoded by now.
-        //
-        // Invariant the event publisher depends on: this consumer's
-        // progress never passes a slot that has not cleared the gate.
-        // The publisher's consumer is chained behind this one (see
-        // `build_pipeline_with_replication`), so this commit is what
-        // releases events to it; committing earlier, or on the shutdown
-        // path out of a gate wait (which goes back to the top of the
-        // loop without committing), would broadcast events the ack
-        // policy has not confirmed. The DPDK stage keeps the same one.
-        consumer.commit();
-
-        // Remove connections that exceeded the send buffer limit.
-        egress.drop_overflowed();
-
-        // Log degradation transitions / re-emit the reminder — after
-        // dispatch, not before it. See `DurabilityGate::after_batch`.
-        gate.after_batch();
-
-        #[cfg(feature = "latency-trace")]
-        dispatch_rec.record_elapsed(consume_ts, trace::mono_trace_ns());
-    }
+    response_loop::run(
+        egress,
+        LoopInputs {
+            consumer,
+            control_rx,
+            gate: GateInputs {
+                journal_persisted_wire_seq,
+                replication_metrics,
+                replica_active,
+                utilization,
+                wait,
+                degraded_release,
+            },
+            policy,
+            heartbeat_interval,
+            encoder,
+            early_replies,
+            #[cfg(test)]
+            pause_after_control_drain,
+        },
+        loop_recorders,
+        shutdown,
+    );
+    true
 }
 
 /// Close every queued server-side end-to-end sample against the flush
@@ -3716,6 +3392,7 @@ pub(crate) mod tests {
         use crate::early_reply::{EARLY_REPLY_QUEUE_CAPACITY, EarlyKind, early_reply_channel};
         use crate::response::{MAX_SEND_BUF, UringEgress};
         use crate::response_frame::{EarlyReplyBuf, MAX_EARLY_REPLY};
+        use crate::response_loop::Egress as _;
 
         /// Replies in the burst: alternately a busy and a refusal with the
         /// widest reason, together well past `MAX_SEND_BUF`, within the
@@ -3736,7 +3413,7 @@ pub(crate) mod tests {
 
         /// A stage's egress holding one connection, 1, on `stream`, and
         /// the count of live connections it decrements.
-        fn egress_over(stream: UnixStream) -> (UringEgress, Arc<AtomicU64>) {
+        pub(super) fn egress_over(stream: UnixStream) -> (UringEgress, Arc<AtomicU64>) {
             let active = Arc::new(AtomicU64::new(1));
             let mut egress = UringEgress::new(
                 IoUring::new(64).expect("an io_uring"),
@@ -3881,6 +3558,154 @@ pub(crate) mod tests {
         }
     }
 
+    /// The kernel egress's hooks, called directly: what a slot's send
+    /// reports to the loop, which counts degraded acks and logs misses
+    /// from it (pinned by the recording egress in `response_loop`'s
+    /// tests), and what the way out sends.
+    mod uring_egress {
+        use std::os::unix::net::UnixStream;
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+
+        use counter_server::{CounterQuery, CounterReport, KIND_RESP_ACK, ResponseEncoder};
+        use melin_transport_core::fence::FenceState;
+        use melin_transport_core::pipeline::{OutputPayload, OutputSlot, RequestId};
+        use melin_wire_protocol::control_codec::TAG_BATCH_END;
+
+        use super::early_drain::egress_over;
+        use super::refusal_order::{Seen, read_frame};
+        use crate::durability_gate::{Backing, BatchEnds};
+        use crate::response::{MAX_SEND_BUF, UringEgress};
+        use crate::response_frame::{EncodeBuf, MAX_APP_FRAME};
+        use crate::response_loop::{Egress as _, SlotOutcome, SlotReply};
+
+        /// The request every slot here ends.
+        const REQUEST: RequestId = RequestId(7);
+
+        /// Hand `egress` a request's last slot for `connection_id`, an ack
+        /// and its terminator, backed by `backing`, encoded into
+        /// `encode_buf`.
+        fn send_last_slot(
+            egress: &mut UringEgress,
+            connection_id: u64,
+            backing: Backing,
+            encode_buf: &mut EncodeBuf,
+        ) -> SlotOutcome {
+            let slot = OutputSlot::<CounterReport, CounterQuery> {
+                connection_id,
+                request_id: REQUEST,
+                wire_seq: 1,
+                payload: OutputPayload::Report(CounterReport::Ack { new_value: 7 }),
+                is_last_in_request: true,
+                ..Default::default()
+            };
+            let mut batch_ends = BatchEnds::new();
+            egress.send_slot(
+                connection_id,
+                SlotReply::new(
+                    &slot,
+                    backing,
+                    &ResponseEncoder,
+                    encode_buf,
+                    &mut batch_ends,
+                ),
+                Instant::now(),
+            )
+        }
+
+        /// A last slot whose append would take its connection past
+        /// `MAX_SEND_BUF` sends nothing and queues the connection for
+        /// removal, and is still `Known`: the connection was found, which
+        /// is what the loop's degraded-ack count and its miss log go by.
+        #[test]
+        fn an_overflowing_last_slot_is_known_and_queues_its_connection_for_removal() {
+            let (server, _client) = UnixStream::pair().expect("socketpair");
+            let (mut egress, active) = egress_over(server);
+            // One byte short of the cap: no frame fits.
+            egress
+                .connections
+                .get_mut(&1)
+                .expect("connection 1")
+                .send_buf
+                .resize(MAX_SEND_BUF - 1, 0);
+
+            let mut encode_buf: EncodeBuf = [0u8; MAX_APP_FRAME];
+            let outcome = send_last_slot(&mut egress, 1, Backing::PrimaryOnly, &mut encode_buf);
+
+            assert_eq!(outcome, SlotOutcome::Known);
+            assert_eq!(egress.to_remove, [1], "queued for removal");
+            let entry = egress.connections.get(&1).expect("removed only later");
+            assert_eq!(entry.send_buf.len(), MAX_SEND_BUF - 1, "nothing appended");
+            assert!(egress.dirty.is_empty(), "nothing to flush");
+            assert_eq!(active.load(Ordering::Relaxed), 1, "not torn down yet");
+        }
+
+        /// A slot for a connection the egress does not hold is `Unknown`,
+        /// and nothing is encoded for it.
+        #[test]
+        fn a_slot_for_an_unknown_connection_is_unknown_and_encodes_nothing() {
+            let (server, _client) = UnixStream::pair().expect("socketpair");
+            let (mut egress, _active) = egress_over(server);
+
+            let mut encode_buf: EncodeBuf = [0u8; MAX_APP_FRAME];
+            let outcome = send_last_slot(&mut egress, 9, Backing::Policy, &mut encode_buf);
+
+            assert_eq!(outcome, SlotOutcome::Unknown);
+            assert!(encode_buf.iter().all(|&b| b == 0), "the reply was encoded");
+            assert!(egress.to_remove.is_empty());
+            assert!(egress.dirty.is_empty());
+        }
+
+        /// An egress holding a reply buffered for connection 1, fenced or
+        /// not, after its way out; and the client's end of the socket.
+        fn shut_down_holding_a_reply(fenced: bool) -> UnixStream {
+            let (server, client) = UnixStream::pair().expect("socketpair");
+            let (mut egress, _active) = egress_over(server);
+            if fenced {
+                let fence = FenceState::new(0);
+                fence.fence();
+                egress.fence_state = Arc::new(fence);
+            }
+            let mut encode_buf: EncodeBuf = [0u8; MAX_APP_FRAME];
+            assert_eq!(
+                send_last_slot(&mut egress, 1, Backing::Policy, &mut encode_buf),
+                SlotOutcome::Known
+            );
+            assert_eq!(egress.dirty, [1], "the reply is buffered");
+            egress.on_shutdown();
+            client
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .expect("set read timeout");
+            client
+        }
+
+        /// A stage stopped unfenced flushes what it buffered on the way
+        /// out.
+        #[test]
+        fn the_way_out_flushes_what_is_buffered() {
+            let mut client = shut_down_holding_a_reply(false);
+            let seen: Vec<Seen> = (0..2)
+                .map(|_| read_frame(&mut client).expect("the buffered reply"))
+                .collect();
+            assert_eq!(
+                seen,
+                [
+                    Seen::App(KIND_RESP_ACK),
+                    Seen::Final(TAG_BATCH_END, REQUEST)
+                ]
+            );
+        }
+
+        /// A fenced stage sends nothing on the way out: a superseded
+        /// ex-primary acknowledges no further work.
+        #[test]
+        fn a_fenced_way_out_sends_nothing() {
+            let mut client = shut_down_holding_a_reply(true);
+            assert!(read_frame(&mut client).is_err(), "a reply went out");
+        }
+    }
+
     /// The io_uring stage's gate-wait hook, called directly: the stage
     /// tests drive it through a running stage, where whether a reply
     /// queued during a wait goes out from the hook or from the boundary
@@ -3899,8 +3724,9 @@ pub(crate) mod tests {
         use crate::batch_boundary::BatchBoundary;
         use crate::durability_gate::GateWait;
         use crate::early_reply::{EarlyKind, early_reply_channel};
-        use crate::response::{GateWaitHook, UringEgress};
+        use crate::response::UringEgress;
         use crate::response_frame::{EarlyReplyBuf, MAX_EARLY_REPLY};
+        use crate::response_loop::GateWaitHook;
 
         const BUSY: EarlyKind<CounterReport> = EarlyKind::Busy;
 
@@ -4640,7 +4466,7 @@ pub(crate) mod tests {
 
         /// A seam that holds the stage on its first `holds` iterations,
         /// and the pause to start the stage with.
-        fn seam(holds: usize) -> (Box<dyn FnMut() + Send>, Seam) {
+        pub(crate) fn seam(holds: usize) -> (Box<dyn FnMut() + Send>, Seam) {
             let (parked_tx, parked) = mpsc::channel();
             let (resume, resume_rx) = mpsc::channel();
             let mut left = holds;
