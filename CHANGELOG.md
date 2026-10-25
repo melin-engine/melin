@@ -12,8 +12,24 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ## [Unreleased]
 
+### Added
+
+- **`melin_pipeline::spsc::Producer::push_with_unless`**: the blocking
+  push, given up with `Stopped`, having written nothing, if a stop flag is
+  set while it waits for room. A push with room never reads the flag.
+
 ### Fixed
 
+- **A DPDK node no longer hangs on shutdown when a poll thread stops
+  draining its replies.** The response stage waited for room on that poll
+  thread's full TX ring without checking whether the node was shutting
+  down (or had been fenced by a new primary), so a stalled poll thread
+  held the stage, and the shutdown with it, indefinitely. The wait now
+  ends on shutdown: the reply it was holding is not sent, nor the rest of
+  its batch, as when a shutdown interrupts a wait for durability, and an
+  early answer (a rejection, a refusal, a busy) that would have to wait is
+  dropped. Those clients reconcile on reconnect, as after any shutdown. A
+  reply that finds room is still sent, as on kernel TCP.
 - **A DPDK client connection is no longer dropped from the reply path when
   a heartbeat cannot be queued** (finding 27 of the determinism audit).
   The connection stayed open with its requests still applied, but every
@@ -21,6 +37,17 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   heartbeat is now retried on the next scan. The node logs a warning when
   a poll thread's heartbeats start being held back by its full TX ring,
   again once per heartbeat interval while they are, and when they resume.
+- **DPDK heartbeats are no longer delayed on a busy node.** On a node
+  whose response stage was nearly saturated, idling only briefly between
+  batches, the scan for idle connections due a heartbeat could be
+  postponed by many seconds, long enough for an idle client to time out.
+  The DPDK response stage now paces its idle housekeeping as the kernel
+  TCP one does: the scan runs once a second however briefly the stage
+  idles, and the stage stops reading the clock on every idle pass once it
+  has been idle for a while.
+- **A DPDK node built with `pipeline-stats` now reports the response
+  stage's utilization at shutdown**, as a kernel TCP node always has. It
+  printed the other stages' and left the response stage out.
 
 ## [0.22.0] - 2026-10-21
 

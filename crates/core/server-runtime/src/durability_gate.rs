@@ -174,19 +174,20 @@ impl BatchEnds {
         }
     }
 
-    /// `BatchEnd` for request `id`, the terminator of a reply backed as
-    /// the policy requires.
+    /// The terminator for request `id`, which `backing` closes: `BatchEnd`
+    /// for a reply backed as the policy requires, `BatchEndDegraded` for
+    /// one backed by the primary alone. Counts nothing: the degraded-ack
+    /// count for `melin_degraded_acks_total` is the response loop's, on a
+    /// reply that reached its connection, so building a terminator can
+    /// never count one.
     #[inline]
-    fn policy(&mut self, id: RequestId) -> &[u8] {
-        control_codec::write_terminal_id(&mut self.policy, id);
-        &self.policy
-    }
-
-    /// `BatchEndDegraded` for request `id`.
-    #[inline]
-    fn primary_only(&mut self, id: RequestId) -> &[u8] {
-        control_codec::write_terminal_id(&mut self.primary_only, id);
-        &self.primary_only
+    pub(crate) fn terminator(&mut self, backing: Backing, id: RequestId) -> &[u8] {
+        let frame = match backing {
+            Backing::Policy => &mut self.policy,
+            Backing::PrimaryOnly => &mut self.primary_only,
+        };
+        control_codec::write_terminal_id(frame, id);
+        frame
     }
 }
 
@@ -596,28 +597,6 @@ impl DurabilityGate {
             "pending change, durable under the policy before it"
         };
         self.apply_change(pending.wire_seq, pending.policy.to_byte(), cause);
-    }
-
-    /// The terminator for request `id`, which `backing` closes, from
-    /// `ends`. Counts each degraded one for `melin_degraded_acks_total`:
-    /// called once per request (on its last slot), by both stages.
-    #[inline]
-    pub(crate) fn batch_end<'e>(
-        &self,
-        backing: Backing,
-        ends: &'e mut BatchEnds,
-        id: RequestId,
-    ) -> &'e [u8] {
-        match backing {
-            Backing::Policy => ends.policy(id),
-            Backing::PrimaryOnly => {
-                self.inputs
-                    .utilization
-                    .degraded_acks
-                    .fetch_add(1, Ordering::Relaxed);
-                ends.primary_only(id)
-            }
-        }
     }
 
     /// Whether the degraded release is open now: degraded release on, no
@@ -1974,14 +1953,6 @@ mod tests {
             self.journal.store(WireSeq::new(pos));
         }
 
-        fn degraded_acks(&self) -> u64 {
-            self.gate
-                .inputs
-                .utilization
-                .degraded_acks
-                .load(Ordering::Relaxed)
-        }
-
         /// Admit `slot`, giving up after `patience`: a timer raises the
         /// shutdown flag, since a gate that holds the slot never returns
         /// on its own. `None` is "still held when patience ran out".
@@ -2043,7 +2014,6 @@ mod tests {
             Some(Duration::from_secs(60)),
         );
         assert_eq!(p.release(5, PATIENCE), None, "held for the grace period");
-        assert_eq!(p.degraded_acks(), 0);
     }
 
     #[test]
@@ -2178,7 +2148,6 @@ mod tests {
     fn no_degraded_release_with_the_switch_off() {
         let mut p = Primary::new(AckPolicy::DiskAndRam, 5, false, None);
         assert_eq!(p.release(5, PATIENCE), None, "the stall, unchanged");
-        assert_eq!(p.degraded_acks(), 0);
     }
 
     /// A replica that is connected but behind is backpressure, not a halt:
@@ -2229,8 +2198,8 @@ mod tests {
 
     /// Chosen behaviour, pinned: a query answered during a halt over state
     /// every replica had confirmed before it left is marked `PrimaryOnly`
-    /// (it ends in `BatchEndDegraded`) and counted in
-    /// `melin_degraded_acks_total`, like any other reply the halted node
+    /// (it ends in `BatchEndDegraded`, which the response loop counts in
+    /// `melin_degraded_acks_total`), like any other reply the halted node
     /// releases on its own disk.
     ///
     /// The gate keeps no record of what the policy confirmed before the
@@ -2275,11 +2244,9 @@ mod tests {
         );
         let mut ends = BatchEnds::new();
         assert_eq!(
-            p.gate
-                .batch_end(Backing::PrimaryOnly, &mut ends, RequestId(5)),
+            ends.terminator(Backing::PrimaryOnly, RequestId(5)),
             encoded(TransportResponse::BatchEndDegraded { id: RequestId(5) })
         );
-        assert_eq!(p.degraded_acks(), 1, "counted in melin_degraded_acks_total");
     }
 
     /// `response`'s frame, as the control codec encodes it.
@@ -2540,28 +2507,24 @@ mod tests {
         assert!(p.gate.pending.is_empty());
     }
 
-    /// The terminator follows the backing, and only degraded ones count.
+    /// The terminator follows the backing.
     #[test]
-    fn the_terminator_follows_the_backing_and_counts_degraded_acks() {
-        let p = Primary::new(AckPolicy::DiskAndRam, 5, false, NO_GRACE);
+    fn the_terminator_follows_the_backing() {
         let mut ends = BatchEnds::new();
         // Each request's terminator names it, whatever the template's
         // previous request was.
         for id in [RequestId(1), RequestId(u64::MAX), RequestId(0)] {
             assert_eq!(
-                p.gate.batch_end(Backing::Policy, &mut ends, id),
+                ends.terminator(Backing::Policy, id),
                 encoded(TransportResponse::BatchEnd { id })
             );
         }
-        assert_eq!(p.degraded_acks(), 0);
         assert_eq!(
-            p.gate
-                .batch_end(Backing::PrimaryOnly, &mut ends, RequestId(7)),
+            ends.terminator(Backing::PrimaryOnly, RequestId(7)),
             encoded(TransportResponse::BatchEndDegraded { id: RequestId(7) })
         );
-        assert_eq!(p.degraded_acks(), 1);
         assert_eq!(
-            ends.policy(RequestId(3)),
+            ends.terminator(Backing::Policy, RequestId(3)),
             encoded(TransportResponse::BatchEnd { id: RequestId(3) })
         );
     }

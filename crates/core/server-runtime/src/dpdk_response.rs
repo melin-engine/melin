@@ -9,6 +9,10 @@
 //!
 //! This decoupling is necessary because smoltcp is single-threaded — only
 //! the DPDK poll thread can call `socket.send_slice()`.
+//!
+//! The stage's loop is the one both transports share
+//! (`response_loop::run`); what is DPDK's own is where its frames go,
+//! [`DpdkEgress`].
 
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
@@ -20,29 +24,24 @@ use melin_pipeline::ring;
 use melin_pipeline::spsc;
 use melin_pipeline::wait::WaitStrategy;
 
-use crate::batch_boundary::{AtBoundary, BatchBoundary};
-use crate::durability_gate::{
-    Admission, Backing, BatchEnds, DurabilityGate, GateInputs, GatePolicy, GateWait,
-};
+use crate::batch_boundary::AtBoundary;
+use crate::durability_gate::{GateInputs, GatePolicy};
 use crate::early_reply::{EarlyReplyQueue, Registered};
+use crate::idle_housekeeping::heartbeat_due;
 use melin_app::Application;
-use melin_app::amortized_timer::AmortizedTimer;
 use melin_transport_core::DurableWireSeqCursor;
 use melin_transport_core::pipeline::{OutputSlot, StageUtilization};
 
-use melin_wire_protocol::control::TransportResponse;
-use melin_wire_protocol::control_codec::{self, BATCH_END_FRAME_LEN};
+use melin_wire_protocol::control_codec::BATCH_END_FRAME_LEN;
 
-use crate::response_frame::{
-    EarlyReplyBuf, EncodeBuf, MAX_APP_FRAME, MAX_EARLY_REPLY, encode_early_reply,
-    encode_slot_payload,
+use crate::response_frame::{EarlyReplyBuf, MAX_APP_FRAME, MAX_EARLY_REPLY, encode_early_reply};
+
+use crate::response_loop::{
+    self, Egress, EgressRecorders, LoopInputs, SlotOutcome, SlotReply, StageNames,
 };
 
 #[cfg(feature = "latency-trace")]
 use melin_transport_core::trace;
-
-/// Maximum number of output slots consumed per batch.
-const MAX_BATCH: usize = 1024;
 
 /// Maximum wire frame size: the largest framed application response, plus
 /// room for the batch terminator (`BatchEnd` or `BatchEndDegraded`, the
@@ -125,12 +124,12 @@ fn tx_lane(connection_id: u64, lanes: usize) -> usize {
     (connection_id >> LANE_SHIFT) as usize % lanes
 }
 
-/// Run the DPDK response stage loop. Blocks the calling thread until shutdown.
+/// Run the DPDK response stage. Blocks the calling thread until shutdown.
 ///
-/// Identical to the TCP response stage except:
-/// - No socket writers — encoded frames are sent via `tx_out` channel
-/// - No flush syscalls — the DPDK poll thread handles transmission
-/// - Heartbeats are sent via the same `tx_out` channel
+/// The shared response loop ([`response_loop::run`]) over this stage's
+/// [`DpdkEgress`]: every reply, early reply and heartbeat goes to the TX
+/// ring of the poll thread that owns its connection, which alone touches
+/// the socket, rather than to a kernel socket.
 ///
 /// Top-level thread entry point — the wide arg list mirrors stage state
 /// owned elsewhere; bundling into a config struct adds indirection
@@ -142,7 +141,7 @@ fn tx_lane(connection_id: u64, lanes: usize) -> usize {
 // for why the gate must use wire-seq space rather than the
 // journal-consumer cursor.
 pub fn run<A: Application>(
-    mut consumer: ring::Consumer<OutputSlot<A::Report, A::QueryResponse>>,
+    consumer: ring::Consumer<OutputSlot<A::Report, A::QueryResponse>>,
     control_rx: mpsc::Receiver<ControlEvent>,
     journal_persisted_wire_seq: DurableWireSeqCursor,
     policy: GatePolicy,
@@ -151,7 +150,7 @@ pub fn run<A: Application>(
     shutdown: &AtomicBool,
     heartbeat_interval: Option<Duration>,
     active_connections: Arc<AtomicU64>,
-    mut tx_producers: Vec<spsc::Producer<TxFrame>>,
+    tx_producers: Vec<spsc::Producer<TxFrame>>,
     utilization: Arc<StageUtilization>,
     wait: WaitStrategy,
     encoder: crate::response::ResponseEncoderArc<A>,
@@ -159,7 +158,7 @@ pub fn run<A: Application>(
     // request (halt rejections, filtered, refused and shed requests),
     // each sent at the first point between two events' replies — see
     // `crate::halt`.
-    mut early_replies: EarlyReplyQueue<A::Report>,
+    early_replies: EarlyReplyQueue<A::Report>,
     // Release of held replies on this node's own fsync while halted;
     // `None` when off. See `crate::halt::DegradedRelease`.
     degraded_release: Option<crate::halt::DegradedRelease>,
@@ -168,395 +167,305 @@ pub fn run<A: Application>(
     // drained, so a test can hold the stage there, and with it every early
     // reply, as the poll thread's parking tests do. `None` runs the stage
     // as production does; compiled out of non-test builds.
-    #[cfg(test)] mut pause_after_control_drain: Option<Box<dyn FnMut() + Send>>,
+    #[cfg(test)] pause_after_control_drain: Option<Box<dyn FnMut() + Send>>,
 ) {
-    // The ack policy in force and the durability gate — the same state
-    // machine the kernel response stage runs. See `DurabilityGate`.
-    let mut gate = DurabilityGate::new(
-        GateInputs {
-            journal_persisted_wire_seq,
-            replication_metrics,
-            replica_active,
-            utilization: Arc::clone(&utilization),
-            wait,
-            degraded_release,
+    let (loop_recorders, egress_recorders) = response_loop::register_recorders(&DpdkEgress::NAMES);
+    let egress = DpdkEgress::new(tx_producers, active_connections, egress_recorders);
+
+    response_loop::run(
+        egress,
+        LoopInputs {
+            consumer,
+            control_rx,
+            gate: GateInputs {
+                journal_persisted_wire_seq,
+                replication_metrics,
+                replica_active,
+                utilization,
+                wait,
+                degraded_release,
+            },
+            policy,
+            heartbeat_interval,
+            encoder,
+            early_replies,
+            #[cfg(test)]
+            pause_after_control_drain,
         },
-        policy,
-        "dpdk response",
+        loop_recorders,
+        shutdown,
     );
-    // Track known connections (for heartbeat scheduling).
-    // FxHash over SipHash: keys are server-generated connection ids, never
-    // attacker-chosen, so HashDoS resistance buys nothing and the default
-    // hasher costs more per lookup than the lookup itself.
-    let mut connections: FxHashMap<u64, ConnectionHeartbeat> =
-        FxHashMap::with_capacity_and_hasher(256, Default::default());
+}
 
-    let mut encode_buf: EncodeBuf = [0u8; MAX_APP_FRAME];
-    let mut early_buf: EarlyReplyBuf = [0u8; MAX_EARLY_REPLY];
-
-    // The two request terminators are the same bytes on every request but
-    // for the request's ID, so they are encoded once here and the ID
-    // written in per request — see `response::run`. Each is
-    // `BATCH_END_FRAME_LEN` bytes, the room `MAX_TX_FRAME` keeps for it.
-    let mut batch_ends = BatchEnds::new();
-
-    // Pre-encode heartbeat frame (fixed-size, no heap allocation).
-    let mut heartbeat_frame = [0u8; 8];
-    let heartbeat_len = control_codec::encode_transport_response(
-        &TransportResponse::Heartbeat,
-        &mut heartbeat_frame,
-    )
-    .expect("heartbeat encodes");
-
-    // Gate the heartbeat scan's clock read so the count==0 spin doesn't
-    // spend the response thread's CPU on `__vdso_clock_gettime`. Reads
-    // the clock every ~1 M idle iterations while spinning; heartbeat
-    // interval is seconds, so this is plenty.
-    let mut heartbeat_timer = AmortizedTimer::new();
-    let mut heartbeat_stalls = HeartbeatStalls::new(tx_producers.len());
-    let mut waiter = wait.waiter();
-    let mut busy_count: u64 = 0;
-    let mut idle_count: u64 = 0;
-    // Whether the stage stands between two events' replies, the only
-    // place early replies may go. See `response::run`.
-    let mut boundary = BatchBoundary::new();
-
-    // Stage histograms — mirror the TCP response stage but without
-    // an `egress` histogram. DPDK egress lives in the poll thread
-    // (`dpdk_transport.rs`), which is where the actual TX happens;
-    // sampling here would only capture SPSC-publish time and
-    // mislead the bench's tick-to-trade breakdown.
+/// The DPDK stage's connections and the TX rings every frame goes to: the
+/// stage's [`Egress`], which the shared loop ([`response_loop::run`])
+/// drives. How it differs from the kernel's, on purpose: see the
+/// `impl Egress for DpdkEgress` block.
+///
+/// No `egress` histogram, unlike the kernel's: DPDK egress lives in the
+/// poll thread (`dpdk_transport.rs`), which is where the actual TX
+/// happens; sampling here would only capture the SPSC publish and mislead
+/// the bench's tick-to-trade breakdown.
+struct DpdkEgress {
+    /// Known connections, for the reply's lookup and heartbeat
+    /// scheduling. FxHash over SipHash: keys are server-generated
+    /// connection ids, never attacker-chosen, so HashDoS resistance buys
+    /// nothing and the default hasher costs more per lookup than the
+    /// lookup itself.
+    connections: FxHashMap<u64, ConnectionHeartbeat>,
+    /// One TX ring per poll thread, indexed by [`tx_lane`]. A `Vec`
+    /// because the thread count is set at startup.
+    tx_producers: Vec<spsc::Producer<TxFrame>>,
+    /// Which lanes' heartbeats are held back by a full ring, for the log.
+    heartbeat_stalls: HeartbeatStalls,
+    /// The node's connection count. The response stage is the sole owner
+    /// of its decrements: the poll thread increments on authentication
+    /// and sends `ControlEvent::Disconnected` on close
+    /// ([`process_control_events`]).
+    active_connections: Arc<AtomicU64>,
+    /// The lane the slot in hand pushed to, held from
+    /// [`Egress::send_slot`] to [`Egress::after_slot`], which flushes it.
+    /// An `Option` that `after_slot` *takes*: it also runs after a miss
+    /// and after a change slot, which must neither flush again nor record
+    /// the last reply's end-to-end sample a second time.
+    pushed: Option<PushedSlot>,
     #[cfg(feature = "latency-trace")]
-    let mut spsc_rec =
-        trace::register_stage("response: SPSC wakeup (matching publish → response consume)");
-    #[cfg(feature = "latency-trace")]
-    let mut dispatch_rec = trace::register_stage("response: dispatch (consume → SPSC publish)");
-    #[cfg(feature = "latency-trace")]
-    let mut server_e2e_rec =
-        trace::register_stage("server e2e (reader recv → response SPSC publish)");
+    server_e2e_rec: trace::StageRecorder,
+    /// Wall time around a slot's push (see [`EgressRecorders::encode`]).
     #[cfg(feature = "tick-to-trade")]
-    let mut journal_wait_rec =
-        trace::register_stage("response: journal-wait (match_complete → journal cursor crossed)");
-    #[cfg(feature = "tick-to-trade")]
-    let mut replica_wait_rec = trace::register_stage(
-        "response: replica-wait (match_complete → replication cursor crossed)",
-    );
-    #[cfg(feature = "tick-to-trade")]
-    let mut encode_rec = trace::register_stage("response: encode (per-kind wire encoding)");
-    // Paces the idle-path recorder flush — see `response::run`.
+    encode_rec: trace::StageRecorder,
+}
+
+/// A slot's push, until its lane is flushed.
+struct PushedSlot {
+    /// The slot's TX ring ([`tx_lane`]). `usize`: it indexes
+    /// `tx_producers`.
+    lane: usize,
+    /// When the reader received the request, if the slot ends it: only
+    /// such a slot closes an end-to-end sample, at the flush.
     #[cfg(feature = "latency-trace")]
-    let mut last_stats_flush = Instant::now();
+    e2e_from: Option<trace::MonoTraceInstant>,
+}
 
-    'run: loop {
-        // Fencing note: a superseded ex-primary exits through this same
-        // shutdown branch (`FenceState::fence_if_superseded` co-sets
-        // `shutdown`). Unlike the kernel response stage there is no
-        // best-effort flush here to suppress, so the fence needs no
-        // dedicated check — exiting stops releasing response frames onto
-        // the TX rings, which is the whole ack gate.
-        if shutdown.load(Ordering::Relaxed) {
-            utilization.busy.store(busy_count, Ordering::Relaxed);
-            utilization.idle.store(idle_count, Ordering::Relaxed);
-            return;
-        }
-
-        // Borrow output slots from the matching stage in place — see
-        // `response::run` for why this is a borrow and not a copy, and
-        // for the consequence of publishing progress after the batch
-        // instead of before it.
-        let slots = consumer.read_contiguous(MAX_BATCH);
-
-        // Take a snapshot of the early replies, then poll the control
-        // channel for connect/disconnect — after the ring is read, never
-        // before: the poll thread queues `Connected` on authentication and
-        // parses that connection's requests only afterwards, so every slot
-        // read above, and every early reply in the snapshot, has its
-        // `Connected` already queued, and this drain sees it. See
-        // `response::run` for the reply this order protects.
-        // Counter accounting: the response stage is the sole owner of
-        // active_connections decrements. The poll thread increments on
-        // auth success and sends ControlEvent::Disconnected on close.
-        let mut registered = early_replies.register(|| {
-            process_control_events(
-                &control_rx,
-                &mut connections,
-                &active_connections,
-                Instant::now,
-            )
-        });
-
-        // Test seam: hold the stage right after the drain — see the
-        // parameter.
-        #[cfg(test)]
-        if let Some(pause) = pause_after_control_drain.as_mut() {
-            pause();
-        }
-
-        if slots.is_empty() {
-            // Between two events only: an empty read is not a boundary in
-            // itself. See `response::run`.
-            if let Some(at) = boundary.at_boundary() {
-                release_early_replies(
-                    &mut registered,
-                    &at,
-                    &*encoder,
-                    &mut connections,
-                    &mut tx_producers,
-                    &mut early_buf,
-                    Instant::now,
-                );
-            }
-
-            idle_count += 1;
-            if idle_count.is_multiple_of(1024) {
-                utilization.busy.store(busy_count, Ordering::Relaxed);
-                utilization.idle.store(idle_count, Ordering::Relaxed);
-            }
-
-            // Heartbeat scan, gated by AmortizedTimer to keep the busy-
-            // spin path off `clock_gettime`. Without this, perf-annotate
-            // showed ~22 % of the response thread's CPU on the vDSO.
-            if let Some(interval) = heartbeat_interval
-                && heartbeat_timer
-                    .tick(Duration::from_secs(1), waiter.spinning())
-                    .is_some()
-            {
-                let now = Instant::now();
-                send_due_heartbeats(
-                    &mut connections,
-                    &mut tx_producers,
-                    &heartbeat_frame[..heartbeat_len],
-                    now,
-                    interval,
-                    &mut heartbeat_stalls,
-                );
-                heartbeat_stalls.finish_scan(now, interval, log_stall_change);
-            }
-
-            // Re-evaluate the policy on a slow timer so the
-            // `policy_degraded` flag and warn-log track the cluster
-            // state even when no batches are flowing. See response.rs
-            // for the rationale.
-            {
-                let now_ts = Instant::now();
-                gate.idle_recheck(now_ts);
-
-                // Hand buffered latency samples to the stats registry
-                // while idle. Reuses the policy check's clock read —
-                // see `response::run` for why this must happen at all.
-                #[cfg(feature = "latency-trace")]
-                if now_ts.duration_since(last_stats_flush) >= trace::IDLE_FLUSH_INTERVAL {
-                    last_stats_flush = now_ts;
-                    spsc_rec.flush();
-                    dispatch_rec.flush();
-                    server_e2e_rec.flush();
-                    #[cfg(feature = "tick-to-trade")]
-                    {
-                        journal_wait_rec.flush();
-                        replica_wait_rec.flush();
-                        encode_rec.flush();
-                    }
-                }
-            }
-
-            waiter.idle();
-            continue;
-        }
-        waiter.reset();
-        busy_count += 1;
-
-        #[cfg(feature = "latency-trace")]
-        let consume_ts = trace::mono_trace_ns();
-
-        // One Instant::now() per batch for heartbeat tracking instead of
-        // per response — heartbeat interval is 10s, sub-ms precision is plenty.
-        let batch_now = Instant::now();
-
-        // Encode and queue responses. Each slot expands to at most two
-        // wire frames: the payload (Report / QueryResponse) and an
-        // optional trailing `BatchEnd`, naming the slot's request, when
-        // `is_last_in_request` is set. `OutputPayload::BatchEnd` carries
-        // no payload of its own — the wire BatchEnd is emitted purely
-        // from the flag.
-        //
-        // The durability gate is evaluated per slot, inline — see
-        // `response::run` for why batch-max gating was a head-of-line
-        // block and why the extra waits are self-limiting.
-        for slot in slots {
+impl DpdkEgress {
+    /// No connections yet, over one TX ring per poll thread.
+    fn new(
+        tx_producers: Vec<spsc::Producer<TxFrame>>,
+        active_connections: Arc<AtomicU64>,
+        // Empty in untraced builds.
+        #[cfg_attr(not(feature = "latency-trace"), allow(unused_variables))]
+        recorders: EgressRecorders,
+    ) -> Self {
+        Self {
+            connections: FxHashMap::with_capacity_and_hasher(256, Default::default()),
+            heartbeat_stalls: HeartbeatStalls::new(tx_producers.len()),
+            tx_producers,
+            active_connections,
+            pushed: None,
             #[cfg(feature = "latency-trace")]
-            spsc_rec.record_elapsed(slot.match_complete_ts, consume_ts);
-
-            // The first slot of an event: the snapshot's early replies go
-            // first, ahead of the gate. See `response::run`.
-            let at_boundary = boundary.at_boundary();
-            if let Some(at) = &at_boundary {
-                release_early_replies(
-                    &mut registered,
-                    at,
-                    &*encoder,
-                    &mut connections,
-                    &mut tx_producers,
-                    &mut early_buf,
-                    || batch_now,
-                );
-            }
-
-            // Per-slot journal-wait / replica-wait tracker. Same shape as
-            // the TCP response — see `crate::response::GateCrossTracker`
-            // for the rationale and edge cases.
+            server_e2e_rec: recorders.server_e2e,
             #[cfg(feature = "tick-to-trade")]
-            let mut gate_tracker = crate::response::GateCrossTracker::new(slot.wire_seq);
-
-            // Gate on `wire_seq` (matches `response::run`) — see that
-            // module's notes on the input-seq vs wire-seq space mismatch
-            // that motivated the field. With the wire-seq stamp, the
-            // slot's own `wire_seq` is the exact value the gate must
-            // observe for that slot's event to count as durable; no `+1`
-            // (the old `+1` compensated for the input-seq
-            // off-by-(starting-1), which is gone now).
-            //
-            // A policy change slot is the switch point (see
-            // `DurabilityGate::admit`). Nothing to flush before a wait:
-            // every slot's frames are released as soon as it is encoded.
-            // Early replies go out during the wait if the slot is the first
-            // of its event (`GateWaitHook`).
-            //
-            // A gate that cannot open does not hold the shutdown sequence;
-            // the reply the policy never confirmed is not queued. A policy
-            // change slot is the gate's own: its frames go to no
-            // connection, whatever it is addressed to. What backs a reply
-            // decides its terminator: the policy, unless the gate released
-            // it on this node's own fsync while halted.
-            let admission = gate.admit(
-                slot,
-                shutdown,
-                #[cfg(feature = "tick-to-trade")]
-                &mut gate_tracker,
-                &mut GateWaitHook {
-                    at_boundary,
-                    registered: &mut registered,
-                    control_rx: &control_rx,
-                    connections: &mut connections,
-                    active_connections: &active_connections,
-                    tx_producers: &mut tx_producers,
-                    encoder: &*encoder,
-                    early_buf: &mut early_buf,
-                },
-            );
-            let (destination, backing) = match admission {
-                Admission::Reply {
-                    connection_id,
-                    backing,
-                } => (Some(connection_id), backing),
-                Admission::GateOnly => (None, Backing::Policy),
-                Admission::Shutdown => continue 'run,
-            };
-            // Handled from here on, whether or not its frames go anywhere
-            // (the miss below skips the rest of the loop body).
-            boundary.handled(slot.is_last_in_request);
-
-            #[cfg(feature = "tick-to-trade")]
-            if let Some(ts) = gate_tracker.journal_crossed() {
-                journal_wait_rec.record_elapsed(slot.match_complete_ts, ts);
-            }
-            #[cfg(feature = "tick-to-trade")]
-            if let Some(ts) = gate_tracker.replica_crossed() {
-                replica_wait_rec.record_elapsed(slot.match_complete_ts, ts);
-            }
-
-            // One lookup, not two: the entry decides whether the
-            // connection is still known, and the same borrow stamps its
-            // heartbeat clock once the frame is queued.
-            let Some((conn_id, conn_state)) =
-                destination.and_then(|id| connections.get_mut(&id).map(|state| (id, state)))
-            else {
-                // A reply for a connection this stage does not hold: it
-                // is gone. The drain runs after the ring is read, so a
-                // connection that is merely new is never a miss. Logged
-                // so a lost reply leaves a trace. Connection 0 is a
-                // server-originated event — a seed, a tick — whose
-                // reports have no client to go to, and is skipped
-                // without a word.
-                if let Some(connection_id) = destination.filter(|&id| id != 0) {
-                    tracing::debug!(
-                        connection_id,
-                        wire_seq = slot.wire_seq,
-                        "reply dropped: connection not registered"
-                    );
-                }
-                continue;
-            };
-
-            // All frames for this slot share the same destination tid
-            // (single connection_id), so we can compute it once and
-            // bundle the slot's 1–2 frames under one Release at the end
-            // of the slot. Per-slot flush — rather than once per outer
-            // batch — keeps individual requests' RTT short under
-            // saturation (each request's response ships as soon as
-            // encoded) while still letting the DPDK poll thread drain
-            // Report + BatchEnd in a single consume cycle for low-rate
-            // workloads (consumer-side win for single-request p99).
-            let tid = tx_lane(conn_id, tx_producers.len());
-
-            // Frame 1: application payload (Report / Query via encoder).
-            // BatchEnd payloads carry no body — the terminator below
-            // handles them via is_last_in_request.
-            let payload_result = encode_slot_payload(&slot.payload, &*encoder, &mut encode_buf);
-
-            // The terminator rides in the same frame: `BatchEnd`, or
-            // `BatchEndDegraded` as the slot is backed. Both are
-            // transport-shaped and the same bytes every time but for the
-            // request's ID, so they are encoded once at startup and the
-            // ID written in per request.
-            let trailer: &[u8] = if slot.is_last_in_request {
-                gate.batch_end(backing, &mut batch_ends, slot.request_id)
-            } else {
-                &[]
-            };
-
-            #[cfg(feature = "tick-to-trade")]
-            let encode_start = trace::mono_trace_ns();
-            push_frame(
-                payload_result,
-                conn_id,
-                &mut tx_producers[tid],
-                &encode_buf,
-                trailer,
-            );
-            #[cfg(feature = "tick-to-trade")]
-            encode_rec.record_elapsed(encode_start, trace::mono_trace_ns());
-
-            // Release this slot's frames as a unit. `flush` is a no-op
-            // when nothing was pushed (e.g. every kind hit an encode
-            // error), so the call is safe regardless.
-            tx_producers[tid].flush();
-            #[cfg(feature = "latency-trace")]
-            if slot.is_last_in_request {
-                // Record server-e2e relative to post-flush wall clock —
-                // i.e. the moment the DPDK poll thread can see the
-                // response.
-                server_e2e_rec.record_elapsed(slot.recv_ts, trace::mono_trace_ns());
-            }
-
-            conn_state.last_send = batch_now;
+            encode_rec: recorders.encode,
         }
-
-        // Borrowed slots are dead here — hand the batch back to the
-        // producer now that every one of them has cleared its gate.
-        //
-        // Invariant the event publisher depends on: this consumer's
-        // progress never passes a slot that has not cleared the gate
-        // (the publisher is chained behind it, so this commit releases
-        // events to it). See the same commit in `response::run`.
-        consumer.commit();
-
-        // Log degradation transitions / re-emit the reminder — after
-        // dispatch, not before it. See `DurabilityGate::after_batch`.
-        gate.after_batch();
-
-        #[cfg(feature = "latency-trace")]
-        dispatch_rec.record_elapsed(consume_ts, trace::mono_trace_ns());
     }
+}
+
+/// Simpler than the kernel's (`response::UringEgress`), and deliberately
+/// so: the poll thread owns every socket, so a frame pushed is a frame
+/// handed over, and there is no per-connection send buffer on this side.
+/// What follows from that, each a hook below rather than a comment:
+///
+/// - No flush cadence and no flush before a gate wait: each slot's lane
+///   is flushed as soon as the slot is pushed ([`Self::after_slot`]), so
+///   [`Self::before_wait`], [`Self::after_wait_release`] and
+///   [`Self::on_idle`] are no-ops.
+/// - No send buffer to overflow, so nothing to drop after a release or a
+///   commit ([`Self::after_idle_release`], [`Self::after_commit`]).
+/// - No shutdown flush to suppress when fenced ([`Self::on_shutdown`]):
+///   leaving the loop stops releasing reply frames, which is the whole ack
+///   gate.
+/// - Heartbeats skip the kernel's blocked-peer and send-buffer-cap checks
+///   ([`Self::send_heartbeats`]): with no send buffer there is nothing for
+///   them to guard; a full TX ring keeps the heartbeat due instead.
+impl Egress for DpdkEgress {
+    type Control = ControlEvent;
+
+    const NAMES: StageNames = StageNames {
+        gate: "dpdk response",
+        dispatch: "response: dispatch (consume → SPSC publish)",
+        server_e2e: "server e2e (reader recv → response SPSC publish)",
+    };
+
+    /// See [`process_control_events`]. The poll thread queues `Connected`
+    /// on authentication and parses that connection's requests only
+    /// afterwards, which is what the loop's drain-after-read relies on.
+    fn drain_control(&mut self, control_rx: &mpsc::Receiver<ControlEvent>) {
+        process_control_events(
+            control_rx,
+            &mut self.connections,
+            &self.active_connections,
+            Instant::now,
+        );
+    }
+
+    /// Push the slot's frames, payload and terminator in one TX frame
+    /// ([`push_frame`]), onto its connection's lane, and keep the lane for
+    /// [`Self::after_slot`] to flush. One lookup, not two: the entry
+    /// decides whether the connection is still known, and the same borrow
+    /// stamps its heartbeat clock, even when nothing was pushed (an encode
+    /// error on a slot that does not end its request).
+    ///
+    /// [`SlotOutcome::Stopped`] if the push waited for room on a full
+    /// lane and `shutdown` ended the wait: nothing was pushed, the clock
+    /// is not stamped, and no lane is kept, since the loop leaves without
+    /// this slot's `after_slot`.
+    #[inline]
+    fn send_slot<R: Copy, Q: Copy>(
+        &mut self,
+        connection_id: u64,
+        reply: SlotReply<'_, R, Q>,
+        now: Instant,
+        shutdown: &AtomicBool,
+    ) -> SlotOutcome {
+        // The loop pairs every send_slot with an after_slot, which takes
+        // the lane: one still held here would go unflushed and lose its
+        // e2e sample when overwritten below.
+        debug_assert!(
+            self.pushed.is_none(),
+            "a pushed lane was not released by after_slot"
+        );
+        let Some(state) = self.connections.get_mut(&connection_id) else {
+            return SlotOutcome::Unknown;
+        };
+        let lane = tx_lane(connection_id, self.tx_producers.len());
+        let frames = reply.into_frames();
+
+        #[cfg(feature = "tick-to-trade")]
+        let encode_start = trace::mono_trace_ns();
+        let pushed = push_frame(
+            frames.payload,
+            connection_id,
+            &mut self.tx_producers[lane],
+            frames.encode_buf,
+            frames.trailer,
+            shutdown,
+        );
+        if let Err(spsc::Stopped) = pushed {
+            return SlotOutcome::Stopped;
+        }
+        #[cfg(feature = "tick-to-trade")]
+        self.encode_rec
+            .record_elapsed(encode_start, trace::mono_trace_ns());
+
+        state.last_send = now;
+        self.pushed = Some(PushedSlot {
+            lane,
+            #[cfg(feature = "latency-trace")]
+            e2e_from: frames.is_last_in_request.then_some(frames.recv_ts),
+        });
+        SlotOutcome::Known
+    }
+
+    /// Release the slot's frames as a unit, if it pushed to a known
+    /// connection: its 1–2 frames share one lane, so they go under one
+    /// release. Per slot rather than once per batch, so each request's
+    /// reply ships as soon as it is pushed under saturation, while the
+    /// poll thread still drains a reply and its terminator in one consume
+    /// for low-rate workloads. `flush` is a no-op when nothing was pushed
+    /// (an encode error with no terminator), so the call is safe
+    /// regardless.
+    #[inline]
+    fn after_slot(&mut self) {
+        let Some(pushed) = self.pushed.take() else {
+            return;
+        };
+        self.tx_producers[pushed.lane].flush();
+        // Server end-to-end, closed after the flush: the moment the poll
+        // thread can see the reply.
+        #[cfg(feature = "latency-trace")]
+        if let Some(recv_ts) = pushed.e2e_from {
+            self.server_e2e_rec
+                .record_elapsed(recv_ts, trace::mono_trace_ns());
+        }
+    }
+
+    /// Send every early reply `registered` holds, between two events'
+    /// replies (`at`), each as its own TX frame ([`push_early_reply`]).
+    /// Returns how many; `now` is read once, and only if there is one. No
+    /// send buffer to overflow: each reply is handed to the poll thread as
+    /// it is encoded. Once `shutdown` is set, a reply whose lane is full
+    /// is dropped rather than waited for ([`push_early_reply`]), so the
+    /// drain finishes without waiting.
+    fn release_early_replies<R: Copy, Q: Copy>(
+        &mut self,
+        registered: &mut Registered<'_, R>,
+        at: &AtBoundary<'_>,
+        encoder: &dyn melin_app::encoder::ResponseEncoder<Report = R, Query = Q>,
+        early_buf: &mut EarlyReplyBuf,
+        now: impl Fn() -> Instant,
+        shutdown: &AtomicBool,
+    ) -> usize {
+        let mut stamp = None;
+        registered.drain(at, |reply| {
+            let now = *stamp.get_or_insert_with(&now);
+            push_early_reply(
+                reply,
+                encoder,
+                &mut self.connections,
+                &mut self.tx_producers,
+                early_buf,
+                now,
+                shutdown,
+            );
+        })
+    }
+
+    /// Nothing to flush: every slot's frames went to the poll thread as
+    /// soon as they were pushed.
+    fn before_wait(&mut self) {}
+
+    /// Nothing to ship: each early reply was flushed as it was pushed.
+    fn after_wait_release(&mut self) {}
+
+    /// Nothing to drop: a push cannot overflow.
+    fn after_idle_release(&mut self) {}
+
+    /// No steady-state flush: nothing is buffered here.
+    fn on_idle(&mut self) {}
+
+    /// Queue a heartbeat for every connection due one
+    /// ([`send_due_heartbeats`]), then log the lanes whose stall began,
+    /// ended or lasts ([`HeartbeatStalls::finish_scan`]).
+    fn send_heartbeats(&mut self, frame: &[u8], now: Instant, interval: Duration) {
+        send_due_heartbeats(
+            &mut self.connections,
+            &mut self.tx_producers,
+            frame,
+            now,
+            interval,
+            &mut self.heartbeat_stalls,
+        );
+        self.heartbeat_stalls
+            .finish_scan(now, interval, log_stall_change);
+    }
+
+    /// Nothing to drop: a push cannot overflow.
+    fn after_commit(&mut self) {}
+
+    #[cfg(feature = "latency-trace")]
+    fn flush_idle_stats(&mut self) {
+        self.server_e2e_rec.flush();
+        #[cfg(feature = "tick-to-trade")]
+        self.encode_rec.flush();
+    }
+
+    /// Nothing to do on the way out, fenced or not. A superseded
+    /// ex-primary leaves the loop through the same exits
+    /// (`FenceState::fence_if_superseded` co-sets `shutdown`), and with no
+    /// buffered bytes here there is no best-effort flush to suppress:
+    /// leaving the loop stops releasing reply frames onto the TX rings,
+    /// which is the whole ack gate.
+    fn on_shutdown(&mut self) {}
 }
 
 /// Push one SPSC frame carrying an encoded payload and/or a pre-encoded
@@ -567,6 +476,13 @@ pub fn run<A: Application>(
 /// nothing. Encode failures are logged at error level and drop the payload,
 /// but still ship the trailer, so a request that fails to encode one response
 /// is still terminated rather than leaving the client waiting.
+///
+/// The one push of a reply or an early reply, and so the one place either
+/// waits for room: on a full ring it waits for the poll thread to drain it,
+/// unless `shutdown` is set meanwhile, and then returns `Err(Stopped)`
+/// having pushed nothing. A wedged poll thread cannot hold the stage past a
+/// shutdown. The flag is read only while waiting: a push with room goes
+/// through whatever it says.
 ///
 /// # Panics
 ///
@@ -581,7 +497,8 @@ fn push_frame(
     tx: &mut spsc::Producer<TxFrame>,
     encode_buf: &[u8],
     trailer: &[u8],
-) {
+    shutdown: &AtomicBool,
+) -> Result<(), spsc::Stopped> {
     let written = match payload {
         Some(Ok(n)) => n,
         Some(Err(reason)) => {
@@ -591,7 +508,7 @@ fn push_frame(
         None => 0,
     };
     if written == 0 && trailer.is_empty() {
-        return;
+        return Ok(());
     }
     let total = written + trailer.len();
     assert!(
@@ -601,19 +518,25 @@ fn push_frame(
     );
     // Lossless: at most `MAX_TX_FRAME`, asserted above.
     let len = total as u16;
-    tx.push_with(|frame| {
-        frame.connection_id = conn_id;
-        frame.len = len;
-        frame.data[..written].copy_from_slice(&encode_buf[..written]);
-        frame.data[written..total].copy_from_slice(trailer);
-    });
+    tx.push_with_unless(
+        |frame| {
+            frame.connection_id = conn_id;
+            frame.len = len;
+            frame.data[..written].copy_from_slice(&encode_buf[..written]);
+            frame.data[written..total].copy_from_slice(trailer);
+        },
+        shutdown,
+    )?;
+    Ok(())
 }
 
 /// Queue an answer the poll thread decided on — a halt rejection, a
 /// filtered or refused request, a shed one — for the poll thread, every
 /// frame of it in one TX frame, encoded by [`encode_early_reply`]. No
 /// durability gate: nothing was published. A connection that has gone
-/// away is skipped.
+/// away is skipped, and so is a reply whose push was stopped by
+/// `shutdown` while it waited for room ([`push_frame`]): a shutdown drops
+/// every unsent reply.
 fn push_early_reply<R: Copy, Q: Copy>(
     reply: crate::early_reply::EarlyReply<R>,
     encoder: &dyn melin_app::encoder::ResponseEncoder<Report = R, Query = Q>,
@@ -621,6 +544,7 @@ fn push_early_reply<R: Copy, Q: Copy>(
     tx_producers: &mut [spsc::Producer<TxFrame>],
     early_buf: &mut EarlyReplyBuf,
     now: Instant,
+    shutdown: &AtomicBool,
 ) {
     let conn_id = reply.connection_id;
     let Some(conn_state) = connections.get_mut(&conn_id) else {
@@ -632,80 +556,22 @@ fn push_early_reply<R: Copy, Q: Copy>(
     };
     let tid = tx_lane(conn_id, tx_producers.len());
     let written = encode_early_reply(&reply, encoder, early_buf);
-    push_frame(
+    if let Err(spsc::Stopped) = push_frame(
         Some(Ok(written)),
         conn_id,
         &mut tx_producers[tid],
         early_buf,
         &[],
-    );
+        shutdown,
+    ) {
+        tracing::debug!(
+            connection_id = conn_id,
+            "early reply dropped: shutting down with the poll thread's ring full"
+        );
+        return;
+    }
     tx_producers[tid].flush();
     conn_state.last_send = now;
-}
-
-/// Send every early reply `registered` holds, between two events' replies
-/// (`at`), each as its own TX frame ([`push_early_reply`]). Returns how
-/// many; `now` is read once, and only if there is one. No send buffer to
-/// overflow: each reply is handed to the poll thread as it is encoded.
-#[allow(clippy::too_many_arguments)]
-fn release_early_replies<R: Copy, Q: Copy>(
-    registered: &mut Registered<'_, R>,
-    at: &AtBoundary<'_>,
-    encoder: &dyn melin_app::encoder::ResponseEncoder<Report = R, Query = Q>,
-    connections: &mut FxHashMap<u64, ConnectionHeartbeat>,
-    tx_producers: &mut [spsc::Producer<TxFrame>],
-    early_buf: &mut EarlyReplyBuf,
-    now: impl Fn() -> Instant,
-) -> usize {
-    let mut stamp = None;
-    registered.drain(at, |reply| {
-        let now = *stamp.get_or_insert_with(&now);
-        push_early_reply(reply, encoder, connections, tx_producers, early_buf, now);
-    })
-}
-
-/// The DPDK stage's [`GateWait`] hook, built for one slot's admit: if the
-/// held slot is the first of its event (`at_boundary`), send early replies
-/// during the wait, registering new connections first
-/// ([`Registered::reregister`]). A slot held in the middle of an event
-/// sends nothing: an early reply there would split that event's reply.
-struct GateWaitHook<'a, 'q, R: Copy, Q: Copy> {
-    at_boundary: Option<AtBoundary<'a>>,
-    registered: &'a mut Registered<'q, R>,
-    control_rx: &'a mpsc::Receiver<ControlEvent>,
-    connections: &'a mut FxHashMap<u64, ConnectionHeartbeat>,
-    active_connections: &'a AtomicU64,
-    tx_producers: &'a mut [spsc::Producer<TxFrame>],
-    encoder: &'a dyn melin_app::encoder::ResponseEncoder<Report = R, Query = Q>,
-    early_buf: &'a mut EarlyReplyBuf,
-}
-
-impl<R: Copy, Q: Copy> GateWait for GateWaitHook<'_, '_, R, Q> {
-    /// Nothing to flush: every slot's frames went to the poll thread as
-    /// soon as they were encoded.
-    fn before_wait(&mut self) {}
-
-    /// Early replies decided while the gate holds a write go out now
-    /// rather than behind it. No clock read on a turn with none.
-    fn while_waiting(&mut self) {
-        let Some(at) = &self.at_boundary else {
-            return;
-        };
-        let connections = &mut *self.connections;
-        let (control_rx, active_connections) = (self.control_rx, self.active_connections);
-        self.registered.reregister(|| {
-            process_control_events(control_rx, connections, active_connections, Instant::now)
-        });
-        release_early_replies(
-            self.registered,
-            at,
-            self.encoder,
-            self.connections,
-            self.tx_producers,
-            self.early_buf,
-            Instant::now,
-        );
-    }
 }
 
 /// Per-connection heartbeat state. No socket writer — the DPDK poll
@@ -766,7 +632,7 @@ fn send_due_heartbeats(
 ) {
     for (&conn_id, state) in connections.iter_mut() {
         let tid = tx_lane(conn_id, tx_producers.len());
-        if now.duration_since(state.last_send) < interval {
+        if !heartbeat_due(state.last_send, now, interval) {
             stalls.record(tid, Heartbeat::NotDue);
             continue;
         }
@@ -1353,120 +1219,6 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), 0);
     }
 
-    /// A journaled policy change addressed to a registered client's own
-    /// connection queues no frame for it, not even a batch end: the
-    /// replies on either side of it are the only frames on the TX ring.
-    /// The kernel stage's counterpart is `response.rs`'s
-    /// `a_change_slot_sends_nothing_and_a_forced_one_waits_for_its_entry`.
-    #[test]
-    fn a_change_slot_queues_no_frame_for_its_connection() {
-        use counter_server::{Counter, CounterQuery, CounterReport, ResponseEncoder};
-        use melin_journal::AckPolicyChange;
-        use melin_pipeline::ring::DisruptorBuilder;
-        use melin_transport_core::WireSeq;
-        use melin_transport_core::lineage::forced_policy_cell;
-        use melin_transport_core::pipeline::OutputPayload;
-
-        use crate::ack_policy::AckPolicy;
-        use crate::durability_gate::GateStart;
-        use crate::early_reply::early_reply_channel;
-
-        /// Bounds the wait for a frame that must arrive.
-        const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
-
-        fn reply(wire_seq: u64) -> OutputSlot<CounterReport, CounterQuery> {
-            OutputSlot {
-                connection_id: 1,
-                input_seq: wire_seq - 1,
-                wire_seq,
-                payload: OutputPayload::Report(CounterReport::Ack {
-                    new_value: wire_seq,
-                }),
-                is_last_in_request: true,
-                ..Default::default()
-            }
-        }
-
-        let (mut producer, mut consumers) =
-            DisruptorBuilder::<OutputSlot<CounterReport, CounterQuery>>::new(64)
-                .add_consumer()
-                .build(WaitStrategy::SpinThenYield);
-        let consumer = consumers.pop().expect("one consumer was requested");
-        let (control_tx, control_rx) = mpsc::channel();
-        control_tx
-            .send(ControlEvent::Connected { connection_id: 1 })
-            .expect("channel open");
-        let (tx, mut rx) = spsc::channel::<TxFrame>(8, WaitStrategy::SpinThenYield);
-        let early_replies = early_reply_channel(crate::early_reply::EARLY_REPLY_QUEUE_CAPACITY).1;
-
-        producer.publish(reply(1));
-        producer.publish(OutputSlot {
-            // Addressed to the client's own connection, which the matching
-            // stage never does: the change still queues nothing for it.
-            connection_id: 1,
-            input_seq: 1,
-            wire_seq: 2,
-            payload: OutputPayload::AckPolicyChange(AckPolicyChange {
-                policy: AckPolicy::Disk.to_byte(),
-                unwitnessed: false,
-            }),
-            is_last_in_request: true,
-            ..Default::default()
-        });
-        producer.publish(reply(3));
-
-        let shutdown = AtomicBool::new(false);
-        std::thread::scope(|scope| {
-            let stage = scope.spawn(|| {
-                run::<Counter>(
-                    consumer,
-                    control_rx,
-                    // Everything published is on disk: nothing is held.
-                    DurableWireSeqCursor::detached(WireSeq::new(3)),
-                    GatePolicy {
-                        start: GateStart::settled(AckPolicy::Disk),
-                        forced: forced_policy_cell().1,
-                    },
-                    None,
-                    None,
-                    &shutdown,
-                    None,
-                    Arc::new(AtomicU64::new(0)),
-                    vec![tx],
-                    Arc::new(StageUtilization::default()),
-                    WaitStrategy::SpinThenYield,
-                    Arc::new(ResponseEncoder),
-                    early_replies,
-                    None,
-                    None,
-                )
-            });
-
-            // The replies on either side of the change: once the second
-            // is queued, the stage has taken the change.
-            let mut frames = Vec::new();
-            let deadline = Instant::now() + SETTLE_TIMEOUT;
-            while frames.len() < 2 && Instant::now() < deadline {
-                match rx.try_consume() {
-                    Some((_, frame)) => frames.push(frame.connection_id),
-                    None => std::thread::yield_now(),
-                }
-            }
-            shutdown.store(true, Ordering::Relaxed);
-            stage.join().expect("stage panicked");
-            // Anything the stage queued before it stopped.
-            while let Some((_, frame)) = rx.try_consume() {
-                frames.push(frame.connection_id);
-            }
-
-            assert_eq!(
-                frames,
-                [1, 1],
-                "one frame per reply, and none for the policy change"
-            );
-        });
-    }
-
     /// A halted node past the grace period answers a held write once its
     /// own journal holds it, ending in `BatchEndDegraded`, and the
     /// refusals around it, which wait for nothing, end in a plain
@@ -1493,7 +1245,7 @@ mod tests {
         use crate::early_reply::{EarlyKind, early_reply_channel};
         use crate::halt::DegradedRelease;
         use crate::replication::ReplicationMetrics;
-        use crate::response::tests::refusal_order::{Seen, early, early_id, frames_of};
+        use crate::response::tests::fixtures::{Seen, early, early_id, frames_of};
 
         /// The held write's ID.
         const HELD: RequestId = RequestId(7);
@@ -1670,23 +1422,29 @@ mod tests {
     mod early_release {
         use super::*;
 
-        use std::collections::{HashMap, VecDeque};
+        use std::collections::{HashMap, HashSet, VecDeque};
         use std::thread::JoinHandle;
 
         use counter_server::{Counter, ResponseEncoder};
-        use melin_transport_core::lineage::forced_policy_cell;
         use proptest::prelude::*;
 
         use super::degraded_release::wire_frames;
         use crate::ack_policy::AckPolicy;
         use crate::durability_gate::GateStart;
+        use crate::early_reply::EarlyKind;
         use crate::response::tests::early_release::{
-            StageHarness, StageInputs, a_gate_held_inside_an_event_sends_no_early_reply,
+            EXIT_TIMEOUT, Rig, StageHarness, StageInputs,
+            a_change_slot_sends_nothing_and_a_forced_one_waits_for_its_entry,
+            a_gate_held_inside_an_event_sends_no_early_reply,
+            a_refusal_is_not_released_ahead_of_its_connection,
+            a_reply_that_lands_with_its_connection_is_delivered,
+            a_stopped_stage_leaves_the_gate_and_drops_the_held_reply,
             an_early_reply_waits_out_an_event_split_across_reads,
-            connection_first_seen_inside_a_gate_wait, early_replies_overtake_a_held_write,
-            every_kind, every_request_is_answered_once_and_whole, script,
+            an_idle_connection_is_sent_heartbeats, connection_first_seen_inside_a_gate_wait,
+            early_replies_overtake_a_held_write, every_kind,
+            every_request_is_answered_once_and_whole, rig, script, stopped_within,
         };
-        use crate::response::tests::refusal_order::Seen;
+        use crate::response::tests::fixtures::{Seen, early_id, frames_of};
 
         /// The DPDK stage under test, read off its TX ring the way the
         /// poll thread reads it, each frame filed under its connection.
@@ -1697,13 +1455,24 @@ mod tests {
             /// connection: the ring interleaves connections, a test reads
             /// one at a time.
             pending: HashMap<u64, VecDeque<Seen>>,
+            /// Every connection the test registered. A TX frame for any
+            /// other is a stray (the kernel stage, with no socket for it,
+            /// cannot even send one), so it fails the test however that
+            /// test reads. A `HashSet`: a handful of ids, looked up once
+            /// per frame, in no order.
+            connected: HashSet<u64>,
             shutdown: Arc<AtomicBool>,
             handle: Option<JoinHandle<()>>,
         }
 
+        /// The harness's TX ring, in frames. A test that fills it, with
+        /// nothing reading it, takes the count from here
+        /// ([`blocked_on_a_full_tx_ring`]).
+        const TX_RING_SIZE: usize = 1024;
+
         fn start_dpdk(inputs: StageInputs) -> DpdkStage {
             let (control, control_rx) = mpsc::channel();
-            let (tx, tx_ring) = spsc::channel::<TxFrame>(1024, WaitStrategy::SpinThenYield);
+            let (tx, tx_ring) = spsc::channel::<TxFrame>(TX_RING_SIZE, WaitStrategy::SpinThenYield);
             let shutdown = Arc::clone(&inputs.shutdown);
             let StageInputs {
                 consumer,
@@ -1712,7 +1481,10 @@ mod tests {
                 replication_metrics,
                 replica_active,
                 utilization,
+                forced,
                 shutdown: stage_shutdown,
+                pause_after_control_drain,
+                heartbeat_interval,
             } = inputs;
             let handle = std::thread::spawn(move || {
                 run::<Counter>(
@@ -1721,12 +1493,12 @@ mod tests {
                     journal,
                     GatePolicy {
                         start: GateStart::settled(AckPolicy::DiskAndRam),
-                        forced: forced_policy_cell().1,
+                        forced,
                     },
                     Some(replication_metrics),
                     Some(replica_active),
                     &stage_shutdown,
-                    None,
+                    heartbeat_interval,
                     Arc::new(AtomicU64::new(0)),
                     vec![tx],
                     utilization,
@@ -1734,13 +1506,14 @@ mod tests {
                     Arc::new(ResponseEncoder),
                     early_replies,
                     None,
-                    None,
+                    pause_after_control_drain,
                 )
             });
             DpdkStage {
                 control,
                 tx_ring,
                 pending: HashMap::new(),
+                connected: HashSet::new(),
                 shutdown,
                 handle: Some(handle),
             }
@@ -1751,6 +1524,7 @@ mod tests {
                 self.control
                     .send(ControlEvent::Connected { connection_id })
                     .expect("the stage is running");
+                self.connected.insert(connection_id);
             }
 
             fn next_frame(&mut self, connection_id: u64, within: Duration) -> Option<Seen> {
@@ -1765,6 +1539,19 @@ mod tests {
                     }
                     match self.tx_ring.try_consume() {
                         Some((_, frame)) => {
+                            // The stage never queues a frame with no
+                            // bytes, which would carry no wire frame for
+                            // a test to see.
+                            assert!(
+                                !frame.as_bytes().is_empty(),
+                                "an empty TX frame for connection {}",
+                                frame.connection_id
+                            );
+                            assert!(
+                                self.connected.contains(&frame.connection_id),
+                                "a TX frame for connection {}, which the test never registered",
+                                frame.connection_id
+                            );
                             let mut seen = Vec::new();
                             wire_frames(frame.as_bytes(), &mut seen);
                             self.pending
@@ -1776,6 +1563,10 @@ mod tests {
                         None => std::thread::yield_now(),
                     }
                 }
+            }
+
+            fn stopped_within(&mut self, within: Duration) -> bool {
+                stopped_within(&self.shutdown, &mut self.handle, within)
             }
         }
 
@@ -1790,6 +1581,11 @@ mod tests {
                     }
                 }
             }
+        }
+
+        #[test]
+        fn an_idle_connection_is_sent_heartbeats_dpdk() {
+            an_idle_connection_is_sent_heartbeats(start_dpdk);
         }
 
         #[test]
@@ -1814,6 +1610,92 @@ mod tests {
             connection_first_seen_inside_a_gate_wait(start_dpdk);
         }
 
+        #[test]
+        fn a_reply_that_lands_with_its_connection_is_delivered_dpdk() {
+            a_reply_that_lands_with_its_connection_is_delivered(start_dpdk);
+        }
+
+        #[test]
+        fn a_refusal_is_not_released_ahead_of_its_connection_dpdk() {
+            a_refusal_is_not_released_ahead_of_its_connection(start_dpdk);
+        }
+
+        /// The stopped case only: the fenced one has no DPDK meaning (the
+        /// stage has no flush to suppress).
+        #[test]
+        fn a_stopped_stage_leaves_the_gate_and_drops_the_held_reply_dpdk() {
+            a_stopped_stage_leaves_the_gate_and_drops_the_held_reply(start_dpdk);
+        }
+
+        #[test]
+        fn a_change_slot_sends_nothing_and_a_forced_one_waits_for_its_entry_dpdk() {
+            a_change_slot_sends_nothing_and_a_forced_one_waits_for_its_entry(start_dpdk);
+        }
+
+        /// Busies `0..count` for connection 1, as the poll thread reads
+        /// them off its TX ring.
+        fn busies(count: usize) -> Vec<Seen> {
+            (0..count as u64)
+                .flat_map(|n| frames_of(EarlyKind::Busy, early_id(n)))
+                .collect()
+        }
+
+        /// Start a stage, held at its drain seam on its first two
+        /// iterations, with connection 1 registered, `early` busies for it
+        /// queued and, if `reply`, a write of request 7 whose event the
+        /// journal already holds; and let it go once its second iteration
+        /// has read them all. Past that seam nothing reads the shutdown
+        /// flag before the push that finds the TX ring full: the gate's
+        /// cached position already covers the write, so its admit does not
+        /// wait. Nothing ever drains the TX ring.
+        fn blocked_on_a_full_tx_ring(early: usize, reply: bool) -> Rig<DpdkStage> {
+            let mut rig = rig(start_dpdk, 1, &[1], 2);
+            rig.seam().parked();
+            for n in 0..early as u64 {
+                rig.answer_early(1, n, EarlyKind::Busy);
+            }
+            if reply {
+                rig.publish(1, 7, 1, true);
+            }
+            rig.seam().resume();
+            rig.seam().parked();
+            rig.seam().resume();
+            rig
+        }
+
+        /// A reply whose push finds the poll thread's TX ring full, the
+        /// early replies released ahead of it having just filled it, does
+        /// not hold the stage past a shutdown: the push gives up once the
+        /// flag is set, and the reply is not sent.
+        #[test]
+        fn a_reply_blocked_on_a_full_tx_ring_does_not_hold_the_stage_past_shutdown() {
+            let mut rig = blocked_on_a_full_tx_ring(TX_RING_SIZE, true);
+
+            assert!(
+                rig.stage.stopped_within(EXIT_TIMEOUT),
+                "the stage stayed blocked on its reply's push"
+            );
+            let filled = busies(TX_RING_SIZE);
+            assert_eq!(rig.frames(1, filled.len()), filled);
+            assert_eq!(rig.quiet(1), None, "the stopped reply was pushed");
+        }
+
+        /// An early reply whose push finds the TX ring full (one more than
+        /// it holds were released together) does not hold the stage past
+        /// a shutdown either: it is dropped, and the stage leaves.
+        #[test]
+        fn an_early_reply_blocked_on_a_full_tx_ring_does_not_hold_the_stage_past_shutdown() {
+            let mut rig = blocked_on_a_full_tx_ring(TX_RING_SIZE + 1, false);
+
+            assert!(
+                rig.stage.stopped_within(EXIT_TIMEOUT),
+                "the stage stayed blocked on an early reply's push"
+            );
+            let filled = busies(TX_RING_SIZE);
+            assert_eq!(rig.frames(1, filled.len()), filled);
+            assert_eq!(rig.quiet(1), None, "the stopped early reply was pushed");
+        }
+
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(24))]
             #[test]
@@ -1829,8 +1711,11 @@ mod tests {
         /// not. Returns the connections after the call and every frame
         /// handed to the poll thread.
         fn hook_turn(between_events: bool) -> (FxHashMap<u64, ConnectionHeartbeat>, Vec<Seen>) {
+            use crate::batch_boundary::BatchBoundary;
+            use crate::durability_gate::GateWait;
             use crate::early_reply::{EarlyKind, early_reply_channel};
-            use crate::response::tests::refusal_order::early;
+            use crate::response::tests::fixtures::early;
+            use crate::response_loop::GateWaitHook;
 
             let (control_tx, control_rx) = mpsc::channel();
             let (mut tx, mut rx) =
@@ -1838,8 +1723,9 @@ mod tests {
             let mut registered = rx.register(|| {});
             let (producer, mut tx_ring) =
                 spsc::channel::<TxFrame>(1024, WaitStrategy::SpinThenYield);
-            let mut producers = vec![producer];
-            let mut connections = FxHashMap::default();
+            let (_, recorders) = response_loop::register_recorders(&DpdkEgress::NAMES);
+            let mut egress =
+                DpdkEgress::new(vec![producer], Arc::new(AtomicU64::new(1)), recorders);
 
             control_tx
                 .send(ControlEvent::Connected { connection_id: 1 })
@@ -1851,6 +1737,7 @@ mod tests {
             let boundary = BatchBoundary::new();
             let mut early_buf: EarlyReplyBuf = [0u8; MAX_EARLY_REPLY];
             GateWaitHook {
+                egress: &mut egress,
                 at_boundary: if between_events {
                     Some(boundary.at_boundary().expect("between events"))
                 } else {
@@ -1858,11 +1745,9 @@ mod tests {
                 },
                 registered: &mut registered,
                 control_rx: &control_rx,
-                connections: &mut connections,
-                active_connections: &AtomicU64::new(1),
-                tx_producers: &mut producers,
                 encoder: &ResponseEncoder,
                 early_buf: &mut early_buf,
+                shutdown: &AtomicBool::new(false),
             }
             .while_waiting();
 
@@ -1871,13 +1756,13 @@ mod tests {
                 assert_eq!(frame.connection_id, 1);
                 wire_frames(frame.as_bytes(), &mut seen);
             }
-            (connections, seen)
+            (egress.connections, seen)
         }
 
         #[test]
         fn gate_wait_hook_between_events_registers_and_sends() {
             use crate::early_reply::EarlyKind;
-            use crate::response::tests::refusal_order::{early_id, frames_of};
+            use crate::response::tests::fixtures::{early_id, frames_of};
 
             let (connections, seen) = hook_turn(true);
 
@@ -1894,8 +1779,300 @@ mod tests {
         }
     }
 
+    /// The DPDK egress's slot hooks, called directly: a slot's frames are
+    /// pushed onto its connection's lane by `send_slot` and released by
+    /// the `after_slot` that follows it, and only that one. What the loop
+    /// does with the outcome is pinned by the recording egress in
+    /// `response_loop`'s tests.
+    mod dpdk_egress {
+        use super::*;
+
+        use counter_server::{CounterQuery, CounterReport, KIND_RESP_ACK, ResponseEncoder};
+        use melin_transport_core::pipeline::{OutputPayload, RequestId};
+        use melin_wire_protocol::control_codec::TAG_BATCH_END;
+
+        use super::degraded_release::wire_frames;
+        use crate::durability_gate::{Backing, BatchEnds};
+        use crate::response::tests::fixtures::Seen;
+        use crate::response_frame::EncodeBuf;
+
+        /// The request every slot here belongs to.
+        const REQUEST: RequestId = RequestId(7);
+
+        /// An egress over `lanes` TX rings holding `connected`, and the
+        /// poll threads' ends of the rings.
+        fn egress_holding(
+            lanes: usize,
+            connected: &[u64],
+        ) -> (DpdkEgress, Vec<spsc::Consumer<TxFrame>>) {
+            let (producers, consumers) = (0..lanes)
+                .map(|_| spsc::channel::<TxFrame>(8, WaitStrategy::SpinThenYield))
+                .unzip();
+            let (_, recorders) = response_loop::register_recorders(&DpdkEgress::NAMES);
+            let mut egress = DpdkEgress::new(
+                producers,
+                Arc::new(AtomicU64::new(connected.len() as u64)),
+                recorders,
+            );
+            let (control_tx, control_rx) = mpsc::channel();
+            for &connection_id in connected {
+                control_tx
+                    .send(ControlEvent::Connected { connection_id })
+                    .expect("the receiver is held");
+            }
+            egress.drain_control(&control_rx);
+            (egress, consumers)
+        }
+
+        /// Hand `egress` one slot of `REQUEST` for `connection_id`, with
+        /// `payload`, ending the request or not, sent at `now`.
+        fn send_slot(
+            egress: &mut DpdkEgress,
+            connection_id: u64,
+            payload: OutputPayload<CounterReport, CounterQuery>,
+            is_last_in_request: bool,
+            now: Instant,
+            encode_buf: &mut EncodeBuf,
+        ) -> SlotOutcome {
+            send_slot_unless(
+                egress,
+                connection_id,
+                payload,
+                is_last_in_request,
+                now,
+                encode_buf,
+                &AtomicBool::new(false),
+            )
+        }
+
+        /// [`send_slot`], with the stage's shutdown flag at `shutdown`.
+        fn send_slot_unless(
+            egress: &mut DpdkEgress,
+            connection_id: u64,
+            payload: OutputPayload<CounterReport, CounterQuery>,
+            is_last_in_request: bool,
+            now: Instant,
+            encode_buf: &mut EncodeBuf,
+            shutdown: &AtomicBool,
+        ) -> SlotOutcome {
+            let slot = OutputSlot {
+                connection_id,
+                request_id: REQUEST,
+                wire_seq: 1,
+                payload,
+                is_last_in_request,
+                ..Default::default()
+            };
+            let mut batch_ends = BatchEnds::new();
+            egress.send_slot(
+                connection_id,
+                SlotReply::new(
+                    &slot,
+                    Backing::Policy,
+                    &ResponseEncoder,
+                    encode_buf,
+                    &mut batch_ends,
+                ),
+                now,
+                shutdown,
+            )
+        }
+
+        /// Fill lane `lane` of `egress` to the brim, published, as a poll
+        /// thread that has stopped draining leaves it.
+        fn fill_lane(egress: &mut DpdkEgress, lane: usize) {
+            while egress.tx_producers[lane]
+                .try_publish(TxFrame::default())
+                .is_ok()
+            {}
+        }
+
+        const ACK: OutputPayload<CounterReport, CounterQuery> =
+            OutputPayload::Report(CounterReport::Ack { new_value: 7 });
+
+        /// Every frame on `ring` the poll thread can see now.
+        fn visible(ring: &mut spsc::Consumer<TxFrame>) -> Vec<(u64, Vec<Seen>)> {
+            let mut frames = Vec::new();
+            while let Some((_, frame)) = ring.try_consume() {
+                let mut seen = Vec::new();
+                wire_frames(frame.as_bytes(), &mut seen);
+                frames.push((frame.connection_id, seen));
+            }
+            frames
+        }
+
+        /// A slot's reply and its terminator go onto its connection's
+        /// lane as one frame, which the poll thread sees only once
+        /// `after_slot` flushed it; the connection's heartbeat clock is
+        /// stamped with the batch's time. A second `after_slot`, as after
+        /// a later miss or change slot, has nothing left to flush.
+        #[test]
+        fn a_slot_is_pushed_to_its_lane_and_released_by_the_next_after_slot() {
+            let connection_id = lane_connection_id(1, 5);
+            let (mut egress, mut rings) = egress_holding(2, &[connection_id]);
+            let now = Instant::now() + Duration::from_secs(60);
+
+            let mut encode_buf: EncodeBuf = [0u8; MAX_APP_FRAME];
+            let outcome = send_slot(&mut egress, connection_id, ACK, true, now, &mut encode_buf);
+
+            assert_eq!(outcome, SlotOutcome::Known);
+            assert_eq!(egress.connections[&connection_id].last_send, now);
+            assert!(
+                visible(&mut rings[1]).is_empty(),
+                "released before after_slot"
+            );
+
+            egress.after_slot();
+            assert_eq!(
+                visible(&mut rings[1]),
+                [(
+                    connection_id,
+                    vec![
+                        Seen::App(KIND_RESP_ACK),
+                        Seen::Final(TAG_BATCH_END, REQUEST)
+                    ]
+                )]
+            );
+            assert!(
+                visible(&mut rings[0]).is_empty(),
+                "pushed to the wrong lane"
+            );
+            assert!(egress.pushed.is_none(), "the lane was read, not taken");
+
+            egress.after_slot();
+            assert!(egress.pushed.is_none());
+            assert!(visible(&mut rings[1]).is_empty());
+        }
+
+        /// A slot that leaves nothing to push (a `BatchEnd` payload that
+        /// does not end its request) still stamps the connection's
+        /// heartbeat clock, and its `after_slot` releases nothing.
+        #[test]
+        fn a_slot_with_nothing_to_push_still_stamps_its_connection() {
+            let (mut egress, mut rings) = egress_holding(1, &[1]);
+            let now = Instant::now() + Duration::from_secs(60);
+
+            let mut encode_buf: EncodeBuf = [0u8; MAX_APP_FRAME];
+            let outcome = send_slot(
+                &mut egress,
+                1,
+                OutputPayload::BatchEnd,
+                false,
+                now,
+                &mut encode_buf,
+            );
+            egress.after_slot();
+
+            assert_eq!(outcome, SlotOutcome::Known);
+            assert_eq!(egress.connections[&1].last_send, now);
+            assert!(visible(&mut rings[0]).is_empty());
+        }
+
+        /// A slot for a connection the egress does not hold is `Unknown`:
+        /// nothing is encoded or pushed, and the `after_slot` after it
+        /// leaves untouched what an earlier slot left (here, nothing).
+        #[test]
+        fn a_slot_for_an_unknown_connection_is_unknown_and_pushes_nothing() {
+            let (mut egress, mut rings) = egress_holding(1, &[1]);
+            let before = egress.connections[&1].last_send;
+
+            let mut encode_buf: EncodeBuf = [0u8; MAX_APP_FRAME];
+            let outcome = send_slot(&mut egress, 9, ACK, true, Instant::now(), &mut encode_buf);
+
+            assert_eq!(outcome, SlotOutcome::Unknown);
+            assert!(egress.pushed.is_none());
+            assert!(encode_buf.iter().all(|&b| b == 0), "the reply was encoded");
+            egress.after_slot();
+            assert!(visible(&mut rings[0]).is_empty());
+            assert_eq!(egress.connections[&1].last_send, before);
+        }
+
+        /// A slot whose lane is full, with shutdown set, is `Stopped`:
+        /// nothing pushed, no lane kept for `after_slot`, and the
+        /// connection's heartbeat clock left as it was.
+        #[test]
+        fn a_slot_on_a_full_lane_is_stopped_by_shutdown() {
+            let (mut egress, mut rings) = egress_holding(1, &[1]);
+            fill_lane(&mut egress, 0);
+            let before = egress.connections[&1].last_send;
+
+            let mut encode_buf: EncodeBuf = [0u8; MAX_APP_FRAME];
+            let outcome = send_slot_unless(
+                &mut egress,
+                1,
+                ACK,
+                true,
+                Instant::now() + Duration::from_secs(60),
+                &mut encode_buf,
+                &AtomicBool::new(true),
+            );
+
+            assert_eq!(outcome, SlotOutcome::Stopped);
+            assert!(egress.pushed.is_none(), "a lane was kept");
+            assert_eq!(egress.connections[&1].last_send, before);
+            let frames = visible(&mut rings[0]);
+            assert_eq!(frames.len(), 8, "only the frames that filled the lane");
+            assert!(
+                frames.iter().all(|(connection_id, _)| *connection_id == 0),
+                "the stopped reply was pushed"
+            );
+        }
+
+        /// Once shutdown is set, an early-reply release still drains the
+        /// whole snapshot without waiting: a reply whose lane is full is
+        /// dropped, its connection's clock left alone, and one whose lane
+        /// has room still goes.
+        #[test]
+        fn a_stopped_release_drops_what_would_wait_and_sends_what_has_room() {
+            use crate::batch_boundary::BatchBoundary;
+            use crate::early_reply::{EARLY_REPLY_QUEUE_CAPACITY, EarlyKind, early_reply_channel};
+            use crate::response::tests::fixtures::{early, early_id, frames_of};
+
+            let full = lane_connection_id(1, 1);
+            let open = lane_connection_id(0, 1);
+            let (mut egress, mut rings) = egress_holding(2, &[full, open]);
+            fill_lane(&mut egress, 1);
+            let before = egress.connections[&full].last_send;
+
+            let (mut tx, mut rx) = early_reply_channel(EARLY_REPLY_QUEUE_CAPACITY);
+            for (n, connection_id) in [full, open].into_iter().enumerate() {
+                tx.try_send(early(connection_id, n as u64, EarlyKind::Busy))
+                    .expect("queue has room");
+            }
+            tx.flush();
+            let boundary = BatchBoundary::new();
+            let mut early_buf: EarlyReplyBuf = [0u8; MAX_EARLY_REPLY];
+            let now = Instant::now() + Duration::from_secs(60);
+            let released = egress.release_early_replies(
+                &mut rx.register(|| {}),
+                &boundary.at_boundary().expect("between events"),
+                &ResponseEncoder,
+                &mut early_buf,
+                || now,
+                &AtomicBool::new(true),
+            );
+
+            assert_eq!(released, 2, "the drain stopped short");
+            assert_eq!(egress.connections[&full].last_send, before);
+            assert_eq!(egress.connections[&open].last_send, now);
+            assert!(
+                visible(&mut rings[1])
+                    .iter()
+                    .all(|(connection_id, _)| *connection_id == 0),
+                "the reply on the full lane was pushed"
+            );
+            assert_eq!(
+                visible(&mut rings[0]),
+                [(open, frames_of(EarlyKind::Busy, early_id(1)))]
+            );
+        }
+    }
+
     mod push_frame {
         use super::*;
+
+        use melin_wire_protocol::control::TransportResponse;
+        use melin_wire_protocol::control_codec;
 
         const TRAILER: &[u8] = b"END";
 
@@ -1907,7 +2084,15 @@ mod tests {
         ) -> Vec<(u64, Vec<u8>)> {
             let (mut tx, mut rx) = spsc::channel::<TxFrame>(8, WaitStrategy::SpinThenYield);
             let encode_buf = b"response-body";
-            super::super::push_frame(payload, 42, &mut tx, encode_buf, trailer);
+            super::super::push_frame(
+                payload,
+                42,
+                &mut tx,
+                encode_buf,
+                trailer,
+                &AtomicBool::new(false),
+            )
+            .expect("never stopped");
             tx.flush();
 
             let mut out = Vec::new();
@@ -1995,7 +2180,15 @@ mod tests {
             .expect("a terminator encodes");
             assert_eq!(written, BATCH_END_FRAME_LEN);
             let (mut tx, mut rx) = spsc::channel::<TxFrame>(8, WaitStrategy::SpinThenYield);
-            super::super::push_frame(Some(Ok(MAX_APP_FRAME)), 42, &mut tx, &response, &trailer);
+            super::super::push_frame(
+                Some(Ok(MAX_APP_FRAME)),
+                42,
+                &mut tx,
+                &response,
+                &trailer,
+                &AtomicBool::new(false),
+            )
+            .expect("never stopped");
             tx.flush();
             let (_, frame) = rx.try_consume().expect("one frame");
             assert_eq!(frame.len as usize, MAX_TX_FRAME);
@@ -2011,7 +2204,58 @@ mod tests {
             let response = [0xAB; MAX_APP_FRAME];
             let trailer = [0u8; BATCH_END_FRAME_LEN + 1];
             let (mut tx, _rx) = spsc::channel::<TxFrame>(8, WaitStrategy::SpinThenYield);
-            super::super::push_frame(Some(Ok(MAX_APP_FRAME)), 42, &mut tx, &response, &trailer);
+            super::super::push_frame(
+                Some(Ok(MAX_APP_FRAME)),
+                42,
+                &mut tx,
+                &response,
+                &trailer,
+                &AtomicBool::new(false),
+            )
+            .expect("never stopped");
+        }
+
+        /// A TX ring of 2, filled and published, with nothing draining it.
+        fn full_ring() -> (spsc::Producer<TxFrame>, spsc::Consumer<TxFrame>) {
+            let (mut tx, rx) = spsc::channel::<TxFrame>(2, WaitStrategy::SpinThenYield);
+            for _ in 0..2 {
+                tx.try_publish(TxFrame::default())
+                    .expect("the ring has room");
+            }
+            (tx, rx)
+        }
+
+        /// On a full ring with shutdown set, the push is stopped and
+        /// pushes nothing: the stage is not held by a poll thread that
+        /// has stopped draining.
+        #[test]
+        fn a_push_on_a_full_ring_is_stopped_by_shutdown() {
+            let (mut tx, mut rx) = full_ring();
+            let pushed = super::super::push_frame(
+                Some(Ok(8)),
+                42,
+                &mut tx,
+                b"response",
+                TRAILER,
+                &AtomicBool::new(true),
+            );
+            tx.flush();
+
+            assert_eq!(pushed, Err(spsc::Stopped));
+            assert_eq!(rx.try_consume().map(|(seq, _)| seq), Some(0));
+            assert_eq!(rx.try_consume().map(|(seq, _)| seq), Some(1));
+            assert!(rx.try_consume().is_none(), "a stopped push published");
+        }
+
+        /// Nothing to send never touches the ring, so it is not stopped
+        /// even on a full one.
+        #[test]
+        fn nothing_to_send_is_never_stopped() {
+            let (mut tx, _rx) = full_ring();
+            assert_eq!(
+                super::super::push_frame(None, 42, &mut tx, &[], &[], &AtomicBool::new(true)),
+                Ok(())
+            );
         }
     }
 }

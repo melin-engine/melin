@@ -10,8 +10,9 @@
 //! count & mask. No sentinel values or wrapping tricks.
 
 use std::cell::UnsafeCell;
+use std::convert::Infallible;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::padding::CachePadded;
 use crate::wait::WaitStrategy;
@@ -19,6 +20,54 @@ use crate::wait::WaitStrategy;
 /// Error returned when the SPSC queue is full.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Full;
+
+/// Error returned by [`Producer::push_with_unless`] when its stop flag
+/// ended the wait for room: nothing was written.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Stopped;
+
+/// What may end a blocking push's wait for room, and the error it ends it
+/// with. Consulted only while the ring is full, so a push with room never
+/// pays for it, whatever the source.
+///
+/// A trait with an associated error rather than an `Option<&AtomicBool>`,
+/// which would cost the same: [`Producer::push_with`] waits on a source
+/// that never stops, whose error is [`Infallible`], so it has no
+/// impossible error to discard. Private: [`Producer::push_with_unless`]
+/// over an `AtomicBool` is the only stoppable push offered.
+trait StopSource {
+    type Error;
+
+    /// `Err` if the wait must end now.
+    fn check(&self) -> Result<(), Self::Error>;
+}
+
+/// The source [`Producer::push_with`] waits on: it never stops.
+struct NeverStops;
+
+impl StopSource for NeverStops {
+    type Error = Infallible;
+
+    #[inline]
+    fn check(&self) -> Result<(), Infallible> {
+        Ok(())
+    }
+}
+
+/// A stop flag, such as a stage's shutdown flag. Relaxed: the flag carries
+/// no data the push reads, and a stop seen one turn late only costs a turn.
+impl StopSource for AtomicBool {
+    type Error = Stopped;
+
+    #[inline]
+    fn check(&self) -> Result<(), Stopped> {
+        if self.load(Ordering::Relaxed) {
+            Err(Stopped)
+        } else {
+            Ok(())
+        }
+    }
+}
 
 /// Shared state between producer and consumer.
 struct Shared<T> {
@@ -148,6 +197,36 @@ impl<T: Copy + Default> Producer<T> {
     /// available, flushing pending writes mid-wait so the consumer can
     /// drain when the ring is saturated.
     pub fn push_with<F: FnOnce(&mut T)>(&mut self, f: F) -> u64 {
+        let Ok(seq) = self.push_with_until(f, &NeverStops);
+        seq
+    }
+
+    /// [`Self::push_with`], unless `stop` is set while it waits for room:
+    /// then it returns `Err(Stopped)` without invoking the closure.
+    ///
+    /// `stop` is read only while the ring is full, after each check for
+    /// room and before the flush and pause that follow it: a push with
+    /// room goes through whatever the flag says, and a stopped push
+    /// returns without one more pause.
+    ///
+    /// A stopped push does not flush: writes left pending by earlier
+    /// non-flushing pushes stay unpublished until the caller calls
+    /// [`Self::flush`].
+    pub fn push_with_unless<F: FnOnce(&mut T)>(
+        &mut self,
+        f: F,
+        stop: &AtomicBool,
+    ) -> Result<u64, Stopped> {
+        self.push_with_until(f, stop)
+    }
+
+    /// The blocking push's wait, written once for every stop source.
+    #[inline]
+    fn push_with_until<F: FnOnce(&mut T), S: StopSource>(
+        &mut self,
+        f: F,
+        stop: &S,
+    ) -> Result<u64, S::Error> {
         let capacity = self.shared.mask + 1;
         let mut waiter = self.wait.waiter();
         loop {
@@ -157,12 +236,14 @@ impl<T: Copy + Default> Producer<T> {
                 // Safety: as in `try_push_with`.
                 unsafe { f(&mut *self.shared.slots[idx].get()) };
                 self.local_head = seq + 1;
-                return seq;
+                return Ok(seq);
             }
             self.cached_tail = self.shared.tail.get().load(Ordering::Acquire);
             if seq - self.cached_tail < capacity {
                 continue;
             }
+            // No room: the only point a stop is read.
+            stop.check()?;
             // No space: flush whatever is pending so the consumer can
             // advance the tail. Without this we'd deadlock against a
             // consumer that has already drained everything we've Released.
@@ -468,6 +549,95 @@ mod tests {
         producer.flush();
         let received = consumer_thread.join().unwrap();
         assert_eq!(received, (0..20u64).collect::<Vec<_>>());
+    }
+
+    /// A push with room goes through even with the stop flag set: the
+    /// flag is read only while waiting for room.
+    #[test]
+    fn push_with_unless_pushes_when_there_is_room_even_if_stopped() {
+        let (mut producer, mut consumer) = channel::<u64>(4, WaitStrategy::SpinThenYield);
+        let stop = AtomicBool::new(true);
+        for i in 0..4u64 {
+            assert_eq!(producer.push_with_unless(|s| *s = i, &stop), Ok(i));
+        }
+        producer.flush();
+        for i in 0..4u64 {
+            assert_eq!(consumer.try_consume(), Some((i, i)));
+        }
+    }
+
+    /// A ring of 4, full and published, behind a consumer that frees
+    /// nothing until the test says so.
+    fn full_ring() -> (Producer<u64>, Consumer<u64>) {
+        let (mut producer, consumer) = channel::<u64>(4, WaitStrategy::SpinThenYield);
+        for i in 0..4u64 {
+            producer.try_publish(i).unwrap();
+        }
+        (producer, consumer)
+    }
+
+    /// How long a test lets a push wait before it looks: long enough for a
+    /// push that wrongly returned to have done so.
+    const WAITING: std::time::Duration = std::time::Duration::from_millis(50);
+
+    /// With the flag clear, a push on a full ring waits for room, and
+    /// lands once the consumer frees a slot.
+    #[test]
+    fn push_with_unless_waits_while_the_ring_is_full() {
+        let (mut producer, mut consumer) = full_ring();
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let pusher = std::thread::spawn(move || {
+            let pushed = producer.push_with_unless(|s| *s = 99, &flag);
+            producer.flush();
+            pushed
+        });
+
+        std::thread::sleep(WAITING);
+        assert!(!pusher.is_finished(), "returned while the ring was full");
+
+        assert_eq!(consumer.try_consume(), Some((0, 0)));
+        assert_eq!(pusher.join().unwrap(), Ok(4));
+        for i in 1..4u64 {
+            assert_eq!(consumer.try_consume(), Some((i, i)));
+        }
+        assert_eq!(consumer.try_consume(), Some((4, 99)));
+    }
+
+    /// The flag set while a push waits ends the wait with `Stopped`,
+    /// having written nothing: the closure never ran and the cursor did
+    /// not move, so the next push lands where the stopped one would have.
+    #[test]
+    fn push_with_unless_returns_stopped_having_written_nothing() {
+        let (producer, mut consumer) = full_ring();
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let pusher = std::thread::spawn(move || {
+            let mut producer = producer;
+            let mut called = false;
+            let pushed = producer.push_with_unless(
+                |s| {
+                    called = true;
+                    *s = 99;
+                },
+                &flag,
+            );
+            (producer, pushed, called)
+        });
+
+        std::thread::sleep(WAITING);
+        assert!(!pusher.is_finished(), "returned before the flag was set");
+        stop.store(true, Ordering::Relaxed);
+        let (mut producer, pushed, called) = pusher.join().unwrap();
+
+        assert_eq!(pushed, Err(Stopped));
+        assert!(!called, "the closure ran on a stopped push");
+        for i in 0..4u64 {
+            assert_eq!(consumer.try_consume(), Some((i, i)));
+        }
+        assert_eq!(consumer.try_consume(), None, "a stopped push published");
+        assert_eq!(producer.try_publish(7), Ok(4));
+        assert_eq!(consumer.try_consume(), Some((4, 7)));
     }
 
     #[test]
