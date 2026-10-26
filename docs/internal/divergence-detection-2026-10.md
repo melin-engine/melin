@@ -268,8 +268,9 @@ replica stops. The plan's position:
 For each window `W` (decision 2), on every copy:
 
 ```text
-digest(W) = BLAKE3 (derive_key context "melin output digest v1") over
-    kind (u8 = 1, output) || window_len K (u64 LE) || window_end (u64 LE)
+digest(W) = XXH3-128 (seed 0, default secret) over
+    "melin output digest v1" || kind (u8 = 1, output)
+        || window_len K (u64 LE) || window_end (u64 LE)
     then, for every Report slot whose wire_seq is in W, in output order:
         wire_seq (u64 LE) || body_len (u32 LE) || body
 ```
@@ -293,14 +294,63 @@ digest(W) = BLAKE3 (derive_key context "melin output digest v1") over
   say that the body must be a pure function of the report: no clock, no
   node identity, no state of the encoder's own. An encoder that breaks it
   now stops replicas, so it goes under `CHANGELOG.md` **Changed**.
-- **Why BLAKE3.** It is already in the dependency tree (the journal chain,
-  and `server-runtime`), takes a streamed input at no allocation, and its
-  32 bytes fill the frame. Accidental collision is not a practical concern
-  at that width. The fold runs per report, so whether it fits the budget is
-  measured (decision 14, open question 1). `transport-core`, where the fold
-  lives, takes `blake3` as an ordinary dependency: the digest must not
-  depend on the `hash-chain` feature, which makes it optional in the
-  journal.
+- **Why XXH3-128, not BLAKE3.** The digest compares copies the operator
+  runs, fed by their own `apply`, so the only collisions that matter are
+  accidental, and at 128 bits those are not a practical concern. What
+  BLAKE3 adds, resistance to an adversary constructing a matching input,
+  buys nothing here, and its speed on large inputs comes from hashing
+  whole chunks side by side, which a stream fed one report of tens of
+  bytes at a time never offers: every 64 bytes folded pays a full serial
+  compression, on the primary's response thread among others. XXH3's
+  per-byte cost on the same stream is a fraction of that. The fold runs
+  per report, so the choice is confirmed by measurement, not by this
+  estimate (decision 14, open question 1).
+- **The crate and its API.** `twox-hash` 2.x (MIT, on `deny.toml`'s allow
+  list), through its streaming `xxhash3_128::RawHasher` over
+  `SecretBuffer::default()`, since a window is fed one report at a time:
+  `write` per piece, `finish_128` at the window's end. Neither hasher has a
+  reset, so a window starts with a fresh one. A fresh
+  `RawHasher::new(SecretBuffer::default())`, assigned over the old one, is
+  a plain value with its stripe buffer inline and the default secret by
+  `'static` reference: no heap, built once per window. Not the crate's
+  `Hasher`, whose constructor boxes a copy of the secret, so starting each
+  window with one would allocate, and nothing on the response thread may.
+  Seed 0 with the default secret is the reference XXH3-128, so the pinned
+  vector of step 1 can be cross-checked against the reference
+  implementation (`xxh128sum`). The digest's bytes are
+  `finish_128().to_be_bytes()`, the reference's canonical form (high half
+  first, big-endian), so the marker's hex reads the same as that tool's
+  output. `Digest` is a `[u8; 16]` newtype rather than a `u128`: the
+  frames, the board payload and the marker carry bytes, a byte array has
+  no byte-order question left once built, and its alignment of 1 keeps the
+  board's payload free of padding (a `u128` beside the `u64` window end
+  would align it to 16 and pad it, failing `NoPadding`).
+- **The domain string and the kind** make the definition explicit. Changing
+  the algorithm, the string or the layout later is a new definition, sent
+  under a new kind value (decision 7), so a replica that does not know it
+  skips it and counts it rather than reporting a divergence: a
+  wire-visible change, never a silent one. `transport-core`, where the
+  fold lives, takes `twox-hash` as an ordinary dependency.
+- **The journal chain keeps BLAKE3.** The chain is the journal's audit
+  trail: its worth is that no entry can be altered while keeping the chain
+  intact, which needs exactly the adversarial resistance XXH3 does not
+  claim. It hashes per entry on the journal stage, batched with writes it
+  makes anyway, so it is not where the per-report cost sits; and changing
+  it would break the segment format, `ChainCheck` on the wire and every
+  existing lineage. Two hashes for two jobs, not a migration.
+- **Why the encoded body, not `std::hash::Hash` on the typed report.**
+  Hashing the typed `Report` would spare the replica and the shadow the
+  encode, and was considered. It was rejected: `Hash`'s contract is
+  consistency with `Eq` for map keys, so an implementation may skip fields,
+  and every skipped field is a divergence unseen; the std docs say what
+  `Hash` feeds a `Hasher` is neither portable across platforms (byte
+  order, `usize`, derived enum discriminants) nor stable across compiler
+  releases; and a `Hash` impl is a second description of each report
+  beside the encoder, free to drift from what clients receive. The
+  encoder's body is the one canonical, portable form of a report. If the
+  measurement shows the replicas cannot afford the encode, the fallback
+  is a purpose-built digest trait in `melin-app` with fixed-width
+  little-endian rules, not `Hash`.
 
 ### 2. Windows, the interval K, and keeping K identical
 
@@ -387,31 +437,33 @@ from where it is today. Three call sites, each with one folder:
 
 Each folder publishes to a **`DigestBoard`**: `R` slots of `(window_end,
 digest)`, the slot for window end `E` being `(E / K) % R`, each a
-`melin_pipeline::seqlock` (a `repr(C)` 40-byte payload without padding, so
-it satisfies `NoPadding`), plus an `AtomicU64` holding the latest window end
-for cheap change detection, plus the schedule record of decision 2 (a
-seqlock of its own, written before the first digest under it). A seqlock
-rather than a queue: a folder must never wait on a reader, a reader that
-falls behind should lose old digests rather than stall anyone, and there
-are several readers (the journal stage's injector, the shadow's comparator,
-the replica's receiver, the health endpoint). The seqlock module already
-enforces single-writer and no-padding in the type system.
+`melin_pipeline::seqlock` (a `repr(C)` 24-byte payload, a `u64` window end
+then the 16 digest bytes, without padding, so it satisfies `NoPadding`),
+plus an `AtomicU64` holding the latest window end for cheap change
+detection, plus the schedule record of decision 2 (a seqlock of its own,
+written before the first digest under it). A seqlock rather than a queue:
+a folder must never wait on a reader, a reader that falls behind should
+lose old digests rather than stall anyone, and there are several readers
+(the journal stage's injector, the shadow's comparator, the replica's
+receiver, the health endpoint). The seqlock module already enforces
+single-writer and no-padding in the type system.
 
 **Sizing R.** `R = ceil((INPUT_RING_CAPACITY + OUTPUT_RING_CAPACITY) /
 MIN_OUTPUT_DIGEST_INTERVAL) + 2`, a constant, allocated once when the
-pipeline is built: with both rings at `1 << 20` slots, 514 slots of
-roughly 48 bytes. It is sized for the worst K, not the K in force, because
-K is not fixed for a pipeline's life: a replica's pipeline outlives its
-sessions (`tcp_receiver.rs` and `dpdk.rs` build it only if absent), and
-each session adopts the K of whichever node is primary (decision 2). A
-board sized for a first primary's K = 65536 would hold 34 slots, lap
-constantly after a failover to a primary at K = 4096, and turn nearly every
-comparison into `Unverified { Lapped }`. The comparator's arrays take the
-same constant, so its sizing cannot drift from the board's either.
-Reallocating at each session start instead would put an allocation on the
-session path for a saving of tens of kilobytes. At any K, R covers the lag
-between any two folders while every ring is moving, with room to spare as K
-grows. A
+pipeline is built: with both rings at `1 << 20` slots, 514 slots of one
+cache line each (each slot is its own seqlock cell, aligned to 64 bytes,
+so the digest's width does not change the footprint). It is sized for
+the worst K, not the K in force, because K is not fixed for a pipeline's
+life: a replica's pipeline outlives its sessions (`tcp_receiver.rs` and
+`dpdk.rs` build it only if absent), and each session adopts the K of
+whichever node is primary (decision 2). A board sized for a first
+primary's K = 65536 would hold 34 slots, lap constantly after a failover
+to a primary at K = 4096, and turn nearly every comparison into
+`Unverified { Lapped }`. The comparator's arrays take the same constant,
+so its sizing cannot drift from the board's either. Reallocating at each
+session start instead would put an allocation on the session path for a
+saving of tens of kilobytes. At any K, R covers the lag between any two
+folders while every ring is moving, with room to spare as K grows. A
 stage held for a long time (a gate held by a halt, with ticks journaled
 behind it) can exceed it, and a reader that finds a window overwritten
 counts it as `Unverified { Lapped }`, never as divergence.
@@ -496,8 +548,8 @@ in the digest path is behind `cfg(feature = "hash-chain")`.
 
 | Change | Layout (after the length prefix) |
 | --- | --- |
-| New frame `MSG_DIGEST = 0x19`, primary to replica | `DigestFrame { tag, kind: u8, window_end: U64, window_len: U64, digest: [u8; 32] }`, 50 bytes |
-| New frame `MSG_DIVERGED = 0x07`, replica to primary | `DivergedFrame { tag, kind: u8, window_end: U64, window_len: U64, expected: [u8; 32], actual: [u8; 32] }`, 82 bytes: the replica's notice before it stops (decision 10) |
+| New frame `MSG_DIGEST = 0x19`, primary to replica | `DigestFrame { tag, kind: u8, window_end: U64, window_len: U64, digest: [u8; 16] }`, 34 bytes |
+| New frame `MSG_DIVERGED = 0x07`, replica to primary | `DivergedFrame { tag, kind: u8, window_end: U64, window_len: U64, expected: [u8; 16], actual: [u8; 16] }`, 50 bytes: the replica's notice before it stops (decision 10) |
 | `StreamStart` gains the digest schedules and the build | `schedules: [ScheduleEntry; 4]` with `ScheduleEntry { kind: u8, interval: U64 }` (kind 0: empty slot; interval 0: this primary sends none of that kind), then `build_id: [u8; 32]` (open question 2), appended after `genesis_entries` |
 
 - **The kind byte from the start.** Only `1 = output` is defined; 0 is
@@ -507,7 +559,10 @@ in the digest path is behind `cfg(feature = "hash-chain")`.
   same frames, sent to replicas that already speak protocol 9, not another
   version bump. That is also why each frame carries its window length,
   and why `StreamStart` carries a table rather than one interval: a new
-  kind brings its own schedule without changing a layout.
+  kind brings its own schedule without changing a layout. The digest
+  field stays 16 bytes for every kind, so a later kind is defined to
+  produce 16 bytes; one that needs more (a tamper-evident digest) is a
+  new frame and a version bump (open question 1).
 - **The handshake does not change**, so the existing version check
   (`HandshakeFrame.protocol_version`, parsed by `decode_replica_message`)
   refuses a mixed pair in both directions with the version error, as at
@@ -581,9 +636,10 @@ the node:
    and stands down on `fenced` (finding 6).
 2. **Logs `error!`** naming the check (`replica-vs-primary` or
    `shadow-vs-live`), the window, both digest prefixes (`hex_prefix`, the
-   journal crate's formatter), and `verified_through`. On a replica it also
-   says: "if other replicas report the same window, the primary's output is
-   the one at fault".
+   journal crate's formatter, widened from `&[u8; 32]` to `&[u8]` so the
+   16-byte digest and the 32-byte chain hash print alike), and
+   `verified_through`. On a replica it also says: "if other replicas
+   report the same window, the primary's output is the one at fault".
 3. **Writes the divergence marker** beside the journal
    (`NodeStore::divergence_marker()`, `<journal>.diverged`), written to a
    temporary file, fsynced, renamed and the directory fsynced, so it
@@ -721,13 +777,17 @@ the only raft-side line that changes.
 | Where | Per report | Per batch / iteration | Per window |
 | --- | --- | --- | --- |
 | Matching stage, every copy | nothing | one `Release` store (applied position) | nothing |
-| Primary response stage | encode (already paid for delivered replies; new for node events' and gone clients'), one BLAKE3 update, after the send | one `Relaxed` latch load per slot; on the idle path one `Acquire` load | finalize, one seqlock store |
-| Replica drain thread | encode, one BLAKE3 update (both new) | one `Acquire` load when the ring is empty | finalize, one seqlock store |
-| Shadow | encode, one BLAKE3 update (both new) | none | finalize, comparator update |
-| Journal stage (primary with replicas) | nothing | one latest-window load, at most one division and one board read | 50-byte frame encode and ring publish |
+| Primary response stage | encode (already paid for delivered replies; new for node events' and gone clients'), one XXH3 update, after the send | one `Relaxed` latch load per slot; on the idle path one `Acquire` load | finalize, one seqlock store |
+| Replica drain thread | encode, one XXH3 update (both new) | one `Acquire` load when the ring is empty | finalize, one seqlock store |
+| Shadow | encode, one XXH3 update (both new) | none | finalize, comparator update |
+| Journal stage (primary with replicas) | nothing | one latest-window load, at most one division and one board read | 34-byte frame encode and ring publish |
 | Replica receiver | nothing | one `Acquire` load | decode, comparator update |
 
-Nothing allocates after construction. The measurement step (step 6) runs
+Nothing allocates after construction. The measurement step (step 6) first
+folds windows of representative report bodies (the examples', and a few
+hundred bytes) through XXH3-128, with and without `twox-hash`'s `std`
+feature (step 1), and through BLAKE3, in a micro-benchmark, so the hash's
+share is known apart from the encode's. It then runs
 `melin-bench` closed-loop against echo, counter and notary, digests at the
 default interval and disabled, over kernel TCP and DPDK, primary with two
 replicas under `disk+ram`, and compares p50, p99 and p99.9. It reads the
@@ -787,10 +847,24 @@ under the netns runner), and is committable on its own. Docs and
   rule and realignment), `DigestBoard` (decision 4, sized from both ring
   capacities and the minimum interval, never from the K in force),
   `DigestComparator` (decision 5, the same constant),
-  `DEFAULT_OUTPUT_DIGEST_INTERVAL`, `MIN_OUTPUT_DIGEST_INTERVAL`. `blake3`
-  becomes an ordinary dependency of `transport-core` (already in
-  `Cargo.lock` and on `deny.toml`'s licence list; `Cargo.lock` staged with
-  it).
+  `DEFAULT_OUTPUT_DIGEST_INTERVAL`, `MIN_OUTPUT_DIGEST_INTERVAL`.
+  `twox-hash` (2.x) becomes a workspace dependency, taken by
+  `transport-core` with `default-features = false, features =
+  ["xxhash3_128"]` (MIT, already on `deny.toml`'s allow list, so `cargo
+  deny check` passes unchanged; new to `Cargo.lock`, which is staged with
+  it). Leaving the defaults off drops the other algorithms and the
+  `random` feature, and with it `rand`. It also drops `std`, which the
+  crate needs for its runtime choice of SSE2, AVX2 or NEON: without it,
+  the stripe loop that every window longer than XXH3's 240-byte
+  short-input cutoff runs is the scalar one. Step 6's micro-benchmark runs
+  both feature sets, and `std` is added if it wins (it turns on `alloc`
+  only to make the allocating `Hasher` available, which the folder does
+  not use). The folder holds a `xxhash3_128::RawHasher` over
+  `SecretBuffer::default()` (no allocation), replaced by a fresh one at
+  each window (decision 1), and writes the domain string and header into
+  it first. The field carries the comment justifying the choice (decision
+  1's reasons, and why `RawHasher` rather than `Hasher`), as do `Digest`
+  and the board's payload.
 - `encode_report_body` (decision 3): `MAX_RESPONSE_BODY` and the body-bound
   check move into it; `server-runtime` re-exports the constant from where it
   is today and `frame_app_response` and `encode_early_reply` call it, so the
@@ -802,13 +876,20 @@ under the netns runner), and is committable on its own. Docs and
   under the existing tick rule (finding 7).
 - Tests, all ungated:
   - folder: the digest of a known window pinned to a byte pattern (so the
-    definition cannot drift silently between builds); a report moved to
-    another position, a byte changed, two reports swapped, an encode error
-    in place of a body, all change it; the same reports folded in two
-    folders started at different positions agree on every window both saw
-    whole and digest no partial window; empty windows digest their header;
-    realignment on a change of K lands on the new grid and publishes the
-    schedule before the first digest under it;
+    definition cannot drift silently between builds, including through a
+    `twox-hash` upgrade or a change of its feature set), the pinned value
+    taken from `xxh128sum` over the same bytes, not from the code under
+    test; the streaming hasher fed report by report equal to the one-shot
+    `xxhash3_128::Hasher::oneshot` of the concatenated bytes, over windows
+    on both sides of the 240-byte cutoff and longer than the hasher's
+    internal buffer (`oneshot` needs no `alloc` either); a second window
+    after a restart digesting as a first one would (nothing carried over);
+    a report moved to another position, a byte changed, two reports
+    swapped, an encode error in place of a body, all change it; the same
+    reports folded in two folders started at different positions agree on
+    every window both saw whole and digest no partial window; empty
+    windows digest their header; realignment on a change of K lands on the
+    new grid and publishes the schedule before the first digest under it;
   - board: exact lookup, lap detection, `latest`, the schedule record
     written before the first digest under it; a two-thread stress test
     asserting no torn value is ever returned, run under Miri by the existing
@@ -887,7 +968,10 @@ under the netns runner), and is committable on its own. Docs and
 - `DivergenceLatch`, `trip`, the `Halted` / `MarkerWritten` tokens, the
   marker (`NodeStore::divergence_marker`), `ArchiveReason::Diverged` and the
   snapshot archival, the `NodeDiverged` error through the one exit helper
-  (decision 10).
+  (decision 10). `melin_journal::error::hex_prefix` widened to `&[u8]`
+  for the divergence log line, rather than a second formatter beside it;
+  every existing call passes a reference to a 32-byte array, which
+  coerces, so no caller changes.
 - The response loop's per-slot latch check, before the send and before an
   early reply's release; the shadow's check before each save.
 - The shadow's comparator against the live board on every node with a
@@ -910,7 +994,10 @@ under the netns runner), and is committable on its own. Docs and
     divergence deposited by another thread while the caller left through
     ordinary shutdown;
   - marker: written durably (temporary file, rename), parsed back, every
-    field present; an unparseable marker still refuses;
+    field present, each digest in full canonical hex; an unparseable
+    marker still refuses;
+  - `hex_prefix`: the same prefix for a 16-byte digest as for a 32-byte
+    hash sharing its first bytes, so the chain's log lines are unchanged;
   - archival: snapshots above `verified_through` move, those at or below
     stay, `.prev` handled the same way, a second run moves nothing, and the
     journal is untouched; with no verified window, every snapshot moves;
@@ -1077,8 +1164,9 @@ under the netns runner), and is committable on its own. Docs and
 
 ### Step 6. Measurement and the operator runbook
 
-- The measurement of decision 14, in a dated document naming its hardware.
-  If the response stage's tail moves, open question 1 decides.
+- The measurement of decision 14, the hash micro-benchmark included, in a
+  dated document naming its hardware. If the response stage's tail moves,
+  open questions 1 and 5 decide.
 - `docs/replication.md`, "Output verification", completed for operators,
   with no implementation detail:
   - **the guarantee** in the words of "The guarantee, and its limit" above,
@@ -1133,11 +1221,13 @@ Add a row to `docs/internal/roadmap.md` ("Next"), roughly:
 > stop on the first one. A digest of application state, at the same window
 > boundaries, closes that. It plugs into what output digests built: a new
 > kind value on the same digest frame and `StreamStart` schedule table (no
-> replication protocol bump), the same board and comparator, the same stop.
-> The new surface is the application's: an opt-in digest function whose
-> contract is the logical state, independent of capacity and iteration
-> order. An application that already keeps an incremental state hash, as
-> the Exchange Core does (Theia), exposes it directly. Plan:
+> replication protocol bump), the same 16-byte digest, the same board and
+> comparator, the same stop. The new surface is the application's: an
+> opt-in digest function whose contract is the logical state, independent
+> of capacity and iteration order. An application that already keeps an
+> incremental state hash, as the Exchange Core does (Theia), exposes it
+> directly, reduced to 16 bytes by the kind's definition if it is wider.
+> Plan:
 > [divergence-detection-2026-10.md](divergence-detection-2026-10.md).
 
 - **Leaves untested:** a roadmap row.
@@ -1157,17 +1247,33 @@ Beyond each step's own list:
 
 ## Open questions and trade-offs
 
-1. **The hash.** BLAKE3 (recommended: in the tree, 32 bytes, no new
-   dependency) or a faster non-cryptographic 128-bit hash such as XXH3-128
-   (a new dependency through `deny.toml`). Collisions are accidental, not
-   adversarial, so either is adequate. Recommendation: BLAKE3, and revisit
-   only if step 6 shows the per-report update in the response stage's
-   tail.
+1. **The hash.** XXH3-128 through `twox-hash` (recommended, decision 1)
+   or BLAKE3 (already in the tree, but a cryptographic hash paying a serial
+   block compression for every 64 bytes folded, for a guarantee this check
+   does not need). Collisions are accidental, not adversarial, so either
+   is adequate; the difference is cost on the response thread.
+   Recommendation: XXH3-128, confirmed by step 6's micro-benchmark. If a
+   crate outside `deny.toml`'s allow list were ever needed instead
+   (`xxhash-rust` is BSL-1.0, the Boost Software License), its allow
+   entry must say in a comment that it is Boost and not BUSL-1.1, the
+   Business Source License the file reserves for our own crates. The
+   frames fix the digest at 16 bytes for every kind (decision 7), which
+   suits any later digest compared between copies, a state digest
+   included: its collisions are just as accidental. An application
+   hash wider than that (a state hash of its own) is reduced to 16 bytes
+   by its kind's definition, and a cryptographic hash truncated to 128
+   bits still leaves accidental collisions out of reach. A digest that
+   must be tamper-evident to a third party is a different job: it needs a
+   wider digest field, so a new frame and a protocol bump, and is not
+   what these frames are for.
 2. **Comparing across builds.** A rolling upgrade that changes a report's
    layout, or the encoder, makes a mixed pair disagree by design, and under
    this plan the replica stops. Options: (a) document that such upgrades run
    with digests off on the primary; (b) `StreamStart` carries a build id (a
-   BLAKE3 of the running executable, read once at startup), and a replica
+   BLAKE3 hash of the running executable, read once at startup, in
+   `server-runtime`, which already depends on `blake3` unconditionally; it
+   stays BLAKE3 and 32 bytes, since it is computed once, off every hot
+   path, so decision 1's cost argument does not reach it), and a replica
    compares only against the same build, counting
    `unverified{reason="build"}` otherwise; (c) an application-declared
    output version, rejected because it is the trait surface this plan
