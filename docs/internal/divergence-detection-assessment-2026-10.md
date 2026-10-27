@@ -4,16 +4,21 @@ Status: **review**. Assesses [divergence-detection-2026-10.md](divergence-detect
 as it stands on branch `plan/state-divergence-detection` at 25f75166.
 Every claim below was
 checked against the plan's text and the code at that commit, and is cited
-as `file:line`. The plan's own line numbers are cited as `plan:N`, against
-the working tree (25f75166 plus the uncommitted removal of one line from
-the step-7 roadmap text at plan:1846); against 25f75166 itself, citations
-past plan:1846 are one line later. Bare file names are in one of two
+as `file:line`. The plan's own line numbers are cited as `plan:N`,
+against the plan as committed with this assessment (a5997135 after the
+rebase onto `main`). The plan has since been updated for item 1.4, which
+shifts the citations after plan:170 by a few lines. Bare file names are in one of two
 crates: `pipeline.rs`, `dispatch.rs`, `journaled_app.rs`, `shadow.rs`,
 `node_store.rs` and `replication/archive.rs` and `replication/catchup.rs`
 are in `crates/core/transport-core/src`; `halt.rs`, `response_loop.rs`,
 `response.rs`, `dpdk_response.rs`, `server.rs`, `replication/mod.rs`,
 `replication/tcp_sender.rs` and `replication/join_worker.rs` are in
-`crates/core/server-runtime/src`. Where a
+`crates/core/server-runtime/src`. Item 1.4 was resolved on `main` after
+this assessment was written (the `fix/encoder-purity` merge, 85075207);
+its section and every mention of it are updated against that merge, and
+the branch has been rebased onto it. Citations of
+`crates/core/app/src/encoder.rs` and `response_frame.rs` are to the
+rebased tree; nothing else cited here changed. Where a
 point depends on the Melin Exchange Core, which is maintained separately and
 is not in this repo, it says "unknown".
 
@@ -23,9 +28,10 @@ weaknesses are elsewhere: one cost it does not see (replication ring slots),
 two statements about what happens after a divergence that do not hold
 (the halt under `disk`, which the code contradicts, and who is left
 running when the primary is the faulty node, which the plan's own
-decision 10 contradicts), and gaps (the encode buffer's stale bytes,
-the tick trap) that will make the first rollout stop healthy applications
-for reasons other than a broken `apply`.
+decision 10 contradicts), and a gap (the tick trap) that will make the
+first rollout stop healthy applications for reasons other than a broken
+`apply`. A second such gap, the encode buffer's stale bytes, is now
+closed on `main` (item 1.4).
 
 ## Summary, ranked by harm to an operator
 
@@ -34,7 +40,7 @@ for reasons other than a broken `apply`.
 | 1 | Digest frames take a replication-ring slot each, up to one per fsync batch. That can halve the headroom before a replica is evicted | Performance | High | **Yes** |
 | 2 | "Under `disk` the primary keeps serving alone" is wrong: the halt applies under every policy | Correctness of the guarantee text | High | **Yes** (text) |
 | 3 | When the primary is at fault, the plan stops the healthy copies, archives their good snapshots and tells the operator to reseed them from the faulty primary | Correctness / operations | High | **Yes** |
-| 4 | The encode buffer is shared by reports and queries, so an encoder that leaves bytes unwritten folds stale bytes, which differ by copy | Correctness | High | **Yes** |
+| 4 | Stale bytes in the shared encode buffer: resolved on `main`. What remains is keeping the zeroing and the purity check on the drain's and the shadow's encodes | Correctness | Low (residual) | Done: now in the plan's decision 4 |
 | 5 | First rollout: the only fallback from enforcement is `--no-output-digests`, which gives up detection entirely | Operations | Medium-High | Decide now |
 | 6 | The tick trap is wider than finding 7 says: replica restarts and promotions trigger it too, with no clock step back needed | Correctness caveat | Medium-High | Confirms open question 8 (b); adds a test |
 | 7 | The snapshot/restore check is narrower than claimed: one round trip per pipeline start, none at all if `clone_via_snapshot` is overridden | Coverage | Medium | Text and runbook |
@@ -54,9 +60,9 @@ for reasons other than a broken `apply`.
 | 21 | API breaks, the API review's "additive" label, and a name clash in `ArchiveReason` | Operations | Low | **Yes** (the rename); the rest is text |
 | 22 | Comparator complexity, and "cannot compile" claims that are only lints | Complexity | Medium | **Yes** (the comparator calls `trip`); the rest in design review |
 | 23 | Smaller implementation traps (allocating sibling, encode-error logs at `error!`, notice aggregation, the board's shape) | Complexity | Low-Medium | **Yes** (stack buffer, encode-error logging); the rest in the steps |
-| 24 | Room for improvement: majority verdict from notices, staleness metrics, offline qualification, a debug encoder check | Improvement | — | Some now, some later |
+| 24 | Room for improvement: majority verdict from notices, staleness metrics, offline qualification | Improvement | — | Some now, some later |
 
-Items 1 to 4, 8 and 16, and the parts of 21, 22 and 23 marked above, should
+Items 1 to 3, 8 and 16, and the parts of 21, 22 and 23 marked above, should
 change the plan before step 1 starts. Items 5, 9 and 10 are decisions to
 take now, because they shape the flag, the protocol and the metrics of
 steps 2 to 5. The rest can be documented or deferred.
@@ -247,39 +253,41 @@ test application whose reports follow capacity-dependent iteration, to pin
 that the check catches it (step 3). The rollout notes should name this as
 the second suspect, after the tick rule.
 
-### 1.4 The shared encode buffer folds stale bytes (item 4)
+### 1.4 The shared encode buffer's stale bytes (item 4): resolved
 
-**Shortfall.** On the primary, reports and query responses are encoded
-into one reused stack buffer (`response_loop.rs:493`, `encode_slot_payload`
-at `response_frame.rs:76-91`). The encoder returns a length
-(`encoder.rs:41-46`), and nothing says it must write every byte below
-that length. An encoder that skips a reserved or padding field leaves
-whatever the previous encode wrote there. On the primary that may be a
-query response. On a replica (no queries) and in the shadow it is a
-different history. The plan's clause, "a pure function of the report"
-(plan:335-339), arguably covers this, but no implementer will read it that
-way. Clients that ignore reserved bytes have never noticed.
+**What it was.** Reports and query responses are encoded into one reused
+stack buffer (`response_loop.rs:493`). An encoder that skipped a reserved
+or padding field sent whatever an earlier encode left there, possibly
+another client's response. Under the digest that would have been a false
+divergence, because the leftover bytes differ by copy.
 
-**Why it matters.** It is a false divergence with no bug in `apply`, it
-depends on traffic mix, and it is hard to diagnose from a marker.
+**What `main` now does** (the `fix/encoder-purity` merge, 85075207):
 
-**Options.** (a) State the rule: every byte in `buf[..n]` is written by
-the encoder. Then enforce it in debug builds: the folder fills the body
-region with a poison pattern, encodes twice with two patterns, and asserts
-equal output. The cost is debug-only, and tests then catch it. (b) Zero
-the whole body region (`MAX_RESPONSE_BODY`, 512 bytes,
-`response_frame.rs:25`) before each encode in release, or the high-water
-mark of the longest body written so far. Zeroing only the previous
-encode's length is not enough: the buffer is reused across every encode,
-so a stale byte can come from any earlier one (encode A writes 100 bytes,
-B writes 10, C returns 50 but skips bytes 10..20, and A's bytes survive
-there). It is one `memset` of at most 512 bytes per report on every copy:
-cheap, removes the class at runtime, and leaves the contract as written. (c) Give each copy separate buffers for reports and
-queries. That fixes the query mix but not reuse across reports.
+- `frame_zeroed` zeroes the whole body region before every encode
+  (`response_frame.rs:75-98`). Its comment says why a high-water mark
+  would not do: an encoder may use bytes past its returned length as
+  scratch.
+- In debug builds, `check_encoder_purity` (`response_frame.rs:127`)
+  encodes twice more over two fill patterns and panics if the result or
+  any byte below the returned length differs. That also catches an
+  encoder with internal state.
+- `ResponseEncoder`'s "Purity" section (`crates/core/app/src/encoder.rs:34-50`)
+  and "The determinism rules" in `docs/building-an-application.md` state
+  the contract.
 
-**Recommendation.** (b) in `encode_report_body` (decision 4), so the class
-cannot occur. Add (a)'s debug double-encode as a check on the encoder's
-purity in general: it also catches an encoder with internal state.
+**What remains.** Both run inside `frame_app_response`, which is the
+primary's only encode path today. The plan's replica drain and shadow
+would encode through `encode_report_body`, outside it, so without a
+change they would get neither. Decision 4 now moves the zeroing and the
+check into `encode_report_body`, so every copy's encode shares them, and
+step 1 pins a direct call. The contract text also needs its scope
+widened: "every response a node encodes" becomes "every report a node
+encodes, sent or folded".
+
+**Residual risk.** An impure encoder used only for report variants that
+no debug-build test sends would still reach production, and there it
+would stop a replica. That is the contract working as intended, and the
+debug check is the place to find it first.
 
 ### 1.5 The tick trap is wider than finding 7 states (item 6)
 
@@ -538,19 +546,20 @@ the roadmap, not in this plan.
 ### 3.2 First rollout: enforcement with only an off switch (item 5)
 
 **Shortfall.** The flag is binary (`--no-output-digests`, plan:454-461).
-Items 1.4 and 1.5 are ways an application that follows today's contract
-stops on upgrade day. Item 1.3 is a way an application that already breaks
-a written rule, unnoticed until now, stops on upgrade day. An operator who
+Item 1.5 is a way an application that follows today's contract stops on
+upgrade day. Items 1.3 and 1.4's residual are ways an application that
+already breaks a written rule, unnoticed until now, stops on upgrade day.
+An operator who
 hits any of them has two choices: stay down, or turn digests off, after
 which nothing is detected at all.
 
 **Weighing the stance.** The user's position is that nondeterminism breaks
 the contract and an outage is acceptable. That holds for a broken `apply`,
-and it holds for item 1.3, whose rule is already written down. It holds
-less well where this plan introduces the contract (the encoder determinism
-clause and the buffer bytes it covers, item 1.4) or where the runtime
-causes the stop (the tick trap, item 1.5). There the application was
-correct yesterday. An observe mode would not weaken the default. It would
+and it holds for items 1.3 and 1.4's residual, whose rules are already
+written down. The encoder rule is now also checked in debug builds, so an
+impure encoder is caught in the application's own tests before it reaches
+a cluster. It holds less well where the runtime causes the stop (the
+tick trap, item 1.5). There the application was correct yesterday. An observe mode would not weaken the default. It would
 replace "off" as the fallback.
 
 **Options.** (a) As planned: enforce, or off. (b) A three-state
@@ -627,16 +636,18 @@ first release that has a marker.
 - `build_pipeline_with_replication` takes a `PipelineId` (`pipeline.rs:3521`);
 - `hex_prefix` widens from `&[u8; 32]` to `&[u8]` (`journal/src/error.rs:9`).
   Calls coerce, but a use as a function pointer of the old type does not;
-- the encoder's determinism clause, a behaviour change with no compile-time
-  check.
+- the encoder's purity contract, already on `main`, gains a consequence:
+  an impure encoder now stops replicas. That is a behaviour change with
+  no compile-time check.
 
 The API review lists S8 as "No (additive)" for breaking
 (`application-api-review-2026-09.md:48`). The plan is not additive: it
 bumps the protocol and changes public enums and contracts.
 
 **Recommendation.** Update S8's row when step 6 points it at the plan.
-For the encoder clause, item 1.4's debug double-encode is the closest
-thing to a compile-time check available.
+For the encoder contract, the debug-build purity check now on `main`
+(item 1.4) is the closest thing to a compile-time check available. The
+plan keeps it on every copy's encode.
 
 ## 4. Performance risks
 
@@ -826,7 +837,7 @@ right.
   silently, count it, and log once per variant at `warn!`. Keep `error!`
   for a reply that was due to a live client, since that drops a reply.
   The encoder's public rustdoc promises "the runtime logs at error level
-  and drops the response" (`crates/core/app/src/encoder.rs:43-45`), so the
+  and drops the response" (`crates/core/app/src/encoder.rs:61-63`), so the
   plan's step 2 must update that contract along with the new sites.
 - **"Every replica streaming reported the same window"** (plan:1209). Each
   replica disconnects right after its notice, so the set of streaming
@@ -866,13 +877,12 @@ In order of value for the cost:
    (plan:1228). Step 5.
 3. **Observe mode and offline qualification** (item 3.2). Before step 5
    is released.
-4. **A debug-build encoder purity check** (item 1.4 (a)). Step 2.
-5. **Protocol negotiation in protocol 9** (item 3.1 (b)). Step 4.
-6. **A generic refusal file** (item 3.4 (b)). Step 3.
-7. **An in-process query digest kind, opt-in** (item 2.3 (b)). Roadmap.
-8. **State digest; chain stored in snapshots.** Already step 7. The state
+4. **Protocol negotiation in protocol 9** (item 3.1 (b)). Step 4.
+5. **A generic refusal file** (item 3.4 (b)). Step 3.
+6. **An in-process query digest kind, opt-in** (item 2.3 (b)). Roadmap.
+7. **State digest; chain stored in snapshots.** Already step 7. The state
    digest also closes items 1.6 and 1.7.
-9. **Deferred replica exit with automatic failover on a primary-fault
+8. **Deferred replica exit with automatic failover on a primary-fault
    verdict** (item 1.2 (c)). Its own plan.
 
 ## What should change before implementation, and what can wait
@@ -886,8 +896,9 @@ In order of value for the cost:
 - 1.2: refusal message and runbook branch on who is at fault; restore
   archived snapshots on a primary-fault verdict; say whether replay is
   possible; add the majority verdict to step 5.
-- 1.4: zero the body region in `encode_report_body`; add the debug
-  double-encode.
+- 1.4: done. The zeroing and the purity check are on `main`, and the plan
+  now moves both into `encode_report_body` so the drain and the shadow
+  share them.
 - 5.1: the latch holds the node-level flag; the replica's shadow takes the
   latch.
 - 2.5: close windows on any slot past them.
