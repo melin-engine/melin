@@ -35,9 +35,12 @@ pub(crate) const MAX_APP_FRAME: usize = HEADER_LEN + MAX_RESPONSE_BODY;
 /// than a `Vec`: fixed size, on the stack, no allocation on the hot path.
 pub(crate) type EncodeBuf = [u8; MAX_APP_FRAME];
 
-/// Frame an application response in `buf`: run `encode` on the body
-/// region, then write the header in front of what it wrote. Returns the
-/// frame's length, header included.
+/// Frame an application response in `buf`: zero the body region, run
+/// `encode` on it, then write the header in front of what it wrote.
+/// Returns the frame's length, header included.
+///
+/// Every application response is framed here, whichever path sends it,
+/// so the zeroing covers them all and no caller can forget it.
 ///
 /// A length past the body region is this server's bug and comes back as
 /// `Err` — the caller logs it and drops the response, rather than send a
@@ -53,6 +56,16 @@ pub(crate) fn frame_app_response(
     buf: &mut EncodeBuf,
     encode: impl FnOnce(&mut [u8]) -> Result<usize, &'static str>,
 ) -> Result<usize, &'static str> {
+    // The runtime cannot tell whether an encoder wrote every byte
+    // below the length it returns, and an encoder may use the bytes past
+    // it as scratch. The buffer is reused for every response, so a byte
+    // it skips would otherwise carry an earlier body, possibly another
+    // client's. Only the whole region guarantees no byte of an earlier
+    // body survives: zeroing up to the previous length, or a high-water
+    // mark of returned lengths, misses the scratch bytes, which resurface
+    // when a later encode skips one. The buffer is reused, so it stays in
+    // L1 and this is one short memset per response.
+    buf[HEADER_LEN..].fill(0);
     let len = encode(&mut buf[HEADER_LEN..])?;
     if len > MAX_RESPONSE_BODY {
         return Err("encoder reported a body longer than its buffer");
@@ -258,19 +271,7 @@ mod tests {
     /// with its batch end, and a refusal whose reason is cut to the limit.
     #[test]
     fn the_widest_early_replies_fit() {
-        struct Widest;
-        impl ResponseEncoder for Widest {
-            type Report = u8;
-            type Query = u16;
-            fn encode_report(&self, _: &u8, buf: &mut [u8]) -> Result<usize, &'static str> {
-                buf.fill(0xAB);
-                Ok(buf.len())
-            }
-            fn encode_query(&self, _: &u16, _: &mut [u8]) -> Result<usize, &'static str> {
-                Ok(0)
-            }
-        }
-        let rejected = early_with(&Widest, EarlyKind::Rejected(0));
+        let rejected = early_with(&FillingEncoder, EarlyKind::Rejected(0xAB));
         assert_eq!(rejected.len(), MAX_APP_FRAME + BATCH_END_FRAME_LEN);
         assert!(rejected.len() <= MAX_EARLY_REPLY);
         let long: &'static str = "r".repeat(1000).leak();
@@ -379,5 +380,97 @@ mod tests {
     fn an_encode_error_passes_through() {
         let (n, _) = frame(|_| Err("no"));
         assert_eq!(n, Err("no"));
+    }
+
+    /// Body length both of [`SkippingEncoder`]'s methods return.
+    const SKIPPING_LEN: usize = 16;
+    /// The body byte [`SkippingEncoder`]'s report leaves unwritten.
+    const SKIPPED: usize = 1;
+
+    /// An encoder that leaves a byte of its report unwritten, as one with
+    /// a reserved or padding field might: its query fills the whole body
+    /// with `0xFF`, its report writes the value at every body byte but
+    /// [`SKIPPED`].
+    struct SkippingEncoder;
+
+    impl ResponseEncoder for SkippingEncoder {
+        type Report = u8;
+        type Query = u16;
+
+        fn encode_report(&self, report: &u8, buf: &mut [u8]) -> Result<usize, &'static str> {
+            buf[..SKIPPED].fill(*report);
+            buf[SKIPPED + 1..SKIPPING_LEN].fill(*report);
+            Ok(SKIPPING_LEN)
+        }
+
+        fn encode_query(&self, _: &u16, buf: &mut [u8]) -> Result<usize, &'static str> {
+            buf[..SKIPPING_LEN].fill(0xFF);
+            Ok(SKIPPING_LEN)
+        }
+    }
+
+    /// [`SkippingEncoder`]'s report of 7, framed: the skipped byte zero,
+    /// every other body byte 7.
+    fn skipped_report_frame() -> Vec<u8> {
+        let mut frame = vec![(TAG_LEN + SKIPPING_LEN) as u8, 0, 0, 0, TAG_APP];
+        frame.extend((0..SKIPPING_LEN).map(|i| if i == SKIPPED { 0 } else { 7 }));
+        frame
+    }
+
+    /// The previous body was another response, possibly to another
+    /// client: none of it may reach this one through a byte the encoder
+    /// skipped.
+    #[test]
+    fn a_body_byte_the_encoder_skips_is_zero_not_the_previous_bodys() {
+        let mut buf = [0u8; MAX_APP_FRAME];
+        let query = frame_app_response(&mut buf, |body| SkippingEncoder.encode_query(&0, body));
+        assert_eq!(query, Ok(HEADER_LEN + SKIPPING_LEN));
+        let report = frame_app_response(&mut buf, |body| SkippingEncoder.encode_report(&7, body));
+        assert_eq!(report, Ok(HEADER_LEN + SKIPPING_LEN));
+        assert_eq!(
+            &buf[..HEADER_LEN + SKIPPING_LEN],
+            &skipped_report_frame()[..],
+            "the skipped byte carries the query's"
+        );
+    }
+
+    /// The early-reply path zeroes too: a short early rejection encoded
+    /// where a widest one was leaves the rest of the application frame's
+    /// region zero, not the previous body's.
+    #[test]
+    fn an_early_rejection_carries_no_byte_of_the_previous_early_reply() {
+        let mut buf = [0u8; MAX_EARLY_REPLY];
+        let reply = |report| EarlyReply {
+            connection_id: 7,
+            request_id: ID,
+            kind: EarlyKind::Rejected(report),
+        };
+        // A widest body, every byte 0xFF: what the next reply must not show.
+        let full = encode_early_reply(&reply(0xFF), &FillingEncoder, &mut buf);
+        assert_eq!(full, MAX_APP_FRAME + BATCH_END_FRAME_LEN);
+        let n = encode_early_reply(&reply(7), &ByteEncoder, &mut buf);
+        let report = [2, 0, 0, 0, TAG_APP, 7];
+        let batch_end = control(TransportResponse::BatchEnd { id: ID });
+        assert_eq!(&buf[..n], &[&report[..], &batch_end].concat()[..]);
+        assert!(
+            buf[n..MAX_APP_FRAME].iter().all(|&b| b == 0),
+            "the region past the reply carries the previous body's bytes"
+        );
+    }
+
+    /// Fills the whole body with the report's value, so a test can see
+    /// every byte of it.
+    struct FillingEncoder;
+
+    impl ResponseEncoder for FillingEncoder {
+        type Report = u8;
+        type Query = u16;
+        fn encode_report(&self, report: &u8, buf: &mut [u8]) -> Result<usize, &'static str> {
+            buf.fill(*report);
+            Ok(buf.len())
+        }
+        fn encode_query(&self, _: &u16, _: &mut [u8]) -> Result<usize, &'static str> {
+            Ok(0)
+        }
     }
 }

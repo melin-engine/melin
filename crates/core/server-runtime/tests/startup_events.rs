@@ -21,10 +21,13 @@ use counter_server::{
     Counter, CounterEvent, GET_VALUE_REQUEST, KIND_RESP_VALUE, RequestDecoder, ResponseEncoder,
     increment_request,
 };
-use melin_client::{Connection, SigningKey, key};
+use melin_client::{Connection, SigningKey};
 use melin_server_runtime::StartupEvents;
-use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
+
+#[path = "common/standalone.rs"]
+mod standalone;
+use standalone::standalone_config;
 
 const CLIENT_KEY: [u8; 32] = [0xAA; 32];
 
@@ -47,7 +50,7 @@ fn boot_with(
     startup: StartupEvents<CounterEvent>,
     tweak: impl FnOnce(&mut ServerConfig),
 ) -> Node {
-    let mut config = standalone_config(dir);
+    let mut config = standalone_config(dir, &SigningKey::from_bytes(&CLIENT_KEY));
     tweak(&mut config);
 
     Node(melin_test_node::start::<Counter>(
@@ -57,34 +60,6 @@ fn boot_with(
         RequestDecoder,
         ResponseEncoder,
     ))
-}
-
-/// A standalone primary's configuration on `dir`'s journal, with
-/// `authorized_keys` written there. `bind` is left for the caller.
-fn standalone_config(dir: &Path) -> ServerConfig {
-    let auth_path = dir.join("authorized_keys");
-    let client_key = SigningKey::from_bytes(&CLIENT_KEY);
-    std::fs::write(
-        &auth_path,
-        key::authorized_keys_line("operator", &client_key.verifying_key(), "test") + "\n",
-    )
-    .expect("write auth keys");
-
-    ServerConfig {
-        journal: dir.join("counter.journal"),
-        authorized_keys: auth_path,
-        standalone: true,
-        ack_policy: melin_server_runtime::ack_policy::AckPolicy::Disk,
-        // Unpinned, and therefore yielding: the suite runs many nodes at
-        // once, and the default layout would stack every node's same-role
-        // thread on one core while a spinner would starve whatever shares
-        // its core, the test's own client included.
-        cores: PipelineCores::unpinned(),
-        tick_interval_ms: 0,
-        snapshot_interval_ms: 0,
-        health_bind: None,
-        ..melin_test_node::config()
-    }
 }
 
 /// Connect to the node at `addr`, authenticate, and return its first
@@ -272,7 +247,7 @@ fn a_node_run_with_its_own_shutdown_flag_serves_and_stops_on_it() {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = ServerConfig {
         bind: free_addr(PORT_BASE),
-        ..standalone_config(dir.path())
+        ..standalone_config(dir.path(), &SigningKey::from_bytes(&CLIENT_KEY))
     };
     let addr = config.bind;
     let shutdown = Arc::new(AtomicBool::new(false));

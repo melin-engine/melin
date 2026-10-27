@@ -20,6 +20,13 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Fixed
 
+- **A response body byte the application's encoder does not write is now
+  zero.** The runtime encodes every response into a reused buffer, and an
+  encoder is free to leave a byte below the length it returns unwritten
+  (a reserved or padding field). Such a byte carried whatever an earlier
+  response left there, possibly a response sent to another client. The
+  runtime now zeroes the whole body region before every encode, on both
+  transports and for early replies too, whatever the encoder does.
 - **A DPDK node no longer hangs on shutdown when a poll thread stops
   draining its replies.** The response stage waited for room on that poll
   thread's full TX ring without checking whether the node was shutting

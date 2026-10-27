@@ -1,10 +1,23 @@
 # No stale bytes in response bodies, and a debug check that encoders are pure (plan)
 
-Status: **proposed, not started**. To be implemented on its own branch
-off `main`. It is independent of the divergence-detection plan
-([divergence-detection-2026-10.md](divergence-detection-2026-10.md)),
-which builds on it: that plan's `encode_report_body` wraps
-`frame_app_response` and so inherits both changes.
+Status: **in progress** (2026-10): steps 1 and 2 done, step 3 not
+started. Where the build departs from the text below:
+
+- Step 1's end-to-end leak test runs through a running node
+  (`crates/core/server-runtime/tests/encoder_purity.rs`) rather than the
+  response stage alone.
+- Step 2's measurement, 2026-10-27, on an Apple M-series laptop (8 cores,
+  Asahi Linux), kernel TCP over loopback, echo with 64-byte requests, one
+  client, window 1, `disk` acks, five interleaved 15-second runs of each
+  build: p50 13.17 to 13.46 µs before, 13.13 to 13.50 µs after; p99 17.2
+  to 17.4 µs before, 16.9 to 17.7 µs after; p99.9 87 to 105 µs before, 85
+  to 136 µs after. Within run-to-run noise, so no high-water mark. Not
+  measured over DPDK: no bench host with a NIC was available.
+
+It was to be implemented on its own branch off `main`. It is independent
+of the divergence-detection plan (not yet written), which is to build on
+it: that plan's `encode_report_body` is to wrap `frame_app_response` and
+so inherit both changes.
 
 ## The problem
 
