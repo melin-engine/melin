@@ -1843,9 +1843,8 @@ Add two rows to `docs/internal/roadmap.md` ("Next"), roughly:
 > values, the same board and comparator, the same stop. The new surface is
 > the application's: an opt-in digest function whose contract is the
 > logical state, independent of capacity and iteration order. An
-> application that already keeps an incremental state hash, as the
-> Exchange Core does (Theia), exposes it directly, reduced to 16 bytes by
-> the kind's definition if it is wider. Plan:
+> application that already keeps an incremental state hash exposes it
+> directly, reduced to 16 bytes by the kind's definition if it is wider. Plan:
 > [divergence-detection-2026-10.md](divergence-detection-2026-10.md).
 
 > **Output chain stored in snapshots** (Medium). Each copy's output chain
