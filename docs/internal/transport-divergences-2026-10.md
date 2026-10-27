@@ -204,6 +204,31 @@ unchanged. No example supplies a publisher, so no test reaches it. Found
 while sharing the DPDK primary path with promotion, which kept the
 startup as it was.
 
+### DPDK primary does not notice a dead pipeline stage (likely bug)
+
+`server.rs`. The kernel TCP primary's accept loop checks each pass
+whether a stage thread that only exits on shutdown or a panic has exited
+(`PipelineHandles::stage_died`). If one has, it logs `error!`, clears
+`pipeline_healthy` and stops the node, which returns `pipeline failure`.
+`run_as_primary_dpdk` runs `run_dpdk_poll`, which leaves only on the
+shutdown flag and never makes that check. After the response stage
+panics, for example, a DPDK primary:
+
+- keeps accepting and authenticating clients, and answers none of their
+  requests;
+- keeps reporting healthy on its health endpoint, since `pipeline_healthy`
+  is only cleared when the node is stopped (`stop_and_join`);
+- reports the failure only when something else stops it.
+
+An operator watching health sees a live node, and its clients see a node
+that has gone silent. The fix is the same check in the DPDK poll loop,
+rate-limited (the kernel loop's is once per accept pass) so it stays off
+the hot path. Pinned by `an_encoder_that_skips_a_body_byte_stops_the_node`
+in `tests/encoder_purity.rs` (a debug-build test, run on DPDK under the
+netns runner), whose `#[cfg(feature = "dpdk")]` block asserts today's
+DPDK behaviour: served on until stopped, the stop then reporting the
+error. The fix replaces that block with the kernel TCP assertion.
+
 ## Deliberate differences (no action)
 
 - Response stage: the DPDK egress's flush, overflow, heartbeat and

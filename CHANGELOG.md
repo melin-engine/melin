@@ -18,8 +18,29 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   push, given up with `Stopped`, having written nothing, if a stop flag is
   set while it waits for room. A push with room never reads the flag.
 
+### Changed
+
+- **Debug builds now panic on an impure `ResponseEncoder`**: one that
+  leaves a body byte below the length it returns unwritten, or whose
+  output depends on anything but the value it encodes (state of its own,
+  the clock). Every response is encoded twice more first, over two
+  different fill patterns, and a difference panics the node's response
+  stage, which sends nothing more. On kernel TCP the node then stops and
+  reports a pipeline failure; on DPDK it keeps accepting connections
+  without answering them until it is stopped, and its stop returns the
+  error. Release builds do not run the check and pay nothing for it. The
+  contract is now documented on `ResponseEncoder` and in the application
+  guide's determinism rules.
+
 ### Fixed
 
+- **A response body byte the application's encoder does not write is now
+  zero.** The runtime encodes every response into a reused buffer, and an
+  encoder is free to leave a byte below the length it returns unwritten
+  (a reserved or padding field). Such a byte carried whatever an earlier
+  response left there, possibly a response sent to another client. The
+  runtime now zeroes the whole body region before every encode, on both
+  transports and for early replies too, whatever the encoder does.
 - **A DPDK node no longer hangs on shutdown when a poll thread stops
   draining its replies.** The response stage waited for room on that poll
   thread's full TX ring without checking whether the node was shutting
