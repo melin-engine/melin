@@ -38,7 +38,7 @@ closed on `main` (item 1.4).
 | # | Item | Group | Severity | Before implementation? |
 | --- | --- | --- | --- | --- |
 | 1 | Digest frames take a replication-ring slot each, up to one per fsync batch. That can halve the headroom before a replica is evicted | Performance | High | **Yes** |
-| 2 | "Under `disk` the primary keeps serving alone" is wrong: the halt applies under every policy | Correctness of the guarantee text | High | **Yes** (text) |
+| 2 | "Under `disk` the primary keeps serving alone" is wrong: the halt applies under every policy | Correctness of the guarantee text | High | Done: plan text corrected, halt cause added to step 5 |
 | 3 | When the primary is at fault, the plan stops the healthy copies, archives their good snapshots and tells the operator to reseed them from the faulty primary | Correctness / operations | High | **Yes** |
 | 4 | Stale bytes in the shared encode buffer: resolved on `main`. What remains is keeping the zeroing and the purity check on the drain's and the shadow's encodes | Correctness | Low (residual) | Done: now in the plan's decision 4 |
 | 5 | First rollout: the only fallback from enforcement is `--no-output-digests`, which gives up detection entirely | Operations | Medium-High | Decide now |
@@ -52,7 +52,7 @@ closed on `main` (item 1.4).
 | 13 | Uncovered windows around restarts and promotions; the failover tail | Coverage | Medium | Defer (step 7) |
 | 14 | Fold placement: after the send it still delays the next reply in the batch | Performance | Medium | Measure (step 6) |
 | 15 | Encode on the replica drain and on the shadow: both are back-pressure points | Performance | Medium | Measure (step 6) |
-| 16 | Windows close only on a `Report` slot or an empty ring, so they close late under report-less load | Coverage / detection delay | Low-Medium | **Yes** (one-line design change) |
+| 16 | Windows close only on a `Report` slot or an empty ring, so they close late under report-less load | Coverage / detection delay | Low-Medium | Done: now in the plan's decision 4 |
 | 17 | Queries are not covered, and `QueryCtx` makes a query check hard | Coverage | Low-Medium | Document |
 | 18 | Idle detection delay is bounded in ticks; unbounded with ticks off | Coverage | Low-Medium | Document |
 | 19 | Chain break under report-less traffic with a stalled drain (open question 11) | Coverage | Low | Defer |
@@ -106,6 +106,15 @@ cheaper half.
 
 **Recommendation.** (a) now, in the plan's guarantee, consequences, step
 5 changelog and open question 3. (b)'s `/healthz` half as part of step 5.
+
+**Done.** Existing tests already pin the claim. In `halt.rs`, the unit
+test `a_forced_disk_lifts_the_halt_until_a_replica_returns` asserts "the
+halt ignores the policy". In `tests/halt_refusal.rs`, two end-to-end
+tests run under `disk`: `a_write_refused_while_halted_is_not_replayed`
+and `a_disk_primary_keeps_answering_once_its_replica_is_gone`. Both have
+a write refused once the last replica leaves. The plan now has (a), and
+(b)'s `/healthz` half is in step 5 (`ReplicaPresence::lower` takes a
+`Departure`). Step 5's two-replica fault test runs under `disk`.
 
 ### 1.2 When the primary is the faulty node (item 3)
 
@@ -499,6 +508,10 @@ prior position (`pipeline.rs:2980-2981`).
 and at or below a query slot's. It is one comparison per slot and needs
 no change to the matching stage.
 
+**Done**, in decision 4. Only the moment a window closes changes, never
+its digest, because which window a report belongs to is fixed by its
+position.
+
 ### 2.6 Chain breaks (item 19)
 
 **Numbering.** Chain breaks are the plan's open question 11
@@ -891,8 +904,8 @@ In order of value for the cost:
 
 - 4.1: emit digests without a ring slot each (piggyback or rate-limit),
   and measure ring occupancy in step 6.
-- 1.1: correct the halt-under-`disk` statements (plan:1754-1756,
-  1796-1800, 1929-1930).
+- 1.1: done. The plan's text now says the halt applies under every
+  policy, and step 5 adds the halt's cause to `/healthz`.
 - 1.2: refusal message and runbook branch on who is at fault; restore
   archived snapshots on a primary-fault verdict; say whether replay is
   possible; add the majority verdict to step 5.
@@ -901,7 +914,7 @@ In order of value for the cost:
   share them.
 - 5.1: the latch holds the node-level flag; the replica's shadow takes the
   latch.
-- 2.5: close windows on any slot past them.
+- 2.5: done. Decision 4 closes windows on any slot past them.
 - 5.2, 5.4: the comparator calls `trip` itself; stack buffer for the frame;
   encode-error logging.
 - 3.5: name the new archive reason so it cannot be confused with

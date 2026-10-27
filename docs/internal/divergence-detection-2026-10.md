@@ -607,10 +607,19 @@ today. Three call sites, each with one folder:
 
 | Copy | Thread | Closes a window when |
 | --- | --- | --- |
-| Primary, live | response stage (`response_loop::run`, so both transports) | a `Report` slot past the window is read, or the output ring is empty and the matching stage has applied past the window's end |
+| Primary, live | response stage (`response_loop::run`, so both transports) | any slot is read whose position the window cannot reach (a `Report` or `BatchEnd` slot at a `wire_seq` past the window's end, a query slot at or past it), or the output ring is empty and the matching stage has applied past the window's end |
 | Replica, live | the drain thread, hoisted out of `replication/mod.rs` into a function with tests | same rule as the primary |
 | Shadow, primary and replica | shadow stage (`shadow::run`) | it has dispatched the window's last position: it sees every position |
 
+- **Any slot closes what lies behind it.** The matching stage writes the
+  output ring in `wire_seq` order. A `BatchEnd` at `w` follows every
+  report below `w`, and a query slot carries the position before it
+  (`pipeline.rs`, the `is_query_event` stamp), so every report at or below
+  that position precedes it. Without this rule, a busy primary whose
+  requests produce no reports would close windows late: its ring holds
+  `BatchEnd` slots and is rarely empty. The rule costs one comparison per
+  slot and changes no digest, because which window a report belongs to is
+  fixed by its position. Only the moment a window closes moves.
 - **The matching stage publishes its applied position.** One `Release` store
   of `next_wire_seq - 1` per batch, after `out_batch.commit()`, into a
   `WireSeq` cursor in `PipelineCursors` (`matching_applied_wire_seq`). An
@@ -1237,7 +1246,8 @@ Logs (levels per the project convention):
 
 Metrics (`/metrics`, rendered in `health.rs`, on replicas through the
 replica health endpoint; `/healthz` carries whether digests are on, each
-comparison's run and whether the node stopped diverged):
+comparison's run, whether the node stopped diverged and, on a halted
+primary, whether its last replica left for divergence, step 5):
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
@@ -1617,6 +1627,26 @@ under the netns runner), and is committable on its own. Docs and
   `Diverged` notice, `SessionExit::Diverged` and its arm
   in `handle_session_exit` running decision 11's stop (decision 9).
 - Primary: the "every replica, same window" aggregation of decision 16.
+- Primary: the halt's cause. `ReplicaPresence::lower` takes a
+  `Departure` (`Disconnected` or `Diverged`). It is an exhaustive enum, so
+  both senders (`tcp_sender.rs`, `dpdk.rs`) and every test helper that
+  stands in for one have to say why their replica left. A sender passes `Diverged` once its
+  session has received a `Diverged` notice. The departure that takes the
+  count to zero records its cause beside the loss stamp, in the same
+  `Release` order, so a reader that sees the count at zero sees that
+  departure's cause. A `lift` clears it. `lower`'s
+  `warn!` names the cause ("the last replica stopped for output
+  divergence — halted, refusing client writes"). `/healthz` carries the
+  cause beside `halted` (`diverged` or `disconnected`), the same way it
+  carries step 3's stop cause. A replica that diverges while others
+  remain changes nothing here, because the node is not halted.
+  `RejectReason` is unchanged. A new variant would break every
+  application's exhaustive `match`, and a client cannot act on it
+  differently: it resends either way once writes are taken. Unit tests in
+  `replica_presence.rs`: the cause of the last departure is the one read,
+  whatever earlier ones were; a `lift` clears it; an override leaves
+  `LastOverridden` whatever the cause. Plus a `health.rs` rendering case
+  for each cause.
 - Metrics `verified_from{against="primary"}`,
   `verified_through{against="primary"}`, `checks_total{against="primary"}`,
   `unverified_windows_total`, `chain_breaks_total`,
@@ -1735,10 +1765,13 @@ under the netns runner), and is committable on its own. Docs and
     event that brings my count to X", violating `prefault`'s contract on
     purpose) stops with a marker whose range contains the position of X,
     its archive exists, its restart is refused, the primary logs the
-    notice and keeps serving on the other replica; the same fault on both
-    replicas makes the primary log the "same window" error, and under
-    `disk+ram` the primary then halts writes (its last replica gone), as
-    the docs will state; and the mixed-build case: the same fault on a
+    notice and keeps serving on the other replica, with `/healthz` still
+    `trading`; the same fault on both replicas makes the primary log the
+    "same window" error and halt writes (its last replica gone), as the
+    docs will state. This case runs under `disk`, the policy whose halt
+    the plan's earlier text got wrong. A write is refused, a query still
+    answers, and `/healthz` reads `halted` with the `diverged` cause; and
+    the mixed-build case: the same fault on a
     replica whose primary is started with another build id (a
     `ServerConfig` field that defaults to the executable's hash and that
     `melin-test-node` can set, the one seam that stands in for a second
@@ -1782,8 +1815,10 @@ under the netns runner), and is committable on its own. Docs and
 - Docs: `docs/replication.md`, "Output verification" extended to the
   replica check and the notices. `CHANGELOG.md` **Changed**: a replica
   whose output disagrees with its primary's now stops, and a primary whose
-  output disagrees stops every replica (under a replica-backed ack policy,
-  writes then halt); applications whose `tick` is not idempotent against a
+  output disagrees stops every replica (writes then halt, under every ack
+  policy, as for any loss of the last replica, and `/healthz` names the
+  halt's cause); `ReplicaPresence::lower` takes the departure's cause;
+  applications whose `tick` is not idempotent against a
   time already passed are named as at risk until monotonic sequencer time
   lands (finding 7).
 - **Leaves untested:** a chain break end to end (it needs a drain thread
@@ -1824,9 +1859,14 @@ under the netns runner), and is committable on its own. Docs and
     chain breaks, digests off), the run gauges, the marker's contents, the
     refused restarts;
   - **consequences**: a nondeterministic primary stops every replica (each
-    sees the primary's output disagree) and, under a replica-backed ack
-    policy, the primary then halts writes for want of a replica; under
-    `disk` it keeps serving alone. The primary's log says when every replica
+    sees the primary's output disagree), and the primary then halts writes
+    for want of a replica. That happens under every ack policy, `disk`
+    included, as for any loss of the last replica, and `/healthz` names
+    divergence as the halt's cause. The primary still answers queries.
+    Under a replica-backed policy, its held replies go out degraded after
+    the grace period. Under `disk`, its own fsync confirms them. An
+    operator who trusts the primary can lift the halt with `ACK-POLICY
+    disk`, the existing override. The primary's log says when every replica
     disagreed at the same window, which points at the primary. A
     nondeterministic replica stops alone and the cluster runs on with one
     copy fewer. A diverged primary stops and a replica is promoted. A
@@ -1956,8 +1996,9 @@ Beyond each step's own list:
    comparing at worst stops a replica loudly.
 3. **Should a primary stop when every replica reports the same window?**
    Its output is then the likely fault, but with one replica the question is
-   undecidable, and under a replica-backed policy the primary halts writes
-   anyway once its replicas have stopped. Recommendation: no automatic stop;
+   undecidable, and the primary halts writes anyway once its replicas have
+   stopped, under every ack policy (`halt.rs`, "Lifted by the operator's
+   consent"). Recommendation: no automatic stop;
    the `error!` and the counter page the operator, who can stop it. Revisit
    with replica-to-replica comparison, if ever.
 4. **Clearing the marker.** Deleting the file, or an admin command.
