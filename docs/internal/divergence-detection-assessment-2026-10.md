@@ -44,7 +44,7 @@ closed on `main` (item 1.4).
 | 5 | First rollout: the only fallback from enforcement is `--no-output-digests`, which gives up detection entirely | Operations | Medium-High | Decide now |
 | 6 | The tick trap is wider than finding 7 says: replica restarts and promotions trigger it too, with no clock step back needed | Correctness caveat | Medium-High | Confirms open question 8 (b); adds a test |
 | 7 | The snapshot/restore check is narrower than claimed: one round trip per pipeline start, none at all if `clone_via_snapshot` is overridden | Coverage | Medium | Text and runbook |
-| 8 | Replica-side stop plumbing: the replica's shadow holds only the pipeline's shutdown flag | Implementation risk | Medium | **Yes** (design) |
+| 8 | Replica-side stop plumbing: the replica's shadow holds only the pipeline's shutdown flag | Implementation risk | Medium | Done: decision 11, step 3 |
 | 9 | Replication protocol 9 is another full-cluster-stop upgrade | Operations | Medium | Decide now |
 | 10 | Build-id gating silently stops comparing on mixed-arch and per-host builds, and nothing alertable shows it | Coverage / operations | Medium | Decide now |
 | 11 | Applications that already break the hash-map-order rule (report order following capacity) will now be stopped: the shadow is restored and never prefaulted, and `Sizing` varies by node | Coverage caveat (rollout) | Medium | Document; shadow prefault and test in step 3 |
@@ -57,9 +57,9 @@ closed on `main` (item 1.4).
 | 18 | Idle detection delay is bounded in ticks; unbounded with ticks off | Coverage | Low-Medium | Document |
 | 19 | Chain break under report-less traffic with a stalled drain (open question 11) | Coverage | Low | Defer |
 | 20 | Downgrade ignores the marker | Operations | Low-Medium | Document, plus a convention |
-| 21 | API breaks, the API review's "additive" label, and a name clash in `ArchiveReason` | Operations | Low | **Yes** (the rename); the rest is text |
-| 22 | Comparator complexity, and "cannot compile" claims that are only lints | Complexity | Medium | **Yes** (the comparator calls `trip`); the rest in design review |
-| 23 | Smaller implementation traps (allocating sibling, encode-error logs at `error!`, notice aggregation, the board's shape) | Complexity | Low-Medium | **Yes** (stack buffer, encode-error logging); the rest in the steps |
+| 21 | API breaks, the API review's "additive" label, and a name clash in `ArchiveReason` | Operations | Low | Rename done (`OutputDiverged`); the rest is text |
+| 22 | Comparator complexity, and "cannot compile" claims that are only lints | Complexity | Medium | `trip` done (decisions 6, 11); the rest in design review |
+| 23 | Smaller implementation traps (allocating sibling, encode-error logs at `error!`, notice aggregation, the board's shape) | Complexity | Low-Medium | Stack buffer and encode-error logging done (decisions 4, 8); the rest in the steps |
 | 24 | Room for improvement: majority verdict from notices, staleness metrics, offline qualification | Improvement | — | Some now, some later |
 
 Items 1 to 3, 8 and 16, and the parts of 21, 22 and 23 marked above, should
@@ -912,13 +912,16 @@ In order of value for the cost:
 - 1.4: done. The zeroing and the purity check are on `main`, and the plan
   now moves both into `encode_report_body` so the drain and the shadow
   share them.
-- 5.1: the latch holds the node-level flag; the replica's shadow takes the
-  latch.
+- 5.1: done. The latch holds the node's flag; the replica's shadow takes
+  the latch; the receiver's waiting push checks it (decision 11, step 3).
 - 2.5: done. Decision 4 closes windows on any slot past them.
-- 5.2, 5.4: the comparator calls `trip` itself; stack buffer for the frame;
-  encode-error logging.
-- 3.5: name the new archive reason so it cannot be confused with
-  `Divergent`.
+- 5.2, 5.4: done. The comparator trips through a `Trip` trait before it
+  returns a `Mismatch`, and the exit helper writes a marker nobody wrote
+  (decisions 6, 11). Fixed-size frames, the chain check and rotate
+  included, encode into arrays (decision 8). Encode failures nobody
+  receives are counted and logged at `warn!` (decision 4). The "same
+  window" definition in 5.4 is still open; it goes with 1.2.
+- 3.5: done: `ArchiveReason::OutputDiverged`, tag `output-diverged`.
 
 **Decide now, because they shape steps 2 to 5:** observe mode (3.2), the
 build-id override and the comparing gauge (2.2), protocol negotiation

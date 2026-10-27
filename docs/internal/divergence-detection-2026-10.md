@@ -603,7 +603,33 @@ never pass through `frame_app_response`, and a copy of the zeroing there
 could drift from the original. Early replies call it too, without a
 folder, so a halt's rejection is framed as today and folded nowhere.
 `server-runtime` keeps re-exporting `MAX_RESPONSE_BODY` from where it is
-today. Three call sites, each with one folder:
+today.
+
+**Encode failures are logged by what they cost.** Today an encode error
+is logged at `error!` by both egresses (`response.rs`, `dpdk_response.rs`),
+and only for a reply due to a client. Once every copy encodes every
+report, the same failure would also fire for:
+- reports nobody receives: node events' reports to connection 0, replies
+  to gone clients;
+- the replica's and the shadow's encodes.
+
+An application whose encoder refuses an internal report variant on
+purpose would then fill every node's log with `error!` lines for no fault
+of the server, which breaks the log-level rule. So the split is:
+- **The fold** records the failure silently (`u32::MAX`, as above) and
+  counts it in `melin_output_encode_errors_total{copy="live"|"shadow"}`.
+  The label keeps a primary's two copies from summing to twice the
+  failures.
+- **The folder** logs at `warn!` once per copy at the first failure, then
+  at each doubling of the count, the same rate limit as chain breaks,
+  with the encoder's static reason.
+- **The egress** keeps `error!` for a reply due to a live client, since
+  that is a dropped reply.
+
+`ResponseEncoder::encode_report`'s rustdoc ("the runtime logs at error
+level and drops the response") is updated in step 2 to say both.
+
+Three call sites, each with one folder:
 
 | Copy | Thread | Closes a window when |
 | --- | --- | --- |
@@ -750,8 +776,9 @@ index differently.
 
 ### 6. The comparator: one pure type for both checks
 
-A `DigestComparator` (`transport-core`, no I/O, no threads) holds two
-fixed-capacity arrays of `R` slots, indexed as the board is:
+A `DigestComparator<T: Trip>` (`transport-core`, no I/O, no threads) holds
+the node's stop, `T`, and two fixed-capacity arrays of `R` slots, indexed as
+the board is:
 
 - **local**: `(end, d, C')` for each local window, fed strictly in order
   (`push_local`), `C'` filled once a run is anchored;
@@ -856,20 +883,39 @@ The rules, for both modes:
 Every call returns the verdicts it produced:
 
 - `Match { end }`: advances the run's `verified_through` to `end`, counted;
-- `Mismatch { end, run_from, verified_through, expected, actual }`, each
-  side a `(WindowDigest, ChainValue)` pair: the divergence verdict. The
-  divergence lies in `(verified_through or run_from - 1, end]`, and when
-  the two `d_e` differ, window `end` itself is one that differs. When the
-  anchor's own `d_e` differs, no run exists yet: `run_from` is the window's
-  first position `end - K + 1`, `verified_through` is `None`
-  (`Option<WireSeq>`, so no caller can read an absent run as position 0),
-  and the range is window `end` alone;
+- `Mismatch { divergence, halted }`: the divergence verdict, returned
+  only after the comparator has already called `T::trip(divergence)`.
+  `divergence` is `{ end, run_from, verified_through, expected, actual }`,
+  where each side is a `(WindowDigest, ChainValue)` pair. The divergence
+  lies in `(verified_through or run_from - 1, end]`, and when the two
+  `d_e` differ, window `end` itself is one that differs. When the anchor's
+  own `d_e` differs, no run exists yet: `run_from` is the window's first
+  position `end - K + 1`, `verified_through` is `None` (`Option<WireSeq>`,
+  so no caller can read an absent run as position 0), and the range is
+  window `end` alone. `halted` is the trip's `Option<T::Token>`: `None`
+  when another site tripped first, and then the caller only stops. A
+  caller cannot hold a mismatch the node has not acted on: the replies are
+  halted before the verdict exists, so dropping it changes nothing. After
+  a `Mismatch` the comparator is spent: every later call returns no
+  verdict;
 - `Anchored { end, unverified, reason }`: a run starts, and the windows
   between the previous run's end (or `F`) and the new run's start are
   counted unverified under `reason` (`start`, `new_primary`, `gap` or
   `build`, by the rule above);
 - `Break { after, lapped }`: the run ended at a local gap of `lapped`
   windows.
+
+**Why the comparator trips, and why through a trait.** If the comparator
+only returned the verdict and left the trip to its caller, a call site
+that matched `Mismatch` and ignored it would compile: Rust has no linear
+types, and `#[must_use]` is only a lint. Holding the stop closes that
+gap, since no caller is left to forget the trip. `Trip` is a trait
+(`fn trip(&self, Divergence) -> Option<Self::Token>`), so the comparator
+stays the step-1 building block it is, with no fence, no flag and no
+file in it. Its property tests use a recording implementation, and step 3
+implements `Trip` for `DivergenceLatch` with `Token = Halted`. Generic
+rather than `dyn`, because there is one implementation per build and the
+call is monomorphized.
 
 `verified_from` and `verified_through` (the current run) are exposed for
 `/healthz` and `/metrics`; the newest verified window end of any run is
@@ -892,7 +938,8 @@ published, it picks the newest closed window whose end is at or below
   cold; lapped means no frame this batch.
 
 If the pick is newer than the last it forwarded, it encodes the frame of
-decision 8 and publishes it through `publish_to_replication_rings` with
+decision 8 on the stack, with no `Vec`, and publishes it through
+`publish_to_replication_rings` (which takes `&[u8]`) with
 `end_seq = end`, the `ChainCheck` convention, so `RingChunk::classify`
 sorts it like any control frame during catch-up. Windows that closed
 between two batches are skipped, which the chain makes safe: the next frame
@@ -914,6 +961,17 @@ on its own batch cadence. Nothing in the digest path is behind
 | New frame `MSG_DIVERGED = 0x07`, replica to primary | `DivergedFrame { tag, kind: u8, window_end: U64, verified_through: U64, expected_window: [u8; 16], actual_window: [u8; 16], expected_chain: [u8; 16], actual_chain: [u8; 16] }`, 82 bytes: the replica's notice before it stops (decision 11). `verified_through` 0 means no run yet (the anchor's own window differs): positions start at 1, so 0 is never a window end, and the decoder maps it to `None` |
 | `StreamStart` gains the digest kinds, the build and the pipeline id | `digest_kinds: u8` (bit `k - 1` set: this primary sends digests of kind `k`; 0: none), then `build_id: [u8; 32]` (open question 2), then `pipeline_id: [u8; 16]` (decision 3), appended after `genesis_entries`: 115 bytes, from 66 |
 
+- **Fixed-size frames encode into arrays.** `encode_digest` returns
+  `[u8; DIGEST_FRAME_LEN]`, and `encode_diverged` returns
+  `[u8; DIVERGED_FRAME_LEN]`, with the length prefix included. The length is
+  then part of the type: a test cannot pass with a frame one byte short,
+  and the journal stage's emit cannot allocate. The sibling it mirrors,
+  `maybe_publish_chain_check`, builds a `Vec` per frame (`pipeline.rs`,
+  "Local buffer: the frame is 45 bytes"). `encode_chain_check` and
+  `encode_rotate` move to the same shape in the same step, so there is one
+  pattern for the fixed-size control frames, not two. This is not a copy
+  of a `Vec` pattern left for the next frame to imitate. Their wire bytes
+  are unchanged, pinned by byte-pattern tests (step 4).
 - **The kind byte from the start.** Only `1 = output` is defined; 0 is
   refused as malformed. Each kind fixes its own window length and
   definition, so frames carry no length. A replica skips a frame of a kind
@@ -1027,7 +1085,20 @@ the node:
 
 1. **Halts replies at once.** `DivergenceLatch::trip(divergence)` latches the
    node's `FenceState` with a new stop cause and co-sets the shutdown flag,
-   the way `fence_if_superseded` owns "fenced ⇒ shutting down". The latch
+   the way `fence_if_superseded` owns "fenced ⇒ shutting down". It is the
+   **node's** shutdown flag, the one the replica's receiver and the
+   primary's readers watch, never a pipeline's own. On a replica the
+   shadow runs on `pipeline_shutdown` (`replication/mod.rs`, the shadow
+   spawn), which only the receiver's teardown sets. A latch built from
+   that flag would stop the pipeline's stages while the receiver ran on
+   against a ring nobody drains. So the latch is built once per node,
+   with the node's `FenceState` and shutdown flag, and handed to every
+   pipeline builder. The replica's shadow takes the latch, not a flag, so
+   it cannot pick the wrong one. The receiver's waiting push, the
+   `accept_slot` abort closure that today checks `journal_failed`, also
+   checks the latch. A shadow that trips stops consuming the input ring,
+   so without that check the receiver would wedge in a push on a full ring
+   and never reach the loop top that reads the shutdown flag. The latch
    keeps the first `Divergence` only; a second trip returns `None`. From the
    latch on: the readers close every client (`Verdict::Close`), the
    response loop hands no slot and no early reply to the egress (a per-slot
@@ -1069,9 +1140,14 @@ the node:
    every snapshot is archived. A snapshot at or below it was followed by matching
    output; one above it was not. Each of `<snapshot>` and `<snapshot>.prev`
    whose header's `journal_sequence` is above it moves into
-   `<snapshot dir>/<snapshot name>.diverged.<n>/`, through the archive
-   module's helpers and a new `ArchiveReason::Diverged`; with no verified
-   window, every snapshot moves. The journal is left in place: it is
+   `<snapshot dir>/<snapshot name>.output-diverged.<n>/`, through the
+   archive module's helpers and a new `ArchiveReason::OutputDiverged`
+   (tag `output-diverged`); with no verified window, every snapshot moves.
+   The name is chosen so it can't be confused with the existing
+   `Divergent` (tag `divergent`), which archives a journal that forked
+   from the primary's after a `HashMismatch`: an operator triaging the
+   directory names has to tell a forked journal from a diverged output at
+   a glance. The journal is left in place: it is
    input-only and the chain vouches for it. The marker is rewritten with
    the archive's path.
 6. **Exits with an error.** The node's run returns
@@ -1085,16 +1161,22 @@ the node:
 `Halted` token (private constructor, neither `Clone` nor `Copy`), the
 marker writer consumes it and returns `MarkerWritten`, and the archiver
 consumes that. Nothing can write a marker, or archive, before the latch is
-set, and a new detection site cannot compile without going through `trip`.
-The comparators hand their verdict to `trip` directly, so no thread can
-"log and carry on".
+set. The halt itself does not rest on the caller: the comparator trips
+before it returns a `Mismatch` (decision 6), so a detection site that
+ignored the verdict would still have halted the node's replies and set
+its shutdown flag. Writing the marker does rest on the detecting thread,
+and the types alone cannot force it. A dropped `Halted` token compiles,
+and `#[must_use]` on it is only a lint. So the exit helper is the
+backstop: it writes the marker itself when it finds a divergence with
+nothing deposited.
 
 **Which thread does what.** The steps span threads: detection is on the
 shadow thread (primary or replica) or the replica's receiver thread, while
 the archive must wait until every pipeline thread has been joined. So:
 
-- The **detecting thread** trips the latch, logs, and writes the marker
-  itself, at once, holding the `Halted` token: the marker is cold work of
+- On the **detecting thread**, the comparator trips the latch. The thread
+  then logs and writes the marker itself, at once, with the `Halted`
+  token the `Mismatch` carried: the marker is cold work of
   the kind the shadow already does (it writes snapshots), and writing it
   before any join means a hang in the shutdown leaves the node refusing to
   restart all the same. It then deposits the result, `MarkerWritten` or the
@@ -1105,7 +1187,10 @@ the archive must wait until every pipeline thread has been joined. So:
   every pipeline thread (and, on a replica, the receiver) has been joined,
   whichever way they left. It claims the latch's contents: nothing there is
   an ordinary exit; a divergence with `MarkerWritten` archives and returns
-  `NodeDiverged`; a divergence whose marker write failed archives nothing
+  `NodeDiverged`; a divergence with nothing deposited (a detecting thread
+  that dropped its token, or died before writing) has its marker written
+  here, from the divergence the latch kept, and then goes on as either
+  case below; a divergence whose marker write failed archives nothing
   (the token is absent, so it cannot) and returns `NodeDiverged` carrying
   the I/O error, logged at `error!`, so the operator learns the refusal on
   restart is not guaranteed. The decision is the latch's, not the exit
@@ -1239,6 +1324,8 @@ Logs (levels per the project convention):
 | The primary sends no output digests, or runs another build (open question 2), for this session | `warn!`, once per session | replica |
 | A digest kind unknown to this build (a frame or a `digest_kinds` bit) | `warn!`, once per session | replica |
 | A chain broke: a local window lapped before the comparator copied it (with the number of windows lapped) | `warn!`, first then at each doubling of the count | the comparing thread |
+| A report the encoder refused, folded as a failure (with the encoder's reason and the count) | `warn!`, first then at each doubling of the count, per copy | every folding thread |
+| A reply due to a live client the encoder refused (unchanged) | `error!` | the egress |
 | A session started: the run kept (same primary pipeline id) or re-anchoring (a new primary pipeline, this replica pipeline's first session, the first compared session after an uncompared one, an uncompared session), with both ids' prefixes | `debug!` | replica receiver |
 | A run anchored (with the windows left unverified before it, and their reason) | `debug!` | the comparing thread |
 | Output digests on, window `K` entries | `info!` at pipeline start | every node |
@@ -1259,6 +1346,7 @@ primary, whether its last replica left for divergence, step 5):
 | `melin_output_unverified_windows_total{reason="start"\|"new_primary"\|"gap"\|"build"}` | counter | replica against primary only, so it carries no `against` label: the shadow's run starts at `F` and cannot break, so it never has an unverified window. Windows left out of every run, each counted once, when the next run anchors, under the stretch's cause (`build` over `gap` over `new_primary` over `start`). `start` grows at a replica's start and at a resync of its state, `new_primary` at a primary restart or a promotion; neither is an alert, and a reconnect to the same primary adds to neither. Alert on `gap`. Nothing is counted while a stretch is still open: during a rolling upgrade `build` stays flat while the builds differ and grows only when the pair converges and a run anchors; meanwhile the stall shows as `verified_through` standing still and the once-per-session "another build" `warn!` |
 | `melin_output_chain_breaks_total` | counter | replica against primary only, as above. Runs ended by a lapped local window, live or during a catch-up; a session start never counts here, whatever its id. Alert on any growth |
 | `melin_output_frames_skipped_total{reason="kind"}` | counter | digest frames of a kind this build does not know |
+| `melin_output_encode_errors_total{copy="live"\|"shadow"}` | counter | reports the encoder refused, folded as failures (decision 4). Every copy counts the same failures when they agree, so growth alone is the application's choice or bug, not a divergence |
 | `melin_output_diverged` | gauge | 1 once the node has stopped for divergence (seen in the short window before it exits) |
 | `melin_replica_output_divergence_total` | counter | primary: `Diverged` notices received. Alert on any growth |
 
@@ -1281,7 +1369,8 @@ under the netns runner), and is committable on its own. Docs and
   rule, decision 3's chain), `DigestBoard` (decision 5,
   `DIGEST_BOARD_SLOTS` derived from both ring capacities and `K`),
   `DigestComparator` (decision 6, both modes, with `begin_session`,
-  `SessionKind` and `SessionStart`), and `PrimaryPipelineId` (decision 8,
+  `SessionKind` and `SessionStart`), the `Trip` trait and `Divergence`
+  (decision 6), and `PrimaryPipelineId` (decision 8,
   with a crate-private constructor for step 4's decoder and these
   tests). Each type and constant
   carries the comment justifying its choice (decision 1's reasons for the
@@ -1343,7 +1432,12 @@ under the netns runner), and is committable on its own. Docs and
     and expected entries from two folders fed the same reports, a
     reference folder started earlier than the local one, the reference
     side sampled at random (most windows never sent), and laps forced by a
-    small capacity:
+    small capacity, with a recording `Trip`:
+    - every `Mismatch` follows exactly one `trip` call with the same
+      `Divergence`, made before the verdict was returned. No trip happens
+      without a `Mismatch`. After one, the comparator returns nothing more
+      and trips no more, and a `Trip` that returns `None` (tripped
+      elsewhere first) yields a `Mismatch` with `halted: None`;
     - never a `Mismatch` when the reports agree;
     - a divergence confined to one window inside a run (from the window
       after an anchor, or the anchor's own window when its local `d` is
@@ -1425,6 +1519,12 @@ under the netns runner), and is committable on its own. Docs and
   encoder and folds. Each pipeline builder creates the boards.
 - `ServerConfig::no_output_digests` and `--no-output-digests`, on every
   node: no folder and no board when set (decision 2).
+- Encode failures handled as decision 4 says:
+  - the folder counts them and rate-limits a `warn!`;
+  - both egresses keep `error!`, but only for a reply they were due to
+    send;
+  - `encode_report`'s rustdoc says both;
+  - metric `melin_output_encode_errors_total`.
 - Metrics `melin_output_digests_enabled`, `melin_output_digest_window`; the
   startup logs of decision 16.
 - Tests:
@@ -1444,10 +1544,19 @@ under the netns runner), and is committable on its own. Docs and
     encoder fails on;
   - `response_loop.rs` tests: a reply to an unknown connection is folded
     and not sent; a window whose last entries have no report closes on the
-    idle path once the applied cursor passes it, and not before; the
+    idle path once the applied cursor passes it, and not before; a
+    window closes on a `BatchEnd` slot past its end and on a query slot
+    at its end, with the ring never empty, so the test isolates the
+    any-slot rule (decision 4); the
     applied cursor is loaded before the ring is read (a recording seam
     holding the stage between the two); with digests off, nothing is
     folded and the frames sent are the same bytes;
+  - encode failures, over a recording egress and `logs::capture`: a
+    refused report to connection 0, and one to a gone client, are folded,
+    counted and logged at `warn!` (once, then at the second and fourth),
+    never at `error!`; a refused reply to a live client is also logged at
+    `error!` by the egress; the replica's drain and the shadow count under
+    their `copy` label;
   - the chain-less build: the same agreement test with `hash-chain` off.
     The pre-commit hook and CI only `cargo check` that build, so the step
     adds a test run of these cases (`cargo nextest run -p
@@ -1461,8 +1570,10 @@ under the netns runner), and is committable on its own. Docs and
   report; the replica's drain and the shadow encode), the new flag in
   `docs/replication.md`'s CLI table. `CHANGELOG.md` **Changed**:
   `encode_report` must be deterministic; `ServerConfig` gains the public
-  field `no_output_digests` (breaking for a struct literal). **Added**: the
-  `--no-output-digests` flag.
+  field `no_output_digests` (breaking for a struct literal); a report the
+  encoder refuses that no client was due is now logged at `warn!` and
+  counted, rather than never encoded. **Added**: the
+  `--no-output-digests` flag, `melin_output_encode_errors_total`.
 - **Leaves untested:** the cost, which is step 6's measurement, not a test;
   any comparison, which steps 3 and 5 add.
 
@@ -1472,7 +1583,7 @@ under the netns runner), and is committable on its own. Docs and
   cause wins; `is_fenced` unchanged for its readers; the cause in
   `/healthz` and in the raft stand-down's log line.
 - `DivergenceLatch`, `trip`, the `Halted` / `MarkerWritten` tokens, the
-  marker (`NodeStore::divergence_marker`), `ArchiveReason::Diverged` and the
+  marker (`NodeStore::divergence_marker`), `ArchiveReason::OutputDiverged` and the
   snapshot archival, the `NodeDiverged` error through the one exit helper
   (decision 11). `melin_journal::error::hex_prefix` widened to `&[u8]`
   for the divergence log line, rather than a second formatter beside it;
@@ -1480,6 +1591,12 @@ under the netns runner), and is committable on its own. Docs and
   coerces, so no caller changes.
 - The response loop's per-slot latch check, before the send and before an
   early reply's release; the shadow's check before each save.
+- The latch built once per node from the node's `FenceState` and shutdown
+  flag, and passed to every pipeline builder. The replica's shadow takes
+  the latch in place of `pipeline_shutdown` for its trip, and keeps the
+  pipeline flag only to exit at teardown. The receiver's `accept_slot`
+  abort closure checks the latch beside `journal_failed`, and leaves
+  through `SessionExit::Shutdown`.
 - The shadow's comparator (`shared_start`) against the live board on every
   node with a shadow (decision 10).
 - `NodeStore::refuse_if_diverged`, `NodeStoreError::Diverged` and the
@@ -1496,9 +1613,10 @@ under the netns runner), and is committable on its own. Docs and
     is observed";
   - `DivergenceLatch`: the first trip wins; it fences and sets shutdown
     before returning the token; the exit helper's claim, for each of its
-    three cases (nothing, marker written, marker failed), including a
-    divergence deposited by another thread while the caller left through
-    ordinary shutdown;
+    four cases (nothing, marker written, marker failed, a divergence with
+    nothing deposited, whose token was dropped: the helper writes the
+    marker and archives), including a divergence deposited by another
+    thread while the caller left through ordinary shutdown;
   - marker: written durably (temporary file, rename), parsed back, every
     field present, each value in full canonical hex, the range, the
     "window differs itself" flag and the archive threshold (on a replica,
@@ -1507,8 +1625,8 @@ under the netns runner), and is committable on its own. Docs and
     window); an unparseable marker still refuses;
   - `hex_prefix`: the same prefix for a 16-byte value as for a 32-byte
     hash sharing its first bytes, so the chain's log lines are unchanged;
-  - archival: snapshots above the marker's archive threshold move, those at
-    or below stay, `.prev` handled the same way, a second run moves
+  - archival: snapshots above the marker's archive threshold move, into a
+    directory tagged `output-diverged`, those at or below stay, `.prev` handled the same way, a second run moves
     nothing, and the journal is untouched; with no verified window, every
     snapshot moves;
   - `node_store.rs`: `refuse_if_diverged` refuses with the marker present,
@@ -1544,7 +1662,18 @@ under the netns runner), and is committable on its own. Docs and
   - integration, same file, a replica's shadow trips (the lossy-restore app
     on the replica only): its receiver leaves through ordinary shutdown,
     and its run still returns `NodeDiverged` with the marker written and
-    the archive done (decision 11, "Which thread does what");
+    the archive done (decision 11, "Which thread does what"). The primary
+    keeps streaming under load, so the trip lands with the replica's input
+    ring full behind the stopped shadow, and the run must return within a
+    bound, which pins the latch check in the waiting push;
+  - `receiver_transport.rs`, the waiting push: a scripted transport, an
+    input ring with no consumer so it fills, and the latch tripped from
+    another thread while a push waits. The session ends in
+    `SessionExit::Shutdown` and publishes nothing more;
+  - `DivergenceLatch`: a trip sets the flag the latch was built with,
+    and the replica builder passes the node's flag, not
+    `pipeline_shutdown`. The builder test asserts that the shadow's latch
+    holds the same `Arc` as the receiver's shutdown flag (`Arc::ptr_eq`);
   - integration beside `raft_failover.rs`: three nodes, the primary (raft
     leader) carrying the lossy-restore app via its `Sizing` (the one input
     a test may vary per node), the primary stops, a replica is elected and
@@ -1556,7 +1685,7 @@ under the netns runner), and is committable on its own. Docs and
   disagrees with its live copy now stops and refuses to restart until its
   marker is cleared (new, always-on behaviour, named first);
   `NodeStoreError::Diverged` (re-exported from `melin-transport-core`) and
-  `ArchiveReason::Diverged` are new variants of public exhaustive enums, so
+  `ArchiveReason::OutputDiverged` are new variants of public exhaustive enums, so
   a consumer's `match` stops compiling until it handles them; the node
   entries resolve through `startup_store()`. **Added**: the `NodeDiverged`
   error a node's run returns, `NodeStore::refuse_if_diverged`.
@@ -1568,7 +1697,12 @@ under the netns runner), and is committable on its own. Docs and
 ### Step 4. Replication protocol 9
 
 - `replication/protocol.rs`: `MSG_DIGEST` and `MSG_DIVERGED` with
-  encoders, decoders and size assertions; `StreamStart`'s
+  encoders returning fixed-size arrays (decision 8), decoders and size
+  assertions; `encode_chain_check` and `encode_rotate` move to the same
+  shape. The journal stage then publishes them from the stack. The
+  catch-up's `send_buf` (`catchup.rs`), which batches a rotate with data,
+  extends from the array, and the receiver tests take the array where
+  they built a `Vec`; `StreamStart`'s
   `digest_kinds`, build id and pipeline id (`StreamStartFrame` to 115
   bytes); the version bump with its history line.
 - The pipeline id (decision 3): `output_digest::PipelineId`, its
@@ -1593,7 +1727,12 @@ under the netns runner), and is committable on its own. Docs and
   step 5. The primary decodes `Diverged` and logs it (decision 16),
   though no replica sends one yet.
 - Tests: round trips; wire byte patterns beside `ack_wire_byte_pattern` and
-  `rotate_wire_byte_pattern`; a v8 handshake refused with the version error
+  `rotate_wire_byte_pattern` (`server-runtime/src/replication/mod.rs`),
+  and a new `chain_check_wire_byte_pattern` beside them. Today the chain
+  check has only a round trip, which a change on both sides would pass, so
+  this test is written and passing against the `Vec` encoder before the
+  move. The two pattern tests then pin the moved encoders to the same
+  bytes; a v8 handshake refused with the version error
   in both directions (the existing
   `a_handshake_from_another_protocol_version_is_refused` covers it once the
   constant moves; one case added for a v9 replica at a scripted v8
