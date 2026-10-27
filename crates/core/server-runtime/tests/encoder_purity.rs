@@ -52,6 +52,10 @@ const REPORT_WITHIN: Duration = Duration::from_secs(2);
 /// byte [`SKIPPED`] unwritten, as an encoder with a reserved or padding
 /// field might: a query response fills its whole body with `0xFF`; a
 /// report writes its kind at byte 0 and `0x11` from byte 2 on.
+///
+/// A deliberate twin of the `SkippingEncoder` in `response_frame.rs`'s unit
+/// tests: an integration test cannot reach that private test module, and
+/// this one must encode the counter's report and query types to run a node.
 struct SkippingEncoder;
 
 impl ResponseEncoder for SkippingEncoder {

@@ -43,9 +43,11 @@
 ///
 /// The runtime zeroes the body region before every encode, so in a
 /// release build a byte the encoder skips goes out as zero, never as a
-/// byte of an earlier response. Debug builds check both rules: each body
-/// is encoded twice more first, over two different fill patterns, and a
-/// difference below the returned length, or in the result, panics.
+/// byte of an earlier response. A debug build of the runtime checks both
+/// rules on every response a node encodes: each body is encoded twice
+/// more first, over two different fill patterns, and a difference below
+/// the returned length, or in the result, panics. A call to the encoder
+/// outside a node, as in a unit test of the encoder alone, is not checked.
 pub trait ResponseEncoder: Send + Sync {
     /// Per-event fan-out report type. Must match
     /// [`crate::Application::Report`] at the call site.
