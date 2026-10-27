@@ -922,13 +922,32 @@ call is monomorphized.
 published beside them, so the marker writer on whichever thread detects
 reads every comparison's value for the archive threshold (decision 11).
 
-### 7. The primary emits from the journal stage, beside `ChainCheck`
+### 7. The primary emits from the journal stage, in the batch's ring slot
 
-`maybe_publish_output_digest`, called right after `maybe_publish_chain_check`
-at the sync point, does nothing without replication producers or with
-digests off. Otherwise, with `end` the last sequence the batch just
-published, it picks the newest closed window whose end is at or below
-`end`:
+The digest frame rides in the ring slot of the batch it follows; it takes
+no slot of its own. A replication ring slot is a `CHUNK_SIZE` byte buffer,
+not a frame (`journal/src/replication.rs`): `try_publish` copies any byte
+count up to it and records only its length and `end_sequence`. Frames are
+length-prefixed. Both senders forward a slot's bytes verbatim
+(`tcp_sender.rs`, `dpdk.rs`, `extend_from_slice(batch.data())`, with
+byte-based budgets only). The receiver extracts frame by frame
+(`process_streaming_frames`), so an `InputBatch` frame followed by a
+digest frame in one slot reads exactly as two slots would.
+
+A slot of its own, as `ChainCheck` takes, would cost a ring slot for
+nearly every batch under load (one window closes per `K` entries, and
+batches are wider than that). That roughly halves the time a replica can
+stall before the full ring evicts it, on a ring that already evicts at
+full rate (`roadmap.md`, "A replica that falls behind at full rate
+cannot rejoin"). Rate-limiting separate frames would cut the cost without
+removing it. Sharing the slot costs `DIGEST_FRAME_LEN` bytes per batch
+instead: 46, the 42-byte frame of decision 8 and its length prefix.
+
+`output_digest_trailer`, called inside `publish_input_batch_to_rings`
+just before the publish, returns `None` without replication producers or
+with digests off. Otherwise, with `end` the last sequence of the batch
+being published, it picks the newest closed window whose end is at or
+below `end`:
 
 - if the board's `latest()` is at or below `end`, that entry (the response
   stage trails the journal stage, which under any ack policy is the usual
@@ -938,19 +957,67 @@ published, it picks the newest closed window whose end is at or below
   cold; lapped means no frame this batch.
 
 If the pick is newer than the last it forwarded, it encodes the frame of
-decision 8 on the stack, with no `Vec`, and publishes it through
-`publish_to_replication_rings` (which takes `&[u8]`) with
-`end_seq = end`, the `ChainCheck` convention, so `RingChunk::classify`
-sorts it like any control frame during catch-up. Windows that closed
-between two batches are skipped, which the chain makes safe: the next frame
-carries a chain value covering them. An idle primary still journals ticks,
-so batches keep coming. A ring too full to take the frame evicts the
-replica exactly as for a `ChainCheck`.
+decision 8 on the stack, as a `[u8; DIGEST_FRAME_LEN]`.
+`publish_input_batch_to_rings` then appends it to the batch buffer
+**after** `finalize_input_batch`, which back-fills the `InputBatch`
+length from the buffer's length, so a trailer appended before it would be
+swallowed into the batch. The buffer is published as one slot with the
+batch's `end_seq`. The rest follows from the layout:
 
-**Independent of the journal chain.** A sibling of
-`maybe_publish_chain_check`, not code inside it: the chain check returns
-early when `encoder.chain_hash()` is `None` (the chain-less build) and runs
-on its own batch cadence. Nothing in the digest path is behind
+- **One change point.** Every batch publish goes through
+  `publish_input_batch_to_rings`: the sync point in `submit_batch` (which
+  `drain_remaining` also reaches) and the flush before a rotation in
+  `maybe_rotate`. It is a free function over `&mut ReplicationState`, to
+  avoid borrowing `self`, so the board's read handle and the last-forwarded
+  end live in `ReplicationState`. The trailer is typed:
+  `publish_input_batch_to_rings(repl, end_seq, trailer: Option<&[u8;
+  DIGEST_FRAME_LEN]>)`.
+- **Order by construction.** The digest's window ends at or below the
+  slot's last entry, and the slot's bytes put it after every one of those
+  entries. The receiver's rule that a digest ahead of the stream position
+  is a `SequenceGap` (decision 9) therefore cannot fire on a healthy
+  stream. That holds even on a handoff's partly duplicated chunk, since
+  the receiver's position after the batch is at least its end.
+- **The board is read slightly earlier than a post-publish call would
+  read it.** `submit_batch` publishes the batch at its top, before the
+  disk slot is claimed, and returns on submission, not durability. The
+  read therefore moves only from after that claim to before it, with the
+  same `end`. The pick rule is unchanged; the board is at worst a moment
+  staler, and the next batch picks up any window that closed meanwhile.
+- **Catch-up.** `RingChunk::classify` peeks only the first frame's tag, so
+  a slot with a trailer is a data batch: `Covered` drops it whole, the
+  digest included (a dropped digest costs delay, never coverage: the next
+  one's chain value covers its windows), and `Next` and `Ahead` forward
+  it whole. Journal-file catch-up carries no digests, as before (decision
+  9 anchors on the first frame).
+- **A batch with no entries carries nothing.** Query-only batches publish
+  no slot (`publish_input_batch_to_rings` returns early). The next batch
+  with entries carries the newest window. An idle primary still journals
+  ticks, which take positions, so batches keep coming.
+- **Eviction is unchanged.** A ring too full for the slot evicts the
+  replica exactly as for the batch alone. The trailer adds no publish.
+
+`ChainCheck` keeps its own slot: one every 64 batches is noise beside the
+batch slots, and moving it is not this plan's change.
+
+**The slot's bytes are reserved, not found.** `max_journal_batch` divides
+the chunk by the full `entry_size`, while a wire slot is `entry_size - 2`
+(the magic stripped). Today that leaves at least several hundred bytes
+free in a full chunk, but only as a by-product of a bound its comment
+calls deliberately conservative. The plan does not rely on it. The
+replication chunk's share of `max_journal_batch` becomes
+`(replication::CHUNK_SIZE - FRAME_HEADER_LEN - DIGEST_FRAME_LEN) /
+entry_size`; the journal write ring's share is unchanged. A `const`
+assertion beside `Sequencer::MAX_BATCH` checks `FRAME_HEADER_LEN +
+n·(entry_size - 2) + DIGEST_FRAME_LEN <= replication::CHUNK_SIZE` for
+the batch bound `n`. `MAX_DATA_FRAME` bounds one frame, not a slot, so it
+is unaffected. The ring's module doc gains the slot's layout: an
+`InputBatch` frame, optionally followed by one digest frame.
+
+**Independent of the journal chain.** Not code inside
+`maybe_publish_chain_check`, which returns early when
+`encoder.chain_hash()` is `None` (the chain-less build) and runs on its
+own batch cadence. Nothing in the digest path is behind
 `cfg(feature = "hash-chain")`.
 
 ### 8. Wire: replication protocol 9
@@ -965,8 +1032,8 @@ on its own batch cadence. Nothing in the digest path is behind
   `[u8; DIGEST_FRAME_LEN]`, and `encode_diverged` returns
   `[u8; DIVERGED_FRAME_LEN]`, with the length prefix included. The length is
   then part of the type: a test cannot pass with a frame one byte short,
-  and the journal stage's emit cannot allocate. The sibling it mirrors,
-  `maybe_publish_chain_check`, builds a `Vec` per frame (`pipeline.rs`,
+  and the journal stage's emit cannot allocate. `maybe_publish_chain_check`
+  builds a `Vec` per frame (`pipeline.rs`,
   "Local buffer: the frame is 45 bytes"). `encode_chain_check` and
   `encode_rotate` move to the same shape in the same step, so there is one
   pattern for the fixed-size control frames, not two. This is not a copy
@@ -1287,7 +1354,7 @@ the only raft-side line that changes.
 | Primary response stage | encode (already paid for delivered replies; new for node events' and gone clients'), one XXH3 update, after the send | one `Relaxed` latch load per slot; on the idle path one `Acquire` load | finalize, one chain hash, one seqlock store |
 | Replica drain thread | encode, one XXH3 update (both new) | one `Acquire` load when the ring is empty | finalize, one chain hash, one seqlock store |
 | Shadow | encode, one XXH3 update (both new) | one board `latest()` read | finalize, one chain hash, comparator update |
-| Journal stage (primary with replicas) | nothing | one latest-window load, at most one division and one board read | at most one 42-byte frame encode and ring publish per batch |
+| Journal stage (primary with replicas) | nothing | one latest-window load, at most one division and one board read | at most one 42-byte frame encode per batch, appended to the batch's slot: 46 more bytes copied, no extra publish |
 | Replica receiver | nothing | one `Acquire` load per iteration (and per pass of a waiting push) | one board read, one chain hash, comparator update; per frame, decode and comparator update |
 
 Nothing allocates after construction. The measurement step (step 6) first
@@ -1759,7 +1826,25 @@ under the netns runner), and is committable on its own. Docs and
 
 ### Step 5. The primary streams digests; replicas compare and stop
 
-- Journal stage: `maybe_publish_output_digest` (decision 7).
+- Journal stage (decision 7):
+  - `output_digest_trailer`;
+  - `publish_input_batch_to_rings` taking the typed trailer and
+    appending it after `finalize_input_batch`;
+  - the board handle and the last-forwarded end in `ReplicationState`;
+  - `max_journal_batch` reserving `DIGEST_FRAME_LEN`, with its `const`
+    assertion;
+  - the ring's module doc stating the slot's layout.
+- `replication_wire.rs`: `chunk_frames(&[u8])`, an iterator over the
+  length-prefixed frames of one ring slot. The test helpers that decode a
+  slot as a single `InputBatch` move onto it:
+  - `handoff.rs`'s `decode`;
+  - `catchup.rs`'s and `join_worker.rs`'s slot decoders;
+  - `pipeline_tests.rs`'s ring readers.
+
+  `try_decode_input_batch_into` reads its declared count of entries and
+  never looks at trailing bytes. A helper that decodes one batch per slot
+  would therefore pass while silently dropping the digest, rather than
+  fail.
 - Receiver: decode, contiguity, the comparator (`anchored`) against the
   live board read at each iteration and in the waiting push,
   `begin_session` at each session start with its `debug!` line, the
@@ -1792,14 +1877,34 @@ under the netns runner), and is committable on its own. Docs and
   `frames_skipped_total`, `melin_replica_output_divergence_total`.
 - Tests:
   - `pipeline_tests.rs`: `primary_emits_output_digest_after_its_position`,
-    modelled on `primary_emits_chain_check_every_interval`: every digest
-    frame in the ring names a window ending at or below its chunk's
-    `end_seq`, none precedes the batch holding its end, frames are in
-    increasing window order and carry the live board's `d` and `C` for
-    their window, with the response stage lagging the journal stage and
-    with a window closed by the applied cursor ahead of it (the `get` arm,
-    and a lapped `get` that sends nothing); and the same with `hash-chain`
-    off, where digests are emitted and no `ChainCheck` is (a
+    modelled on `primary_emits_chain_check_every_interval`, reading each
+    slot through `chunk_frames`:
+    - a digest frame only ever follows the `InputBatch` frame in that
+      batch's slot, never alone and never first;
+    - it names a window ending at or below the slot's `end_seq`;
+    - frames are in increasing window order and carry the live board's
+      `d` and `C` for their window;
+    - the digests take no slot: the ring holds exactly one slot per batch
+      published, plus the chain checks;
+    - the same holds through the rotation flush in `maybe_rotate`;
+    - a window that closes during a query-only batch (which publishes
+      nothing) goes out in the next batch's slot.
+
+    These run with the response stage lagging the journal stage, and with
+    a window closed by the applied cursor ahead of it (the `get` arm, and
+    a lapped `get` that sends nothing).
+  - `max_journal_batch`: a batch of the bound's full width, for an
+    application at `MAX_ENTRY_SIZE` and for one at the smallest entry,
+    plus its trailer, fits `replication::CHUNK_SIZE`. The `const`
+    assertion pins it at compile time; the test pins the arithmetic the
+    assertion relies on;
+  - `catchup.rs` and `handoff.rs`: a slot with a trailer is classified by
+    its batch. `Covered` drops it whole, and `Next` (with an overlap the
+    receiver trims) and `Ahead` forward the trailer with it. A scripted
+    receiver after a `Next` overlap takes the digest with no
+    `SequenceGap`;
+  - `primary_emits_output_digest_after_its_position` again with
+    `hash-chain` off, where digests are emitted and no `ChainCheck` is (a
     `cargo nextest run -p melin-transport-core --no-default-features` run,
     filtered to it, added to the chain-off loop beside step 2's: this test
     needs only the journal stage, which is in that crate);
@@ -1983,6 +2088,9 @@ under the netns runner), and is committable on its own. Docs and
   per-window cost included, in a dated document naming its hardware. If
   the response stage's tail moves, open questions 1 and 5 decide; if the
   per-window cost is above decision 2's estimate, open question 9 does.
+  The run also reports replication ring slots per published batch (one,
+  digests on or off, decision 7) and replica evictions, both with digests
+  on and off.
 - `docs/replication.md`, "Output verification", completed for operators,
   with no implementation detail:
   - **the guarantee** in the words of "The guarantee, and its limits"

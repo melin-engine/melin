@@ -37,7 +37,7 @@ closed on `main` (item 1.4).
 
 | # | Item | Group | Severity | Before implementation? |
 | --- | --- | --- | --- | --- |
-| 1 | Digest frames take a replication-ring slot each, up to one per fsync batch. That can halve the headroom before a replica is evicted | Performance | High | **Yes** |
+| 1 | Digest frames take a replication-ring slot each, up to one per fsync batch. That can halve the headroom before a replica is evicted | Performance | High | Done: the digest shares the batch's slot (decision 7) |
 | 2 | "Under `disk` the primary keeps serving alone" is wrong: the halt applies under every policy | Correctness of the guarantee text | High | Done: plan text corrected, halt cause added to step 5 |
 | 3 | When the primary is at fault, the plan stops the healthy copies, archives their good snapshots and tells the operator to reseed them from the faulty primary | Correctness / operations | High | **Yes** |
 | 4 | Stale bytes in the shared encode buffer: resolved on `main`. What remains is keeping the zeroing and the purity check on the drain's and the shadow's encodes | Correctness | Low (residual) | Done: now in the plan's decision 4 |
@@ -702,6 +702,28 @@ cleanly, otherwise (a) with `N` chosen so the added delay stays within one
 slots per batch" and "evictions" to step 6's measurement. Do not make this
 plan wait on (c).
 
+**Done: (b), with the frame at the back of the slot, not the front.**
+`RingChunk::classify` reads the first frame's tag, so a digest placed
+first would turn a data slot into a control slot. Placed after the
+`InputBatch` frame, it is classified with its batch, and it follows the
+entries it covers by the slot's own layout. Both senders forward slot
+bytes verbatim, and the receiver extracts frame by frame. A review against
+the code confirmed both and added four points, all now in decision 7 and
+step 5:
+- the room is reserved in `max_journal_batch` with a `const` assertion,
+  rather than taken from the slack its full-`entry_size` divisor happens
+  to leave;
+- the trailer is appended after `finalize_input_batch`, which takes the
+  batch length from the buffer, inside `publish_input_batch_to_rings`,
+  which both publish sites go through;
+- the board is read just before the publish, which moves it only slightly
+  earlier and changes nothing that matters;
+- the test helpers that decode a slot as one batch move onto a frame
+  iterator, because the batch decoder ignores trailing bytes and would
+  drop the digest silently.
+
+Step 6 measures ring slots per batch and evictions.
+
 ### 4.2 The fold on the primary's response thread (item 14)
 
 **Shortfall.** Decision 4 folds "after the send so that the hash is not on
@@ -902,8 +924,8 @@ In order of value for the cost:
 
 **Change the plan before step 1:**
 
-- 4.1: emit digests without a ring slot each (piggyback or rate-limit),
-  and measure ring occupancy in step 6.
+- 4.1: done. The digest frame trails the batch in its slot (decision 7),
+  and step 6 measures ring occupancy.
 - 1.1: done. The plan's text now says the halt applies under every
   policy, and step 5 adds the halt's cause to `/healthz`.
 - 1.2: refusal message and runbook branch on who is at fault; restore
@@ -942,8 +964,7 @@ test added.
 
 ## Decisions for the user
 
-1. **Ring slots (4.1):** piggyback digest frames on data batches, or
-   rate-limit them?
+1. **Ring slots (4.1):** decided: the digest shares the batch's slot.
 2. **Faulty primary (1.2):** widen the plan's scope (it excludes majority
    verdicts) to add the partial two-against-one verdict from notices in
    step 5, and should a primary found at fault by it trip its own latch?
