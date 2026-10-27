@@ -40,11 +40,31 @@ pub(crate) type EncodeBuf = [u8; MAX_APP_FRAME];
 /// Returns the frame's length, header included.
 ///
 /// Every application response is framed here, whichever path sends it,
-/// so the zeroing covers them all and no caller can forget it.
+/// so the zeroing and, in debug builds, the purity check cover them all
+/// and no caller can forget them.
 ///
 /// A length past the body region is this server's bug and comes back as
 /// `Err` — the caller logs it and drops the response, rather than send a
 /// frame that would desync the client's framing.
+///
+/// # Panics
+///
+/// In debug builds only, if `encode` is impure: see
+/// [`check_encoder_purity`].
+#[inline]
+pub(crate) fn frame_app_response(
+    buf: &mut EncodeBuf,
+    encode: impl Fn(&mut [u8]) -> Result<usize, &'static str>,
+) -> Result<usize, &'static str> {
+    // Triples the encoder calls, in debug builds only; release builds pay
+    // nothing for it.
+    #[cfg(debug_assertions)]
+    check_encoder_purity(buf, &encode);
+    frame_zeroed(buf, encode)
+}
+
+/// [`frame_app_response`] without the purity check: the zeroing, the
+/// encode and the header, which is everything a release build does.
 ///
 /// Writes the same header as the wire protocol's `seal_request` but does
 /// not call it: the body cap here is `MAX_RESPONSE_BODY`, not the request
@@ -52,11 +72,11 @@ pub(crate) type EncodeBuf = [u8; MAX_APP_FRAME];
 /// `EncodeBuf`'s fixed size already bounds the frame, so the extra frame
 /// limit check would be a wasted branch on the response hot path.
 #[inline]
-pub(crate) fn frame_app_response(
+fn frame_zeroed(
     buf: &mut EncodeBuf,
     encode: impl FnOnce(&mut [u8]) -> Result<usize, &'static str>,
 ) -> Result<usize, &'static str> {
-    // The runtime cannot tell whether an encoder wrote every byte
+    // A release build cannot tell whether an encoder wrote every byte
     // below the length it returns, and an encoder may use the bytes past
     // it as scratch. The buffer is reused for every response, so a byte
     // it skips would otherwise carry an earlier body, possibly another
@@ -75,6 +95,67 @@ pub(crate) fn frame_app_response(
     buf[..4].copy_from_slice(&payload_len.to_le_bytes());
     buf[4] = TAG_APP;
     Ok(HEADER_LEN + len)
+}
+
+/// What [`check_encoder_purity`]'s panic message starts with.
+#[cfg(debug_assertions)]
+const IMPURE_ENCODER: &str = "impure response encoder";
+
+/// The two patterns [`check_encoder_purity`] fills the body region with
+/// before its two encodes: different at every bit, so a byte an encoder
+/// skips differs between the two whatever its position.
+#[cfg(debug_assertions)]
+const POISON: [u8; 2] = [0xA5, 0x5A];
+
+/// Debug builds' check that `encode` is pure: encode twice, the body
+/// region filled with a different [`POISON`] pattern each time, and panic
+/// unless both return the same `Ok` length with the same bytes below it,
+/// or the same `Err`. That catches an encoder that skips a byte below the
+/// length it returns (it shows the poison) and one whose output depends
+/// on something other than its input, such as its own state.
+///
+/// A panic, not an error: an impure encoder is a bug in the application.
+/// In production the zeroing makes a skipped byte harmless, but not a
+/// body that depends on the encoder's state: copies of one response
+/// then differ from node to node, which a digest of the responses
+/// (planned, to detect diverging nodes) would turn into a stopped node.
+/// And the skipped byte is still a bug, in a field the application meant
+/// to write. Panicking in the tests that encode it finds the bug where it
+/// is cheap to fix. Bytes past the returned length are not compared: an
+/// encoder may use them as scratch.
+#[cfg(debug_assertions)]
+fn check_encoder_purity(
+    buf: &mut EncodeBuf,
+    encode: &impl Fn(&mut [u8]) -> Result<usize, &'static str>,
+) {
+    const CONTRACT: &str = "an encoder must write every byte below the length it returns, \
+                            and its output must depend only on the value it encodes";
+    let body = &mut buf[HEADER_LEN..];
+    body.fill(POISON[0]);
+    let first = encode(body);
+    // An array, not a `Vec`: one body, its size fixed, no allocation.
+    let mut first_body = [0u8; MAX_RESPONSE_BODY];
+    first_body.copy_from_slice(body);
+    body.fill(POISON[1]);
+    let second = encode(body);
+    if first != second {
+        panic!(
+            "{IMPURE_ENCODER}: two encodes of one value returned {first:?}, then {second:?}; \
+             {CONTRACT}"
+        );
+    }
+    // A length past the region is refused by the caller; compare what
+    // lies within it.
+    let Ok(len) = first.map(|len| len.min(MAX_RESPONSE_BODY)) else {
+        return;
+    };
+    if let Some(at) = (0..len).find(|&i| first_body[i] != body[i]) {
+        panic!(
+            "{IMPURE_ENCODER}: body byte {at} of {len} differs between two encodes of one \
+             value ({:#04x} over {:#04x}, then {:#04x} over {:#04x}); {CONTRACT}",
+            first_body[at], POISON[0], body[at], POISON[1],
+        );
+    }
 }
 
 /// Encode one output slot's payload frame into `buf`.
@@ -322,7 +403,7 @@ mod tests {
     }
 
     fn frame(
-        encode: impl FnOnce(&mut [u8]) -> Result<usize, &'static str>,
+        encode: impl Fn(&mut [u8]) -> Result<usize, &'static str>,
     ) -> (Result<usize, &'static str>, EncodeBuf) {
         let mut buf = [0u8; MAX_APP_FRAME];
         let result = frame_app_response(&mut buf, encode);
@@ -365,6 +446,7 @@ mod tests {
     fn the_encoder_is_given_the_whole_body_bound() {
         let (n, _) = frame(|body| {
             assert_eq!(body.len(), MAX_RESPONSE_BODY);
+            body.fill(1);
             Ok(MAX_RESPONSE_BODY)
         });
         assert_eq!(n, Ok(MAX_APP_FRAME));
@@ -372,7 +454,10 @@ mod tests {
 
     #[test]
     fn a_length_past_the_body_is_refused() {
-        let (n, _) = frame(|_| Ok(MAX_RESPONSE_BODY + 1));
+        let (n, _) = frame(|body| {
+            body.fill(1);
+            Ok(MAX_RESPONSE_BODY + 1)
+        });
         assert!(n.is_err());
     }
 
@@ -417,15 +502,20 @@ mod tests {
         frame
     }
 
+    // The zeroing test below frames through `frame_zeroed`, which skips
+    // the purity check: its encoder is impure by design, so through
+    // `frame_app_response` a debug build panics before the zeroing is
+    // seen. That keeps the release guarantee tested in every build.
+
     /// The previous body was another response, possibly to another
     /// client: none of it may reach this one through a byte the encoder
     /// skipped.
     #[test]
     fn a_body_byte_the_encoder_skips_is_zero_not_the_previous_bodys() {
         let mut buf = [0u8; MAX_APP_FRAME];
-        let query = frame_app_response(&mut buf, |body| SkippingEncoder.encode_query(&0, body));
+        let query = frame_zeroed(&mut buf, |body| SkippingEncoder.encode_query(&0, body));
         assert_eq!(query, Ok(HEADER_LEN + SKIPPING_LEN));
-        let report = frame_app_response(&mut buf, |body| SkippingEncoder.encode_report(&7, body));
+        let report = frame_zeroed(&mut buf, |body| SkippingEncoder.encode_report(&7, body));
         assert_eq!(report, Ok(HEADER_LEN + SKIPPING_LEN));
         assert_eq!(
             &buf[..HEADER_LEN + SKIPPING_LEN],
@@ -436,7 +526,8 @@ mod tests {
 
     /// The early-reply path zeroes too: a short early rejection encoded
     /// where a widest one was leaves the rest of the application frame's
-    /// region zero, not the previous body's.
+    /// region zero, not the previous body's. Both encoders are pure, so
+    /// this goes through `encode_early_reply` itself in every build.
     #[test]
     fn an_early_rejection_carries_no_byte_of_the_previous_early_reply() {
         let mut buf = [0u8; MAX_EARLY_REPLY];
@@ -456,6 +547,129 @@ mod tests {
             buf[n..MAX_APP_FRAME].iter().all(|&b| b == 0),
             "the region past the reply carries the previous body's bytes"
         );
+    }
+
+    /// Whatever the purity check does to the region, what is sent is
+    /// what a release build sends: the body over zeroes, not over poison.
+    #[test]
+    fn a_frame_is_the_same_in_debug_and_release_builds() {
+        let mut checked = [0u8; MAX_APP_FRAME];
+        let mut zeroed = [0u8; MAX_APP_FRAME];
+        // Writes less than it returns, but the same bytes every time: pure.
+        let encode = |body: &mut [u8]| {
+            body[0] = 7;
+            Ok(1)
+        };
+        assert_eq!(frame_app_response(&mut checked, encode), Ok(6));
+        assert_eq!(frame_zeroed(&mut zeroed, encode), Ok(6));
+        assert_eq!(checked, zeroed, "the whole buffer, body region included");
+        assert!(
+            checked[6..].iter().all(|&b| b == 0),
+            "no poison left behind"
+        );
+    }
+
+    /// Writes a call count into its one-byte body: output that depends on
+    /// the encoder's state, not on the value it encodes.
+    #[cfg(debug_assertions)]
+    #[derive(Default)]
+    struct CountingEncoder {
+        // An atomic, not a `Cell`: a `ResponseEncoder` is `Sync`.
+        calls: std::sync::atomic::AtomicU8,
+    }
+
+    #[cfg(debug_assertions)]
+    impl ResponseEncoder for CountingEncoder {
+        type Report = u8;
+        type Query = u16;
+        fn encode_report(&self, _: &u8, buf: &mut [u8]) -> Result<usize, &'static str> {
+            buf[0] = self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(1)
+        }
+        fn encode_query(&self, _: &u16, _: &mut [u8]) -> Result<usize, &'static str> {
+            Ok(0)
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "impure response encoder: body byte 1 of 16 differs")]
+    fn a_skipped_body_byte_fails_the_purity_check() {
+        let mut buf = [0u8; MAX_APP_FRAME];
+        // Dropped result: the call panics before it returns one.
+        let _ = encode_slot_payload(&OutputPayload::Report(7), &SkippingEncoder, &mut buf);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "impure response encoder: body byte 0 of 1 differs")]
+    fn a_body_that_depends_on_the_encoders_state_fails_the_purity_check() {
+        let mut buf = [0u8; MAX_APP_FRAME];
+        // Dropped result: the call panics before it returns one.
+        let _ = encode_slot_payload(
+            &OutputPayload::Report(7),
+            &CountingEncoder::default(),
+            &mut buf,
+        );
+    }
+
+    /// A result that depends on the encoder's state: a length that
+    /// changes, or an error one time and not the next.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_result_that_depends_on_the_encoders_state_fails_the_purity_check() {
+        let results: [[Result<usize, &'static str>; 2]; 3] = [
+            [Ok(1), Ok(2)],
+            [Ok(1), Err("no")],
+            [Err("no"), Err("other")],
+        ];
+        for pair in results {
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            let encode = |body: &mut [u8]| {
+                body[..2].fill(0);
+                pair[calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 2]
+            };
+            let panic = std::panic::catch_unwind(|| {
+                let mut buf = [0u8; MAX_APP_FRAME];
+                frame_app_response(&mut buf, encode)
+            })
+            .expect_err("an impure result must fail the check");
+            let message = panic
+                .downcast_ref::<String>()
+                .expect("a formatted panic message");
+            assert!(
+                message.starts_with(&format!(
+                    "{IMPURE_ENCODER}: two encodes of one value returned {:?}, then {:?}",
+                    pair[0], pair[1]
+                )),
+                "{message}"
+            );
+        }
+    }
+
+    /// The early-reply path is checked too: it frames through
+    /// `frame_app_response`.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "impure response encoder: body byte 1 of 16 differs")]
+    fn an_early_rejection_is_checked_for_purity() {
+        early_with(&SkippingEncoder, EarlyKind::Rejected(7));
+    }
+
+    /// Scratch writes past the returned length are not compared, however
+    /// they vary: an encoder may use those bytes as it likes.
+    #[test]
+    fn scratch_past_the_returned_length_passes_the_purity_check() {
+        let calls = std::sync::atomic::AtomicU8::new(0);
+        let (n, buf) = frame(|body| {
+            body[1] = calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            body[0] = 7;
+            Ok(1)
+        });
+        assert_eq!(n, Ok(6));
+        assert_eq!(&buf[..6], &[2, 0, 0, 0, TAG_APP, 7]);
     }
 
     /// Fills the whole body with the report's value, so a test can see

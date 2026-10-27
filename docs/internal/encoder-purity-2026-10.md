@@ -1,11 +1,15 @@
 # No stale bytes in response bodies, and a debug check that encoders are pure (plan)
 
-Status: **in progress** (2026-10): steps 1 and 2 done, step 3 not
-started. Where the build departs from the text below:
+Status: **done** (2026-10), steps 1 to 3. Where the build departs from
+the text below:
 
-- Step 1's end-to-end leak test runs through a running node
+- Step 1's end-to-end leak test ran through a running node
   (`crates/core/server-runtime/tests/encoder_purity.rs`) rather than the
-  response stage alone.
+  response stage alone. CI runs no test with `--release`, so step 3
+  replaced it there with the debug test that the check fires through a
+  running node, on kernel TCP and on DPDK.
+- The check-free inner function (`frame_zeroed`) is private, not
+  `pub(crate)`: only `frame_app_response` and its own tests call it.
 - Step 2's measurement, 2026-10-27, on an Apple M-series laptop (8 cores,
   Asahi Linux), kernel TCP over loopback, echo with 64-byte requests, one
   client, window 1, `disk` acks, five interleaved 15-second runs of each
