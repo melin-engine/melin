@@ -165,9 +165,16 @@ Stated here as the operator docs will state it (step 6):
   `transport-core/src/shadow.rs`).
 - **The encoding is the application's, the framing the runtime's.**
   `ResponseEncoder::encode_report` (`melin-app`) writes a body.
-  `frame_app_response` (`server-runtime/src/response_frame.rs`) bounds it by
-  `MAX_RESPONSE_BODY` and writes the header. Nothing in the encoder's
-  contract says today that its bytes depend only on the report.
+  `frame_app_response` (`server-runtime/src/response_frame.rs`) zeroes the
+  body region, calls the encoder, bounds the result by `MAX_RESPONSE_BODY`
+  and writes the header. In debug builds it first checks that the encoder
+  is pure (`check_encoder_purity`): two more encodes over two fill
+  patterns must agree below the returned length. The encoder's contract
+  already says so (`ResponseEncoder`'s "Purity" section in `melin-app`,
+  and "The determinism rules" in `docs/building-an-application.md`): the
+  same value encodes to the same result whatever came before, and every
+  byte below the returned length is written. Every application response
+  is framed there today; the replica and the shadow encode nothing.
 - **Ticks.** The primary's reader journals a `Tick` every
   `--tick-interval-ms` (default 250, `ServerConfig::tick_interval_ms`; 0
   disables tick generation, `ServerConfig::tick_interval`). Each is an
@@ -332,11 +339,17 @@ d(W) = XXH3-128 (seed 0, default secret) over
   (finding 2). Reports of node events (connection 0) and reports to clients
   that have gone **are** folded: they are the application's output whether
   or not anyone receives them.
-- **The encoder's contract gains a clause.** `ResponseEncoder::encode_report`'s
-  rustdoc and `docs/building-an-application.md` ("The determinism rules")
-  say that the body must be a pure function of the report: no clock, no
-  node identity, no state of the encoder's own. An encoder that breaks it
-  now stops replicas, so it goes under `CHANGELOG.md` **Changed**.
+- **The encoder's contract is already the one the digest needs.**
+  `ResponseEncoder`'s "Purity" section and "The determinism rules" in
+  `docs/building-an-application.md` require the same result for the same
+  value whatever was encoded before, and every byte below the returned
+  length written. The zeroing makes a skipped byte zero on every copy, so
+  only an encoder whose output depends on something other than its input
+  (its own state, the clock, the node) can make copies disagree. The
+  debug-build purity check catches that in an application's tests. What
+  changes is the consequence: an encoder that breaks the contract now
+  stops replicas, which the contract text and `CHANGELOG.md` **Changed**
+  say, and the contract adds "no node identity" to its examples.
 - **Why XXH3-128, not BLAKE3.** The digest compares copies the operator
   runs, fed by their own `apply`, so the only collisions that matter are
   accidental, and at 128 bits those are not a practical concern. What
@@ -576,15 +589,21 @@ d(W) = XXH3-128 (seed 0, default secret) over
 encodes a report's body through the application's `ResponseEncoder` into
 the caller's buffer, folds `(wire_seq, body)` into the open window,
 closes windows as positions pass, extends its chain, and publishes each
-closed window to a `DigestBoard` (decision 5). The body encode itself (the
-encoder's call and the `MAX_RESPONSE_BODY` check) moves from
-`response_frame.rs` into one free function there, `encode_report_body`,
-which the folder calls and `frame_app_response` takes as its body closure,
-so the bound a client's frame obeys and the bound the fold folds are one
-statement. Early replies call it too, without a folder, so a halt's
-rejection is framed as today and folded nowhere. `server-runtime` keeps
-re-exporting `MAX_RESPONSE_BODY` from where it is today. Three call sites,
-each with one folder:
+closed window to a `DigestBoard` (decision 5). The body encode itself
+moves from `response_frame.rs` into one free function there,
+`encode_report_body`: the zeroing of the body region, the debug-build
+purity check (`check_encoder_purity`), the encoder's call and the
+`MAX_RESPONSE_BODY` check, all of what `frame_app_response` and
+`frame_zeroed` do today except the header. The folder calls it, and
+`frame_app_response` keeps only the header and takes it as its body
+closure. So the bound a client's frame obeys and the bound the fold
+folds are one statement. And so are the zeroing and the purity check,
+which then cover the replica's drain and the shadow too: those encodes
+never pass through `frame_app_response`, and a copy of the zeroing there
+could drift from the original. Early replies call it too, without a
+folder, so a halt's rejection is framed as today and folded nowhere.
+`server-runtime` keeps re-exporting `MAX_RESPONSE_BODY` from where it is
+today. Three call sites, each with one folder:
 
 | Copy | Thread | Closes a window when |
 | --- | --- | --- |
@@ -1270,15 +1289,26 @@ under the netns runner), and is committable on its own. Docs and
   both feature sets, and `std` is added if it wins (it turns on `alloc`
   only to make the allocating `Hasher` instance available, which the
   folder does not use).
-- `encode_report_body` (decision 4): `MAX_RESPONSE_BODY` and the body-bound
-  check move into it; `server-runtime` re-exports the constant from where it
-  is today and `frame_app_response` and `encode_early_reply` call it, so the
-  framing is unchanged.
-- `ResponseEncoder::encode_report` rustdoc gains the determinism clause
-  (decision 1); `docs/building-an-application.md`, "The determinism rules",
-  says the same, and names the routine causes of a repeated or backwards
-  tick (the double call, a restart or restore across a clock step back)
-  under the existing tick rule (finding 7).
+- `encode_report_body` (decision 4): the zeroing, the debug-build purity
+  check, `MAX_RESPONSE_BODY` and the body-bound check move into it from
+  `response_frame.rs` (`frame_zeroed`, `check_encoder_purity`), with their
+  comments; `server-runtime` re-exports the constant from where it is
+  today, and `frame_app_response` and `encode_early_reply` call it, so the
+  framing is unchanged. The purity check's tests (`response_frame.rs`'s
+  unit tests and `server-runtime/tests/encoder_purity.rs`) keep passing,
+  and the unit tests of the zeroing and the check move with the code; a
+  test in `transport-core` pins that a direct call to `encode_report_body`
+  (the path the drain and the shadow take) zeroes and, in debug builds,
+  checks.
+- `ResponseEncoder`'s "Purity" rustdoc and `docs/building-an-application.md`
+  ("The determinism rules") already state the contract (decision 1). They
+  gain its new consequence and "no node identity" among the examples.
+  The rustdoc's "every response a node encodes" and the guide's "each
+  response a node sends" become "every report a node encodes, sent or
+  folded", since replicas and the shadow now encode reports that nobody
+  is sent. The guide also names the routine causes of a repeated or
+  backwards tick (the double call, a restart or restore across a clock
+  step back) under the existing tick rule (finding 7).
 - Tests, all ungated:
   - folder: the digest of a known window and the chain value after two
     known windows pinned to byte patterns (so the definition cannot drift
@@ -1369,7 +1399,7 @@ under the netns runner), and is committable on its own. Docs and
       `Break`, never a `Match` across it; one indexing helper for board and
       comparator.
 - `framing` tests in `response_frame.rs` keep passing unchanged: the
-  framing is the same bytes.
+  framing is the same bytes, the zeroing and the purity check included.
 - **Leaves untested:** nothing calls these types yet, so whether each copy
   feeds them the same reports is step 2's to show.
 
