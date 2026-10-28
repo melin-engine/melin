@@ -22,6 +22,22 @@ rebased tree; nothing else cited here changed. Where a
 point depends on the Melin Exchange Core, which is maintained separately and
 is not in this repo, it says "unknown".
 
+**Superseded in part, 2026-10-28.** The plan now stops the whole cluster
+on any divergence, with no fault attribution, and carries the stop on the
+data plane: a flag on the replica's acks and handshake, a halt frame from
+the primary, a bounded linger, and a cap of three raft voters, so two
+stopped nodes leave no quorum. Why raft was not chosen to carry it, and
+the problems the data-plane design had to solve, are in
+[divergence-cluster-halt-evaluation-2026-10.md](divergence-cluster-halt-evaluation-2026-10.md).
+That decision makes these items moot:
+- 1.1 (b): the `Departure` halt cause, since no node keeps serving after a
+  stop;
+- 1.2: the faulty primary, since who is at fault no longer matters;
+- 3.5: the archive reason, since nothing is archived;
+- in 5.4, the "same window" aggregation.
+
+Their sections are kept as the record of why the plan moved.
+
 The plan is careful and mostly sound. Its chain, its anchor and pipeline-id
 rules and its stop ordering hold up under the cases checked here. Its
 weaknesses are elsewhere: one cost it does not see (replication ring slots),

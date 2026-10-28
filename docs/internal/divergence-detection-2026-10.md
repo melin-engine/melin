@@ -6,8 +6,8 @@ detection for a nondeterministic `apply`".
 
 The one-line goal: **every copy of the application digests the reports it
 produced, in windows of a fixed number of entries, chains the window digests,
-and a node whose chain disagrees with the reference stops serving, for good,
-until an operator brings it back.** The hash chain proves that every node
+and when two copies disagree the whole cluster stops serving, for good: the
+way back is a new cluster.** The hash chain proves that every node
 holds the same *input*. Nothing proves that the same input produced the same
 *output*. A nondeterministic `apply` (a randomly seeded `HashMap` iterated,
 the wall clock read, an allocation address hashed), a `snapshot`/`restore`
@@ -19,31 +19,52 @@ What is digested is the **output**: the bytes of every report the
 application's encoder produces for a journaled event. It is computed once,
 in the runtime, for every application. There is no trait to implement and
 no opt-in, and it is on unless the operator turns it off. A divergence means
-the application broke its determinism contract, so there is no repair: the
-node that sees it stops and refuses to start again until an operator has
-looked. One clause of that contract is a trap the runtime still sets, the
-tick rule, and finding 7 takes a position on it.
+the application broke its determinism contract. Every copy runs the same
+build, so which copy produced the odd output does not matter, and nothing
+is repaired. The node that sees it stops and tells the rest of the cluster,
+which stops too (decision 11), and every stopped node refuses to start
+again. Operations resume only on a new cluster, started from the journal
+with a fixed application or with output digests off (step 6). One clause of
+that contract is a trap the runtime still sets, the tick rule, and finding
+7 takes a position on it.
 
 The journal stays input-only and the snapshot format is untouched. Nothing
 new is journaled and nothing is stored: each copy's chain starts when its
 pipeline starts. The digest rides the replication stream as a control frame,
-as the chain check does.
+as the chain check does, and the stop travels the same stream: a flag on the
+replica's acks and a halt frame from the primary. Raft carries nothing new.
 
 ## The guarantee, and its limits
 
 Stated here as the operator docs will state it (step 6):
 
-- **A node never serves once its output has been seen to disagree with the
-  output clients were served.** A replica whose reports differ from its
-  primary's, or a node whose snapshot-making copy (the shadow) answers
-  differently from its live copy, stops: it sends no further reply, takes no
-  further client, cannot be promoted, and refuses to restart until an
-  operator clears it.
+- **Once two copies' outputs are seen to disagree, the cluster stops
+  serving.** A replica whose reports differ from its primary's, or a node
+  whose snapshot-making copy (the shadow) answers differently from its live
+  copy, stops at once: it sends no further reply, takes no further client
+  and cannot be promoted. It then tells the nodes it can reach, directly or
+  through the primary, and each of them stops the same way. Every stopped
+  node refuses to restart. With at most three raft voters, two stopped
+  nodes leave no quorum, so no election can promote the third (decision
+  14). The only way back is a new cluster (step 6).
 - **Every copy still running produced the same client-visible reports, byte
   for byte, as the copy clients were answered from, for every position of
   its verified run** `[from, through]` (`/healthz`, `/metrics`). A run is
   contiguous by construction: no window inside it went uncompared.
 - **The limits.**
+  - **A detector nobody can reach stops alone.** The stop travels on the
+    replication links. A stopped node keeps its replication endpoint up for
+    a bounded linger (decision 11) to reach nodes that were between
+    sessions. A detector that stays cut off from both others past the
+    linger, while they still reach each other, stops alone, and they may
+    fail over and serve. That needs a partition isolating exactly the
+    detecting node, starting around the moment of detection and lasting
+    longer than the failover grace and the linger. The others' own checks
+    are a likely backstop: nondeterminism tends to recur on every copy. It
+    is not a guarantee.
+  - **A manual promotion overrides the stop.** `PROMOTE` of a node that
+    never heard the halt is the operator's act, and the docs list every
+    path around the stop in one place (step 6).
   - **Divergence that has not yet shown in any report is not caught.** Two
     copies can hold different state and still answer every request
     identically, for example a balance that differs only on an account
@@ -115,9 +136,9 @@ Stated here as the operator docs will state it (step 6):
 - **Repair is not reused.** A chain divergence is repaired by snapshot
   resync (`handle_session_exit`, `MAX_INPROCESS_DIVERGENCE_RESYNCS`,
   `archive_local_lineage`). An output divergence is not a damaged journal
-  but a broken contract, so this plan takes none of that path. What it
-  reuses is the archive naming (`replication/archive.rs`: `archive_dir`,
-  `lowest_free_index`, the exhaustive `ArchiveReason`).
+  but a broken contract, so this plan takes none of that path, and moves
+  no file: the snapshots of a stopped cluster are set aside by the operator
+  as part of starting a new one (step 6).
 
 ### Where reports are produced and where they go, on each copy
 
@@ -193,6 +214,29 @@ Stated here as the operator docs will state it (step 6):
   writes for want of a replica) keeps answering queries and releasing held
   replies, which is the opposite of what a diverged node must do, so the
   fence is the halt machinery this plan uses.
+- **Raft leaves with the node.** The raft driver is handed the node's
+  shutdown flag (`server.rs`, `spawn_raft_driver`; `raft.rs`) and leaves its
+  loop within one 100 ms poll (`melin-raft`'s `driver.rs`). So a node whose
+  shutdown flag is set drops out of the control plane, and a node that
+  refuses to start never rejoins it: both entries resolve the store before
+  any raft spawn, and `melin_raft::spawn` has no other caller. openraft
+  counts a voter that is down: its majority is over the configured set.
+- **Raft voters are capped from below only.** `build_raft_config` checks a
+  minimum under auto-promotion (`raft.rs`), and nothing refuses more voters
+  than data-plane nodes. A primary streams to at most two replicas (the
+  two producer slots, `pipeline.rs`), so a fourth or fifth voter is a
+  standby that can never be a connected replica.
+- **Replicas never re-point.** After a failover, surviving replicas keep
+  dialling their `--replica-of` until an operator re-points them
+  (`docs/replication.md`, "Deployment rules"), with reconnect backoff from
+  1 s up to `MAX_BACKOFF` (30 s, `replication/mod.rs`).
+- **Acks are read in a few places.** Kernel TCP reads acks in the live
+  loop only, not during catch-up, snapshot transfer or the bridge
+  (`tcp_sender.rs`). The DPDK sender keeps only the newest ack while a slot
+  joins (`keep_last_ack`, `dpdk.rs`). Every ack that moves a cursor passes
+  `ReplicaCursors::record_ack` (`transport-core/src/replication/cursors.rs`),
+  which stores rather than takes a maximum. Every read site skips frames it
+  does not decode.
 - **The response loop checks shutdown once per batch** (top of `'run`), and
   "a send with room goes through whatever the flag says": a batch already
   read is sent to its end. Stopping replies *at* detection needs a per-slot
@@ -254,20 +298,36 @@ The primary still orders its frame behind the entries it covers, from the
 journal stage: a digest ahead of the stream becomes a contiguity violation,
 catch-up stays quiet, the wire stays ordered (decision 7).
 
-**6. Raft needs nothing new.** A diverged node latches the fence before
-anything else (decision 11). From then until it exits, the fenced inputs
-already make it refuse auto-promotion, stand down from elections and never
-challenge, and the readers close every client. Every place a replica honours
-a promotion request (the in-session poll in `streaming_loop`, each
-receiver's reconnect-loop top) checks the shutdown flag first, which the
-divergence sets with the latch. If a request still slipped through that
-check-then-check window, the primary pipeline it builds shares the node's
-`FenceState`, so its readers close every client and its stages stop on the
-shutdown flag. After the exit, the marker keeps the node from restarting
-(decision 12), so it can neither rejoin raft nor be elected. A raft frame
-version, a divergent bit or a challenger arm would add nothing. The one
-thing to pin is that a diverged raft *leader* exits, so peers elect: an
-integration test in step 3.
+**6. Raft carries nothing new: the stop travels the data plane, and quorum
+loss does the rest.** A stopped node latches the fence before anything else
+(decision 11), so until its raft driver leaves on the shutdown flag the
+fenced inputs make it refuse auto-promotion, and the readers close every
+client. Every place a replica honours a promotion request (the in-session
+poll in `streaming_loop`, each receiver's reconnect-loop top) checks the
+shutdown flag first, which the stop sets with the latch. If a request still
+slipped through that check-then-check window, the primary pipeline it
+builds shares the node's `FenceState`, so its readers close every client
+and its stages stop on the shutdown flag. After the exit, the marker keeps
+the node from restarting (decision 12), so it never rejoins raft.
+
+What makes the stop cluster-wide is arithmetic on voters, not a raft
+message. A cluster has at most three voters once decision 14 caps them,
+and openraft's majority is over the configured set. So once two nodes have
+stopped, no election can succeed. The stop reaches a second node in every
+connected case: a replica that detects tells its primary through its acks;
+a primary that detects, or is told, tells its connected replicas with a
+halt frame (decision 11). A raft log entry would also reach a node that
+missed both, but it costs the first application data in raft, a
+forwarding RPC, a persisted halted state and a raft storage version. The
+only case it would add is a partition around the detector (the limits).
+
+Two conditions hold this argument up, and the plan carries both. A raft
+leader cut off from its quorum can still auto-promote without an election
+(openraft 0.9 never steps a leader down on quorum loss). The fix is a
+quorum-contact gate on auto-promotion, being fixed separately on `main`,
+which is a release prerequisite (decision 14). And a cluster with more
+than three voters keeps a majority after two stop, which decision 14's
+voter cap refuses.
 
 **7. The runtime still hands applications repeated and backwards ticks.**
 Determinism audit finding 17 and the roadmap item "Monotonic sequencer time"
@@ -918,9 +978,8 @@ rather than `dyn`, because there is one implementation per build and the
 call is monomorphized.
 
 `verified_from` and `verified_through` (the current run) are exposed for
-`/healthz` and `/metrics`; the newest verified window end of any run is
-published beside them, so the marker writer on whichever thread detects
-reads every comparison's value for the archive threshold (decision 11).
+`/healthz` and `/metrics`, and the marker records the detecting
+comparison's run (decision 11).
 
 ### 7. The primary emits from the journal stage, in the batch's ring slot
 
@@ -1025,12 +1084,22 @@ own batch cadence. Nothing in the digest path is behind
 | Change | Layout (after the length prefix) |
 | --- | --- |
 | New frame `MSG_DIGEST = 0x19`, primary to replica | `DigestFrame { tag, kind: u8, window_end: U64, window: [u8; 16], chain: [u8; 16] }`, 42 bytes |
-| New frame `MSG_DIVERGED = 0x07`, replica to primary | `DivergedFrame { tag, kind: u8, window_end: U64, verified_through: U64, expected_window: [u8; 16], actual_window: [u8; 16], expected_chain: [u8; 16], actual_chain: [u8; 16] }`, 82 bytes: the replica's notice before it stops (decision 11). `verified_through` 0 means no run yet (the anchor's own window differs): positions start at 1, so 0 is never a window end, and the decoder maps it to `None` |
+| `Ack` gains the stop flag, replica to primary | `AckFrame { tag, acked_sequence: U64, in_memory_sequence: U64, flags: u8, window_end: U64 }`, 26 bytes, from 17. `flags` bit 0 is `STOPPED`: this replica has stopped (decision 11), and its positions are frozen at the last ones it sent. `window_end` is the position its stop names (the diverged window, or the one it was told of), 0 when `STOPPED` is clear |
+| `Handshake` gains the same two fields, replica to primary | `HandshakeFrame { tag, last_sequence: U64, chain_hash: [u8; 32], epoch: U64, protocol_version: U16, flags: u8, window_end: U64 }`, 60 bytes, from 51: a stopped replica redialling tells the primary before anything else is exchanged (decision 11). Appended after `protocol_version`, so an older primary still parses the version and refuses it |
+| New frame `MSG_HALT = 0x1A`, primary to replica | `HaltFrame { tag, cause: u8, window_end: U64 }`, 10 bytes: the cluster is stopping. `cause` 1 is "this primary detected", 2 "a replica told this primary"; `window_end` as on the ack |
 | `StreamStart` gains the digest kinds, the build and the pipeline id | `digest_kinds: u8` (bit `k - 1` set: this primary sends digests of kind `k`; 0: none), then `build_id: [u8; 32]` (open question 2), then `pipeline_id: [u8; 16]` (decision 3), appended after `genesis_entries`: 115 bytes, from 66 |
 
+- **Unknown flag bits and causes are refused**, as `genesis_known` is: a
+  bit this build does not define is a peer's protocol bug, never read as
+  a stop or as no stop. A `window_end` that is not 0 with `STOPPED` clear
+  is refused the same way.
+- **The full divergence record stays in the marker.** The wire carries
+  only what lets a node stop and say who told it, plus the position for
+  its log. Digests and chain values are the detecting node's evidence, in
+  its marker and its `error!` line.
 - **Fixed-size frames encode into arrays.** `encode_digest` returns
-  `[u8; DIGEST_FRAME_LEN]`, and `encode_diverged` returns
-  `[u8; DIVERGED_FRAME_LEN]`, with the length prefix included. The length is
+  `[u8; DIGEST_FRAME_LEN]`, and `encode_halt` returns
+  `[u8; HALT_FRAME_LEN]`, with the length prefix included. The length is
   then part of the type: a test cannot pass with a frame one byte short,
   and the journal stage's emit cannot allocate. `maybe_publish_chain_check`
   builds a `Vec` per frame (`pipeline.rs`,
@@ -1063,14 +1132,17 @@ own batch cadence. Nothing in the digest path is behind
 - **A window end that is not a positive multiple of its kind's `K`** is the
   primary's protocol bug and ends the session as a `FrameError`, never as a
   divergence.
-- **The handshake does not change**, so the existing version check
-  (`HandshakeFrame.protocol_version`, parsed by `decode_replica_message`)
-  refuses a mixed pair in both directions with the version error, as at
-  every earlier bump. `REPL_PROTOCOL_VERSION` becomes 9, with the history
-  comment extended. Size assertions for the two new frames and the grown
-  `StreamStart` (`StreamStartFrame`, 66 to 115 bytes); `docs/replication.md`'s
-  frame tables gain them, and its `StreamStart` row and the frame list in
-  `server-runtime/src/replication/mod.rs`'s module docs gain the three
+- **A mixed pair is still refused in both directions.** The handshake's
+  new fields come after `protocol_version`, so a v8 primary parses the
+  longer v9 handshake's prefix and fails the version check, and a v9
+  primary refuses the shorter v8 handshake with the existing "too short
+  ... older, incompatible replication protocol version" error.
+  `REPL_PROTOCOL_VERSION` becomes 9, with the history comment extended.
+  Size assertions for the two new frames and the grown `Ack`, `Handshake`
+  and `StreamStart` (`StreamStartFrame`, 66 to 115 bytes);
+  `docs/replication.md`'s frame tables gain them, and its `StreamStart`,
+  `Ack` and `Handshake` rows and the frame list in
+  `server-runtime/src/replication/mod.rs`'s module docs gain the new
   fields.
 
 ### 9. The replica compares in its receiver
@@ -1117,11 +1189,18 @@ own batch cadence. Nothing in the digest path is behind
   counts nothing: the comparator attributes the session's windows to
   `build` at the next `Anchored` (decision 6), so they are counted once.
   A replica with digests off decodes and drops frames.
-- A `Mismatch` ends the session with a new
-  `SessionExit::Diverged(Divergence)`. The match in `handle_session_exit` is
-  exhaustive, so every receiver must decide what it means, and its arm runs
-  decision 11's stop and returns `Err`: it never reaches a reconnect-loop
-  top, where a promotion request could be honoured.
+- A `Mismatch` (the comparator has already tripped the latch, decision
+  6), a `Halt` frame from the primary, or the latch found tripped by the
+  replica's own shadow, ends streaming. The receiver publishes nothing
+  more and, on the same session, runs decision 11's notice: it sends one
+  flagged ack with the last positions it sent, then waits for the
+  primary's `Halt` or its close, within the notice bound. The session then
+  ends with a new `SessionExit::Stopped(HaltCause)`. The match in
+  `handle_session_exit` is exhaustive, so every receiver must decide what
+  it means. Its arm never reaches a reconnect-loop top, where a promotion
+  request could be honoured: it returns to the exit helper, which runs the
+  linger (decision 11). `process_streaming_frames` decodes `Halt` beside
+  `Digest`, and a `Halt` trips the latch with cause `ClusterHalted`.
 
 ### 10. The in-process check: shadow against live, on every node with a shadow
 
@@ -1135,7 +1214,8 @@ work between batches. Either may lead (the shadow trails the journal; the
 live folder on a primary trails the gate), so an entry can wait in the
 comparator for the other; a live window lapped before the shadow polled it
 is a skipped sample, and the next poll's covers it. A `Mismatch` stops the
-node (decision 11), whether it is a primary or a replica.
+node and, through it, the cluster (decision 11), whether it is a primary
+or a replica.
 
 This is the only check on a node without replicas, and it catches what the
 replica check cannot see on a primary: a shadow built by
@@ -1145,12 +1225,16 @@ would come back from. A node without a shadow (`--snapshot-interval-ms 0`)
 has no in-process check, and a standalone node without one has no check at
 all; both are logged at startup and documented as limits.
 
-### 11. On divergence: stop, in one order
+### 11. On divergence: the cluster stops, in one order
 
-Whichever comparison finds it (a replica's receiver, or any node's shadow),
-the node:
+A node stops for one of two causes, `HaltCause` (exhaustive):
+`Detected(Divergence)`, when one of its own comparisons finds it (a
+replica's receiver, or any node's shadow), and `ClusterHalted { by, via,
+window_end }`, when another node tells it (`by` the primary or a replica's
+slot and key fingerprint, `via` the ack, the handshake or the halt frame).
+Either way, the node:
 
-1. **Halts replies at once.** `DivergenceLatch::trip(divergence)` latches the
+1. **Halts replies at once.** `DivergenceLatch::trip(cause)` latches the
    node's `FenceState` with a new stop cause and co-sets the shutdown flag,
    the way `fence_if_superseded` owns "fenced ⇒ shutting down". It is the
    **node's** shutdown flag, the one the replica's receiver and the
@@ -1166,57 +1250,45 @@ the node:
    checks the latch. A shadow that trips stops consuming the input ring,
    so without that check the receiver would wedge in a push on a full ring
    and never reach the loop top that reads the shutdown flag. The latch
-   keeps the first `Divergence` only; a second trip returns `None`. From the
+   keeps the first cause only; a second trip returns `None`. From the
    latch on: the readers close every client (`Verdict::Close`), the
    response loop hands no slot and no early reply to the egress (a per-slot
    `Relaxed` load of the latch, before the send, decision 4), the shadow
-   saves no further snapshot (checked before every save), and raft refuses
-   and stands down on `fenced` (finding 6).
-2. **Logs `error!`** naming the check (`replica-vs-primary` or
+   saves no further snapshot (checked before every save), auto-promotion
+   refuses on `fenced`, and the raft driver leaves on the shutdown flag, so
+   the node drops out of the control plane (finding 6).
+2. **Logs `error!`.** For `Detected`: the check (`replica-vs-primary` or
    `shadow-vs-live`), the range known to hold the divergence, whether the
    window at its end differs itself, both chain values' and window digests'
    prefixes (`hex_prefix`, the journal crate's formatter, widened from
    `&[u8; 32]` to `&[u8]` so 16-byte values and the 32-byte chain hash
-   print alike), and the run. On a replica it also says: "if other replicas
-   report the same window, the primary's output is the one at fault".
+   print alike), and the run. For `ClusterHalted`: who told it, by which
+   path, and the position named. Both end "the cluster is stopping: see
+   docs/replication.md, Output verification".
 3. **Writes the divergence marker** beside the journal
    (`NodeStore::divergence_marker()`, `<journal>.diverged`), written to a
    temporary file, fsynced, renamed and the directory fsynced, so it
    survives a crash. Plain text, for an operator: the format version, the
-   check, the kind, the window end, the range known to hold the divergence
-   and whether that window differs itself, both window digests and both
-   chain values in full hex, the run (`verified_from`, `verified_through`),
-   the archive threshold (step 5's last verified position, or "none" with
-   no verified window), the archive directory (once known), the node's
-   build id, and the wall-clock time (for people; nothing reads it). The
-   threshold is fixed when the marker is written, from each comparison's
-   newest verified window end as it stands then; a comparison that
-   advances afterwards is ignored, which can only archive more, never
-   less. The exit helper's archival and startup's re-run both read it from
-   the marker, so the two cannot disagree.
-4. **On a replica, sends the `Diverged` notice** to its primary, best
-   effort, before the session ends.
-5. **Archives, never deletes, the snapshots above the last verified
-   position**, once every pipeline thread has been joined, so no shadow save
-   can race it. The last verified position (the marker's archive
-   threshold) is the newest window end a comparison has verified, in any
-   run, and the least of it across the node's comparisons (on a replica,
-   its check against the primary and its shadow's against live): a
-   snapshot is only as good as the least-checked copy that led to it. If
-   any comparison has verified no window, the threshold is "none" and
-   every snapshot is archived. A snapshot at or below it was followed by matching
-   output; one above it was not. Each of `<snapshot>` and `<snapshot>.prev`
-   whose header's `journal_sequence` is above it moves into
-   `<snapshot dir>/<snapshot name>.output-diverged.<n>/`, through the
-   archive module's helpers and a new `ArchiveReason::OutputDiverged`
-   (tag `output-diverged`); with no verified window, every snapshot moves.
-   The name is chosen so it can't be confused with the existing
-   `Divergent` (tag `divergent`), which archives a journal that forked
-   from the primary's after a `HashMismatch`: an operator triaging the
-   directory names has to tell a forked journal from a diverged output at
-   a glance. The journal is left in place: it is
-   input-only and the chain vouches for it. The marker is rewritten with
-   the archive's path.
+   cause (`detected` with the check, or `cluster-halted` with `by` and
+   `via`), the window end, and for `detected` the range known to hold the
+   divergence, whether that window differs itself, both window digests and
+   both chain values in full hex, and the run (`verified_from`,
+   `verified_through`); then `notice` (`pending`, `delivered` or `none`,
+   rewritten as the notice of step 4 progresses), the node's build id, and
+   the wall-clock time (for people; nothing reads it).
+4. **Tells the rest of the cluster, then lingers.** What it does depends
+   on its role (below, "The notice and the linger"). In short: a replica
+   flags its acks and, if no session is open, redials with a flagged
+   handshake; a primary sends `Halt` to every connected replica and keeps
+   its replication endpoint answering `Halt`. Every stopped node keeps
+   doing so for `HALT_LINGER` after its pipeline is down, unless it knows
+   the rest are told, then exits.
+5. **Moves no file.** Every snapshot the broken build wrote, on every node
+   and below any verified position too, is suspect: state can diverge
+   before a report shows it, and a fixed build may not even restore it. So
+   nothing is archived here; the new-cluster procedure sets every node's
+   snapshots aside (step 6). The journal is left in place: it is
+   input-only and the chain vouches for it.
 6. **Exits with an error.** The node's run returns
    `Err(NodeDiverged { .. })`, through one helper every node entry
    (`run_tcp`, `run_dpdk`, so `run`, `run_with_shutdown` and
@@ -1226,9 +1298,14 @@ the node:
 
 **The order is enforced by types, not by a comment.** `trip` returns a
 `Halted` token (private constructor, neither `Clone` nor `Copy`), the
-marker writer consumes it and returns `MarkerWritten`, and the archiver
-consumes that. Nothing can write a marker, or archive, before the latch is
-set. The halt itself does not rest on the caller: the comparator trips
+marker writer consumes it and returns a `MarkerOutcome` (`Written`, or the
+I/O error), and the notice and the linger take that. Nothing can write a
+marker, or tell another node, before the latch is set, and nothing tells
+another node before the marker write has been attempted. A crash just
+after telling the others then leaves a node that refuses to restart,
+rather than one that rejoins the cluster it has just stopped. A failed
+write still lets the notice run (below). The halt itself does not rest
+on the caller: the comparator trips
 before it returns a `Mismatch` (decision 6), so a detection site that
 ignored the verdict would still have halted the node's replies and set
 its shutdown flag. Writing the marker does rest on the detecting thread,
@@ -1238,34 +1315,91 @@ backstop: it writes the marker itself when it finds a divergence with
 nothing deposited.
 
 **Which thread does what.** The steps span threads: detection is on the
-shadow thread (primary or replica) or the replica's receiver thread, while
-the archive must wait until every pipeline thread has been joined. So:
+shadow thread (primary or replica) or the replica's receiver thread, a
+`ClusterHalted` trip on a replica's receiver or on any of a primary's
+senders, while the linger must wait until every pipeline thread has been
+joined. So:
 
-- On the **detecting thread**, the comparator trips the latch. The thread
-  then logs and writes the marker itself, at once, with the `Halted`
-  token the `Mismatch` carried: the marker is cold work of
-  the kind the shadow already does (it writes snapshots), and writing it
-  before any join means a hang in the shutdown leaves the node refusing to
-  restart all the same. It then deposits the result, `MarkerWritten` or the
-  I/O error, back into the `DivergenceLatch`, which is one `Arc` per node
-  shared by every detection site and the exit helper (a `Mutex` around an
-  `Option`, touched only on this cold path).
+- On the **tripping thread** (a comparator's for `Detected`, the receiver
+  or a sender for `ClusterHalted`), the trip latches. The thread then logs
+  and writes the marker itself, at once, with the `Halted` token: the
+  marker is cold work of the kind the shadow already does (it writes
+  snapshots), and writing it before any join means a hang in the shutdown
+  leaves the node refusing to restart all the same. It then deposits the
+  `MarkerOutcome` back into the `DivergenceLatch`, which is one `Arc` per
+  node shared by every trip site, the notice and the exit helper (a
+  `Mutex` around an `Option`, touched only on this cold path).
+- The **notice in the session** runs on the replica's receiver and on the
+  primary's senders, the threads that own the links. Each waits for the
+  latch to hold a `MarkerOutcome` (the tripping thread writes it within
+  one fsync) before sending its flagged ack or its `Halt`.
 - The **exit helper** is the single return path of every node entry, after
   every pipeline thread (and, on a replica, the receiver) has been joined,
   whichever way they left. It claims the latch's contents: nothing there is
-  an ordinary exit; a divergence with `MarkerWritten` archives and returns
-  `NodeDiverged`; a divergence with nothing deposited (a detecting thread
-  that dropped its token, or died before writing) has its marker written
-  here, from the divergence the latch kept, and then goes on as either
-  case below; a divergence whose marker write failed archives nothing
-  (the token is absent, so it cannot) and returns `NodeDiverged` carrying
-  the I/O error, logged at `error!`, so the operator learns the refusal on
-  restart is not guaranteed. The decision is the latch's, not the exit
-  path's: a replica receiver that sees only the shutdown flag and leaves
-  through `SessionExit::Shutdown`, after its shadow tripped, still returns
-  through the helper, which finds the divergence and archives. No exit
-  path can skip the claim, because the helper is the only way to return
-  from the entry.
+  an ordinary exit; a stop whose marker is written runs the linger and returns
+  `NodeDiverged`; a stop with nothing deposited (a detecting thread that
+  dropped its token, or died before writing) has its marker written here,
+  from the cause the latch kept, and then goes on as either case below; a
+  stop whose marker write failed still runs the linger, then returns
+  `NodeDiverged` carrying the I/O error, logged at `error!`, so the
+  operator learns the refusal on restart is not guaranteed. The linger
+  runs without a marker because only the running process holds the stop
+  then: telling the others is what keeps the cluster down when this node
+  might come back. The decision is the latch's, not the exit path's: a
+  replica receiver that sees only the shutdown flag and leaves through
+  `SessionExit::Shutdown`, after its shadow tripped, still returns through
+  the helper, which finds the stop and lingers. No exit path can skip the
+  claim, because the helper is the only way to return from the entry.
+
+**The notice and the linger.** `HALT_LINGER` is `2 × MAX_BACKOFF`, 60 s: a
+replica in reconnect backoff redials within `MAX_BACKOFF`, so a primary that
+lingers twice that long meets every replica that was between sessions when
+it stopped, with a full backoff's margin. A constant, not a flag: the value
+follows from the backoff, and an operator has nothing to tune it against.
+By role:
+
+- **A replica that stopped.** On its current session, it sends one ack with
+  `STOPPED` set, its positions frozen at the last ones it sent (so the
+  primary's stored cursors do not move: `record_ack` stores, it does not take
+  a maximum), and waits up to the notice bound (a few heartbeat intervals)
+  for the primary's `Halt` or its close. A `Halt` received means the primary
+  knows: the marker's `notice` becomes `delivered`, and the replica exits
+  without lingering. Otherwise, after the pipeline is down, it redials its
+  `--replica-of` with `STOPPED` in its handshake until an answer arrives (a
+  `Halt`, or the primary closing after reading it) or `HALT_LINGER` ends.
+  A replica stopped by a `Halt` tells nobody: the primary already knows,
+  and its `notice` is `none`.
+- **A primary that stopped.** Every replication sender, on both transports,
+  sends `Halt` on its slot and closes it at a frame boundary on every exit
+  path once the latch is set. On kernel TCP, the slot's handler writes the
+  frame, shuts its write side only, and drains until the replica closes or
+  the notice bound passes, so a reset caused by unread acks cannot destroy
+  the frame (the guard's two-way shutdown, `uring_teardown.rs`, would).
+  DPDK already lingers on the way out (`linger_then_reset`, `dpdk.rs`). A
+  slot in a snapshot transfer or a catch-up is closed the same way, and its
+  replica meets the halt at its next handshake. Then, after the pipeline is
+  down, the primary keeps its replication endpoint (the listener on kernel
+  TCP, the port it holds on DPDK, which initialises the EAL once per
+  process) answering every authenticated handshake with `Halt`, until
+  `HALT_LINGER` ends or both slots have received one, whichever is first.
+  It never streams, never answers clients and never starts raft in that
+  time.
+- **A primary told by a replica.** The flag trips the latch with cause
+  `ClusterHalted`. `ReplicaCursors::record_ack` checks `STOPPED` and trips
+  *before* it stores, so neither sender can forget it and a flagged ack
+  moves no cursor. `keep_last_ack` keeps the flag sticky while a DPDK slot
+  joins. The handshake checks it after authentication and before the epoch
+  and chain checks, so a stopped replica is never sent a snapshot. The
+  primary then does all of the above, so the other replica is told.
+
+**Why this stops the cluster.** Finding 6 gives the argument: with at most
+three voters (decision 14), two stopped nodes leave no quorum. In every
+connected case, the stop reaches a second node: a replica that detects
+reaches the primary; a primary that detects, or is told, reaches its
+connected replicas; and the linger extends "connected" from the moment of
+detection to the minute after it. A node that missed both is alone against
+two stopped nodes, so no election promotes it. What remains is the
+partition of "The guarantee, and its limits".
 
 What "at once" means, precisely: no slot is handed to a transport after the
 response stage has observed the latch. Bytes handed on before it (a kernel
@@ -1274,22 +1408,22 @@ diverged window (it must close and reach the other copy), so the replies of
 that window have gone out by the time anyone knows; what the stop
 guarantees is that nothing further does.
 
-No automatic repair and no retry: a divergence means the application's
-determinism contract is broken, a restart from the same journal and the same
-build has no reason to behave differently, and an outage is the intended
-outcome.
+No automatic repair, no retry and no fault attribution: a divergence means
+the application's determinism contract is broken, every copy runs the same
+broken build, a restart from the same journal and the same build has no
+reason to behave differently, and an outage of the whole cluster is the
+intended outcome.
 
 ### 12. Startup refuses while the marker exists
 
 A new `NodeStore::refuse_if_diverged(&self) -> Result<(), NodeStoreError>`,
 which every node entry calls right after `resolve` and before it opens its
 journal, starts raft or serves anything, returns
-`NodeStoreError::Diverged { marker, check, range, threshold, archive, stopped_at }`
-if the marker exists, every field parsed from the marker (`range` the
-positions known to hold the divergence, `threshold` the archive threshold,
-`None` with no verified window, `archive` an `Option`, `None` when no
-snapshot lay above the threshold, `stopped_at` its wall-clock time), so the
-message below quotes the marker and nothing else. `resolve` stays as it
+`NodeStoreError::Diverged { marker, cause, window_end, stopped_at }`
+if the marker exists, every field parsed from the marker (`cause` the
+marker's cause, `detected` with its check and range or `cluster-halted`
+with who told it, `stopped_at` its wall-clock time), so the message below
+quotes the marker and nothing else. `resolve` stays as it
 is, writing nothing, so a test or tool that resolves a diverged node's
 paths is neither refused nor moves files.
 Both entries resolve through `ServerConfig::store()` today (`run_tcp` and
@@ -1299,28 +1433,22 @@ place the refusal is made, so a third entry takes it by calling the same
 function; `store()` stays write-free for tests. The error says what
 happened and what to do:
 
-> this node stopped on `<time>` because its output diverged from the
-> `<primary's | shadow's>` between positions `<a>` and `<b>` (details in
-> `<marker>`). Its snapshots after position `<N>` (the archive threshold;
-> "all of its snapshots" with none) are in `<archive>`; its
-> journal is intact. (With nothing archived, the sentence reads "None of
-> its snapshots lies after position `<N>`, so none was moved; its journal
-> is intact.") Find which copy is at fault (several replicas
-> reporting the same window point at the primary), fix the application,
-> rebuild this node's state (reseed it from the current primary, or replay
-> its journal), then delete `<marker>`. See docs/replication.md, "Output
-> verification".
+> this node stopped on `<time>` because the cluster's output diverged
+> (`<detected here: its output differs from the primary's | its shadow's,
+> between positions <a> and <b>>` or `<told by <who> via <path>, at
+> position <n>>`; details in `<marker>`). The application broke its
+> determinism contract, so this cluster cannot be restarted: do not delete
+> this marker to bring this node back. Start a new cluster from the
+> journal, with a fixed application or with output digests off. See
+> docs/replication.md, "Output verification".
 
-Before refusing, `refuse_if_diverged` re-runs the archival of decision 11
-(idempotent: it moves only snapshots above the marker's archive threshold
-that are still in place), so a crash between the marker and the
-archive cannot leave a suspect snapshot for an operator to boot from by
-mistake. A marker that cannot be parsed still refuses, naming the file.
+A marker that cannot be parsed still refuses, naming the file.
 
-So a diverged node cannot come back on its own (systemd's `Restart=always`
-just logs the refusal at each attempt), and cannot be elected. Normal
-failover then promotes a replica whose output matched the primary's up to
-its last run's end.
+So a stopped node cannot come back on its own (systemd's `Restart=always`
+just logs the refusal at each attempt), never rejoins raft, and cannot be
+elected. Neither can the cluster: once two nodes refuse, there is no
+quorum (finding 6). The marker is moved aside, not deleted, as part of
+the new-cluster procedure, where it is the incident's record (step 6).
 
 ### 13. Snapshots, recovery, failover, rejoin
 
@@ -1333,18 +1461,46 @@ its last run's end.
 | Promotion | The warm application moves into a new primary pipeline with new folders, a new chain from the seed and a new pipeline id; its replicas re-anchor on its first frame (`new_primary`). |
 | Ex-primary rejoining | A forked journal is caught by the chain check first and resynced. Otherwise it is a replica like any other, with a new replica pipeline, anchoring on the new primary's first frame. |
 | Reconnect to the same primary | The same pipeline id: the run, its anchor and the expected side are kept, the local windows closed meanwhile extend the run, and the new session's first frame is compared as any later frame. It verifies every window since the last match, catch-up included, and nothing is counted unverified. A stream gap or a damaged entry reconnects the same way. |
-| A diverged node | Stopped and refusing to start (decisions 11, 12). |
+| A stopped node | Lingering for `HALT_LINGER` to tell the others, then stopped and refusing to start (decisions 11, 12). |
+| A failover around a stop | None should follow: the stop reaches the others, and two stopped nodes leave no quorum (finding 6). |
 | Shutdown drain | Windows still open are dropped: nothing would act on them. |
 
 ### 14. Raft and failover
 
-Nothing changes in `raft_promotion.rs` or `melin-raft` (finding 6). The step
-that adds the stop (step 3) carries the test that pins it: a diverged
-primary that is the raft leader exits, a healthy replica is elected and
-promotes, and the diverged node's restart is refused. The stop cause added
-to `FenceState` lets the stand-down's log line say "diverged" rather than
-"fenced" for an operator reading why a node stopped campaigning; that is
-the only raft-side line that changes.
+Raft carries no message for the stop (finding 6). Two things change, and
+one is a prerequisite:
+
+- **The voter cap.** A cluster refuses more raft voters than one plus the
+  primary's replica slots, three today, derived from the slot array's
+  length so the bound moves with it. It is checked twice: on the
+  `--raft-peer` flags in `build_raft_config`, and when the driver starts,
+  on the *stored* membership, which overrides edited flags after the raft
+  directory's first boot (`driver.rs`, `docs/replication.md`). A directory
+  initialised with five otherwise keeps five. It applies whatever the
+  digest setting: a voter that can never be a connected replica adds
+  nothing to failover. It breaks a deployment that lists more, so it goes
+  under `CHANGELOG.md` **Changed**. With one configured replica there are
+  two voters, and auto-promotion is already refused (`raft.rs`). Without
+  raft, or with raft observational, nothing auto-promotes: only the
+  operator paths of step 6 remain.
+- **The quorum-contact gate (prerequisite, fixed separately).** A raft
+  leader cut off from its quorum keeps reporting `Leader` (openraft 0.9
+  never steps a leader down on quorum loss). A replica can hold raft
+  leadership while the primary is healthy, and promotes without an
+  election once its link has been down past `PRIMARY_DOWN_GRACE`. So if
+  the replica that missed the stop is the raft leader, quorum loss alone
+  does not stop it. The fix refuses auto-promotion unless the leader heard
+  a majority recently (openraft's `millis_since_quorum_ack`). It is a bug
+  today, divergence or not, and it is being fixed on its own branch.
+  Steps 3 to 5 do not reach a release before it lands. Whether its bound
+  needs tightening here (a quorum ack taken after the grace ran out, so a
+  leader whose last ack predates the halt cannot pass) is open question 3.
+
+The stop cause added to `FenceState` lets raft's stand-down and refusal
+lines say "stopped: output divergence" rather than "fenced". Step 4
+carries the test that pins the whole: a three-node cluster whose primary,
+the raft leader, detects; both replicas stop, nothing promotes, and every
+restart is refused.
 
 ### 15. Hot-path cost
 
@@ -1356,6 +1512,7 @@ the only raft-side line that changes.
 | Shadow | encode, one XXH3 update (both new) | one board `latest()` read | finalize, one chain hash, comparator update |
 | Journal stage (primary with replicas) | nothing | one latest-window load, at most one division and one board read | at most one 42-byte frame encode per batch, appended to the batch's slot: 46 more bytes copied, no extra publish |
 | Replica receiver | nothing | one `Acquire` load per iteration (and per pass of a waiting push) | one board read, one chain hash, comparator update; per frame, decode and comparator update |
+| Primary senders | nothing | per ack: 9 more bytes read and one well-predicted flag test in `record_ack` | nothing |
 
 Nothing allocates after construction. The measurement step (step 6) first
 folds windows of `K` representative report bodies (the examples', and a
@@ -1382,11 +1539,12 @@ Logs (levels per the project convention):
 
 | Event | Level | Where |
 | --- | --- | --- |
-| Output diverged: the node stops (check, range, digests, run) | `error!` | the diverging node |
-| Marker written; snapshots archived (with paths) | `error!` (part of the stop) | the diverging node |
-| Startup refused: the marker exists | `error!` (the run's returned error) | the diverged node, at each start |
-| A replica reported divergence (`Diverged` notice) | `error!` | primary |
-| Every replica streaming reported the same window | `error!`, once per window: "every replica disagrees with this primary at the same window: this primary's output is the likely fault" | primary |
+| Output diverged: the node stops (check, range, digests, run) | `error!` | the detecting node |
+| Told to stop (who, which path, the position) | `error!` | every node told, by an ack, a handshake or a halt frame |
+| Marker written (with its path) | `error!` (part of the stop) | every stopped node |
+| Still telling: the notice not yet answered (who it is waiting for) | `warn!`, at intervals during the linger | a stopped node |
+| Notice answered, or the linger ended unanswered | `info!` / `warn!` | a stopped node, before it exits |
+| Startup refused: the marker exists | `error!` (the run's returned error) | a stopped node, at each start |
 | Output digests off on this node (`--no-output-digests`), or no in-process check (no shadow) | `warn!` at startup | every node |
 | The primary sends no output digests, or runs another build (open question 2), for this session | `warn!`, once per session | replica |
 | A digest kind unknown to this build (a frame or a `digest_kinds` bit) | `warn!`, once per session | replica |
@@ -1400,8 +1558,8 @@ Logs (levels per the project convention):
 
 Metrics (`/metrics`, rendered in `health.rs`, on replicas through the
 replica health endpoint; `/healthz` carries whether digests are on, each
-comparison's run, whether the node stopped diverged and, on a halted
-primary, whether its last replica left for divergence, step 5):
+comparison's run, and, on a stopped node during its linger, the stop's
+cause and the notice's state):
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
@@ -1414,19 +1572,27 @@ primary, whether its last replica left for divergence, step 5):
 | `melin_output_chain_breaks_total` | counter | replica against primary only, as above. Runs ended by a lapped local window, live or during a catch-up; a session start never counts here, whatever its id. Alert on any growth |
 | `melin_output_frames_skipped_total{reason="kind"}` | counter | digest frames of a kind this build does not know |
 | `melin_output_encode_errors_total{copy="live"\|"shadow"}` | counter | reports the encoder refused, folded as failures (decision 4). Every copy counts the same failures when they agree, so growth alone is the application's choice or bug, not a divergence |
-| `melin_output_diverged` | gauge | 1 once the node has stopped for divergence (seen in the short window before it exits) |
-| `melin_replica_output_divergence_total` | counter | primary: `Diverged` notices received. Alert on any growth |
+| `melin_output_diverged{cause="detected"\|"cluster_halted"}` | gauge | 1 once the node has stopped (seen during the linger, before it exits) |
+| `melin_cluster_halt_notice{state="pending"\|"delivered"}` | gauge | a stopped node's notice, during the linger. A linger that ends `pending` is the documented limit's case: page on it |
 
 `melin_replica_divergence_total` keeps its meaning (journal chain) so that
-existing alerts do not change. A diverged node is fenced, so the health
+existing alerts do not change. A stopped node is fenced, so the health
 endpoint's `trading` flag already reads false on it; `/healthz` adds the
-stop cause.
+stop cause. The health endpoint stays up through the linger, so these are
+readable until the node exits. After that, the exit, the refused restarts
+and the marker are the record.
 
 ## Steps
 
 Each step builds, passes the full suite (kernel TCP, and the DPDK suite
 under the netns runner), and is committable on its own. Docs and
 `CHANGELOG.md` move with the behaviour they describe.
+
+**Steps 3 to 5 ship in one release, after the quorum-contact gate
+(decision 14).** Step 3 alone would stop a node whose shadow trips without
+telling the others, so a primary would stop and its replicas fail over:
+the opposite of the decision. Step 4 brings the notice, and step 5 the
+cross-node check. Each stays its own commit, and the tree passes at each.
 
 ### Step 1. The pure building blocks
 
@@ -1649,10 +1815,12 @@ under the netns runner), and is committable on its own. Docs and
 - `FenceState`: a stop cause (`Superseded | Diverged`, exhaustive), first
   cause wins; `is_fenced` unchanged for its readers; the cause in
   `/healthz` and in the raft stand-down's log line.
-- `DivergenceLatch`, `trip`, the `Halted` / `MarkerWritten` tokens, the
-  marker (`NodeStore::divergence_marker`), `ArchiveReason::OutputDiverged` and the
-  snapshot archival, the `NodeDiverged` error through the one exit helper
-  (decision 11). `melin_journal::error::hex_prefix` widened to `&[u8]`
+- `DivergenceLatch`, `trip`, `HaltCause` (`Detected` only; step 4 adds
+  `ClusterHalted`), the `Halted` token and `MarkerOutcome`, the marker
+  (`NodeStore::divergence_marker`), the `NodeDiverged` error through the
+  one exit helper (decision 11), which in this step returns once every
+  thread is joined: the linger comes with the notice, in step 4.
+  `melin_journal::error::hex_prefix` widened to `&[u8]`
   for the divergence log line, rather than a second formatter beside it;
   every existing call passes a reference to a 32-byte array, which
   coerces, so no caller changes.
@@ -1666,9 +1834,9 @@ under the netns runner), and is committable on its own. Docs and
   through `SessionExit::Shutdown`.
 - The shadow's comparator (`shared_start`) against the live board on every
   node with a shadow (decision 10).
-- `NodeStore::refuse_if_diverged`, `NodeStoreError::Diverged` and the
-  archival re-run at startup, called from `ServerConfig::startup_store()`
-  by both entries; `resolve` and `store()` unchanged (decision 12).
+- `NodeStore::refuse_if_diverged` and `NodeStoreError::Diverged`, called
+  from `ServerConfig::startup_store()` by both entries; `resolve` and
+  `store()` unchanged (decision 12).
 - Metrics `verified_from{against="shadow"}`,
   `verified_through{against="shadow"}`, `checks_total{against="shadow"}`,
   `melin_output_diverged`.
@@ -1680,28 +1848,24 @@ under the netns runner), and is committable on its own. Docs and
     is observed";
   - `DivergenceLatch`: the first trip wins; it fences and sets shutdown
     before returning the token; the exit helper's claim, for each of its
-    four cases (nothing, marker written, marker failed, a divergence with
+    four cases (nothing, marker written, marker failed, a stop with
     nothing deposited, whose token was dropped: the helper writes the
-    marker and archives), including a divergence deposited by another
-    thread while the caller left through ordinary shutdown;
+    marker), including a stop deposited by another thread while the
+    caller left through ordinary shutdown;
   - marker: written durably (temporary file, rename), parsed back, every
-    field present, each value in full canonical hex, the range, the
-    "window differs itself" flag and the archive threshold (on a replica,
-    the lesser of its two comparisons' newest verified ends, from an earlier
-    run when the current one has verified nothing; "none" with no verified
-    window); an unparseable marker still refuses;
+    field present, each value in full canonical hex, the range and the
+    "window differs itself" flag; `notice` reads `none` in this step; an
+    unparseable marker still refuses;
   - `hex_prefix`: the same prefix for a 16-byte value as for a 32-byte
     hash sharing its first bytes, so the chain's log lines are unchanged;
-  - archival: snapshots above the marker's archive threshold move, into a
-    directory tagged `output-diverged`, those at or below stay, `.prev` handled the same way, a second run moves
-    nothing, and the journal is untouched; with no verified window, every
-    snapshot moves;
+  - no file moves: after a stop, every snapshot and the journal are where
+    they were;
   - `node_store.rs`: `refuse_if_diverged` refuses with the marker present,
-    and the message names the marker, the range, the archive threshold, the
-    archive and the doc section, each as the marker holds it, and, for a
-    marker with no archive (no snapshot above the threshold), says that
-    none was moved rather than naming a directory; `resolve`
-    on the same store succeeds and moves nothing; `server.rs`: `startup_store()` refuses where `store()` does not;
+    and the message names the marker, the cause, the position and the doc
+    section, each as the marker holds it, and says a new cluster is the way
+    back; `resolve` on the same store succeeds and moves nothing;
+    `server.rs`: `startup_store()` refuses where `store()` does not, and
+    a node refused at startup never spawns its raft driver;
   - shadow: a fault-injecting test app whose `restore` leaves a
     non-serialized flag that changes a later report (a lossy
     `snapshot`/`restore`): the shadow, built by `clone_via_snapshot`,
@@ -1713,23 +1877,14 @@ under the netns runner), and is committable on its own. Docs and
     through `melin-test-node` so it also runs on DPDK under the netns
     runner: one node with that app under load stops, its run returns
     `NodeDiverged`, the `error!` appears (`logs::capture`), the marker
-    exists, the post-divergence snapshot is archived, every client
-    connection is closed and a request sent after the trip gets no reply
-    (the per-slot ordering itself is pinned by the unit test above, which
-    an end-to-end test cannot time), and a restart is refused with the
-    error;
-  - integration, same file, the way back (the runbook's procedure, so the
-    runbook's steps are tested rather than prose): after the refusal,
-    delete the marker and restart with the post-divergence snapshots left
-    archived; the node boots from its journal and the snapshot it kept at
-    or below the verified position (or from the journal alone when none
-    was kept), its state equals a fresh replay of the same journal, and it
-    serves again. Run with the lossy-restore fault switched off on the
-    restart (it is the `Sizing`), as an operator restarts on a fixed build;
+    exists, every client connection is closed and a request sent after the
+    trip gets no reply (the per-slot ordering itself is pinned by the unit
+    test above, which an end-to-end test cannot time), and a restart is
+    refused with the error;
   - integration, same file, a replica's shadow trips (the lossy-restore app
     on the replica only): its receiver leaves through ordinary shutdown,
-    and its run still returns `NodeDiverged` with the marker written and
-    the archive done (decision 11, "Which thread does what"). The primary
+    and its run still returns `NodeDiverged` with the marker written
+    (decision 11, "Which thread does what"). The primary
     keeps streaming under load, so the trip lands with the replica's input
     ring full behind the stopped shadow, and the run must return within a
     bound, which pins the latch check in the waiting push;
@@ -1741,31 +1896,30 @@ under the netns runner), and is committable on its own. Docs and
     and the replica builder passes the node's flag, not
     `pipeline_shutdown`. The builder test asserts that the shadow's latch
     holds the same `Arc` as the receiver's shutdown flag (`Arc::ptr_eq`);
-  - integration beside `raft_failover.rs`: three nodes, the primary (raft
-    leader) carrying the lossy-restore app via its `Sizing` (the one input
-    a test may vary per node), the primary stops, a replica is elected and
-    promotes, and the ex-primary's restart is refused. The data plane runs
-    on DPDK under the runner; raft is kernel TCP by design.
+  - a stopped node's raft driver leaves within its poll: a three-node
+    in-process raft test whose stopped node's peers see it `Silent`.
 - Docs: `docs/replication.md`, a first "Output verification" section with
-  the in-process check, the stop and the startup refusal; the runbook is
-  completed in step 6. `CHANGELOG.md` **Changed**: a node whose shadow
-  disagrees with its live copy now stops and refuses to restart until its
-  marker is cleared (new, always-on behaviour, named first);
-  `NodeStoreError::Diverged` (re-exported from `melin-transport-core`) and
-  `ArchiveReason::OutputDiverged` are new variants of public exhaustive enums, so
-  a consumer's `match` stops compiling until it handles them; the node
+  the in-process check, the stop and the startup refusal; the cluster-wide
+  stop lands with step 4, the runbook in step 6. `CHANGELOG.md` (with
+  steps 4 and 5, one release) **Changed**: a node whose shadow disagrees
+  with its live copy now stops and refuses to restart (new, always-on
+  behaviour, named first); `NodeStoreError::Diverged` (re-exported from
+  `melin-transport-core`) is a new variant of a public exhaustive enum, so
+  a consumer's `match` stops compiling until it handles it; the node
   entries resolve through `startup_store()`. **Added**: the `NodeDiverged`
   error a node's run returns, `NodeStore::refuse_if_diverged`.
-- **Leaves untested:** a crash between the marker and the archive is
-  covered by the startup re-run's unit test, not by killing a process
-  mid-stop; a hardware fault is modelled only by the fault-injecting app
-  (the detection path is the same).
+- **Leaves untested:** a crash between the trip and the marker (the
+  exit helper's backstop is unit-tested, not a killed process); a
+  hardware fault is modelled only by the fault-injecting app (the
+  detection path is the same); the cluster-wide stop, which is step 4's.
 
-### Step 4. Replication protocol 9
+### Step 4. Replication protocol 9, and the cluster-wide stop
 
-- `replication/protocol.rs`: `MSG_DIGEST` and `MSG_DIVERGED` with
+- `replication/protocol.rs`: `MSG_DIGEST` and `MSG_HALT` with
   encoders returning fixed-size arrays (decision 8), decoders and size
-  assertions; `encode_chain_check` and `encode_rotate` move to the same
+  assertions; `AckFrame` and `HandshakeFrame` gain `flags` and
+  `window_end`, with unknown bits refused; `encode_chain_check` and
+  `encode_rotate` move to the same
   shape. The journal stage then publishes them from the stack. The
   catch-up's `send_buf` (`catchup.rs`), which batches a rotate with data,
   extends from the array, and the receiver tests take the array where
@@ -1791,8 +1945,20 @@ under the netns runner), and is committable on its own. Docs and
   `StreamStart` for its comparator, and warns once when the primary sends
   no output digests, names an unknown kind or runs another build. Digest
   frames are decoded and, for now, dropped: no primary sends one until
-  step 5. The primary decodes `Diverged` and logs it (decision 16),
-  though no replica sends one yet.
+  step 5.
+- The cluster-wide stop (decision 11, "The notice and the linger"):
+  `HaltCause::ClusterHalted`; the replica's flagged ack after the latch,
+  its wait for `Halt`, and its redial with a flagged handshake;
+  `ReplicaCursors::record_ack`, `keep_last_ack` and the handshake trip
+  the latch on `STOPPED` before storing or answering; every sender's
+  "send `Halt`, half-close, drain" on every exit path once the latch is
+  set, on both transports; the primary's handshake-only endpoint during
+  `HALT_LINGER`; the exit helper running the linger; the marker's
+  `notice` states; the health endpoint kept up through the linger.
+  The notice is driven by the shadow's trip in this step. Step 5 adds the
+  replica's comparison as a second detector, through the same notice.
+- Raft: the voter cap on the flags and on the stored membership (decision
+  14), and the stop cause in the stand-down and refusal lines.
 - Tests: round trips; wire byte patterns beside `ack_wire_byte_pattern` and
   `rotate_wire_byte_pattern` (`server-runtime/src/replication/mod.rs`),
   and a new `chain_check_wire_byte_pattern` beside them. Today the chain
@@ -1817,12 +1983,63 @@ under the netns runner), and is committable on its own. Docs and
   `StreamStart` one pipeline sends, across reconnects and on the catch-up
   and snapshot paths, carries the same one (the `catchup.rs` test that
   checks the post-snapshot `StreamStart`'s fields gains it).
-- Docs: `docs/replication.md` frame tables, and the `StreamStart` row's
-  description (the id names the running primary, so a replica knows a
-  reconnect from a restart). `CHANGELOG.md` **Changed**: replication
-  protocol 9, mixed pairs refused; `build_pipeline_with_replication` takes
-  a `PipelineId`.
-- **Leaves untested:** a primary that sends digests, which is step 5.
+- Tests of the stop, unit and ungated:
+  - `protocol.rs`: the ack, the handshake and `Halt` round-trip with
+    every flag and cause; unknown bits and causes, and a `window_end`
+    without `STOPPED`, are refused; a v8 handshake gets the too-short
+    error, and a v9-sized one carrying version 8 the version error;
+  - `cursors.rs`: a flagged ack trips the latch before it stores, and
+    moves no cursor;
+  - `keep_last_ack` keeps the flag across newer acks. Today its tests
+    compile only under the `dpdk` feature, so the function and its
+    `JoinFrames`, which need no hardware, move beside `try_extract_frame`
+    in `receiver_transport.rs`, ungated, so the test runs on every host;
+  - `receiver_transport.rs`, with the scripted transport: after the
+    latch, one flagged ack carrying the last positions sent, the wait for
+    `Halt`, and a flagged handshake on the next dial when none came; a
+    `Halt` received trips `ClusterHalted` and ends the notice at once;
+  - the linger's rules as pure functions: when the primary's endpoint
+    stops answering (`HALT_LINGER`, or both slots told), when a replica
+    stops redialling, and the marker's `notice` transitions;
+  - `raft.rs` and the driver: four voters refused from the flags, and a
+    raft directory initialised with four refused at driver start.
+- Tests of the stop, integration (`output_divergence.rs`, on both
+  transports, the DPDK cases under the netns runner; raft on kernel TCP),
+  faults through `Sizing`:
+  - the primary, the raft leader, detects through its shadow: both
+    replicas stop on `Halt`, nothing promotes, and every restart is
+    refused;
+  - a replica's shadow detects: the primary stops on the flag, and the
+    other replica on the primary's `Halt`;
+  - a replica between sessions when the primary stops (held in reconnect
+    backoff by the test proxy, `tests/common/proxy.rs`, then released
+    inside `HALT_LINGER`): it meets the lingering primary's handshake
+    answer and stops, and nothing promotes;
+  - a replica that detects while disconnected: its redial reaches the
+    primary inside the linger, the primary stops and halts the other
+    replica;
+  - a replica stops during a kernel-TCP catch-up and during a DPDK join,
+    a snapshot transfer included: the primary stops at the flagged
+    handshake or through `keep_last_ack`, and never sends a snapshot to a
+    stopped replica;
+  - a failed marker write (a seam): the node still lingers and tells the
+    others, and its run returns the I/O error;
+  - the documented limit: the detector cut off by the test proxy for
+    longer than `HALT_LINGER` stops alone; the others are a quorum and
+    may fail over. The test asserts the counted, logged outcome
+    (`notice` left `pending`, the linger's `warn!`), not a stop the design
+    does not promise.
+- Docs: `docs/replication.md` frame tables, the `StreamStart`, `Ack` and
+  `Handshake` rows' descriptions (the id names the running primary, so a
+  replica knows a reconnect from a restart), and "Output verification"
+  gaining the cluster-wide stop, the linger and its limit. `CHANGELOG.md`
+  **Changed**: replication protocol 9, mixed pairs refused;
+  `build_pipeline_with_replication` takes a `PipelineId`; a divergence on
+  any node stops the whole cluster; more than three raft voters are
+  refused.
+- **Leaves untested:** a primary that sends digests, which is step 5; a
+  routing split with asymmetric reachability (the proxy cuts whole
+  links); a host reboot during the linger.
 
 ### Step 5. The primary streams digests; replicas compare and stop
 
@@ -1847,34 +2064,13 @@ under the netns runner), and is committable on its own. Docs and
   fail.
 - Receiver: decode, contiguity, the comparator (`anchored`) against the
   live board read at each iteration and in the waiting push,
-  `begin_session` at each session start with its `debug!` line, the
-  `Diverged` notice, `SessionExit::Diverged` and its arm
-  in `handle_session_exit` running decision 11's stop (decision 9).
-- Primary: the "every replica, same window" aggregation of decision 16.
-- Primary: the halt's cause. `ReplicaPresence::lower` takes a
-  `Departure` (`Disconnected` or `Diverged`). It is an exhaustive enum, so
-  both senders (`tcp_sender.rs`, `dpdk.rs`) and every test helper that
-  stands in for one have to say why their replica left. A sender passes `Diverged` once its
-  session has received a `Diverged` notice. The departure that takes the
-  count to zero records its cause beside the loss stamp, in the same
-  `Release` order, so a reader that sees the count at zero sees that
-  departure's cause. A `lift` clears it. `lower`'s
-  `warn!` names the cause ("the last replica stopped for output
-  divergence — halted, refusing client writes"). `/healthz` carries the
-  cause beside `halted` (`diverged` or `disconnected`), the same way it
-  carries step 3's stop cause. A replica that diverges while others
-  remain changes nothing here, because the node is not halted.
-  `RejectReason` is unchanged. A new variant would break every
-  application's exhaustive `match`, and a client cannot act on it
-  differently: it resends either way once writes are taken. Unit tests in
-  `replica_presence.rs`: the cause of the last departure is the one read,
-  whatever earlier ones were; a `lift` clears it; an override leaves
-  `LastOverridden` whatever the cause. Plus a `health.rs` rendering case
-  for each cause.
+  `begin_session` at each session start with its `debug!` line, and the
+  `Mismatch` handing over to step 4's notice through
+  `SessionExit::Stopped` (decision 9).
 - Metrics `verified_from{against="primary"}`,
   `verified_through{against="primary"}`, `checks_total{against="primary"}`,
   `unverified_windows_total`, `chain_breaks_total`,
-  `frames_skipped_total`, `melin_replica_output_divergence_total`.
+  `frames_skipped_total`.
 - Tests:
   - `pipeline_tests.rs`: `primary_emits_output_digest_after_its_position`,
     modelled on `primary_emits_chain_check_every_interval`, reading each
@@ -1912,8 +2108,8 @@ under the netns runner), and is committable on its own. Docs and
     local board: a digest ahead of the stream position is a `SequenceGap`;
     the first is taken as the anchor and later ones compared; a fault in a
     window the scripted primary never sends a frame for is a `Mismatch` at
-    the next frame, which sends the notice and ends the session with
-    `SessionExit::Diverged`; a promotion request pending when the mismatch
+    the next frame, which trips the latch, sends the flagged ack and ends
+    the session with `SessionExit::Stopped`; a promotion request pending when the mismatch
     arrives is not honoured (the session ends in the divergence, and the
     receiver returns the error); a local window lapped (a small-capacity
     board) breaks the run, counts the gap and re-anchors on the next
@@ -1938,7 +2134,7 @@ under the netns runner), and is committable on its own. Docs and
       catch-up and before it, `verified_from` is unchanged, nothing is
       counted unverified and no `Anchored` is returned; a fault in a
       catch-up window makes that same frame a `Mismatch` and
-      `SessionExit::Diverged`; a local window closing in the first
+      `SessionExit::Stopped`; a local window closing in the first
       session after its primary's last frame extends the kept run; the
       `debug!` line says the run was kept;
     - the same id, a frame of the first session re-delivered in the
@@ -1991,8 +2187,8 @@ under the netns runner), and is committable on its own. Docs and
       the receiver does not enforce mid-frame, and does not depend on a
       nominal frame width the builder only bounds;
   - `tcp_receiver.rs` and `dpdk.rs` (the latter under the runner): the
-    divergence exit tears the pipeline down, archives and returns the error
-    without reaching the reconnect-loop top; a `Disconnected`, a
+    `Stopped` exit tears the pipeline down, runs the notice and returns the
+    error without reaching the reconnect-loop top; a `Disconnected`, a
     `StreamGap` and a `Corrupted` reconnect each keep the pipeline's
     comparator, with its run and held id, against a scripted primary
     reconnected under the same id (the reconnect path is
@@ -2007,15 +2203,13 @@ under the netns runner), and is committable on its own. Docs and
     headroom and no drain is stalled); a replica given a fault through its
     `Sizing` (its test app's `prefault` stores "change the report of the
     event that brings my count to X", violating `prefault`'s contract on
-    purpose) stops with a marker whose range contains the position of X,
-    its archive exists, its restart is refused, the primary logs the
-    notice and keeps serving on the other replica, with `/healthz` still
-    `trading`; the same fault on both replicas makes the primary log the
-    "same window" error and halt writes (its last replica gone), as the
-    docs will state. This case runs under `disk`, the policy whose halt
-    the plan's earlier text got wrong. A write is refused, a query still
-    answers, and `/healthz` reads `halted` with the `diverged` cause; and
-    the mixed-build case: the same fault on a
+    purpose) stops with a marker whose range contains the position of X;
+    its flagged ack stops the primary, whose `Halt` stops the other
+    replica; every node's marker names its cause (`detected` on the
+    replica, `cluster-halted` by that replica on the primary, by the
+    primary on the other replica), nothing promotes, and every restart is
+    refused. The same with both replicas faulted, the second stop arriving
+    while the primary is already stopping. And the mixed-build case: the same fault on a
     replica whose primary is started with another build id (a
     `ServerConfig` field that defaults to the executable's hash and that
     `melin-test-node` can set, the one seam that stands in for a second
@@ -2055,14 +2249,11 @@ under the netns runner), and is committable on its own. Docs and
   - integration, idle: a primary with ticks on and no client traffic, the
     replica's checks keep growing, one window per `K` ticks; with ticks
     off, none grows until traffic resumes;
-  - the primary's notice handling over DPDK, under the runner.
+  - the replica-detected stop over DPDK, under the runner.
 - Docs: `docs/replication.md`, "Output verification" extended to the
-  replica check and the notices. `CHANGELOG.md` **Changed**: a replica
-  whose output disagrees with its primary's now stops, and a primary whose
-  output disagrees stops every replica (writes then halt, under every ack
-  policy, as for any loss of the last replica, and `/healthz` names the
-  halt's cause); `ReplicaPresence::lower` takes the departure's cause;
-  applications whose `tick` is not idempotent against a
+  replica check. `CHANGELOG.md` **Changed**: a replica whose output
+  disagrees with its primary's now stops the whole cluster, as step 4's
+  shadow check does; applications whose `tick` is not idempotent against a
   time already passed are named as at risk until monotonic sequencer time
   lands (finding 7).
 - **Leaves untested:** a chain break end to end (it needs a drain thread
@@ -2073,8 +2264,8 @@ under the netns runner), and is committable on its own. Docs and
   drawing the same id, which a test cannot cause without a seam in
   `draw`, and `draw` takes none (its consequence, a kept run compared
   against a restarted chain, is a `Mismatch` on the first frame, the path
-  the same-id fault case exercises: a stop of a healthy replica, never a
-  missed divergence, and at 128 random bits not a case to plan for); a
+  the same-id fault case exercises: a needless stop of the cluster, never
+  a missed divergence, and at 128 random bits not a case to plan for); a
   primary restarted across a clock step back with an
   application whose `tick` breaks the rule (finding 7): the tick generator
   reads the wall clock and has no seam a test can step back, and the
@@ -2094,66 +2285,94 @@ under the netns runner), and is committable on its own. Docs and
 - `docs/replication.md`, "Output verification", completed for operators,
   with no implementation detail:
   - **the guarantee** in the words of "The guarantee, and its limits"
-    above, and **the limits**: latent divergence; the windows before a
+    above, and **the limits**: a detector nobody can reach within the
+    linger; manual promotion; latent divergence; the windows before a
     replica's first comparison with a restarted or newly promoted primary,
     or after its own restart or resync, while a reconnect to a running
     primary keeps coverage, catch-up included, unless a chain break is
     counted; the detection delay bounded in entries and so in ticks when
     idle; the unverified tail at failover; queries; nodes without
     snapshots;
-  - **what an operator sees**: the `error!` lines, the gauges and counters
-    to alert on (`melin_output_diverged`, `melin_replica_output_divergence_total`,
-    chain breaks, digests off), the run gauges, the marker's contents, the
-    refused restarts;
-  - **consequences**: a nondeterministic primary stops every replica (each
-    sees the primary's output disagree), and the primary then halts writes
-    for want of a replica. That happens under every ack policy, `disk`
-    included, as for any loss of the last replica, and `/healthz` names
-    divergence as the halt's cause. The primary still answers queries.
-    Under a replica-backed policy, its held replies go out degraded after
-    the grace period. Under `disk`, its own fsync confirms them. An
-    operator who trusts the primary can lift the halt with `ACK-POLICY
-    disk`, the existing override. The primary's log says when every replica
-    disagreed at the same window, which points at the primary. A
-    nondeterministic replica stops alone and the cluster runs on with one
-    copy fewer. A diverged primary stops and a replica is promoted. A
-    diverged node is never promoted and does not come back by itself;
-  - **which copy is at fault**: several replicas at the same window point
-    at the primary; one replica alone points at that replica (or its
-    host); a divergence soon after a restart, a failover or a clock step
-    points first at how the application handles a tick for a time already
-    passed, a rule its contract states and the runtime does not yet make
-    impossible (finding 7);
-  - **bringing a node back**: read the marker; decide which copy is at
-    fault; fix the application (a determinism bug) or the host (memory);
-    rebuild the node's state, either by reseeding (move its journal and
-    snapshots aside and start it as a replica, so it takes the primary's
-    snapshot) or by replay from before the divergence (keep the journal,
-    keep or restore a snapshot at or below the verified position, the
-    archived ones being the suspect ones, kept for investigation); delete
-    the marker; start it;
+  - **what an operator sees**: the `error!` lines on every node, naming
+    who detected and who told whom; the gauges to alert on
+    (`melin_output_diverged`, `melin_cluster_halt_notice`, chain breaks,
+    digests off), the run gauges, each node's marker, the refused
+    restarts;
+  - **consequences**: any divergence, on any node, stops the whole
+    cluster: no node answers clients, no node is promoted, and no node
+    restarts. Which copy produced the odd output does not matter: every
+    copy runs the same build, and the build broke its determinism
+    contract. A divergence soon after a restart, a failover or a clock
+    step points first at how the application handles a tick for a time
+    already passed, a rule its contract states and the runtime does not
+    yet make impossible (finding 7); a hardware fault is possible, and
+    the new cluster shows it if the fixed build diverges again;
+  - **what overrides the stop**, in one place: a manual `PROMOTE` of a
+    node that never heard the halt; observational raft steering an
+    operator to `PROMOTE` its leader, which may be the unaware node;
+    voter replacement, which looks like the fix for "two nodes refuse to
+    start" and is not. The refusal text points here;
+  - **starting a new cluster**, the only way back, tested (below):
+    1. Stop every node, lingering ones included.
+    2. Move each node's marker aside, kept as the incident's record, and
+       set every node's snapshots aside: the broken build wrote them all.
+    3. Pick the node whose journal reaches the highest position *and*
+       goes back to sequence 1. With snapshots set aside, recovery needs
+       the whole history and refuses with `MissingHistoryPrefix`
+       otherwise. A replica seeded by snapshot transfer holds only the
+       segments from its snapshot on. If no node reaches sequence 1, copy
+       the missing early segments from any node or archive that has them:
+       a healthy replica's segments are the primary's byte for byte, and
+       the segment chain check verifies the splice. Only if no copy
+       survives anywhere is a snapshot the broken build wrote the starting
+       point, knowingly.
+    4. Replay it once with the fixed build (or, on the same build, with
+       `--no-output-digests`, which is not a recovery: the replay is one
+       more draw of the nondeterminism, and the docs say so), standalone,
+       so its shadow writes a snapshot from the fixed build.
+    5. Give every node a fresh `--raft-dir` and the other nodes clean data
+       directories, and start the cluster as on first deployment; the
+       replicas reseed from the new primary.
+
+    The history clients were served and the fixed build's replay may
+    differ: the journal is the audit trail of what was asked, and the
+    replay is the state from now on. A cluster that ever failed over has
+    journaled epochs above the fresh raft terms, and auto-promotion
+    refuses while the term is at or below the epoch: the new cluster has
+    manual failover only until enough elections have passed (a roadmap
+    item, step 7, which also fixes voter replacement);
   - the `--no-output-digests` switch, what turning it off gives up, and
     why the window is not configurable (it is part of the digest's
     definition, the same on every node).
 - `docs/internal/application-api-review-2026-09.md` S8 points here; the
   pipeline architecture doc's responsibilities table names the folders.
-- **Leaves untested:** the runbook is prose; its procedure is exercised by
-  step 3's integration tests (the refusal, then the way back: marker
-  deleted, journal replay from a kept snapshot, serving again) and step 5's
-  (a stopped replica's refusal). Reseeding a cleared replica from its
-  primary is not a new path: it is the existing bootstrap of a replica with
-  no local state, which its own tests cover.
+- Tests: the new-cluster procedure as an integration test
+  (`output_divergence.rs`), so the runbook's steps are tested rather than
+  prose. A three-node cluster is stopped by a fault through `Sizing` and
+  then rebuilt, with the fault switched off as an operator restarts on a
+  fixed build:
+  - every marker and snapshot is moved aside, and each raft dir is fresh;
+  - the new primary replays from genesis, and its state equals a fresh
+    replay of the same journal;
+  - the replicas reseed and the cluster serves;
+  - for a history that once failed over, auto-promotion refuses with the
+    term-below-epoch reason.
 
-### Step 7. Roadmap: two follow-ups
+  A second case starts from a node whose journal does not reach sequence
+  1: recovery refuses with `MissingHistoryPrefix` until the early segments
+  are copied in.
+- **Leaves untested:** the runbook's prose itself; a hardware fault.
 
-Add two rows to `docs/internal/roadmap.md` ("Next"), roughly:
+### Step 7. Roadmap: four follow-ups
+
+Add four rows to `docs/internal/roadmap.md` ("Next"), roughly:
 
 > **Application state digest** (Medium). Output digests catch a divergence
 > only once a report shows it. Two copies whose state differs where no
 > report has yet looked (latent divergence) are both verified, and the
 > drifted one may be promoted at a failover, after which its reports
-> differ from what the old primary's would have been, and its own replicas
-> stop on the first one. A digest of application state, chained at window
+> differ from what the old primary's would have been, and the cluster
+> stops on the first one. A digest of application state, chained at window
 > boundaries as output digests are, closes that. It plugs into what output
 > digests built: a new kind value on the same digest frame and
 > `StreamStart` kind bits (no replication protocol bump), the same 16-byte
@@ -2182,7 +2401,24 @@ Add two rows to `docs/internal/roadmap.md` ("Next"), roughly:
 > primary's origin compares chain values directly instead of anchoring.
 > Plan: [divergence-detection-2026-10.md](divergence-detection-2026-10.md).
 
-- **Leaves untested:** two roadmap rows.
+> **A stopped node that holds its notice until delivered** (Low). A node
+> stopped for divergence tells the others on the replication links and
+> lingers for a minute to reach one that was between sessions. A detector
+> cut off for longer stops alone, and the others may fail over. Keeping
+> the stopped node in a handshake-only mode until its notice is
+> delivered, across restarts (the marker records it pending), closes all
+> but a host reboot. Worth it only if the linger's limit is seen in
+> practice. Plan: [divergence-detection-2026-10.md](divergence-detection-2026-10.md).
+
+> **A raft term floor for a fresh raft cluster** (Medium). Auto-promotion
+> refuses while the raft term is at or below the journal's fencing epoch.
+> A raft cluster started fresh on an existing journal (a new cluster after
+> a divergence, or a voter replaced with a wiped raft dir) restarts terms
+> from zero, so a history that ever failed over gets manual failover only
+> until enough elections have passed. Raise a fresh raft cluster's terms
+> above the highest journal epoch its peers advertise.
+
+- **Leaves untested:** four roadmap rows.
 
 ## What this leaves untested, and why
 
@@ -2190,6 +2426,9 @@ Beyond each step's own list:
 
 - **Hardware faults** (a bit flip in live memory) are modelled only by the
   fault-injecting apps; the detection path is the same.
+- **The partition limit** is tested only as the documented outcome (step
+  4): the cut-off detector stops alone and says so. Nothing asserts what
+  the others do, since the design does not promise it.
 - **Mixed builds during a rolling upgrade** are covered by step 5's
   receiver tests and its mixed-build integration case, which sets the build
   id through configuration, not by running two binaries: the hash of the
@@ -2223,7 +2462,7 @@ Beyond each step's own list:
    not what these frames are for.
 2. **Comparing across builds.** A rolling upgrade that changes a report's
    layout, or the encoder, makes a mixed pair disagree by design, and under
-   this plan the replica stops. Options: (a) document that such upgrades run
+   this plan the cluster stops. Options: (a) document that such upgrades run
    with digests off on the primary; (b) `StreamStart` carries a build id (a
    BLAKE3 hash of the running executable, read once at startup, in
    `server-runtime`, which already depends on `blake3` unconditionally; it
@@ -2240,18 +2479,28 @@ Beyond each step's own list:
    forget it. A node that cannot read its own executable sends an all-zero
    id, which a replica treats as matching any build, and logs `warn!` at
    startup: skipping the check on such hosts would lose it silently, while
-   comparing at worst stops a replica loudly.
-3. **Should a primary stop when every replica reports the same window?**
-   Its output is then the likely fault, but with one replica the question is
-   undecidable, and the primary halts writes anyway once its replicas have
-   stopped, under every ack policy (`halt.rs`, "Lifted by the operator's
-   consent"). Recommendation: no automatic stop;
-   the `error!` and the counter page the operator, who can stop it. Revisit
-   with replica-to-replica comparison, if ever.
-4. **Clearing the marker.** Deleting the file, or an admin command.
-   Recommendation: deleting the file. It is an explicit act, works when the
-   node will not start (which is exactly when an admin socket is not
-   there), and is what the refusal's message says.
+   comparing at worst stops the cluster loudly.
+3. **Does the quorum-contact gate need tightening for the stop?** The gate
+   being fixed separately refuses auto-promotion unless the raft leader
+   heard a majority within the election timeout (1 s). A replica leading
+   raft whose primary link had been down for 2.5 s when the primary
+   stopped passes it: its grace ends 0.5 s later, while its last quorum
+   ack is under 1 s old, though both other nodes have left raft. (a) Keep
+   the gate as fixed, and count this inside the documented limit. (b)
+   Require a quorum ack received after the grace ran out
+   (`millis_since_quorum_ack < primary_link_down_for − PRIMARY_DOWN_GRACE`):
+   a live majority answers within one heartbeat, so a real failover waits
+   that much longer, and stopped peers never answer. Recommendation: (b),
+   proposed to the gate's branch rather than built here. It still relies
+   on the other replica having stopped: with both replicas between
+   sessions when the primary stops, the other keeps answering, and the
+   case falls inside the documented limit.
+4. **Clearing the marker.** Moving it aside, as one step of starting a
+   new cluster (step 6), or an admin command. Recommendation: the file,
+   moved and kept as the incident's record. It is an explicit act, it
+   works when the node will not start (which is exactly when an admin
+   socket is not there), and the refusal says not to do it to bring the
+   node back.
 5. **Where the primary folds.** In the response stage after the send
    (recommended: no new thread, the bytes are already encoded there), or in
    a dedicated output-ring consumer, the same code as the replica's drain,
@@ -2265,12 +2514,15 @@ Beyond each step's own list:
    publishers, which the gate must also pass without waiting).
 7. **A stop that does not finish.** The stop exits through the node's
    ordinary shutdown, which fenced nodes already take. If a thread never
-   joined, a fenced, diverged raft leader could hold its leadership until it
-   is killed. Recommendation: no watchdog in this plan; the fenced-shutdown
-   path is the same one superseded primaries rely on, and a hang there is a
-   bug for both. The marker is written by the detecting thread before any
-   join (decision 11), so even a stop that hangs and is killed leaves a
-   node that refuses to restart.
+   joined, the exit helper never runs the linger, so a stopped primary
+   would not answer handshakes with `Halt`; its raft driver still leaves
+   on the shutdown flag on its own. Recommendation: no watchdog in this
+   plan; the fenced-shutdown path is the same one superseded primaries
+   rely on, and a hang there is a bug for both. The marker is written by
+   the tripping thread before any join, and the in-session notice runs on
+   the link-owning threads before the join too (decision 11), so even a
+   stop that hangs and is killed leaves a node that refuses to restart
+   and, in the connected case, has told the others.
 8. **Ordering against monotonic sequencer time.** (a) Make the
    monotonic-time plan a build prerequisite of step 3; (b) land steps 1 to
    5 in any order against it, but release step 5 only with or after it;
@@ -2346,7 +2598,13 @@ Beyond each step's own list:
   application and produces no reports, so it has nothing to compare an
   output digest against. A state digest (step 7) is the kind a subscriber
   could check, and would be the time to revisit this.
-- Replica-to-replica comparison and majority verdicts.
+- Replica-to-replica comparison, majority verdicts, and any attribution
+  of a divergence to one copy.
+- Raft carrying the stop (a log entry, a forwarding RPC, a persisted
+  halted state). It would reach a node that missed the data-plane notice,
+  which only the documented partition case needs, at the cost of the first
+  application data in raft and a raft storage version. Rejected for this
+  plan; revisit only if that limit is seen in practice.
 - Making `apply` deterministic: this plan detects nondeterminism; the
   determinism work removes sources of it. "Monotonic sequencer time" is the
   one this plan depends on for its release (finding 7, open question 8),
