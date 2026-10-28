@@ -4,19 +4,19 @@
 [![docs.rs](https://img.shields.io/docsrs/melin-app)](https://docs.rs/melin-app)
 [![CI](https://img.shields.io/github/actions/workflow/status/melin-engine/melin/pre-merge.yml?label=CI)](https://github.com/melin-engine/melin/actions/workflows/pre-merge.yml)
 [![MSRV](https://img.shields.io/crates/msrv/melin-app)](Cargo.toml)
-[![License: BSL-1.1](https://img.shields.io/badge/license-BSL--1.1-blue)](LICENSE)
+[![License: BUSL-1.1](https://img.shields.io/badge/license-BUSL--1.1-blue)](LICENSE)
 
-Melin is a low-latency durable replication layer for your state machine. It is the runtime under a matching engine, a ledger, or any system that records every event and must replay identically for audit while keeping tail latency inside a budget measured in microseconds. Built in Rust on an [LMAX](https://martinfowler.com/articles/lmax.html)-inspired architecture: lock-free disruptor rings, io_uring I/O with optional DPDK kernel bypass, and mechanical sympathy throughout.
+Melin is a low-latency durable replication layer for state machines. It acts as the runtime under a matching engine, a ledger, or any system that records every event and must replay identically while keeping tail latency inside a budget measured in microseconds. Built in Rust on an [LMAX](https://martinfowler.com/articles/lmax.html)-inspired architecture: lock-free disruptor rings, io_uring I/O with optional DPDK kernel bypass, and mechanical sympathy throughout.
 
 **Design partners wanted.** We are looking for one or two design partners willing to run Melin in a non-critical capacity (internal crossing, a new instrument, a parallel run alongside an existing engine) in exchange for direct engineering support and influence over the roadmap. Get in touch: [contact@melin-engine.com](mailto:contact@melin-engine.com).
 
 ## Features
 
-**Nothing is acknowledged before it is safe.** Every event is journaled and synchronously replicated before the client sees a response. The ack policy chooses what "safe" means. By default (`disk+ram`) it is one fsynced copy plus a second copy in another node's memory, so a slow disk or a dead node costs neither latency nor data. A stricter `two-disks` policy and a faster `ram` policy are available. See [replication](docs/replication.md).
+**Nothing is acknowledged before it is safe.** Every event is journaled and synchronously replicated before the client sees a response. The chosen ack policy determines what "safe" means. By default (`disk+ram`) it is one fsynced copy plus a second copy in another node's memory, so a slow disk or a dead node costs neither latency nor data. A stricter `two-disks` policy and a faster `ram` policy are available. See [replication](docs/replication.md).
 
 **Fast.** At a million events per second, p99 in the low hundreds of microseconds on kernel TCP and in the tens with DPDK kernel bypass, full round trip including persistence and replication on commodity datacenter hardware. See [Benchmarks](#benchmarks).
 
-**Deterministic replay.** Given the same journal, the application reaches the same state and emits the same output, on every node and after every restart. Melin supplies the total order and the timestamps, so your logic never reads a clock. Keeping it pure is the only rule left to you.
+**Deterministic replay.** Given the same journal, the application reaches the same state and emits the same output, on every node and after every restart. Melin supplies the total order and the timestamps, so application logic never reads a clock.
 
 **Tamper-evident history.** Per-entry CRC32C catches corruption. A BLAKE3 hash chain across segments catches rewrites, missing or foreign segments, and a node whose journal disagrees with the cluster's. See [journal](docs/journal.md).
 
@@ -46,16 +46,16 @@ Every figure is a full round trip as the client sees it: the request leaves the 
 
 ## Building an application on Melin
 
-Melin's core crates form a generic sequencer. Your application plugs in via four traits:
+Melin's core crates form a generic sequencer. An application plugs in via four traits:
 
 | Trait | Role |
 |-------|------|
-| `AppEvent` | Your journaled event type: its encoding, and the widest it can get, which the journal sizes itself from |
-| `Application` | Your business logic: receives events, produces output, snapshots and restores its state |
-| `RequestDecoder` | Turns a request's body, laid out as you define it, into your event; the runtime reads the framing |
-| `ResponseEncoder` | Writes your response's body; the runtime frames it |
+| `AppEvent` | The application's journaled event type: its encoding, and the widest it can get, which the journal sizes itself from |
+| `Application` | The business logic: receives events, produces output, snapshots and restores its state |
+| `RequestDecoder` | Turns a request's body, laid out as the application defines it, into an event; the runtime reads the framing |
+| `ResponseEncoder` | Writes a response's body; the runtime frames it |
 
-The one rule: your application must be deterministic, because every node replays the same events and must reach the same state. The [application guide](docs/building-an-application.md) walks through a complete application and sets out what that rule asks of it along with event design, retries, upgrades and testing. Everything else (transport, journaling, replication, signal handling, memory locking, CPU pinning) is handled by the runtime, and your binary becomes pure composition:
+The one rule: the application must be deterministic, because every node replays the same events and must reach the same state. The [application guide](docs/building-an-application.md) walks through a complete application and sets out what that rule asks of it along with event design, retries, upgrades and testing. Everything else (transport, journaling, replication, signal handling, memory locking, CPU pinning) is handled by the runtime, and the application's binary becomes pure composition:
 
 ```rust
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -68,9 +68,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Three examples, in order of size: [`crates/examples/echo`](crates/examples/echo) is the runtime with nothing on top, a state-free echo, and the sequencer's latency floor to measure any application against; [`crates/examples/counter`](crates/examples/counter) is the smallest application with state to keep; and [`crates/examples/notary`](crates/examples/notary) exercises the ordering and durability guarantees: a tamper-evident hash chain over client-submitted digests.
-
-On the other side of the socket, [`melin-client`](crates/core/client) speaks the wire protocol: length-prefixed framing, the Ed25519 challenge/response, the reply batch, so a client of your application is your own request and response codec and nothing else. Every example client and test harness is built on it. Like the examples, it is Apache-2.0: it is the code you link into your own client binaries. Its off-by-default `dpdk` feature runs a connection over kernel bypass on the node's own DPDK transport, which links that BUSL-1.1 code into the binary; see [Kernel bypass](docs/building-an-application.md#kernel-bypass).
+The [examples](crates/examples) (a state-free [echo](crates/examples/echo), a minimal [counter](crates/examples/counter) and a hash-chain [notary](crates/examples/notary)) are the quickest way in.
 
 ## Architecture
 
@@ -87,7 +85,7 @@ A node runs a fixed set of pinned threads connected by lock-free disruptor rings
 
 - **Reader**: one thread multiplexing every client connection, over kernel TCP with io_uring or over DPDK in userspace. Sole producer into the input ring.
 - **Journal**: its `journal-seq` thread sequences, encodes, and hash-chains events and feeds encoded batches to the replication senders. A separate `journal-disk` thread writes and syncs the batches and publishes the durability cursors. Because the two are split, a slow disk stalls neither ordering nor the replica feed.
-- **Application**: consumes the input ring in parallel with the journal. Runs your logic and publishes results to the output ring. Never waits on disk.
+- **Application**: consumes the input ring in parallel with the journal. Runs the application logic and publishes results to the output ring. Never waits on disk.
 - **Response**: drains the output ring but gates each response on the journal and replication cursors before sending it, so persist-before-ack is enforced without stalling the application.
 - **Event publisher**: broadcasts application output to subscribers (market data, audit, analytics). It reads behind the response stage, so subscribers see an event only once it is as durable as the client's reply.
 - **Shadow**: a third consumer on the input ring, gated on the journal cursor, that takes periodic snapshots without pausing the application.
@@ -108,12 +106,10 @@ The Melin Exchange Core is the reference application built on this sequencer, di
 
 Bug fixes and correctness improvements are welcome. Feature PRs will likely be closed: the roadmap is driven by the needs of the product and its design partners.
 
-By submitting a pull request, you agree to the terms of our [Contributor License Agreement](CLA.md).
+Submitting a pull request means agreeing to the terms of the [Contributor License Agreement](CLA.md).
 
 ## License
 
 Licensed under the [Business Source License 1.1](LICENSE). Production use requires a commercial license from P.L.S.C. Contact [contact@melin-engine.com](mailto:contact@melin-engine.com).
 
 Each version of the Licensed Work converts to Apache License, Version 2.0 on the fourth anniversary of its first public distribution.
-
-The examples under [`crates/examples`](crates/examples) are licensed under the [Apache License, Version 2.0](crates/examples/echo/LICENSE) from the start: they exist to be copied into your own application, and the runtime's licence does not travel with the copied code.
