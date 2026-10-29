@@ -381,6 +381,16 @@ pub struct RaftStatus {
     /// control plane is visible instead of its gauges freezing at the
     /// last-published (possibly leader) state.
     pub running: AtomicBool,
+    /// Milliseconds since a majority of the control plane last
+    /// acknowledged this node as leader, as the driver last reported it.
+    /// An atomic like its siblings: written by the driver's bridge, read
+    /// by the promotion poller and the health thread, never locked.
+    /// `u64` because openraft reports the age as one, so no conversion
+    /// can fail. Private, because it holds a sentinel
+    /// ([`Self::NO_QUORUM_ACK`]) for "none" that only
+    /// [`Self::millis_since_quorum_ack`] and
+    /// [`Self::set_millis_since_quorum_ack`] know how to read and write.
+    millis_since_quorum_ack: AtomicU64,
 }
 
 impl RaftStatus {
@@ -391,8 +401,15 @@ impl RaftStatus {
     pub const ROLE_CANDIDATE: u8 = 2;
     pub const ROLE_LEADER: u8 = 3;
 
-    /// Fresh status for node `node_id`: follower, term 0, no leader,
-    /// running.
+    /// The stored quorum-ack age meaning "none" (not leading, or never
+    /// acknowledged). `u64::MAX` and never 0, because 0 is a real age:
+    /// "acknowledged just now". An age of `u64::MAX` ms (half a billion
+    /// years) collides with it and reads back as none; both mean "no
+    /// recent majority", so the collision changes no decision.
+    const NO_QUORUM_ACK: u64 = u64::MAX;
+
+    /// Fresh status for node `node_id`: follower, term 0, no leader, no
+    /// quorum ack, running.
     pub fn new(node_id: u64) -> Self {
         Self {
             node_id,
@@ -400,17 +417,39 @@ impl RaftStatus {
             leader_id: AtomicU64::new(0),
             role: std::sync::atomic::AtomicU8::new(Self::ROLE_FOLLOWER),
             running: AtomicBool::new(true),
+            millis_since_quorum_ack: AtomicU64::new(Self::NO_QUORUM_ACK),
+        }
+    }
+
+    /// Publish the age of this node's last majority acknowledgement as
+    /// leader, in milliseconds; `None` when it is not leading or has never
+    /// been acknowledged.
+    pub fn set_millis_since_quorum_ack(&self, age: Option<u64>) {
+        self.millis_since_quorum_ack
+            .store(age.unwrap_or(Self::NO_QUORUM_ACK), Ordering::Relaxed);
+    }
+
+    /// The age last published by [`Self::set_millis_since_quorum_ack`]:
+    /// `None` when the node is not leading, has never been acknowledged,
+    /// or its driver has stopped. An age of `u64::MAX` also reads as
+    /// `None` (see the sentinel's comment).
+    pub fn millis_since_quorum_ack(&self) -> Option<u64> {
+        match self.millis_since_quorum_ack.load(Ordering::Relaxed) {
+            Self::NO_QUORUM_ACK => None,
+            age => Some(age),
         }
     }
 
     /// Mark the driver stopped: clears leadership (role → follower,
-    /// leader → none) so `melin_raft_is_leader` cannot stay stuck at 1
-    /// on a node whose control plane has died, and drops
+    /// leader → none, quorum-ack age → none) so `melin_raft_is_leader`
+    /// cannot stay stuck at 1, nor the age frozen at a fresh value, on a
+    /// node whose control plane has died, and drops
     /// `melin_raft_driver_running` to 0. The term is left as-is — its
     /// last value is still meaningful for correlating the outage.
     pub fn mark_stopped(&self) {
         self.role.store(Self::ROLE_FOLLOWER, Ordering::Relaxed);
         self.leader_id.store(0, Ordering::Relaxed);
+        self.set_millis_since_quorum_ack(None);
         self.running.store(false, Ordering::Relaxed);
     }
 }
@@ -560,6 +599,8 @@ struct RaftSnapshot {
     leader_id: u64,
     role: u8,
     running: bool,
+    /// [`RaftStatus::millis_since_quorum_ack`]; `None` omits the series.
+    quorum_ack_age_ms: Option<u64>,
 }
 
 impl HealthSnapshot {
@@ -811,6 +852,7 @@ impl HealthSnapshot {
                 leader_id: r.leader_id.load(Ordering::Relaxed),
                 role: r.role.load(Ordering::Relaxed),
                 running: r.running.load(Ordering::Relaxed),
+                quorum_ack_age_ms: r.millis_since_quorum_ack(),
             }),
         }
     }
@@ -1061,6 +1103,18 @@ impl HealthSnapshot {
                 u8::from(raft.running && raft.role == RaftStatus::ROLE_LEADER),
                 u8::from(raft.running),
             );
+            // Omitted rather than exported as a number when there is no
+            // age (not leading, never acknowledged), and when the driver
+            // has stopped: a dead control plane must not show a fresh
+            // lease. Best-effort like the block above.
+            if let Some(age) = raft.quorum_ack_age_ms.filter(|_| raft.running) {
+                let _ = write!(
+                    c,
+                    "# HELP melin_raft_quorum_ack_age_ms Milliseconds since a majority of the control plane last acknowledged this node as leader; absent when not leading or not yet acknowledged.\n\
+                     # TYPE melin_raft_quorum_ack_age_ms gauge\n\
+                     melin_raft_quorum_ack_age_ms {age}\n",
+                );
+            }
         }
         c.position() as usize
     }
@@ -1334,6 +1388,7 @@ mod tests {
             .store(RaftStatus::ROLE_LEADER, Ordering::Relaxed);
         status.leader_id.store(7, Ordering::Relaxed);
         status.term.store(4, Ordering::Relaxed);
+        status.set_millis_since_quorum_ack(Some(0));
 
         status.mark_stopped();
 
@@ -1343,8 +1398,25 @@ mod tests {
         );
         assert_eq!(status.leader_id.load(Ordering::Relaxed), 0);
         assert!(!status.running.load(Ordering::Relaxed));
+        // A dead driver must not leave a fresh lease behind.
+        assert_eq!(status.millis_since_quorum_ack(), None);
         // Term is deliberately retained for outage correlation.
         assert_eq!(status.term.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn raft_status_quorum_ack_age_round_trips_through_its_sentinel() {
+        let status = RaftStatus::new(7);
+        assert_eq!(status.millis_since_quorum_ack(), None, "fresh status");
+        // 0 is "acknowledged just now", not the sentinel.
+        for age in [Some(0), Some(1234), None] {
+            status.set_millis_since_quorum_ack(age);
+            assert_eq!(status.millis_since_quorum_ack(), age);
+        }
+        // The one value that collides with the sentinel reads as none;
+        // both refuse, so the collision is harmless.
+        status.set_millis_since_quorum_ack(Some(u64::MAX));
+        assert_eq!(status.millis_since_quorum_ack(), None);
     }
 
     #[test]
@@ -1360,6 +1432,7 @@ mod tests {
         raft.role.store(RaftStatus::ROLE_LEADER, Ordering::Relaxed);
         raft.leader_id.store(2, Ordering::Relaxed);
         raft.term.store(7, Ordering::Relaxed);
+        raft.set_millis_since_quorum_ack(Some(42));
         let fence = Arc::new(crate::fence::FenceState::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -1377,6 +1450,11 @@ mod tests {
         assert!(body.contains("melin_raft_term 7\n"), "{body}");
         assert!(body.contains("melin_raft_is_leader 1\n"), "{body}");
         assert!(body.contains("melin_raft_driver_running 1\n"), "{body}");
+        assert!(
+            body.contains("# TYPE melin_raft_quorum_ack_age_ms gauge\n"),
+            "{body}"
+        );
+        assert!(body.contains("melin_raft_quorum_ack_age_ms 42\n"), "{body}");
         // A replica is following, not accepting client writes.
         assert!(body.contains("melin_trading_active 0\n"), "{body}");
 
@@ -1394,6 +1472,7 @@ mod tests {
         let raft = Arc::new(RaftStatus::new(3));
         raft.role.store(RaftStatus::ROLE_LEADER, Ordering::Relaxed);
         raft.leader_id.store(3, Ordering::Relaxed);
+        raft.set_millis_since_quorum_ack(Some(5));
         raft.mark_stopped();
         let fence = Arc::new(crate::fence::FenceState::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1409,9 +1488,47 @@ mod tests {
         let body = http_request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
         assert!(body.contains("melin_raft_is_leader 0\n"), "{body}");
         assert!(body.contains("melin_raft_driver_running 0\n"), "{body}");
+        assert!(!body.contains("melin_raft_quorum_ack_age_ms"), "{body}");
 
         shutdown.store(true, Ordering::Relaxed);
         handle.join().unwrap();
+    }
+
+    /// The Prometheus body for a replica whose control plane is `raft`,
+    /// formatted straight from a snapshot (no listener).
+    fn replica_prometheus_body(raft: &Arc<RaftStatus>) -> String {
+        let state = HealthState::for_replica(
+            Arc::new(crate::fence::FenceState::new(0)),
+            Some(Arc::clone(raft)),
+            Arc::new(AtomicBool::new(true)),
+        );
+        let mut buf = [0u8; 16384];
+        let len = HealthSnapshot::collect(&state).write_prometheus(&mut buf);
+        String::from_utf8(buf[..len].to_vec()).unwrap()
+    }
+
+    #[test]
+    fn quorum_ack_age_gauge_only_on_a_running_acknowledged_leader() {
+        let raft = Arc::new(RaftStatus::new(4));
+        raft.role.store(RaftStatus::ROLE_LEADER, Ordering::Relaxed);
+        raft.leader_id.store(4, Ordering::Relaxed);
+
+        // A leader never acknowledged by a majority exports no age.
+        let body = replica_prometheus_body(&raft);
+        assert!(body.contains("melin_raft_is_leader 1\n"), "{body}");
+        assert!(!body.contains("melin_raft_quorum_ack_age_ms"), "{body}");
+
+        // 0 is a real age ("just now"), exported as such.
+        raft.set_millis_since_quorum_ack(Some(0));
+        let body = replica_prometheus_body(&raft);
+        assert!(body.contains("melin_raft_quorum_ack_age_ms 0\n"), "{body}");
+
+        // A snapshot that saw the driver stopped before the age was
+        // cleared (the stores are independent) still omits it.
+        raft.running.store(false, Ordering::Relaxed);
+        let body = replica_prometheus_body(&raft);
+        assert!(body.contains("melin_raft_driver_running 0\n"), "{body}");
+        assert!(!body.contains("melin_raft_quorum_ack_age_ms"), "{body}");
     }
 
     #[test]
@@ -2614,7 +2731,7 @@ mod tests {
             journal_utilization: Arc::new(StageUtilization::new()),
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
-            raft: None,
+            raft: Some(full_raft_status()),
         };
 
         let handle = std::thread::spawn(move || {
@@ -2623,6 +2740,19 @@ mod tests {
 
         let body = http_request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
         (body, shutdown, handle)
+    }
+
+    /// A raft status emitting every `melin_raft_*` gauge at its widest:
+    /// a running leader with an acknowledged quorum, its term, ids and age
+    /// one short of `u64::MAX` (the age's "none" sentinel), so the body
+    /// size test measures the longest raft section the endpoint can write.
+    fn full_raft_status() -> Arc<RaftStatus> {
+        let raft = Arc::new(RaftStatus::new(u64::MAX - 1));
+        raft.term.store(u64::MAX - 1, Ordering::Relaxed);
+        raft.leader_id.store(u64::MAX - 1, Ordering::Relaxed);
+        raft.role.store(RaftStatus::ROLE_LEADER, Ordering::Relaxed);
+        raft.set_millis_since_quorum_ack(Some(u64::MAX - 1));
+        raft
     }
 
     #[test]
@@ -3088,9 +3218,14 @@ mod tests {
             .nth(1)
             .expect("HTTP head separator present");
 
+        // Every raft gauge is in the measured body, at its widest.
+        assert!(
+            metrics_body.contains(&format!("melin_raft_quorum_ack_age_ms {}\n", u64::MAX - 1)),
+            "fixture's raft section missing: {metrics_body}"
+        );
+
         // The body buffer in handle_health_connection is 16384 bytes.
-        // Today's body is around 6.5 KiB without the raft gauges; keep
-        // 25 % headroom and fail loudly if we ever drift past it. The
+        // Keep 25 % headroom and fail loudly if we ever drift past it. The
         // point of this test is to fire before silent truncation, not
         // to track the exact size.
         const BODY_BUF: usize = 16384;

@@ -215,6 +215,16 @@ fn await_single_leader(nodes: &[&Node]) -> u64 {
 }
 
 impl Cluster {
+    fn status(&self, id: u64) -> &RaftStatus {
+        &self
+            .nodes
+            .iter()
+            .find(|n| n.id == id)
+            .unwrap()
+            .handles
+            .status
+    }
+
     fn stop_node(&mut self, id: u64) {
         let node = self.nodes.iter_mut().find(|n| n.id == id).unwrap();
         node.shutdown.store(true, Ordering::Relaxed);
@@ -272,6 +282,104 @@ fn three_nodes_elect_exactly_one_leader_and_reelect_on_leader_loss() {
         second_term > first_term,
         "re-election must advance the term ({second_term} vs {first_term}) — \
          term-mints-epoch depends on this"
+    );
+
+    cluster.stop_all();
+}
+
+/// Wait until `status` reports a quorum-ack age: a new leader's first
+/// majority acknowledgement lands one round trip after its election.
+fn await_quorum_ack(status: &RaftStatus) -> u64 {
+    let deadline = Instant::now() + ELECTION_DEADLINE;
+    loop {
+        if let Some(age) = status.millis_since_quorum_ack() {
+            return age;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the leader reported no quorum ack within {ELECTION_DEADLINE:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Pins the driver's liveness assertion empirically: a leader whose
+/// peers all answer never reports an age the promotion filter refuses.
+#[test]
+fn a_healthy_leaders_quorum_ack_age_stays_under_the_gate() {
+    const SAMPLE_FOR: Duration = Duration::from_secs(3);
+    // The age peaks (about one tick) only between a heartbeat's send and
+    // its reply, a round trip, and reads near 0 the rest of the time: a
+    // coarse sampler never sees the peak this test is about.
+    const SAMPLE_EVERY: Duration = Duration::from_millis(1);
+
+    let mut cluster = start_cluster(3);
+    let refs: Vec<&Node> = cluster.nodes.iter().collect();
+    let leader = await_single_leader(&refs);
+    let status = cluster.status(leader);
+    let mut max_age = await_quorum_ack(status);
+
+    let end = Instant::now() + SAMPLE_FOR;
+    while Instant::now() < end {
+        assert_eq!(
+            status.role.load(Ordering::Relaxed),
+            RaftStatus::ROLE_LEADER,
+            "node {leader} lost leadership in a healthy cluster"
+        );
+        let age = status
+            .millis_since_quorum_ack()
+            .expect("an acknowledged leader keeps reporting an age");
+        max_age = max_age.max(age);
+        std::thread::sleep(SAMPLE_EVERY);
+    }
+    // Reported so the margin can be re-measured (plan §7 Q1).
+    eprintln!("healthy leader {leader}: max quorum-ack age {max_age} ms");
+    assert!(
+        Duration::from_millis(max_age) <= crate::QUORUM_ACK_MAX_AGE,
+        "a healthy leader reported a quorum-ack age of {max_age} ms, past the \
+         {:?} promotion gate",
+        crate::QUORUM_ACK_MAX_AGE
+    );
+
+    cluster.stop_all();
+}
+
+/// Pins the premise of the promotion gate: openraft 0.9 has no
+/// check-quorum, so a leader cut off from every peer keeps its role, and
+/// only its ageing quorum ack tells it apart from a healthy one. If this
+/// fails, openraft changed and the gate's design must be revisited.
+#[test]
+fn a_leader_that_loses_both_peers_keeps_leading_and_its_ack_ages() {
+    let mut cluster = start_cluster(3);
+    let refs: Vec<&Node> = cluster.nodes.iter().collect();
+    let leader = await_single_leader(&refs);
+    await_quorum_ack(cluster.status(leader));
+
+    let followers: Vec<u64> = cluster
+        .nodes
+        .iter()
+        .map(|n| n.id)
+        .filter(|&id| id != leader)
+        .collect();
+    for id in followers {
+        cluster.stop_node(id);
+    }
+    std::thread::sleep(crate::QUORUM_ACK_MAX_AGE + Duration::from_secs(1));
+
+    let status = cluster.status(leader);
+    assert!(status.running.load(Ordering::Relaxed));
+    assert_eq!(
+        status.role.load(Ordering::Relaxed),
+        RaftStatus::ROLE_LEADER,
+        "a leader with no reachable peer stepped down: openraft gained check-quorum"
+    );
+    let age = status
+        .millis_since_quorum_ack()
+        .expect("a leader acknowledged once keeps reporting an age");
+    assert!(
+        Duration::from_millis(age) > crate::QUORUM_ACK_MAX_AGE,
+        "the quorum-ack age ({age} ms) did not grow past the {:?} gate with both peers gone",
+        crate::QUORUM_ACK_MAX_AGE
     );
 
     cluster.stop_all();

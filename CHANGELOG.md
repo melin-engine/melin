@@ -17,9 +17,22 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 - **`melin_pipeline::spsc::Producer::push_with_unless`**: the blocking
   push, given up with `Stopped`, having written nothing, if a stop flag is
   set while it waits for room. A push with room never reads the flag.
+- **`melin_raft_quorum_ack_age_ms` gauge**: on the node leading the
+  control plane, the milliseconds since a majority last acknowledged its
+  leadership; absent on other nodes and before the first
+  acknowledgement. A leader cut off from its peers keeps its role, so a
+  growing value is the one sign that it has lost its majority.
+- **`melin_raft::QUORUM_ACK_MAX_AGE`**: the oldest quorum acknowledgement
+  the automatic-promotion policy accepts, half the control plane's
+  leader lease.
 
 ### Changed
 
+- **`melin_transport_core::health::RaftStatus` gains a private field**
+  (the quorum-ack age, read and written through
+  `millis_since_quorum_ack` and `set_millis_since_quorum_ack`), so it can
+  no longer be built with a struct literal outside the crate; build it
+  with `RaftStatus::new`.
 - **A node sends its control-plane traffic from the address its
   `--raft-bind` names.** When that is a specific IP rather than
   `0.0.0.0` or `::`, outgoing control-plane connections are bound to it

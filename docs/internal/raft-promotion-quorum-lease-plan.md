@@ -657,7 +657,11 @@ rewritten from this record:
     `Some(0)` stays `Some(0)`, `Some(1234)`, and `Some(u64::MAX)` reads
     `None`. Extend `replica_health_endpoint_serves_raft_gauges_and_reports_halted`
     (gauge present with value), and `stopped_driver_clears_is_leader_gauge`
-    plus a never-acked leader (gauge absent).
+    (gauge absent after `mark_stopped`), plus
+    `quorum_ack_age_gauge_only_on_a_running_acknowledged_leader`, which
+    formats a snapshot directly: a never-acked leader (absent), an age of
+    0 (present, 0), and a snapshot with the driver stopped but the age
+    not yet cleared (absent: the `running` condition on its own).
   - `driver.rs` unit tests: `publish_metrics` with
     `RaftMetrics::new_initial` as a leader with `Some(7)` gives `Some(7)`;
     as a follower with `None` gives `None`. `heartbeat_interval_ms` over
@@ -669,8 +673,17 @@ rewritten from this record:
   - `crates/core/raft/src/tests/election.rs`, using its `Cluster`,
     `await_single_leader` and `stop_node`:
     - `a_healthy_leaders_quorum_ack_age_stays_under_the_gate`: sample the
-      leader's status every 50 ms for 3 s and assert the max ≤
+      leader's status every 1 ms for 3 s and assert the max ≤
       `QUORUM_ACK_MAX_AGE`. This pins the liveness assertion empirically.
+      Not every 50 ms, as first planned: the reported age reaches about a
+      tick only between a heartbeat's send and its reply (one round trip,
+      sub-millisecond on loopback) and reads near 0 otherwise, so a 50 ms
+      sampler saw 0 to 1 ms and never the peak.
+      Measured while implementing (2026-10-29, Apple Silicon aarch64,
+      Linux 6.19 Asahi, `cargo test` debug build, alone and beside other
+      test suites; nextest was not installed): the peak was the leader's
+      tick period minus a millisecond or so, 355 to 467 ms (ids 1 to 3),
+      never near 1000 ms.
     - `a_leader_that_loses_both_peers_keeps_leading_and_its_ack_ages`:
       stop both followers and wait `QUORUM_ACK_MAX_AGE` + 1 s. Assert the
       leader still reports `ROLE_LEADER` (pins the no-check-quorum
@@ -973,7 +986,8 @@ each answer went.
 
 - **Q1 Threshold (decided: 1000 ms).** Re-measure with the step 2
   election test under `cargo nextest` load. If the healthy max gets near
-  1000, revisit with the user.
+  1000, revisit with the user. Step 2 measured 355 to 467 ms, one tick
+  (the record is under step 2).
 - **Q2 Bridge latency (resolved).** The nudge cannot stall the bridge; no
   loop change. The confirmation's deadline is taken before the send
   (step 4).
