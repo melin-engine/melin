@@ -248,6 +248,14 @@ current code.
   factory into each `RaftClient`. A bind failure is an `io::Error` on the
   connect path, so openraft backs off and retries as for any other
   connect failure; log at `debug!` with the peer and the IP.
+- Startup refusal (decided with the user, open-questions Q14 option 3):
+  a node whose raft `bind` IP is specific and of a different address
+  family from any configured `--raft-peer` refuses to start, naming the
+  bind and the peer. Its control plane could never dial that peer, and the
+  operator should learn it at boot rather than from logs. Pure check over
+  `RaftConfig`, unit-tested per family combination (v4/v4, v6/v6,
+  unspecified/either pass; v4/v6 and v6/v4 refuse). CHANGELOG
+  **Changed**.
 - Production effect: on a multi-homed host a node bound to one interface
   now sends its raft traffic from that interface too, matching what peers
   see in their firewall rules. A node whose raft listener is bound to a
@@ -635,11 +643,14 @@ follow-up).
   leader at term >= 1 exists. openraft should reject its vote (follower
   lease, and a single-term leader id it cannot beat) and overwrite its log
   on the first append, but the existing tests exercise only concurrent
-  initialisation or a stored-state restart. Confirm the bring-up converges
-  to the replica leader without a re-election (assert the leader's id and
-  term are unchanged after node 1 joins), since step 1's positive test and
-  every later integration case depend on it. If it does not, start node 1
-  with a delayed or skipped `initialize` and say why.
+  initialisation or a stored-state restart. **To test in step 1b:**
+  `start_replicas_first()` asserts the leader's id and term are unchanged
+  after node 1 joins, and `replica_leader_promotes_when_the_primary_dies`
+  is run repeatedly before step 1b is committed. Step 1's positive test
+  and every later integration case depend on it. The fallback options
+  (open-questions Q10) are deferred until that test says they are
+  needed; one of them touches `RaftConfig`'s public API and would need the
+  user.
 - **Q11 Term of `read_log_id`.** `get_read_log_id` returns
   `max(leader's first log id of the term, committed)`. If its
   `leader_id` term always equals the confirming leader's current term,
@@ -692,6 +703,47 @@ follow-up).
   The harness's `isolate_from_primary` makes both cases testable. Add a
   characterisation test for the writes-flowing case (asserting no
   promotion), and record the idle case in §10 until the follow-up lands.
+- **Not addressed (follow-up): stale peer tips.** `PeerTips::record_at`
+  overwrites unconditionally, so an old frame arriving after a newer one
+  on another connection to the same peer regresses the stored tip and
+  looks fresh. If that makes the faster replica look level with the
+  slower one when the slower one decides, the peer-tip veto passes and
+  acknowledged writes can be lost. The reply path is bounded by the RPC
+  timeout; the request path is not. Unlikely, but the outcome is the worst
+  class, so it gets its own branch, **after everything in this plan**
+  (decided with the user). The sender stamps every envelope with a boot
+  identifier and a per-frame counter, the counter taken in the same
+  critical section as the tip read so that counter order is tip-read
+  order (decided). The receiver drops anything older than the newest it
+  has seen, and a dropped frame does not refresh the peer's last-heard
+  time. The boot identifier is a kernel boot stamp, not persisted
+  (decided): the host's `/proc/sys/kernel/random/boot_id` plus the
+  process start time from `CLOCK_BOOTTIME`. Within one host boot, process
+  starts are strictly ordered (`CLOCK_BOOTTIME` is monotonic and not
+  stepped by NTP), so a stale frame from an earlier process is dropped;
+  across host boots, a different boot id replaces the stored one (the old
+  kernel is gone, so no old-boot frame can still be in flight). Rejected:
+  a persisted counter, because losing or rewinding that state makes
+  peers drop every frame from the node, it looks `Silent`, the veto skips
+  it, and the bug returns; a random nonce, because nonces are unordered
+  (a stale frame after a restart regresses the tip for a heartbeat, and a
+  "retire the old nonce" rule can drop a live process for good). The
+  helper lives in `melin-transport-core` (which already depends on
+  `libc`); an unreadable `boot_id` refuses startup rather than falling
+  back. A VM snapshot restore rewinds clocks, memory and disk together;
+  that is a hazard shared with the journal, for the operator docs, not
+  this design.
+  The release introducing the raft protocol version must be guaranteed
+  undecodable by today's `RpcFrame` decoder, pinned by a test against a
+  frozen copy of it.
+- **Prerequisite of both follow-ups: a raft protocol version.** Neither
+  `RpcFrame` (`wire.rs`) nor the raft handshake (`auth.rs`, which reuses
+  only the replication challenge/response frames) carries a version, so a
+  raft envelope change between releases is undiagnosable, and a postcard
+  layout change could be misdecoded rather than refused. The follow-up
+  branch should first add a `RAFT_PROTOCOL_VERSION` exchanged right after
+  authentication, refusing a mismatch with an error naming both versions
+  (the replication handshake's pattern), then change the envelope.
 
 ## 9. Coverage
 
