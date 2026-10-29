@@ -22,17 +22,25 @@ Status per question:
 - **resolved by reading**: the code answers it; the answer is cited.
 - **needs experiment**: reading narrows it, but a run decides. The
   experiment and the result that selects each option are given.
-- **needs decision**: a trade-off the user owns.
+- **decided**: the user has decided; the decision is recorded in the
+  plan, and the analysis below is kept for its reasoning only.
+
+Every recommendation below has been adopted in the plan, in the step
+named under each question, except where a question says otherwise and
+why. The plan's §7 lists where each one landed.
 
 ---
 
 ## Q1. The gate threshold (decided: 1000 ms)
 
 **Question.** Is `QUORUM_ACK_MAX_AGE` = `LEADER_LEASE_MS / 2` = 1000 ms
-right? The safety assertion (1), the liveness assertion (2) and the
-transient-refusal behaviour of §5 all hang on it.
+right? The liveness assertion and the transient-refusal behaviour of the
+plan's §5 hang on it. Since the mint-time quorum confirmation carries the
+safety claim, the threshold is an early filter only (plan §4), and the
+plan no longer carries a safety assertion over it.
 
-**Decision recorded.** 1000 ms, agreed with the user. Not reopened here.
+**Decision recorded.** 1000 ms, agreed with the user (plan §5). Not
+reopened here.
 
 **Residual risks, and how the plan checks each.**
 
@@ -44,30 +52,31 @@ transient-refusal behaviour of §5 all hang on it.
   raft core also runs the RPC server, the bridge, the state-machine worker
   and inline `fsync`s (see Q2). Check:
   `a_healthy_leaders_quorum_ack_age_stays_under_the_gate` (step 2), re-run
-  under full-suite load as Q1 already asks; liveness assertion 2 is the
+  under full-suite load as plan §7 Q1 asks; the liveness assertion is the
   compile-time form.
-- *The staleness bound of §4 assumes the driver thread is not blocked.*
+- *The reported age lags when the driver thread is blocked.*
   `FileLogStore::save_vote` and `FileLogStore::append`
   (`crates/core/raft/src/storage.rs`) call `sync_data` inline on the raft
-  runtime thread, so a slow disk delays the flush and the bridge store
-  past `MAX_TICK_PERIOD` + `METRICS_BRIDGE_POLL`. The gate then reads an
-  age younger than the truth by up to the stall. Likelihood: low (those
-  writes happen on elections and membership entries, not on heartbeats),
-  impact: the decision-time gate is optimistic for that long. Check: none
-  at decision time, by design; the mint-time quorum round trip (step 4)
-  does not read the metric and is the backstop, and its bound is timed on
-  the server thread, so a stall there refuses rather than mints late (Q2).
+  runtime thread, so a slow disk delays the flush and the bridge store.
+  The filter then reads an age younger than the truth by up to the stall.
+  Likelihood: low (those writes happen on elections and membership
+  entries, not on heartbeats), impact: the filter passes when it should
+  not, which costs an abandoned promotion, not safety. Check: none at
+  decision time, by design; the mint-time quorum round trip (step 4) does
+  not read the metric, and its deadline is timed on the server thread, so
+  a stall there refuses rather than mints late (Q2).
 - *A future openraft changes the lease.* `leader_lease` is
   `election_timeout_max` (`EngineConfig::new`) and is applied in
   `Engine::handle_vote_req` only to a committed vote. A version that
-  changes either invalidates assertion 1. Check: the locked 0.9.25, the
+  changes either invalidates the mint-time safety assertion. Check: the locked 0.9.25, the
   re-derive comment beside the `"0.9"` requirement, and
   `a_leader_that_loses_both_peers_keeps_leading_and_its_ack_ages`, which
   fails if check-quorum appears or the age stops growing. A downstream
   build resolving a later 0.9.x is not covered (plan §10).
 - *Clock-rate drift between nodes.* The lease is timed on the follower's
-  clock, the age on the leader's. Covered by `SCHEDULING_SLACK_MS` in
-  assertion 1; not testable at run time (plan §10).
+  clock, the confirmation's deadline on the leader's. Covered by
+  `SCHEDULING_SLACK_MS` in the mint-time safety assertion; not testable
+  at run time (plan §10).
 
 ---
 
@@ -75,8 +84,11 @@ transient-refusal behaviour of §5 all hang on it.
 
 **Question.** Can `raft.trigger().elect().await` in the `driver_main`
 bridge loop stall the metric stores for anywhere near
-`SCHEDULING_SLACK_MS`? If so, the stores move ahead of the nudge. The
-staleness term `METRICS_BRIDGE_POLL` in assertion 1 depends on it.
+`SCHEDULING_SLACK_MS`? If so, the stores move ahead of the nudge. An
+earlier draft of the plan had a safety assertion over the bridge's
+staleness that depended on it; the plan has since dropped that assertion
+(the decision-time check is an early filter, plan §4), so the answer now
+only affects how promptly the filter sees a fresh age.
 
 **Resolved by reading: the nudge cannot stall.** `Trigger::elect`
 (`raft/trigger.rs`) calls `RaftInner::send_external_command`
@@ -94,18 +106,13 @@ the raft storage `fsync`s inline (`FileLogStore::save_vote` through
 `write_file_atomic`, `FileLogStore::append` with `sync_data`). A stall
 there delays every task on the thread, the bridge included. That matters
 little at decision time (Q1). It does not threaten the mint-time bound,
-because step 4 already times that bound on the server thread:
-`LeaderConfirm::confirm` blocks in
-`recv_timeout(LEADER_CONFIRM_TIMEOUT + SCHEDULING_SLACK)` right after its
-own `send`, and the driver cannot start `get_read_log_id` (C) before it
-has received that request. A reply that arrives at all therefore arrives
-within the backstop of roughly C on the server thread's clock, and the
-publish follows with nothing blocking in between. A stalled runtime turns
-into a `TimedOut` refusal, never a late mint, so assertion 4 holds however
-long the raft thread stalls. The one gap is small: the backstop's clock
-starts at the `recv_timeout` call, not at the `send`, so a server thread
-preempted between the two, while the driver has already started C,
-stretches the window by the length of that preemption.
+because step 4 times that bound on the server thread: the driver cannot
+start `get_read_log_id` (C) before it has received the request, so a
+reply that arrives at all arrives within the server thread's deadline,
+and a stalled runtime turns into a `TimedOut` refusal, never a late mint.
+The draft this question was written against started that deadline at the
+wait rather than before the `send`, leaving a preemption gap between the
+two; option 3 closes it.
 
 **Options.**
 
@@ -129,7 +136,9 @@ stretches the window by the length of that preemption.
    `recv_timeout(deadline.saturating_duration_since(Instant::now()))`.
    That instant precedes C, so the backstop then bounds the whole window
    from a conservative lower bound on C, preemption between `send` and
-   the wait included.
+   the wait included. (As analysed; the adopted form below drops the
+   driver-side timeout and moves the slack out of the deadline into the
+   mint-time assertion.)
    - Pros: closes the one gap above. It is an implementation detail of
      `confirm`: no new refusal, no new error variant, no change to agreed
      behaviour (the same `TimedOut`, the same total bound).
@@ -139,7 +148,7 @@ stretches the window by the length of that preemption.
      for a large part of the slack at exactly that point; a wrong
      `saturating_duration_since` (a negative duration) is ruled out by
      the saturating form.
-   - Value: the bound of assertion 4 is then measured from before C on
+   - Value: the mint-time safety bound is then measured from before C on
      the thread that publishes, with no window outside it.
    - Cost: small (two lines in `confirm`; a test with a driver stub that
      replies just past the deadline and expects `TimedOut`).
@@ -152,15 +161,28 @@ anchoring the backstop's deadline before the send closes the one
 preemption gap without changing step 4's behaviour, so the implementer
 can settle it.
 
+**Adopted (plan step 4), simplified.** Once the deadline is taken before
+the send, it alone bounds the window from before C, so the driver-side
+timeout adds nothing and the plan drops it: `confirm` takes
+`deadline = Instant::now() + LEADER_CONFIRM_TIMEOUT` before `send` and
+waits on what is left of it. The mint-time safety assertion becomes
+`LEADER_CONFIRM_TIMEOUT_MS + SCHEDULING_SLACK_MS < LEADER_LEASE_MS`, with
+the slack covering reply-to-publish and clock drift. The step 4 test with
+a late-replying stub pins only that a late reply is refused; it cannot
+pin the anchoring, since the send is a non-blocking enqueue and the two
+orders differ by nanoseconds. The anchoring is held by `deadline` being
+the first statement of `confirm`, with a comment, and is listed as
+untested in plan §10.
+
 ---
 
 ## Q3. Torn reads of term and age
 
 **Question.** The bridge stores term, leader, role and (new) age as
 separate `Relaxed` atomics, and the poller reads them separately. Can a
-fresh age from term *t* pair with term *t′ > t*? The plan relies on a
-timing argument plus a term double-read; the alternative is a
-Release/Acquire seqlock.
+fresh age from term *t* pair with term *t′ > t*? An earlier draft relied
+on a timing argument plus a term double-read; the alternatives are a
+single read or a Release/Acquire seqlock.
 
 **Resolved by reading: the timing argument holds, and the mint-time check
 makes any residual tear harmless.**
@@ -206,16 +228,31 @@ makes any residual tear harmless.**
 
 **Options.**
 
-1. **`Relaxed` plus the term double-read** (the plan).
+0. **`Relaxed`, each value read once.**
+   - Pros: no change to the bridge's memory model, no extra code or test.
+     The term filed with the request is the one the mint confirms
+     exactly (Q11).
+   - Cons: a tear goes undetected at decision time.
+   - Risk: low. A tear can let the filter pass for one poll, or file a
+     term the node no longer leads in; either way the mint-time
+     confirmation refuses (at worst an abandoned promotion and an exit,
+     which needs a tear across a re-election, shown above to be many
+     bridge stores apart).
+   - Value: the guarantee the other options aim at already comes from
+     step 4.
+   - Cost: none.
+1. **`Relaxed` plus the term double-read** (an earlier draft of the plan).
    - Pros: no change to the bridge's memory model; the double-read
      catches a tear across a term change in the common case.
-   - Cons: not a guarantee on weakly ordered hardware (aarch64), as the
-     plan says.
+   - Cons: not a guarantee on weakly ordered hardware (aarch64). It only
+     catches a store landing between two loads nanoseconds apart, and
+     not a stale-but-coherent term, which is what a cross-location
+     `Relaxed` tear actually is.
    - Risk: low. A missed tear lets an early filter pass for one poll, and
      the mint-time confirmation still refuses.
-   - Value: cheap insurance, plus a test hook (`consider_auto_promotion`
-     refusing on a term change).
-   - Cost: small.
+   - Value: little beyond option 0: what it catches, the mint already
+     refuses.
+   - Cost: small (a second load, a refusal path and its test).
 2. **Seqlock-style Release/Acquire** (bridge stores age then term with
    `Release`; reader loads term, age, term with `Acquire`).
    - Pros: an actual guarantee that age and term are from one store.
@@ -238,10 +275,12 @@ makes any residual tear harmless.**
    - Value: moderate, if a guarantee were needed.
    - Cost: medium (API churn in a published crate).
 
-**Recommendation.** Option 1. The timing argument holds by reading,
-openraft never carries an age across leaderships, and the exact term
-check at mint time (Q11) makes acting on a torn read harmless. A stronger
-ordering would duplicate what step 4 already proves.
+**Recommendation.** Option 0, adopted in plan step 3. The timing argument
+holds by reading, openraft never carries an age across leaderships, and
+the exact term check at mint time (Q11) makes acting on a torn read
+harmless. The double-read (option 1, recommended in an earlier version of
+this analysis) and any stronger ordering would duplicate, weakly or
+fully, what step 4 already proves.
 
 ---
 
@@ -253,7 +292,7 @@ still leads? Step 4 depends on it.
 **Decision recorded.** A real quorum confirmation
 (`Raft::get_read_log_id`, bounded by `LEADER_CONFIRM_TIMEOUT`) right
 before the `EpochBump` publish; on failure the node publishes nothing and
-exits with an error. Not reopened here.
+exits with an error (plan step 4). Not reopened here.
 
 **Residual risks, and how the plan checks each.**
 
@@ -267,24 +306,26 @@ exits with an error. Not reopened here.
 - *Liveness depends on a supervisor.* Exit-on-failure assumes something
   restarts the process; without one, an abandoned promotion leaves the
   node down. Check: none in code; the plan's `docs/replication.md` text
-  should say that the node exits and must be restarted (it says
-  "restarting it rejoins it as a replica").
+  says that the node exits and must be restarted by its supervisor
+  (adopted, step 4).
 - *A stalled raft runtime during the confirmation* (Q2). Not a safety
-  risk: `recv_timeout(LEADER_CONFIRM_TIMEOUT + SCHEDULING_SLACK)` on the
-  server thread starts before the driver can start C, so a stall becomes
+  risk: the confirmation's deadline is taken on the server thread before
+  the request is sent, so before the driver can start C; a stall becomes
   a `TimedOut` refusal, and the publish follows an in-time reply with
-  nothing blocking. Residual: the backstop's clock starts at the wait,
-  not the send, so a server thread preempted between the two stretches
-  the window by that preemption. Q2 option 3 anchors the deadline before
-  the send. Check: a `confirm` test with a driver stub that replies past
-  the deadline.
+  nothing blocking. Check: a `confirm` test with a stub that replies past
+  the deadline (step 4) pins the refusal of a late reply; the
+  deadline-before-send order is held by the code's shape, not a test
+  (plan §10).
 - *"Journal untouched" is asserted by the unit test only.* The
   `journal_promotion_epoch_bump` stub test shows nothing is published,
   but no test restarts an abandoned node and checks that it rejoins
   without a divergence. Likelihood of a problem: low (the bump is the
-  tenure's first entry). A cheap addition: a server-runtime test that
-  runs the refusal and then restarts the node as a replica, asserting
-  `melin_replica_divergence_total` stays 0 on the primary (Q6).
+  tenure's first entry). A restart-after-abandon integration test was
+  considered and **not adopted**: no integration test can produce an
+  abandoned promotion on demand (the quorum loss would have to be timed
+  inside the drain/prefault window, plan §10), and the rejoin itself is
+  the ordinary replica restart that existing tests cover. Recorded in
+  plan §10.
 - *Manual `PROMOTE` skips the confirmation.* Intended: it keeps manual
   failover available during a control-plane outage. Check: the
   `Manual`-skips-the-stub unit test.
@@ -311,7 +352,10 @@ stands in for the matching stage.
 **Options.**
 
 1. **Unit tests in `server.rs`** with the existing ring builder and a
-   stub `LeadershipConfirm`.
+   stub confirmation (a closure in the plan, which dropped the
+   `LeadershipConfirm` trait an earlier draft named: one production
+   closure, built by one helper both call sites share, and one test
+   stub do not need a trait).
    - Pros: covers every origin and outcome deterministically; asserts
      both "no slot published" (`try_consume` is `None`) and "fence epoch
      unchanged".
@@ -330,8 +374,8 @@ stands in for the matching stage.
    - Value: low.
    - Cost: large.
 
-**Recommendation.** Option 1. The fixture already exists in the same
-file, so the plan's fallback is not needed.
+**Recommendation.** Option 1, adopted in plan step 4. The fixture already
+exists in the same file, so the integration fallback is not needed.
 
 ---
 
@@ -354,9 +398,9 @@ Step 1c's heal-phase assertions depend on both.
   `crates/core/transport-core/src/replication/archive.rs`, tags
   `divergent` / `resync` from `ArchiveReason::tag`). Both are private, but
   the format is documented for operators in `docs/replication.md`
-  ("sibling directory named `<journal>.divergent.<n>`") and the CHANGELOG,
-  so renaming it is an operator-visible change. `dpdk_veth/main.rs`
-  already hard-codes `divergent.journal.divergent.0`.
+  ("sibling directory named `<journal>.divergent.<n>`"), so renaming it
+  is an operator-visible change. `dpdk_veth/main.rs` already hard-codes
+  `divergent.journal.divergent.0`.
 - A caveat: an *absence* assertion on one exact name passes vacuously if
   the format ever changes. Divergence and archiving are also post-fix
   checks: in the red run the primary is fenced, and nobody points `L` back
@@ -403,8 +447,9 @@ Step 1c's heal-phase assertions depend on both.
    - Cost: small to medium.
 
 **Recommendation.** Option 2 for step 1c, plus the divergence counter on
-the primary as planned. Option 3 is worth doing only if another test
-needs the format, because it adds public API for tests alone.
+the primary as planned; both adopted in plan step 1c. Option 3 is worth
+doing only if another test needs the format, because it adds public API
+for tests alone.
 
 ---
 
@@ -431,7 +476,8 @@ tests. They port with the type; the compiler will list them.
 none). 2. An entry anyway (cons: describes a non-API change to operators;
 value: none).
 
-**Recommendation.** Option 1, as planned.
+**Recommendation.** Option 1, as planned; the test callers are listed in
+plan step 0.
 
 ---
 
@@ -455,7 +501,7 @@ step (`pre-merge.yml`, `kind(test)` over `melin-server-runtime` with
   client IP (`10.99.0.1`), not loopback. Raft proxies built with it would
   have raft traffic, bound to 127.0.0.*i*, dial a non-loopback local
   address.
-- **A second gap:** the plan's `raft_ip(i) = 127.0.0.(i+1)` gives node 0
+- **A second gap:** an earlier draft's `raft_ip(i) = 127.0.0.(i+1)` gives node 0
   `127.0.0.1`, the source address the kernel picks for any unbound
   loopback socket. Checked here: an unbound connect to 127.0.0.3 arrives
   from 127.0.0.1. If 1a's source binding regressed, node 0's connections
@@ -482,19 +528,26 @@ on `br0`, not on `lo`.
      DPDK job, not locally.
    - Value: none beyond saving a few lines.
    - Cost: none.
-2. **Add `Proxy::start_on(ip, upstream)`; `Proxy::start` becomes
-   `start_on(local_ip(), upstream)`; the raft proxies bind on 127.0.0.1;
-   `raft_ip(i) = 127.0.0.(i+2)`.**
+2. **Add `Proxy::start_on(ip, upstream, stalled)`; `Proxy::start`
+   becomes `start_on(local_ip(), upstream, |_| false)`; the raft proxies
+   bind on 127.0.0.1; `raft_ip(i) = 127.0.0.(i+2)`.**
    - Pros: raft (kernel TCP on every transport) never touches the
      DPDK-facing address, so the partition tests behave the same on both
-     transports. No node shares the default loopback source, so a 1a
-     regression fails the partition tests visibly.
-   - Cons: one more constructor in `proxy.rs`, used by one includer. The
-     file has no dead-code allowance, so `degraded_acks.rs` must keep
-     using `start` and `raft_failover.rs` `start_on`; both get used.
+     transports. No node shares the default loopback source, so under a
+     1a regression no per-source block matches; the isolated leader's
+     outbound links stay up and step 1c's assertion that the other two
+     elect a new leader fails visibly (the 1a unit tests catch it first).
+   - Cons: one more constructor in `proxy.rs`. The file has no dead-code
+     allowance, so every item must be used by both includers: `start`
+     delegates to `start_on`, which keeps `start_on` used by
+     `degraded_acks.rs` too. (The same rule is why the plan passes the
+     per-source block list to `start_on` as a predicate, defined in
+     `raft_failover.rs`, rather than adding `block_from` methods that
+     `degraded_acks.rs` would leave unused.)
    - Risk: low.
-   - Value: transport-independent partition tests, and a harness that
-     cannot pass vacuously.
+   - Value: transport-independent partition tests, and, with step 1c
+     asserting the re-election, a harness whose isolation is checked
+     rather than assumed.
    - Cost: small.
 3. **Gate the partition tests to kernel TCP** (the plan's fallback).
    - Pros: no DPDK question at all.
@@ -509,7 +562,8 @@ run the "Runtime suites on DPDK" step. If the partition tests pass, done.
 If only they fail, compare against option 1 before falling back to
 option 3, and record why in the file header.
 
-**Recommendation.** Option 2.
+**Recommendation.** Option 2, adopted in plan step 1b; the CI run is
+still to do (plan §7).
 
 ---
 
@@ -552,8 +606,13 @@ heal converge, or should `heal()` cut then restore the raft proxies?
      `cluster-serial` group costs everyone).
    - Value: exercises delayed delivery, though no assertion targets it.
    - Cost: none.
-2. **`heal()` cuts then restores the raft proxies** (the generation bump
-   closes every held relay; new connections are relayed).
+2. **`heal()` cuts the raft proxies, then clears the block list, then
+   restores them** (the generation bump closes every held relay; new
+   connections are relayed). The cut must precede the clear: a relay
+   stalled for a blocked source would otherwise resume and flush before
+   the cut. Only the raft proxies, plus the isolated node's replication
+   proxy: cutting the other replica's replication link would drop the
+   primary's in-memory replica under `disk+ram` during the heal phase.
    - Pros: deterministic heal; matches what the clients already did
      (they abandoned those connections); frees the held threads.
    - Cons: delayed-frame delivery is not exercised.
@@ -571,22 +630,28 @@ heal converge, or should `heal()` cut then restore the raft proxies?
    - Value: a bounded harness however long the watch window grows.
    - Cost: small.
 
-**Status: needs experiment** only to decide whether option 1 is viable.
-Run the step 1c heal phase repeatedly (for example
-`cargo nextest run -p melin-server-runtime --test raft_failover <name>`
-in a shell loop). Any run that does not converge within the heal window
-rules option 1 out.
+**Status: resolved; adopted (plan step 1b).** The experiment that would
+have decided whether option 1 is viable is not needed, since option 1 is
+not used.
 
-**Recommendation.** Option 3. It is cheap, it makes the heal
-deterministic, and it keeps the harness bounded. If stale-tip delivery is
-worth pinning, it deserves a targeted test of its own (below).
+**Recommendation.** Option 3, adopted in plan step 1b. It is cheap, it
+makes the heal deterministic, and it keeps the harness bounded. The plan
+also has the relay re-check the generation between read and write, so a
+held relay that passed its generation check just before the heal's cut,
+and then saw the block list cleared, drops the bytes buffered during the
+isolation instead of flushing them into the healed link. The plan's `cut` also closes the healthy raft
+pair's relays once at heal; they reconnect on the next
+heartbeat, well inside an election timeout. Stale-tip delivery is left to
+the stale-peer-tip follow-up (plan §8), which pins it with tests of its
+own.
 
 ---
 
-## Q10. Late primary bring-up converges without a re-election
+## Q10. Late primary bring-up converges without a re-election (decided: settled by a step 1b test)
 
 **Question.** `start_replicas_first()` starts node 1 (the primary) after
-nodes 2 and 3 have elected a leader. Does node 1's own `initialize` and
+nodes 2 and 3 have elected a leader. Nodes are named by raft id here;
+`Cluster` indexes them from 0, so node 1 is index 0. Does node 1's own `initialize` and
 first campaign disturb that leader? Every later integration case relies
 on leadership staying on the replica.
 
@@ -662,13 +727,18 @@ on leadership staying on the replica.
    - Value: low.
    - Cost: small.
 
-**Status: needs experiment** (cheap). Run step 1b's
-`replica_leader_promotes_when_the_primary_dies` with the id-and-term
-assertion repeatedly. If it holds, option 1 stands. If node 1 ever forces
+**Status: decided (plan step 1b and §7).** The deciding test is step
+1b's `replica_leader_promotes_when_the_primary_dies` with the id-and-term
+assertion, run repeatedly. If it holds, option 1 stands. If node 1 ever forces
 a re-election, capture the raft logs (`RUST_LOG=openraft=info`) before
 choosing option 2, which would then need the user (a new config surface).
 
 **Recommendation.** Option 1.
+
+**Decision recorded** (plan step 1b and §7): option 1, with the
+id-and-term assertion in `start_replicas_first()` and repeated runs
+before step 1b is committed; options 2 and 3 are deferred until that test
+says they are needed.
 
 ---
 
@@ -718,9 +788,13 @@ instead of re-reading metrics afterwards?
    - Value: lower than option 1.
    - Cost: small.
 
-**Recommendation.** Option 1, keeping the pre-check from current metrics
-(`TermMoved` / `NotLeader` before the round trip) as planned, since it
-avoids a round trip that is bound to fail.
+**Recommendation.** Option 1, adopted in plan step 4. An earlier draft
+also pre-checked term and role from current metrics before the round
+trip; the plan drops that pre-check. The result check already covers both
+cases exactly (a follower's `get_read_log_id` answers `ForwardToLeader`
+at once, without a round trip, and a stale term fails the comparison), so
+the pre-check only saved a round trip on a path that is about to exit,
+at the cost of two more branches to cover.
 
 ---
 
@@ -747,8 +821,9 @@ inside that ttl.
   `LEADER_CONFIRM_TIMEOUT` (500 ms), with `NoQuorum`.
 - A follower with a higher vote answers `HigherVote`, which yields
   `ForwardToLeader`, mapped to `NotLeader`.
-- `TimedOut` appears only if the driver's runtime is stalled long enough
-  to push the answer past 500 ms (Q2).
+- `TimedOut` appears only if the driver's runtime or the server thread is
+  stalled long enough to push the answer past the server thread's
+  500 ms deadline (Q2; the plan applies no driver-side timeout).
 
 **Options.**
 
@@ -770,7 +845,9 @@ inside that ttl.
 
 **Recommendation.** Option 1 for the stopped-followers case, whose
 refused connects involve no timer, and the set for anything that involves
-a frozen link.
+a frozen link. Adopted in plan step 4, which adds only the
+stopped-followers test; the set applies to a frozen-link variant if one
+is ever added (plan §7, Q12).
 
 ---
 
@@ -792,11 +869,11 @@ Linux as well.
 assumption (cost: small; risk: none). 2. A `cfg(target_os)` skip path
 (cons: dead code on a platform that cannot build the crate; value: none).
 
-**Recommendation.** Option 1.
+**Recommendation.** Option 1, adopted in plan step 1b.
 
 ---
 
-## Q14. Bind-before-connect edge cases
+## Q14. Bind-before-connect edge cases (decided: startup refusal)
 
 **Question.** With 1a, a raft `bind` on a specific IP whose family differs
 from a peer's, or one that is no longer assigned, must fail the connect
@@ -867,26 +944,38 @@ operator should hear about at boot. The startup refusal is a new
 operator-facing behaviour, so it is listed for the user; option 2 alone
 is the implementer's call.
 
+**Decision recorded** (plan step 1a): option 3. Two refinements in the
+plan: the startup check sits in `melin_raft::spawn`'s config validation
+rather than `build_raft_config`, so library users get it too, and it
+shares one helper with the connect-path check, so the rule exists once.
+A specific bind with a peer that is not an IP literal is refused at
+startup as well, since the bound path cannot dial it.
+
 ---
 
 ## Findings beyond the questions
 
-Found while answering the above. Each needs either a line in the plan or
-a separate follow-up.
+Found while answering the above. Each has a line in the plan or a
+follow-up, as noted.
 
 1. **Raft storage `fsync`s on the driver thread** (Q2). They do not
-   endanger the mint-time bound, which the server thread's backstop
-   already enforces; the backstop's deadline should be taken before the
-   `send` rather than at the wait (Q2 option 3).
+   endanger the mint-time bound, which the server thread's deadline
+   enforces; the deadline is taken before the `send` (adopted, plan
+   step 4).
 2. **Each confirmation opens fresh connections**
    (`handle_check_is_leader_request` → `new_client`), with the Ed25519
-   handshake, inside one heartbeat interval (Q12). Fine on a LAN; worth
-   one sentence in step 4, so that nobody reads the 500 ms bound as one
+   handshake, inside one heartbeat interval (Q12). Fine on a LAN; stated
+   in plan §3, §5 and §8, so that nobody reads the 500 ms bound as one
    RTT.
-3. **`Proxy::start` binds `local_ip()`**, and **`raft_ip(0)` is
-   127.0.0.1** (Q8). Both are harness details to fix in 1b.
-4. **Step 0's caller list omits test callers** (Q7).
-5. **A delayed raft frame can regress a peer's recorded tip.**
+3. **`Proxy::start` binds `local_ip()`**, and **`raft_ip(0)` was
+   127.0.0.1** (Q8). Both fixed in plan step 1b.
+4. **Step 0's caller list omitted test callers** (Q7). Listed in plan
+   step 0.
+5. **A delayed raft frame can regress a peer's recorded tip.** *Decided:
+   a follow-up branch after this plan, recorded in plan §8* (a raft
+   protocol version first, then envelopes stamped with a kernel boot
+   stamp and a counter taken with the tip read). The options sketched
+   below are superseded by that decision and kept for context.
    `PeerTips::record_at` overwrites with the arrival time, so a frame
    delayed by a partition (proxy flush in tests, TCP retransmission in
    production) makes an old tip look fresh until the peer's next frame.
@@ -897,9 +986,9 @@ a separate follow-up.
    the primary steering. Options for a follow-up: ignore a sample whose
    tip is behind the stored one within the same epoch (a peer's tip only
    regresses on a re-seed, which changes its lineage), or stamp tips with
-   the sender's term and drop samples from older terms. Needs a decision
-   on whether to pursue it.
-6. **Bind failures retry without backoff** (Q14).
+   the sender's term and drop samples from older terms.
+6. **Bind failures retry without backoff** (Q14). Mapped to
+   `Unreachable` in plan step 1a.
 
 ---
 
@@ -907,31 +996,36 @@ a separate follow-up.
 
 | Question | Status | Recommended option | Risk if wrong | Cost |
 |---|---|---|---|---|
-| Q1 threshold | decided (1000 ms) | keep; re-measure under nextest load in step 2 | transient refusals delay failover; never unsafe (step 4 backstop) | small |
-| Q2 bridge latency | resolved by reading | no loop change; take `confirm`'s backstop deadline before the send | a server thread preempted between send and wait stretches the mint window by that preemption | small |
-| Q3 torn reads | resolved by reading | `Relaxed` plus term double-read | an early filter passes for one poll; mint-time term check refuses | small |
-| Q4 mint refusal | decided (confirm, exit) | keep; add a restart-after-abandon rejoin test | an abandoned node that does not rejoin cleanly goes unnoticed | small |
-| Q5 unit-testing the mint | resolved by reading | unit tests with the existing ring fixture | the refusal path stays untested | small |
-| Q6 post-heal evidence | resolved by reading | divergence counter on primary; scan for `.divergent.<n>` / `.resync.<n>` siblings (not a bare prefix, which rotated segments match) | an absence check passes vacuously | small |
-| Q7 public API | resolved by reading | no CHANGELOG entry | none | none |
-| Q8 DPDK runner | needs experiment (one CI run) | `Proxy::start_on`, raft proxies on 127.0.0.1, `raft_ip(i) = 127.0.0.(i+2)` | partition tests pass vacuously or fail only on DPDK | small |
-| Q9 frozen links on heal | needs experiment (only to keep option 1) | cut + restore on heal; hold blocked accepts without threads | flaky heal phase; thread growth | small |
-| Q10 late primary bring-up | needs experiment (cheap) | keep `initialize`; assert leader id and term unchanged | every later case runs with leadership off the replica | small |
-| Q11 term of `read_log_id` | resolved by reading | compare `read_log_id.leader_id.term` to the requested term | a confirmation of another term accepted | small |
-| Q12 confirm latency | resolved by reading | exact `NoQuorum` for stopped peers; set for frozen links | a rare flake, or an unnoticed openraft change | small |
-| Q13 non-Linux | resolved by reading | no fallback; note the Linux assumption | none (the crate does not build off Linux) | small |
-| Q14 bind edge cases | resolved by reading; startup family check needs decision | clear errors, map to `Unreachable`, startup family check | log noise and an unclear error, no correctness impact | small |
+| Q1 threshold | decided (1000 ms) | keep; re-measure under nextest load in step 2 | transient refusals delay failover; never unsafe (the mint-time confirmation) | small |
+| Q2 bridge latency | resolved by reading; adopted (step 4) | no loop change; `confirm`'s single deadline taken before the send, no driver-side timeout | a server thread preempted between send and wait stretches the mint window by that preemption | small |
+| Q3 torn reads | resolved by reading; adopted (step 3) | `Relaxed`, read once; no double-read | an early filter passes for one poll; mint-time term check refuses | none |
+| Q4 mint refusal | decided (confirm, exit; step 4) | keep; docs name the supervisor restart; no restart-after-abandon test (cannot be produced on demand) | an abandoned node that does not rejoin cleanly goes unnoticed | small |
+| Q5 unit-testing the mint | resolved by reading; adopted (step 4) | unit tests with the existing ring fixture | the refusal path stays untested | small |
+| Q6 post-heal evidence | resolved by reading; adopted (step 1c) | divergence counter on primary; scan for `.divergent.<n>` / `.resync.<n>` siblings (not a bare prefix, which rotated segments match) | an absence check passes vacuously | small |
+| Q7 public API | resolved by reading; adopted (step 0) | no CHANGELOG entry; test callers port too | none | none |
+| Q8 DPDK runner | adopted (step 1b); one CI run to confirm | `Proxy::start_on`, raft proxies on 127.0.0.1, `raft_ip(i) = 127.0.0.(i+2)` | partition tests pass vacuously or fail only on DPDK | small |
+| Q9 frozen links on heal | resolved; adopted (step 1b) | cut raft proxies, clear blocks, restore; hold blocked accepts without threads | flaky heal phase; thread growth | small |
+| Q10 late primary bring-up | decided (step 1b test settles it) | keep `initialize`; assert leader id and term unchanged; fallbacks deferred | every later case runs with leadership off the replica | small |
+| Q11 term of `read_log_id` | resolved by reading; adopted (step 4) | compare `read_log_id.leader_id.term` to the requested term; no metric pre-check | a confirmation of another term accepted | small |
+| Q12 confirm latency | resolved by reading; adopted (step 4) | exact `NoQuorum` for stopped peers; set for frozen links | a rare flake, or an unnoticed openraft change | small |
+| Q13 non-Linux | resolved by reading; adopted (step 1b) | no fallback; note the Linux assumption | none (the crate does not build off Linux) | small |
+| Q14 bind edge cases | decided (startup refusal; step 1a) | clear errors, map to `Unreachable`, startup check in `melin_raft::spawn` sharing one helper with the connect path | log noise and an unclear error, no correctness impact | small |
 
-## Questions that need a user decision
+## Decisions recorded
 
-The implementer can settle the rest from the recommendations above. These
-change agreed behaviour or operator-visible behaviour:
+No question is still waiting on the user. These are the user's
+decisions, each recorded in the plan:
 
-1. **Q14: refusing to start on a raft bind/peer family mismatch.** A new
-   startup refusal. Recommended.
-2. **Finding 5: stale-frame tip regression in `PeerTips`.** Whether to
-   open a follow-up. It is outside this plan, and the narrow window plus
-   the existing steering make it a candidate, not an emergency.
-3. **Q10, only if its experiment fails:** whether a late-joiner
-   `initialize` knob may enter `RaftConfig` (published) for a test's
-   sake, or the bring-up should be redesigned instead.
+1. **Q1:** the threshold is 1000 ms (plan §5).
+2. **Q4:** a mint-time quorum confirmation, and exit on failure (plan
+   step 4).
+3. **Per-node loopback IPs with source-bound raft dialing** (plan
+   step 1).
+4. **Q14:** refusing to start on a raft bind/peer address-family
+   mismatch (plan step 1a).
+5. **Q10:** settled by the step 1b test; the fallbacks, one of which
+   would add a late-joiner knob to `RaftConfig` (published) and need the
+   user, are deferred until that test fails (plan §7).
+6. **Finding 5:** the stale-peer-tip fix gets its own branch after this
+   plan: a raft protocol version first, then envelopes stamped with a
+   kernel boot stamp and a counter taken with the tip read (plan §8).
