@@ -32,6 +32,7 @@ use tracing::info;
 use tracing::warn;
 
 use crate::network::RaftClientFactory;
+use crate::network::plan_dial;
 use crate::recency::TipSource;
 use crate::rpc_server::RpcServerConfig;
 use crate::rpc_server::serve;
@@ -99,6 +100,12 @@ pub struct RaftPeer {
 #[derive(Debug, Clone)]
 pub struct RaftConfig {
     pub node_id: NodeId,
+    /// The control-plane listener. When its IP is specific (not `0.0.0.0`
+    /// or `::`), outbound control-plane connections are made from that IP
+    /// too, so every other member's address in [`Self::peers`] must be an
+    /// IP literal of the same family: [`spawn`] refuses anything else.
+    /// A wildcard bind dials as the kernel routes, and a peer address may
+    /// then be a hostname.
     pub bind: std::net::SocketAddr,
     pub dir: PathBuf,
     /// All cluster members including this node — see [`RaftPeer`].
@@ -184,6 +191,19 @@ pub fn spawn(
                 "raft node ids must be non-zero (0 is the no-leader sentinel)",
             ));
         }
+    }
+    // A control plane bound to a specific IP dials from it, so a peer it
+    // could never reach that way is a misconfiguration to refuse at boot,
+    // not to retry in the background. This node's own entry is never
+    // dialled by it. The stored membership, dialled after first boot, is
+    // checked again on every connect by the same rule.
+    for peer in config.peers.iter().filter(|p| p.id != config.node_id) {
+        plan_dial(config.bind, &peer.addr).map_err(|refusal| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("--raft-peer id {}: {refusal}", peer.id),
+            )
+        })?;
     }
 
     // Fail startup on a bad bind/dir, not in the background.
@@ -304,6 +324,7 @@ async fn driver_main(
         Arc::clone(&signing_key),
         Arc::clone(&tip),
         Arc::clone(&peer_tips),
+        config.bind,
     );
     let raft: Raft<TypeConfig> = match Raft::new(
         config.node_id,

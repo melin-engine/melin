@@ -8,12 +8,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::driver::{RaftConfig, RaftHandles, RaftPeer, spawn};
-use crate::recency::TipSource;
+use crate::tests::tip_at;
 use base64::Engine;
 use ed25519_dalek::SigningKey;
 use melin_app::auth::{AuthorizedKeys, NoRoles};
-use melin_transport_core::cursors::AdvertisedJournalTip;
-use melin_transport_core::fence::FenceState;
 use melin_transport_core::health::RaftStatus;
 use melin_transport_core::test_ports::free_addr;
 use tempfile::TempDir;
@@ -87,16 +85,11 @@ fn start_cluster_with_tips(tips: &[u64]) -> Cluster {
             dir: dir.path().to_path_buf(),
             peers: peers.clone(),
         };
-        let tip = Arc::new(TipSource {
-            fence: Arc::new(FenceState::new(0)),
-            seq: AdvertisedJournalTip::new(melin_transport_core::WireSeq::new(tips[i])),
-            ready: Arc::new(AtomicBool::new(true)),
-        });
         let handles = spawn(
             config,
             Arc::new(keys[i].clone()),
             Arc::clone(&authorized_keys),
-            tip,
+            tip_at(0, tips[i]),
             None, // no supersession policy — election-only test nodes
             Arc::clone(&shutdown),
         )
@@ -109,6 +102,85 @@ fn start_cluster_with_tips(tips: &[u64]) -> Cluster {
         dirs.push(dir);
     }
     Cluster { nodes, _dirs: dirs }
+}
+
+/// `spawn` for node 1, listening on `bind`, with node 2 at `peer_addr`
+/// and node 1's own entry at `self_addr`; started already shut down, so
+/// a configuration it accepts stops at once. `dir` holds its raft state.
+fn spawn_node_1(
+    dir: &TempDir,
+    bind: &str,
+    self_addr: &str,
+    peer_addr: &str,
+) -> std::io::Result<RaftHandles> {
+    let key = SigningKey::from_bytes(&[1; 32]);
+    let peers = vec![
+        RaftPeer {
+            id: 1,
+            addr: self_addr.to_owned(),
+            pubkey: key.verifying_key().to_bytes(),
+        },
+        RaftPeer {
+            id: 2,
+            addr: peer_addr.to_owned(),
+            pubkey: SigningKey::from_bytes(&[2; 32]).verifying_key().to_bytes(),
+        },
+    ];
+    let config = RaftConfig {
+        node_id: 1,
+        bind: bind.parse().unwrap(),
+        dir: dir.path().to_path_buf(),
+        peers,
+    };
+    spawn(
+        config,
+        Arc::new(key),
+        Arc::new(AuthorizedKeys::parse::<NoRoles>("").unwrap()),
+        tip_at(0, 0),
+        None,
+        Arc::new(AtomicBool::new(true)),
+    )
+}
+
+#[test]
+fn spawn_refuses_a_peer_a_specific_bind_cannot_dial() {
+    for (bind, peer) in [
+        ("127.0.0.2:0", "[::1]:7002"),
+        ("[::1]:0", "127.0.0.3:7002"),
+        ("127.0.0.2:0", "localhost:7002"),
+    ] {
+        let dir = TempDir::new().unwrap();
+        let Err(e) = spawn_node_1(&dir, bind, "127.0.0.2:7001", peer) else {
+            panic!("{bind} with peer {peer} must be refused");
+        };
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+        let message = e.to_string();
+        let bind_ip = bind
+            .parse::<std::net::SocketAddr>()
+            .unwrap()
+            .ip()
+            .to_string();
+        assert!(
+            message.contains("id 2") && message.contains(&bind_ip) && message.contains(peer),
+            "{message}"
+        );
+    }
+}
+
+/// Only the peers this node dials are checked: its own entry is what the
+/// others dial, and a wildcard bind lets the kernel route and resolve.
+#[test]
+fn spawn_accepts_what_the_bind_can_dial() {
+    for (bind, self_addr, peer) in [
+        ("127.0.0.2:0", "node-1.internal:7001", "127.0.0.3:7002"),
+        ("0.0.0.0:0", "127.0.0.2:7001", "[::1]:7002"),
+        ("0.0.0.0:0", "127.0.0.2:7001", "localhost:7002"),
+    ] {
+        let dir = TempDir::new().unwrap();
+        let handles = spawn_node_1(&dir, bind, self_addr, peer)
+            .unwrap_or_else(|e| panic!("{bind} with peer {peer} must start: {e}"));
+        handles.join.join().unwrap();
+    }
 }
 
 /// Poll the live nodes' gauges until exactly one reports leadership and the

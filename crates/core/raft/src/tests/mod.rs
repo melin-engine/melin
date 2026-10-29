@@ -8,3 +8,22 @@
 mod election;
 mod rpc_loopback;
 mod storage_suite;
+
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
+use crate::recency::TipSource;
+use melin_transport_core::cursors::AdvertisedJournalTip;
+use melin_transport_core::fence::FenceState;
+
+/// A ready advertised journal tip at (epoch, seq). Most tests want (0, 0)
+/// so recency filters nothing; the recency tests raise it.
+fn tip_at(epoch: u64, seq: u64) -> Arc<TipSource> {
+    let fence = Arc::new(FenceState::new(0));
+    fence.observe_epoch(epoch);
+    Arc::new(TipSource {
+        fence,
+        seq: AdvertisedJournalTip::new(melin_transport_core::WireSeq::new(seq)),
+        ready: Arc::new(AtomicBool::new(true)),
+    })
+}
