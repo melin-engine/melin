@@ -299,28 +299,36 @@ passes on current code.
   parse the peer's stored address as a `SocketAddr` (`TcpSocket::connect`
   needs one; the CLI already guarantees an IP literal, `parse_raft_peer`),
   build a `tokio::net::TcpSocket` of the bind's family, bind it to
-  `(bind_ip, 0)`, then `connect` (still under `CONNECT_TIMEOUT`). When the
+  the bind address with port 0 (so a link-local IPv6 bind keeps its scope
+  id), then `connect` (still under `CONNECT_TIMEOUT`). When the
   bind is unspecified, keep today's `TcpStream::connect` (the kernel picks
   the source, and a hostname still resolves). Thread the bind IP from
   `RaftConfig::bind` through `RaftClientFactory` into each `RaftClient`.
 - On the bound path, refuse before any syscall, with an `io::Error`
   naming the bind IP and the peer: an address that is not an IP literal
   (document on `RaftConfig::bind` that a specific bind needs IP-literal
-  peers), and a family mismatch. Map `AddrNotAvailable` (the bind IP is
-  no longer assigned) and these two refusals to `RPCError::Unreachable`
-  in `to_rpc_error`, so openraft backs off as for a dead peer instead of
-  retrying every heartbeat (§3). Log at `debug!` with the peer and the IP.
+  peers), and a family mismatch. The refusal is a typed error
+  (`DialRefusal`) inside the `io::Error`, so `to_rpc_error` matches it by
+  type rather than by `InvalidInput`, which other failures could carry.
+  Map `AddrNotAvailable` (the bind IP is no longer assigned; the bind
+  error is rewrapped with the bind and the peer, keeping its kind) and
+  these two refusals to `RPCError::Unreachable` in `to_rpc_error`, so
+  openraft backs off as for a dead peer instead of retrying every
+  heartbeat (§3). Log at `debug!` with the peer and the IP (the existing
+  failed-RPC line gains both fields).
 - Startup refusal (decided with the user, open-questions Q14): a node
   whose raft `bind` IP is specific refuses to start if any configured
   peer is not an IP literal or is of the other address family, naming the
   bind and the peer. Its control plane could never dial that peer, and
   the operator should learn it at boot rather than from logs. It goes in
   `melin_raft::spawn`'s config validation, beside the self-peer and
-  duplicate-id checks, so library users get it too. One pure helper over
-  `(bind IP, peer address)` serves both this check and the connect path
-  (no second copy of the rule); the connect-path check stays because
-  after first boot the stored membership, not the CLI list, is dialled.
-  CHANGELOG **Changed**.
+  duplicate-id checks, so library users get it too. It skips the node's
+  own entry, which it never dials (the others dial it). One pure helper
+  over `(bind address, peer address)` (`plan_dial`) serves both this
+  check and the connect path (no second copy of the rule); the
+  connect-path check stays because after first boot the stored
+  membership, not the CLI list, is dialled. CHANGELOG **Changed**, and
+  the `--raft-bind` help text states the rule.
 - Production effect: on a multi-homed host a node bound to one interface
   now sends its raft traffic from that interface too, matching what peers
   see in their firewall rules. A node whose raft listener is bound to a
@@ -336,7 +344,9 @@ passes on current code.
   either pass; v4/v6, v6/v4 and a hostname with a specific bind refuse);
   `to_rpc_error` maps each of the new refusals and `AddrNotAvailable` to
   `Unreachable`; `spawn` refuses a mismatched configuration with the
-  bind and the peer in the message.
+  bind and the peer in the message. None needs `::1`: the IPv6 cases
+  are refused before any syscall, and the observed-source tests run on
+  127.0.0.0/8.
 
 **1b — the harness.**
 

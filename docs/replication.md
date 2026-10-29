@@ -673,6 +673,14 @@ Enable it per node with:
 | `--raft-dir <path>` | Durable election state. Defaults to the journal path with a `.raft` extension. |
 | `--raft-auto-promote` | Act on election wins (below). Off by default. |
 
+A node sends its control-plane traffic from the address its
+control-plane listener is bound to, so peers and firewalls see it
+connect from the address they dial. When `--raft-bind` names a specific
+IP rather than `0.0.0.0` or `::`, the node refuses to start if another
+member's `--raft-peer` address is of the other address family (an IPv4
+bind cannot reach an IPv6 peer, nor the reverse), naming the bind and
+the peer.
+
 Peer links authenticate with the same Ed25519 replication keys as the
 data plane (the `replication` role in `authorized_keys`), so
 `--replication-key` is required on every raft-enabled node, primaries
