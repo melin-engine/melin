@@ -25,6 +25,12 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 - **`melin_raft::QUORUM_ACK_MAX_AGE`**: the oldest quorum acknowledgement
   the automatic-promotion policy accepts, half the control plane's
   leader lease.
+- **`melin_raft::LeaderConfirm` and `melin_raft::LeaderConfirmError`**:
+  a blocking check, under a fixed deadline, that a majority of the
+  control plane still acknowledges this node as leader in a given term,
+  and why it refused (not the leader, leading in another term, no
+  majority, no answer in time, driver stopped). Reached through the new
+  `RaftHandles::leader_confirm` field.
 
 ### Changed
 
@@ -33,6 +39,8 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   `millis_since_quorum_ack` and `set_millis_since_quorum_ack`), so it can
   no longer be built with a struct literal outside the crate; build it
   with `RaftStatus::new`.
+- **`melin_raft::RaftHandles` gains a `leader_confirm` field**, which
+  breaks struct literals and exhaustive destructuring of it.
 - **A node sends its control-plane traffic from the address its
   `--raft-bind` names.** When that is a specific IP rather than
   `0.0.0.0` or `::`, outgoing control-plane connections are bound to it

@@ -171,10 +171,13 @@ L's deposition the paragraph below. The confirmation compares
 `read_log_id.leader_id.term` with the term the request was filed for, so
 a node that lost term t and won t′ in between refuses (Q11).
 `LeaderConfirm::confirm` takes its deadline (`LEADER_CONFIRM_TIMEOUT`) on
-the server thread **before** sending the request, so before C. A reply it
-accepts arrived before C + `LEADER_CONFIRM_TIMEOUT`, and the publish
+the server thread **before** sending the request, so before C, and
+accepts a reply only on a clock reading taken after the reply is in hand
+and still before the deadline (step 4a explains why `recv_timeout` alone
+does not give that). So a reply is accepted before
+C + `LEADER_CONFIRM_TIMEOUT`, and the publish
 follows with nothing blocking in between, so the epoch is minted before
-C + `LEADER_CONFIRM_TIMEOUT` + `SCHEDULING_SLACK` < C + `leader_lease`
+C + `LEADER_CONFIRM_TIMEOUT` + `SCHEDULING_SLACK_MS` < C + `leader_lease`
 (the mint-time safety assertion, §5). No metric enters this argument, and
 a stalled raft runtime turns into a `TimedOut` refusal, never a late mint.
 
@@ -225,8 +228,8 @@ and the assertions are the backstop for all of them.
 | `QUORUM_ACK_MAX_AGE_MS` | 1000 | `= LEADER_LEASE_MS / 2`, the filter threshold (`pub const QUORUM_ACK_MAX_AGE: Duration`). Decided with the user | 2 |
 | `MAX_TICK_PERIOD_MS` | 523 | `= (HEARTBEAT_INTERVAL_MS + HEARTBEAT_JITTER_MS - 1) * 3 / 2`, the slowest node's tick | 2 |
 | `RTT_BUDGET_MS` | 100 | allowance for one heartbeat round trip, liveness assertion only | 2 |
-| `LEADER_CONFIRM_TIMEOUT_MS` | 500 | the mint-time confirmation's deadline, taken on the server thread before the request is sent (`const LEADER_CONFIRM_TIMEOUT: Duration`, crate-private: only the driver and its tests read it, step 4). openraft gives each voter one `heartbeat_interval` (at most 349 ms) including a fresh connect and handshake; anything past half a second is a control plane in trouble, and refusing is the right answer | 4 |
-| `SCHEDULING_SLACK_MS` | 200 | covers reply-to-publish on the server thread (preemption, the publish itself) and clock-rate drift between the leader's clock and the followers' lease clocks | 4 |
+| `LEADER_CONFIRM_TIMEOUT_MS` | 500 | the mint-time confirmation's deadline, taken on the server thread before the request is sent (`const LEADER_CONFIRM_TIMEOUT: Duration`, crate-private: only the driver and its tests read it, step 4a). openraft gives each voter one `heartbeat_interval` (at most 349 ms) including a fresh connect and handshake; anything past half a second is a control plane in trouble, and refusing is the right answer | 4a |
+| `SCHEDULING_SLACK_MS` | 200 | covers reply-to-publish on the server thread (preemption, the publish itself) and clock-rate drift between the leader's clock and the followers' lease clocks | 4a |
 
 Compile-time assertions (`const _: () = assert!(…)`, each with a message):
 
@@ -234,7 +237,7 @@ Compile-time assertions (`const _: () = assert!(…)`, each with a message):
   (1000 ≥ 523 + 100). A healthy leader's reported age peaks at about one
   tick plus a round trip, at the flush that comes just before a
   heartbeat reply. The filter must not refuse a healthy leader.
-- **Mint-time safety** (step 4): `LEADER_CONFIRM_TIMEOUT_MS + SCHEDULING_SLACK_MS < LEADER_LEASE_MS`
+- **Mint-time safety** (step 4a): `LEADER_CONFIRM_TIMEOUT_MS + SCHEDULING_SLACK_MS < LEADER_LEASE_MS`
   (500 + 200 = 700 < 2000, §4).
 
 Deliberately absent: a bridge-poll constant and a safety assertion over
@@ -267,7 +270,7 @@ Independent of everything after it, so it goes first. Its standalone fix
 is small: an auto-promotion needs `term > fence_epoch`, so at term 1 the
 fence epoch is 0 and the minted epoch is 1 either way; the misclassified
 alignment warning could only misfire if the fence epoch moved between
-decision and mint. The real value is the type, which step 4's mint-time
+decision and mint. The real value is the type, which step 4b's mint-time
 confirmation needs ("an election at term t") and a raw `u64` cannot say.
 
 - `crates/core/server-runtime/src/promotion.rs`: replace the raw `u64`
@@ -643,7 +646,7 @@ rewritten from this record:
   duplicate). Add a comment beside it that `QUORUM_ACK_MAX_AGE` relies on
   the lease semantics read in 0.9.25 (`handle_vote_req`,
   `EngineConfig::new`) and must be re-derived on any upgrade (0.10
-  changes elections). Step 4 extends the comment with
+  changes elections). Step 4a extends the comment with
   `LEADER_CONFIRM_TIMEOUT` and `get_read_log_id`'s behaviour
   (`handle_check_is_leader_request`) when it adds them. The premise is pinned
   behaviourally rather than by version: `Cargo.lock` holds 0.9.25 for our
@@ -797,7 +800,7 @@ rewritten from this record:
   cannot reach a majority, including the last survivor, no longer
   auto-promotes.
 
-### Step 4: `fix(server-runtime): confirm leadership with a quorum round trip when the promotion epoch is minted`
+### Step 4: confirm leadership with a quorum round trip when the promotion epoch is minted
 
 Decided with the user: a real quorum confirmation at mint time, and on
 failure the node exits with an error. Rejected: waiting a bounded time for
@@ -806,9 +809,19 @@ in place (undoing the pipeline handover is complicated and risky), and
 committing the promotion as a raft log entry (strongest, but a
 control-plane redesign; recorded as a possible follow-up).
 
+Split into two commits (decided with the user): 4a adds the confirmation
+to `melin-raft` with no behaviour change in a running node, 4b wires it
+into the mint in `melin-server-runtime`.
+
+#### Step 4a: `feat(raft): confirm leadership with a quorum round trip`
+
+`melin-raft` only. `melin-server-runtime` keeps compiling unchanged: it
+holds `RaftHandles` in an `Option` and reads fields by name, with no
+struct literal or exhaustive destructuring.
+
 - `crates/core/raft` — a blocking leadership confirmation the server
   thread can call without touching tokio:
-  - Add `LEADER_CONFIRM_TIMEOUT`, `SCHEDULING_SLACK` and the mint-time
+  - Add `LEADER_CONFIRM_TIMEOUT`, `SCHEDULING_SLACK_MS` and the mint-time
     safety assertion (§5), and extend step 2's comment beside the
     openraft requirement in `crates/core/raft/Cargo.toml`:
     `LEADER_CONFIRM_TIMEOUT` relies on `get_read_log_id`'s behaviour
@@ -825,6 +838,15 @@ control-plane redesign; recorded as a possible follow-up).
     sending (Q2), send `ConfirmRequest { term, reply }` with `reply` a
     `std::sync::mpsc::SyncSender` of capacity 1, and wait with
     `recv_timeout(deadline.saturating_duration_since(Instant::now()))`.
+    A reply that `recv_timeout` hands back is accepted only if
+    `Instant::now() <= deadline` still holds: `std`'s `recv_timeout`
+    returns a queued message before it looks at the clock, and measures
+    its own deadline from when it is called, so without that check a
+    server thread preempted between computing the remaining time and the
+    wait would accept a reply that arrived after `deadline` (found while
+    implementing 4a). With it, the acceptance itself happens before
+    `deadline`, and only the reply-to-publish stretch is left to
+    `SCHEDULING_SLACK_MS`.
     This one deadline is the whole time bound: the driver applies no
     timeout of its own (openraft already bounds each voter by one
     `heartbeat_interval`, and a second, shorter timer would only duplicate
@@ -845,10 +867,51 @@ control-plane redesign; recorded as a possible follow-up).
     metrics: a follower's `get_read_log_id` answers `ForwardToLeader` at
     once without a round trip, and a stale term is caught exactly by the
     result. A reply whose receiver has gone (the server gave up) is
-    dropped with a comment saying so.
+    dropped with a comment saying so. The task is aborted beside the RPC
+    server task when the driver stops, so the receiver is dropped and a
+    later `confirm` fails its send (`DriverStopped`); a request in flight
+    loses its reply sender, which `recv_timeout` reports as disconnected
+    (`DriverStopped` too).
   - Re-export `LeaderConfirm` and `LeaderConfirmError` from `lib.rs`.
-    `crates/core/server-runtime/src/raft.rs`: `RaftDriverGuard` hands the
-    handle out like `status()`.
+- Tests:
+  - `crates/core/raft/src/tests/election.rs`: the leader's `confirm(term)`
+    passes; a follower's returns `NotLeader`; the leader asked for an
+    older term returns `TermMoved`; after stopping both followers the
+    leader's returns exactly `NoQuorum` (refused connects involve no
+    timer, Q12) within `LEADER_CONFIRM_TIMEOUT`; after driver shutdown,
+    `DriverStopped`.
+  - `driver.rs` unit test (crate-internal, no public seam): a
+    `LeaderConfirm` over a channel whose receiver a test thread holds and
+    answers just past the deadline returns `TimedOut`; that exercises the
+    wait running out. The acceptance check above, which refuses a reply
+    already queued when the waiting thread reads it past the deadline,
+    is a pure function of what the wait received, the clock reading and
+    the deadline, so its own unit test pins it deterministically (a reply
+    read past the deadline is `TimedOut` whatever it says, one read
+    before or at it passes through, and both wait failures map as
+    above); no scheduler race could reach that arm reliably through the
+    stub. Neither can pin that the deadline is taken before the send:
+    `UnboundedSender::send` is a non-blocking enqueue, so the two orders
+    differ by nanoseconds no test observes. The order is enforced by
+    `confirm` taking `deadline` as its first statement, with a comment
+    there citing §4 (listed in §10). Beside it, unit tests over the same
+    stub for the two `DriverStopped` paths of `confirm` (receiver gone,
+    reply sender dropped), and over the driver's pure mapping from
+    openraft's result for every arm, including the two no election test
+    reaches (`Ok` with no `read_log_id`, `Fatal`), and over the error
+    messages (distinct per variant, naming the term or the deadline they
+    carry).
+- CHANGELOG **Changed**: `melin-raft`'s `RaftHandles` gains a
+  `leader_confirm` field (breaks struct literals and exhaustive
+  destructuring; it is in the crate's public exports). **Added**:
+  `LeaderConfirm` and `LeaderConfirmError` exported from `melin-raft`.
+  `LEADER_CONFIRM_TIMEOUT` stays crate-private: nothing outside the
+  driver reads it.
+
+#### Step 4b: `fix(server-runtime): abandon a promotion whose leadership a quorum does not confirm`
+
+- `crates/core/server-runtime/src/raft.rs`: `RaftDriverGuard` hands the
+  `LeaderConfirm` handle out like `status()`.
 - `crates/core/server-runtime/src/server.rs`, `journal_promotion_epoch_bump`:
   - Takes `origin: PromotionOrigin` and
     `confirm: impl FnOnce(u64) -> Result<(), LeaderConfirmError>`, and
@@ -859,7 +922,7 @@ control-plane redesign; recorded as a possible follow-up).
     `input_producer.publish(...)`, after the function's existing alignment
     `warn!` and `info!("promotion: injecting epoch bump")`, so nothing
     blocking (a log write can block on a full stderr pipe) sits between
-    the reply and the publish and `SCHEDULING_SLACK` covers only the
+    the reply and the publish and `SCHEDULING_SLACK_MS` covers only the
     publish. For an election the `info!` is reworded to announce the
     confirmation (`"promotion: confirming leadership before the epoch
     bump"`), so a refusal's log does not read as a bump that happened.
@@ -886,20 +949,6 @@ control-plane redesign; recorded as a possible follow-up).
   configured primary. This follows the `check_promotable` precedent ("a
   promotion is refused, and the node exits with an error").
 - Tests:
-  - `crates/core/raft/src/tests/election.rs`: the leader's `confirm(term)`
-    passes; a follower's returns `NotLeader`; the leader asked for an
-    older term returns `TermMoved`; after stopping both followers the
-    leader's returns exactly `NoQuorum` (refused connects involve no
-    timer, Q12) within `LEADER_CONFIRM_TIMEOUT`; after driver shutdown,
-    `DriverStopped`.
-  - `driver.rs` unit test (crate-internal, no public seam): a
-    `LeaderConfirm` over a channel whose receiver a test thread holds and
-    answers just past the deadline returns `TimedOut`. This pins that a
-    reply after the deadline is refused. It cannot pin that the deadline
-    is taken before the send: `UnboundedSender::send` is a non-blocking
-    enqueue, so the two orders differ by nanoseconds no test observes.
-    The order is enforced by `confirm` taking `deadline` as its first
-    statement, with a comment there citing §4 (listed in §10).
   - `server.rs` tests, extending step 0's `promotion_epoch_tests` and its
     `minted_epoch` ring helper rather than building another ring (Q5;
     step 0 landed that helper, so nothing needs hoisting out of
@@ -919,12 +968,16 @@ control-plane redesign; recorded as a possible follow-up).
   supervisor) it rejoins as a replica.
 - CHANGELOG **Changed**: an automatic promotion is abandoned, and the node
   exits, if a majority does not confirm its leadership just before it
-  takes over. **Changed**: `melin-raft`'s `RaftHandles` gains a
-  `leader_confirm` field (breaks struct literals and exhaustive
-  destructuring; it is in the crate's public exports). **Added**:
-  `LeaderConfirm` and `LeaderConfirmError` exported from `melin-raft`.
-  `LEADER_CONFIRM_TIMEOUT` stays crate-private: nothing outside the
-  driver reads it.
+  takes over.
+- Log level, to decide in this step: openraft 0.9.25's
+  `handle_check_is_leader_request` logs at `error` ("timeout while
+  confirming leadership for read request", `raft_core.rs`) for each voter
+  whose confirming heartbeat fails or is refused, and nothing in the
+  workspace filters the `openraft` target. Once promotion calls `confirm`,
+  a promotion with a stopped peer emits error-level lines for degraded
+  operation, which the log-level rules reserve for malfunctions. Either
+  cap the `openraft` target at `warn` in the node binaries' default filter
+  or say in `docs/replication.md` that those lines are expected then.
 
 ### Step 5: `fix(raft): fence on a higher epoch carried by a reply`
 
@@ -1006,15 +1059,15 @@ each answer went.
   1000, revisit with the user. Step 2 measured 355 to 467 ms, one tick
   (the record is under step 2).
 - **Q2 Bridge latency (resolved).** The nudge cannot stall the bridge; no
-  loop change. The confirmation's deadline is taken before the send
-  (step 4).
+  loop change. The confirmation's deadline is taken before the send, and
+  a reply is accepted only on a clock reading still before it (step 4a).
 - **Q3 Torn reads (resolved).** `Relaxed`, read once; no double-read
   (step 3).
 - **Q4 Mint refusal policy (decided).** Quorum confirmation, exit on
-  failure (step 4). A restart-after-abandon integration test is not
+  failure (step 4a confirms, step 4b exits). A restart-after-abandon integration test is not
   added; see §10.
 - **Q5 Testing `journal_promotion_epoch_bump` (resolved).** Unit tests
-  over step 0's `promotion_epoch_tests` ring helper (step 4).
+  over step 0's `promotion_epoch_tests` ring helper (step 4b).
 - **Q6 Post-heal evidence (resolved).** Divergence counter on the
   primary; archive scan over both tags (step 1c).
 - **Q7 Public API (resolved).** No CHANGELOG entry; test callers listed
@@ -1041,9 +1094,9 @@ each answer went.
   re-election. The fallbacks (open-questions Q10) stay unused; one of
   them touches `RaftConfig`'s public API and would need the user.
 - **Q11 Term of `read_log_id` (resolved).** Compare
-  `read_log_id.leader_id.term` (step 4).
+  `read_log_id.leader_id.term` (step 4a).
 - **Q12 Confirmation latency without a quorum (resolved).** Exactly
-  `NoQuorum` for stopped peers (step 4). The plan adds no confirmation
+  `NoQuorum` for stopped peers (step 4a). The plan adds no confirmation
   test through a frozen link; if one is ever added, it asserts the set
   `{NoQuorum, TimedOut}` plus the time bound.
 - **Q13 Non-Linux hosts (resolved).** No fallback; one header sentence
@@ -1080,7 +1133,7 @@ each answer went.
   client per voter), so a few round trips on a LAN rather than one, on a
   path that already drains and prefaults.
 - **Changed at mint time:** an abandoned promotion exits the process; it
-  relies on a supervisor to restart the node (documented in step 4).
+  relies on a supervisor to restart the node (documented in step 4b).
 - **Residual liveness risk: a promotion crash loop.** The decision-time
   filter reads heartbeat acks on raft's long-lived connections; the
   mint-time confirmation goes through `get_read_log_id`, which opens a
@@ -1200,9 +1253,9 @@ Any changed line still unexecuted goes into §10 with a reason.
 - **The decision-to-mint race itself** (majority lost after a passing
   decision but before the mint). Producing it end to end needs isolation
   timed inside the drain/prefault window. It is covered by the
-  `election.rs` confirmation tests (a real quorum loss makes `confirm`
-  fail) and the `journal_promotion_epoch_bump` unit test with a refusing
-  stub, not by an integration test.
+  `election.rs` confirmation tests (step 4a: a real quorum loss makes
+  `confirm` fail) and the `journal_promotion_epoch_bump` unit test with a
+  refusing stub (step 4b), not by an integration test.
 - **Restarting an abandoned node** (open-questions Q4). For the same
   reason no integration test can produce an abandoned promotion on
   demand. That its journal is untouched follows from the unit test (no
@@ -1225,7 +1278,7 @@ Any changed line still unexecuted goes into §10 with a reason.
   argument rests on it, but sending is a non-blocking enqueue, so no test
   can tell "deadline, then send" from "send, then deadline". It is held
   by `deadline` being the first statement of `confirm`, with a comment
-  citing §4, and by review; the step 4 unit test pins only that a late
+  citing §4, and by review; the step 4a unit test pins only that a late
   reply is refused.
 - **The relay's post-read drop, and the accept loop's refusal to hold a
   socket past a cut** (step 1b). Each fires only when a cut lands inside

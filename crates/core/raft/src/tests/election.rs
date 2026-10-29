@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::driver::{RaftConfig, RaftHandles, RaftPeer, spawn};
+use crate::driver::{
+    LEADER_CONFIRM_TIMEOUT, LeaderConfirmError, RaftConfig, RaftHandles, RaftPeer, spawn,
+};
 use crate::tests::tip_at;
 use base64::Engine;
 use ed25519_dalek::SigningKey;
@@ -215,19 +217,35 @@ fn await_single_leader(nodes: &[&Node]) -> u64 {
 }
 
 impl Cluster {
+    fn handles(&self, id: u64) -> &RaftHandles {
+        &self.nodes.iter().find(|n| n.id == id).unwrap().handles
+    }
+
     fn status(&self, id: u64) -> &RaftStatus {
-        &self
-            .nodes
+        &self.handles(id).status
+    }
+
+    /// The node ids other than `id`.
+    fn others(&self, id: u64) -> Vec<u64> {
+        self.nodes
             .iter()
-            .find(|n| n.id == id)
-            .unwrap()
-            .handles
-            .status
+            .map(|n| n.id)
+            .filter(|&other| other != id)
+            .collect()
     }
 
     fn stop_node(&mut self, id: u64) {
         let node = self.nodes.iter_mut().find(|n| n.id == id).unwrap();
         node.shutdown.store(true, Ordering::Relaxed);
+    }
+
+    /// Stop node `id` and wait for its driver to exit, so its listener is
+    /// closed and connecting to it is refused.
+    fn stop_node_and_join(&mut self, id: u64) {
+        self.stop_node(id);
+        let at = self.nodes.iter().position(|n| n.id == id).unwrap();
+        let node = self.nodes.remove(at);
+        node.handles.join.join().expect("driver thread panicked");
     }
 
     fn stop_all(&mut self) {
@@ -355,13 +373,7 @@ fn a_leader_that_loses_both_peers_keeps_leading_and_its_ack_ages() {
     let leader = await_single_leader(&refs);
     await_quorum_ack(cluster.status(leader));
 
-    let followers: Vec<u64> = cluster
-        .nodes
-        .iter()
-        .map(|n| n.id)
-        .filter(|&id| id != leader)
-        .collect();
-    for id in followers {
+    for id in cluster.others(leader) {
         cluster.stop_node(id);
     }
     std::thread::sleep(crate::QUORUM_ACK_MAX_AGE + Duration::from_secs(1));
@@ -380,6 +392,69 @@ fn a_leader_that_loses_both_peers_keeps_leading_and_its_ack_ages() {
         Duration::from_millis(age) > crate::QUORUM_ACK_MAX_AGE,
         "the quorum-ack age ({age} ms) did not grow past the {:?} gate with both peers gone",
         crate::QUORUM_ACK_MAX_AGE
+    );
+
+    cluster.stop_all();
+}
+
+/// The leader's quorum round trip confirms its own term and no other; a
+/// follower's is refused at once; a stopped driver's is refused too.
+#[test]
+fn leadership_is_confirmed_for_the_leaders_own_term_only() {
+    let mut cluster = start_cluster(3);
+    let refs: Vec<&Node> = cluster.nodes.iter().collect();
+    let leader = await_single_leader(&refs);
+    await_quorum_ack(cluster.status(leader));
+    let term = cluster.status(leader).term.load(Ordering::Relaxed);
+    let leader_confirm = cluster.handles(leader).leader_confirm.clone();
+
+    assert_eq!(leader_confirm.confirm(term), Ok(()));
+    assert_eq!(
+        leader_confirm.confirm(term - 1),
+        Err(LeaderConfirmError::TermMoved { now: term })
+    );
+
+    let follower = cluster.others(leader)[0];
+    let follower_term = cluster.status(follower).term.load(Ordering::Relaxed);
+    assert_eq!(
+        cluster
+            .handles(follower)
+            .leader_confirm
+            .confirm(follower_term),
+        Err(LeaderConfirmError::NotLeader)
+    );
+
+    cluster.stop_all();
+    assert_eq!(
+        leader_confirm.confirm(term),
+        Err(LeaderConfirmError::DriverStopped)
+    );
+}
+
+/// With both followers stopped, their connects are refused at once, so the
+/// leader's confirmation fails with exactly `NoQuorum` and well inside its
+/// deadline rather than timing out (a frozen link would allow `TimedOut`
+/// as well).
+#[test]
+fn a_leader_without_a_live_peer_is_refused_confirmation_for_lack_of_quorum() {
+    let mut cluster = start_cluster(3);
+    let refs: Vec<&Node> = cluster.nodes.iter().collect();
+    let leader = await_single_leader(&refs);
+    await_quorum_ack(cluster.status(leader));
+    let term = cluster.status(leader).term.load(Ordering::Relaxed);
+
+    for id in cluster.others(leader) {
+        cluster.stop_node_and_join(id);
+    }
+    let started = Instant::now();
+    assert_eq!(
+        cluster.handles(leader).leader_confirm.confirm(term),
+        Err(LeaderConfirmError::NoQuorum)
+    );
+    let took = started.elapsed();
+    assert!(
+        took < LEADER_CONFIRM_TIMEOUT,
+        "the refusal took {took:?}, past the {LEADER_CONFIRM_TIMEOUT:?} deadline"
     );
 
     cluster.stop_all();

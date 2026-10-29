@@ -26,8 +26,12 @@ path = "src/lib.rs"
 #   - `serde`: serializable RPC/log types for our postcard wire format.
 #   - `storage-v2`: the split RaftLogStorage/RaftStateMachine traits.
 # `QUORUM_ACK_MAX_AGE` (driver.rs) relies on the follower-lease semantics
-# read in 0.9.25 (`Engine::handle_vote_req`, `EngineConfig::new`) and must
-# be re-derived on any upgrade (0.10 changes elections). Not pinned
+# read in 0.9.25 (`Engine::handle_vote_req`, `EngineConfig::new`), and
+# `LEADER_CONFIRM_TIMEOUT` (driver.rs) on `Raft::get_read_log_id`'s
+# behaviour there (`RaftCore::handle_check_is_leader_request`: one
+# heartbeat per voter under a `heartbeat_interval` timeout, the vote and
+# read log id captured before sending); both must be re-derived on any
+# upgrade (0.10 changes elections). Not pinned
 # exactly: an `=` pin in a published library makes resolution brittle for
 # a consumer that also depends on openraft 0.9. `Cargo.lock` holds 0.9.25
 # for our builds, and the election test
