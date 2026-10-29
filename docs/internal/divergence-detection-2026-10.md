@@ -4,6 +4,12 @@ Status: **proposal**. Implements item S8 of the
 [application API review](application-api-review-2026-09.md), "No divergence
 detection for a nondeterministic `apply`".
 
+Code is cited as `file:line` against branch `plan/state-divergence-detection`
+at 1164fce7 (its code is unchanged since 3d0ec3d4, the commit the
+[cluster-halt evaluation](divergence-cluster-halt-evaluation-2026-10.md)
+cites); a later edit to a cited file moves its lines, so the function or
+type named beside each citation is the anchor to search for.
+
 The one-line goal: **every copy of the application digests the reports it
 produced, in windows of a fixed number of entries, chains the window digests,
 and when two copies disagree the whole cluster stops serving, for good: the
@@ -95,7 +101,10 @@ Stated here as the operator docs will state it (step 6):
     intervals. With ticks disabled (`--tick-interval-ms 0`), an idle node's
     last window stays open until traffic fills it.
   - **The tail at failover.** Positions after a run's end (the windows not
-    yet compared when a primary stops) are not verified.
+    yet compared when a primary stops) are not verified. Nor are the
+    windows a promoted replica's own in-process check had not reached when
+    the promotion took its copies down: the promoted node's check starts
+    afresh from its live state.
   - **Queries are not covered**: they are not journaled, so no other copy
     answers them.
 
@@ -222,10 +231,16 @@ Stated here as the operator docs will state it (step 6):
   any raft spawn, and `melin_raft::spawn` has no other caller. openraft
   counts a voter that is down: its majority is over the configured set.
 - **Raft voters are capped from below only.** `build_raft_config` checks a
-  minimum under auto-promotion (`raft.rs`), and nothing refuses more voters
-  than data-plane nodes. A primary streams to at most two replicas (the
-  two producer slots, `pipeline.rs`), so a fourth or fifth voter is a
-  standby that can never be a connected replica.
+  minimum under auto-promotion (`raft.rs:91`), and nothing refuses more
+  voters than data-plane nodes. A primary streams to at most two replicas
+  (`ReplicaSlotCursors::SLOTS`, the two producer slots), so a fourth or
+  fifth voter is a standby that can never be a connected replica. After
+  the raft directory's first boot the stored membership is in force, and
+  the driver compares it with the flags only inside its own thread, after
+  `initialize`, where a failure can only `mark_stopped` and leave the node
+  running without raft (`driver.rs:367`, `:405`); the store itself is
+  opened synchronously in `melin_raft::spawn` (`driver.rs:192`), so the
+  node's start can still fail there.
 - **Replicas never re-point.** After a failover, surviving replicas keep
   dialling their `--replica-of` until an operator re-points them
   (`docs/replication.md`, "Deployment rules"), with reconnect backoff from
@@ -233,10 +248,44 @@ Stated here as the operator docs will state it (step 6):
 - **Acks are read in a few places.** Kernel TCP reads acks in the live
   loop only, not during catch-up, snapshot transfer or the bridge
   (`tcp_sender.rs`). The DPDK sender keeps only the newest ack while a slot
-  joins (`keep_last_ack`, `dpdk.rs`). Every ack that moves a cursor passes
-  `ReplicaCursors::record_ack` (`transport-core/src/replication/cursors.rs`),
-  which stores rather than takes a maximum. Every read site skips frames it
-  does not decode.
+  joins (`keep_last_ack`, `dpdk.rs:252`), and the streaming arm records it
+  only once the join is over (`dpdk.rs:1165`, `1341`). Every ack that moves
+  a cursor passes `ReplicaCursors::record_ack`
+  (`transport-core/src/replication/cursors.rs:149`), which checks the ack
+  against the sent high-water first, evicting on a violation, and then
+  stores rather than takes a maximum. Its two callers are the kernel live
+  loop (`tcp_sender.rs:1040`) and the DPDK streaming arm. Every read site
+  skips frames it does not decode (`tcp_sender.rs:1155`, `dpdk.rs:260`).
+- **The primary's handshake is read in one place per transport**, after
+  authentication and before the epoch check: `handle_replica_connection`
+  (`tcp_sender.rs:480`, the fence check at `:502`) and the DPDK
+  `Handshaking` arm (`dpdk.rs:1033`, the fence check at `:1048`).
+- **Nothing replication-facing outlives the pipeline today.** On kernel
+  TCP the replication listener is bound once in the entry
+  (`server.rs:1050`) but moved into the sender thread, whose supervisor
+  joins its handlers and returns on the shutdown flag
+  (`tcp_sender.rs:163`), dropping the listener. On DPDK the EAL and port
+  (`DpdkShared`, `server.rs:2565`) live in the entry, but the transport,
+  which holds the replication listener, is moved into
+  `run_as_primary_dpdk` (`server.rs:2938`), whose poll loop ends with
+  `close_all_links`: a 100 ms drain, then a reset of every link
+  (`linger_then_reset`, `dpdk.rs:202`, `1526`). The primary's health
+  endpoint runs on the node's shutdown flag (`server.rs:3980`) and is
+  joined with the pipeline (`stop_and_join`, `server.rs:1645`); only the
+  replica's has a stop flag of its own, held by the entry
+  (`spawn_replica_health`, `raft.rs:318`).
+- **A replica reads primary messages in five places**, each ending in a
+  wildcard arm that returns an error out of the receiver: the handshake's
+  answer (`tcp_receiver.rs:783`, the `_` arm at `:854`; `dpdk.rs:1928`),
+  the snapshot's begin and the segment seed's (`replication/mod.rs:1209`,
+  `:1246`), the chunked body (`receiver_transport.rs:242`), the
+  `StreamStart` that follows a snapshot transfer (`replication/mod.rs:1423`,
+  the "expected StreamStart after snapshot" arm at `:1470`), and the
+  stream (`process_streaming_frames`).
+- **The replica's shutdown exit drains its acks.** `streaming_loop`'s
+  shutdown arm (`receiver_transport.rs:975`) runs `drain_pending_acks`,
+  which waits on the journal cursor and sends an ordinary cumulative ack
+  before the session ends.
 - **The response loop checks shutdown once per batch** (top of `'run`), and
   "a send with room goes through whatever the flag says": a batch already
   read is sent to its end. Stopping replies *at* detection needs a per-slot
@@ -304,8 +353,12 @@ loss does the rest.** A stopped node latches the fence before anything else
 fenced inputs make it refuse auto-promotion, and the readers close every
 client. Every place a replica honours a promotion request (the in-session
 poll in `streaming_loop`, each receiver's reconnect-loop top) checks the
-shutdown flag first, which the stop sets with the latch. If a request still
-slipped through that check-then-check window, the primary pipeline it
+shutdown flag first, which the stop sets with the latch, and both read the
+latch again once the replica pipeline is joined, so a trip by a shadow
+still applying the entries the receiver fed it is caught before the
+application is handed over (decision 11). If a request still
+slipped through those checks (the reconnect-loop top's check-then-act
+window), the primary pipeline it
 builds shares the node's `FenceState`, so its readers close every client
 and its stages stop on the shutdown flag. After the exit, the marker keeps
 the node from restarting (decision 12), so it never rejoins raft.
@@ -1092,7 +1145,34 @@ own batch cadence. Nothing in the digest path is behind
 - **Unknown flag bits and causes are refused**, as `genesis_known` is: a
   bit this build does not define is a peer's protocol bug, never read as
   a stop or as no stop. A `window_end` that is not 0 with `STOPPED` clear
-  is refused the same way.
+  is refused the same way. On the primary's ack read sites, which today
+  skip any frame that does not decode (`tcp_sender.rs:1155`,
+  `dpdk.rs:1338`, and the join's `keep_last_ack`, `dpdk.rs:260`), an ack
+  refused for its flags is not skipped: it takes the ack-violation path
+  (evict, `error!`), since it is an authenticated member's bug exactly as
+  an impossible cursor is, and a skipped one could be a stop the primary
+  never sees. `decode_replica_message` returns that refusal as an error
+  of its own, distinct from a frame of another kind, so a read site can
+  tell the two apart; `keep_last_ack` returns it as a `JoinFrames`
+  violation arm, which the `Joining` arm evicts on. The DPDK streaming
+  arm's frame loop (`dpdk.rs:1333`) today duplicates `drain_ack_frames`
+  (`tcp_sender.rs:1138`) inline in the gated poll loop; it is replaced by
+  a call to `drain_ack_frames`, hoisted, ungated, beside `keep_last_ack`
+  in `receiver_transport.rs`, with the record, latency and persist-watch
+  work in its closure and its framing error taken through the arm's
+  existing `ack_error` teardown. One helper then reads every streaming
+  ack on both transports, and its ungated tests cover both.
+- **`Halt` cannot fall into a wildcard arm.** Every place a replica reads
+  a primary message ends in a `_` arm that returns an error out of the
+  receiver (what the code shows), so a `Halt` added as one more
+  `PrimaryMessage` variant would make a replica that meets it in a
+  handshake answer or a snapshot transfer exit with "unexpected response",
+  with no marker and free to restart. `decode_primary_message` therefore
+  returns `PrimaryFrame::Halt(Halt)` or `PrimaryFrame::Message(PrimaryMessage)`,
+  and `Halt` is not a `PrimaryMessage`: each of the five read sites must
+  match the outer enum, which has no room for a wildcard to swallow it,
+  and trips the latch with `ClusterHalted { via: Halt }` before it looks
+  at the message.
 - **The full divergence record stays in the marker.** The wire carries
   only what lets a node stop and say who told it, plus the position for
   its log. Digests and chain values are the detecting node's evidence, in
@@ -1195,12 +1275,17 @@ own batch cadence. Nothing in the digest path is behind
   more and, on the same session, runs decision 11's notice: it sends one
   flagged ack with the last positions it sent, then waits for the
   primary's `Halt` or its close, within the notice bound. The session then
-  ends with a new `SessionExit::Stopped(HaltCause)`. The match in
-  `handle_session_exit` is exhaustive, so every receiver must decide what
-  it means. Its arm never reaches a reconnect-loop top, where a promotion
-  request could be honoured: it returns to the exit helper, which runs the
-  linger (decision 11). `process_streaming_frames` decodes `Halt` beside
-  `Digest`, and a `Halt` trips the latch with cause `ClusterHalted`.
+  ends with a new `SessionExit::Stopped(HaltCause)`. Both receivers hand
+  every exit to the one shared `handle_session_exit`
+  (`replication/mod.rs:950`), whose `match exit` is exhaustive, so the
+  new variant cannot compile without its arm there. That arm tears the
+  pipeline down and returns `AfterSession::Return` with the stop's error,
+  which `AfterSession::adopt` passes through to `run_receiver*`'s caller
+  on both transports, so it never reaches a reconnect-loop top, where a
+  promotion request could be honoured: it returns to the exit helper,
+  which runs the linger (decision 11). `process_streaming_frames`
+  decodes `Halt` beside `Digest`, and a `Halt` trips the latch with
+  cause `ClusterHalted`.
 
 ### 10. The in-process check: shadow against live, on every node with a shadow
 
@@ -1232,7 +1317,9 @@ A node stops for one of two causes, `HaltCause` (exhaustive):
 replica's receiver, or any node's shadow), and `ClusterHalted { by, via,
 window_end }`, when another node tells it (`by` the primary or a replica's
 slot and key fingerprint, `via` the ack, the handshake or the halt frame).
-Either way, the node:
+The stop is honoured whatever the node's own `--no-output-digests`: that
+flag governs what a node computes, not whether it obeys a stop. Either
+way, the node:
 
 1. **Halts replies at once.** `DivergenceLatch::trip(cause)` latches the
    node's `FenceState` with a new stop cause and co-sets the shutdown flag,
@@ -1247,9 +1334,78 @@ Either way, the node:
    pipeline builder. The replica's shadow takes the latch, not a flag, so
    it cannot pick the wrong one. The receiver's waiting push, the
    `accept_slot` abort closure that today checks `journal_failed`, also
-   checks the latch. A shadow that trips stops consuming the input ring,
-   so without that check the receiver would wedge in a push on a full ring
-   and never reach the loop top that reads the shutdown flag. The latch
+   checks the latch, at both of its call sites: the streaming path
+   (`receiver_transport.rs:545`) and the promotion drain,
+   `process_drain_frames` (`receiver_transport.rs:800`). A shadow that
+   trips stops consuming the input ring, so without that check the
+   receiver would wedge in a push on a full ring and never reach the loop
+   top that reads the shutdown flag, and a drain that a promotion started
+   at the moment of the trip would wait forever, its node never reaching
+   the exit helper or the notice. On the streaming path an abort leaves
+   the frame's slots pushed before it as today's `journal_failed` abort
+   does: the `if frame_published` block after the abort's `break`
+   (`receiver_transport.rs:572-584`) commits them and queues their ack
+   target, and nothing after them is pushed. Harmless after a stop: the
+   stopped loop top skips `drain_pending_acks`, so that target is never
+   acknowledged, and the flagged ack carries the positions last sent, not
+   it; and the marker refuses the restart that would replay them. Kept
+   rather than special-cased, so the abort has one shape whatever its
+   cause. The drain's `Err` arm already stops the
+   drain at the last contiguous slot; its `warn!` names the cause it read
+   (the journal stage's failure, or the stop) rather than always the
+   journal. What follows the drain changes with it. Today the promotion
+   branch runs `drain_pending_acks` after the drain
+   (`receiver_transport.rs:1025`) and then `break SessionExit::Promote`
+   (`:1034`), whose arm in `handle_session_exit`
+   (`replication/mod.rs:985`) hands the application to the entry to run
+   as primary. A drain that ended with the latch set, whether its abort
+   read the latch or the shadow tripped while it ran, does neither: it
+   skips `drain_pending_acks`, as the stopped loop top does, so no
+   ordinary ack goes out after the stop, and leaves as the stopped loop
+   top does, through the notice (the flagged ack, the wait for `Halt`)
+   and `SessionExit::Stopped`, never `Promote`. That reading, once after
+   the drain loop and before `drain_pending_acks`, is only the early exit:
+   it sees a trip by the receiver's own abort, or by the shadow on entries
+   it applied before the reading. It cannot see the rest. The shadow trips
+   on its own thread as it applies entries, and it trails the receiver, so
+   the entries the drain itself pushed are usually applied after the
+   reading: while `drain_pending_acks` waits on the journal cursor
+   (`pop_all_blocking`, `receiver_transport.rs:1170`), or during the
+   teardown, which publishes the sentinel and joins the shadow only after
+   the session has broken with `Promote` (`replication/mod.rs:757-773`,
+   reached from the `Promote` arm at `:985`). A divergent window closing
+   on one of the drained frames is the common case, not a corner. So the
+   guarantee is a second reading, in `handle_session_exit`'s `Promote` arm,
+   after `teardown_replica_pipeline` has returned: every thread of the
+   replica pipeline is joined then (`shutdown_pipeline`,
+   `replication/mod.rs:351` on), so no thread that could trip for the old
+   pipeline is left, and the receiver is the caller. Set, the arm does not
+   hand the application over (`Ok(Some(..))`, `:987`): it returns as the
+   `Stopped` arm does, and the exit helper finds the stop in the latch.
+   The other promotion, at each receiver's reconnect-loop top
+   (`tcp_receiver.rs:684`, `dpdk.rs:1713`), has the same gap: it checks the
+   shutdown flag, then `take_pipeline_for_promotion` tears down a pipeline
+   whose shadow may still be applying the last session's entries
+   (`replication/mod.rs:1141-1142`). So the post-join reading is one
+   function, a promotion teardown that joins the pipeline, reads the latch
+   and returns the application only when it is clear, and both the
+   `Promote` arm and `take_pipeline_for_promotion` go through it, so
+   neither can hand over a stopped node's application.
+   The session's link is already closed (`close()`, `:975`, runs before the
+   `match`), so no flagged ack can go out on it; the marker's `notice`
+   stays `pending`, and the exit helper's replica linger redials
+   `--replica-of` with a flagged handshake (below), as for a replica whose
+   in-session notice went unanswered. An ordinary ack that
+   `drain_pending_acks` sent before the shadow's trip is an ack sent before
+   the stop, like any ack the receiver sends between a trip and its next
+   reading: it carries journal positions, not a verdict, and the flagged
+   handshake follows it. The shadow leaves on the pipeline flag the
+   teardown sets (`shadow.rs:107`), not at the sentinel, so the entries it
+   had not applied by then are never compared by the old pipeline's shadow,
+   and the promoted node's shadow is a new clone of the live application
+   (`server.rs:1779`) starting a new run: that tail is unverified (the
+   limits, "The tail at failover"), not a stop missed. With both readings,
+   a stopped replica never becomes a primary that told nobody. The latch
    keeps the first cause only; a second trip returns `None`. From the
    latch on: the readers close every client (`Verdict::Close`), the
    response loop hands no slot and no early reply to the egress (a per-slot
@@ -1274,7 +1430,7 @@ Either way, the node:
    divergence, whether that window differs itself, both window digests and
    both chain values in full hex, and the run (`verified_from`,
    `verified_through`); then `notice` (`pending`, `delivered` or `none`,
-   rewritten as the notice of step 4 progresses), the node's build id, and
+   rewritten as the notice of item 4 progresses), the node's build id, and
    the wall-clock time (for people; nothing reads it).
 4. **Tells the rest of the cluster, then lingers.** What it does depends
    on its role (below, "The notice and the linger"). In short: a replica
@@ -1298,21 +1454,23 @@ Either way, the node:
 
 **The order is enforced by types, not by a comment.** `trip` returns a
 `Halted` token (private constructor, neither `Clone` nor `Copy`), the
-marker writer consumes it and returns a `MarkerOutcome` (`Written`, or the
-I/O error), and the notice and the linger take that. Nothing can write a
-marker, or tell another node, before the latch is set, and nothing tells
-another node before the marker write has been attempted. A crash just
-after telling the others then leaves a node that refuses to restart,
-rather than one that rejoins the cluster it has just stopped. A failed
-write still lets the notice run (below). The halt itself does not rest
+marker writer consumes it and returns a `MarkerOutcome` (`Written`, the
+I/O error, or `Unconfirmed` when the write did not settle in time), and
+the notice and the linger take that. Nothing can write a marker, or tell
+another node, before the latch is set. Nothing tells another node before
+the marker write has settled or `HALT_NOTICE_BOUND` has passed. In every
+case but a hung disk, a crash just after telling the others then leaves
+a node that refuses to restart, rather than one that rejoins the cluster
+it has just stopped. A failed or unconfirmed write still lets the notice
+run (below). The halt itself does not rest
 on the caller: the comparator trips
 before it returns a `Mismatch` (decision 6), so a detection site that
 ignored the verdict would still have halted the node's replies and set
 its shutdown flag. Writing the marker does rest on the detecting thread,
 and the types alone cannot force it. A dropped `Halted` token compiles,
-and `#[must_use]` on it is only a lint. So the exit helper is the
-backstop: it writes the marker itself when it finds a divergence with
-nothing deposited.
+and `#[must_use]` on it is only a lint. So the token's `Drop` records
+that it was abandoned, and whichever of the notice or the exit helper
+reaches the latch first writes the marker (below).
 
 **Which thread does what.** The steps span threads: detection is on the
 shadow thread (primary or replica) or the replica's receiver thread, a
@@ -1321,34 +1479,83 @@ senders, while the linger must wait until every pipeline thread has been
 joined. So:
 
 - On the **tripping thread** (a comparator's for `Detected`, the receiver
-  or a sender for `ClusterHalted`), the trip latches. The thread then logs
-  and writes the marker itself, at once, with the `Halted` token: the
-  marker is cold work of the kind the shadow already does (it writes
-  snapshots), and writing it before any join means a hang in the shutdown
-  leaves the node refusing to restart all the same. It then deposits the
-  `MarkerOutcome` back into the `DivergenceLatch`, which is one `Arc` per
-  node shared by every trip site, the notice and the exit helper (a
-  `Mutex` around an `Option`, touched only on this cold path).
+  or a sender for `ClusterHalted`), the trip latches. The thread logs and
+  hands the `Halted` token to a short-lived `divergence-marker` thread
+  (one spawn per node lifetime, on the cold path), which consumes the
+  token, writes the marker and deposits the `MarkerOutcome`. No
+  link-owning thread ever enters the write. At three of the four trip
+  sites the tripping thread *is* a link owner: the replica's receiver for
+  replica-vs-primary and for `ClusterHalted`, a primary sender for
+  `ClusterHalted`, and on DPDK the poll thread for every `ClusterHalted`
+  (a flagged ack through `record_ack`, `dpdk.rs:1341`, or a flagged
+  handshake, `dpdk.rs:1033`). A link owner stuck inside `fsync(2)` could
+  not be released by any bound on a wait. Writing beside the links also
+  means the DPDK poll thread never stalls on the write, and the pipeline
+  joins never wait on a marker fsync, so the exit helper and the linger
+  always run. Writing the marker before any join means a hang in the
+  shutdown leaves the node refusing to restart all the same. If the
+  thread cannot be spawned, the tripping thread writes the marker
+  itself, as the one fallback, and logs `error!`. The outcome goes to the
+  `DivergenceLatch`, which is one `Arc` per
+  node shared by every trip site, the notice and the exit helper. It
+  lives in `transport-core` beside `FenceState`, so `ReplicaCursors` (the
+  same crate) can hold it. Its marker state is a `Mutex` around an
+  exhaustive enum, touched only on this cold path: `Clear`, `Pending`
+  (tripped, the token alive), `Abandoned` (the token dropped unconsumed),
+  `Claimed` (a waiter writing in the token's place), `Written` or
+  `Failed(io::Error)`. `Halted`'s `Drop` moves `Pending` to `Abandoned`
+  when the token goes unconsumed, and does no I/O itself. A `Condvar`
+  beside the `Mutex` wakes the kernel transport's blocked waiters on every
+  change; the DPDK poll thread never blocks on it, and reads the state
+  once per poll iteration instead.
 - The **notice in the session** runs on the replica's receiver and on the
-  primary's senders, the threads that own the links. Each waits for the
-  latch to hold a `MarkerOutcome` (the tripping thread writes it within
-  one fsync) before sending its flagged ack or its `Halt`.
+  primary's senders, the threads that own the links. Each waits up to
+  `HALT_NOTICE_BOUND` for the latch to leave `Pending` and `Claimed`
+  before sending its flagged ack or its `Halt`. A small fsync lands in
+  milliseconds, so in every ordinary stop the marker is down first. Past
+  the bound, the waiter logs `error!` ("marker not confirmed within the
+  notice bound; telling the cluster without it") and sends its notice
+  anyway. A marker fsync that outlasts the bound is a hung disk, and a
+  notice held for it would turn the eventual kill into a failover onto
+  the broken build, with no marker anywhere and no `Halt` sent (open
+  question 7). A late write is harmless: the state moves to `Written`
+  whenever it lands, and the exit helper reads it once more after the
+  linger. The DPDK poll thread keeps polling its transport while it
+  waits. A waiter that finds `Abandoned` claims the write (`Abandoned` to
+  `Claimed` under the lock, so exactly one claimer writes) and hands it to
+  a `divergence-marker` thread as the trip does, from the cause the latch
+  kept. A token dropped by a bug then cannot leave the link-owning threads
+  waiting, and the claimer itself never enters the write. Claims are taken
+  only on `Abandoned`, never on `Pending`, so there is never a second
+  writer. The claim is a guard: depositing the outcome consumes it, and
+  its `Drop` moves `Claimed` back to `Abandoned`, so a writer that unwinds
+  mid-write leaves the write to the next claimer.
 - The **exit helper** is the single return path of every node entry, after
   every pipeline thread (and, on a replica, the receiver) has been joined,
   whichever way they left. It claims the latch's contents: nothing there is
   an ordinary exit; a stop whose marker is written runs the linger and returns
-  `NodeDiverged`; a stop with nothing deposited (a detecting thread that
-  dropped its token, or died before writing) has its marker written here,
-  from the cause the latch kept, and then goes on as either case below; a
-  stop whose marker write failed still runs the linger, then returns
-  `NodeDiverged` carrying the I/O error, logged at `error!`, so the
-  operator learns the refusal on restart is not guaranteed. The linger
+  `NodeDiverged`; a stop left `Abandoned` (a detecting thread that
+  dropped its token, or unwound before writing, in a build that unwinds)
+  has its marker handed to a writer here, by the same claim, and then goes
+  on as either case below. `Pending` or `Claimed` found here means a
+  writer still in its fsync (a hung disk), or a leaked token or claim
+  guard (a `mem::forget`, since a dropped one returns the state to
+  `Abandoned`). The helper cannot tell them apart and does not need to: it
+  waits one `HALT_NOTICE_BOUND`, then runs the linger, reads the state
+  once more, and returns `NodeDiverged` with `MarkerOutcome::Unconfirmed`
+  if it still has not settled, logged at `error!`. It never blocks on the
+  write. The helper's `match` names all six states, so a seventh must
+  decide too. A stop whose marker write failed, or stayed unconfirmed,
+  still runs the linger, then returns `NodeDiverged` carrying the I/O
+  error or `Unconfirmed`, logged at `error!`, so the operator learns the
+  refusal on restart is not guaranteed. The linger
   runs without a marker because only the running process holds the stop
   then: telling the others is what keeps the cluster down when this node
   might come back. The decision is the latch's, not the exit path's: a
-  replica receiver that sees only the shutdown flag and leaves through
-  `SessionExit::Shutdown`, after its shadow tripped, still returns through
-  the helper, which finds the stop and lingers. No exit path can skip the
+  replica receiver that sees only the shutdown flag outside a session (in
+  its backoff, or mid-handshake) after its shadow tripped, and leaves as
+  on an ordinary shutdown, still returns through the helper, which finds
+  the stop and lingers. No exit path can skip the
   claim, because the helper is the only way to return from the entry.
 
 **The notice and the linger.** `HALT_LINGER` is `2 × MAX_BACKOFF`, 60 s: a
@@ -1356,41 +1563,225 @@ replica in reconnect backoff redials within `MAX_BACKOFF`, so a primary that
 lingers twice that long meets every replica that was between sessions when
 it stopped, with a full backoff's margin. A constant, not a flag: the value
 follows from the backoff, and an operator has nothing to tune it against.
+
+The notice bound, `HALT_NOTICE_BOUND`, is a second constant, 5 s, and
+not derived from `replication_heartbeat_secs` (`server.rs:305`, a flag,
+default 5). It bounds a wait on a peer that is connected and was just
+sent a frame (the replica waiting for `Halt` after its flagged ack, a
+sender's write and drain after its `Halt`), which a live peer answers
+within a round trip and a poll, not on its heartbeat cadence. It also
+bounds the link owners' wait for the marker (above), which a healthy disk
+settles in milliseconds: the journal sets no fsync deadline of its own to
+derive one from. Tied to
+the heartbeat, an operator's large heartbeat would let these waits eat
+most or all of the linger. The kernel slots drain on their own handler
+threads and DPDK's `close_all_links` polls every slot at once, so the
+primary's teardown spends about one bound, not one per slot, before its
+endpoint lingers; a replica spends one before it redials. The relation
+is pinned at compile time, beside both constants:
+
+```rust
+const _: () = assert!(5 * HALT_NOTICE_BOUND.as_secs() <= HALT_LINGER.as_secs());
+```
+
+(`Duration::as_secs` is `const`, so no second pair of constants), so a
+later change to either cannot leave the notice waits a large share of
+the linger unnoticed.
+
 By role:
 
-- **A replica that stopped.** On its current session, it sends one ack with
-  `STOPPED` set, its positions frozen at the last ones it sent (so the
-  primary's stored cursors do not move: `record_ack` stores, it does not take
-  a maximum), and waits up to the notice bound (a few heartbeat intervals)
-  for the primary's `Halt` or its close. A `Halt` received means the primary
-  knows: the marker's `notice` becomes `delivered`, and the replica exits
-  without lingering. Otherwise, after the pipeline is down, it redials its
+- **A replica that stopped.** `streaming_loop`'s loop top reads the latch
+  before its shutdown arm: a stopped replica must not run
+  `drain_pending_acks` (`receiver_transport.rs:977`), which would wait on
+  its journal cursor and then send an ordinary ack after the stop. On its
+  current session it sends one ack with `STOPPED` set, its positions
+  frozen at the last ones it sent (`last_sent_acked_seq` and
+  `last_sent_in_memory_seq`), and waits up to the notice bound
+  (`HALT_NOTICE_BOUND`, above) for the primary's `Halt`
+  or its close, reading and discarding every other frame meanwhile and
+  publishing nothing. A `Halt` received means the primary knows: the
+  marker's `notice` becomes `delivered`, and the replica exits without
+  lingering. Otherwise, after the pipeline is down, it redials its
   `--replica-of` with `STOPPED` in its handshake until an answer arrives (a
   `Halt`, or the primary closing after reading it) or `HALT_LINGER` ends.
-  A replica stopped by a `Halt` tells nobody: the primary already knows,
-  and its `notice` is `none`.
+  The redial is the exit helper's, over the receiver's own dial,
+  authentication and handshake code (factored out of each receiver's
+  reconnect loop, not copied), with the transport the entry still holds: a
+  kernel socket, or on DPDK the transport `run_receiver_dpdk` borrows
+  (`dpdk.rs:1553`). The factored dial takes the linger's absolute
+  deadline. Today's kernel dial is a bare `TcpStream::connect`
+  (`tcp_receiver.rs:690`), which against a primary whose SYNs are dropped
+  rather than reset (a host down behind a switch, a firewall) blocks for
+  the kernel's SYN retries, longer than `HALT_LINGER` itself; the factored
+  one uses `TcpStream::connect_timeout` with the time left before the
+  deadline. A per-call timeout does not bound what follows: `read_frame`'s
+  `read_exact` loops over reads (`protocol.rs:532-543`), so a listener at
+  `--replica-of` that drips its challenge a byte per read timeout (a
+  mis-pointed address, a stale host: the replica authenticates to it, not
+  the reverse) would hold the redial past the linger. So the exchange runs
+  through the same deadline `Read` adapter as the primary's kernel linger
+  (below), one type in `server-runtime` used by both sides, not two, and
+  writes take the smaller of their own timeout (`tcp_receiver.rs:722`) and
+  the time left, so no redial outlasts the linger. The dial checks
+  the deadline before each of those calls and returns its timeout
+  outcome when nothing is left: `connect_timeout` returns `InvalidInput`
+  for a zero `Duration`, and `set_read_timeout` and `set_write_timeout`
+  refuse `Some(Duration::ZERO)`, so a remainder that has run out (or
+  rounds to zero) must never reach them. On DPDK the dial and the
+  handshake are polled, and the linger loop checks the deadline on every
+  pass. The reconnect loop calls the same dial with no deadline beyond
+  its own, so its behaviour is unchanged. A replica stopped by a `Halt`
+  tells nobody: the primary already knows, and its `notice` is `none`. A
+  `Halt` is
+  recognised wherever a replica reads a primary message, the handshake's
+  answer and a snapshot transfer included (decision 8), so a replica that
+  was between sessions, or mid-transfer, stops with its marker rather than
+  exiting on an "unexpected response".
 - **A primary that stopped.** Every replication sender, on both transports,
   sends `Halt` on its slot and closes it at a frame boundary on every exit
-  path once the latch is set. On kernel TCP, the slot's handler writes the
-  frame, shuts its write side only, and drains until the replica closes or
-  the notice bound passes, so a reset caused by unread acks cannot destroy
-  the frame (the guard's two-way shutdown, `uring_teardown.rs`, would).
-  DPDK already lingers on the way out (`linger_then_reset`, `dpdk.rs`). A
-  slot in a snapshot transfer or a catch-up is closed the same way, and its
-  replica meets the halt at its next handshake. Then, after the pipeline is
-  down, the primary keeps its replication endpoint (the listener on kernel
-  TCP, the port it holds on DPDK, which initialises the EAL once per
-  process) answering every authenticated handshake with `Halt`, until
-  `HALT_LINGER` ends or both slots have received one, whichever is first.
-  It never streams, never answers clients and never starts raft in that
-  time.
+  path once the latch is set, and closes it so that a reset cannot destroy
+  the frame before the replica reads it: the replica's acks, left unread,
+  make a close send a reset, and whether a peer stack still delivers
+  bytes it received before a reset is the stack's choice, not one the stop
+  should rest on. So:
+  - *Kernel TCP, live.* `live_stream_uring` sends the `Halt` through its
+    ring once the send in flight completes (a whole ring chunk, so at a
+    frame boundary), then shuts its write side only and keeps its `RECV`
+    reaping, and discarding, acks until the replica's end of stream or the
+    notice bound, and only then lets `InflightUring`'s two-way shutdown and
+    drain run (`uring_teardown.rs:49`).
+  - *Kernel TCP, every other path* (authenticated but before streaming,
+    catch-up, snapshot transfer, bridge): these return to
+    `run_replica_slot` (`tcp_sender.rs:428`), the one exit of every
+    handler, which writes the `Halt` on a clone of the stream with a write
+    timeout of the notice bound (a replica that has stopped reading must
+    not hold the handler, and with it the join), half-closes, and reads
+    with the same bound until end of stream. Today `run_replica_slot`
+    moves its stream into `handle_replica_connection` (`:433`) and keeps
+    no handle, so it takes the clone before the call. Since every handler,
+    the live loop's included, returns through it, the handler says how it
+    ended rather than leaving `run_replica_slot` to guess:
+    `handle_replica_connection` returns a `SlotEnd` (`Unauthenticated`,
+    `HaltSent`, `Open`, or `Broken` for a path that failed mid-frame)
+    alongside its result, and `run_replica_slot` writes only on `Open`.
+    The live loop, which sent its own and shut its write side, returns
+    `HaltSent`, so no second write meets a shut socket and is logged as a
+    connection error; a peer that never authenticated is never told; and
+    a `Broken` path has no frame boundary to write at, so its replica
+    meets the halt at its next handshake. An exhaustive `match` on the
+    enum makes a new exit path decide which it is.
+  - *DPDK.* `close_all_links` (`dpdk.rs:1526`), the poll loop's last act,
+    queues `Halt` on every authenticated slot and closes each (a FIN after
+    the frame) instead of `linger_then_reset`'s reset, polling until each
+    replica has closed or the notice bound passes; only then are the
+    remaining links reset.
+
+  Then, after the pipeline is down, the primary keeps its replication
+  endpoint answering every authenticated handshake with `Halt`, through
+  each transport's existing authentication and handshake decode, hoisted
+  rather than copied. On kernel TCP the exit helper accepts on the
+  returned listener. The listener is non-blocking by construction
+  (`ReplicationListener::new`, `server.rs:1370`), so the loop waits for a
+  connection with `poll(2)` on its descriptor, with the linger's remaining
+  time as the timeout, rather than spinning on `WouldBlock` or switching
+  the listener to blocking, and leaves when the poll times out at the
+  deadline. On each accepted stream it runs the sequence
+  `handle_replica_connection` opens with (`authenticate_replica`,
+  `auth.rs:89`, then the handshake's `read_frame` and
+  `decode_replica_message`, `tcp_sender.rs:476-484`), hoisted into one
+  function both call. A per-read timeout is not enough here: the
+  handler's 10 s (`set_read_timeout`, `:470`) bounds each `read`, and
+  `read_frame`'s `read_exact` (`protocol.rs:532-543`) loops over reads,
+  so a peer dripping one byte per timeout holds a thread for most of
+  `HALT_LINGER`, and two such peers would hold every linger thread
+  while a real replica goes untold. So the linger reads through a small
+  `Read` adapter over the stream that carries an absolute deadline, one
+  notice bound for the whole authenticate-and-handshake exchange, sets
+  the socket's read timeout to the time remaining before each read, and
+  returns `TimedOut` once it has passed. The DPDK linger bounds a
+  connection the same way, with one absolute deadline of its own (below),
+  not the sender's `AuthChallenge` deadline, which is `AUTH_TIMEOUT`,
+  10 s (`dpdk.rs:319`), covers only the challenge, and is cleared once
+  the peer authenticates (`dpdk.rs:889`). Each stream runs on a
+  short-lived thread of its own, at most `SLOTS` at once as today's
+  acceptor spawns one handler per slot (`:278-362`), so a silent or
+  dripping peer holds one of them for one bound at most and never the
+  accept loop. On DPDK there is no blocking path to
+  reuse: the primary authenticates only inside the sender's poll loop
+  (`accept_connection` issuing the challenge, `dpdk.rs:778-805`, and the
+  `Authenticating` arm's `step_authentication`, `:865-899`, `auth.rs:214`),
+  and `close_all_links` has just ended that loop. So the linger drives a
+  poll loop of its own over the returned transport: the challenge issue,
+  hoisted out of `accept_connection` into a function both call, then
+  `step_authentication` per connection, then the handshake frame's
+  decode and the queued `Halt`. Its per-connection state is a small
+  linger-only struct (handle, buffers, challenge, phase), not
+  `SlotSender`, which carries rings and cursors a stopped primary no
+  longer has. The struct carries one absolute deadline, set at accept to
+  now plus `HALT_NOTICE_BOUND`, which it hands to `step_authentication`
+  as the challenge's deadline and which the loop checks on every poll in
+  each phase, the handshaking one included, resetting the connection
+  once it has passed. The sender's bounds do not carry over: its
+  `AuthChallenge` deadline ends at authentication, and its handshaking
+  phase after it is bounded only by `PeerLiveness::REPLICATION`, whose
+  probes a peer that is alive but silent answers
+  (`peer_liveness.rs:360-363`), so without the linger's own deadline an
+  authenticated peer that never sends its handshake would hold a linger
+  connection for all of `HALT_LINGER`. The loop holds at most `SLOTS`
+  linger connections at once, in a fixed array as the sender's
+  `accept_connection` holds its slots (`dpdk.rs:757-765`), and resets a
+  connection that arrives with every one in use, as the sender does, so
+  a silent or dripping peer holds one entry for one bound at most, the
+  same limit as the kernel side's threads. Nothing outlives
+  the pipeline today (what the code shows), so the endpoint is handed back
+  to the exit helper: on kernel TCP the sender thread returns the
+  `ReplicationListener` it was given, so connections that arrive during
+  the teardown wait in its backlog rather than being refused, and a
+  replica's backoff is not escalated by a refusal; on DPDK
+  `run_as_primary_dpdk` returns its transport, whose replication listener
+  is still open, and the EAL and port stay with the entry's `DpdkShared`.
+  The primary's health endpoint gets a stop flag of its own, as the
+  replica's has, raised by the exit helper after the linger rather than
+  by the pipeline's shutdown, so `/healthz` and `/metrics` stay readable
+  throughout. Its handle therefore leaves `PipelineHandles`: today
+  `stop_and_join` joins it with the pipeline threads (`server.rs:1645`),
+  and with a flag only the exit helper raises, which runs after that
+  join, the join would never return. The entry holds it instead, in the
+  replica's `ReplicaHealthGuard` (`raft.rs:285`), reused rather than
+  copied (and renamed `HealthGuard`, now that both roles hold one),
+  whose `stop` raises the flag and joins and whose `Drop` does the same.
+  On an ordinary shutdown, with no stop latched, the entry stops the
+  guard as soon as `stop_and_join` returns, so a clean exit is as prompt
+  as today; an error return out of the entry drops it. The endpoint
+  answers until `HALT_LINGER` ends or the replicas told, counted by
+  distinct key fingerprint, in session or by handshake, reach
+  `ReplicaSlotCursors::SLOTS`, whichever is first.
+  Counting distinct keys rather than sessions keeps a replica told twice
+  (its session cut after the first `Halt` was sent but before it was read)
+  from ending the linger while the other is still between sessions; two
+  replicas sharing a key make the linger run its full length, which costs
+  time, never coverage. It never streams, never answers clients and never
+  starts raft in that time.
 - **A primary told by a replica.** The flag trips the latch with cause
-  `ClusterHalted`. `ReplicaCursors::record_ack` checks `STOPPED` and trips
-  *before* it stores, so neither sender can forget it and a flagged ack
-  moves no cursor. `keep_last_ack` keeps the flag sticky while a DPDK slot
-  joins. The handshake checks it after authentication and before the epoch
-  and chain checks, so a stopped replica is never sent a snapshot. The
-  primary then does all of the above, so the other replica is told.
+  `ClusterHalted`, at the first place each transport sees it:
+  - `ReplicaCursors::record_ack`, which holds the node's latch, checks
+    `STOPPED` before its sent high-water check and before it stores, so a
+    flagged ack can neither be lost to an eviction nor move a cursor. It
+    returns `Result<AckRecorded, AckViolation>`, with
+    `AckRecorded::Stored` or `AckRecorded::Stopped(Option<Halted>)`, so
+    neither caller can treat a stop as an ordinary ack, and the one that
+    tripped first holds the token for the marker.
+  - `keep_last_ack`, which today only keeps the newest ack for the
+    streaming arm to record after the join, returns
+    `JoinFrames::Stopped { window_end }` when any ack it reads carries the
+    flag, and the `Joining` arm trips at once: a stopped replica stops
+    reading its join, so a flag held for the streaming arm might never be
+    recorded.
+  - The handshake, after authentication and before the epoch and chain
+    checks (`tcp_sender.rs:480`; `dpdk.rs:1033`), so a stopped replica is
+    never sent a snapshot.
+
+  The primary then does all of the above, so the other replica is told.
 
 **Why this stops the cluster.** Finding 6 gives the argument: with at most
 three voters (decision 14), two stopped nodes leave no quorum. In every
@@ -1471,16 +1862,36 @@ Raft carries no message for the stop (finding 6). Two things change, and
 one is a prerequisite:
 
 - **The voter cap.** A cluster refuses more raft voters than one plus the
-  primary's replica slots, three today, derived from the slot array's
-  length so the bound moves with it. It is checked twice: on the
-  `--raft-peer` flags in `build_raft_config`, and when the driver starts,
-  on the *stored* membership, which overrides edited flags after the raft
-  directory's first boot (`driver.rs`, `docs/replication.md`). A directory
+  primary's replica slots, three today, derived from
+  `ReplicaSlotCursors::SLOTS` so the bound moves with it. `melin-raft`
+  already depends on `melin-transport-core` (`crates/core/raft/Cargo.toml:48`,
+  used at `driver.rs:23` and `recency.rs:43`), where the constant is public
+  (`cursors.rs:143`, `lib.rs:26`), so both checks read
+  `ReplicaSlotCursors::SLOTS + 1` directly, through one `pub const
+  MAX_VOTERS` in `melin-raft` that `build_raft_config` uses too, and
+  `RaftConfig` is unchanged. It is checked twice: on the
+  `--raft-peer` flags in `build_raft_config` (`raft.rs:91`, beside the
+  minimum), and on the *stored* membership, which overrides edited flags
+  after the raft directory's first boot (`docs/replication.md`,
+  "Membership is static"). The second check runs in `melin_raft::spawn`,
+  right after `storage::open` (`driver.rs:192`), over the membership the
+  opened store holds (the state machine's, or the log's `initialize` entry
+  if it was never applied), so it fails the node's start before the
+  driver thread exists. The store's only membership readers today are
+  openraft's async trait methods (`applied_state`, `storage.rs:594`),
+  and `spawn` is synchronous, so the step adds a small synchronous
+  accessor on `FileStateMachine` and on `FileLogStore`, each reading
+  through the store's existing `std::sync::Mutex` (`storage.rs:243`,
+  `:319`), rather than a `block_on` in `spawn`. Not in `driver_main`
+  beside the existing stored-membership comparison (`driver.rs:376`): a
+  refusal there can only
+  `mark_stopped`, leaving a node that serves on without raft. A directory
   initialised with five otherwise keeps five. It applies whatever the
   digest setting: a voter that can never be a connected replica adds
-  nothing to failover. It breaks a deployment that lists more, so it goes
-  under `CHANGELOG.md` **Changed**. With one configured replica there are
-  two voters, and auto-promotion is already refused (`raft.rs`). Without
+  nothing to failover. It breaks a deployment that lists more, so it
+  goes under `CHANGELOG.md` **Changed**. With
+  one configured replica there are two voters, and auto-promotion is
+  already refused (`raft.rs`). Without
   raft, or with raft observational, nothing auto-promotes: only the
   operator paths of step 6 remain.
 - **The quorum-contact gate (prerequisite, fixed separately).** A raft
@@ -1815,8 +2226,11 @@ cross-node check. Each stays its own commit, and the tree passes at each.
 - `FenceState`: a stop cause (`Superseded | Diverged`, exhaustive), first
   cause wins; `is_fenced` unchanged for its readers; the cause in
   `/healthz` and in the raft stand-down's log line.
-- `DivergenceLatch`, `trip`, `HaltCause` (`Detected` only; step 4 adds
-  `ClusterHalted`), the `Halted` token and `MarkerOutcome`, the marker
+- `DivergenceLatch` (in `transport-core`, beside `FenceState`), `trip`,
+  `HaltCause` (`Detected` only; step 4 adds `ClusterHalted`), the `Halted`
+  token with its `Drop` recording `Abandoned`, the latch's marker state
+  and its claim, the `divergence-marker` writer thread, `MarkerOutcome`
+  (`Unconfirmed` included), the marker
   (`NodeStore::divergence_marker`), the `NodeDiverged` error through the
   one exit helper (decision 11), which in this step returns once every
   thread is joined: the linger comes with the notice, in step 4.
@@ -1830,8 +2244,20 @@ cross-node check. Each stays its own commit, and the tree passes at each.
   flag, and passed to every pipeline builder. The replica's shadow takes
   the latch in place of `pipeline_shutdown` for its trip, and keeps the
   pipeline flag only to exit at teardown. The receiver's `accept_slot`
-  abort closure checks the latch beside `journal_failed`, and leaves
-  through `SessionExit::Shutdown`.
+  abort closure checks the latch beside `journal_failed` at both call
+  sites: the streaming path, which leaves through `SessionExit::Shutdown`,
+  and the promotion drain (`process_drain_frames`), which stops at the
+  last contiguous slot and logs the cause it read. The promotion branch
+  reads the latch after its drain loop: set, it skips
+  `drain_pending_acks` and leaves through `SessionExit::Shutdown` (the
+  interim exit, as on the streaming path; step 4 makes it the notice and
+  `Stopped`), never `SessionExit::Promote`. That reading is the early
+  exit; the guarantee is the promotion teardown (decision 11), which joins
+  the replica pipeline, reads the latch, and hands the application over
+  only when it is clear, called by `handle_session_exit`'s `Promote` arm
+  and by `take_pipeline_for_promotion` alike. Set, both return as on an
+  ordinary shutdown (`Ok(None)`, the interim, as above), and the exit
+  helper finds the stop and returns `NodeDiverged`.
 - The shadow's comparator (`shared_start`) against the live board on every
   node with a shadow (decision 10).
 - `NodeStore::refuse_if_diverged` and `NodeStoreError::Diverged`, called
@@ -1848,10 +2274,21 @@ cross-node check. Each stays its own commit, and the tree passes at each.
     is observed";
   - `DivergenceLatch`: the first trip wins; it fences and sets shutdown
     before returning the token; the exit helper's claim, for each of its
-    four cases (nothing, marker written, marker failed, a stop with
-    nothing deposited, whose token was dropped: the helper writes the
-    marker), including a stop deposited by another thread while the
-    caller left through ordinary shutdown;
+    cases (nothing, marker written, marker failed, a stop left
+    `Abandoned` by a dropped token: the helper hands the write to a
+    writer), and `Pending` or `Claimed` left by a `mem::forget` token or
+    guard, or by a writer still in its fsync: the helper waits one bound,
+    never blocks, and returns `Unconfirmed`, including a stop deposited
+    by another thread while the caller left through ordinary shutdown; a
+    waiter blocked on `Pending` released by the token's drop, finding
+    `Abandoned`, claiming once, and a second waiter racing it waiting
+    through `Claimed`, finding `Written` and claiming nothing (two
+    threads, so the claim's exclusivity is what is tested); a claim
+    guard dropped before it deposits returns the state to `Abandoned`,
+    and the next waiter claims; a waiter whose bound passes with the
+    write unsettled returns unsettled, and no tripping thread ever runs
+    the fsync itself (it hands the token over, the spawn-failure fallback
+    aside);
   - marker: written durably (temporary file, rename), parsed back, every
     field present, each value in full canonical hex, the range and the
     "window differs itself" flag; `notice` reads `none` in this step; an
@@ -1891,7 +2328,29 @@ cross-node check. Each stays its own commit, and the tree passes at each.
   - `receiver_transport.rs`, the waiting push: a scripted transport, an
     input ring with no consumer so it fills, and the latch tripped from
     another thread while a push waits. The session ends in
-    `SessionExit::Shutdown` and publishes nothing more;
+    `SessionExit::Shutdown`; the frame's slots pushed before the abort
+    are committed (the ring's producer cursor covers them) and nothing
+    after them is pushed. The same for the
+    promotion drain: `process_drain_frames` over scripted drain frames
+    into a full ring, the latch tripped while a push waits; the drain
+    returns, stopped at the last slot it published. And through
+    `streaming_loop`, a promotion requested on the scripted transport
+    with the latch tripped during the drain (the full-ring case) and,
+    separately, tripped by the scripted transport's `poll_recv` during
+    the drain with ring space to spare, so the drain publishes every
+    frame and only the branch's latch read sees the trip: each session ends in `SessionExit::Shutdown`, not
+    `Promote`, and the scripted transport records no ack after the trip;
+  - `replication/mod.rs`, beside the `handle_session_exit` exit table
+    (`:4031`), the trip that both of those miss: the shadow tripping on
+    the last drained entry after the receiver's reading. A pipeline whose
+    shadow stub waits for `pipeline_shutdown` (which only the teardown
+    sets), then trips the latch and exits, so the trip lands strictly
+    after the session ended in `SessionExit::Promote` and before the join.
+    `handle_session_exit` with `Promote` returns `Ok(None)`, never the
+    application, and the exit helper returns `NodeDiverged`; the same stub
+    through `take_pipeline_for_promotion` (the reconnect-loop top's
+    promotion) returns no application either; and with the stub exiting
+    without a trip, both hand the application over as today;
   - `DivergenceLatch`: a trip sets the flag the latch was built with,
     and the replica builder passes the node's flag, not
     `pipeline_shutdown`. The builder test asserts that the shadow's latch
@@ -1947,18 +2406,77 @@ cross-node check. Each stays its own commit, and the tree passes at each.
   frames are decoded and, for now, dropped: no primary sends one until
   step 5.
 - The cluster-wide stop (decision 11, "The notice and the linger"):
-  `HaltCause::ClusterHalted`; the replica's flagged ack after the latch,
-  its wait for `Halt`, and its redial with a flagged handshake;
-  `ReplicaCursors::record_ack`, `keep_last_ack` and the handshake trip
-  the latch on `STOPPED` before storing or answering; every sender's
-  "send `Halt`, half-close, drain" on every exit path once the latch is
-  set, on both transports; the primary's handshake-only endpoint during
-  `HALT_LINGER`; the exit helper running the linger; the marker's
-  `notice` states; the health endpoint kept up through the linger.
+  - `HaltCause::ClusterHalted` and `SessionExit::Stopped(HaltCause)`, with
+    its arm in the shared `handle_session_exit`'s exhaustive `match exit`
+    returning `AfterSession::Return` with the stop's error (decision 9),
+    so neither receiver's reconnect loop goes round again;
+  - `PrimaryFrame` (decision 8), so all five replica read sites handle
+    `Halt`, the post-snapshot `StreamStart` (`replication/mod.rs:1423`)
+    included;
+  - `streaming_loop`'s loop top reading the latch before its shutdown arm,
+    so a stop skips `drain_pending_acks`; the replica's flagged ack, its
+    wait for `Halt`, and the exit helper's redial with a flagged handshake
+    over the receivers' factored dial-and-handshake code. The waiting
+    push's abort on the latch (step 3's; on today's code an abort becomes
+    `FrameError::Fatal("ring full mid-publish")`,
+    `receiver_transport.rs:554`, and `SessionExit::Fatal` at `:1120`, and
+    which step 3 routes to `SessionExit::Shutdown` as an interim) now
+    pushes nothing after the slots already in the ring (those it commits,
+    as on step 3, decision 11) and returns to `streaming_loop`'s loop top,
+    whose latch read runs the notice and ends in `Stopped`; a `journal_failed`
+    abort stays `Fatal`. The promotion branch's latch read after its drain
+    (step 3's, which left through `Shutdown`) now runs the same notice
+    and ends in `Stopped`, and step 3's promotion teardown, finding the
+    latch set, now returns the stop's error as the `Stopped` arm does, so
+    the exit helper's replica linger redials `--replica-of` with a flagged
+    handshake (the link is closed by then, so no in-session notice); step
+    3's post-`Promote` stub case now also asserts that redial, with
+    `STOPPED` and the window end in its handshake, against a scripted
+    primary that answers `Halt`, and the marker's `notice` going from
+    `pending` to `delivered`. Step 3's replica-shadow integration case, whose
+    receiver left through `SessionExit::Shutdown`, now asserts `Stopped`
+    and the primary's stop, and step 3's `receiver_transport.rs`
+    waiting-push case now asserts one flagged ack on the scripted
+    transport, carrying the positions last sent rather than the committed
+    partial frame's target, no ordinary ack, and `Stopped`; step 3's two
+    promotion-drain cases now assert the same (one flagged ack, no
+    ordinary ack, the wait for `Halt`, and `Stopped`, never `Promote`);
+  - `record_ack` (`AckRecorded`, the `STOPPED` check first), `keep_last_ack`
+    (`JoinFrames::Stopped`, and a violation arm for an ack refused for its
+    flags) and the handshake tripping the latch; `drain_ack_frames` hoisted
+    beside `keep_last_ack` and called by the DPDK streaming arm in place of
+    its inline copy;
+    `ReplicaCursors::new` takes the latch;
+  - every sender's `Halt` on every exit path once the latch is set: the
+    kernel live loop through its ring before its guard's teardown, every
+    other kernel path in `run_replica_slot` with a bounded write, keyed on
+    the handler's `SlotEnd`, DPDK in
+    `close_all_links` with a FIN and a bounded wait instead of the reset;
+  - the endpoint handed back to the exit helper (the sender thread
+    returning its `ReplicationListener`, `run_as_primary_dpdk` its
+    transport), and the primary's health endpoint on a stop flag of its
+    own, its handle moved out of `PipelineHandles` into a
+    `ReplicaHealthGuard` the entry holds (renamed `HealthGuard`, now that
+    both roles use it), stopped after the linger, or at once after
+    `stop_and_join` on an ordinary shutdown;
+  - the handshake-only endpoint during `HALT_LINGER`, its end counted by
+    distinct key: on kernel TCP over the hoisted authenticate-and-read-
+    handshake function `handle_replica_connection` now calls, on DPDK a
+    linger poll loop over the returned transport, reusing the hoisted
+    challenge issue and `step_authentication`, its fixed array of `SLOTS`
+    linger connections each with one absolute deadline checked in every
+    phase (decision 11); the exit helper running
+    the linger; the marker's
+    `notice` states; `HALT_NOTICE_BOUND`, a constant independent of the
+    heartbeat, with its compile-time bound against `HALT_LINGER`.
+
   The notice is driven by the shadow's trip in this step. Step 5 adds the
   replica's comparison as a second detector, through the same notice.
-- Raft: the voter cap on the flags and on the stored membership (decision
-  14), and the stop cause in the stand-down and refusal lines.
+- Raft: the voter cap (`melin_raft::MAX_VOTERS`, from
+  `ReplicaSlotCursors::SLOTS`) on the flags and on the stored membership
+  in `melin_raft::spawn`, read through the new synchronous store
+  accessors (decision 14), and the
+  stop cause in the stand-down and refusal lines.
 - Tests: round trips; wire byte patterns beside `ack_wire_byte_pattern` and
   `rotate_wire_byte_pattern` (`server-runtime/src/replication/mod.rs`),
   and a new `chain_check_wire_byte_pattern` beside them. Today the chain
@@ -1988,21 +2506,63 @@ cross-node check. Each stays its own commit, and the tree passes at each.
     every flag and cause; unknown bits and causes, and a `window_end`
     without `STOPPED`, are refused; a v8 handshake gets the too-short
     error, and a v9-sized one carrying version 8 the version error;
-  - `cursors.rs`: a flagged ack trips the latch before it stores, and
-    moves no cursor;
-  - `keep_last_ack` keeps the flag across newer acks. Today its tests
+  - `cursors.rs`: a flagged ack trips the latch, returns
+    `AckRecorded::Stopped` with the token, and moves no cursor; a flagged
+    ack whose positions would fail the sent high-water check still trips
+    rather than evicting; a second flagged ack returns `Stopped(None)`;
+    an ack refused for its flags evicts as a violation, and is not
+    skipped, in `drain_ack_frames`, which after the hoist reads the
+    streaming acks of both transports, and in `keep_last_ack` below;
+  - `keep_last_ack` returns `JoinFrames::Stopped` when any ack it reads
+    carries the flag, a newer unflagged one included, and its violation
+    arm for an ack refused for its flags. Today its tests
     compile only under the `dpdk` feature, so the function and its
     `JoinFrames`, which need no hardware, move beside `try_extract_frame`
     in `receiver_transport.rs`, ungated, so the test runs on every host;
   - `receiver_transport.rs`, with the scripted transport: after the
-    latch, one flagged ack carrying the last positions sent, the wait for
-    `Halt`, and a flagged handshake on the next dial when none came; a
-    `Halt` received trips `ClusterHalted` and ends the notice at once;
+    latch, one flagged ack carrying the last positions sent and no
+    ordinary ack before it (the shutdown arm's drain skipped), data frames
+    read and discarded and nothing published during the wait for `Halt`,
+    and a flagged handshake on the next dial when none came; a `Halt`
+    received trips `ClusterHalted` and ends the notice at once; a `Halt`
+    as the handshake's answer, and in place of a `SnapshotBegin`, a
+    `SnapshotChunk`, a `SegmentSeedBegin` and the `StreamStart` that
+    follows `SnapshotEnd` and the seed, trips the latch and ends in
+    `Stopped`, never in an "unexpected response" error (the scripted
+    transport serves both receivers' shared code; the transport-specific
+    handshake arms are the integration cases' below);
+  - `tcp_sender.rs`, over a socket pair: the live loop's halt sends the
+    `Halt` after an in-flight send completes, shuts the write side only,
+    keeps reading acks the peer sends after it, and the peer reads the
+    whole `Halt` before end of stream, and exactly one `Halt` (the live
+    loop's `HaltSent` suppresses `run_replica_slot`'s); `run_replica_slot`
+    writes a `Halt` on `Open` and none on `Unauthenticated` or `Broken`;
+    its halt on a peer that never reads returns within the write bound;
+  - the latch's marker state: a link-owning waiter finds `Abandoned`,
+    claims it and hands the write to a `divergence-marker` thread, and the
+    marker lands before it sends (step 3's claim, here exercised from
+    the notice);
   - the linger's rules as pure functions: when the primary's endpoint
-    stops answering (`HALT_LINGER`, or both slots told), when a replica
+    stops answering (`HALT_LINGER`, or `SLOTS` distinct keys told; one key
+    told twice, in session and by handshake, counts once), when a replica
     stops redialling, and the marker's `notice` transitions;
+  - the factored kernel dial under a deadline, ungated over loopback: a
+    listener whose accept queue is full (its backlog shrunk with
+    `libc::listen(fd, 0)` and filled by one unaccepted connection, so the
+    kernel drops further SYNs, as a host behind a dead link does) makes
+    the dial return a timeout at the deadline rather than after the SYN
+    retries, and a peer that accepts but never answers the handshake
+    returns at the deadline too, not after the 5 s read timeout when less
+    is left; a peer that drips its challenge one byte inside each read
+    timeout still makes the dial return at the deadline; and a deadline
+    already passed returns the timeout outcome
+    without a call, not an `InvalidInput` from a zero `Duration`; the
+    DPDK dial's deadline is the linger loop's, covered by the
+    pure-function case above and the netns linger case below;
   - `raft.rs` and the driver: four voters refused from the flags, and a
-    raft directory initialised with four refused at driver start.
+    raft directory initialised with four refused by `melin_raft::spawn`,
+    returning an error before any driver thread exists, under flags that
+    list three.
 - Tests of the stop, integration (`output_divergence.rs`, on both
   transports, the DPDK cases under the netns runner; raft on kernel TCP),
   faults through `Sizing`:
@@ -2014,7 +2574,29 @@ cross-node check. Each stays its own commit, and the tree passes at each.
   - a replica between sessions when the primary stops (held in reconnect
     backoff by the test proxy, `tests/common/proxy.rs`, then released
     inside `HALT_LINGER`): it meets the lingering primary's handshake
-    answer and stops, and nothing promotes;
+    answer and stops with its marker (`cluster-halted`, by the primary,
+    via the handshake answer), and nothing promotes; the same with the
+    replica dialling while the primary's pipeline is still tearing down,
+    which is answered from the listener's backlog rather than refused. The
+    DPDK case, under the netns runner, is the only test of the linger's own
+    poll loop (challenge, `step_authentication`, handshake decode, `Halt`
+    over the transport `run_as_primary_dpdk` returned), which no stub
+    stands in for; a peer that connects to the lingering endpoint and
+    never answers the challenge, or drips its response a byte at a time
+    inside each read timeout, or authenticates and then never sends its
+    handshake, is dropped at the exchange's deadline (`HALT_NOTICE_BOUND`
+    from its accept), on each transport, and a replica dialling after it
+    is still answered; on DPDK, `SLOTS` such peers connected at once
+    leave a further connection reset, and a replica dialling once their
+    deadline has passed is answered (the kernel adapter's deadline
+    arithmetic is also a unit test over a loopback pair, ungated; the
+    DPDK linger's per-connection deadline and full-array decision are
+    pure functions of the phase, the deadline and the clock, unit-tested
+    ungated beside the rules below). The
+    primary's `/healthz` and `/metrics` answer throughout the linger, and
+    on an ordinary shutdown with no stop the primary's health port is
+    released when its run returns (the guard stopped after
+    `stop_and_join`, not left to a linger);
   - a replica that detects while disconnected: its redial reaches the
     primary inside the linger, the primary stops and halts the other
     replica;
@@ -2022,8 +2604,25 @@ cross-node check. Each stays its own commit, and the tree passes at each.
     a snapshot transfer included: the primary stops at the flagged
     handshake or through `keep_last_ack`, and never sends a snapshot to a
     stopped replica;
+  - the converse: the primary stops while a replica is mid catch-up and
+    mid snapshot transfer, on each transport, the transfer cut both inside
+    the body and after the seed but before the post-snapshot `StreamStart`:
+    the replica stops on the `Halt` in its transfer with its marker
+    written, and on DPDK, where the
+    sender's ordinary teardown resets, the `Halt` is read before the link
+    goes;
   - a failed marker write (a seam): the node still lingers and tells the
     others, and its run returns the I/O error;
+  - a hung marker write. The marker writer takes its fsync through a small
+    trait the node is built with, and `melin-test-node` passes one that
+    blocks on an `Arc<Barrier>`. On kernel TCP, the primary's shadow
+    detects with its fsync blocked: both replicas receive `Halt` within
+    `HALT_NOTICE_BOUND` and refuse to restart, and the primary's run
+    returns `NodeDiverged` with `Unconfirmed`. The same with a replica
+    detecting: the primary stops within the bound. Ungated latch unit
+    tests sit beside them: a writer blocked on the barrier, a waiter with
+    a short bound returns unsettled, and releasing the barrier yields
+    `Written`, read by the exit helper's second look;
   - the documented limit: the detector cut off by the test proxy for
     longer than `HALT_LINGER` stops alone; the others are a quorum and
     may fail over. The test asserts the counted, logged outcome
@@ -2034,12 +2633,18 @@ cross-node check. Each stays its own commit, and the tree passes at each.
   replica knows a reconnect from a restart), and "Output verification"
   gaining the cluster-wide stop, the linger and its limit. `CHANGELOG.md`
   **Changed**: replication protocol 9, mixed pairs refused;
-  `build_pipeline_with_replication` takes a `PipelineId`; a divergence on
-  any node stops the whole cluster; more than three raft voters are
-  refused.
+  `build_pipeline_with_replication` takes a `PipelineId`;
+  `decode_primary_message` returns a `PrimaryFrame`, and
+  `ReplicaCursors::new` and `record_ack` change signature (all public in
+  `melin-transport-core`); a divergence on any node stops the whole
+  cluster; more than three raft voters are refused, from the flags or
+  from a raft directory's stored membership.
 - **Leaves untested:** a primary that sends digests, which is step 5; a
   routing split with asymmetric reachability (the proxy cuts whole
-  links); a host reboot during the linger.
+  links); a host reboot during the linger; a reset racing the `Halt` on a
+  real network, where only the half-close ordering is pinned (by the
+  socket-pair test and the integration cases), not the peer stack's
+  behaviour on a reset, which the design no longer relies on.
 
 ### Step 5. The primary streams digests; replicas compare and stop
 
@@ -2109,9 +2714,9 @@ cross-node check. Each stays its own commit, and the tree passes at each.
     the first is taken as the anchor and later ones compared; a fault in a
     window the scripted primary never sends a frame for is a `Mismatch` at
     the next frame, which trips the latch, sends the flagged ack and ends
-    the session with `SessionExit::Stopped`; a promotion request pending when the mismatch
-    arrives is not honoured (the session ends in the divergence, and the
-    receiver returns the error); a local window lapped (a small-capacity
+    the session with `SessionExit::Stopped`; a promotion request pending
+    when the mismatch arrives is not honoured (the session ends in the
+    divergence, and the receiver returns the error); a local window lapped (a small-capacity
     board) breaks the run, counts the gap and re-anchors on the next
     frame, and `verified_through` never moves past the gap; the board read
     in a push waiting for ring space keeps the run unbroken with the input
@@ -2209,8 +2814,8 @@ cross-node check. Each stays its own commit, and the tree passes at each.
     replica, `cluster-halted` by that replica on the primary, by the
     primary on the other replica), nothing promotes, and every restart is
     refused. The same with both replicas faulted, the second stop arriving
-    while the primary is already stopping. And the mixed-build case: the same fault on a
-    replica whose primary is started with another build id (a
+    while the primary is already stopping. And the mixed-build case: the
+    same fault on a replica whose primary is started with another build id (a
     `ServerConfig` field that defaults to the executable's hash and that
     `melin-test-node` can set, the one seam that stands in for a second
     binary) leaves the replica serving, with `verified_through` standing
@@ -2311,7 +2916,10 @@ cross-node check. Each stays its own commit, and the tree passes at each.
     node that never heard the halt; observational raft steering an
     operator to `PROMOTE` its leader, which may be the unaware node;
     voter replacement, which looks like the fix for "two nodes refuse to
-    start" and is not. The refusal text points here;
+    start" and is not; and a forced `ACK-POLICY disk` on a node whose
+    marker never landed (a hung disk at the stop: its log says "marker not
+    confirmed", and its peers refuse to start). The refusal text points
+    here;
   - **starting a new cluster**, the only way back, tested (below):
     1. Stop every node, lingering ones included.
     2. Move each node's marker aside, kept as the incident's record, and
@@ -2518,11 +3126,24 @@ Beyond each step's own list:
    would not answer handshakes with `Halt`; its raft driver still leaves
    on the shutdown flag on its own. Recommendation: no watchdog in this
    plan; the fenced-shutdown path is the same one superseded primaries
-   rely on, and a hang there is a bug for both. The marker is written by
-   the tripping thread before any join, and the in-session notice runs on
-   the link-owning threads before the join too (decision 11), so even a
-   stop that hangs and is killed leaves a node that refuses to restart
-   and, in the connected case, has told the others.
+   rely on, and a hang there is a bug for both. The stop's own waits are
+   bounded by the notice bound: every `Halt` write and drain, and the
+   link-owning threads' wait on the marker, which a `divergence-marker`
+   thread writes beside them (decision 11). A hung marker fsync is bounded
+   like every other wait before the notice: the notice goes out without
+   the marker, and the exit returns `Unconfirmed`. Unlike a hung journal,
+   which stalls the cluster and, once killed, fails over onto a good build,
+   a hung stop that is killed would otherwise fail the cluster over onto
+   a build already seen to diverge, with no marker anywhere and no `Halt`
+   sent. That is why this wait is bounded and the journal's is not. The
+   residue: a node whose marker never landed can restart once its disk
+   recovers. Its peers have stopped, so it has no quorum to rejoin and
+   cannot be promoted. A primary restarted that way has no replica
+   streaming, so it halts client writes under every ack policy (`halt.rs`,
+   "Lifted by the operator's consent"). It still answers queries from the
+   broken build's state, and an operator's forced `ACK-POLICY disk` would
+   let it take writes. Its two replicas' refusals and the `error!` lines
+   are the operator's signal (step 6).
 8. **Ordering against monotonic sequencer time.** (a) Make the
    monotonic-time plan a build prerequisite of step 3; (b) land steps 1 to
    5 in any order against it, but release step 5 only with or after it;
