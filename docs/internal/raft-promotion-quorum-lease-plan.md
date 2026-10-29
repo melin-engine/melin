@@ -854,6 +854,27 @@ each answer went.
   path that already drains and prefaults.
 - **Changed at mint time:** an abandoned promotion exits the process; it
   relies on a supervisor to restart the node (documented in step 4).
+- **Residual liveness risk: a promotion crash loop.** The decision-time
+  filter reads heartbeat acks on raft's long-lived connections; the
+  mint-time confirmation goes through `get_read_log_id`, which opens a
+  fresh connection per voter (connect plus Ed25519 handshake) within one
+  `heartbeat_interval`. Anything that breaks new connections but not
+  established ones (a firewall admitting only established flows,
+  ephemeral-port exhaustion, the raft bind IP removed while old sockets
+  live on) makes the filter pass and the confirmation fail every time:
+  the node promotes, abandons, exits, restarts, and may win the election
+  again. Acked data is never at risk, but failover stalls, and the logs
+  show repeated "automatic promotion abandoned" lines with `NoQuorum` or
+  `TimedOut`. A cause local to one node resolves itself (the others elect
+  a different leader, which fails over); a cluster-wide one blocks
+  automatic failover until fixed, leaving a manual `PROMOTE`. No
+  mechanism is added for it: the genuine-failover tests (step 1b's
+  `replica_leader_promotes_when_the_primary_dies` and
+  `killed_primary_triggers_exactly_one_auto_promotion`) run the real
+  confirmation end to end, so a spurious `NoQuorum` under CI load shows
+  up there first. If it does, revisit (for example, a confirmation that
+  reuses the replication streams' connections) rather than widen the
+  timeout past the mint-time safety assertion.
 - **Not addressed (follow-up):** a *one-sided* partition where the leader
   replica L loses only its link to the primary while the other replica O
   still reaches both. L has a fresh lease (O acks it), so the filter and
