@@ -160,6 +160,12 @@ impl RaftDriverGuard {
         self.handles.as_ref().map(|h| Arc::clone(&h.status))
     }
 
+    /// The mint-time leadership confirmation a promotion's epoch bump
+    /// asks before it is published; `None` when raft is off.
+    pub(crate) fn leader_confirm(&self) -> Option<melin_raft::LeaderConfirm> {
+        self.handles.as_ref().map(|h| h.leader_confirm.clone())
+    }
+
     /// The promotion thread's inputs; `None` when raft is off.
     pub(crate) fn promotion_wiring(&self) -> Option<PromotionWiring> {
         self.handles.as_ref().map(|h| PromotionWiring {

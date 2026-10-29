@@ -942,7 +942,9 @@ struct literal or exhaustive destructuring.
     poller files elections. One refusing arm is the cheapest honest
     answer.
 - Both call sites `?` the result, wrapping it as "automatic promotion
-  abandoned: …". `PipelineHandles` drop joins the spawned stages
+  abandoned: …" through one helper beside `leader_confirmation`,
+  `promotion_abandoned(LeaderConfirmError) -> String`, so the wording is
+  written once for both transports. `PipelineHandles` drop joins the spawned stages
   (verified, §3). The node exits with an error, its journal untouched by
   the tenure (the bump is the tenure's first entry, §3), and must be
   restarted by its supervisor, after which it rejoins as a replica of its
@@ -960,7 +962,27 @@ struct literal or exhaustive destructuring.
     `shutdown` flag, or a thread that consumes and calls
     `FenceState::observe_epoch`, so the wait returns); `Manual` publishes
     without calling the stub; `leader_confirmation(None)` returns
-    `DriverStopped` for any term.
+    `DriverStopped` for any term. As landed, `minted_epoch` is built on a
+    `bump` helper (one ring, the call's outcome, the published epoch if
+    any, the fence epoch after) that every case shares; the refusal case
+    runs every `LeaderConfirmError` variant and checks the stub is asked
+    the election's own term; an accepting case with the shutdown flag
+    down runs the wait to completion against a consumer thread that
+    applies the bump (`FenceState::observe_epoch`); and
+    `promotion_abandoned`'s wording is pinned.
+  - Integration: the genuine-failover tests run the real confirmation end
+    to end (an abandonment there fails the test: the winner's thread
+    returns an error, and `Node::stop` panics on one). Recorded when 4b
+    was implemented, on an aarch64 host: `raft_failover.rs` whole file
+    twice on kernel TCP, `replicated_failover.rs` and
+    `genesis_promotion.rs` passed, and every `raft_failover.rs` test,
+    one per process, passed under `scripts/dpdk/netns-runner.sh` with the
+    `dpdk` feature. No `NoQuorum` or `TimedOut` abandonment was seen. Run
+    with the nodes' log, both genuine failovers logged "confirming
+    leadership before the epoch bump" (the attempt) then, once the
+    matching stage applied it, "epoch bump applied" (the outcome; added
+    after review, so it was not in that run's log), plus one openraft
+    error line for the dead primary (below).
 - `docs/replication.md`, after the refusal list: before taking over, the
   promoting node confirms with a majority of the control plane that it
   still leads. If it cannot, the promotion is abandoned and the node exits
@@ -978,6 +1000,16 @@ struct literal or exhaustive destructuring.
   operation, which the log-level rules reserve for malfunctions. Either
   cap the `openraft` target at `warn` in the node binaries' default filter
   or say in `docs/replication.md` that those lines are expected then.
+  **Decided: documented.** The subscriber belongs to the application's
+  binary, not the runtime (the examples install
+  `EnvFilter::from_default_env()`, and an application such as the
+  Exchange Core installs its own), so the runtime has no default filter
+  to cap, and capping it in each example would copy one directive into
+  every binary while missing every customer's. The line is real and
+  routine: every genuine failover whose dead primary is a voter logs one
+  (`Connection refused` for that voter) when its refusal lands before the
+  majority, as both genuine-failover tests showed. `docs/replication.md`
+  quotes the line and says it is expected then.
 
 ### Step 5: `fix(raft): fence on a higher epoch carried by a reply`
 
@@ -1261,7 +1293,12 @@ Any changed line still unexecuted goes into §10 with a reason.
   demand. That its journal is untouched follows from the unit test (no
   slot published) and the bump being the tenure's first entry; the
   rejoin itself is the ordinary replica restart, which existing tests
-  cover.
+  cover. The same holds for the error arm of the two call sites' `?`
+  (`run_as_primary`, `run_as_primary_dpdk`): no test reaches it, since
+  only an abandoned promotion does; what it returns is pinned by
+  `promotion_abandoned`'s unit test, and the stage teardown on an early
+  return by `PipelineHandles`'s drop, which `spawn_health_endpoint(..)?`
+  already relies on.
 - **The one-sided partition with an idle primary** (§8): a known gap
   until the follow-up design; the writes-flowing case is tested.
 - **A nudged follower winning while the leader was just acknowledged**

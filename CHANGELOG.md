@@ -75,6 +75,16 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   after the grace period; it now refuses, saying it may be partitioned,
   and recovery is a manual `PROMOTE`. A genuine failover waits one more
   control-plane round trip after the election.
+- **An automatic promotion is abandoned, and the node exits with an
+  error, if a majority of the control plane does not confirm its
+  leadership just before it takes over.** The promoting node asks for
+  that confirmation after its pipeline is ready and before it journals
+  anything as primary, so an abandoned promotion leaves the journal
+  unchanged; restarted by its supervisor, the node rejoins as a replica.
+  This keeps a leader that lost its majority after deciding to promote
+  from deposing a primary the rest of the cluster still reaches. A
+  manual `PROMOTE` is not confirmed, and stays available while the
+  control plane is down.
 
 ### Fixed
 

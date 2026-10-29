@@ -768,6 +768,28 @@ Auto-promotion is deliberately conservative. The elected replica
   strictly above the epoch in force; the alignment heals as terms
   advance — promote manually in the interim).
 
+Passing these checks starts the promotion; it does not finish it. Just
+before taking over, after its pipeline is ready and before it journals
+anything as primary or serves any client, the promoting node confirms with a
+majority of the control plane that it still leads, in the term it was
+elected at. If it cannot (it has lost its majority, or a newer leader
+exists, or the control plane did not answer within half a second), the
+promotion is **abandoned and the node exits with an error** naming the
+reason (`automatic promotion abandoned: …`). Its journal is unchanged,
+and once its supervisor restarts it, it rejoins as a replica of its
+configured primary, so run nodes under a supervisor that restarts them
+(systemd's `Restart=on-failure`, say). This confirmation is what keeps a
+leader that lost its majority after deciding to promote from deposing a
+primary the rest of the cluster still reaches. While it runs, the control
+plane's own library logs an error-level line ("timeout while confirming
+leadership for read request") for each peer that does not answer; a
+failover with a dead peer, the dead primary included, can show one, and
+it is expected then. Repeated abandonments with "did not answer" reasons
+while the control plane otherwise looks healthy point at new connections
+between the nodes failing while established ones still work (a firewall
+admitting only established flows, say): each confirmation opens fresh
+connections to its peers.
+
 Manual `PROMOTE` remains available at all times, including during a
 control-plane outage; whichever request is filed first wins, and a
 later duplicate cannot retarget an in-flight promotion.

@@ -47,6 +47,7 @@ use melin_app::encoder::ResponseEncoder;
 use melin_app::{AppEvent, Application};
 use melin_pipeline::ring::Consumer;
 use melin_pipeline::wait::WaitStrategy;
+use melin_raft::{LeaderConfirm, LeaderConfirmError};
 
 use crate::layout::{DEFAULT_CORES, parse_cores};
 /// The layout types live in [`crate::layout`]; re-exported here because
@@ -1251,6 +1252,7 @@ where
                     promotion_request.pending(), // promoted — EpochBump with the origin's epoch floor
                     false, // a promoted node continues the history it streamed
                     raft_status,
+                    raft.leader_confirm(),
                     journal_tip,
                 );
             }
@@ -1356,6 +1358,7 @@ where
         None, // not promoted — no EpochBump injection
         began_history,
         raft_status,
+        None, // not promoted — no leadership to confirm
         journal_tip,
     )
 }
@@ -1740,6 +1743,10 @@ fn run_as_primary<A, L>(
     // with replication on, client service waits for the first replica.
     began_history: bool,
     raft_status: Option<Arc<melin_transport_core::health::RaftStatus>>,
+    // The raft driver's leadership confirmation, asked before an
+    // election's epoch bump (`journal_promotion_epoch_bump`); `None` when
+    // raft is off or the node is not promoted.
+    leader_confirm: Option<LeaderConfirm>,
     // Control-plane advertised tip. This primary's journal stage becomes
     // its writer (the raft driver keeps reading the same handle across a
     // promotion) — see `AdvertisedJournalTip`.
@@ -2194,9 +2201,18 @@ where
     )?;
 
     // Promotion fencing: the bump is the first entry of a promoted node's
-    // tenure. See `journal_promotion_epoch_bump`.
+    // tenure. See `journal_promotion_epoch_bump`. An abandoned promotion
+    // returns here: `stages`' drop stops and joins what was spawned, and
+    // nothing of the tenure reached the journal.
     if let Some(origin) = promotion {
-        journal_promotion_epoch_bump(origin, &fence_state, &mut input_producer, &shutdown);
+        journal_promotion_epoch_bump(
+            origin,
+            &fence_state,
+            &mut input_producer,
+            &shutdown,
+            leader_confirmation(leader_confirm.as_ref()),
+        )
+        .map_err(promotion_abandoned)?;
     }
     // The policy this tenure requests, after the bump; see
     // `PublisherClaim::journal_boot`. Only the booted claim attaches the
@@ -2782,6 +2798,7 @@ where
                     control.lineage_ack_policy.load(),
                     promotion_request.pending(), // promoted — EpochBump with the origin's epoch floor
                     raft_status,
+                    raft.leader_confirm(),
                     journal_tip,
                 );
             }
@@ -2912,6 +2929,7 @@ where
         recovered_lineage.ack_policy,
         None, // not promoted — no EpochBump injection
         raft_status,
+        None, // not promoted — no leadership to confirm
         journal_tip,
     )
 }
@@ -2955,6 +2973,8 @@ fn run_as_primary_dpdk<A>(
     lineage_ack_policy: Option<LineagePolicy>,
     promotion: Option<PromotionOrigin>,
     raft_status: Option<Arc<melin_transport_core::health::RaftStatus>>,
+    // As `run_as_primary`'s.
+    leader_confirm: Option<LeaderConfirm>,
     journal_tip: melin_transport_core::AdvertisedJournalTip,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
@@ -3300,9 +3320,17 @@ where
     // Promotion fencing, as on kernel TCP: the bump is the first entry of
     // a promoted node's tenure, ahead of `on_primary`, and is applied
     // before the poll loop below serves any client or replica. See
-    // `journal_promotion_epoch_bump`.
+    // `journal_promotion_epoch_bump`. An abandoned promotion returns here,
+    // as on kernel TCP.
     if let Some(origin) = promotion {
-        journal_promotion_epoch_bump(origin, &fence_state, &mut input_producer, &shutdown);
+        journal_promotion_epoch_bump(
+            origin,
+            &fence_state,
+            &mut input_producer,
+            &shutdown,
+            leader_confirmation(leader_confirm.as_ref()),
+        )
+        .map_err(promotion_abandoned)?;
     }
     // As on kernel TCP: the policy this tenure requests, after the bump,
     // and the booted claim the poll thread attaches.
@@ -3422,12 +3450,23 @@ where
 /// tenure epochs align with raft terms and two overlapping
 /// promotions from different elections always allocate distinct
 /// epochs — the newer one fences the older.
+///
+/// An election's bump is published only once `confirm` (built by
+/// [`leader_confirmation`]) has had a majority of the control plane
+/// confirm this node still leads in the term it was elected at; that
+/// round trip, not the decision-time quorum-ack filter, is what keeps a
+/// leader that lost its majority since the decision from deposing a
+/// primary the rest of the cluster still reaches. On a refusal nothing is
+/// published, so the journal holds nothing of the tenure, and the error is
+/// returned for the caller to abandon the promotion. A manual `PROMOTE` is
+/// not confirmed: it stays available during a control-plane outage.
 fn journal_promotion_epoch_bump<E: melin_app::AppEvent>(
     origin: PromotionOrigin,
     fence_state: &melin_transport_core::fence::FenceState,
     input_producer: &mut melin_pipeline::ring::Producer<InputSlot<E>>,
     shutdown: &AtomicBool,
-) {
+    confirm: impl FnOnce(u64) -> Result<(), LeaderConfirmError>,
+) -> Result<(), LeaderConfirmError> {
     use melin_app::unix_epoch_nanos;
     use melin_journal::JournalEvent;
 
@@ -3452,7 +3491,33 @@ fn journal_promotion_epoch_bump<E: melin_app::AppEvent>(
              refusals may report term/epoch misalignment until a newer election"
         );
     }
-    info!(new_epoch, ?origin, "promotion: injecting epoch bump");
+    match origin {
+        PromotionOrigin::Manual => {
+            info!(new_epoch, ?origin, "promotion: injecting epoch bump");
+        }
+        PromotionOrigin::Election { term } => {
+            // Logged before the confirmation, not after: a log write can
+            // block (a full stderr pipe), and the publish must follow an
+            // accepted confirmation with nothing blocking in between, so
+            // that the epoch is minted inside the leader lease the round
+            // trip renewed (`SCHEDULING_SLACK_MS` covers the publish only).
+            info!(
+                new_epoch,
+                ?origin,
+                "promotion: confirming leadership before the epoch bump"
+            );
+            if let Err(error) = confirm(term) {
+                warn!(
+                    %error,
+                    term,
+                    new_epoch,
+                    "promotion: the control plane did not confirm this node's leadership \
+                     in its election term; no epoch bump published, abandoning the promotion"
+                );
+                return Err(error);
+            }
+        }
+    }
     input_producer.publish(InputSlot::node_event(
         JournalEvent::EpochBump { epoch: new_epoch },
         unix_epoch_nanos(),
@@ -3462,6 +3527,45 @@ fn journal_promotion_epoch_bump<E: melin_app::AppEvent>(
     // by the shutdown flag so a stuck pipeline can't wedge startup.
     ORCHESTRATOR_WAIT
         .wait_until(|| fence_state.epoch() >= new_epoch || shutdown.load(Ordering::Relaxed));
+    // Logged after the publish, so outside the reply-to-publish stretch
+    // above; this is the line saying the tenure began, where the one
+    // before the confirmation only announced the attempt. The wait can
+    // also end on shutdown, before the matching stage applied the bump.
+    if fence_state.epoch() >= new_epoch {
+        info!(new_epoch, ?origin, "promotion: epoch bump applied");
+    } else {
+        info!(
+            new_epoch,
+            ?origin,
+            "promotion: epoch bump published; shutdown began before it was applied"
+        );
+    }
+    Ok(())
+}
+
+/// The confirmation [`journal_promotion_epoch_bump`] asks before an
+/// election's bump, over this node's raft driver. Shared by both
+/// transports' primary paths so the no-driver arm is written once.
+///
+/// With no handle (raft off) the confirmation refuses with
+/// [`LeaderConfirmError::DriverStopped`]. No election can be filed then,
+/// since only the raft poller files one, but the type cannot rule the
+/// pairing out: the origin crosses `PromotionRequest`'s atomic from another
+/// thread and cannot carry the handle. Refusing is the honest answer.
+fn leader_confirmation(
+    handle: Option<&LeaderConfirm>,
+) -> impl FnOnce(u64) -> Result<(), LeaderConfirmError> + '_ {
+    move |term| match handle {
+        Some(handle) => handle.confirm(term),
+        None => Err(LeaderConfirmError::DriverStopped),
+    }
+}
+
+/// The error a primary path returns when [`journal_promotion_epoch_bump`]
+/// refused, so the node exits saying why. Only an election is confirmed,
+/// so only an automatic promotion is ever abandoned.
+fn promotion_abandoned(error: LeaderConfirmError) -> String {
+    format!("automatic promotion abandoned: {error}")
 }
 
 /// The election term a promoted tenure's epoch failed to match, for
@@ -5681,34 +5785,192 @@ mod primary_gate_policy_tests {
 /// warning applies.
 #[cfg(test)]
 mod promotion_epoch_tests {
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use counter_server::CounterEvent;
     use melin_journal::JournalEvent;
-    use melin_pipeline::ring::DisruptorBuilder;
+    use melin_pipeline::ring::{Consumer, DisruptorBuilder, Producer};
     use melin_pipeline::wait::WaitStrategy;
     use melin_transport_core::fence::FenceState;
 
     use super::{
-        InputSlot, PromotionOrigin, journal_promotion_epoch_bump, misaligned_election_term,
+        InputSlot, LeaderConfirmError, PromotionOrigin, journal_promotion_epoch_bump,
+        leader_confirmation, misaligned_election_term, promotion_abandoned,
     };
 
-    /// The epoch `journal_promotion_epoch_bump` publishes for `origin`
-    /// over a fence at `fence_epoch`. Nothing applies the bump, so the
-    /// shutdown flag is raised up front to release the wait that follows
-    /// the publish.
-    fn minted_epoch(origin: PromotionOrigin, fence_epoch: u64) -> u64 {
-        let (mut producer, mut consumers) = DisruptorBuilder::<InputSlot<CounterEvent>>::new(4)
+    /// What one `journal_promotion_epoch_bump` call did.
+    struct Bump {
+        outcome: Result<(), LeaderConfirmError>,
+        /// The epoch of the one `EpochBump` published, if any.
+        published: Option<u64>,
+        /// The fence epoch after the call.
+        fence_epoch: u64,
+    }
+
+    /// The input ring a bump is published to, with the one consumer that
+    /// reads it back.
+    fn ring() -> (
+        Producer<InputSlot<CounterEvent>>,
+        Consumer<InputSlot<CounterEvent>>,
+    ) {
+        let (producer, mut consumers) = DisruptorBuilder::<InputSlot<CounterEvent>>::new(4)
             .add_consumer()
             .build(WaitStrategy::BusySpin);
+        (producer, consumers.remove(0))
+    }
+
+    /// Run `journal_promotion_epoch_bump` for `origin` over a fence at
+    /// `fence_epoch`, with `confirm` as the leadership confirmation.
+    /// Nothing applies the bump, so the shutdown flag is raised up front
+    /// to release the wait that follows the publish.
+    fn bump(
+        origin: PromotionOrigin,
+        fence_epoch: u64,
+        confirm: impl FnOnce(u64) -> Result<(), LeaderConfirmError>,
+    ) -> Bump {
+        let (mut producer, mut consumer) = ring();
         let fence = FenceState::new(fence_epoch);
-        journal_promotion_epoch_bump(origin, &fence, &mut producer, &AtomicBool::new(true));
-        let (_, slot) = consumers[0].try_consume().expect("the bump was published");
-        assert!(consumers[0].try_consume().is_none(), "one entry only");
-        match slot.event {
+        let outcome = journal_promotion_epoch_bump(
+            origin,
+            &fence,
+            &mut producer,
+            &AtomicBool::new(true),
+            confirm,
+        );
+        let published = consumer.try_consume().map(|(_, slot)| match slot.event {
             JournalEvent::EpochBump { epoch } => epoch,
             other => panic!("expected an EpochBump, got {other:?}"),
+        });
+        assert!(consumer.try_consume().is_none(), "one entry at most");
+        Bump {
+            outcome,
+            published,
+            fence_epoch: fence.epoch(),
         }
+    }
+
+    /// The epoch `journal_promotion_epoch_bump` publishes for `origin`
+    /// over a fence at `fence_epoch`, its leadership confirmed.
+    fn minted_epoch(origin: PromotionOrigin, fence_epoch: u64) -> u64 {
+        let minted = bump(origin, fence_epoch, |_| Ok(()));
+        assert_eq!(minted.outcome, Ok(()));
+        minted.published.expect("the bump was published")
+    }
+
+    /// A refused confirmation publishes nothing, so nothing of the tenure
+    /// reaches the journal, leaves the fence where it was, and is returned
+    /// for the caller to abandon the promotion, whatever the refusal.
+    #[test]
+    fn a_refused_confirmation_publishes_nothing() {
+        for refusal in [
+            LeaderConfirmError::NotLeader,
+            LeaderConfirmError::TermMoved { now: 8 },
+            LeaderConfirmError::NoQuorum,
+            LeaderConfirmError::TimedOut,
+            LeaderConfirmError::DriverStopped,
+        ] {
+            let refused = bump(PromotionOrigin::Election { term: 7 }, 3, |term| {
+                assert_eq!(term, 7, "the election's own term is confirmed");
+                Err(refusal)
+            });
+            assert_eq!(refused.outcome, Err(refusal));
+            assert_eq!(refused.published, None, "{refusal:?} published a bump");
+            assert_eq!(refused.fence_epoch, 3);
+        }
+    }
+
+    /// An election's bump is published once its own term is confirmed,
+    /// and only then.
+    #[test]
+    fn a_confirmed_election_publishes_its_bump() {
+        let mut asked = None;
+        let confirmed = bump(PromotionOrigin::Election { term: 9 }, 3, |term| {
+            asked = Some(term);
+            Ok(())
+        });
+        assert_eq!(asked, Some(9));
+        assert_eq!(confirmed.outcome, Ok(()));
+        assert_eq!(confirmed.published, Some(9));
+    }
+
+    /// A manual `PROMOTE` is never confirmed, so it stays available while
+    /// the control plane is down.
+    #[test]
+    fn a_manual_promotion_skips_the_confirmation() {
+        let manual = bump(PromotionOrigin::Manual, 6, |_| {
+            panic!("a manual promotion asked for a leadership confirmation")
+        });
+        assert_eq!(manual.outcome, Ok(()));
+        assert_eq!(manual.published, Some(7));
+    }
+
+    /// The bump's wait returns once the bump is applied, with the shutdown
+    /// flag down: a consumer standing in for the matching stage applies it.
+    #[test]
+    fn a_confirmed_bump_returns_once_applied() {
+        let (mut producer, mut consumer) = ring();
+        let fence = FenceState::new(2);
+        // Raised by the consumer before it panics, so the bump's wait
+        // for the fence returns and the test fails instead of hanging.
+        let shutdown = AtomicBool::new(false);
+        // Generous against a loaded CI host: it only bounds a regression
+        // that publishes nothing, which would otherwise hang the test.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                loop {
+                    if std::time::Instant::now() >= deadline {
+                        shutdown.store(true, Ordering::Relaxed);
+                        panic!("no EpochBump published after an accepted confirmation");
+                    }
+                    if let Some((_, slot)) = consumer.try_consume() {
+                        match slot.event {
+                            JournalEvent::EpochBump { epoch } => fence.observe_epoch(epoch),
+                            other => {
+                                shutdown.store(true, Ordering::Relaxed);
+                                panic!("expected an EpochBump, got {other:?}");
+                            }
+                        };
+                        return;
+                    }
+                    std::thread::yield_now();
+                }
+            });
+            let outcome = journal_promotion_epoch_bump(
+                PromotionOrigin::Election { term: 5 },
+                &fence,
+                &mut producer,
+                &shutdown,
+                |_| Ok(()),
+            );
+            assert_eq!(outcome, Ok(()));
+            assert_eq!(fence.epoch(), 5, "returned before the bump was applied");
+        });
+    }
+
+    /// Without a raft driver the confirmation refuses every term.
+    #[test]
+    fn no_driver_refuses_every_confirmation() {
+        for term in [0, 1, 7, u64::MAX] {
+            assert_eq!(
+                leader_confirmation(None)(term),
+                Err(LeaderConfirmError::DriverStopped)
+            );
+        }
+    }
+
+    /// The node's exit error names the abandonment and the refusal.
+    #[test]
+    fn an_abandoned_promotion_says_why() {
+        let message = promotion_abandoned(LeaderConfirmError::NoQuorum);
+        assert!(
+            message.starts_with("automatic promotion abandoned: "),
+            "{message}"
+        );
+        assert!(
+            message.ends_with(&LeaderConfirmError::NoQuorum.to_string()),
+            "{message}"
+        );
     }
 
     #[test]
