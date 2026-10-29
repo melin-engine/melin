@@ -59,8 +59,26 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   error. Release builds do not run the check and pay nothing for it. The
   contract is now documented on `ResponseEncoder` and in the application
   guide's determinism rules.
+- **A replica that cannot reach a majority of the control plane no longer
+  auto-promotes, including the last survivor.** Under
+  `--raft-auto-promote`, a replica holding control-plane leadership now
+  promotes only if a majority acknowledged that leadership recently. A
+  replica whose primary and other replica are both gone used to promote
+  after the grace period; it now refuses, saying it may be partitioned,
+  and recovery is a manual `PROMOTE`. A genuine failover waits one more
+  control-plane round trip after the election.
 
 ### Fixed
+
+- **An isolated replica no longer promotes itself beside a healthy
+  primary.** Under `--raft-auto-promote`, a replica that held
+  control-plane leadership and was cut off from both other nodes promoted
+  itself and served clients beside the healthy primary for as long as the
+  partition lasted; once the network healed, either it shut the healthy
+  primary down (a needless failover onto the node holding the least data,
+  the other replica left orphaned) or both kept serving, depending on
+  which control-plane message crossed first. An isolated replica now never
+  promotes itself.
 
 - **A response body byte the application's encoder does not write is now
   zero.** The runtime encodes every response into a reused buffer, and an

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use melin_raft::{JournalTip, PeerTips};
+use melin_raft::{JournalTip, PeerTips, QUORUM_ACK_MAX_AGE};
 use melin_transport_core::health::RaftStatus;
 use tracing::{info, warn};
 
@@ -84,6 +84,36 @@ const PEER_TIP_GRACE: Duration = Duration::from_millis(1500);
 /// the same thing.
 const TIP_NOT_READY: &str = "journal recovery has not seeded this node's tip yet";
 const FENCED: &str = "node is fenced (superseded by a newer primary)";
+
+/// The leader-lease refusal ([`leader_lease_check`]). Named so the tests
+/// and the decision agree on one wording an operator can search for.
+const NO_LEADER_LEASE: &str = "a majority of the control plane has not acknowledged this node's \
+                               leadership recently — it may be partitioned, and a partitioned \
+                               leader must not depose the primary";
+
+/// The leader-lease filter: did a majority of the control plane
+/// acknowledge this node as leader within [`QUORUM_ACK_MAX_AGE`]?
+///
+/// openraft has no check-quorum step-down, so a leader cut off from
+/// every other voter keeps its role and term for as long as the partition
+/// lasts; only the age of its last majority acknowledgement tells it
+/// apart from a leader the cluster still follows. `None` (never
+/// acknowledged in this term, or not leading by the time the driver
+/// published) refuses, as does an age past the threshold. The threshold
+/// itself passes: [`QUORUM_ACK_MAX_AGE`] is the largest age the liveness
+/// assertion in `melin-raft` lets a healthy leader report.
+///
+/// An early filter, not a safety proof: the reported age is a snapshot,
+/// and nothing bounds the time from this check to the promotion's epoch
+/// being minted. Its job is to stop an isolated leader, or a lone
+/// survivor, from starting a promotion at all, and to tell the operator
+/// why.
+fn leader_lease_check(quorum_ack_age: Option<Duration>) -> Result<(), &'static str> {
+    match quorum_ack_age {
+        Some(age) if age <= QUORUM_ACK_MAX_AGE => Ok(()),
+        Some(_) | None => Err(NO_LEADER_LEASE),
+    }
+}
 
 /// One configured peer's journal-tip observation, digested from
 /// [`PeerTips`] by the poll loop so [`auto_promotion_decision`] stays a
@@ -168,6 +198,14 @@ struct AutoPromotionInputs {
     /// [`PRIMARY_DOWN_GRACE`] so a transient blip cannot trip a
     /// failover; the link state is one-sided (this node's socket only).
     primary_link_down_for: Duration,
+    /// How long ago a majority of the control plane last acknowledged
+    /// this node as leader, as the raft driver last published it; `None`
+    /// when not acknowledged in this term (see [`leader_lease_check`]).
+    /// An `Option<Duration>` rather than the raw milliseconds the atomic
+    /// holds: `RaftStatus` already decoded its "none" sentinel, so the
+    /// decision compares durations and can never mistake a sentinel for
+    /// an age.
+    quorum_ack_age: Option<Duration>,
     /// A primary has been observed at least once since this process
     /// booted (a `StreamStart` was accepted —
     /// `ReplicaControlPlane::primary_observed`). Process-lifetime, not
@@ -205,6 +243,20 @@ struct AutoPromotionInputs {
 ///   blip from a real failure. Require the link to have been down
 ///   continuously past [`PRIMARY_DOWN_GRACE`]; a healthy primary
 ///   reconnects well inside that window.
+/// - `quorum_ack_age` — a leader is not proof the cluster follows it:
+///   openraft keeps a leader cut off from every other voter leading, at
+///   its term, for the whole partition. Refuse unless a majority
+///   acknowledged this leadership within the lease filter's threshold
+///   ([`leader_lease_check`]). Judged before the rules below because
+///   without a majority the peer observations are all `Silent` and say
+///   nothing, and the operator should be told the node may be
+///   partitioned, not shown a peer table. This is an early filter, not
+///   the guarantee: the time from here to the promotion's epoch being
+///   minted is unbounded, and a leadership confirmation at mint time
+///   (step 4 of `docs/internal/raft-promotion-quorum-lease-plan.md`,
+///   not yet in place) is what will make the promotion safe. A lone
+///   survivor whose two peers are dead refuses too; it cannot tell that
+///   from being partitioned.
 /// - `primary_observed` / `journal_empty` — a node that has never seen
 ///   a primary this boot *and* holds no journal data is a blank genesis
 ///   node: an election among blank nodes proves nothing about acked
@@ -250,6 +302,7 @@ fn auto_promotion_decision(inputs: &AutoPromotionInputs) -> Result<(), &'static 
              a transient blip from a real failure before failover",
         );
     }
+    leader_lease_check(inputs.quorum_ack_age)?;
     if !inputs.primary_observed && inputs.local_tip.last_sequence == 0 {
         return Err(
             "no primary has been observed since boot and the local journal is empty — a blank \
@@ -337,6 +390,16 @@ fn consider_auto_promotion(
         return;
     }
     let term = status.term.load(Ordering::Relaxed);
+    // Read once, `Relaxed` like the role and term beside it, and not
+    // re-checked against a second read of the term: a torn read (an age
+    // from one term, the term from the next) can at worst let the filter
+    // pass for one poll, or file a term this node no longer leads in, and
+    // the leadership confirmation where the epoch is minted checks the
+    // filed term exactly and refuses (the lease plan's step 4, not yet in
+    // place; until then the exposure is the one the separate role and
+    // term loads above already carry). A double read would only narrow a
+    // window of nanoseconds that confirmation covers.
+    let quorum_ack_age = status.millis_since_quorum_ack().map(Duration::from_millis);
     // Loaded once: `local_tip.epoch` and the `fence_epoch` input must not
     // tear if a fencing event lands mid-poll.
     let fence_epoch = fence_state.epoch();
@@ -352,6 +415,7 @@ fn consider_auto_promotion(
         ack_policy: effective_ack_policy(lineage_policy, || ack_policy.requested()),
         primary_link_up: control.primary_link_up.load(Ordering::Acquire),
         primary_link_down_for,
+        quorum_ack_age,
         primary_observed: control.primary_observed.load(Ordering::Acquire),
         local_tip: JournalTip {
             epoch: fence_epoch,
@@ -407,6 +471,7 @@ fn consider_auto_promotion(
                     node_id = status.node_id,
                     term,
                     reason,
+                    quorum_ack_age = ?inputs.quorum_ack_age,
                     peers = ?inputs.peers,
                     local_tip = ?inputs.local_tip,
                     "elected leader but refusing auto-promotion"
@@ -792,6 +857,8 @@ mod tests {
             primary_link_up: false,
             // Well past the grace: a sustained outage, not a blip.
             primary_link_down_for: PRIMARY_DOWN_GRACE * 10,
+            // The other replica acknowledged this leadership just now.
+            quorum_ack_age: Some(Duration::ZERO),
             // A normal failover: the primary streamed to this node
             // before dying, and the journal carries its data.
             primary_observed: true,
@@ -877,6 +944,103 @@ mod tests {
         assert!(
             auto_promotion_decision(&inputs).is_ok(),
             "a sustained outage past the grace must promote"
+        );
+    }
+
+    // --- Leader-lease filter ---
+
+    #[test]
+    fn refuses_without_a_quorum_ack() {
+        let inputs = AutoPromotionInputs {
+            quorum_ack_age: None,
+            ..ok_inputs()
+        };
+        assert_eq!(auto_promotion_decision(&inputs), Err(NO_LEADER_LEASE));
+    }
+
+    #[test]
+    fn refuses_a_stale_quorum_ack_and_passes_at_the_threshold() {
+        assert_eq!(leader_lease_check(Some(Duration::ZERO)), Ok(()));
+        let at = AutoPromotionInputs {
+            quorum_ack_age: Some(QUORUM_ACK_MAX_AGE),
+            ..ok_inputs()
+        };
+        assert_eq!(auto_promotion_decision(&at), Ok(()), "the threshold passes");
+        let past = AutoPromotionInputs {
+            quorum_ack_age: Some(QUORUM_ACK_MAX_AGE + Duration::from_millis(1)),
+            ..ok_inputs()
+        };
+        assert_eq!(
+            auto_promotion_decision(&past),
+            Err(NO_LEADER_LEASE),
+            "a millisecond past the threshold refuses"
+        );
+    }
+
+    /// The isolated leader of the bug this filter exists for: its primary
+    /// link down past the grace, both peers silent, no majority. It is
+    /// told it may be partitioned, not shown the peer veto (which would
+    /// pass it: silent peers do not block) or a later rule.
+    #[test]
+    fn an_isolated_leader_is_told_it_is_partitioned() {
+        let inputs = AutoPromotionInputs {
+            quorum_ack_age: None,
+            peers: vec![
+                (1, PeerTipObservation::Silent { last: None }),
+                (
+                    3,
+                    PeerTipObservation::Silent {
+                        last: Some(tip(3, 100)),
+                    },
+                ),
+            ],
+            ..ok_inputs()
+        };
+        let reason = auto_promotion_decision(&inputs).unwrap_err();
+        assert_eq!(reason, NO_LEADER_LEASE);
+        assert!(reason.contains("partitioned"), "{reason}");
+
+        // Judged before the genesis rule and the peer-tip veto, which
+        // would otherwise speak first: a blank node, a peer still unknown
+        // and one ahead all report the lease.
+        let inputs = AutoPromotionInputs {
+            quorum_ack_age: None,
+            primary_observed: false,
+            local_tip: tip(3, 0),
+            peers: vec![
+                (1, PeerTipObservation::Unknown),
+                (3, PeerTipObservation::Fresh(tip(3, 1))),
+            ],
+            ..ok_inputs()
+        };
+        assert_eq!(auto_promotion_decision(&inputs), Err(NO_LEADER_LEASE));
+    }
+
+    /// The healthy cluster's reasons stay what they were: the link rules
+    /// are judged before the lease, so a leader whose primary is alive
+    /// (or only blipped) is told that, whatever its lease.
+    #[test]
+    fn the_link_rules_are_reported_before_the_lease() {
+        let up = AutoPromotionInputs {
+            primary_link_up: true,
+            primary_link_down_for: Duration::ZERO,
+            quorum_ack_age: None,
+            ..ok_inputs()
+        };
+        assert!(
+            auto_promotion_decision(&up)
+                .unwrap_err()
+                .contains("live primary")
+        );
+        let blip = AutoPromotionInputs {
+            primary_link_down_for: PRIMARY_DOWN_GRACE - Duration::from_millis(1),
+            quorum_ack_age: None,
+            ..ok_inputs()
+        };
+        assert!(
+            auto_promotion_decision(&blip)
+                .unwrap_err()
+                .contains("moments ago")
         );
     }
 
@@ -1072,6 +1236,13 @@ mod tests {
         // Both peers dead — even one whose last-known tip was ahead.
         // Its data is unreachable; nothing better is available, so
         // promotion proceeds (the caller warns about the higher tip).
+        //
+        // With the leader-lease filter, both peers silent cannot coexist
+        // with a fresh lease in production: a fresh lease means a peer
+        // answered well inside `PEER_TIP_GRACE`, so it is not silent.
+        // `ok_inputs`' fresh lease keeps the veto's own rule tested in
+        // isolation here; the case as it occurs, with no lease, is
+        // `an_isolated_leader_is_told_it_is_partitioned`.
         let inputs = AutoPromotionInputs {
             local_tip: tip(3, 100),
             peers: vec![
@@ -1097,11 +1268,7 @@ mod tests {
         // the journal-safety veto. Keying only on the term would log the
         // first and swallow the second, leaving the stalled failover
         // explained by a condition that stopped holding at the crash.
-        let status = RaftStatus::new(2);
-        status
-            .role
-            .store(RaftStatus::ROLE_LEADER, Ordering::Relaxed);
-        status.term.store(7, Ordering::Relaxed);
+        let status = leader_status(7, Some(0));
         let control = crate::replication::ReplicaControlPlane::new();
         control.tip_ready.store(true, Ordering::Release);
         control
@@ -1159,11 +1326,7 @@ mod tests {
     /// this node asks for `disk`.
     #[test]
     fn auto_promotion_judges_by_the_lineage_policy_not_the_nodes_own() {
-        let status = RaftStatus::new(2);
-        status
-            .role
-            .store(RaftStatus::ROLE_LEADER, Ordering::Relaxed);
-        status.term.store(7, Ordering::Relaxed);
+        let status = leader_status(7, Some(0));
         let control = crate::replication::ReplicaControlPlane::new();
         control.tip_ready.store(true, Ordering::Release);
         control.primary_observed.store(true, Ordering::Release);
@@ -1213,6 +1376,77 @@ mod tests {
             control.promote.pending(),
             Some(PromotionOrigin::Election { term: 7 })
         );
+    }
+
+    /// A leader without a majority's acknowledgement (never acknowledged
+    /// in its term, as an isolated leader or a lone survivor is) files
+    /// nothing, however clear every other rule is, and the refusal it
+    /// logs is the lease's. Then the same leader, once acknowledged,
+    /// files: the lease was the only thing in the way.
+    #[test]
+    fn consider_auto_promotion_files_nothing_without_a_lease() {
+        let status = leader_status(7, None);
+        let control = crate::replication::ReplicaControlPlane::new();
+        control.tip_ready.store(true, Ordering::Release);
+        control.primary_observed.store(true, Ordering::Release);
+        control
+            .journal_tip
+            .advance(melin_transport_core::WireSeq::new(100));
+        control.lineage_ack_policy.observe(
+            melin_transport_core::WireSeq::new(90),
+            streamed_change(AckPolicy::DiskAndRam),
+        );
+        let fence = melin_transport_core::fence::FenceState::new(0);
+        let policy = crate::policy_control::test_support::replicated(AckPolicy::DiskAndRam);
+        let peer_tips = PeerTips::new();
+        // Both peers unheard past the grace: silent, as an isolated
+        // leader sees them.
+        let peer_ids = [1u64, 3];
+        let mut last_refused = None;
+        let consider = |last: &mut Option<(u64, &'static str)>| {
+            consider_auto_promotion(
+                &status,
+                &control,
+                &fence,
+                &policy,
+                &peer_tips,
+                &peer_ids,
+                PRIMARY_DOWN_GRACE * 2,
+                PEER_TIP_GRACE * 2,
+                last,
+            );
+        };
+
+        consider(&mut last_refused);
+        assert!(!control.promote.is_requested(), "nothing filed");
+        assert_eq!(last_refused, Some((7, NO_LEADER_LEASE)));
+
+        // A stale age refuses the same way.
+        status.set_millis_since_quorum_ack(Some(
+            u64::try_from(QUORUM_ACK_MAX_AGE.as_millis()).expect("fits") + 1,
+        ));
+        consider(&mut last_refused);
+        assert!(!control.promote.is_requested(), "nothing filed");
+        assert_eq!(last_refused, Some((7, NO_LEADER_LEASE)));
+
+        status.set_millis_since_quorum_ack(Some(0));
+        consider(&mut last_refused);
+        assert_eq!(
+            control.promote.pending(),
+            Some(PromotionOrigin::Election { term: 7 })
+        );
+    }
+
+    /// A running driver's status for node 2, leading at `term`, with the
+    /// quorum-ack age the bridge would have published.
+    fn leader_status(term: u64, quorum_ack_age_ms: Option<u64>) -> RaftStatus {
+        let status = RaftStatus::new(2);
+        status
+            .role
+            .store(RaftStatus::ROLE_LEADER, Ordering::Relaxed);
+        status.term.store(term, Ordering::Relaxed);
+        status.set_millis_since_quorum_ack(quorum_ack_age_ms);
+        status
     }
 
     /// A witnessed change to `policy`, as the stream carries it.

@@ -748,13 +748,30 @@ rewritten from this record:
     the lease.
   - New `consider_auto_promotion_files_nothing_without_a_lease`: a leader
     `RaftStatus` with no age leaves `promote.is_requested()` false and
-    logs the lease reason.
+    logs the lease reason; so does a stale one, and a fresh one then
+    files, so the lease is shown to be the only thing in the way.
+  - Added while implementing: `the_link_rules_are_reported_before_the_lease`
+    (the link-up and blip reasons still win without a lease), and a second
+    case in `an_isolated_leader_is_told_it_is_partitioned` (a blank node
+    with an `Unknown` and an ahead peer still reports the lease), which
+    pin the placement. The three `consider_auto_promotion` tests share a
+    `leader_status(term, age)` helper. The refusal log line carries the
+    age (`quorum_ack_age`) beside the peer table.
 - Integration (`raft_failover.rs`):
   - Step 1c's test, now green.
   - New `a_replica_leader_alone_never_auto_promotes`: replicas-first
-    bring-up, then stop the primary **and** the other replica. Over
-    `NO_PROMOTION_WATCH` the leader never serves. Red on current code
-    too: this is the behaviour change, pinned.
+    bring-up, then stop the other replica and then the primary (both
+    are voters, so the lease lapses `QUORUM_ACK_MAX_AGE` after the
+    second stops; the other replica goes first, its `stop` returning
+    only once it is down, so the primary's acks end as the primary-down
+    grace starts and the lease lapses well inside it, whereas a slow
+    clean stop of the primary first could let the other's acks hold the
+    lease fresh past the grace).
+    Over `NO_PROMOTION_WATCH` the leader never serves, and at the end it
+    still leads at its term (otherwise the refusal proves nothing about
+    the lease). Red on current code too: this is the behaviour change,
+    pinned. Checked by running it with the gate disabled: the leader
+    served within the watch.
   - Step 1b's tests and `killed_primary_triggers_exactly_one_auto_promotion`
     must stay green: the filter must not cost a genuine failover.
 - `docs/replication.md`, "Automatic failover", refusal list. New bullet:

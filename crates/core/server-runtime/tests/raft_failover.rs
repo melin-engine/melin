@@ -18,9 +18,12 @@
 //!   proceeds, the promoted node's gate starting from that lineage policy.
 //! - Raft leadership held by a replica (the replicas start first and
 //!   elect one before the primary joins): it promotes when the primary
-//!   dies; isolated from both peers, the other two elect a new leader;
-//!   cut from the primary alone while writes flow, it does not promote,
-//!   and once healed rejoins as a replica.
+//!   dies, but not when the other replica died before it (a lone survivor
+//!   never auto-promotes); isolated from both peers, the other two elect a
+//!   new leader, the isolated one never promotes, and once healed the
+//!   primary is still unfenced and the only node serving; cut from the
+//!   primary alone while writes flow, it does not promote, and once healed
+//!   rejoins as a replica.
 //!
 //! Nodes are started through `melin-test-node`: on kernel TCP by default,
 //! on DPDK with this crate's `dpdk` feature, under
@@ -41,7 +44,7 @@ mod proxy;
 
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -85,6 +88,44 @@ const TICK_MS: u64 = 5;
 /// judging by a stale `disk+ram` would have completed.
 const NO_PROMOTION_WATCH: Duration = Duration::from_secs(12);
 
+/// How long a healed cluster is watched for the fallout of a partition:
+/// several election timeouts, and a replica's reconnect and catch-up.
+const HEAL_WATCH: Duration = Duration::from_secs(15);
+
+/// The reasons a replica archives its lineage, as they appear in the
+/// archive's directory name (`<journal file name>.<reason>.<n>`). A copy
+/// of what `ArchiveReason::tag` in `melin-transport-core` owns, which is
+/// private: the names are documented for operators
+/// (`docs/replication.md`), so a rename is already a visible change, but
+/// a reason added there must be added here too.
+const ARCHIVE_REASONS: [&str; 2] = ["divergent", "resync"];
+
+/// The archives beside `journal`, by file name: its siblings named
+/// `<journal file name>.<reason>.<n>`. Not a bare prefix match: rotated
+/// segments (`<journal file name>.NNNNNN`) and snapshot files share the
+/// journal's stem.
+fn archives_beside(journal: &Path) -> Vec<String> {
+    let name = journal
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("a journal file name in UTF-8");
+    let dir = journal.parent().expect("a journal in a directory");
+    std::fs::read_dir(dir)
+        .expect("list the journal's directory")
+        .map(|entry| entry.expect("a directory entry").file_name())
+        .filter_map(|sibling| sibling.into_string().ok())
+        .filter(|sibling| {
+            sibling
+                .strip_prefix(name)
+                .and_then(|rest| rest.strip_prefix('.'))
+                .and_then(|rest| rest.split_once('.'))
+                .is_some_and(|(reason, n)| {
+                    ARCHIVE_REASONS.contains(&reason) && n.parse::<u32>().is_ok()
+                })
+        })
+        .collect()
+}
+
 /// Whether a client connect to `addr` is answered with the auth
 /// Challenge — the definitive "this node serves as primary" signal (a
 /// replica's client listener never accepts).
@@ -106,10 +147,21 @@ fn serves_clients(addr: SocketAddr, patience: Duration) -> bool {
 
 /// One increment on `conn`, which the node must ack.
 fn acked_write(conn: &mut melin_client::Connection) {
+    if let Err(e) = try_acked_write(conn) {
+        panic!("{e}");
+    }
+}
+
+/// One increment on `conn`: `Err` saying why if the node did not ack it,
+/// for a test that records the failure rather than stopping at it.
+fn try_acked_write(conn: &mut melin_client::Connection) -> Result<(), String> {
     let reply = conn
         .request_one(&increment_request(1))
-        .expect("a reply to the write");
-    assert_eq!(reply[0], KIND_RESP_ACK);
+        .map_err(|e| format!("no reply to the write: {e}"))?;
+    match reply.first() {
+        Some(&KIND_RESP_ACK) => Ok(()),
+        kind => Err(format!("the write was not acked: reply kind {kind:?}")),
+    }
 }
 
 /// Node `i`'s loopback IP in a partitionable cluster: its raft listener
@@ -402,13 +454,18 @@ impl Cluster {
         }
     }
 
+    /// Node `i`'s journal, the same on every boot.
+    fn journal(&self, i: usize) -> PathBuf {
+        self.tmp.path().join(format!("node-{i}.journal"))
+    }
+
     /// Node `i`'s configuration: the same journal, keys and raft identity
     /// on every boot, with health and admin endpoints.
     fn config(&self, i: usize, ack_policy: AckPolicy, tick_interval_ms: u64) -> ServerConfig {
         let key_path = self.tmp.path().join(format!("key-{i}"));
         std::fs::write(&key_path, self.nodes[i].key.to_bytes()).unwrap();
         ServerConfig {
-            journal: self.tmp.path().join(format!("node-{i}.journal")),
+            journal: self.journal(i),
             authorized_keys: self.auth_path.clone(),
             ack_policy,
             // Unpinned, and therefore yielding: three nodes run in this
@@ -537,15 +594,20 @@ impl Cluster {
         gauge(health, "melin_raft_term")
     }
 
+    /// One of the nodes `among` (by index) that leads the control plane at
+    /// a term above `term`, with its term.
+    fn leader_above(&self, term: u64, among: &[usize]) -> Option<(usize, u64)> {
+        among
+            .iter()
+            .find_map(|&i| self.leads_at(i).filter(|&t| t > term).map(|t| (i, t)))
+    }
+
     /// Wait until one of the nodes `among` (by index) leads the control
     /// plane at a term above `term`, and return it with its term.
     fn wait_leader_above(&self, term: u64, among: &[usize]) -> (usize, u64) {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            let leading = among
-                .iter()
-                .find_map(|&i| self.leads_at(i).filter(|&t| t > term).map(|t| (i, t)));
-            if let Some(leading) = leading {
+            if let Some(leading) = self.leader_above(term, among) {
                 return leading;
             }
             assert!(
@@ -865,6 +927,61 @@ fn replica_leader_promotes_when_the_primary_dies() {
     }
 }
 
+/// The lone survivor (`docs/internal/raft-promotion-quorum-lease-plan.md`,
+/// §8): a replica that leads the control plane while the primary and the
+/// other replica both die never auto-promotes, since from where it stands
+/// that cannot be told from being partitioned; recovery is a manual
+/// `PROMOTE`. It keeps leading at its term throughout (openraft has no
+/// check-quorum step-down), so it is the leader-lease filter, not a lost
+/// leadership, that holds it back. Both peers are voters, so the lease
+/// lapses `QUORUM_ACK_MAX_AGE` after the second of them stops. The other
+/// replica is stopped first, and `stop` returns only once it is down, so
+/// the primary's acks end when the primary-down grace starts and the
+/// lease lapses well inside it. The reverse order would not be safe: a
+/// slow clean stop of the primary could let the other replica's acks
+/// keep the lease fresh past the grace.
+#[test]
+#[serial]
+fn a_replica_leader_alone_never_auto_promotes() {
+    let cluster = Cluster::new();
+    let ReplicaLed {
+        primary,
+        mut replicas,
+        leader,
+        term,
+    } = cluster.start_replicas_first(AckPolicy::DiskAndRam);
+
+    // `replicas` holds nodes 1 and 2 at 0 and 1.
+    let survivor = replicas.remove(leader - 1);
+    let other = replicas.pop().expect("the other replica");
+    other.stop();
+    primary.stop();
+
+    let deadline = Instant::now() + NO_PROMOTION_WATCH;
+    while Instant::now() < deadline {
+        assert!(
+            !serves_clients(
+                cluster.nodes[leader].addrs.client(),
+                Duration::from_millis(300)
+            ),
+            "node {} promoted itself with both other nodes gone\n{}",
+            leader + 1,
+            cluster.cluster_summary()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(
+        cluster.leads_at(leader),
+        Some(term),
+        "node {} should still lead at term {term}, alone: otherwise the refusal proves \
+         nothing about the lease\n{}",
+        leader + 1,
+        cluster.cluster_summary()
+    );
+
+    survivor.stop();
+}
+
 /// A replica leader isolated from both peers is replaced: the primary and
 /// the other replica, which still reach each other, elect a new leader at
 /// a higher term, and the primary keeps serving. Proves that
@@ -944,4 +1061,168 @@ fn a_replica_leader_cut_from_the_primary_alone_does_not_promote_while_writes_flo
 
     drop(conn);
     led.stop();
+}
+
+/// What [`an_isolated_replica_leader_never_deposes_a_healthy_primary`]
+/// saw, recorded through both phases and asserted at the end, so that one
+/// failing run shows every consequence rather than the first. Nodes are
+/// numbered from 1, as in [`Cluster::cluster_summary`], so the record
+/// reads beside it without translation.
+#[derive(Debug)]
+struct IsolationRecord {
+    /// The isolated replica leader's node number, and the term it led at.
+    leader_node: usize,
+    term: u64,
+    /// While isolated: how long after the isolation a write to the primary
+    /// first went unacked, and why, if one did (no write is attempted
+    /// after it).
+    write_failed: Option<(Duration, String)>,
+    /// While isolated: the first leader the primary or the other replica
+    /// elected above `term`, by node number, with its term.
+    re_elected: Option<(usize, u64)>,
+    /// While isolated: how long after the isolation the isolated leader
+    /// was first seen serving clients, if it was.
+    leader_served_after: Option<Duration>,
+    /// Over the heal watch: how long after the heal the primary was first
+    /// seen stopped by itself (finished, or its shutdown flag set, which
+    /// only a fence does before the test stops it), if it was.
+    primary_fenced_after: Option<Duration>,
+    /// At the end of the heal watch: whether the primary serves clients,
+    /// and which replicas do, by node number.
+    primary_serves: bool,
+    replica_nodes_serving: Vec<usize>,
+    /// The primary's `melin_replicas_connected` and
+    /// `melin_replica_divergence_total` as last read over the heal watch
+    /// (`None`: its health endpoint never answered).
+    replicas_connected: Option<u64>,
+    divergence_total: Option<u64>,
+    /// Archives beside the isolated leader's journal at the end.
+    archives: Vec<String>,
+}
+
+/// The isolated-leader bug (`docs/internal/raft-promotion-quorum-lease-plan.md`,
+/// §1 and step 1c): a replica that leads the control plane and is cut off
+/// from both peers must not promote itself, and once healed the primary,
+/// which the other replica kept reaching, must still serve, and be the only
+/// node that does, with both replicas back and nothing diverged or
+/// archived. That the partition took effect is part of it: the primary
+/// and the other replica elect a new leader above the isolated one's term.
+#[test]
+#[serial]
+fn an_isolated_replica_leader_never_deposes_a_healthy_primary() {
+    let cluster = Cluster::partitionable();
+    let led = cluster.start_replicas_first(AckPolicy::DiskAndRam);
+    let (leader, other, term) = (led.leader, led.other(), led.term);
+    let primary_health = cluster.nodes[0].health_addr;
+    let mut conn = cluster.client(&led.primary);
+
+    // Isolated, with writes flowing, so the primary's journal moves past
+    // the isolated leader's.
+    cluster.isolate(leader);
+    let isolated = Instant::now();
+    let mut write_failed = None;
+    let mut re_elected = None;
+    let mut leader_served_after = None;
+    while isolated.elapsed() < NO_PROMOTION_WATCH {
+        if write_failed.is_none()
+            && let Err(why) = try_acked_write(&mut conn)
+        {
+            write_failed = Some((isolated.elapsed(), why));
+        }
+        re_elected = re_elected.or_else(|| cluster.leader_above(term, &[0, other]));
+        if leader_served_after.is_none()
+            && cluster
+                .serving_replicas(Duration::from_millis(300))
+                .contains(&leader)
+        {
+            leader_served_after = Some(isolated.elapsed());
+        }
+    }
+    drop(conn);
+
+    cluster.heal();
+    let healed = Instant::now();
+    let mut primary_fenced_after = None;
+    let mut replicas_connected = None;
+    let mut divergence_total = None;
+    while healed.elapsed() < HEAL_WATCH {
+        if primary_fenced_after.is_none()
+            && (led.primary.is_finished() || led.primary.shutdown_requested())
+        {
+            primary_fenced_after = Some(healed.elapsed());
+        }
+        replicas_connected =
+            gauge(primary_health, "melin_replicas_connected").or(replicas_connected);
+        divergence_total =
+            gauge(primary_health, "melin_replica_divergence_total").or(divergence_total);
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let node = |i: usize| i + 1;
+    let record = IsolationRecord {
+        leader_node: node(leader),
+        term,
+        write_failed,
+        re_elected: re_elected.map(|(i, t)| (node(i), t)),
+        leader_served_after,
+        primary_fenced_after,
+        primary_serves: serves_clients(cluster.nodes[0].addrs.client(), Duration::from_secs(2)),
+        replica_nodes_serving: cluster
+            .serving_replicas(Duration::from_secs(2))
+            .into_iter()
+            .map(node)
+            .collect(),
+        replicas_connected,
+        divergence_total,
+        archives: archives_beside(&cluster.journal(leader)),
+    };
+
+    assert!(
+        record.write_failed.is_none()
+            && record.re_elected.is_some()
+            && record.leader_served_after.is_none()
+            && record.primary_fenced_after.is_none()
+            && record.primary_serves
+            && record.replica_nodes_serving.is_empty()
+            && record.replicas_connected == Some(2)
+            && record.divergence_total == Some(0)
+            && record.archives.is_empty(),
+        "expected the primary to ack every write while node {node} was isolated, the primary \
+         and the other replica to elect a leader above node {node}'s term {term}, node {node} never \
+         to serve, and the healed primary unfenced and the only node serving, with both \
+         replicas back, no divergence and no archive: {record:#?}\n{}",
+        cluster.cluster_summary(),
+        node = record.leader_node,
+        term = record.term,
+    );
+    led.stop();
+}
+
+/// The archive scan matches both archive forms at any index, and nothing
+/// else that shares the journal's stem: rotated segments, snapshot files,
+/// another node's archives, or a name that only looks like one.
+#[test]
+fn archives_beside_matches_only_archive_forms() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join("node-1.journal");
+    for name in [
+        "node-1.journal",
+        "node-1.journal.000001",
+        "node-1.journal.snap.tmp",
+        "node-1.journal.snapshot.prev",
+        "node-1.journal.divergent.0",
+        "node-1.journal.resync.12",
+        "node-1.journal.divergent.x",
+        "node-1.journal.resync.",
+        "node-1.journal.other.0",
+        "node-1.journaldivergent.0",
+        "node-2.journal.divergent.0",
+    ] {
+        std::fs::create_dir(dir.path().join(name)).unwrap();
+    }
+    let mut archives = archives_beside(&journal);
+    archives.sort();
+    assert_eq!(
+        archives,
+        ["node-1.journal.divergent.0", "node-1.journal.resync.12"]
+    );
 }
