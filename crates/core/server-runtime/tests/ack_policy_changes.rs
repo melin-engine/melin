@@ -39,7 +39,7 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, mpsc};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -58,11 +58,13 @@ use melin_test_node::probe::{
     admin_command, admin_reply_when_up, admin_until_ok, gauge, wait_for_gauge,
 };
 use melin_test_node::{Addrs, Node};
-use melin_transport_core::test_ports::free_addr;
 use serial_test::serial;
 
+#[path = "common/port_pool.rs"]
+mod port_pool;
 #[path = "common/raw_replica.rs"]
 mod raw_replica;
+use port_pool::give_back;
 use raw_replica::RawReplica;
 
 /// Port range for `free_addr`, shared with the other cluster tests: every
@@ -88,48 +90,10 @@ const JOURNALED: &str = "melin_ack_policy_journaled";
 /// The primary's durable journal sequence.
 const DURABLE: &str = "melin_journal_sequence";
 
-/// Ports a finished test handed back, for the next one to take. Under
-/// plain `cargo test` every test in this binary shares one process, and
-/// so one block of `free_addr` ports, which a fresh set per test would
-/// exhaust. Reuse bounds the block's use only because the tests run one
-/// at a time (`#[serial]`): run at once, they would hold more ports than
-/// the block has, whatever is handed back. A `Vec`: a handful of ports,
-/// scanned for one that binds and taken out in no particular order.
-static RETURNED_PORTS: Mutex<Vec<SocketAddr>> = Mutex::new(Vec::new());
-
-/// A loopback port no running test holds: one handed back that binds
-/// now, or a new one from this file's port range. A stopped node's
-/// endpoint threads may outlive it briefly, still bound: such a port
-/// stays in the pool, for a later test.
+/// A loopback port no running test holds, from this file's port range:
+/// tests hand theirs back (`port_pool`).
 fn port() -> SocketAddr {
-    let reused = {
-        // A test that panicked holding the lock left the pool whole: it
-        // only scans and takes out.
-        let mut pool = RETURNED_PORTS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        pool.iter()
-            .position(|addr| std::net::TcpListener::bind(addr).is_ok())
-            .map(|index| pool.swap_remove(index))
-    };
-    // Outside the lock: an exhausted block panics this test alone.
-    reused.unwrap_or_else(|| free_addr(PORT_BASE))
-}
-
-/// Hand a finished test's ports back: its node's addresses on kernel TCP
-/// (on DPDK they are the runner slot's, from no pool) and `endpoints`. A
-/// test that failed keeps them: it may have left a node bound to one.
-fn give_back(addrs: &Addrs, endpoints: [SocketAddr; 2]) {
-    if std::thread::panicking() {
-        return;
-    }
-    let mut pool = RETURNED_PORTS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if cfg!(not(feature = "dpdk")) {
-        pool.extend([addrs.client(), addrs.replication()]);
-    }
-    pool.extend(endpoints);
+    port_pool::port(PORT_BASE)
 }
 
 /// Wait until a stopped node's health and admin endpoints are released.

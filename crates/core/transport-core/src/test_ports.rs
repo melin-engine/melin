@@ -11,7 +11,8 @@ use std::sync::{Mutex, OnceLock};
 /// binary shares one process, and so one block, and this allocator never
 /// reissues a port within a process: a binary whose tests together take
 /// more than a block must hand ports back and run its tests one at a time
-/// (as `ack_policy_changes.rs` in `melin-server-runtime` does).
+/// (as `melin-server-runtime`'s `ack_policy_changes.rs` and
+/// `raft_failover.rs` do, through `tests/common/port_pool.rs`).
 const BLOCK: u16 = 50;
 /// Blocks per range: each `base` owns `base..base + BLOCK * NBLOCKS`
 /// (5000 ports). Callers must space their bases accordingly.

@@ -373,8 +373,21 @@ passes on current code.
     isolation costs two threads (open-questions Q9). A `restore` without
     a `cut` leaves held sockets held; neither includer relies on it
     (`degraded_acks.rs` cuts before it restores), and the doc on
-    `restore` says so.
+    `restore` says so. The accept loop reads the generation before
+    anything else, and pushes a held socket only if no cut has moved it
+    since (checked under the list's lock), so a connection accepted
+    while a cut runs is closed rather than held past it, and a relay
+    opened then exits on its first pass.
   - Update the header to name `raft_failover.rs` and the source predicate.
+- `crates/core/server-runtime/tests/common/port_pool.rs`, hoisted out of
+  `ack_policy_changes.rs` (which now includes it): the pool of ports a
+  finished test hands back. Under plain `cargo test` a binary's tests
+  share one process and so one `free_addr` block, which the file's
+  existing tests already nearly filled; the new ones exhaust it
+  (observed: `no free port in block`). `raft_failover.rs` takes its
+  ports from the pool and its `Cluster`'s drop hands them back, as
+  `test_ports::free_addr`'s doc prescribes. nextest, one process per
+  test, never hit this.
 - `crates/core/server-runtime/tests/raft_failover.rs`:
   - `#[path = "common/proxy.rs"] mod proxy;` (as `degraded_acks.rs` does).
   - One header sentence: the partition tests assume Linux's routing of
@@ -388,11 +401,14 @@ passes on current code.
     source an unbound loopback socket gets, so under a regression of 1a
     no block matches and only the `freeze` on a node's own proxy bites.
     What catches that regression is the 1a unit tests on the observed
-    source IP, plus step 1c's assertion that the primary and `O` elect a
-    new raft leader while `L` is isolated: with the blocks ineffective,
-    `L`'s outbound links stay up, it keeps its quorum, and that assertion
-    fails (Q8). The §8 characterisation below asserts only an absence and
-    so cannot detect it on its own. One
+    source IP, plus the isolation test below (and step 1c's assertion)
+    that the primary and `O` elect a new raft leader while `L` is
+    isolated: with the blocks ineffective, `L`'s outbound links stay up,
+    it keeps its quorum, and that assertion fails (Q8; checked by
+    making the block list match nothing, which fails it). The §8
+    characterisation below catches it too: it asserts that the primary,
+    cut from `L`, campaigns above `L`'s term, which it does not while
+    it still hears `L`. One
     `Proxy::start_on(127.0.0.1, …)` sits in front of every node's raft
     listener, so raft never touches the DPDK runner's client-facing
     address, and the **proxy** addresses go into `peers`. One replication
@@ -406,8 +422,10 @@ passes on current code.
     leadership on a **replica** deterministically. A normal bring-up does
     not: raft id 1 (the primary) has the shortest tick period and usually
     wins the first election. Assert the leader's id and term are unchanged
-    once the primary has joined (Q10, decided: this assertion settles it),
-    and return the leading replica's index.
+    once the primary has joined (Q10, decided: this assertion settles it):
+    it waits until every node reports that leader at that term, and fails
+    at once if any node reports a higher term. It returns the nodes with
+    the leading replica's index and its term (`ReplicaLed`).
   - `isolate(i)`: `freeze` node *i*'s raft proxy (nothing reaches *i*),
     block `raft_ip(i)` at both other raft proxies (*i* reaches nobody), and
     cut replica *i*'s replication proxy. The primary ↔ other-replica raft
@@ -420,12 +438,14 @@ passes on current code.
     replication proxy, leaving *i* ↔ other-replica up. The one-sided
     partition of §8.
   - `heal()`, in this order (Q9): `cut` every **raft** proxy, then clear
-    the block list, then `restore` the raft proxies, then `restore` `L`'s
-    replication proxy (already cut by `isolate`, so it holds nothing). The
+    the block list, then `restore` the raft proxies, then `restore` the
+    replication proxies: `L`'s (already cut by `isolate`, so it holds
+    nothing), and the other replica's, on which `restore` changes nothing
+    (it was never frozen or cut), so `heal()` needs no argument. The
     cut comes first so that a relay stalled for a blocked source exits on
     the generation change instead of resuming when the list empties and
     flushing its buffered frames. The other replica's replication proxy,
-    which `isolate` never touched, is left alone: cutting it would drop
+    which `isolate` never touched, is never cut: cutting it would drop
     the primary's in-memory replica under `disk+ram` exactly while step 1c
     checks that the primary keeps serving. The cut closes every held or
     stalled raft relay, so no stale raft frame is flushed into a healed
@@ -450,18 +470,35 @@ passes on current code.
     cleared only after it), and a forwarding relay reading in that
     instant carries live bytes, not buffered ones. `degraded_acks.rs`
     keeps its behaviour (a cut link carries nothing either way).
-- New tests, green before and after the fix:
+- New tests, green before and after the fix. The workspace denies
+  `unused`, so every helper above needs a caller in this commit, not
+  only in step 1c: that is why the isolation test exists and why the
+  characterisation heals.
   - `replica_leader_promotes_when_the_primary_dies`. Replicas-first
-    bring-up, stop the primary, `wait_one_promoted()`. This is the case
+    bring-up (`Cluster::new()`: no partition needed), stop the primary,
+    `wait_one_promoted()`, which must be `L`. This is the case
     where leadership is held *through* the failure, which the existing
     `killed_primary_triggers_exactly_one_auto_promotion` does not
     guarantee. Run it repeatedly before committing (Q10).
+  - `an_isolated_replica_leader_is_replaced_by_the_primary_and_the_other_replica`.
+    Replicas-first bring-up, `isolate(L)`, then the primary or `O` leads
+    above `L`'s term, and the primary still acks a write. The harness
+    check that `isolate` takes effect (step 1c records the same premise).
+    Nothing is asserted about `L` and no heal follows: on current code
+    `L` promotes while isolated (the bug), so the test stops the nodes
+    without healing.
   - `a_replica_leader_cut_from_the_primary_alone_does_not_promote_while_writes_flow`
-    (§8 characterisation). Replicas-first bring-up, keep writing to the
-    primary through a `melin_client::Connection`, `isolate_from_primary(L)`.
-    Over `NO_PROMOTION_WATCH`, `L` never serves and the primary keeps
-    serving: the other replica's tip moves ahead of `L`'s and the
-    peer-tip veto refuses.
+    (§8 characterisation). Replicas-first bring-up, `isolate_from_primary(L)`,
+    wait for the primary's `melin_replicas_connected 1`, then over
+    `NO_PROMOTION_WATCH` keep writing to the primary through a
+    `melin_client::Connection` (every write acked) while no replica
+    serves: the other replica's tip moves ahead of `L`'s and the
+    peer-tip veto refuses. At the end, `L` still leads at its term and
+    the primary, hearing from no leader, has campaigned above it (in
+    vain: `O`'s vote is held by `L`'s lease), which shows the raft
+    partition took effect. Then `heal()`: the primary gets back to
+    `melin_replicas_connected 2`, acks a write, and still no replica
+    serves.
 - Run the whole file, then commit.
 
 ### Step 1c: reproduce the bug (not committed on its own)
@@ -833,21 +870,27 @@ each answer went.
   primary; archive scan over both tags (step 1c).
 - **Q7 Public API (resolved).** No CHANGELOG entry; test callers listed
   (step 0).
-- **Q8 DPDK (adopted, one CI run to confirm).** `Proxy::start_on`, raft
-  proxies on 127.0.0.1, `raft_ip(i) = 127.0.0.(i+2)` (step 1b). Run the
-  "Runtime suites on DPDK" CI step. If only the partition tests fail
-  there, compare with the raft proxies on `local_ip()` before gating them
-  to kernel TCP, and record why in the file header.
+- **Q8 DPDK (adopted; passes under the runner locally).** `Proxy::start_on`,
+  raft proxies on 127.0.0.1, `raft_ip(i) = 127.0.0.(i+2)` (step 1b). The
+  whole of `raft_failover.rs` and `degraded_acks.rs` passed under
+  `scripts/dpdk/netns-runner.sh` with the `dpdk` feature on an aarch64
+  host, one test per process, repeatedly; the partition tests are not
+  gated. The "Runtime suites on DPDK" CI step (x86_64) is still the
+  confirmation; if only the partition tests fail there, compare with the
+  raft proxies on `local_ip()` before gating them to kernel TCP, and
+  record why in the file header.
 - **Q9 Frozen raft links on heal (resolved).** On heal, cut the raft
   proxies, then clear the block list, then restore (that order, so no
   stalled relay resumes first); blocked accepts held without threads; the
   relay re-checks the generation before writing (step 1b). No experiment needed,
   since unblock-only is not used.
-- **Q10 Late primary bring-up (decided).** Settled by the step 1b
-  assertion and repeated runs before committing 1b. The fallbacks
-  (open-questions Q10) are deferred until that test says they are
-  needed; one of them touches `RaftConfig`'s public API and would need the
-  user.
+- **Q10 Late primary bring-up (settled).** The step 1b assertion in
+  `start_replicas_first` held on every run before committing 1b
+  (`replica_leader_promotes_when_the_primary_dies` repeated alone, and
+  every replicas-first test in repeated whole-file runs, on kernel TCP
+  and under the DPDK netns runner): the late primary never forced a
+  re-election. The fallbacks (open-questions Q10) stay unused; one of
+  them touches `RaftConfig`'s public API and would need the user.
 - **Q11 Term of `read_log_id` (resolved).** Compare
   `read_log_id.leader_id.term` (step 4).
 - **Q12 Confirmation latency without a quorum (resolved).** Exactly
@@ -1018,10 +1061,12 @@ Any changed line still unexecuted goes into §10 with a reason.
   by `deadline` being the first statement of `confirm`, with a comment
   citing §4, and by review; the step 4 unit test pins only that a late
   reply is refused.
-- **The relay's post-read drop** (step 1b). It fires only when a heal
-  lands inside one relay pass, which no test can time; it is a
-  test-harness guard, not product code, and the step 1c heal phase runs
-  through it without depending on hitting the window.
+- **The relay's post-read drop, and the accept loop's refusal to hold a
+  socket past a cut** (step 1b). Each fires only when a cut lands inside
+  one relay pass or one accept, which no test can time; each is a
+  test-harness guard, not product code, and the heal phases (step 1b's
+  characterisation, step 1c) run through them without depending on
+  hitting the window.
 - **openraft's lease internals** (`handle_vote_req`, `EngineConfig::new`).
   They are not tested from melin: `Raft` handles stay inside the driver
   thread, so a follower cannot be sent a crafted `VoteRequest` without
