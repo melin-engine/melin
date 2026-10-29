@@ -24,18 +24,47 @@ from both the primary and the other replica therefore passes every rule in
 
 `consider_auto_promotion` then calls `control.promote.request(term)`.
 
-Inferred consequences, not yet proven by a test (step 1c proves or
-disproves them):
+Consequences, as step 1c's test observed them (the record is under
+step 1c):
 
-- the isolated replica serves as a primary that no other node reaches;
-- on heal, its epoch (= its term) is higher than the healthy primary's.
-  Its raft appends trip `fence_if_superseded` on the primary, so the
-  healthy primary shuts itself down. The result is a needless failover,
-  the other replica orphaned (its `--replica-of` still names the dead
-  primary), and the isolated node's journal diverged from the primary's
-  (it journaled an `EpochBump` while the primary kept writing). When it
-  is pointed back at the old lineage it is re-seeded and its journal
+- the isolated replica promotes itself a few seconds after the isolation
+  (the primary-down grace, then the promotion) and accepts clients as a
+  primary that no other node reaches, while the primary and the other
+  replica, which still reach each other, elect a new raft leader above
+  its term and the primary keeps acking writes. Two nodes serve clients
+  for the rest of the partition.
+- on heal, its epoch (= its term) is higher than the healthy primary's,
+  and what follows depends on which raft frame crosses first (the dated
+  record under step 1c has how often each was seen):
+  - either a raft *request* from the isolated node (its stale
+    leader's append, or a vote request) reaches the primary, trips
+    `fence_if_superseded`, and the healthy primary shuts itself down
+    within about a second. The result is a needless failover onto the
+    node that holds the least data, the other replica orphaned (its
+    `--replica-of` still names the dead primary; it does not promote,
+    though it sometimes takes raft leadership), and the isolated node's
+    journal diverged from the primary's (it journaled an `EpochBump`
+    while the primary kept writing);
+  - or the primary leads raft when the heal lands and its
+    heartbeat reaches the isolated node first: that node steps down to
+    follower without ever sending the primary a request, and **both keep
+    serving clients** past the heal. Nothing fences either: the
+    supersession check reads the epoch only on *inbound requests*
+    (`RpcServerConfig::observe_peer_epoch`, from `handle_connection`), not on
+    the replies a leader reads (`RaftClient::request` feeds them only to
+    `PeerTips`), and the primary's own epoch is lower, so the isolated
+    node has nothing to fence on. A split brain that outlives the
+    partition.
+- Inferred, not exercised (nobody points the isolated node back at the
+  old lineage in the test): when it is, it is re-seeded and its journal
   archived.
+
+The fix removes both outcomes at the source, since the isolated node
+never promotes. The one-way supersession check is a gap of its own,
+closed by step 5: any other path that leaves two serving nodes with the
+higher-epoch one a raft follower that sends the other no request (a
+manual `PROMOTE` of a partitioned replica, plausibly) is not closed by
+raft heartbeats until then.
 
 ## 2. The fix in one paragraph
 
@@ -528,13 +557,15 @@ Write `an_isolated_replica_leader_never_deposes_a_healthy_primary` in
    prefix: rotated segments and snapshot files share the journal stem.
    The tag list is a copy of what the private `ArchiveReason::tag` owns;
    a comment beside it says so and why (Q6).
+   At the end of the window, also which replicas serve (`serving_replicas`),
+   so a primary that was not fenced but serves beside `L` shows too.
 4. Assert all of it at the end in one message, which also carries
    `cluster_summary()`: the primary and `O` elected a new raft leader at
    a higher term while `L` was isolated (the §1 premise, and the proof
    that `isolate` took effect: without it every other assertion can hold
    because `L` was never cut off), `L` never served, the primary never
-   fenced and still serving, `L` back as a replica (2 connected), no
-   divergence, no archive.
+   fenced and still serving, no replica serving, `L` back as a replica
+   (2 connected), no divergence, no archive.
 
 Run it on current code. **Expected red**: `L` served, and the primary
 fenced on heal. Paste the observed record into the step 3 commit body (one
@@ -546,6 +577,29 @@ on `L` never serving alone.
 Divergence and archiving can only fire after the fix (in the red run
 nobody points `L` back at the old lineage); their absence then shows `L`
 rejoined cleanly.
+
+**Observed on current code** (2026-10-29, at `b1bb6a64` plus the test;
+Apple Silicon aarch64 host, Linux 6.19 Asahi, kernel TCP, `cargo test`
+debug build, the test alone; thirteen runs, the timings from the last
+nine, after the record gained them). Red on every run. §1 was
+rewritten from this record:
+
+- Re-election (the premise, so the harness holds): on every run the
+  primary (once, `O`) led at `L`'s term + 1 while `L` was isolated, and
+  the primary acked every write.
+- `L` served: on every run, first seen accepting clients about 3 to 4 s
+  after the isolation (the probe loop's cadence bounds the resolution).
+- Heal, primary fenced: on twelve runs, 0.5 to 0.9 s after the heal; `L`
+  then the only node serving, `O` serving nothing (raft afterwards led by
+  `L` or `O`, or by nobody, by the end of the window).
+- Heal, primary **not** fenced: on one run (the primary led raft at the
+  heal, `L` its follower at the same term), the primary and `L` both
+  served clients to the end of the 15 s window: a split brain past the
+  heal. Explained in §1 (the supersession check reads only inbound
+  requests).
+- `melin_replicas_connected` on the primary never returned to 2 (last
+  read 1, `O`); `melin_replica_divergence_total` 0; no archive beside
+  `L`'s journal. As expected, since nobody points `L` back.
 
 ### Step 2: `feat(raft): publish the leader's quorum-ack age`
 
@@ -702,10 +756,16 @@ rejoined cleanly.
 - `docs/replication.md` "Cluster recovery", "Primary crashes, one or both
   replicas alive": add that with the primary and the other replica both
   gone, recovery is manual.
-- CHANGELOG **Fixed**: an isolated replica leader no longer deposes a
-  healthy primary (wording per step 1c's observation). **Changed**: a
-  replica that cannot reach a majority, including the last survivor, no
-  longer auto-promotes.
+- CHANGELOG **Fixed** (wording from step 1c's observation): a replica
+  that held control-plane leadership and was cut off from both other
+  nodes promoted itself and served clients beside the healthy primary
+  for as long as the partition lasted; once the network healed, either
+  it shut the healthy primary down (a needless failover onto the node
+  holding the least data, the other replica left orphaned) or both kept
+  serving, depending on which control-plane message crossed first. An
+  isolated replica now never promotes itself. **Changed**: a replica that
+  cannot reach a majority, including the last survivor, no longer
+  auto-promotes.
 
 ### Step 4: `fix(server-runtime): confirm leadership with a quorum round trip when the promotion epoch is minted`
 
@@ -836,7 +896,65 @@ control-plane redesign; recorded as a possible follow-up).
   `LEADER_CONFIRM_TIMEOUT` stays crate-private: nothing outside the
   driver reads it.
 
-### Step 5: `docs: record the quorum-lease gate for contributors`
+### Step 5: `fix(raft): fence on a higher epoch carried by a reply`
+
+Decided with the user: the one-way supersession check found by step 1c
+is closed in this branch, as a step of its own. It is independent of the
+lease gate: steps 2 to 4 remove the path step 1c hit (the isolated node
+never promotes), and this step closes the gap for every other path to two
+serving nodes whose higher-epoch one is a raft follower that sends the
+other no request (a manual `PROMOTE` of a partitioned replica,
+plausibly).
+
+- `crates/core/raft/src/rpc_server.rs`: move the body of
+  `RpcServerConfig::observe_peer_epoch` onto `SupersessionPolicy` itself
+  (`SupersessionPolicy::observe(&self, peer_epoch)`: the `serving` check,
+  `fence_if_superseded`, the `warn!`), so the request path and the reply
+  path share one statement of the rule. `observe_peer_epoch` keeps its
+  `Option` handling and calls it.
+- `crates/core/raft/src/network.rs`: `RaftClientFactory` and each
+  `RaftClient` hold the same `Option<SupersessionPolicy>` (an `Arc`
+  clone of what `RpcServerConfig` gets; `driver_main` builds it once and
+  hands it to both). `RaftClient::request` feeds every reply envelope's
+  `tip_epoch` to it, beside the existing `peer_tips.record`. Comment why
+  a reply counts: it carries the responder's epoch exactly as a request
+  carries the sender's, and a serving raft leader learns of a higher
+  epoch among its followers only through replies.
+- Semantics are unchanged: higher epoch wins, as on the request path and
+  the data-plane handshake. A reply cannot misfire where a request would
+  not: both carry the same field from the same `TipSource`. To verify
+  while implementing: that a replica's advertised epoch rises only when
+  it applies a streamed `EpochBump` or its own promotion's, so a reply at
+  a higher epoch always means a newer tenure exists (§7 has the question
+  as Q15).
+- Tests:
+  - `crates/core/raft/src/tests/rpc_loopback.rs`: a client whose policy
+    says serving, at epoch `e`, sends a request to a server advertising
+    `e + 1`; the client fences (`shutdown` set, fence state superseded).
+    A client not serving does not fence; a reply at `e` or lower does
+    not fence.
+  - `crates/core/server-runtime/tests/raft_failover.rs`, deterministic
+    reproduction of step 1c's split-brain outcome: two serving nodes, the
+    healthy primary leading raft and a higher-epoch node its follower,
+    with that follower's requests to the primary blocked one way (the
+    primary's raft proxy blocks the follower's source; the follower's
+    proxy stays open, so the primary's heartbeats reach it and the
+    replies come back on the primary's own connection). How the
+    higher-epoch node is made serving is settled while implementing (a
+    manual `PROMOTE` of an isolated replica is the likely route). Red
+    before this step (both keep serving), green after (the primary
+    fences within a heartbeat or two). Name it for the behaviour, e.g.
+    `a_serving_leader_fences_on_a_followers_higher_epoch`.
+- `docs/replication.md`, where fencing on supersession is described:
+  the check now also runs on control-plane replies, so a serving node
+  learns it was superseded from any control-plane exchange, in either
+  direction.
+- CHANGELOG **Fixed**: a node serving as primary that led the control
+  plane, with a higher-epoch serving node among its followers, kept
+  serving beside it (seen after a partition healed); it now fences as
+  soon as a control-plane reply carries the higher epoch.
+
+### Step 6: `docs: record the quorum-lease gate for contributors`
 
 - `docs/internal/raft-control-plane.md`, "Auto-promotion policy": the
   §4 argument (the lease, the challenger-nudge case and the peer-tip veto
@@ -902,6 +1020,14 @@ each answer went.
 - **Q14 Bind-before-connect edge cases (decided).** Clear refusals mapped
   to `Unreachable`, and the startup refusal in `melin_raft::spawn`
   (step 1a).
+- **Q15 Can a reply's epoch be higher without a newer tenure?** (open,
+  step 5). Fencing on replies is sound only if a node's advertised epoch
+  (`TipSource::local_tip`, from its `FenceState`) rises solely when a
+  newer tenure exists: applying a streamed `EpochBump`, or minting its own
+  promotion's. Check every writer of the fence epoch (`observe_epoch`,
+  the promotion mint, recovery from the journal, a re-seed) before
+  wiring the reply path, and record the answer here. If some path can
+  raise it otherwise, that path is a bug on the request path today too.
 
 ## 8. Behaviour change and residual risk
 
@@ -1005,10 +1131,17 @@ each answer went.
   authentication, refusing a mismatch with an error naming both versions
   (the replication handshake's pattern), then changes the envelope
   (decided with the user).
+- **Addressed by step 5 (found by step 1c): the supersession check was
+  one-way.** A serving node fenced on a higher epoch carried by an
+  inbound raft *request*, never by a reply, so a serving raft leader
+  whose followers include a higher-epoch serving node kept serving (§1,
+  the run where both served past the heal). Steps 2 to 4 remove the path
+  step 1c hit; step 5 closes the gap for every other path, with no
+  protocol change (reply envelopes already carry the epoch).
 
 ## 9. Coverage
 
-After step 4, run
+After step 5, run
 `cargo llvm-cov nextest -p melin-raft -p melin-transport-core -p melin-server-runtime --html`.
 Cover every changed branch:
 
@@ -1025,7 +1158,9 @@ Cover every changed branch:
 - the sentinel accessors;
 - `publish_metrics` and `heartbeat_interval_ms`;
 - the gauge's present and absent branches;
-- `PromotionOrigin` encoding.
+- `PromotionOrigin` encoding;
+- `SupersessionPolicy::observe` from both the request and the reply
+  path (serving and not, higher, equal and lower epoch).
 
 Any changed line still unexecuted goes into §10 with a reason.
 
