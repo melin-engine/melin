@@ -250,22 +250,36 @@ confirmation needs ("an election at term t") and a raw `u64` cannot say.
   `u64::MAX`; `request` refuses `Election { term: u64::MAX }` (returns
   `false`, with a comment that the value is the manual sentinel) rather
   than asserting, so debug and release behave the same and the refusal is
-  testable. Justify the encoding in a comment per CLAUDE.md. Add
+  testable. `Election { term: 0 }` is refused the same way: no election
+  is at term 0, and the word would read back as "no request" (the old
+  `debug_assert!(min_epoch >= 1)` let a release build file it and report
+  success). Justify the encoding in a comment per CLAUDE.md. Add
   `PromotionOrigin::epoch_floor()` (`Manual` → 1, `Election { term }` →
   term), so `journal_promotion_epoch_bump`'s `max(epoch + 1, floor)` is
   unchanged.
 - Callers: `raft_promotion::consider_auto_promotion`
   (`Election { term }`), `admin.rs` `PROMOTE` (`Manual`), the
   `promotion_request.pending()` arguments in `server.rs`'s two replica
-  branches, and `journal_promotion_epoch_bump`'s alignment warning, which
-  becomes a `match` on the origin. That also fixes the warning being
+  branches (and the `promotion` parameters of `run_as_primary` and
+  `run_as_primary_dpdk` they feed), and `journal_promotion_epoch_bump`'s
+  alignment warning, which becomes a `match` on the origin in a small
+  pure helper beside it (`misaligned_election_term`, so the
+  classification is unit-testable). That also fixes the warning being
   skipped for a term-1 election. Test callers of the `u64` API port with
-  the type: `admin.rs`, `replication/tcp_receiver.rs`,
-  `replication/receiver_transport.rs` and `replication/mod.rs` tests
-  (open-questions Q7; the compiler lists them).
+  the type: `admin.rs`, `replication/tcp_receiver.rs` and
+  `replication/receiver_transport.rs` tests (open-questions Q7; the
+  compiler lists them; `replication/mod.rs` only constructs the handle
+  and needs no change). The `max` rule's description in
+  `docs/internal/raft-control-plane.md` names the origin instead of
+  `MANUAL`.
 - Tests in `promotion.rs`: the existing four ported, plus "an election at
   term 1 is not a manual promotion" (the bug this closes), "a term equal
-  to the manual sentinel is refused", and `epoch_floor` per variant.
+  to the manual sentinel is refused", the term-0 refusal, and
+  `epoch_floor` per variant. In `server.rs`: the epoch
+  `journal_promotion_epoch_bump` publishes per origin (manual, an election
+  above the fence, an election the fence overtook), read off a small
+  input ring with the shutdown flag raised so the apply wait returns, and
+  the warning helper per origin.
 - No CHANGELOG entry: `mod promotion` is private in
   `crates/core/server-runtime/src/lib.rs`, nothing re-exports it, and the
   one public holder (`ReplicaControlPlane`) keeps it in a `pub(crate)`
@@ -749,8 +763,11 @@ control-plane redesign; recorded as a possible follow-up).
     enqueue, so the two orders differ by nanoseconds no test observes.
     The order is enforced by `confirm` taking `deadline` as its first
     statement, with a comment there citing §4 (listed in §10).
-  - `server.rs` tests, with the ring fixture hoisted out of
-    `primary_gate_policy_tests::matching_stage` rather than copied (Q5):
+  - `server.rs` tests, extending step 0's `promotion_epoch_tests` and its
+    `minted_epoch` ring helper rather than building another ring (Q5;
+    step 0 landed that helper, so nothing needs hoisting out of
+    `primary_gate_policy_tests::matching_stage`, which builds a matching
+    stage, not a producer/consumer pair):
     an `Election` origin and a refusing stub publishes nothing
     (`try_consume` is `None`, the fence epoch is unchanged) and returns
     `Err`; an accepting stub publishes as before (pass a raised
@@ -801,7 +818,7 @@ each answer went.
   failure (step 4). A restart-after-abandon integration test is not
   added; see §10.
 - **Q5 Testing `journal_promotion_epoch_bump` (resolved).** Unit tests
-  with the hoisted ring fixture (step 4).
+  over step 0's `promotion_epoch_tests` ring helper (step 4).
 - **Q6 Post-heal evidence (resolved).** Divergence counter on the
   primary; archive scan over both tags (step 1c).
 - **Q7 Public API (resolved).** No CHANGELOG entry; test callers listed

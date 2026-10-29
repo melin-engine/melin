@@ -1466,8 +1466,7 @@ mod tests {
     /// for the promote drain tests.
     fn promoted_control() -> crate::replication::ReplicaControlPlane {
         let c = control();
-        c.promote
-            .request(crate::promotion::PromotionRequest::MANUAL);
+        c.promote.request(crate::promotion::PromotionOrigin::Manual);
         c
     }
 

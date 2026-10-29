@@ -50,7 +50,7 @@ use std::time::Duration;
 
 use crate::ack_policy::AckPolicy;
 use crate::policy_control::{AckPolicyControl, Refused, RequestOutcome};
-use crate::promotion::PromotionRequest;
+use crate::promotion::{PromotionOrigin, PromotionRequest};
 
 use ed25519_dalek::{Verifier, VerifyingKey};
 use tracing::{debug, error, info, warn};
@@ -313,7 +313,7 @@ fn handle_connection(
                 // First request wins; a duplicate (or a race with an
                 // auto-promotion) leaves the in-flight transition
                 // untouched — still OK from the operator's viewpoint.
-                if request.request(PromotionRequest::MANUAL) {
+                if request.request(PromotionOrigin::Manual) {
                     info!("promotion triggered by operator");
                 } else {
                     // debug!, not info!: an operator-caused no-op, not
@@ -619,7 +619,7 @@ mod tests {
         .expect("spawn admin listener");
 
         assert_eq!(send_command(addr, &key, b"PROMOTE\n"), "OK");
-        assert_eq!(promote.pending(), Some(PromotionRequest::MANUAL));
+        assert_eq!(promote.pending(), Some(PromotionOrigin::Manual));
         assert!(!rotate.load(Ordering::Acquire));
 
         shutdown.store(true, Ordering::Release);
@@ -727,7 +727,7 @@ mod tests {
 
         // Final PROMOTE on the same listener still works.
         assert_eq!(send_command(addr, &key, b"PROMOTE\n"), "OK");
-        assert_eq!(promote.pending(), Some(PromotionRequest::MANUAL));
+        assert_eq!(promote.pending(), Some(PromotionOrigin::Manual));
 
         shutdown.store(true, Ordering::Release);
     }

@@ -21,6 +21,7 @@ use melin_journal::AckPolicyByte;
 
 use crate::ack_policy::AckPolicy;
 use crate::policy_control::AckPolicyControl;
+use crate::promotion::PromotionOrigin;
 use crate::replication::ReplicaControlPlane;
 
 /// Poll cadence for the promotion thread. Matches the codebase's
@@ -384,9 +385,11 @@ fn consider_auto_promotion(
                     );
                 }
             }
-            // `request` can only lose to a racing manual PROMOTE; either
+            // `request` can only lose to a racing manual PROMOTE: of the
+            // two terms it refuses, 0 fails the decision's
+            // `term > fence_epoch` and `u64::MAX` is never reached. Either
             // way a promotion is now in flight.
-            if control.promote.request(term) {
+            if control.promote.request(PromotionOrigin::Election { term }) {
                 info!(
                     node_id = status.node_id,
                     term, "elected leader — auto-promoting this replica"
@@ -1204,6 +1207,12 @@ mod tests {
         observe(95, AckPolicy::DiskAndRam);
         consider(AckPolicy::Disk, &mut last_refused);
         assert!(control.promote.is_requested(), "promotion filed");
+        // Filed as the election it is, at the term won, so the epoch
+        // minted is that term rather than `epoch + 1`.
+        assert_eq!(
+            control.promote.pending(),
+            Some(PromotionOrigin::Election { term: 7 })
+        );
     }
 
     /// A witnessed change to `policy`, as the stream carries it.

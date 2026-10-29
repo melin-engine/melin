@@ -38,6 +38,7 @@ type Pipeline<A> = GenericPipeline<A>;
 
 use crate::StartupEvents;
 use crate::client_auth::MAX_AUTH_FRAME;
+use crate::promotion::PromotionOrigin;
 use crate::reader::RequestDecoderArc;
 use crate::response::ResponseEncoderArc;
 use melin_app::auth::{AuthorizedKeys, ClientRole, KeyRole, RoleId};
@@ -1244,7 +1245,7 @@ where
                     ack_policy,
                     fence_state,
                     control.lineage_ack_policy.load(),
-                    promotion_request.pending(), // promoted — EpochBump with the request's epoch floor
+                    promotion_request.pending(), // promoted — EpochBump with the origin's epoch floor
                     false, // a promoted node continues the history it streamed
                     raft_status,
                     journal_tip,
@@ -1731,7 +1732,7 @@ fn run_as_primary<A, L>(
     // gate's start: the policy before the newest change, with the change
     // pending (`initial_gate_policy`).
     lineage_ack_policy: Option<LineagePolicy>,
-    promotion: Option<u64>,
+    promotion: Option<PromotionOrigin>,
     // This boot began the history (`InitializedEngine::began_history`):
     // with replication on, client service waits for the first replica.
     began_history: bool,
@@ -2191,13 +2192,8 @@ where
 
     // Promotion fencing: the bump is the first entry of a promoted node's
     // tenure. See `journal_promotion_epoch_bump`.
-    if let Some(requested_epoch) = promotion {
-        journal_promotion_epoch_bump(
-            requested_epoch,
-            &fence_state,
-            &mut input_producer,
-            &shutdown,
-        );
+    if let Some(origin) = promotion {
+        journal_promotion_epoch_bump(origin, &fence_state, &mut input_producer, &shutdown);
     }
     // The policy this tenure requests, after the bump; see
     // `PublisherClaim::journal_boot`. Only the booted claim attaches the
@@ -2781,7 +2777,7 @@ where
                     ack_policy,
                     fence_state,
                     control.lineage_ack_policy.load(),
-                    promotion_request.pending(), // promoted — EpochBump with the request's epoch floor
+                    promotion_request.pending(), // promoted — EpochBump with the origin's epoch floor
                     raft_status,
                     journal_tip,
                 );
@@ -2954,7 +2950,7 @@ fn run_as_primary_dpdk<A>(
     fence_state: Arc<melin_transport_core::fence::FenceState>,
     // As `run_as_primary`'s.
     lineage_ack_policy: Option<LineagePolicy>,
-    promotion: Option<u64>,
+    promotion: Option<PromotionOrigin>,
     raft_status: Option<Arc<melin_transport_core::health::RaftStatus>>,
     journal_tip: melin_transport_core::AdvertisedJournalTip,
 ) -> Result<(), Box<dyn std::error::Error>>
@@ -3302,13 +3298,8 @@ where
     // a promoted node's tenure, ahead of `on_primary`, and is applied
     // before the poll loop below serves any client or replica. See
     // `journal_promotion_epoch_bump`.
-    if let Some(requested_epoch) = promotion {
-        journal_promotion_epoch_bump(
-            requested_epoch,
-            &fence_state,
-            &mut input_producer,
-            &shutdown,
-        );
+    if let Some(origin) = promotion {
+        journal_promotion_epoch_bump(origin, &fence_state, &mut input_producer, &shutdown);
     }
     // As on kernel TCP: the policy this tenure requests, after the bump,
     // and the booted claim the poll thread attaches.
@@ -3421,15 +3412,15 @@ where
 /// already advertises the new epoch. The caller must be the input ring's
 /// only producer.
 ///
-/// The new epoch honours the promotion request's floor: a manual
-/// `PROMOTE` carries `MANUAL` (= 1) and resolves to the classic
-/// `epoch + 1`; a raft auto-promotion carries its election term
-/// (strictly above the old epoch by the driver's request rule), so
+/// The new epoch honours the origin's floor
+/// ([`PromotionOrigin::epoch_floor`]): a manual `PROMOTE` resolves to the
+/// classic `epoch + 1`; a raft auto-promotion floors it at its election
+/// term (strictly above the old epoch by the driver's request rule), so
 /// tenure epochs align with raft terms and two overlapping
 /// promotions from different elections always allocate distinct
 /// epochs — the newer one fences the older.
 fn journal_promotion_epoch_bump<E: melin_app::AppEvent>(
-    requested_epoch: u64,
+    origin: PromotionOrigin,
     fence_state: &melin_transport_core::fence::FenceState,
     input_producer: &mut melin_pipeline::ring::Producer<InputSlot<E>>,
     shutdown: &AtomicBool,
@@ -3437,7 +3428,10 @@ fn journal_promotion_epoch_bump<E: melin_app::AppEvent>(
     use melin_app::unix_epoch_nanos;
     use melin_journal::JournalEvent;
 
-    let new_epoch = fence_state.epoch().saturating_add(1).max(requested_epoch);
+    let new_epoch = fence_state
+        .epoch()
+        .saturating_add(1)
+        .max(origin.epoch_floor());
     // Re-validate the term↔epoch alignment at the moment the epoch is
     // minted, not just at the driver's request-time check: a streamed
     // `EpochBump` from a concurrent promotion elsewhere can raise the
@@ -3445,22 +3439,17 @@ fn journal_promotion_epoch_bump<E: melin_app::AppEvent>(
     // instead of the election term. Fencing still converges (the
     // epochs stay distinct and the higher one wins), but the skew
     // makes later "epochs outran raft terms" refusals — so say what
-    // actually happened while the evidence exists. Manual promotions
-    // (requested == MANUAL) are exempt: they never claimed alignment.
-    if requested_epoch > crate::promotion::PromotionRequest::MANUAL && new_epoch != requested_epoch
-    {
+    // actually happened while the evidence exists.
+    if let Some(term) = misaligned_election_term(origin, new_epoch) {
         warn!(
             new_epoch,
-            requested_epoch,
+            term,
             "promotion epoch does not match its election term — a concurrent \
              promotion advanced the fencing epoch mid-drain; auto-promotion \
              refusals may report term/epoch misalignment until a newer election"
         );
     }
-    info!(
-        new_epoch,
-        requested_epoch, "promotion: injecting epoch bump"
-    );
+    info!(new_epoch, ?origin, "promotion: injecting epoch bump");
     input_producer.publish(InputSlot::node_event(
         JournalEvent::EpochBump { epoch: new_epoch },
         unix_epoch_nanos(),
@@ -3470,6 +3459,17 @@ fn journal_promotion_epoch_bump<E: melin_app::AppEvent>(
     // by the shutdown flag so a stuck pipeline can't wedge startup.
     ORCHESTRATOR_WAIT
         .wait_until(|| fence_state.epoch() >= new_epoch || shutdown.load(Ordering::Relaxed));
+}
+
+/// The election term a promoted tenure's epoch failed to match, for
+/// `journal_promotion_epoch_bump`'s alignment warning. A manual promotion
+/// never claimed alignment, so it is never misaligned, whatever epoch it
+/// takes.
+fn misaligned_election_term(origin: PromotionOrigin, new_epoch: u64) -> Option<u64> {
+    match origin {
+        PromotionOrigin::Manual => None,
+        PromotionOrigin::Election { term } => (new_epoch != term).then_some(term),
+    }
 }
 
 /// Journal a primary's `on_primary` [`StartupEvents`] and return once
@@ -5671,6 +5671,75 @@ mod primary_gate_policy_tests {
         assert_eq!(start(&record), pending(false));
         record.observe(WireSeq::new(9), streamed(AckPolicy::Disk, true));
         assert_eq!(start(&record), pending(true));
+    }
+}
+
+/// The epoch a promotion mints from its origin, and when its alignment
+/// warning applies.
+#[cfg(test)]
+mod promotion_epoch_tests {
+    use std::sync::atomic::AtomicBool;
+
+    use counter_server::CounterEvent;
+    use melin_journal::JournalEvent;
+    use melin_pipeline::ring::DisruptorBuilder;
+    use melin_pipeline::wait::WaitStrategy;
+    use melin_transport_core::fence::FenceState;
+
+    use super::{
+        InputSlot, PromotionOrigin, journal_promotion_epoch_bump, misaligned_election_term,
+    };
+
+    /// The epoch `journal_promotion_epoch_bump` publishes for `origin`
+    /// over a fence at `fence_epoch`. Nothing applies the bump, so the
+    /// shutdown flag is raised up front to release the wait that follows
+    /// the publish.
+    fn minted_epoch(origin: PromotionOrigin, fence_epoch: u64) -> u64 {
+        let (mut producer, mut consumers) = DisruptorBuilder::<InputSlot<CounterEvent>>::new(4)
+            .add_consumer()
+            .build(WaitStrategy::BusySpin);
+        let fence = FenceState::new(fence_epoch);
+        journal_promotion_epoch_bump(origin, &fence, &mut producer, &AtomicBool::new(true));
+        let (_, slot) = consumers[0].try_consume().expect("the bump was published");
+        assert!(consumers[0].try_consume().is_none(), "one entry only");
+        match slot.event {
+            JournalEvent::EpochBump { epoch } => epoch,
+            other => panic!("expected an EpochBump, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_manual_promotion_mints_the_next_epoch() {
+        assert_eq!(minted_epoch(PromotionOrigin::Manual, 0), 1);
+        assert_eq!(minted_epoch(PromotionOrigin::Manual, 6), 7);
+    }
+
+    #[test]
+    fn an_election_mints_its_term_when_above_the_fence() {
+        assert_eq!(minted_epoch(PromotionOrigin::Election { term: 1 }, 0), 1);
+        assert_eq!(minted_epoch(PromotionOrigin::Election { term: 9 }, 3), 9);
+    }
+
+    /// A concurrent promotion raised the fence past the term mid-drain:
+    /// the epoch still moves forward, past the term.
+    #[test]
+    fn an_election_overtaken_by_the_fence_mints_the_next_epoch() {
+        assert_eq!(minted_epoch(PromotionOrigin::Election { term: 4 }, 4), 5);
+        assert_eq!(minted_epoch(PromotionOrigin::Election { term: 1 }, 1), 2);
+    }
+
+    /// An election whose minted epoch is not its term is reported, at term
+    /// 1 too (as a raw number, term 1 was the manual sentinel and the
+    /// warning skipped it); a manual promotion never is.
+    #[test]
+    fn the_alignment_warning_names_only_a_misaligned_election() {
+        let election = |term| PromotionOrigin::Election { term };
+        assert_eq!(misaligned_election_term(election(1), 2), Some(1));
+        assert_eq!(misaligned_election_term(election(4), 5), Some(4));
+        assert_eq!(misaligned_election_term(election(1), 1), None);
+        assert_eq!(misaligned_election_term(election(9), 9), None);
+        assert_eq!(misaligned_election_term(PromotionOrigin::Manual, 1), None);
+        assert_eq!(misaligned_election_term(PromotionOrigin::Manual, 7), None);
     }
 }
 

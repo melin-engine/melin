@@ -2859,7 +2859,7 @@ mod tests {
             assert!(
                 control
                     .promote
-                    .request(crate::promotion::PromotionRequest::MANUAL),
+                    .request(crate::promotion::PromotionOrigin::Manual),
                 "promotion filed"
             );
 

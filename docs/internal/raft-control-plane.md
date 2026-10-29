@@ -57,12 +57,13 @@ format version byte covers the `Vote` layout, so a binary built with
 the feature flipped refuses an existing `--raft-dir` instead of
 misreading it.
 
-Epoch allocation on promotion is `max(fence_epoch + 1, requested)`
-(`server.rs`): a manual `PROMOTE` files `MANUAL` (= 1) and folds to the
-classic `epoch + 1`; an auto-promotion files its term. Manual and
-automatic promotions coexist — first request wins the one-shot, and a
-manual promotion that outruns raft terms simply makes the policy refuse
-(`term <= fence_epoch`) until terms catch up.
+Epoch allocation on promotion is `max(fence_epoch + 1, floor)`
+(`server.rs`), the floor coming from the request's `PromotionOrigin`: a
+manual `PROMOTE` files `Manual`, whose floor of 1 folds to the classic
+`epoch + 1`; an auto-promotion files `Election { term }`, whose floor is
+its term. Manual and automatic promotions coexist — first request wins
+the one-shot, and a manual promotion that outruns raft terms simply
+makes the policy refuse (`term <= fence_epoch`) until terms catch up.
 
 ## Journal-tip vote recency filter (`recency.rs`)
 
