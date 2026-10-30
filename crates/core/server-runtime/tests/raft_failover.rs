@@ -975,19 +975,19 @@ fn replica_leader_promotes_when_the_primary_dies() {
     }
 }
 
-/// The lone survivor (`docs/internal/raft-promotion-quorum-lease-plan.md`,
-/// §8): a replica that leads the control plane while the primary and the
-/// other replica both die never auto-promotes, since from where it stands
-/// that cannot be told from being partitioned; recovery is a manual
-/// `PROMOTE`. It keeps leading at its term throughout (openraft has no
-/// check-quorum step-down), so it is the leader-lease filter, not a lost
-/// leadership, that holds it back. Both peers are voters, so the lease
-/// lapses `QUORUM_ACK_MAX_AGE` after the second of them stops. The other
-/// replica is stopped first, and `stop` returns only once it is down, so
-/// the primary's acks end when the primary-down grace starts and the
-/// lease lapses well inside it. The reverse order would not be safe: a
-/// slow clean stop of the primary could let the other replica's acks
-/// keep the lease fresh past the grace.
+/// The lone survivor (`docs/internal/raft-control-plane.md`, "The
+/// leader-lease gate"): a replica that leads the control plane while the
+/// primary and the other replica both die never auto-promotes, since from
+/// where it stands that cannot be told from being partitioned; recovery is
+/// a manual `PROMOTE`. It keeps leading at its term throughout (openraft
+/// has no check-quorum step-down), so it is the leader-lease filter, not a
+/// lost leadership, that holds it back. Both peers are voters, so the
+/// lease lapses `QUORUM_ACK_MAX_AGE` after the second of them stops. The
+/// other replica is stopped first, and `stop` returns only once it is
+/// down, so the primary's acks end when the primary-down grace starts and
+/// the lease lapses well inside it. The reverse order would not be safe: a
+/// slow clean stop of the primary could let the other replica's acks keep
+/// the lease fresh past the grace.
 #[test]
 #[serial]
 fn a_replica_leader_alone_never_auto_promotes() {
@@ -1048,15 +1048,17 @@ fn an_isolated_replica_leader_is_replaced_by_the_primary_and_the_other_replica()
     led.stop();
 }
 
-/// The one-sided partition (`docs/internal/raft-promotion-quorum-lease-plan.md`,
-/// §8): the replica leader loses only its links to the primary, while the
-/// other replica still reaches both. With writes flowing, the other
-/// replica's tip moves ahead of the leader's, so the peer-tip veto keeps
-/// the leader from promoting, and the other replica, whose own primary
-/// link is up, does not campaign: nobody promotes and the primary keeps
-/// serving. Once healed, the leader rejoins as a replica. That the
-/// partition took effect is checked too: the primary, hearing from no
-/// leader, campaigns above the leader's term, in vain.
+/// The one-sided partition
+/// (`docs/internal/raft-control-plane-follow-ups.md`, item 4, whose
+/// idle-primary case is the gap left open): the replica leader loses only
+/// its links to the primary, while the other replica still reaches both.
+/// With writes flowing, the other replica's tip moves ahead of the
+/// leader's, so the peer-tip veto keeps the leader from promoting, and the
+/// other replica, whose own primary link is up, does not campaign: nobody
+/// promotes and the primary keeps serving. Once healed, the leader rejoins
+/// as a replica. That the partition took effect is checked too: the
+/// primary, hearing from no leader, campaigns above the leader's term, in
+/// vain.
 ///
 /// A characterisation of what the code does, not a guarantee: with an
 /// idle primary nothing vetoes, and the leader promotes (a known gap).
@@ -1148,8 +1150,8 @@ struct IsolationRecord {
     archives: Vec<String>,
 }
 
-/// The isolated-leader bug (`docs/internal/raft-promotion-quorum-lease-plan.md`,
-/// §1 and step 1c): a replica that leads the control plane and is cut off
+/// The isolated-leader bug (`docs/internal/raft-control-plane.md`, "The
+/// leader-lease gate"): a replica that leads the control plane and is cut off
 /// from both peers must not promote itself, and once healed the primary,
 /// which the other replica kept reaching, must still serve, and be the only
 /// node that does, with both replicas back and nothing diverged or
@@ -1253,18 +1255,20 @@ fn an_isolated_replica_leader_never_deposes_a_healthy_primary() {
 /// fails at any deadline and only a slow one is helped by a longer one.
 const FENCE_WATCH: Duration = Duration::from_secs(60);
 
-/// The one-way supersession check (`docs/internal/raft-promotion-quorum-lease-plan.md`,
-/// §1 and step 5), the split brain step 1c saw after a heal, reproduced on
-/// purpose: the primary leads the control plane and keeps serving while a
-/// replica that follows it is manually promoted (cut from the primary on
-/// the data plane, as an operator would promote a replica they believe
-/// orphaned). The promoted node, at the higher epoch, sends the primary
-/// no request: the replicas' raft requests are stalled at every proxy,
-/// while the primary's heartbeats reach them and their replies come back
-/// on the primary's own connections. Nothing on the data plane joins the
-/// two either. So the primary learns of the newer tenure only from a
-/// reply, and must fence on it, leaving the promoted node the only one
-/// serving.
+/// The one-way supersession check (`SupersessionPolicy`, which once read
+/// only inbound requests; `docs/internal/raft-control-plane.md`,
+/// "Auto-promotion policy"), the split brain
+/// `an_isolated_replica_leader_never_deposes_a_healthy_primary` saw after
+/// a heal before the lease gate, reproduced on purpose: the primary leads
+/// the control plane and keeps serving while a replica that follows it is
+/// manually promoted (cut from the primary on the data plane, as an
+/// operator would promote a replica they believe orphaned). The promoted
+/// node, at the higher epoch, sends the primary no request: the replicas'
+/// raft requests are stalled at every proxy, while the primary's
+/// heartbeats reach them and their replies come back on the primary's own
+/// connections. Nothing on the data plane joins the two either. So the
+/// primary learns of the newer tenure only from a reply, and must fence on
+/// it, leaving the promoted node the only one serving.
 #[test]
 #[serial]
 fn a_serving_leader_fences_on_a_followers_higher_epoch() {

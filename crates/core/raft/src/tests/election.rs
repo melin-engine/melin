@@ -350,7 +350,8 @@ fn a_healthy_leaders_quorum_ack_age_stays_under_the_gate() {
         max_age = max_age.max(age);
         std::thread::sleep(SAMPLE_EVERY);
     }
-    // Reported so the margin can be re-measured (plan §7 Q1).
+    // Reported so the margin can be re-measured under load (see
+    // `docs/internal/raft-control-plane-follow-ups.md`).
     eprintln!("healthy leader {leader}: max quorum-ack age {max_age} ms");
     assert!(
         Duration::from_millis(max_age) <= crate::QUORUM_ACK_MAX_AGE,

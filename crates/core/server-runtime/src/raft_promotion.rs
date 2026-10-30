@@ -252,11 +252,11 @@ struct AutoPromotionInputs {
 ///   nothing, and the operator should be told the node may be
 ///   partitioned, not shown a peer table. This is an early filter, not
 ///   the guarantee: the time from here to the promotion's epoch being
-///   minted is unbounded, and a leadership confirmation at mint time
-///   (step 4 of `docs/internal/raft-promotion-quorum-lease-plan.md`,
-///   not yet in place) is what will make the promotion safe. A lone
-///   survivor whose two peers are dead refuses too; it cannot tell that
-///   from being partitioned.
+///   minted is unbounded, and the leadership confirmation at mint time
+///   (`journal_promotion_epoch_bump`; the argument is in
+///   `docs/internal/raft-control-plane.md`, "The leader-lease gate") is
+///   what makes the promotion safe. A lone survivor whose two peers are
+///   dead refuses too; it cannot tell that from being partitioned.
 /// - `primary_observed` / `journal_empty` — a node that has never seen
 ///   a primary this boot *and* holds no journal data is a blank genesis
 ///   node: an election among blank nodes proves nothing about acked
@@ -395,10 +395,9 @@ fn consider_auto_promotion(
     // from one term, the term from the next) can at worst let the filter
     // pass for one poll, or file a term this node no longer leads in, and
     // the leadership confirmation where the epoch is minted checks the
-    // filed term exactly and refuses (the lease plan's step 4, not yet in
-    // place; until then the exposure is the one the separate role and
-    // term loads above already carry). A double read would only narrow a
-    // window of nanoseconds that confirmation covers.
+    // filed term exactly and refuses (`journal_promotion_epoch_bump`). A
+    // double read would only narrow a window of nanoseconds that
+    // confirmation covers.
     let quorum_ack_age = status.millis_since_quorum_ack().map(Duration::from_millis);
     // Loaded once: `local_tip.epoch` and the `fence_epoch` input must not
     // tear if a fencing event lands mid-poll.

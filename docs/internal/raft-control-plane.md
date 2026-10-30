@@ -3,7 +3,8 @@
 The `melin-raft` crate and its wiring in `melin-server-runtime` implement
 the control plane described operationally in `docs/replication.md`: leader
 election, static membership, and fencing-epoch allocation. This document
-covers the design arguments a contributor needs before touching it.
+covers the design arguments a contributor needs before touching it;
+decided but unbuilt work is in `raft-control-plane-follow-ups.md`.
 
 ## Scope and non-goals
 
@@ -23,9 +24,13 @@ One dedicated `raft-driver` thread per node owns:
   codebase synchronous and the hot path untouched,
 - the control-plane TCP listener (kernel TCP always, even on DPDK
   nodes — the control plane must not consume a DPDK queue),
-- a metrics bridge copying `RaftMetrics` into the lock-free
+- a metrics bridge copying `RaftMetrics` (term, leader, role, and the
+  age of the leader's last majority acknowledgement) into the lock-free
   `RaftStatus` atomics the health endpoint and the auto-promotion
-  thread read.
+  thread read (`publish_metrics`),
+- a confirmation task (`serve_confirmations`) answering the blocking
+  `LeaderConfirm::confirm` the server thread calls when it mints a
+  promotion's epoch (see "The leader-lease gate" below).
 
 Everything that *acts* on elections lives outside the async world:
 `raft_promotion.rs` is a plain `std` thread polling `RaftStatus` every
@@ -127,6 +132,327 @@ higher fencing epoch self-fences and
 shuts down, exactly like the data-plane handshake path but without
 waiting for a data-plane connection to cross.
 
+Fencing on replies as well as requests adds no new way to misfire,
+because a node advertises a higher epoch only when a newer tenure
+exists. The advertised epoch is `TipSource::local_tip`, which reads
+`FenceState::epoch`, and that is written only by `FenceState::new` and
+`FenceState::observe_epoch` (a `fetch_max`, so it never falls). Every
+caller feeds it either a journaled `EpochBump` or the primary's own
+advertised epoch. `EpochBump`s reach it through recovery
+(`adopt_recovered_lineage`, or a primary's boot from its journal), the
+matching stage (`observe_live_lineage`) and a transferred snapshot. Their
+only producer is `journal_promotion_epoch_bump`: no client input can
+carry one, and an abandoned promotion publishes nothing. A replica
+adopts its primary's advertised epoch in `accept_stream_start`, which by
+induction is a tenure that exists, and it refuses a lower one first
+(`FenceState::refuses_primary`). It also adopts it in
+`handle_resync_verdict`, after rebasing onto that primary's snapshot,
+without the refusal (its prior state was discarded); the value is still
+the primary's own tenure, and `fetch_max` cannot lower the epoch. If a
+change gives the epoch any other writer, this argument has to be made
+again for that writer.
+
+### The leader-lease gate
+
+openraft 0.9 has no check-quorum step-down: a leader that can reach no
+other voter keeps `ServerState::Leader` and its term for as long as it is
+partitioned. A *replica* holding raft leadership and cut off from both
+peers would otherwise pass every rule above: its primary link is down
+past `PRIMARY_DOWN_GRACE`, both peers digest to `Silent` once it has led
+past `PEER_TIP_GRACE` (and the peer-tip veto skips `Silent`), and its
+term is above the fence epoch. Before the gate such a node promoted
+itself and served clients beside the healthy primary, which the other
+replica still reached; on heal, either one of its raft requests made the
+healthy primary fence (a needless failover onto the node holding the
+least data, the other replica orphaned) or both kept serving. The lone
+survivor, whose two peers are dead, is the same case seen from inside:
+it cannot tell "both others dead" from "I am partitioned".
+
+Two checks close it, one at each end of the promotion:
+
+- a **decision-time filter** in `auto_promotion_decision`
+  (`leader_lease_check`): refuse unless a majority acknowledged this
+  leader within `QUORUM_ACK_MAX_AGE`, read from openraft's
+  `RaftMetrics::millis_since_quorum_ack` as bridged into `RaftStatus`;
+- a **mint-time confirmation** in `journal_promotion_epoch_bump`
+  (`server.rs`): just before an election's `EpochBump` is published, a
+  real quorum round trip (`LeaderConfirm::confirm`, openraft's
+  `Raft::get_read_log_id` on the driver thread) must confirm that the node
+  still leads in the term it was elected at. This one carries the safety
+  claim; the filter makes none.
+
+A promotion request carries its origin in its type
+(`PromotionOrigin::Manual` or `PromotionOrigin::Election { term }`), so
+the mint knows which term to confirm, and a manual `PROMOTE` is never
+confused with an election at term 1.
+
+#### The lease
+
+What openraft 0.9.25 guarantees, and where:
+
+- a follower whose vote is committed rejects every vote request while
+  `now <= vote_utime + leader_lease` (`Engine::handle_vote_req`), and
+  `leader_lease` is `election_timeout_max` (`EngineConfig::new`);
+- a follower touches `vote_utime` on every accepted vote-bearing RPC,
+  heartbeats included, at the time it processes it
+  (`VoteHandler::update_vote`);
+- the leader's clock for a follower is the **sending** time of the request
+  it acknowledged (`ReplicationHandler::update_success_progress` →
+  `update_leader_clock`), and the quorum-acknowledged time counts the
+  leader itself (`Leader::last_quorum_acked_time`), so in a three-voter
+  cluster it is the newest follower acknowledgement.
+
+Let S be the sending time of the newest request a majority acknowledged,
+and F a follower in that majority. F handled the request at some R ≥ S
+and touched its `vote_utime` then, so until R + `leader_lease` ≥ S +
+`leader_lease` it refuses every *other* node's vote request, nudged
+candidates included. Every election needs a majority, which shares a
+member with the acknowledging one, so before S + `leader_lease` a third
+node can be elected only with the leader L's own vote, that is only by
+deposing L. (L's own `vote_utime` is set when it becomes leader, in
+`Engine::establish_leader`, and is not refreshed by acknowledgements, so
+L may grant that vote; see below.)
+
+F itself can still be elected. Its timer-driven campaign waits
+`leader_lease + election_timeout` from `vote_utime`, but the challenger
+nudge (`challenger_should_campaign` → `raft.trigger().elect()`) skips
+that timer: F votes for itself and the third node may grant its vote. The
+lease does not exclude this, and two older mechanisms cover it:
+
+- **The peer-tip veto.** The nudge fires only while F's tip is ahead of
+  the leader's tip as F last heard it within `PEER_TIP_GRACE`. F's
+  acknowledgement is what keeps L's lease fresh, and the same reply
+  carries F's tip, so L sees F as `PeerTipObservation::Fresh` and ahead of
+  its own tip, which does not move (L's primary link is down). The veto in
+  `auto_promotion_decision` refuses. The lease filter runs before the veto
+  but does not replace it.
+- **Epoch fencing.** If F wins anyway (L's veto passed before F's tip
+  arrived, and F won after L's confirmation), L's epoch is its term T and
+  F's promotion mints T + 1; `fence_if_superseded` fences L as soon as the
+  higher epoch reaches it, through a raft request or reply or a
+  data-plane handshake. L never deposes F.
+
+So the claim is narrower than "no other leader exists": no other leader
+can exist that L's peer-tip view and the epoch rule do not already
+handle.
+
+#### The mint-time confirmation carries the safety claim
+
+Let C be the moment the driver starts `get_read_log_id`. openraft captures
+the vote and the read log id before sending, so `Ok` means a majority
+accepted heartbeats carrying this leader's vote, sent at or after C. By
+the lease argument, until C + `leader_lease` no node but an acknowledging
+follower can be elected without deposing L. `confirmation_outcome`
+compares `read_log_id.leader_id.term` with the term the request was filed
+for (the read log id is the newer of the leader's own blank entry and the
+committed one, so it carries the confirming leader's term,
+`LeaderHandler::get_read_log_id`), so a node that lost term t and won t′
+in between gets `TermMoved` and refuses.
+
+`LeaderConfirm::confirm` takes its deadline (`LEADER_CONFIRM_TIMEOUT`) as
+its first statement, on the server thread, **before** sending the request,
+so before C. It accepts a reply only on a clock reading taken after the
+reply is in hand and still before the deadline (`accept_answer`):
+`recv_timeout` hands back a queued message before it reads the clock and
+times its wait from when it is called, so on its own it could accept a
+reply that arrived late to a thread preempted before the wait. The driver
+applies no timeout of its own; openraft bounds each voter by one
+`heartbeat_interval`, and the caller's deadline bounds the whole.
+`journal_promotion_epoch_bump` logs "promotion: confirming leadership
+before the epoch bump" *before* calling `confirm`, and publishes straight
+after it returns, with nothing that can block (a log write can, on a full
+stderr pipe) in between. So the epoch is minted before C +
+`LEADER_CONFIRM_TIMEOUT` + `SCHEDULING_SLACK_MS`, which the mint-time
+safety assertion keeps under C + `leader_lease`. No metric enters this
+argument, and a stalled raft runtime turns into a `TimedOut` refusal,
+never a late mint.
+
+What it leaves open: L itself may grant a higher-term vote and step down.
+The confirmation then fails (openraft answers a non-leader with
+`ForwardToLeader`, mapped to `NotLeader`). If it steps down after the
+confirmation returned `Ok` and before the mint, the epoch rule fences L
+when the newer leader promotes and mints a higher epoch; if the newer
+leader is the primary, which never mints, nothing fences L's epoch and
+L's mint deposes it. Reaching that between C and the mint needs a peer
+that has not heard L for a lease while another still acknowledges L and
+L's primary link is down: the one-sided partition recorded in
+`raft-control-plane-follow-ups.md`, not a case the gate closes.
+
+`LeaderConfirmError` is exhaustive: `NotLeader`, `TermMoved { now }`,
+`NoQuorum` (openraft's `QuorumNotEnough`), `TimedOut`, and
+`DriverStopped` (the request could not be sent, the driver dropped it,
+or openraft returned `Fatal`). The caller treats them alike; they exist
+for the log line and so tests can pin which path ran. Peers that are
+stopped refuse the connection at once, so a leader with no live peer gets
+exactly `NoQuorum` well inside the deadline; through a silent link it
+takes one `heartbeat_interval`, still inside it.
+
+#### The decision-time filter, and what it buys
+
+`leader_lease_check` passes when this node leads and its last reported
+quorum-ack age is at most `QUORUM_ACK_MAX_AGE`; `None` (never
+acknowledged in this term) refuses. The reported age only ever
+under-reports the truth (openraft computes it when it flushes metrics,
+at least once per tick; the bridge stores it at least every
+`SHUTDOWN_POLL`; it is floored to the millisecond), and the time from the
+decision to the mint is unbounded (drain, `check_promotable`, prefault,
+stage start-up), so a pass proves nothing about the mint. The filter
+sits after the primary-link rules and before the genesis rule and the
+peer-tip veto, so a healthy cluster still logs "the link is up" or the
+grace, and an isolated leader is told it may be partitioned instead of
+being shown a peer table of `Silent` peers. What it buys:
+
+- an isolated leader's age only grows, so it refuses for good, with a
+  reason that names the partition, instead of draining, prefaulting,
+  failing the confirmation and exiting;
+- a lone survivor refuses the same way without disturbing its replica
+  pipeline. This is a deliberate behaviour change: a replica that cannot
+  reach a majority never auto-promotes, and recovery is a manual
+  `PROMOTE`;
+- the operator sees the evidence: the refusal line carries the age, and
+  `melin_raft_quorum_ack_age_ms` is the one gauge that shows a raft leader
+  has lost its majority (openraft keeps the role).
+
+Its one constraint is liveness: it must not refuse a healthy leader (the
+liveness assertion below). A filter that wrongly passes costs one
+abandoned promotion, never safety, so nothing argues a margin over metric
+staleness. The age, the term and the role are separate `Relaxed` loads,
+each read once (`consider_auto_promotion`): a torn read can at worst let
+the filter pass for one poll or file a term the node no longer leads in,
+and the confirmation checks the filed term exactly. openraft keeps the
+quorum clock in its `Leader` value, so a new leadership reports `None`
+until its first acknowledgement and never inherits an age.
+
+The cost on a genuine failover: the new leader promotes only once a
+majority has acknowledged it, one control-plane round trip after its
+election plus at most one promotion poll (openraft replicates the new
+term's blank entry at once and flushes metrics on every loop iteration).
+That is inside the time the peer-tip veto already waits for `Unknown`
+peers. At mint time it adds one confirmation round trip, on fresh
+connections: `get_read_log_id` opens a new client per voter
+(`RaftNetworkFactory::new_client`), so a connect and an Ed25519 handshake
+each, which is why the deadline is not one round trip.
+
+#### An abandoned promotion
+
+On a refusal `journal_promotion_epoch_bump` publishes nothing, logs at
+`warn!` (degraded operation, not a malfunction) with the error, the term
+and the epoch, and returns the error. Both primary paths (`run_as_primary`,
+`run_as_primary_dpdk`) turn it into "automatic promotion abandoned: …"
+(`promotion_abandoned`, one wording for both transports) and return it,
+so the node exits with an error; `PipelineHandles`'s drop stops and joins
+the stages already spawned. The bump is the tenure's first entry, so the
+journal holds nothing of the tenure, and once its supervisor restarts the
+node it rejoins as a replica of its configured primary, as after a
+`check_promotable` refusal. Undoing the handover in place, waiting for
+the lease to return, and committing the promotion as a raft log entry
+were all rejected (the first as complicated and risky, the second as
+little gain for more code, the third as a control-plane redesign).
+
+A manual `PROMOTE` is not confirmed, so manual failover stays available
+during a control-plane outage. Both transports get the confirmation from
+one helper, `leader_confirmation`, whose no-driver arm returns
+`DriverStopped`: only the raft poller files elections, but the origin
+crosses `PromotionRequest`'s atomic from another thread and cannot carry
+the handle, so the type cannot rule that pairing out.
+
+Residual liveness risk, with no mechanism against it: the filter reads
+acknowledgements on raft's long-lived connections and the confirmation
+opens fresh ones, so anything that breaks new connections but not
+established ones (a firewall admitting only established flows,
+ephemeral-port exhaustion, the raft bind IP removed while old sockets
+live on) makes the node promote, abandon, exit, restart and possibly win
+again. Acked data is never at risk; a cause local to one node resolves
+itself when another node wins, a cluster-wide one blocks automatic
+failover until fixed. `docs/replication.md` tells operators what that
+looks like.
+
+openraft logs "timeout while confirming leadership for read request" at
+`error` for each voter whose confirming heartbeat fails, so every genuine
+failover whose dead primary is a voter logs one. It is left as it is (the
+subscriber is the application's, so the runtime has no filter to cap)
+and documented for operators.
+
+#### Constants and compile-time assertions
+
+All in `crates/core/raft/src/driver.rs`, next to the values they derive
+from, so every assertion sits in the crate that owns its inputs. The
+derived ones are written as the expression, not a literal, so a change to
+an input carries through; the assertions are the backstop for all of
+them.
+
+| Constant | Value | Derivation |
+|---|---|---|
+| `LEADER_LEASE_MS` | 2000 | `= ELECTION_TIMEOUT_MAX_MS` (openraft's `EngineConfig::new`) |
+| `QUORUM_ACK_MAX_AGE_MS` | 1000 | `= LEADER_LEASE_MS / 2`: half the lease, a decided ratio (not forced by any input) written as the expression so it follows the lease; exported as `QUORUM_ACK_MAX_AGE` for the filter in `melin-server-runtime` |
+| `MAX_TICK_PERIOD_MS` | derived | `= (HEARTBEAT_INTERVAL_MS + HEARTBEAT_JITTER_MS - 1) * 3 / 2`, the slowest node's tick (`heartbeat_interval_ms`'s maximum, times openraft's tick factor) |
+| `RTT_BUDGET_MS` | 100 | one heartbeat round trip, for the liveness assertion only |
+| `LEADER_CONFIRM_TIMEOUT_MS` | 500 | `confirm`'s deadline (`LEADER_CONFIRM_TIMEOUT`, crate-private). openraft gives each voter one `heartbeat_interval` (at most `heartbeat_interval_ms`'s maximum) including a fresh connect and handshake; later than this is a control plane in trouble |
+| `SCHEDULING_SLACK_MS` | 200 | reply-to-publish on the server thread (preemption, the publish) plus clock-rate drift between the leader's clock and the followers' lease clocks |
+
+- **Liveness**: `QUORUM_ACK_MAX_AGE_MS >= MAX_TICK_PERIOD_MS + RTT_BUDGET_MS`.
+  A healthy leader's reported age peaks at about one tick plus a round
+  trip, at the flush just before a heartbeat's reply lands.
+- **Mint-time safety**: `LEADER_CONFIRM_TIMEOUT_MS + SCHEDULING_SLACK_MS < LEADER_LEASE_MS`.
+
+Deliberately absent: any assertion over decision-time staleness (the
+filter makes no safety claim). The threshold trade-off: one lost
+heartbeat brings the reported age to about two ticks plus a round trip,
+which on the slowest-ticking node passes 1000 ms and refuses
+*transiently*; the 100 ms poll retries, so the cost is a short delay and
+one log line, never a stuck or unsafe failover.
+
+#### The openraft version is part of the argument
+
+The lease semantics (`Engine::handle_vote_req`, `EngineConfig::new`) and
+`get_read_log_id`'s behaviour (`RaftCore::handle_check_is_leader_request`:
+one heartbeat per voter under a `heartbeat_interval` timeout, the vote and
+read log id captured before sending) were read in openraft 0.9.25, and
+everything above must be **re-derived on any upgrade** (0.10 changes
+elections; see the roadmap's migration item). The comment beside the
+`openraft = "0.9"` requirement in `crates/core/raft/Cargo.toml` says so.
+The requirement is not an exact pin, which would make resolution brittle
+for a consumer that also depends on openraft 0.9; `Cargo.lock` holds
+0.9.25 for our builds, and
+`a_leader_that_loses_both_peers_keeps_leading_and_its_ack_ages`
+(`src/tests/election.rs`) fails if a release adds check-quorum or stops
+ageing the acknowledgement. A downstream build resolving a later 0.9.x
+patch is covered by none of these; openraft keeping lease semantics
+stable within 0.9 is assumed.
+
+#### Where it is tested, and what is not
+
+- Unit: `leader_lease_check` and its placement in
+  `auto_promotion_decision` (`raft_promotion.rs`); `accept_answer`,
+  `confirmation_outcome` for every openraft answer, `publish_metrics` and
+  `heartbeat_interval_ms` (`driver.rs`); `journal_promotion_epoch_bump` per
+  origin and outcome, `leader_confirmation`'s no-handle arm and
+  `promotion_abandoned`'s wording (`server.rs`, `promotion_epoch_tests`).
+- `src/tests/election.rs`: a healthy leader's sampled age stays under the
+  threshold (`a_healthy_leaders_quorum_ack_age_stays_under_the_gate`, the
+  liveness assertion checked empirically), the no-check-quorum premise
+  above, and the confirmation's pass, `NotLeader`, `TermMoved`, `NoQuorum`
+  and `DriverStopped` paths.
+- `crates/core/server-runtime/tests/raft_failover.rs`: an isolated replica
+  leader never deposes a healthy primary, a lone survivor never
+  auto-promotes, a leader cut from the primary alone does not promote
+  while writes flow, and the genuine failovers
+  (`replica_leader_promotes_when_the_primary_dies`,
+  `killed_primary_triggers_exactly_one_auto_promotion`) run the real
+  confirmation end to end, so a spurious refusal under load shows there
+  first.
+- Not tested: the decision-to-mint race end to end, and so an abandoned
+  promotion and its restart (the quorum loss would have to be timed
+  inside the drain/prefault window; the refusal is covered by the
+  confirmation tests and the stub test, the rejoin is the ordinary replica
+  restart); `confirm` taking its deadline before the send (a non-blocking
+  enqueue, so no test can tell the orders apart: held by the statement
+  order and its comment); the real-clock margin of the mint-time
+  assertion; openraft's lease internals, since `Raft` handles stay inside
+  the driver thread; the nudged follower winning while L was just
+  acknowledged (covered by the peer-tip veto's and fencing's own tests);
+  the one-sided partition with an idle primary, a known gap.
+
 ## RPC transport
 
 Length-prefixed postcard frames (`wire.rs`) carrying the tip envelope
@@ -141,11 +467,41 @@ Authentication is one-way: the dialer never verifies the responder, so
 replies (votes, peer tips, and the epoch a serving node fences on) are
 trusted from whatever answers at the peer's configured address. A forged
 higher epoch can stop a serving primary (fail-safe, never a split
-brain); mutual authentication is follow-up work, recorded in
-`raft-promotion-quorum-lease-plan.md` §8.
+brain); mutual authentication is decided follow-up work, recorded in
+`raft-control-plane-follow-ups.md` with the raft protocol version it
+depends on. Neither the envelope nor the handshake carries a version
+today.
 `--raft-peer` lists are identical on every node and include the node
 itself (the self entry supplies the dialable address written into the
 first-boot membership).
+
+**Outbound connections are made from the listener's IP.** When
+`RaftConfig::bind` is a specific IP (not `0.0.0.0` or `::`),
+`RaftClient::ensure_connected` binds the outgoing socket to that IP, port
+0 (a link-local IPv6 bind keeps its scope id), before connecting; with a
+wildcard bind it dials as the kernel routes, and a peer address may be a
+hostname. One pure helper, `plan_dial`, states the rule for both places
+that apply it: `spawn` refuses at startup a configured peer that a
+specific bind could never dial (not an IP literal, or the other address
+family), naming the bind and the peer and skipping the node's own entry;
+and every connect re-checks the stored membership, which is what is
+dialled after first boot. A refusal there is a typed `DialRefusal` inside
+the `io::Error`, and `to_rpc_error` maps it, like `AddrNotAvailable` (the
+bind IP is no longer assigned), to `RPCError::Unreachable`, so openraft
+backs off as for a dead peer instead of retrying every heartbeat (it backs
+off only on `Unreachable`). On a multi-homed host this makes control-plane
+traffic leave from the interface the listener is bound to, which is what
+peers' firewall rules see. It is also what makes per-pair partition tests
+possible: without it every loopback connection comes from 127.0.0.1, so a
+test proxy cannot tell which node a raft connection comes from. In
+`raft_failover.rs`, `Cluster::partitionable` binds node *i*'s raft
+listener on `raft_ip(i)` = 127.0.0.(*i*+2) (Linux routes all of
+127.0.0.0/8 to `lo`; no node takes 127.0.0.1, so a regression of the
+source binding makes no block match rather than one match by accident),
+puts a proxy on 127.0.0.1 in front of every raft listener, and stalls a
+blocked source per connection, silently, like a partition; `partition`,
+`isolate`, `isolate_from_primary`, `mute_replicas` and `heal` are built
+on that.
 
 ## Storage (`storage.rs`)
 
@@ -177,8 +533,10 @@ election plus a 100 ms poll), never order flow; stability wins.
 
 ## What the in-process tests cannot cover
 
-True power-loss fsync semantics of the raft files, asymmetric network
-partitions (tests kill threads and links, not selective packet loss),
-inter-node clock skew, and whole-process `kill -9` mid-append (covered
-indirectly by the storage crash tests). The venue for those is a manual
-multi-VM failover drill with the AWS bench scripts.
+True power-loss fsync semantics of the raft files, network faults
+finer than a silent per-pair or one-way partition (the proxies above
+stall or cut whole connections; there is no selective packet loss,
+reordering or delay), inter-node clock skew, and whole-process
+`kill -9` mid-append (covered indirectly by the storage crash tests).
+The venue for those is a manual multi-VM failover drill with the AWS
+bench scripts.

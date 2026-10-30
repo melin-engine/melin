@@ -383,11 +383,11 @@ async fn client_after_a_reply_at(server_epoch: u64, serving: bool) -> (bool, boo
     )
 }
 
-/// The reply path (step 5 of
-/// `docs/internal/raft-promotion-quorum-lease-plan.md`): a serving node
-/// whose request is answered by a peer at a strictly higher epoch fences
-/// and co-sets its shutdown flag, as it would on a request from that
-/// peer. A serving raft leader hears its followers only in replies.
+/// The reply path (`docs/internal/raft-control-plane.md`, "Auto-promotion
+/// policy"): a serving node whose request is answered by a peer at a
+/// strictly higher epoch fences and co-sets its shutdown flag, as it would
+/// on a request from that peer. A serving raft leader hears its followers
+/// only in replies.
 #[tokio::test]
 async fn a_serving_client_fences_on_a_reply_at_a_higher_epoch() {
     assert_eq!(
