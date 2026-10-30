@@ -121,7 +121,9 @@ under rather than its own configuration.
 Under `--raft-auto-promote` the raft mesh doubles as a fencing channel
 (`SupersessionPolicy` in `rpc_server.rs`): a serving node — a primary,
 or a replica whose promotion is already in flight — that reads a peer
-envelope advertising a strictly higher fencing epoch self-fences and
+envelope (a request it serves, or the reply to one it sent: one policy,
+shared by the RPC server and the client factory) advertising a strictly
+higher fencing epoch self-fences and
 shuts down, exactly like the data-plane handshake path but without
 waiting for a data-plane connection to cross.
 
@@ -135,6 +137,12 @@ challenge-response (initiator proves; `Permission::Replication`;
 codecs shared with the data plane so the two paths cannot diverge), and
 the server pins each connection's authenticated key to its configured
 node id — a request claiming another id closes the connection.
+Authentication is one-way: the dialer never verifies the responder, so
+replies (votes, peer tips, and the epoch a serving node fences on) are
+trusted from whatever answers at the peer's configured address. A forged
+higher epoch can stop a serving primary (fail-safe, never a split
+brain); mutual authentication is follow-up work, recorded in
+`raft-promotion-quorum-lease-plan.md` §8.
 `--raft-peer` lists are identical on every node and include the node
 itself (the self entry supplies the dialable address written into the
 first-boot membership).

@@ -592,11 +592,15 @@ async fn driver_main(
         }
     };
 
+    // One policy for both directions: the RPC server applies it to every
+    // inbound request, the clients to every reply.
+    let supersession = supersession.map(Arc::new);
     let network = RaftClientFactory::new(
         Arc::clone(&signing_key),
         Arc::clone(&tip),
         Arc::clone(&peer_tips),
         config.bind,
+        supersession.clone(),
     );
     let raft: Raft<TypeConfig> = match Raft::new(
         config.node_id,

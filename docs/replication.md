@@ -807,7 +807,12 @@ are promoted without the check.
 Under auto-promotion the raft peer mesh also becomes an additional
 fencing channel: a serving primary whose peers advertise a higher
 fencing epoch self-fences and shuts down immediately, without waiting
-for a data-plane connection to cross.
+for a data-plane connection to cross. The check runs on every
+control-plane message in both directions, the replies a node receives
+as well as the requests, so a serving node learns it was superseded from
+any control-plane exchange: one that leads the control plane hears it in
+its followers' answers to its heartbeats, even from a node that sends it
+nothing of its own.
 
 ### Deployment rules
 

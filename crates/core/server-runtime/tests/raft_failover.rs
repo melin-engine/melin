@@ -24,6 +24,9 @@
 //!   primary is still unfenced and the only node serving; cut from the
 //!   primary alone while writes flow, it does not promote, and once healed
 //!   rejoins as a replica.
+//! - A primary that leads raft, with a replica manually promoted among its
+//!   followers and sending it no request, fences on the higher epoch the
+//!   follower's replies carry.
 //!
 //! Nodes are started through `melin-test-node`: on kernel TCP by default,
 //! on DPDK with this crate's `dpdk` feature, under
@@ -411,12 +414,30 @@ impl Cluster {
     fn isolate(&self, i: usize) {
         let links = self.links();
         links.raft[i].0.freeze();
-        for (j, (_, blocked)) in links.raft.iter().enumerate() {
+        self.stall_from(i);
+        links.replication(i).cut();
+    }
+
+    /// Stall every raft connection node `i` opens, at both other nodes'
+    /// proxies: no request of `i`'s reaches anyone. Connections the
+    /// others open to `i` are untouched.
+    fn stall_from(&self, i: usize) {
+        for (j, (_, blocked)) in self.links().raft.iter().enumerate() {
             if j != i {
                 blocked.block(raft_ip(i));
             }
         }
-        links.replication(i).cut();
+    }
+
+    /// Stall every raft connection a replica opens, at both other nodes'
+    /// proxies, and nothing else: the replicas still hear the primary and
+    /// answer it on the primary's own connections, but no request of
+    /// theirs reaches anyone, so only the primary can lead the control
+    /// plane.
+    fn mute_replicas(&self) {
+        for replica in 1..3 {
+            self.stall_from(replica);
+        }
     }
 
     /// Cut replica `i` off from the primary alone: their raft link and
@@ -546,16 +567,7 @@ impl Cluster {
         self.wait_formed(&primary);
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            let views: Vec<(Option<u64>, Option<u64>)> = self
-                .nodes
-                .iter()
-                .map(|n| {
-                    (
-                        gauge(n.health_addr, "melin_raft_term"),
-                        gauge(n.health_addr, "melin_raft_leader_id"),
-                    )
-                })
-                .collect();
+            let views = self.raft_views();
             assert!(
                 views.iter().all(|&(t, _)| t.is_none_or(|t| t <= term)),
                 "the late primary forced a re-election: node {} led at term {term}, \
@@ -583,6 +595,19 @@ impl Cluster {
             );
             std::thread::sleep(Duration::from_millis(200));
         }
+    }
+
+    /// Each node's (term, leader id) gauges, by index (`None`: not read).
+    fn raft_views(&self) -> Vec<(Option<u64>, Option<u64>)> {
+        self.nodes
+            .iter()
+            .map(|n| {
+                (
+                    gauge(n.health_addr, "melin_raft_term"),
+                    gauge(n.health_addr, "melin_raft_leader_id"),
+                )
+            })
+            .collect()
     }
 
     /// The term node `i` leads the control plane in, if it does.
@@ -613,6 +638,29 @@ impl Cluster {
             assert!(
                 Instant::now() < deadline,
                 "none of nodes {among:?} (by index) came to lead above term {term}\n{}",
+                self.cluster_summary()
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    /// Wait until every node follows node `leader` (by index) at one term,
+    /// and return the term.
+    fn wait_all_follow(&self, leader: usize) -> u64 {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let views = self.raft_views();
+            if let Some(term) = self.leads_at(leader)
+                && views
+                    .iter()
+                    .all(|&view| view == (Some(term), Some(leader as u64 + 1)))
+            {
+                return term;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the nodes never all followed node {}: (term, leader id) per node {views:?}\n{}",
+                leader + 1,
                 self.cluster_summary()
             );
             std::thread::sleep(Duration::from_millis(200));
@@ -1195,6 +1243,105 @@ fn an_isolated_replica_leader_never_deposes_a_healthy_primary() {
         term = record.term,
     );
     led.stop();
+}
+
+/// How long a serving raft leader is given to fence once a follower's
+/// epoch rises above its own. The next heartbeat's reply carries the
+/// higher epoch back, so a passing run fences within one heartbeat
+/// interval and never waits this long; the rest is slack for a loaded
+/// host, as generous as the file's other waits, since an absent fence
+/// fails at any deadline and only a slow one is helped by a longer one.
+const FENCE_WATCH: Duration = Duration::from_secs(60);
+
+/// The one-way supersession check (`docs/internal/raft-promotion-quorum-lease-plan.md`,
+/// §1 and step 5), the split brain step 1c saw after a heal, reproduced on
+/// purpose: the primary leads the control plane and keeps serving while a
+/// replica that follows it is manually promoted (cut from the primary on
+/// the data plane, as an operator would promote a replica they believe
+/// orphaned). The promoted node, at the higher epoch, sends the primary
+/// no request: the replicas' raft requests are stalled at every proxy,
+/// while the primary's heartbeats reach them and their replies come back
+/// on the primary's own connections. Nothing on the data plane joins the
+/// two either. So the primary learns of the newer tenure only from a
+/// reply, and must fence on it, leaving the promoted node the only one
+/// serving.
+#[test]
+#[serial]
+fn a_serving_leader_fences_on_a_followers_higher_epoch() {
+    melin_test_node::logs::capture_if_requested();
+    let cluster = Cluster::partitionable();
+    let primary = cluster.start_primary(AckPolicy::DiskAndRam, 0);
+    let replicas = cluster.start_replicas(AckPolicy::DiskAndRam, false);
+    cluster.wait_formed(&primary);
+
+    // Only the primary can lead now, and every node follows it.
+    cluster.mute_replicas();
+    let term = cluster.wait_all_follow(0);
+
+    // Node 3 is cut from the primary on the data plane and promoted by
+    // hand; node 2 keeps following the primary, so the primary keeps
+    // acking under `disk+ram`.
+    let promoted = 2;
+    cluster.links().replication(promoted).cut();
+    wait_for_gauge(cluster.nodes[0].health_addr, "melin_replicas_connected", 1);
+    assert_eq!(
+        admin_command(
+            cluster.nodes[promoted].admin_addr,
+            &cluster.operator,
+            "PROMOTE"
+        )
+        .as_deref(),
+        Some("OK")
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !serves_clients(
+        cluster.nodes[promoted].addrs.client(),
+        Duration::from_millis(500),
+    ) {
+        assert!(
+            Instant::now() < deadline,
+            "node {} never served after its manual promotion\n{}",
+            promoted + 1,
+            cluster.cluster_summary()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // The primary, still leading at the term the promoted node follows it
+    // in, fences on the first reply that carries the higher epoch.
+    let promoted_at = Instant::now();
+    while !(primary.is_finished() || primary.shutdown_requested()) {
+        assert!(
+            promoted_at.elapsed() < FENCE_WATCH,
+            "two nodes serve: the primary, leading the control plane at term {term} (now \
+             leading at {:?}), never fenced on node {}'s higher epoch, and serves clients: {}\n{}",
+            cluster.leads_at(0),
+            promoted + 1,
+            serves_clients(cluster.nodes[0].addrs.client(), Duration::from_millis(500)),
+            cluster.cluster_summary()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // We never write this flag ourselves: its being set proves the primary
+    // fenced itself (fence-on-supersession co-sets it).
+    assert!(
+        primary.shutdown_requested(),
+        "the primary stopped without fencing"
+    );
+    primary
+        .join()
+        .expect("the fenced primary returned an error instead of stopping cleanly");
+    assert!(
+        serves_clients(
+            cluster.nodes[promoted].addrs.client(),
+            Duration::from_secs(2)
+        ),
+        "the promoted node, at the higher epoch, must keep serving"
+    );
+
+    for replica in replicas {
+        replica.stop();
+    }
 }
 
 /// The archive scan matches both archive forms at any index, and nothing

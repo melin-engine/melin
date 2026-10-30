@@ -1037,11 +1037,10 @@ plausibly).
   epoch among its followers only through replies.
 - Semantics are unchanged: higher epoch wins, as on the request path and
   the data-plane handshake. A reply cannot misfire where a request would
-  not: both carry the same field from the same `TipSource`. To verify
-  while implementing: that a replica's advertised epoch rises only when
-  it applies a streamed `EpochBump` or its own promotion's, so a reply at
-  a higher epoch always means a newer tenure exists (§7 has the question
-  as Q15).
+  not: both carry the same field from the same `TipSource`. Verified
+  before wiring: a node's advertised epoch rises only when a newer tenure
+  exists, so a reply at a higher epoch always means one does (§7, Q15,
+  with every writer cited).
 - Tests:
   - `crates/core/raft/src/tests/rpc_loopback.rs`: a client whose policy
     says serving, at epoch `e`, sends a request to a server advertising
@@ -1060,6 +1059,20 @@ plausibly).
     before this step (both keep serving), green after (the primary
     fences within a heartbeat or two). Name it for the behaviour, e.g.
     `a_serving_leader_fences_on_a_followers_higher_epoch`.
+
+    As built: not an isolated replica, which would campaign through the
+    partition at rising terms and, on heal, make the primary step down on
+    the first `HigherVote` reply and re-elect, a detour through raft
+    churn the test does not need. Instead `Cluster::mute_replicas` stalls
+    both replicas' raft connections at every other proxy from the start,
+    so only the primary can lead and every reply rides its connections;
+    `Cluster::wait_all_follow` waits until all three follow it at one
+    term. Node 3's replication link is then cut (the replica an operator
+    believes orphaned) and it is promoted by a manual `PROMOTE`, the step
+    3 gate playing no part. With the reply-path call removed from
+    `RaftClient::request` the test fails at its watch: the primary still
+    leads at the same term and serves clients beside node 3. With it, the
+    primary fences on the first heartbeat replies after node 3 serves.
 - `docs/replication.md`, where fencing on supersession is described:
   the check now also runs on control-plane replies, so a serving node
   learns it was superseded from any control-plane exchange, in either
@@ -1109,7 +1122,25 @@ each answer went.
   whole of `raft_failover.rs` and `degraded_acks.rs` passed under
   `scripts/dpdk/netns-runner.sh` with the `dpdk` feature on an aarch64
   host, one test per process, repeatedly; the partition tests are not
-  gated. The "Runtime suites on DPDK" CI step (x86_64) is still the
+  gated. That includes step 5's
+  `a_serving_leader_fences_on_a_followers_higher_epoch`, run alone and
+  in whole-file runs, some of them with every core loaded, and with the
+  nodes' log captured: the primary fenced on the first heartbeat reply
+  after the promoted node applied its bump, every time. A review run
+  reported it failing at the fence watch (then 10 s) on its first three
+  runs on this host, with the follower's bump applied and no fence; it
+  did not recur, and is consistent with a binary built while the
+  reply-path wiring was removed for the red-before run. A review
+  reproduced that mechanism: a red-before build from a copy of the tree
+  sharing `CARGO_TARGET_DIR` writes `melin-raft` artifacts under the same
+  metadata hash (cargo leaves a workspace member's path out of it) with a
+  newer fingerprint, so the untouched source looks fresh and the next
+  build of any dependent, the `dpdk`-feature test binary included, links
+  the patched `melin-raft`. After such a run, run `cargo clean -p melin-raft`
+  (or give the copy its own target directory in the first place). The watch is now
+  the file's usual 60 s, which a passing run never approaches; the test
+  captures the nodes' log under `RUST_LOG`, so a recurrence can be
+  rerun with it. The "Runtime suites on DPDK" CI step (x86_64) is still the
   confirmation; if only the partition tests fail there, compare with the
   raft proxies on `local_ip()` before gating them to kernel TCP, and
   record why in the file header.
@@ -1136,14 +1167,38 @@ each answer went.
 - **Q14 Bind-before-connect edge cases (decided).** Clear refusals mapped
   to `Unreachable`, and the startup refusal in `melin_raft::spawn`
   (step 1a).
-- **Q15 Can a reply's epoch be higher without a newer tenure?** (open,
-  step 5). Fencing on replies is sound only if a node's advertised epoch
-  (`TipSource::local_tip`, from its `FenceState`) rises solely when a
-  newer tenure exists: applying a streamed `EpochBump`, or minting its own
-  promotion's. Check every writer of the fence epoch (`observe_epoch`,
-  the promotion mint, recovery from the journal, a re-seed) before
-  wiring the reply path, and record the answer here. If some path can
-  raise it otherwise, that path is a bug on the request path today too.
+- **Q15 Can a reply's epoch be higher without a newer tenure?**
+  (resolved: no, step 5). `TipSource::local_tip` reads
+  `FenceState::epoch`, and the epoch is written only by
+  `FenceState::new` and `FenceState::observe_epoch` (a `fetch_max`, so it
+  never falls). Every caller outside tests:
+  - `FenceState::new(0)` on a replica (`server.rs`, both transports'
+    replica branches), and `FenceState::new(recovered_lineage.epoch)` on
+    a primary booting from its journal (`run_as_primary`,
+    `run_as_primary_dpdk`): the highest `EpochBump` its journal or
+    snapshot holds (`Lineage::observe` through `fence::observe_into`).
+  - `observe_live_lineage` (`pipeline.rs`), the matching stage applying
+    an `EpochBump` from its input ring: a streamed one on a replica, or
+    its own promotion's on the node that minted it. The only producer of
+    an `EpochBump` is `journal_promotion_epoch_bump` (`server.rs`); no
+    client input can carry one (`InputSlot::node_event` is called only by
+    the runtime, for ticks, `on_primary` events, policy changes and the
+    bump), and an abandoned promotion publishes nothing (step 4b).
+  - `adopt_recovered_lineage` (`replication/mod.rs`): a replica's
+    recovered journal, or a snapshot transferred from its primary; again
+    journaled `EpochBump`s only.
+  - `accept_stream_start` and the post-snapshot `StreamStart` in
+    `replication/mod.rs`: the replica adopts the epoch its primary
+    advertises. That is not one of the two mechanisms named above, but
+    it is the primary's own fence epoch, so by induction a tenure that
+    exists (minted by it or applied by it), and a lower one is refused
+    first (`refuses_primary`). It can run ahead of the entries the replica
+    holds (determinism audit finding 14), which matters to tip
+    *ordering*, not to fencing: a serving node below that epoch is
+    superseded by the tenure either way.
+  So a node advertises a higher epoch only when a newer tenure exists,
+  on replies as on requests, and fencing on replies adds no new way to
+  misfire.
 
 ## 8. Behaviour change and residual risk
 
@@ -1254,6 +1309,25 @@ each answer went.
   the run where both served past the heal). Steps 2 to 4 remove the path
   step 1c hit; step 5 closes the gap for every other path, with no
   protocol change (reply envelopes already carry the epoch).
+- **Residual risk (follow-up): the responder is not authenticated.**
+  Raft authentication is one-way: the dialer proves its key, and
+  `authenticate_outbound` accepts the responder's verdict without
+  checking who the responder is. On the request path a fence follows
+  only a proven key; on the reply path (step 5) anything answering at a
+  peer's configured raft address (a process that took the port after the
+  peer died, or something on the network path) can send a reply with a
+  huge `tip_epoch` and make a serving primary fence and shut down. The
+  failure is fail-safe (an outage, never a split brain), and openraft
+  already trusts unauthenticated replies for votes and `peer_tips`, so
+  the trust model is not new, but this path now leads directly to a
+  primary outage. Closing it needs mutual authentication (the responder
+  signs a nonce chosen by the dialer), which changes the raft handshake
+  and so belongs with the raft protocol version above. Accepted by the
+  user for this branch, and **added to the follow-up branch** (decided):
+  its order there is the raft protocol version, then mutual
+  authentication in the same handshake change, then the stale-tip stamp.
+  The responder's key must be pinned to the configured peer id the
+  client dialled, as the server already pins the dialer's.
 
 ## 9. Coverage
 
@@ -1333,4 +1407,7 @@ Any changed line still unexecuted goes into §10 with a reason.
   openraft treating lease semantics as stable within 0.9 is assumed.
 - **DPDK-specific partition behaviour**: only if Q8's CI run forces the
   partition tests to kernel TCP. Raft is kernel TCP everywhere, and the
-  mint path is shared by both transports.
+  mint path is shared by both transports. Step 5's reply-path fence is
+  tested under the DPDK runner locally (aarch64, Q8); the one
+  unexplained failure a review run reported there did not reproduce, so
+  its cause is unconfirmed until CI's x86_64 run agrees.

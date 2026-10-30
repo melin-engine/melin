@@ -130,8 +130,11 @@ pub struct RpcServerConfig {
     pub peer_tips: Arc<crate::recency::PeerTips>,
     /// Fence-on-supersession (see [`SupersessionPolicy`]); `None` when
     /// auto-promotion is off — without automation, fencing stays a
-    /// data-plane-contact concern exactly as documented today.
-    pub supersession: Option<SupersessionPolicy>,
+    /// data-plane-contact concern exactly as documented today. Behind an
+    /// `Arc` because the outbound clients hold the same policy (the reply
+    /// path, [`crate::network::RaftClientFactory`]): one instance, built
+    /// once by the driver, so the two paths cannot be armed differently.
+    pub supersession: Option<Arc<SupersessionPolicy>>,
     /// Journal-tip vote filter (see `crate::recency`). One per node —
     /// its drop counter is *this voter's* view of election progress, so
     /// it is shared across peer connections. A `std::sync::Mutex` (not
@@ -140,14 +143,17 @@ pub struct RpcServerConfig {
     pub vote_filter: std::sync::Mutex<VoteFilter>,
 }
 
-/// The raft peer mesh as an additional fencing channel. Every inbound
-/// envelope carries the sender's journal-tip *fencing epoch*; a node
-/// that currently claims to be serving (a primary, or a replica whose
-/// promotion is already in flight) and observes a strictly higher epoch
-/// has been superseded — it self-fences and shuts down, exactly like
-/// the data-plane handshake path (`FenceState::fence_if_superseded`).
-/// This closes the split-brain window faster than waiting for a
-/// data-plane connection to cross: raft heartbeats flow continuously.
+/// The raft peer mesh as an additional fencing channel. Every envelope,
+/// request and reply alike, carries its sender's journal-tip *fencing
+/// epoch*; a node that currently claims to be serving (a primary, or a
+/// replica whose promotion is already in flight) and observes a strictly
+/// higher epoch has been superseded — it self-fences and shuts down,
+/// exactly like the data-plane handshake path
+/// (`FenceState::fence_if_superseded`). This closes the split-brain
+/// window faster than waiting for a data-plane connection to cross: raft
+/// heartbeats flow continuously. Both directions count: the RPC server
+/// observes every inbound request, and the RPC client every reply (a
+/// serving raft leader hears a follower's epoch only in its replies).
 pub struct SupersessionPolicy {
     pub fence: Arc<melin_transport_core::fence::FenceState>,
     /// Process shutdown flag, co-set on supersession (self-demotion).
@@ -159,25 +165,31 @@ pub struct SupersessionPolicy {
     pub serving: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
-impl RpcServerConfig {
-    /// Feed an inbound envelope's advertised fencing epoch to the
-    /// supersession policy, if one is armed and this node is serving.
-    fn observe_peer_epoch(&self, peer_epoch: u64) {
-        let Some(policy) = &self.supersession else {
-            return;
-        };
-        if !(policy.serving)() {
+impl SupersessionPolicy {
+    /// Apply the rule to one envelope's advertised fencing epoch, from a
+    /// request or a reply: if this node is serving and `peer_epoch` is
+    /// strictly above its own, fence and co-set the shutdown flag. The
+    /// one statement of the rule for both paths; logged once, on the
+    /// first latch.
+    pub(crate) fn observe(&self, peer_epoch: u64) {
+        if !(self.serving)() {
             return;
         }
-        if policy
-            .fence
-            .fence_if_superseded(peer_epoch, &policy.shutdown)
-            == Some(true)
-        {
+        if self.fence.fence_if_superseded(peer_epoch, &self.shutdown) == Some(true) {
             warn!(
                 peer_epoch,
                 "raft peer advertises a higher fencing epoch — this node is superseded; fencing"
             );
+        }
+    }
+}
+
+impl RpcServerConfig {
+    /// Feed an inbound envelope's advertised fencing epoch to the
+    /// supersession policy, if one is armed.
+    fn observe_peer_epoch(&self, peer_epoch: u64) {
+        if let Some(policy) = &self.supersession {
+            policy.observe(peer_epoch);
         }
     }
 

@@ -98,6 +98,14 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   which control-plane message crossed first. An isolated replica now never
   promotes itself.
 
+- **A primary leading the control plane fences on a follower's higher
+  epoch.** Under `--raft-auto-promote`, a node serving as primary that led
+  the control plane, with a higher-epoch serving node among its
+  followers, kept serving beside it (seen after a partition healed): the
+  supersession check read only the control-plane requests a node
+  received, and a follower sends its leader none. It now fences as soon
+  as a control-plane reply carries the higher epoch.
+
 - **A response body byte the application's encoder does not write is now
   zero.** The runtime encodes every response into a reused buffer, and an
   encoder is free to leave a byte below the length it returns unwritten

@@ -63,7 +63,7 @@ Severity is a judgement from code reading.
 | 10 | A runtime ack-policy change never reaches replicas while data flows | High | Confirmed (fixed) |
 | 11 | The DPDK replication sender skips a batch that does not fit its transmit queue | High | Reproduced (fixed) |
 | 12 | A primary disk stall makes a truthful replica look divergent | Medium | Confirmed |
-| 13 | Raft-mesh fencing ignores reply envelopes | Medium | Confirmed |
+| 13 | Raft-mesh fencing ignores reply envelopes | Medium | Confirmed (fixed) |
 | 14 | A replica adopts its primary's epoch before it holds that epoch's entries | Medium | Confirmed |
 | 15 | Promotion can drop a rotation boundary | Medium | Confirmed |
 | 16 | A torn, never-acknowledged final entry can block startup | Medium | Reproduced (fixed) |
@@ -880,6 +880,15 @@ promotion", and that the raft mesh is an additional fencing channel.
 
 **Fix direction.** Feed reply envelopes' epochs to the same supersession
 policy.
+
+**Status: fixed** as directed above. The rule lives on
+`SupersessionPolicy::observe`, which the RPC server applies to every
+inbound request and `RaftClient::request` to every reply; the driver
+builds one policy and hands it to both. Pinned by the reply-path tests in
+`raft/src/tests/rpc_loopback.rs` and, end to end with this scenario's
+manual `PROMOTE` of a follower of a primary that leads raft,
+`a_serving_leader_fences_on_a_followers_higher_epoch` in
+`server-runtime/tests/raft_failover.rs`.
 
 ### 14. A replica adopts its primary's epoch before it holds that epoch's entries
 
