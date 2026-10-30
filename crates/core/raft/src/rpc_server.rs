@@ -1,6 +1,7 @@
 //! Inbound control-plane RPC: accepts authenticated peer connections,
-//! checks that they speak this node's raft protocol version, and
-//! dispatches their requests into the local raft core.
+//! checks that they speak this node's raft protocol version, proves this
+//! node's own key to them, and dispatches their requests into the local
+//! raft core.
 //!
 //! Dispatch is generic over [`RaftApi`] (implemented by `openraft::Raft`) so
 //! the server — auth, identity pinning, framing, error paths — is testable
@@ -18,6 +19,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use ed25519_dalek::SigningKey;
 use melin_app::auth::AuthorizedKeys;
 use openraft::Raft;
 use openraft::raft::AppendEntriesRequest;
@@ -29,9 +31,12 @@ use openraft::raft::VoteResponse;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tracing::debug;
+use tracing::error;
 use tracing::warn;
 
-use crate::auth::authenticate_inbound;
+use crate::auth::AuthError;
+use crate::auth::answer_challenge;
+use crate::auth::challenge_peer;
 use crate::recency::JournalTip;
 use crate::recency::TipSource;
 use crate::recency::VoteFilter;
@@ -45,9 +50,11 @@ use crate::wire::exchange_version;
 use crate::wire::read_frame;
 use crate::wire::write_frame;
 
-/// Bound on the challenge-response exchange, and separately on the version
-/// exchange that follows it — an unauthenticated socket may not sit on the
-/// accept path longer than this, nor one that has not yet sent a version.
+/// Bound on the challenge-response exchange, separately on the version
+/// exchange that follows it, and on this node's answer to the dialer's
+/// challenge after that — an unauthenticated socket may not sit on the
+/// accept path longer than this, nor one that has not yet sent a version
+/// or a verdict on this node's key.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Idle bound on an authenticated link. Peers only hold a connection open
@@ -118,10 +125,16 @@ impl RaftApi for Raft<TypeConfig> {
 
 /// Server-side identity and envelope state.
 pub struct RpcServerConfig {
+    /// This node's replication key, which it proves to every dialer once
+    /// the version exchange has passed (the dialer pins it to the node id
+    /// it dialled).
+    pub signing_key: Arc<SigningKey>,
     pub authorized_keys: Arc<AuthorizedKeys>,
     /// Verified pubkey → configured node id, from the `--raft-peer` table.
     /// A key that authenticates but isn't a configured peer is refused: the
-    /// replication trust domain is broader than the raft voter set.
+    /// replication trust domain is broader than the raft voter set. The
+    /// same `Arc` the outbound clients pin responders with
+    /// ([`crate::network::RaftClientFactory`]).
     pub peer_ids: Arc<HashMap<[u8; 32], NodeId>>,
     /// Local journal tip: stamped on every response envelope, and the
     /// voter side of the recency filter below.
@@ -261,15 +274,26 @@ async fn handle_connection<A: RaftApi>(
     // Authenticate, bounded.
     let pubkey = match tokio::time::timeout(
         AUTH_TIMEOUT,
-        authenticate_inbound(&mut stream, &cfg.authorized_keys),
+        challenge_peer(&mut stream, &cfg.authorized_keys),
     )
     .await
     {
         Ok(Ok(pubkey)) => pubkey,
-        Ok(Err(e)) => {
+        Ok(Err(AuthError::Refused(refusal))) => {
             // A failed peer auth on the control plane is worth attention —
             // it is either misconfiguration or an impersonation attempt.
-            warn!(%peer_addr, error = %e, "raft peer failed authentication");
+            warn!(%peer_addr, error = %refusal, "raft peer failed authentication");
+            return;
+        }
+        Ok(Err(AuthError::Io(e))) => {
+            // A link that fails under the handshake proves nothing about
+            // anyone's key: a network event, like any other closed link.
+            debug!(%peer_addr, error = %e, "raft peer link closed during authentication");
+            return;
+        }
+        Ok(Err(AuthError::Entropy(e))) => {
+            // This node's own malfunction: no peer can make it happen.
+            error!(%peer_addr, error = %e, "raft peer auth: getrandom failed");
             return;
         }
         Err(_elapsed) => {
@@ -307,6 +331,32 @@ async fn handle_connection<A: RaftApi>(
         }
         Err(_elapsed) => {
             debug!(%peer_addr, peer_id, "raft peer version exchange timed out");
+            return;
+        }
+    }
+
+    // This node's own key, to the dialer, which accepts only the key
+    // configured for the node id it dialled: it reads no reply before
+    // then, and none is sent. After the version exchange, so a dialer on
+    // another release is refused by version rather than by a frame it
+    // does not know.
+    match tokio::time::timeout(
+        AUTH_TIMEOUT,
+        answer_challenge(&mut stream, &cfg.signing_key),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            // `debug!`: a dialer refusing this node's key logs why at
+            // `warn` on its own side, the side that knows (as this side
+            // does for a dialer's key above); here it is only a closed
+            // link, or the dialer's `AuthFailed`.
+            debug!(%peer_addr, peer_id, error = %e, "raft peer did not accept this node's key");
+            return;
+        }
+        Err(_elapsed) => {
+            debug!(%peer_addr, peer_id, "raft peer's challenge timed out");
             return;
         }
     }

@@ -36,7 +36,8 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 - **Control-plane links carry a protocol version (raft protocol 1), and
   refuse a peer on another release.** Right after authenticating, both
-  ends of a `--raft-peer` link exchange their version; on a mismatch the
+  ends of a `--raft-peer` link exchange their version (raft protocol 1
+  also authenticates both ends, see **Fixed**); on a mismatch the
   link is closed, both ends log a warning naming both versions, and the
   dialer backs off as from an unreachable peer. This release and earlier
   ones refuse each other's control-plane links in either direction, so a
@@ -94,8 +95,30 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   from deposing a primary the rest of the cluster still reaches. A
   manual `PROMOTE` is not confirmed, and stays available while the
   control plane is down.
+- **A `--raft-peer` list in which two entries name the same public key
+  is refused at startup**; it used to boot, with
+  one of those members pinned to the other's id. **A stored member whose
+  `--raft-peer` entry was removed is no longer connected to** (it was
+  already refused when it connected): with mutual authentication (see
+  **Fixed**) a node has no key to require of it.
 
 ### Fixed
+
+- **A forged control-plane reply can no longer stop a serving primary.**
+  A node checked the key of every control-plane peer that connected to
+  it, but not of the peer it connected to, so whatever answered at a
+  peer's `--raft-peer` address (for example a process that took the port
+  after the peer died) could reply with a higher fencing epoch and make
+  a serving primary under `--raft-auto-promote` fence and shut down, or
+  report a journal position of its choosing to the promotion checks.
+  Authentication is now mutual: the connecting node also requires the
+  node it reached to prove the `replication` key its `--raft-peer` entry
+  names, and reads no reply before then. A refused peer is logged as a
+  warning and retried with backoff. This authenticates the endpoints, not
+  the traffic between them: control-plane frames are neither encrypted
+  nor integrity-checked after the handshake, so the control-plane network
+  must still be one an attacker cannot sit on. The consequences for the
+  peer list are under **Changed**.
 
 - **An isolated replica no longer promotes itself beside a healthy
   primary.** Under `--raft-auto-promote`, a replica that held

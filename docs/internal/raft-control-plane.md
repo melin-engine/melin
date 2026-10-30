@@ -458,20 +458,42 @@ stable within 0.9 is assumed.
 Length-prefixed postcard frames (`wire.rs`) carrying the tip envelope
 plus openraft's serde-enabled RPC types. Postcard over bincode: compact
 varints and no encoder/decoder configuration knobs to diverge between
-peers. Peer links authenticate with the replication Ed25519
-challenge-response (initiator proves; `Permission::Replication`;
-codecs shared with the data plane so the two paths cannot diverge), and
-the server pins each connection's authenticated key to its configured
-node id — a request claiming another id closes the connection.
-Authentication is one-way: the dialer never verifies the responder, so
-replies (votes, peer tips, and the epoch a serving node fences on) are
-trusted from whatever answers at the peer's configured address. A forged
-higher epoch can stop a serving primary (fail-safe, never a split
-brain); mutual authentication is decided follow-up work, recorded in
-`raft-control-plane-follow-ups.md`.
+peers. Peer links authenticate **mutually** with the replication Ed25519
+challenge-response (`auth.rs`; `Permission::Replication` on both keys;
+codecs shared with the data plane so the two paths cannot diverge, and
+one verification, `verify_challenge_response_identified`, for both
+directions). The dialer proves first (`answer_challenge` against the
+server's `challenge_peer`), and the server pins the authenticated key to
+its configured node id — a request claiming another id closes the
+connection. After the version exchange below, the dialer challenges the
+responder (`challenge_responder`) and accepts only the key the
+`--raft-peer` table maps to the node id it dialled: the same
+key → id table (`peer_ids`, one `Arc` shared by `RpcServerConfig` and
+`RaftClientFactory`) the server pins with. The stored membership's
+`Node` is openraft's `BasicNode`, an address only, so the key always
+comes from the live CLI list, and a stored node no `--raft-peer` entry
+names is not dialled at all (`KeyRefusal::NoKeyConfigured`, before any
+syscall; logged at `debug` per attempt, since it repeats at openraft's
+backoff cadence and `driver_main` already warns once at startup that the
+stored membership differs from the `--raft-peer` list). A refusal
+(unknown key, another role, another peer's key, a bad signature) sends
+`AuthFailed` and closes the link before any request is sent, so no reply
+is read: nothing said by whatever answers at a peer's address can fence
+this node or enter `PeerTips`. The dialer logs it
+at `warn`, like the server a dialer's failed authentication
+(misconfiguration or impersonation, not a malfunction of this node), and
+`to_rpc_error` maps the typed `KeyRefusal` to `Unreachable` so openraft
+backs off. The responder logs the dialer's refusal of its key at `debug`
+only: the dialer, which knows why, has warned. The server logs a link
+that fails *under* its own challenge (an I/O error, not a refusal) at
+`debug` too. The second challenge costs one more round trip per new
+connection; raft links are long-lived, and a leadership confirmation's
+fresh connections are well inside its `heartbeat_interval` on a LAN.
 
-**The link carries a protocol version.** Right after authentication,
-and after the server has pinned the key, both ends send a version frame
+**The link carries a protocol version.** Right after the dialer's
+authentication, and after the server has pinned its key (and before the
+dialer challenges the responder, so a peer on another release is refused
+by version, both named), both ends send a version frame
 carrying `RAFT_PROTOCOL_VERSION` (`wire.rs`) and read the other's
 (`exchange_version`; both write before reading, the frames being a few
 bytes). The frame is hand-encoded and fixed for good,

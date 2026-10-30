@@ -512,8 +512,11 @@ pub struct ServerConfig {
     /// for the node itself** — the self entry supplies the dialable
     /// address peers use to reach it, and identical lists keep the
     /// first-boot membership consistent. The pubkey pins the peer's
-    /// identity: a connection authenticated with a different key cannot
-    /// speak for that id.
+    /// identity in both directions: a connection authenticated with a
+    /// different key cannot speak for that id, and when this node
+    /// connects to that id, whatever answers at its address must prove
+    /// that key or is refused. Each entry needs its own key: a list in
+    /// which two entries share one is refused at startup.
     #[arg(long)]
     pub raft_peer: Vec<String>,
 

@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use crate::driver::{
     LEADER_CONFIRM_TIMEOUT, LeaderConfirmError, RaftConfig, RaftHandles, RaftPeer, spawn,
 };
+use crate::tests::authorized_keys_table;
 use crate::tests::tip_at;
-use base64::Engine;
 use ed25519_dalek::SigningKey;
 use melin_app::auth::{AuthorizedKeys, NoRoles};
 use melin_transport_core::health::RaftStatus;
@@ -53,18 +53,13 @@ fn start_cluster_with_tips(tips: &[u64]) -> Cluster {
     // Reserve n distinct localhost ports — see `free_addr`.
     let addrs: Vec<String> = (0..n).map(|_| free_addr(PORT_BASE).to_string()).collect();
 
-    let table: String = keys
+    let names: Vec<String> = (1..=n).map(|id| format!("node-{id}")).collect();
+    let entries: Vec<(&SigningKey, &str, &str)> = keys
         .iter()
-        .enumerate()
-        .map(|(i, k)| {
-            format!(
-                "replication {} node-{}\n",
-                base64::engine::general_purpose::STANDARD.encode(k.verifying_key().to_bytes()),
-                i + 1
-            )
-        })
+        .zip(&names)
+        .map(|(k, name)| (k, "replication", name.as_str()))
         .collect();
-    let authorized_keys = Arc::new(AuthorizedKeys::parse::<NoRoles>(&table).unwrap());
+    let authorized_keys = Arc::new(authorized_keys_table(&entries));
 
     // Identical peer list on every node, self included — the production
     // configuration shape.

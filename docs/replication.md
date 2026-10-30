@@ -669,7 +669,7 @@ Enable it per node with:
 |---|---|
 | `--raft-bind <addr>` | Control-plane listener (kernel TCP, also on DPDK nodes). Enables the control plane. |
 | `--raft-node-id <id>` | This node's id (non-zero, unique per cluster). |
-| `--raft-peer <id@host:port#base64-pubkey>` | One cluster member (repeatable). Give **every node the same list, including an entry for the node itself**. The pubkey pins the peer's identity: a connection authenticated with a different key cannot speak for that id. |
+| `--raft-peer <id@host:port#base64-pubkey>` | One cluster member (repeatable). Give **every node the same list, including an entry for the node itself**. The pubkey pins the peer's identity in both directions: a connection authenticated with a different key cannot speak for that id, and when this node connects to that id, whatever answers at its address must prove that key or is refused. Each entry needs its own key: a list in which two entries share one is refused at startup. |
 | `--raft-dir <path>` | Durable election state. Defaults to the journal path with a `.raft` extension. |
 | `--raft-auto-promote` | Act on election wins (below). Off by default. |
 
@@ -684,7 +684,20 @@ the peer.
 Peer links authenticate with the same Ed25519 replication keys as the
 data plane (the `replication` role in `authorized_keys`), so
 `--replication-key` is required on every raft-enabled node, primaries
-included. Election state is observable on every node's `--health-bind`
+included. Authentication is mutual: the connecting node proves its key,
+then checks that the node it reached proves the key its `--raft-peer`
+entry names, and reads nothing from it before then. A process that took
+over a dead peer's address, or anything else answering there, therefore
+cannot vote, report a journal position, or make a serving primary step
+down. A node that is refused this way logs a warning naming the node it
+dialled (and, if the key belongs to another configured member, that
+member: their addresses are likely swapped) and retries with backoff, as
+from an unreachable peer. The handshake authenticates the two ends,
+not the traffic after it: control-plane messages are neither encrypted
+nor integrity-protected, so run peer links on a network an attacker
+cannot sit on (a private control-plane network or VLAN).
+
+Election state is observable on every node's `--health-bind`
 endpoint via the `melin_raft_*` gauges (node id, term, leader, role,
 whether the driver is running, and on the leader the age of its last
 majority acknowledgement) — raft-enabled replicas serve a minimal
@@ -842,7 +855,10 @@ nothing of its own.
   raft flags off.
 - **Membership is static on this release.** The `--raft-peer` list is
   fixed at first boot (later flag changes are ignored in favor of the
-  stored membership, with a warning). Surviving replicas do **not**
+  stored membership, with a warning). The public keys are the exception:
+  they are read from the flags on every start, so a key change takes
+  effect on restart, and a stored member whose entry is removed is
+  neither accepted nor connected to. Surviving replicas do **not**
   automatically re-point `--replica-of` at a newly promoted primary —
   reconnecting them is still operator work after a failover. Give
   every candidate `--replication-bind` (see the flags section) so the
@@ -1205,8 +1221,9 @@ normal-case post-recovery state.
   policy yet, so the first primary to serve it under protocol 8 (by boot
   or promotion) serves under the policy it requests and journals it.
 - **The control plane is versioned too, and needs the same.** Control-plane
-  links (`--raft-peer`) exchange a protocol version right after
-  authenticating, and a node refuses a peer that speaks another one,
+  links (`--raft-peer`) exchange a protocol version as part of the
+  handshake (after the connecting node proves its key, before the node it
+  reached proves its own), and a node refuses a peer that speaks another one,
   logging a warning that names both versions. Nodes on different
   releases therefore never vote for each other or follow each other's
   control-plane leader: there is **no automatic failover across

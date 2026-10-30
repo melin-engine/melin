@@ -49,7 +49,9 @@ pub const MAX_RPC_FRAME: usize = 4 << 20;
 /// versions named instead of misdecoding. `u16`, like the replication
 /// protocol's version: it counts releases that change the link, and the
 /// version frame's layout fixes its width for good.
-/// History: 1 = the first versioned link. Releases before it send an
+/// History: 1 = the first versioned link, authenticated both ways (after
+/// the version exchange the dialer challenges the responder, see
+/// `crate::auth::challenge_responder`). Releases before it send an
 /// `RpcFrame` straight after authentication, and refuse this one's
 /// version frame (see [`VERSION_FRAME_LEN`]).
 pub const RAFT_PROTOCOL_VERSION: u16 = 1;

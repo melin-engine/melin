@@ -10,9 +10,9 @@ anchors; line numbers are left out because they go stale.
 
 The first three items are one follow-up branch, **in this order**: the
 raft protocol version (done), then mutual authentication in the same
-handshake change, then the stale-peer-tip stamp, which is the first
-envelope change the version protects. The one-sided partition gap after
-them is a separate design that has only been sketched.
+handshake change (done), then the stale-peer-tip stamp, which is the
+first envelope change the version protects. The one-sided partition gap
+after them is a separate design that has only been sketched.
 
 ## 1. A raft protocol version (done)
 
@@ -25,47 +25,52 @@ that releases from before it refuse as an undecodable `RpcFrame`
 (pinned against a frozen copy of their decoder in
 `crates/core/raft/src/tests/pre_version_wire.rs`).
 
-What it means for items 2 and 3: **each bumps `RAFT_PROTOCOL_VERSION`**
-(item 2 changes the handshake, item 3 the envelope) and adds a line to
-its history. Item 2's new handshake frames belong after the version
-exchange, so a peer on version 1 is refused by version, both named,
-rather than tripping over a frame it does not know; the version frame's
-own layout never changes. Neither item needs a frozen-decoder test of
-its own: from version 1 on, a peer reads the version before anything
-else.
+What it means for item 3: **it bumps `RAFT_PROTOCOL_VERSION`** (it
+changes the envelope) and adds a line to its history, unless version 1
+is still unreleased when it lands, in which case version 1 absorbs it as
+it absorbed item 2 (check `git tag` and the changelog's Unreleased
+section: a version only has to change once a release has shipped it).
+The version frame's own layout never changes. It needs no
+frozen-decoder test of its own: from version 1 on, a peer reads the
+version before anything else.
 
-## 2. Mutual raft authentication
+## 2. Mutual raft authentication (done)
 
-**Problem.** Raft authentication is one-way: the dialer proves its key
-(`authenticate_outbound` signs the responder's nonce), and the responder
-pins the dialer's key to its configured node id, but the dialer accepts
-the responder's verdict without checking who the responder is. Since the
-reply path fences (`RaftClient::request` feeds every reply's `tip_epoch`
-to `SupersessionPolicy::observe`), anything answering at a peer's
-configured raft address (a process that took the port after the peer
-died, or something on the network path) can send a reply with a huge
-`tip_epoch` and make a serving primary fence and shut down. The failure
-is fail-safe (an outage, never a split brain), and openraft already
-trusts unauthenticated replies for votes and the replies feed `PeerTips`,
-so the trust model is not new; but this path now leads directly to a
-primary outage. Accepted for the lease branch by the maintainer and
-added to this follow-up (decided).
+Built as decided here, and described in `raft-control-plane.md` ("RPC
+transport"). The problem it closed: authentication was one-way, so
+anything answering at a peer's raft address could send a reply with a
+huge `tip_epoch` and make a serving primary fence and shut down (the
+reply path feeds every reply's epoch to `SupersessionPolicy::observe`),
+or feed `PeerTips` a tip of its choosing. Out of scope, as before: an
+active attacker on the path, who could relay both challenges and rewrite
+the frames after them, since raft frames carry no MAC binding them to the
+session; the control-plane network is assumed private.
 
-**Design (decided).** In the raft handshake, after item 1's version
-exchange: the dialer
-sends a nonce of its own, and the responder signs it with its key; the
-dialer verifies the signature and checks that the key is the one
-configured for **the peer id it dialled** (the `--raft-peer` entry, or
-the stored membership's node), exactly as the server already pins the
-dialer's key to the id a request claims. The responder's key must hold
-the `replication` role, as the dialer's must. Share the verification with
-`verify_challenge_response_identified` rather than writing a second copy.
-
-**Tests.** A responder with the right key passes; one with an unknown
-key, a key of another role, or the key of a *different* configured peer
-is refused by the dialer; a dialer refusing never applies a reply (no
-fence, no peer tip recorded). The reply-path fence tests in
-`crates/core/raft/src/tests/rpc_loopback.rs` keep passing.
+- After the version exchange the dialer challenges the responder
+  (`challenge_responder` in `crates/core/raft/src/auth.rs`), through the
+  same verification as the responder's challenge of the dialer
+  (`verify_challenge_response_identified`, now returning a typed
+  `KeyRefusal`), and accepts only the key the `--raft-peer` table maps
+  to the id it dialled. That table is the server's own key → id map,
+  one `Arc` shared with `RaftClientFactory`; the stored membership's
+  node is an address only, so a stored node that no `--raft-peer` entry
+  names is not dialled at all.
+- No version bump: `RAFT_PROTOCOL_VERSION` 1 came in on the same
+  unreleased branch (no release tag carries it), so version 1 is
+  defined as including mutual authentication.
+- A refusal is logged at `warn` on the dialer and maps to `Unreachable`;
+  it happens before any request is sent, so no reply is applied. The one
+  exception is a dialled node no `--raft-peer` entry gives a key to: it
+  is logged at `debug` per attempt, since the driver already warns once
+  at startup that the stored membership differs from the configured list.
+- Tests: `auth.rs` (the dialer's challenge: the right key, another
+  configured peer's key, a signature over another nonce, a malformed
+  response, a stray replication key, no configured key) and
+  `src/tests/rpc_loopback.rs` (a real server proving an unknown key, an
+  operator key, the other peer's key or a stray replication key is
+  refused as unreachable, with no fence and no peer tip recorded; a node
+  with no configured key is never connected to; the accepted replies of
+  the reply-path tests record the tip).
 
 ## 3. Stale peer tips
 
