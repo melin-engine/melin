@@ -245,11 +245,19 @@ pub(crate) fn spawn_raft_driver(
         dir = %raft_config.dir.display(),
         "starting control-plane raft driver"
     );
-    let tip = Arc::new(melin_raft::TipSource {
-        fence: Arc::clone(fence_state),
-        seq: journal_tip,
-        ready: tip_ready,
-    });
+    // Every control-plane frame this process sends is stamped with it, so
+    // peers can drop a delayed frame's journal tip. Read here, once, so
+    // the time it reads stands for this process's start; an unreadable
+    // boot id refuses startup rather than stamping frames that peers
+    // cannot order.
+    let boot = melin_transport_core::boot_stamp::BootStamp::read()
+        .map_err(|e| format!("the control plane cannot stamp its messages: {e}"))?;
+    let tip = Arc::new(melin_raft::TipSource::new(
+        Arc::clone(fence_state),
+        journal_tip,
+        tip_ready,
+        boot,
+    ));
     // The raft mesh doubles as a fencing channel only under
     // auto-promotion: without automation, a serving node's fencing
     // stays a data-plane-contact concern exactly as documented.

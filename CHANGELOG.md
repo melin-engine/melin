@@ -31,6 +31,11 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   and why it refused (not the leader, leading in another term, no
   majority, no answer in time, driver stopped). Reached through the new
   `RaftHandles::leader_confirm` field.
+- **`melin_transport_core::boot_stamp::BootStamp`**: the host's boot id
+  and the process start on `CLOCK_BOOTTIME`, read once at startup, which
+  orders a node's processes on one host; and **`melin_raft::SenderStamp`
+  and `melin_raft::StampedTip`**, a control-plane frame's place in its
+  sender's order and the journal tip it carried.
 
 ### Changed
 
@@ -44,6 +49,19 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   cluster mixing them has no automatic failover across the two: upgrade
   every node together (see "Upgrade and rollback notes" in
   `docs/replication.md`).
+- **A raft-enabled node refuses to start if it cannot read the kernel's
+  boot id** (`/proc/sys/kernel/random/boot_id`), which its control-plane
+  messages now carry with the process start time so that peers can order
+  them (see **Fixed**). Raft protocol 1 includes this envelope change; no
+  release shipped it before, so the version stays 1. See "Deployment
+  rules" in `docs/replication.md`, which also warns against resuming a
+  node from a VM snapshot.
+- **`melin_raft::TipSource` gains private fields** (its boot stamp and
+  frame counter), so it is now built with `TipSource::new`, which takes a
+  `melin_transport_core::boot_stamp::BootStamp` (`BootStamp::read`).
+  **`PeerTips::record` and `record_at` take a `StampedTip`** (the tip and
+  the `SenderStamp` of the frame that carried it) and return whether it
+  was recorded.
 - **`melin_transport_core::health::RaftStatus` gains a private field**
   (the quorum-ack age, read and written through
   `millis_since_quorum_ack` and `set_millis_since_quorum_ack`), so it can
@@ -103,6 +121,19 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   **Fixed**) a node has no key to require of it.
 
 ### Fixed
+
+- **A delayed control-plane message can no longer let a replica missing
+  acknowledged writes pass the promotion check.** A node recorded each
+  peer's journal position from every control-plane message as it
+  arrived. A peer can hold several connections to a node, so a message
+  delayed in the network (a retransmission after a partition, say) could
+  arrive after a newer one and make that peer's position look older than
+  it was, and freshly heard. Under `--raft-auto-promote`, a slower replica
+  deciding at that moment could see the faster one as level with it and
+  promote, losing the acknowledged writes only the faster one held. Every
+  control-plane message now carries its place in the sender's order, and
+  a message older than one already heard from the same node no longer
+  updates that node's position or the time it was last heard.
 
 - **A forged control-plane reply can no longer stop a serving primary.**
   A node checked the key of every control-plane peer that connected to

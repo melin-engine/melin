@@ -111,6 +111,81 @@ otherwise never re-arm. Two openraft-specific consequences:
   must give the caught-up side a quorum that does not need the behind
   node's cooperation (see `src/tests/election.rs`).
 
+### Peer tips are ordered by a sender stamp
+
+The same envelope tips feed `PeerTips`, the per-peer record the
+promotion-time checks read (the peer-tip veto, the challenger nudge and the
+stand-down rule in `raft_promotion.rs`). A peer may hold several
+connections to a node (openraft opens a fresh client per voter to confirm
+leadership, beside the long-lived ones), so a frame sent before another can
+arrive after it: a TCP retransmission after a partition, say. Recorded
+blindly, it would regress the peer's tip and stamp it with the arrival
+time, and a faster replica could look level with a slower one while the
+slower one decides, letting the veto pass and losing acknowledged writes.
+The reply path is bounded by the RPC timeout; the request path is not.
+
+So every envelope, request and reply, carries a `SenderStamp`
+(`RpcFrame::stamp`): the sender's boot id, its process start, and a
+per-frame counter.
+
+- **Sender.** `TipSource::stamp` is the one place an outgoing envelope's
+  tip is read: it takes the counter and reads the tip (two independent
+  loads, fence epoch and advertised sequence) under one `Mutex`, so counter
+  order is tip-read order. `RaftClient::request` and the RPC server's reply
+  path both call it, sharing one counter per process. A `Mutex` is fine
+  here: the raft send path, a few frames per heartbeat per peer, never the
+  event hot path, never held across an `.await`.
+- **Boot identity.** `melin_transport_core::boot_stamp::BootStamp`, read
+  once at startup by `spawn_raft_driver`: the 128 bits of
+  `/proc/sys/kernel/random/boot_id` and `CLOCK_BOOTTIME` in nanoseconds.
+  Nothing is persisted. Within one host boot `CLOCK_BOOTTIME` is monotonic
+  and never stepped, so a later process start reads a later value; across
+  boots the old kernel is gone, so nothing it sent can still be in flight.
+  An unreadable or malformed `boot_id` (or clock) refuses startup of a
+  raft-enabled node: there is no weaker fallback that keeps the ordering.
+- **Receiver.** `PeerTips::record` keeps, per peer, the newest stamp
+  accepted and drops any frame not newer (`SenderStamp::is_newer_than`:
+  another boot id is always newer; within a boot, a later process start,
+  then a higher counter; an equal stamp is the same frame). A dropped
+  frame refreshes nothing: neither the tip nor the last-heard time, or a
+  stale frame would keep a dead peer `Fresh`. It is logged at `debug`.
+- **What the stamp gates: the peer-tip record only.** The frame itself is
+  still served (or, as a reply, returned to openraft); its epoch still goes
+  to `SupersessionPolicy::observe`; a vote request's own tip still decides
+  the vote filter. Both are harmless on an older frame: the fence epoch
+  only rises, so an older frame's epoch is never higher than a newer one's
+  from the same sender (fencing on it is never wrong), and an older
+  candidate tip can only make the monotone filter stricter. Gating them
+  would only add paths where a real frame is ignored.
+
+Rejected, and why: a persisted counter (a restored disk or a deleted file
+rewinds it, every peer then drops every frame from the node, it looks
+`Silent`, the veto skips `Silent` peers, and the bug returns silently); a
+random per-process nonce (unordered: after a restart a stale frame from the
+previous process regresses the tip); heuristics without a stamp (ignoring a
+tip behind the stored one within an epoch, or ordering by raft term:
+neither orders frames within a term or an epoch, where the stale frame
+sits).
+
+Residual: a frame of the old boot that reached the receiver's socket before
+the sender's host went down and is still unread when a frame of the new
+boot is read would be recorded, since another boot id always wins; the
+receiver would have to sit on a readable socket for longer than a host
+reboot. A VM snapshot restore rewinds the clock, memory and disk together:
+a hazard shared with the journal, and in the operator docs.
+
+Tested in `recency.rs` (an older frame dropped without refreshing the peer,
+a newer one recorded, a new boot id replacing the stored one, a later
+process start winning, and counter order being tip-read order under
+concurrent stamping), in `boot_stamp.rs` (startup refused through a seam
+over the path, malformed ids), and in `src/tests/rpc_loopback.rs` (a real
+server reading a stale frame on one connection after a newer one on
+another, and a client reading a stale reply). The step 1b partition
+proxies in `raft_failover.rs` do not reproduce a reorder end to end: a
+blocked relay stalls and is closed on heal rather than released, and
+`PeerTips` is not observable from an integration test; the loopback test
+drives the same receive path over real connections.
+
 ## Auto-promotion policy (`raft_promotion.rs`)
 
 `auto_promotion_decision` is a pure function; the refusal strings are
@@ -500,7 +575,9 @@ bytes). The frame is hand-encoded and fixed for good,
 `[len: u32 LE = 3][tag 0x52][version: u16 LE]`, so any release can read
 any other's version whatever else changes; bump the version whenever
 what crosses the link changes (the envelope, the openraft types in it,
-the handshake). A mismatch is a typed `VersionRefusal` naming both
+the handshake), once a release has shipped the current one. Version 1
+came in unreleased with mutual authentication and the sender stamp above,
+so it includes both. A mismatch is a typed `VersionRefusal` naming both
 versions; a first frame of another length or tag is refused the same
 way, which is what a release from before the version sends (an
 `RpcFrame`). Both ends log it at `warn` (a peer on another release, not

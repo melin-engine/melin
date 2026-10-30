@@ -768,7 +768,10 @@ Auto-promotion is deliberately conservative. The elected replica
   replica, so at the moment of a crash the slower replica legitimately
   lacks the newest acked events. Every raft message carries the
   sender's journal position; the winner refuses to promote while any
-  peer it can still hear advertises a position ahead of its own. The
+  peer it can still hear advertises a position ahead of its own. A
+  message delayed in the network that arrives after a newer one from the
+  same node is ignored, so it can neither make that peer look behind
+  where it is nor make it look recently heard. The
   caught-up peer recognizes the standoff (it sees the leader's
   position on every heartbeat) and takes over leadership itself, so
   promotion lands on the node that holds every acked event. A peer
@@ -863,6 +866,24 @@ nothing of its own.
   reconnecting them is still operator work after a failover. Give
   every candidate `--replication-bind` (see the flags section) so the
   winner's listener is already up when you re-point them.
+- **The control plane needs the kernel's boot id.** A raft-enabled node
+  reads `/proc/sys/kernel/random/boot_id` at startup and refuses to start
+  if it cannot (a container or sandbox that hides `/proc/sys`, say): its
+  peers use it, with the process start time, to tell its current
+  control-plane messages from delayed ones. Nothing is stored, so a
+  restart or a host reboot needs no care. Do not run a node inside a
+  Linux time namespace that offsets the boot-time clock (as some
+  checkpoint/restore tools set up): a restart there can read an earlier
+  start time than the process it replaces, and its peers would take its
+  messages for delayed ones and stop hearing it.
+- **Do not resume a running node from a VM snapshot.** Restoring one
+  rewinds the node's clock, memory and disk together, so the restored
+  process carries on from a past it already left: its journal and
+  `--raft-dir` go back to an older state, and its peers take its
+  control-plane messages for delayed ones they have already superseded,
+  so it looks silent to them for a while. It is the hazard of rolling
+  back the journal and `--raft-dir` (see "`--raft-dir` is durable state"
+  above), with the process still running on top.
 - **Same peer list everywhere.** Identical `--raft-peer` lists
   (including each node's own entry) keep the first-boot membership
   consistent across the cluster.

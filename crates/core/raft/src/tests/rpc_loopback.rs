@@ -12,15 +12,15 @@ use std::time::Duration;
 
 use crate::auth::{AuthError, KeyRefusal, answer_challenge, challenge_peer, challenge_responder};
 use crate::network::RaftClientFactory;
-use crate::recency::{JournalTip, PeerTips, TipSource};
+use crate::recency::{JournalTip, PeerTips, SenderStamp, StampedTip, TipSource};
 use crate::rpc_server::{RaftApi, RpcServerConfig, SupersessionPolicy, serve};
 use crate::tests::authorized_keys_table;
 use crate::tests::pre_version_wire;
-use crate::tests::tip_at;
+use crate::tests::{tip_at, tip_source};
 use crate::types::{NodeId, TypeConfig};
 use crate::wire::{
-    RAFT_PROTOCOL_VERSION, VersionExchangeError, VersionRefusal, exchange_version,
-    exchange_version_as,
+    RAFT_PROTOCOL_VERSION, RpcBody, RpcFrame, VersionExchangeError, VersionRefusal,
+    exchange_version, exchange_version_as, read_frame, write_frame,
 };
 use ed25519_dalek::SigningKey;
 use melin_app::auth::AuthorizedKeys;
@@ -73,6 +73,8 @@ struct Harness {
     unlisted_peer_key: SigningKey,
     /// Listed under the `operator` role.
     operator_key: SigningKey,
+    /// The tips the server records off the requests it reads.
+    peer_tips: Arc<PeerTips>,
 }
 
 /// A server advertising (0, 0), with no supersession policy.
@@ -146,12 +148,13 @@ async fn start_server_signing(
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let shutdown = Arc::new(AtomicBool::new(false));
+    let peer_tips = Arc::new(PeerTips::new());
     let cfg = Arc::new(RpcServerConfig {
         signing_key: Arc::new(signing_key),
         authorized_keys: authorized_keys(),
         peer_ids: peer_ids(),
         tip,
-        peer_tips: Arc::new(PeerTips::new()),
+        peer_tips: Arc::clone(&peer_tips),
         supersession,
         vote_filter: std::sync::Mutex::new(Default::default()),
     });
@@ -163,6 +166,7 @@ async fn start_server_signing(
         client_key,
         unlisted_peer_key,
         operator_key,
+        peer_tips,
     }
 }
 
@@ -304,11 +308,7 @@ async fn oversized_frame_is_refused() {
     // Through the whole handshake on a raw connection, so the oversized
     // prefix lands in the envelope reader rather than being refused as a
     // wrong-length version or challenge response.
-    let mut stream = authenticated_link(&h).await;
-    exchange_version(&mut stream).await.unwrap();
-    challenge_responder(&mut stream, &authorized_keys(), &peer_ids(), 1)
-        .await
-        .unwrap();
+    let mut stream = handshaken_link(&h).await;
     stream.write_all(&u32::MAX.to_le_bytes()).await.unwrap();
     stream.flush().await.unwrap();
     // The server must drop the connection rather than allocate.
@@ -342,11 +342,11 @@ async fn assert_closed_by_peer(stream: &mut tokio::net::TcpStream) {
 async fn votes_are_dropped_until_the_tip_is_ready() {
     let ready = Arc::new(AtomicBool::new(false));
     let h = start_server_with(
-        Arc::new(TipSource {
-            fence: Arc::new(FenceState::new(0)),
-            seq: AdvertisedJournalTip::new(melin_transport_core::WireSeq::new(0)),
-            ready: Arc::clone(&ready),
-        }),
+        tip_source(
+            Arc::new(FenceState::new(0)),
+            AdvertisedJournalTip::new(melin_transport_core::WireSeq::new(0)),
+            Arc::clone(&ready),
+        ),
         None,
     )
     .await;
@@ -784,6 +784,140 @@ async fn authenticated_link(h: &Harness) -> tokio::net::TcpStream {
     let mut stream = tokio::net::TcpStream::connect(&h.addr).await.unwrap();
     answer_challenge(&mut stream, &h.client_key).await.unwrap();
     stream
+}
+
+/// A raw link to the harness's server through the whole handshake, as
+/// node 2: ready for envelopes of the test's own making.
+async fn handshaken_link(h: &Harness) -> tokio::net::TcpStream {
+    let mut stream = authenticated_link(h).await;
+    exchange_version(&mut stream).await.unwrap();
+    challenge_responder(&mut stream, &authorized_keys(), &peer_ids(), 1)
+        .await
+        .unwrap();
+    stream
+}
+
+/// The boot id of the hand-stamped frames below.
+const STAMP_BOOT: [u8; 16] = [9; 16];
+
+/// `JournalTip { epoch: 3, last_sequence: seq }` on frame `counter` of one
+/// sender process.
+fn stamped_at(counter: u64, seq: u64) -> StampedTip {
+    StampedTip {
+        tip: JournalTip {
+            epoch: 3,
+            last_sequence: seq,
+        },
+        stamp: SenderStamp {
+            boot_id: STAMP_BOOT,
+            started_ns: 1_000,
+            counter,
+        },
+    }
+}
+
+/// Send node 2's heartbeat on `stream` in an envelope carrying `tip`, and
+/// read the server's answer, which must be a success.
+async fn heartbeat_stamped(stream: &mut tokio::net::TcpStream, tip: StampedTip) {
+    write_frame(
+        stream,
+        &RpcFrame::new(tip, RpcBody::AppendReq(append_from(2))),
+    )
+    .await
+    .unwrap();
+    let reply = read_frame(stream).await.unwrap();
+    assert!(
+        matches!(
+            reply.body,
+            RpcBody::AppendResp(AppendEntriesResponse::Success)
+        ),
+        "{reply:?}"
+    );
+}
+
+/// The receive path end to end, over two real connections from one peer: a
+/// frame the peer sent before one the server has already read, arriving
+/// after it on the other connection, is still served, but its tip is not
+/// recorded and does not refresh the peer's last-heard time. A newer frame
+/// on the slow connection is recorded again.
+#[tokio::test]
+async fn the_server_drops_the_tip_of_a_frame_older_than_one_it_has_read() {
+    let h = start_server().await;
+    let mut slow = handshaken_link(&h).await;
+    let mut fast = handshaken_link(&h).await;
+
+    // Frame 10 overtakes frame 9, which the slow link delivers later.
+    heartbeat_stamped(&mut fast, stamped_at(10, 100)).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    heartbeat_stamped(&mut slow, stamped_at(9, 50)).await;
+
+    // Recorded off frame 10, at least the sleep ago; frame 9, just read,
+    // would make it a moment.
+    let (tip, age) = h.peer_tips.sample(2, std::time::Instant::now()).unwrap();
+    assert_eq!(tip, stamped_at(10, 100).tip, "the tip must not regress");
+    assert!(
+        age >= Duration::from_millis(50),
+        "the stale frame must not refresh the peer: last heard {age:?} ago"
+    );
+
+    // Recorded off frame 11: no older than its send, however slow the host.
+    let sent = std::time::Instant::now();
+    heartbeat_stamped(&mut slow, stamped_at(11, 120)).await;
+    let now = std::time::Instant::now();
+    let (tip, age) = h.peer_tips.sample(2, now).unwrap();
+    assert_eq!(tip, stamped_at(11, 120).tip);
+    assert!(age <= now - sent, "{age:?}");
+    h.shutdown.store(true, Ordering::Relaxed);
+}
+
+/// A stand-in node 1 for one connection, through the whole handshake, that
+/// answers one request with a success in an envelope carrying `tip`.
+async fn responder_answering_with(tip: StampedTip) -> (String, tokio::task::JoinHandle<()>) {
+    responder_then(move |mut stream| async move {
+        exchange_version(&mut stream).await.unwrap();
+        answer_challenge(&mut stream, &server_key()).await.unwrap();
+        read_frame(&mut stream).await.unwrap();
+        write_frame(
+            &mut stream,
+            &RpcFrame::new(tip, RpcBody::AppendResp(AppendEntriesResponse::Success)),
+        )
+        .await
+        .unwrap();
+    })
+    .await
+}
+
+/// The reply path: a reply older than a frame already recorded from its
+/// sender is returned to raft, but its tip is not recorded; a newer one is.
+#[tokio::test]
+async fn the_client_drops_the_tip_of_a_reply_older_than_one_it_has_read() {
+    let peer_tips = Arc::new(PeerTips::new());
+    let t0 = std::time::Instant::now();
+    assert!(peer_tips.record_at(1, stamped_at(10, 100), t0));
+    let mut factory = client_factory_recording(
+        &client_key(),
+        tip_at(0, 0),
+        WILDCARD_BIND,
+        None,
+        Arc::clone(&peer_tips),
+    );
+
+    for (reply, recorded) in [
+        (stamped_at(9, 50), stamped_at(10, 100).tip),
+        (stamped_at(11, 120), stamped_at(11, 120).tip),
+    ] {
+        let (addr, responder) = responder_answering_with(reply).await;
+        let resp = factory
+            .new_client(1, &BasicNode { addr })
+            .await
+            .append_entries(append_from(2), opt())
+            .await
+            .unwrap();
+        assert_eq!(resp, AppendEntriesResponse::Success);
+        responder.await.unwrap();
+        let (tip, _age) = peer_tips.sample(1, std::time::Instant::now()).unwrap();
+        assert_eq!(tip, recorded, "after a reply stamped {:?}", reply.stamp);
+    }
 }
 
 /// The server refuses a dialer on another release once authenticated,

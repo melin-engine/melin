@@ -3,8 +3,10 @@
 //! Length-prefixed frames (`[len: u32 LE][postcard payload]`) carrying an
 //! [`RpcFrame`] envelope. The envelope always includes the sender's journal
 //! tip (fencing epoch + advertised journal sequence), read live from the
-//! node's `TipSource` — the voter side feeds it to the vote recency filter
-//! (see `crate::recency`).
+//! node's `TipSource` together with the frame's place in the sender's
+//! order (its stamp) — the voter side feeds the tip to the vote recency
+//! filter, and every receiver records it per peer unless a newer frame
+//! from that peer is already recorded (see `crate::recency`).
 //!
 //! Postcard over bincode: compact varint encoding, and no encoder/decoder
 //! configuration knobs (fixint vs varint, endianness, limits) that could
@@ -33,6 +35,9 @@ use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 
+use crate::recency::JournalTip;
+use crate::recency::SenderStamp;
+use crate::recency::StampedTip;
 use crate::types::NodeId;
 use crate::types::TypeConfig;
 
@@ -51,7 +56,9 @@ pub const MAX_RPC_FRAME: usize = 4 << 20;
 /// version frame's layout fixes its width for good.
 /// History: 1 = the first versioned link, authenticated both ways (after
 /// the version exchange the dialer challenges the responder, see
-/// `crate::auth::challenge_responder`). Releases before it send an
+/// `crate::auth::challenge_responder`), whose envelope carries the sender
+/// stamp ([`RpcFrame::stamp`]). Both came in before any release shipped
+/// version 1, so neither bumped it. Releases before it send an
 /// `RpcFrame` straight after authentication, and refuse this one's
 /// version frame (see [`VERSION_FRAME_LEN`]).
 pub const RAFT_PROTOCOL_VERSION: u16 = 1;
@@ -215,7 +222,35 @@ pub struct RpcFrame {
     pub tip_epoch: u64,
     /// Sender's journal tip sequence.
     pub tip_seq: u64,
+    /// The frame's place in its sender's order, taken with the tip above,
+    /// so the receiver can drop the tip of a frame that arrives after a
+    /// newer one (see `crate::recency::PeerTips`).
+    pub stamp: SenderStamp,
     pub body: RpcBody,
+}
+
+impl RpcFrame {
+    /// The envelope for `body`, carrying `tip` as its sender stamped it
+    /// (`TipSource::stamp`).
+    pub fn new(tip: StampedTip, body: RpcBody) -> Self {
+        Self {
+            tip_epoch: tip.tip.epoch,
+            tip_seq: tip.tip.last_sequence,
+            stamp: tip.stamp,
+            body,
+        }
+    }
+
+    /// The sender's tip and stamp, as the envelope carries them.
+    pub fn stamped_tip(&self) -> StampedTip {
+        StampedTip {
+            tip: JournalTip {
+                epoch: self.tip_epoch,
+                last_sequence: self.tip_seq,
+            },
+            stamp: self.stamp,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -313,21 +348,36 @@ mod tests {
     use super::*;
     use openraft::Vote;
 
+    /// A stamp with every field distinct, so a round trip that swapped or
+    /// dropped one shows.
+    const STAMP: SenderStamp = SenderStamp {
+        boot_id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+        started_ns: 987_654_321,
+        counter: 42,
+    };
+
     #[tokio::test]
     async fn frame_round_trip() {
-        let frame = RpcFrame {
-            tip_epoch: 7,
-            tip_seq: 1234,
-            body: RpcBody::VoteReq(VoteRequest {
+        let sent = StampedTip {
+            tip: JournalTip {
+                epoch: 7,
+                last_sequence: 1234,
+            },
+            stamp: STAMP,
+        };
+        let frame = RpcFrame::new(
+            sent,
+            RpcBody::VoteReq(VoteRequest {
                 vote: Vote::new(3, 42),
                 last_log_id: None,
             }),
-        };
+        );
         let mut buf = Vec::new();
         write_frame(&mut buf, &frame).await.unwrap();
         let decoded = read_frame(&mut buf.as_slice()).await.unwrap();
         assert_eq!(decoded.tip_epoch, 7);
         assert_eq!(decoded.tip_seq, 1234);
+        assert_eq!(decoded.stamped_tip(), sent);
         match decoded.body {
             RpcBody::VoteReq(r) => {
                 assert_eq!(r.vote, Vote::new(3, 42));
@@ -500,11 +550,16 @@ mod tests {
         let mut envelope = Vec::new();
         write_frame(
             &mut envelope,
-            &RpcFrame {
-                tip_epoch: 0,
-                tip_seq: 0,
-                body: RpcBody::Error(String::new()),
-            },
+            &RpcFrame::new(
+                StampedTip {
+                    tip: JournalTip {
+                        epoch: 0,
+                        last_sequence: 0,
+                    },
+                    stamp: STAMP,
+                },
+                RpcBody::Error(String::new()),
+            ),
         )
         .await
         .unwrap();

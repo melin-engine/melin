@@ -17,6 +17,7 @@ use crate::recency::TipSource;
 use base64::Engine;
 use ed25519_dalek::SigningKey;
 use melin_app::auth::{AuthorizedKeys, NoRoles};
+use melin_transport_core::boot_stamp::BootStamp;
 use melin_transport_core::cursors::AdvertisedJournalTip;
 use melin_transport_core::fence::FenceState;
 
@@ -41,9 +42,24 @@ pub(crate) fn authorized_keys_table(entries: &[(&SigningKey, &str, &str)]) -> Au
 fn tip_at(epoch: u64, seq: u64) -> Arc<TipSource> {
     let fence = Arc::new(FenceState::new(0));
     fence.observe_epoch(epoch);
-    Arc::new(TipSource {
+    tip_source(
         fence,
-        seq: AdvertisedJournalTip::new(melin_transport_core::WireSeq::new(seq)),
-        ready: Arc::new(AtomicBool::new(true)),
-    })
+        AdvertisedJournalTip::new(melin_transport_core::WireSeq::new(seq)),
+        Arc::new(AtomicBool::new(true)),
+    )
+}
+
+/// A tip source over `fence` and `seq`, stamping its frames with this
+/// host's real boot stamp, as a node does.
+fn tip_source(
+    fence: Arc<FenceState>,
+    seq: AdvertisedJournalTip,
+    ready: Arc<AtomicBool>,
+) -> Arc<TipSource> {
+    Arc::new(TipSource::new(
+        fence,
+        seq,
+        ready,
+        BootStamp::read().expect("this host's boot stamp"),
+    ))
 }

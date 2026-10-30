@@ -76,6 +76,8 @@ SKIPS=(
     --skip replication::validate
     --skip replication::archive
     --skip replication::catchup
+    # Reads /proc and a temp file, and asks for CLOCK_BOOTTIME.
+    --skip boot_stamp::
 )
 
 echo "==> miri: melin-transport-core (no-persist)"

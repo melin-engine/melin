@@ -51,7 +51,7 @@ use crate::auth::KeyRefusal;
 use crate::auth::answer_challenge;
 use crate::auth::challenge_responder;
 use crate::auth::key_configured_for;
-use crate::recency::{JournalTip, PeerTips, TipSource};
+use crate::recency::{PeerTips, TipSource};
 use crate::rpc_server::SupersessionPolicy;
 use crate::types::Node;
 use crate::types::NodeId;
@@ -394,17 +394,7 @@ impl RaftClient {
                 .stream
                 .as_mut()
                 .ok_or_else(|| io::Error::other("no connection after connect"))?;
-            let local = self.tip.local_tip();
-            let (tip_epoch, tip_seq) = (local.epoch, local.last_sequence);
-            write_frame(
-                stream,
-                &RpcFrame {
-                    tip_epoch,
-                    tip_seq,
-                    body,
-                },
-            )
-            .await?;
+            write_frame(stream, &RpcFrame::new(self.tip.stamp(), body)).await?;
             read_frame(stream).await
         })
         .await
@@ -417,19 +407,19 @@ impl RaftClient {
                 // `TipSource`, so it is the same evidence of a newer
                 // tenure. And a serving raft leader learns of a higher
                 // epoch among its followers only here: a follower sends
-                // its leader no request.
+                // its leader no request. Observed whatever the frame's
+                // stamp: a frame older than one already heard carries an
+                // epoch no higher than the newer one did (the fence epoch
+                // never falls), so fencing on it is never wrong.
                 if let Some(policy) = &self.supersession {
                     policy.observe(frame.tip_epoch);
                 }
                 // Every reply envelope carries the target's journal tip —
-                // feed the promotion-time safety check (see `PeerTips`).
-                self.peer_tips.record(
-                    self.target,
-                    JournalTip {
-                        epoch: frame.tip_epoch,
-                        last_sequence: frame.tip_seq,
-                    },
-                );
+                // feed the promotion-time safety check (see `PeerTips`),
+                // which drops it, and says so at `debug`, if a newer frame
+                // from the target is already recorded. Nothing else here
+                // depends on which.
+                self.peer_tips.record(self.target, frame.stamped_tip());
                 Ok(frame.body)
             }
             Err(e) => {

@@ -389,30 +389,33 @@ async fn handle_connection<A: RaftApi>(
         }
 
         // Fence-on-supersession: every peer envelope advertises the
-        // sender's fencing epoch (see `SupersessionPolicy`).
+        // sender's fencing epoch (see `SupersessionPolicy`). Observed
+        // whatever the frame's stamp, like the vote filter below: only the
+        // peer-tip record is gated on it (see `crate::recency::PeerTips`).
+        // A frame older than one already heard from the peer carries an
+        // epoch no higher than the newer one did (the fence epoch never
+        // falls), so fencing on it is never wrong.
         cfg.observe_peer_epoch(frame.tip_epoch);
 
         // Record the sender's advertised tip under its authenticated
-        // peer id for the promotion-time journal-safety check.
-        cfg.peer_tips.record(
-            peer_id,
-            JournalTip {
-                epoch: frame.tip_epoch,
-                last_sequence: frame.tip_seq,
-            },
-        );
+        // peer id for the promotion-time journal-safety check, unless a
+        // newer frame from that peer is already recorded (dropped, and
+        // logged at `debug`, by `PeerTips::record`). The request itself is
+        // served either way: only its tip is stale.
+        let sender_tip = frame.stamped_tip();
+        cfg.peer_tips.record(peer_id, sender_tip);
 
         // Journal-tip recency filter (see `crate::recency`): a vote
         // request from a candidate behind our own tip is dropped before
         // it can reach `Raft::vote` — indistinguishable from packet loss,
         // so raft safety is untouched. Appends re-arm the filter: they
-        // prove a live leader exists.
+        // prove a live leader exists. The candidate's tip is the one its
+        // own envelope carries, stale or not: it describes the candidate
+        // when it sent this request, and an older tip can only make the
+        // filter stricter, never admit a candidate it would refuse now.
         match &frame.body {
             RpcBody::VoteReq(_) => {
-                let candidate_tip = JournalTip {
-                    epoch: frame.tip_epoch,
-                    last_sequence: frame.tip_seq,
-                };
+                let candidate_tip = sender_tip.tip;
                 if !cfg.admit_vote(candidate_tip) {
                     debug!(
                         peer_id,
@@ -436,13 +439,7 @@ async fn handle_connection<A: RaftApi>(
         }
 
         let response = handle_body(&api, frame.body).await;
-        let local = cfg.tip.local_tip();
-        let (tip_epoch, tip_seq) = (local.epoch, local.last_sequence);
-        let reply = RpcFrame {
-            tip_epoch,
-            tip_seq,
-            body: response,
-        };
+        let reply = RpcFrame::new(cfg.tip.stamp(), response);
         match tokio::time::timeout(WRITE_TIMEOUT, write_frame(&mut stream, &reply)).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {

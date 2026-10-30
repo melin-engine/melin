@@ -31,5 +31,5 @@ mod tests;
 pub use driver::{
     LeaderConfirm, LeaderConfirmError, QUORUM_ACK_MAX_AGE, RaftConfig, RaftHandles, RaftPeer, spawn,
 };
-pub use recency::{JournalTip, PeerTips, TipSource};
+pub use recency::{JournalTip, PeerTips, SenderStamp, StampedTip, TipSource};
 pub use rpc_server::SupersessionPolicy;

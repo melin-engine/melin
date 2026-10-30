@@ -848,6 +848,19 @@ mod tests {
         }
     }
 
+    /// `tip` as the first frame a peer's process sent: what `PeerTips`
+    /// records off a peer's envelope.
+    fn first_frame(tip: JournalTip) -> melin_raft::StampedTip {
+        melin_raft::StampedTip {
+            tip,
+            stamp: melin_raft::SenderStamp {
+                boot_id: [1; 16],
+                started_ns: 1,
+                counter: 0,
+            },
+        }
+    }
+
     fn ok_inputs() -> AutoPromotionInputs {
         AutoPromotionInputs {
             tip_ready: true,
@@ -1285,7 +1298,7 @@ mod tests {
         // Peer 3 is a caught-up replica; peer 1 is the primary, unheard
         // — which digests to `Silent` rather than `Unknown` because this
         // node has led (and so heartbeated it) well past the grace.
-        peer_tips.record(3, tip(0, 101));
+        assert!(peer_tips.record(3, first_frame(tip(0, 101))));
         let peer_ids = [1u64, 3];
         let leader_for = PEER_TIP_GRACE * 2;
         let mut last_refused = None;
@@ -1473,7 +1486,7 @@ mod tests {
             PeerTipObservation::Silent { last: None }
         );
 
-        tips.record_at(2, tip(3, 7), t0);
+        assert!(tips.record_at(2, first_frame(tip(3, 7)), t0));
         // Within the grace: fresh.
         assert_eq!(
             observe_peer(&tips, 2, Duration::ZERO, t0 + PEER_TIP_GRACE),

@@ -11,7 +11,7 @@ anchors; line numbers are left out because they go stale.
 The first three items are one follow-up branch, **in this order**: the
 raft protocol version (done), then mutual authentication in the same
 handshake change (done), then the stale-peer-tip stamp, which is the
-first envelope change the version protects. The one-sided partition gap
+first envelope change the version protects (done). The one-sided partition gap
 after them is a separate design that has only been sketched.
 
 ## 1. A raft protocol version (done)
@@ -25,11 +25,10 @@ that releases from before it refuse as an undecodable `RpcFrame`
 (pinned against a frozen copy of their decoder in
 `crates/core/raft/src/tests/pre_version_wire.rs`).
 
-What it means for item 3: **it bumps `RAFT_PROTOCOL_VERSION`** (it
-changes the envelope) and adds a line to its history, unless version 1
-is still unreleased when it lands, in which case version 1 absorbs it as
-it absorbed item 2 (check `git tag` and the changelog's Unreleased
-section: a version only has to change once a release has shipped it).
+What it meant for item 3: it would have bumped `RAFT_PROTOCOL_VERSION`
+(it changes the envelope) had a release shipped version 1; none had, so
+version 1 absorbed it as it absorbed item 2 (a version only has to change
+once a release has shipped it).
 The version frame's own layout never changes. It needs no
 frozen-decoder test of its own: from version 1 on, a peer reads the
 version before anything else.
@@ -72,7 +71,18 @@ session; the control-plane network is assumed private.
   with no configured key is never connected to; the accepted replies of
   the reply-path tests record the tip).
 
-## 3. Stale peer tips
+## 3. Stale peer tips (done)
+
+Built as decided here, and described in `raft-control-plane.md` ("Peer
+tips are ordered by a sender stamp"): `SenderStamp` on every `RpcFrame`,
+taken with the tip by `TipSource::stamp`; `PeerTips::record` drops a frame
+not newer than the one recorded, tip and last-heard time alike; the boot
+identity is `BootStamp` in `melin-transport-core`, read once by
+`spawn_raft_driver`, whose failure refuses startup. The stamp gates the
+peer-tip record only, not the epoch fed to `SupersessionPolicy::observe`
+nor the vote filter's candidate tip (the design document says why). No
+version bump: version 1 was still unreleased, so it absorbed the envelope
+change as it absorbed item 2. The design as decided follows.
 
 **Problem.** `PeerTips::record_at` (`crates/core/raft/src/recency.rs`)
 overwrites unconditionally and stamps the *arrival* time. An old frame
