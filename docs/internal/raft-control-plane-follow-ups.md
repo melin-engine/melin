@@ -12,7 +12,8 @@ The first three items are one follow-up branch, **in this order**: the
 raft protocol version (done), then mutual authentication in the same
 handshake change (done), then the stale-peer-tip stamp, which is the
 first envelope change the version protects (done). The one-sided partition gap
-after them is a separate design that has only been sketched.
+after them turned out, by test, to need ticks disabled; its fix has only been
+sketched, for that case.
 
 ## 1. A raft protocol version (done)
 
@@ -150,29 +151,57 @@ same boot wins over an earlier one; the counter and the tip are taken
 together (a unit test over the stamping helper); startup refuses when
 `boot_id` cannot be read (through a seam over the path).
 
-## 4. The one-sided partition with an idle primary (sketched, not decided)
+## 4. The one-sided partition with an idle primary (pinned: a gap only with ticks disabled)
 
 **Gap.** The replica raft leader `L` loses only its link to the primary,
 while the other replica `O` still reaches both. `L` keeps a fresh lease
 (`O` acks it), so the leader-lease filter and the mint-time confirmation
-both pass. Whether `L` then deposes the primary depends on traffic:
+both pass. Whether `L` then deposes the primary depends on whether the
+primary journals anything during `PRIMARY_DOWN_GRACE`:
 
-- if the primary takes writes during `PRIMARY_DOWN_GRACE`, `O`'s tip moves
-  ahead of `L`'s and the peer-tip veto refuses for as long as `O` stays
-  ahead. `O` does not campaign, because the challenger nudge needs `O`'s
-  own primary link down (`challenger_should_campaign`), so nobody promotes
-  and the primary keeps serving. Pinned by
-  `a_replica_leader_cut_from_the_primary_alone_does_not_promote_while_writes_flow`
-  in `crates/core/server-runtime/tests/raft_failover.rs`;
-- if the primary is **idle**, the tips stay equal, nothing vetoes, and `L`
-  promotes and deposes a primary the rest of the cluster can see. Untested,
-  since the outcome is the known gap.
+- if it does, `O`'s tip moves ahead of `L`'s and the peer-tip veto
+  refuses for as long as `O` stays ahead. `O` does not campaign, because
+  the challenger nudge needs `O`'s own primary link down
+  (`challenger_should_campaign`), so nobody promotes and the primary keeps
+  serving. A primary is never idle in this sense by default: it journals a
+  clock tick every `--tick-interval-ms` (default 250 ms), well inside the
+  grace. The chain: the ingress thread of a primary (the reader under
+  `run_as_primary`, the poll thread under `run_as_primary_dpdk`; a replica
+  runs neither) publishes
+  `JournalEvent::Tick` onto the input ring (`tick::publish_tick`); the
+  journal stage sequences and journals it like any entry, and replication
+  streams it in an `InputBatch`; `O`'s receiver advances its
+  `AdvertisedJournalTip` to the *accepted* position as it publishes the
+  batch into its ring, before the entry is persisted
+  (`receiver_transport.rs`); `TipSource::stamp` reads that tip into every
+  envelope, so `O`'s next heartbeat reply to `L` carries it, while `L`'s
+  tip, its replication link cut, stays where it was. Pinned both ways by
+  `replica_leader_cut_from_the_primary_alone` in
+  `crates/core/server-runtime/tests/raft_failover.rs`:
+  `..._does_not_promote_while_writes_flow` (writes, ticks disabled) and
+  `..._does_not_promote_while_the_primary_is_idle` (no write, the default
+  tick cadence; with `RUST_LOG` set, `L`'s refusal once the grace ends is
+  the peer-tip veto's);
+- if it does not, that is with ticks disabled (`--tick-interval-ms 0`) and
+  no client write, the tips stay equal, nothing vetoes, and `L` promotes
+  and deposes a primary the rest of the cluster can see. Confirmed by
+  running the idle-primary test once with the primary's ticks disabled (a
+  scratch change, not kept): `L` auto-promoted as the grace ran out and
+  minted its epoch. Not kept as a test, since it would pin the defect.
+  `docs/replication.md` tells operators so, beside the link grace.
 
 This is the documented one-sided-link limitation of `PRIMARY_DOWN_GRACE`
 (the link flag is this node's socket only). The same partition also
 reaches the one case the mint-time argument leaves open (see
 `raft-control-plane.md`): `L` steps down after its confirmation and
 before the mint, and the newer leader is the primary, which never mints.
+With ticks on, the peer-tip veto keeps `L` from reaching its
+confirmation through this partition at all, so reaching that case this
+way needs ticks disabled as well.
+
+Whether auto-promotion should be supported with ticks disabled at all (and
+if not, whether to refuse or warn at startup) is open, for the maintainer.
+The fix below is for the case it is.
 
 **Sketched fix.** Carry each node's primary-link state in the raft
 envelope, beside the tip, and have a replica refuse to auto-promote while

@@ -22,8 +22,8 @@
 //!   never auto-promotes); isolated from both peers, the other two elect a
 //!   new leader, the isolated one never promotes, and once healed the
 //!   primary is still unfenced and the only node serving; cut from the
-//!   primary alone while writes flow, it does not promote, and once healed
-//!   rejoins as a replica.
+//!   primary alone, it does not promote while writes flow, nor while the
+//!   primary is idle but ticking, and once healed rejoins as a replica.
 //! - A primary that leads raft, with a replica manually promoted among its
 //!   followers and sending it no request, fences on the higher epoch the
 //!   follower's replies carry.
@@ -547,23 +547,24 @@ impl Cluster {
 
     /// The replicas (under `ack_policy`, not replicating if promoted)
     /// first, until one of them leads the control plane, then the primary
-    /// under `ack_policy` with no ticks. Neither replica can promote
-    /// meanwhile: one that never observed a primary refuses. This puts
-    /// raft leadership on a replica deterministically, which a normal
-    /// bring-up does not (the primary, raft id 1, ticks fastest and
-    /// usually wins the first election).
+    /// under `ack_policy`, ticking every `tick_interval_ms` (0: no ticks,
+    /// so it journals nothing a client does not write). Neither replica
+    /// can promote meanwhile: one that never observed a primary refuses.
+    /// This puts raft leadership on a replica deterministically, which a
+    /// normal bring-up does not (the primary, raft id 1, ticks fastest
+    /// and usually wins the first election).
     ///
     /// The primary's own first campaign must not disturb that leader: its
     /// log is shorter, and the other replica's vote is held by the
     /// leader's lease. Checked here on every bring-up: the cluster forms
     /// with every node following the same leader at the same term, and no
     /// node ever reports a higher term.
-    fn start_replicas_first(&self, ack_policy: AckPolicy) -> ReplicaLed {
+    fn start_replicas_first(&self, ack_policy: AckPolicy, tick_interval_ms: u64) -> ReplicaLed {
         let replicas = self.start_replicas(ack_policy, false);
         // Every term is above 0.
         let (leader, term) = self.wait_leader_above(0, &[1, 2]);
 
-        let primary = self.start_primary(ack_policy, 0);
+        let primary = self.start_primary(ack_policy, tick_interval_ms);
         self.wait_formed(&primary);
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
@@ -960,7 +961,7 @@ fn replica_leader_promotes_when_the_primary_dies() {
         replicas,
         leader,
         ..
-    } = cluster.start_replicas_first(AckPolicy::DiskAndRam);
+    } = cluster.start_replicas_first(AckPolicy::DiskAndRam, 0);
 
     primary.stop();
     assert_eq!(
@@ -997,7 +998,7 @@ fn a_replica_leader_alone_never_auto_promotes() {
         mut replicas,
         leader,
         term,
-    } = cluster.start_replicas_first(AckPolicy::DiskAndRam);
+    } = cluster.start_replicas_first(AckPolicy::DiskAndRam, 0);
 
     // `replicas` holds nodes 1 and 2 at 0 and 1.
     let survivor = replicas.remove(leader - 1);
@@ -1039,7 +1040,7 @@ fn a_replica_leader_alone_never_auto_promotes() {
 #[serial]
 fn an_isolated_replica_leader_is_replaced_by_the_primary_and_the_other_replica() {
     let cluster = Cluster::partitionable();
-    let led = cluster.start_replicas_first(AckPolicy::DiskAndRam);
+    let led = cluster.start_replicas_first(AckPolicy::DiskAndRam, 0);
 
     cluster.isolate(led.leader);
     cluster.wait_leader_above(led.term, &[0, led.other()]);
@@ -1048,41 +1049,69 @@ fn an_isolated_replica_leader_is_replaced_by_the_primary_and_the_other_replica()
     led.stop();
 }
 
+/// What the primary journals while its replica leader is cut from it
+/// alone ([`replica_leader_cut_from_the_primary_alone`]): whatever moves
+/// the other replica's tip, which still follows the primary, ahead of the
+/// leader's.
+#[derive(Clone, Copy, Debug)]
+enum PrimaryTraffic {
+    /// A client write after another, and no clock ticks: the writes alone
+    /// move the tip.
+    Writes,
+    /// No client write, and clock ticks at the default
+    /// `--tick-interval-ms`: an idle primary as deployed, whose ticks are
+    /// journal entries like any other and replicate as such.
+    TicksOnly,
+}
+
 /// The one-sided partition
-/// (`docs/internal/raft-control-plane-follow-ups.md`, item 4, whose
-/// idle-primary case is the gap left open): the replica leader loses only
-/// its links to the primary, while the other replica still reaches both.
-/// With writes flowing, the other replica's tip moves ahead of the
-/// leader's, so the peer-tip veto keeps the leader from promoting, and the
-/// other replica, whose own primary link is up, does not campaign: nobody
-/// promotes and the primary keeps serving. Once healed, the leader rejoins
-/// as a replica. That the partition took effect is checked too: the
-/// primary, hearing from no leader, campaigns above the leader's term, in
-/// vain.
+/// (`docs/internal/raft-control-plane-follow-ups.md`, item 4): the replica
+/// leader loses only its links to the primary, while the other replica
+/// still reaches both. Whatever the primary journals under `traffic`
+/// reaches the other replica only, so its tip moves ahead of the leader's
+/// and the peer-tip veto keeps the leader from promoting, and the other
+/// replica, whose own primary link is up, does not campaign: nobody
+/// promotes over [`NO_PROMOTION_WATCH`], and the primary still acks a
+/// write at its end. Once healed, the leader rejoins as a replica. That
+/// the partition took effect is checked too: the primary, hearing from no
+/// leader, campaigns above the leader's term, in vain.
 ///
-/// A characterisation of what the code does, not a guarantee: with an
-/// idle primary nothing vetoes, and the leader promotes (a known gap).
-#[test]
-#[serial]
-fn a_replica_leader_cut_from_the_primary_alone_does_not_promote_while_writes_flow() {
+/// A characterisation of what the code does, not a guarantee: a primary
+/// that journals nothing at all (no writes, ticks disabled) leaves the
+/// tips equal, nothing vetoes, and the leader promotes (the known gap,
+/// left untested since the outcome is the defect).
+fn replica_leader_cut_from_the_primary_alone(traffic: PrimaryTraffic) {
+    melin_test_node::logs::capture_if_requested();
+    let tick_interval_ms = match traffic {
+        PrimaryTraffic::Writes => 0,
+        PrimaryTraffic::TicksOnly => ServerConfig::default().tick_interval_ms,
+    };
     let cluster = Cluster::partitionable();
-    let led = cluster.start_replicas_first(AckPolicy::DiskAndRam);
+    let led = cluster.start_replicas_first(AckPolicy::DiskAndRam, tick_interval_ms);
     let primary_health = cluster.nodes[0].health_addr;
-    let mut conn = cluster.client(&led.primary);
+    // Connected at the first write: under `TicksOnly` that is after the
+    // watch, so an idle client cannot outlast the primary's connection
+    // timeout.
+    let mut conn = None;
 
     cluster.isolate_from_primary(led.leader);
     wait_for_gauge(primary_health, "melin_replicas_connected", 1);
     let deadline = Instant::now() + NO_PROMOTION_WATCH;
     while Instant::now() < deadline {
-        acked_write(&mut conn);
+        if let PrimaryTraffic::Writes = traffic {
+            acked_write(conn.get_or_insert_with(|| cluster.client(&led.primary)));
+        }
+        // Also paces the loop: each replica's refusal waits out the
+        // patience.
         assert_eq!(
             cluster.serving_replicas(Duration::from_millis(300)),
             Vec::<usize>::new(),
-            "a replica promoted while the leader was cut from the primary alone, with writes \
-             flowing\n{}",
+            "a replica promoted while the leader was cut from the primary alone \
+             ({traffic:?})\n{}",
             cluster.cluster_summary()
         );
     }
+    acked_write(conn.get_or_insert_with(|| cluster.client(&led.primary)));
 
     // The partition took effect, and the leader kept its majority through
     // the other replica: the primary, hearing from no leader, campaigns
@@ -1101,7 +1130,7 @@ fn a_replica_leader_cut_from_the_primary_alone_does_not_promote_while_writes_flo
 
     cluster.heal();
     wait_for_gauge(primary_health, "melin_replicas_connected", 2);
-    acked_write(&mut conn);
+    acked_write(conn.get_or_insert_with(|| cluster.client(&led.primary)));
     assert_eq!(
         cluster.serving_replicas(Duration::from_millis(300)),
         Vec::<usize>::new(),
@@ -1111,6 +1140,25 @@ fn a_replica_leader_cut_from_the_primary_alone_does_not_promote_while_writes_flo
 
     drop(conn);
     led.stop();
+}
+
+/// [`replica_leader_cut_from_the_primary_alone`] with writes flowing and
+/// no ticks: the writes alone keep the leader from promoting.
+#[test]
+#[serial]
+fn a_replica_leader_cut_from_the_primary_alone_does_not_promote_while_writes_flow() {
+    replica_leader_cut_from_the_primary_alone(PrimaryTraffic::Writes);
+}
+
+/// [`replica_leader_cut_from_the_primary_alone`] with no client write and
+/// the default tick cadence: the primary's ticks alone keep the leader
+/// from promoting, each moving the other replica's tip ahead of the
+/// leader's well inside the primary-down grace. The idle-primary gap of
+/// item 4 needs ticks disabled.
+#[test]
+#[serial]
+fn a_replica_leader_cut_from_the_primary_alone_does_not_promote_while_the_primary_is_idle() {
+    replica_leader_cut_from_the_primary_alone(PrimaryTraffic::TicksOnly);
 }
 
 /// What [`an_isolated_replica_leader_never_deposes_a_healthy_primary`]
@@ -1161,7 +1209,7 @@ struct IsolationRecord {
 #[serial]
 fn an_isolated_replica_leader_never_deposes_a_healthy_primary() {
     let cluster = Cluster::partitionable();
-    let led = cluster.start_replicas_first(AckPolicy::DiskAndRam);
+    let led = cluster.start_replicas_first(AckPolicy::DiskAndRam, 0);
     let (leader, other, term) = (led.leader, led.other(), led.term);
     let primary_health = cluster.nodes[0].health_addr;
     let mut conn = cluster.client(&led.primary);

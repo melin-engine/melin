@@ -351,7 +351,10 @@ leader is the primary, which never mints, nothing fences L's epoch and
 L's mint deposes it. Reaching that between C and the mint needs a peer
 that has not heard L for a lease while another still acknowledges L and
 L's primary link is down: the one-sided partition recorded in
-`raft-control-plane-follow-ups.md`, not a case the gate closes.
+`raft-control-plane-follow-ups.md`, not a case the gate closes. The
+peer-tip veto keeps L from deciding to promote through that partition
+while the primary journals anything, its clock ticks included, so it
+takes ticks disabled and an idle primary.
 
 `LeaderConfirmError` is exhaustive: `NotLeader`, `TermMoved { now }`,
 `NoQuorum` (openraft's `QuorumNotEnough`), `TimedOut`, and
@@ -511,7 +514,8 @@ stable within 0.9 is assumed.
 - `crates/core/server-runtime/tests/raft_failover.rs`: an isolated replica
   leader never deposes a healthy primary, a lone survivor never
   auto-promotes, a leader cut from the primary alone does not promote
-  while writes flow, and the genuine failovers
+  while writes flow nor while the primary is idle but ticking at the
+  default cadence, and the genuine failovers
   (`replica_leader_promotes_when_the_primary_dies`,
   `killed_primary_triggers_exactly_one_auto_promotion`) run the real
   confirmation end to end, so a spurious refusal under load shows there
@@ -526,7 +530,9 @@ stable within 0.9 is assumed.
   assertion; openraft's lease internals, since `Raft` handles stay inside
   the driver thread; the nudged follower winning while L was just
   acknowledged (covered by the peer-tip veto's and fencing's own tests);
-  the one-sided partition with an idle primary, a known gap.
+  the one-sided partition with an idle primary and ticks disabled, a
+  known gap (confirmed once by a scratch run, not kept as a test since it
+  would pin the defect; `raft-control-plane-follow-ups.md`, item 4).
 
 ## RPC transport
 

@@ -736,7 +736,12 @@ Auto-promotion is deliberately conservative. The elected replica
   sustained outage keeps a brief hiccup from deposing a healthy primary,
   at the cost of a few seconds of extra failover latency. The grace
   period cannot vouch for a primary whose *startup* outlasts it — see
-  the bring-up rule under "Deployment rules";
+  the bring-up rule under "Deployment rules". A lasting cut of the
+  winner's link alone, while the other replica still reaches the
+  primary, is caught by the peer check below as long as the primary
+  journals something, and its clock ticks are enough. With ticks
+  disabled (`--tick-interval-ms 0`) an idle primary journals nothing,
+  and such a cut can depose it;
 - **a majority of the control plane has not acknowledged its leadership
   recently.** A node cut off from both other nodes can still believe it
   leads (the control plane does not make an isolated leader step down),
