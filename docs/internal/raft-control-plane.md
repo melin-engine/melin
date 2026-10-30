@@ -468,9 +468,32 @@ replies (votes, peer tips, and the epoch a serving node fences on) are
 trusted from whatever answers at the peer's configured address. A forged
 higher epoch can stop a serving primary (fail-safe, never a split
 brain); mutual authentication is decided follow-up work, recorded in
-`raft-control-plane-follow-ups.md` with the raft protocol version it
-depends on. Neither the envelope nor the handshake carries a version
-today.
+`raft-control-plane-follow-ups.md`.
+
+**The link carries a protocol version.** Right after authentication,
+and after the server has pinned the key, both ends send a version frame
+carrying `RAFT_PROTOCOL_VERSION` (`wire.rs`) and read the other's
+(`exchange_version`; both write before reading, the frames being a few
+bytes). The frame is hand-encoded and fixed for good,
+`[len: u32 LE = 3][tag 0x52][version: u16 LE]`, so any release can read
+any other's version whatever else changes; bump the version whenever
+what crosses the link changes (the envelope, the openraft types in it,
+the handshake). A mismatch is a typed `VersionRefusal` naming both
+versions; a first frame of another length or tag is refused the same
+way, which is what a release from before the version sends (an
+`RpcFrame`). Both ends log it at `warn` (a peer on another release, not
+a malfunction, but automatic failover is degraded while it lasts), the
+server closes, and the dialer's `to_rpc_error` maps it, like a
+`DialRefusal`, to `Unreachable` so openraft backs off. Releases from
+before the version refuse the frame too, as an undecodable `RpcFrame`:
+the shortest postcard envelope is four bytes, so a three-byte payload
+runs out mid-frame. `src/tests/pre_version_wire.rs` pins this against a
+frozen copy of their decoder, for every version the frame can carry; do
+not update that copy when the envelope changes. Such an old dialer sees
+its first reply fail to decode, an old responder hangs up, and this
+release's dialer sees only the hang-up (a network error, retried as
+one).
+
 `--raft-peer` lists are identical on every node and include the node
 itself (the self entry supplies the dialable address written into the
 first-boot membership).

@@ -25,25 +25,15 @@ use melin_transport_core::replication::protocol::encode_auth_ok;
 use melin_transport_core::replication::protocol::encode_challenge;
 use melin_transport_core::replication::protocol::encode_challenge_response;
 use tokio::io::AsyncRead;
-use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
+
+use crate::wire::read_bounded_payload;
 
 /// Async read of one control frame (`[len: u32 LE][payload]`), bounded by
 /// [`MAX_CONTROL_FRAME`] — the async analog of `protocol::read_frame`.
 async fn read_control_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Vec<u8>> {
-    let mut len_buf = [0u8; 4];
-    r.read_exact(&mut len_buf).await?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    if len > MAX_CONTROL_FRAME {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("control frame length {len} exceeds cap {MAX_CONTROL_FRAME}"),
-        ));
-    }
-    let mut payload = vec![0u8; len];
-    r.read_exact(&mut payload).await?;
-    Ok(payload)
+    read_bounded_payload(r, MAX_CONTROL_FRAME, "control frame").await
 }
 
 /// Verify a `ChallengeResponse` payload against the nonce we issued,

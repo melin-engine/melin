@@ -1,4 +1,5 @@
-//! Inbound control-plane RPC: accepts authenticated peer connections and
+//! Inbound control-plane RPC: accepts authenticated peer connections,
+//! checks that they speak this node's raft protocol version, and
 //! dispatches their requests into the local raft core.
 //!
 //! Dispatch is generic over [`RaftApi`] (implemented by `openraft::Raft`) so
@@ -38,12 +39,15 @@ use crate::types::NodeId;
 use crate::types::TypeConfig;
 use crate::wire::RpcBody;
 use crate::wire::RpcFrame;
+use crate::wire::VersionExchangeError;
 use crate::wire::claimed_sender;
+use crate::wire::exchange_version;
 use crate::wire::read_frame;
 use crate::wire::write_frame;
 
-/// Bound on the challenge-response exchange — an unauthenticated socket may
-/// not sit on the accept path longer than this.
+/// Bound on the challenge-response exchange, and separately on the version
+/// exchange that follows it — an unauthenticated socket may not sit on the
+/// accept path longer than this, nor one that has not yet sent a version.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Idle bound on an authenticated link. Peers only hold a connection open
@@ -279,6 +283,33 @@ async fn handle_connection<A: RaftApi>(
         warn!(%peer_addr, "authenticated key is not a configured raft peer — closing");
         return;
     };
+
+    // Protocol version, both ways, before any envelope is read or sent.
+    // After the pinning, so only a configured peer learns this node's
+    // version; bounded like authentication, since no envelope has proven
+    // the link live yet.
+    match tokio::time::timeout(AUTH_TIMEOUT, exchange_version(&mut stream)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(VersionExchangeError::Refused(refusal))) => {
+            // `warn!`, not `error!`: a peer on another release is an
+            // upgrade in progress (or a half-finished one), not a
+            // malfunction of this node. But while it lasts the control
+            // plane cannot elect across the two releases, so automatic
+            // failover is degraded, which needs the operator's attention.
+            // The level the replication handshake gives its own version
+            // mismatch, and this server a failed authentication.
+            warn!(%peer_addr, peer_id, error = %refusal, "raft peer runs another release — closing");
+            return;
+        }
+        Ok(Err(VersionExchangeError::Io(e))) => {
+            debug!(%peer_addr, peer_id, error = %e, "raft peer link closed during the version exchange");
+            return;
+        }
+        Err(_elapsed) => {
+            debug!(%peer_addr, peer_id, "raft peer version exchange timed out");
+            return;
+        }
+    }
     debug!(%peer_addr, peer_id, "raft peer connected");
 
     loop {

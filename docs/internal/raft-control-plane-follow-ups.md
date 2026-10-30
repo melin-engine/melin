@@ -9,54 +9,30 @@ matters, the decided design and what was rejected. Function names are the
 anchors; line numbers are left out because they go stale.
 
 The first three items are one follow-up branch, **in this order**: the
-raft protocol version, then mutual authentication in the same handshake
-change, then the stale-peer-tip stamp, which is the first envelope change
-the version protects. The one-sided partition gap after them is a
-separate design that has only been sketched.
+raft protocol version (done), then mutual authentication in the same
+handshake change, then the stale-peer-tip stamp, which is the first
+envelope change the version protects. The one-sided partition gap after
+them is a separate design that has only been sketched.
 
-## 1. A raft protocol version (prerequisite of 2 and 3)
+## 1. A raft protocol version (done)
 
-**Problem.** Neither the RPC envelope (`RpcFrame` in
-`crates/core/raft/src/wire.rs`: a `u32` LE length prefix and a postcard
-payload) nor the raft handshake (`crates/core/raft/src/auth.rs`, which
-reuses only the replication challenge/response frames from
-`melin_transport_core::replication::protocol`) carries a version. A raft
-envelope change between releases is therefore undiagnosable during a
-rolling upgrade, and because postcard is not self-describing, a layout
-change could be *misdecoded* by the other release rather than refused.
-Items 2 and 3 both change what crosses the raft link, so this comes
-first (decided).
+Built as decided here, and described in `raft-control-plane.md`
+("RPC transport", "The link carries a protocol version"):
+`RAFT_PROTOCOL_VERSION` in
+`crates/core/raft/src/wire.rs`, exchanged both ways by
+`exchange_version` after authentication, in a fixed three-byte frame
+that releases from before it refuse as an undecodable `RpcFrame`
+(pinned against a frozen copy of their decoder in
+`crates/core/raft/src/tests/pre_version_wire.rs`).
 
-**Design (decided).**
-
-- A `RAFT_PROTOCOL_VERSION` constant in `melin-raft`, exchanged right
-  after authentication succeeds and before the first `RpcFrame`, in both
-  directions. A mismatch closes the connection with an error naming both
-  versions, as the replication handshake does with
-  `REPL_PROTOCOL_VERSION` (`crates/core/transport-core/src/replication/protocol.rs`)
-  and the client protocol with `CLIENT_PROTOCOL_VERSION`.
-- The version frame has a **fixed byte layout** (a tag and a little-endian
-  version, encoded by hand like the replication control frames), not
-  postcard, so every future release can read an older or newer peer's
-  version frame whatever else changes.
-- The release that introduces it must be **guaranteed undecodable by
-  today's `RpcFrame` decoder**. Today's nodes expect an `RpcFrame` straight
-  after authentication, so a new dialer's version frame lands in an old
-  responder's `read_frame` (and a new responder's in an old dialer's
-  reply read). It must fail to decode there, never decode as a valid
-  frame: choose the frame's bytes so postcard rejects them as an
-  `RpcFrame` (for example a payload too short to hold the envelope, or one
-  whose `RpcBody` variant index is out of range). Pin it with a test that
-  feeds the version frame to a **frozen copy** of today's `RpcFrame`
-  decoder (a copy of the types and `read_frame` as they are now, kept in
-  the test with a comment saying why it is a copy) and asserts an error.
-  Otherwise the first mixed-version cluster could act on a misread vote
-  or tip.
-
-**Tests.** Matching versions connect; a mismatch is refused in each
-direction with both versions in the message; the frozen-decoder test
-above; the frame's encode/decode round trip and its refusal of a short or
-wrong-tag frame.
+What it means for items 2 and 3: **each bumps `RAFT_PROTOCOL_VERSION`**
+(item 2 changes the handshake, item 3 the envelope) and adds a line to
+its history. Item 2's new handshake frames belong after the version
+exchange, so a peer on version 1 is refused by version, both named,
+rather than tripping over a frame it does not know; the version frame's
+own layout never changes. Neither item needs a frozen-decoder test of
+its own: from version 1 on, a peer reads the version before anything
+else.
 
 ## 2. Mutual raft authentication
 
@@ -75,7 +51,8 @@ so the trust model is not new; but this path now leads directly to a
 primary outage. Accepted for the lease branch by the maintainer and
 added to this follow-up (decided).
 
-**Design (decided).** In the same handshake change as item 1: the dialer
+**Design (decided).** In the raft handshake, after item 1's version
+exchange: the dialer
 sends a nonce of its own, and the responder signs it with its key; the
 dialer verifies the signature and checks that the key is the one
 configured for **the peer id it dialled** (the `--raft-peer` entry, or

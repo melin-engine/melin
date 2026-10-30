@@ -1204,6 +1204,19 @@ normal-case post-recovery state.
   every node on its existing files. An existing history records no
   policy yet, so the first primary to serve it under protocol 8 (by boot
   or promotion) serves under the policy it requests and journals it.
+- **The control plane is versioned too, and needs the same.** Control-plane
+  links (`--raft-peer`) exchange a protocol version right after
+  authenticating, and a node refuses a peer that speaks another one,
+  logging a warning that names both versions. Nodes on different
+  releases therefore never vote for each other or follow each other's
+  control-plane leader: there is **no automatic failover across
+  versions**, and while the cluster is split across releases only nodes
+  of a release that alone holds a majority can elect anyone. The release
+  that introduces the version is such a change: it and earlier releases
+  refuse each other's control-plane links in either direction (an
+  earlier release logs only that the connection failed, so read the
+  newer node's log). Upgrade the whole cluster in one window, as above,
+  and treat automatic failover as off until the last node is upgraded.
 - **Snapshots are forward-compatible.** This release reads snapshots
   written by pre-fencing releases (their epoch is taken as 0, which
   is exact — they predate any promotion), snapshots written before

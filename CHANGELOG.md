@@ -34,6 +34,15 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Changed
 
+- **Control-plane links carry a protocol version (raft protocol 1), and
+  refuse a peer on another release.** Right after authenticating, both
+  ends of a `--raft-peer` link exchange their version; on a mismatch the
+  link is closed, both ends log a warning naming both versions, and the
+  dialer backs off as from an unreachable peer. This release and earlier
+  ones refuse each other's control-plane links in either direction, so a
+  cluster mixing them has no automatic failover across the two: upgrade
+  every node together (see "Upgrade and rollback notes" in
+  `docs/replication.md`).
 - **`melin_transport_core::health::RaftStatus` gains a private field**
   (the quorum-ack age, read and written through
   `millis_since_quorum_ack` and `set_millis_since_quorum_ack`), so it can
