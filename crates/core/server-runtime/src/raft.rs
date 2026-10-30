@@ -96,6 +96,75 @@ pub(crate) fn build_raft_config(config: &ServerConfig) -> Result<Option<RaftConf
             peers.len()
         ));
     }
+    // A primary's journaled ticks are what keep a one-sided partition (a
+    // replica raft leader cut from the primary alone, the other replica
+    // still reaching both) from deposing it: they move the other replica's
+    // tip ahead of the leader's, and the peer-tip veto refuses. An idle
+    // primary with no tick inside the leader's primary-down grace leaves
+    // the tips equal, and the leader promotes: ticks disabled, or a cadence
+    // too slow (the bound's derivation is beside
+    // `raft_promotion::MAX_AUTO_PROMOTE_TICK_DELAY`).
+    //
+    // Refused on every node that sets `--raft-auto-promote`, not only on a
+    // primary: any node may become the primary by promotion, and a replica
+    // can judge only its own flags, not the primary's. The dangerous
+    // cluster spans nodes (the primary ticking too slowly, the replicas
+    // auto-promoting), which no single node can see; this refusal closes it
+    // for a uniformly configured cluster, and the docs state the rule for
+    // the rest: every node of a raft cluster ticks within the bound.
+    //
+    // The group-commit window counts against the same bound: the journal
+    // stage hands a batch to the replication sender only once the window
+    // has passed since its first entry, so an idle primary's tick waits it
+    // out before it leaves for the replicas.
+    if config.raft_auto_promote {
+        let max_tick = ServerConfig::MAX_AUTO_PROMOTE_TICK_DELAY;
+        let grace_s = crate::raft_promotion::PRIMARY_DOWN_GRACE.as_secs();
+        let exposure = format!(
+            "an idle primary that journals no tick within the {grace_s} s failover grace can be \
+             deposed by a replica raft leader cut off from it alone"
+        );
+        let remedy = "or drop --raft-auto-promote and promote manually";
+        match config.tick_interval() {
+            Some(tick) if tick <= max_tick => {
+                // `saturating_add`: the sum is only compared with the
+                // bound, and a saturated one is above it all the same.
+                if tick.saturating_add(config.group_commit_delay()) > max_tick {
+                    return Err(format!(
+                        "--raft-auto-promote cannot be combined with --tick-interval-ms {} and \
+                         --group-commit-us {} — a tick waits out the group-commit window before \
+                         it replicates, and {exposure}; keep --tick-interval-ms plus the \
+                         group-commit window within {} ms (half the grace), {remedy}",
+                        config.tick_interval_ms,
+                        config.group_commit_us,
+                        max_tick.as_millis(),
+                    ));
+                }
+            }
+            _ => {
+                // With a group-commit window set, state the whole rule at
+                // once, so a cadence brought into range is not refused
+                // again on the next start for the window it leaves no room
+                // for.
+                let window = if config.group_commit_us == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        ", and keep it plus the --group-commit-us {} window within {} ms",
+                        config.group_commit_us,
+                        max_tick.as_millis(),
+                    )
+                };
+                return Err(format!(
+                    "--raft-auto-promote cannot be combined with --tick-interval-ms {} — \
+                     {exposure}; set --tick-interval-ms between 1 and {} (half the \
+                     grace){window}, {remedy}",
+                    config.tick_interval_ms,
+                    max_tick.as_millis(),
+                ));
+            }
+        }
+    }
     let dir = config
         .raft_dir
         .clone()
@@ -423,24 +492,31 @@ mod tests {
         );
     }
 
-    #[test]
-    fn auto_promote_requires_three_voters() {
+    /// A raft config that clears every other gate: three voters, this node
+    /// among them, a replication key.
+    fn three_voter_config() -> ServerConfig {
         let mut c = base_config();
         c.raft_bind = Some("127.0.0.1:7001".parse().unwrap());
         c.raft_node_id = Some(1);
         c.replication_key = Some("key".into());
+        c.raft_peer = (1..=3)
+            .map(|i| format!("{i}@10.0.0.{i}:7001#{}", b64_key(i)))
+            .collect();
+        c
+    }
+
+    #[test]
+    fn auto_promote_requires_three_voters() {
+        let mut c = three_voter_config();
         c.raft_auto_promote = true;
-        c.raft_peer = vec![
-            format!("1@10.0.0.1:7001#{}", b64_key(1)),
-            format!("2@10.0.0.2:7001#{}", b64_key(2)),
-        ];
+        let third = c.raft_peer.pop().expect("three peers");
         // A two-node cluster cannot elect after losing either node, so
         // automation would never fire when needed — refused at startup.
         let err = build_raft_config(&c).unwrap_err();
         assert!(err.contains("at least 3"), "{err}");
 
         // Three voters clears the gate with the same flags.
-        c.raft_peer.push(format!("3@10.0.0.3:7001#{}", b64_key(3)));
+        c.raft_peer.push(third);
         assert!(build_raft_config(&c).unwrap().is_some());
 
         // The flag alone (no --raft-bind) is a partial flag set, refused
@@ -451,17 +527,158 @@ mod tests {
     }
 
     #[test]
-    fn valid_config_parses_and_defaults_dir() {
+    fn auto_promote_refuses_ticks_outside_the_failover_grace() {
+        let max_ms = u64::try_from(ServerConfig::MAX_AUTO_PROMOTE_TICK_DELAY.as_millis())
+            .expect("the bound fits in u64 milliseconds");
+        let mut c = three_voter_config();
+        c.raft_auto_promote = true;
+
+        // Ticks disabled, and every cadence above the bound: refused, in
+        // one message naming both flags, the cadence given, the grace (in
+        // seconds, as the help and docs state it) and the bound.
+        let grace = format!(
+            "{} s failover grace",
+            crate::raft_promotion::PRIMARY_DOWN_GRACE.as_secs()
+        );
+        for ms in [0, max_ms + 1, u64::MAX] {
+            c.tick_interval_ms = ms;
+            let err = build_raft_config(&c).unwrap_err();
+            assert!(
+                err.contains("--raft-auto-promote")
+                    && err.contains(&format!("--tick-interval-ms {ms} "))
+                    && err.contains(&grace)
+                    && err.contains(&format!("between 1 and {max_ms} ")),
+                "{err}"
+            );
+        }
+
+        // Every cadence from 1 ms to the bound, the default included:
+        // accepted.
+        let default_ms = ServerConfig::default().tick_interval_ms;
+        assert!(
+            default_ms <= max_ms,
+            "the default cadence is within the bound"
+        );
+        for ms in [1, default_ms, max_ms] {
+            c.tick_interval_ms = ms;
+            assert!(build_raft_config(&c).unwrap().is_some(), "{ms} ms");
+        }
+
+        // The group-commit window counts against the bound: a cadence and
+        // window summing to the bound are accepted, one microsecond more is
+        // refused in a message naming both flags, and so is a window that
+        // would overflow the sum.
+        let us_per_ms = 1_000;
+        for (tick_ms, group_commit_us, accepted) in [
+            (max_ms, 0, true),
+            (max_ms - 1, us_per_ms, true),
+            (1, (max_ms - 1) * us_per_ms, true),
+            (max_ms, 1, false),
+            (max_ms - 1, us_per_ms + 1, false),
+            (default_ms, u64::MAX, false),
+        ] {
+            c.tick_interval_ms = tick_ms;
+            c.group_commit_us = group_commit_us;
+            let result = build_raft_config(&c);
+            let case = format!("{tick_ms} ms + {group_commit_us} us: {result:?}");
+            if accepted {
+                assert!(result.unwrap().is_some(), "{case}");
+            } else {
+                let err = result.unwrap_err();
+                assert!(
+                    err.contains(&format!("--tick-interval-ms {tick_ms} and "))
+                        && err.contains(&format!("--group-commit-us {group_commit_us} "))
+                        && err.contains(&grace)
+                        && err.contains(&format!("within {max_ms} ms")),
+                    "{case}"
+                );
+            }
+        }
+        // A cadence out of range is refused as such whatever the window,
+        // and with a window set the message states the sum rule too, so
+        // one restart finds the whole rule; without one it does not
+        // mention the window.
+        for ms in [0, max_ms + 1] {
+            c.tick_interval_ms = ms;
+            c.group_commit_us = 1;
+            let err = build_raft_config(&c).unwrap_err();
+            assert!(
+                err.contains(&format!("between 1 and {max_ms} "))
+                    && err.contains("--group-commit-us 1 window")
+                    && err.contains(&format!("within {max_ms} ms")),
+                "{err}"
+            );
+            c.group_commit_us = 0;
+            let err = build_raft_config(&c).unwrap_err();
+            assert!(!err.contains("--group-commit-us"), "{err}");
+        }
+
+        // Without auto-promotion (manual promotion only), any cadence,
+        // ticks disabled included, and any group-commit window: accepted.
+        c.raft_auto_promote = false;
+        for ms in [0, 1, max_ms, max_ms + 1, u64::MAX] {
+            c.tick_interval_ms = ms;
+            assert!(build_raft_config(&c).unwrap().is_some(), "{ms} ms");
+        }
+        c.group_commit_us = u64::MAX;
+        assert!(build_raft_config(&c).unwrap().is_some());
+
+        // Ticks disabled on a node without raft: no control plane, nothing
+        // to refuse.
         let mut c = base_config();
+        c.tick_interval_ms = 0;
+        assert!(build_raft_config(&c).unwrap().is_none());
+    }
+
+    /// The `--help` of the three flags states the bound in figures (a doc
+    /// comment cannot interpolate a constant), so this pins the figures to
+    /// the constants: a change to either fails here rather than leaving
+    /// the help stating a bound the node no longer enforces.
+    #[test]
+    fn the_tick_bound_in_the_help_matches_the_constants() {
+        use clap::CommandFactory as _;
+        let bound = format!(
+            "1 and {} ms (half the {} s failover grace)",
+            ServerConfig::MAX_AUTO_PROMOTE_TICK_DELAY.as_millis(),
+            crate::raft_promotion::PRIMARY_DOWN_GRACE.as_secs(),
+        );
+        let above = format!(
+            "above {} ms (half the {} s failover grace)",
+            ServerConfig::MAX_AUTO_PROMOTE_TICK_DELAY.as_millis(),
+            crate::raft_promotion::PRIMARY_DOWN_GRACE.as_secs(),
+        );
+        let window = format!(
+            "plus --tick-interval-ms within {} ms",
+            ServerConfig::MAX_AUTO_PROMOTE_TICK_DELAY.as_millis(),
+        );
+        let sum = format!(
+            "window at most {} ms",
+            ServerConfig::MAX_AUTO_PROMOTE_TICK_DELAY.as_millis(),
+        );
+        let command = ServerConfig::command();
+        for (flag, expected) in [
+            ("raft_auto_promote", bound),
+            ("raft_auto_promote", sum),
+            ("tick_interval_ms", above),
+            ("group_commit_us", window),
+        ] {
+            let arg = command
+                .get_arguments()
+                .find(|a| a.get_id() == flag)
+                .expect("the flag exists");
+            let help = arg
+                .get_long_help()
+                .or(arg.get_help())
+                .expect("the flag has help")
+                .to_string();
+            assert!(help.contains(&expected), "{flag}: {help}");
+        }
+    }
+
+    #[test]
+    fn valid_config_parses_and_defaults_dir() {
+        let mut c = three_voter_config();
         c.journal = "/data/melin.journal".into();
-        c.raft_bind = Some("0.0.0.0:7001".parse().unwrap());
-        c.raft_node_id = Some(1);
-        c.replication_key = Some("key".into());
-        c.raft_peer = vec![
-            format!("1@10.0.0.1:7001#{}", b64_key(1)),
-            format!("2@10.0.0.2:7001#{}", b64_key(2)),
-            format!("3@10.0.0.3:7001#{}", b64_key(3)),
-        ];
         let rc = build_raft_config(&c).unwrap().unwrap();
         assert_eq!(rc.node_id, 1);
         assert_eq!(rc.peers.len(), 3);

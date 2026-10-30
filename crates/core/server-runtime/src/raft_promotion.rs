@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use melin_raft::{JournalTip, PeerTips, QUORUM_ACK_MAX_AGE};
+use melin_raft::{JournalTip, PEER_TIP_REPORT_MAX_DELAY, PeerTips, QUORUM_ACK_MAX_AGE};
 use melin_transport_core::health::RaftStatus;
 use tracing::{info, warn};
 
@@ -55,7 +55,88 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// still-recovering primary is accepted as a real failover (the
 /// ex-primary is fenced on contact), and the operator rule is to bring
 /// the cluster up primary-first — see `docs/replication.md`.
-const PRIMARY_DOWN_GRACE: Duration = Duration::from_secs(3);
+///
+/// `pub(crate)` for `build_raft_config`, whose refusal of a tick cadence
+/// above [`MAX_AUTO_PROMOTE_TICK_DELAY`] names the grace it is half of.
+pub(crate) const PRIMARY_DOWN_GRACE: Duration = Duration::from_secs(3);
+
+// The startup refusal and the `--help` text state the grace in whole
+// seconds (`as_secs`, which truncates); a fractional grace would make them
+// understate it, so it must stay a whole number of seconds.
+const _: () = assert!(
+    PRIMARY_DOWN_GRACE.subsec_nanos() == 0,
+    "PRIMARY_DOWN_GRACE is stated in whole seconds: keep it whole, or state it in ms"
+);
+
+/// The slowest `--tick-interval-ms` a node accepts with
+/// `--raft-auto-promote`, its `--group-commit-us` window included: half
+/// of [`PRIMARY_DOWN_GRACE`].
+///
+/// The one-sided partition: the replica raft leader `L` loses only its
+/// link to the primary, the other replica `O` still reaches both. `L`'s
+/// own tip is frozen from the cut on; `O`'s moves with the next entry the
+/// primary journals, and once `L` sees `O` ahead the peer-tip veto in
+/// [`auto_promotion_decision`] refuses. An idle primary journals only its
+/// clock ticks, so a tick must land inside `L`'s grace, with time to
+/// travel, or `L` promotes over a primary the rest of the cluster still
+/// sees. From the cut, the worst case adds up:
+///
+/// - the next tick: at most one cadence after the last, plus the ingress
+///   loop's lateness in noticing it is due (`TickSchedule` keeps a grid
+///   one cadence apart, and a loop that fell behind restarts the grid
+///   from the late tick rather than skipping, so the gap never exceeds a
+///   cadence plus that lateness; a tick is dropped only on a full input
+///   ring, whose queued entries move the tip themselves);
+/// - the group-commit window: the journal stage hands a batch to the
+///   replication sender only once `--group-commit-us` has passed since its
+///   first entry, so an idle primary's tick waits the window out. The
+///   startup check holds the cadence plus this window to this bound, so
+///   the two items so far together stay within it. The sum is a
+///   deliberate upper bound, not `max(cadence, window)`: a window shorter
+///   than the cadence delays every tick alike and the gap stays one
+///   cadence, but a longer one coalesces ticks into a batch whose first
+///   entry may come up to a cadence after the previous flush, and that
+///   batch then waits a full window, so the gap is the two added;
+/// - the tick from the primary's input ring to `O`'s replication receiver,
+///   which advances `O`'s tip on receipt, before persisting
+///   ([`TICK_DATA_PATH_BUDGET`] covers this and the lateness above);
+/// - `O`'s tip to `L`: on the reply to `L`'s next heartbeat, at most
+///   [`PEER_TIP_REPORT_MAX_DELAY`].
+///
+/// `L`'s grace starts no earlier than the cut (when its replication
+/// receiver sees the link down, and the poll loop after it), so the sum
+/// must stay under [`PRIMARY_DOWN_GRACE`]; the assertion below checks it.
+/// Half the grace rather than the largest cadence that fits leaves the
+/// rest as margin for what the budgets understate (a scheduling stall, a
+/// slow disk delaying the journal stage), and the default cadence sits far
+/// inside it.
+pub(crate) const MAX_AUTO_PROMOTE_TICK_DELAY: Duration = PRIMARY_DOWN_GRACE
+    .checked_div(2)
+    .expect("division by a non-zero constant");
+
+/// The time a due tick takes from the primary's ingress loop to the other
+/// replica's journal tip: the loop noticing the deadline (the io_uring
+/// reader arms a kernel timeout for it, the DPDK poll thread checks every
+/// few thousand polls), the input ring, the journal stage's encoding (its
+/// group-commit window is counted against the cadence instead), the
+/// replication sender and the wire. Sub-millisecond on a healthy pair;
+/// the budget covers a scheduling hiccup. Read only by the assertion
+/// below.
+const TICK_DATA_PATH_BUDGET: Duration = Duration::from_millis(250);
+
+// The derivation on `MAX_AUTO_PROMOTE_TICK_DELAY`: a tick at the
+// slowest accepted cadence (group-commit window included) still moves the
+// other replica's tip, and reaches the raft leader, before the leader's
+// primary-down grace ends.
+// In milliseconds because `Duration`'s operators are not `const`.
+const _: () = assert!(
+    MAX_AUTO_PROMOTE_TICK_DELAY.as_millis()
+        + TICK_DATA_PATH_BUDGET.as_millis()
+        + PEER_TIP_REPORT_MAX_DELAY.as_millis()
+        < PRIMARY_DOWN_GRACE.as_millis(),
+    "MAX_AUTO_PROMOTE_TICK_DELAY lets an idle primary's next tick reach the raft leader \
+     after its PRIMARY_DOWN_GRACE ends: lower it, or lengthen the grace"
+);
 
 /// How long a configured peer may go unheard before the journal-safety
 /// veto treats it as dead rather than merely not-yet-sampled.

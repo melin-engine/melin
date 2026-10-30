@@ -115,8 +115,18 @@ pub const QUORUM_ACK_MAX_AGE: Duration = Duration::from_millis(QUORUM_ACK_MAX_AG
 const MAX_TICK_PERIOD_MS: u64 = (HEARTBEAT_INTERVAL_MS + HEARTBEAT_JITTER_MS - 1) * 3 / 2;
 
 /// Allowance for one heartbeat round trip, for the liveness assertion
-/// only.
+/// and [`PEER_TIP_REPORT_MAX_DELAY`].
 const RTT_BUDGET_MS: u64 = 100;
+
+/// The longest a live, reachable follower's journal-tip change takes to
+/// reach the raft leader's [`PeerTips`](crate::PeerTips): every reply
+/// envelope carries the responder's tip as it stands when it answers, and
+/// the leader heartbeats each follower once per tick, so the change rides
+/// the reply to the next heartbeat, at most one tick period
+/// (`MAX_TICK_PERIOD_MS`) plus a round trip away. Read by the server
+/// runtime to bound the tick cadence automatic promotion accepts.
+pub const PEER_TIP_REPORT_MAX_DELAY: Duration =
+    Duration::from_millis(MAX_TICK_PERIOD_MS + RTT_BUDGET_MS);
 
 // A healthy leader's reported quorum-ack age peaks at about one tick plus
 // a round trip (the flush just before a heartbeat's reply lands), so the

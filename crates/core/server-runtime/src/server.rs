@@ -210,6 +210,9 @@ pub struct ServerConfig {
     #[arg(long, default_value = DEFAULT_CORES, value_parser = parse_cores)]
     pub cores: PipelineCores,
     /// Group commit coalescing delay in microseconds. Keep at 0 for TCP.
+    /// With `--raft-auto-promote`, keep this delay plus --tick-interval-ms
+    /// within 1500 ms: an idle primary's tick waits it out before it
+    /// replicates (see --tick-interval-ms).
     #[arg(long, default_value_t = 0)]
     pub group_commit_us: u64,
     /// Heartbeat interval in seconds. The server sends a heartbeat to idle
@@ -464,7 +467,12 @@ pub struct ServerConfig {
     /// transitions) fires in deterministic, journaled lockstep. There is
     /// no separate tick thread on either transport. Set to 0 to disable
     /// tick generation entirely (useful for benchmarks that don't
-    /// exercise time-driven features).
+    /// exercise time-driven features). With `--raft-auto-promote`, 0 and
+    /// any cadence above 1500 ms (half the 3 s failover grace) are
+    /// refused: an idle primary's ticks, landing inside that grace, are
+    /// part of what keeps automatic failover from deposing it (see
+    /// docs/replication.md). A `--group-commit-us` delay counts against
+    /// the same bound.
     ///
     /// Defaults to 250 ms. Under load the matching stage advances the
     /// application's clock at every-event resolution from `slot.timestamp_ns`
@@ -534,7 +542,11 @@ pub struct ServerConfig {
     /// operator policy decision. Requires `--raft-bind` and at least
     /// three configured voters (a two-node cluster cannot elect after
     /// losing either node, so automation would be dead weight with real
-    /// misconfiguration risk; see docs/replication.md).
+    /// misconfiguration risk; see docs/replication.md), and clock ticks at
+    /// `--tick-interval-ms` between 1 and 1500 ms (half the 3 s failover
+    /// grace), and that cadence plus the `--group-commit-us` window at
+    /// most 1500 ms: run every node of a raft cluster with ticks within
+    /// that bound.
     #[arg(long, default_value_t = false)]
     pub raft_auto_promote: bool,
 }
@@ -607,6 +619,16 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
+    /// The longest a node with `--raft-auto-promote` may take to hand an
+    /// idle primary's clock tick to replication: its `--tick-interval-ms`
+    /// plus its `--group-commit-us` window, summed. Half the primary-down grace automatic
+    /// failover waits out, so that an idle primary's next clock tick moves
+    /// a still-connected replica's journal tip ahead, and the raft leader
+    /// sees it, before a replica cut off from that primary alone may
+    /// promote (the derivation is beside its definition).
+    pub const MAX_AUTO_PROMOTE_TICK_DELAY: std::time::Duration =
+        crate::raft_promotion::MAX_AUTO_PROMOTE_TICK_DELAY;
+
     /// Whether this node accepts replicas: whether `--replication-bind`
     /// is set, in either role (a replica holds the port from boot, and
     /// serves replicas on it once promoted). The one answer the

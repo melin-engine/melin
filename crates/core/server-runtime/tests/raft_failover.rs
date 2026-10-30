@@ -86,6 +86,57 @@ const JOURNALED: &str = "melin_ack_policy_journaled";
 /// to heartbeat.
 const TICK_MS: u64 = 5;
 
+/// What the primary journals on its own clock, and how soon it replicates
+/// it: its `--tick-interval-ms` and `--group-commit-us`. Never a cadence
+/// of 0, nor a cadence plus window above
+/// [`ServerConfig::MAX_AUTO_PROMOTE_TICK_DELAY`]: every node runs
+/// `--raft-auto-promote`, which refuses either.
+#[derive(Clone, Copy, Debug)]
+struct PrimaryClock {
+    tick_interval_ms: u64,
+    group_commit_us: u64,
+}
+
+impl PrimaryClock {
+    /// Ticking every `tick_interval_ms`, with no group-commit window.
+    fn ticking_every(tick_interval_ms: u64) -> Self {
+        Self {
+            tick_interval_ms,
+            group_commit_us: 0,
+        }
+    }
+
+    /// The default cadence and window, as a node runs unless a test needs
+    /// another.
+    fn default_cadence() -> Self {
+        let defaults = ServerConfig::default();
+        Self {
+            tick_interval_ms: defaults.tick_interval_ms,
+            group_commit_us: defaults.group_commit_us,
+        }
+    }
+
+    /// The slowest cadence plus window `--raft-auto-promote` accepts,
+    /// `window` of it the group-commit window and the rest the cadence.
+    fn at_the_auto_promote_bound(window: Duration) -> Self {
+        let bound = ServerConfig::MAX_AUTO_PROMOTE_TICK_DELAY;
+        let cadence = bound
+            .checked_sub(window)
+            .expect("the window fits inside the bound");
+        // Truncated, the flags would sum below the bound and the test
+        // would no longer run at it.
+        assert!(
+            cadence.subsec_nanos().is_multiple_of(1_000_000)
+                && window.subsec_nanos().is_multiple_of(1_000),
+            "the flags take whole milliseconds of cadence and microseconds of window"
+        );
+        Self {
+            tick_interval_ms: u64::try_from(cadence.as_millis()).expect("fits in u64 ms"),
+            group_commit_us: u64::try_from(window.as_micros()).expect("fits in u64 us"),
+        }
+    }
+}
+
 /// How long the finding-10 refusal is watched once the primary is gone:
 /// past the link-down grace, an election and a promotion, which a replica
 /// judging by a stale `disk+ram` would have completed.
@@ -481,8 +532,9 @@ impl Cluster {
     }
 
     /// Node `i`'s configuration: the same journal, keys and raft identity
-    /// on every boot, with health and admin endpoints.
-    fn config(&self, i: usize, ack_policy: AckPolicy, tick_interval_ms: u64) -> ServerConfig {
+    /// on every boot, with health and admin endpoints, ticking at the
+    /// default cadence.
+    fn config(&self, i: usize, ack_policy: AckPolicy) -> ServerConfig {
         let key_path = self.tmp.path().join(format!("key-{i}"));
         std::fs::write(&key_path, self.nodes[i].key.to_bytes()).unwrap();
         ServerConfig {
@@ -495,7 +547,6 @@ impl Cluster {
             // while a spinner would starve whatever shares its core, the
             // test's own client included.
             cores: PipelineCores::unpinned(),
-            tick_interval_ms,
             snapshot_interval_ms: 0,
             health_bind: Some(self.nodes[i].health_addr),
             admin_bind: Some(self.nodes[i].admin_addr),
@@ -520,10 +571,11 @@ impl Cluster {
         )
     }
 
-    /// Node 0, the primary, under `ack_policy`, ticking every
-    /// `tick_interval_ms` (0: no ticks).
-    fn start_primary(&self, ack_policy: AckPolicy, tick_interval_ms: u64) -> Node {
-        let mut config = self.config(0, ack_policy, tick_interval_ms);
+    /// Node 0, the primary, under `ack_policy`, on `clock`.
+    fn start_primary(&self, ack_policy: AckPolicy, clock: PrimaryClock) -> Node {
+        let mut config = self.config(0, ack_policy);
+        config.tick_interval_ms = clock.tick_interval_ms;
+        config.group_commit_us = clock.group_commit_us;
         config.replication_bind = Some(self.nodes[0].addrs.replication());
         self.start(&self.nodes[0].addrs, config)
     }
@@ -536,7 +588,7 @@ impl Cluster {
     fn start_replicas(&self, ack_policy: AckPolicy, replication_bind: bool) -> Vec<Node> {
         (1..3)
             .map(|i| {
-                let mut config = self.config(i, ack_policy, 0);
+                let mut config = self.config(i, ack_policy);
                 config.replica_of = Some(self.replica_of(i));
                 config.replication_bind =
                     replication_bind.then(|| self.nodes[i].addrs.replication());
@@ -547,8 +599,7 @@ impl Cluster {
 
     /// The replicas (under `ack_policy`, not replicating if promoted)
     /// first, until one of them leads the control plane, then the primary
-    /// under `ack_policy`, ticking every `tick_interval_ms` (0: no ticks,
-    /// so it journals nothing a client does not write). Neither replica
+    /// under `ack_policy`, on `clock`. Neither replica
     /// can promote meanwhile: one that never observed a primary refuses.
     /// This puts raft leadership on a replica deterministically, which a
     /// normal bring-up does not (the primary, raft id 1, ticks fastest
@@ -559,12 +610,12 @@ impl Cluster {
     /// leader's lease. Checked here on every bring-up: the cluster forms
     /// with every node following the same leader at the same term, and no
     /// node ever reports a higher term.
-    fn start_replicas_first(&self, ack_policy: AckPolicy, tick_interval_ms: u64) -> ReplicaLed {
+    fn start_replicas_first(&self, ack_policy: AckPolicy, clock: PrimaryClock) -> ReplicaLed {
         let replicas = self.start_replicas(ack_policy, false);
         // Every term is above 0.
         let (leader, term) = self.wait_leader_above(0, &[1, 2]);
 
-        let primary = self.start_primary(ack_policy, tick_interval_ms);
+        let primary = self.start_primary(ack_policy, clock);
         self.wait_formed(&primary);
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
@@ -767,10 +818,8 @@ fn killed_primary_triggers_exactly_one_auto_promotion() {
     let cluster = Cluster::new();
     let nodes = &cluster.nodes;
 
-    // --- Primary (node 0) under `disk+ram`, and replicas (nodes 1, 2).
-    // No ticks, so the primary journals nothing but its lineage's first
-    // policy change before it is killed. ---
-    let primary = cluster.start_primary(AckPolicy::DiskAndRam, 0);
+    // --- Primary (node 0) under `disk+ram`, and replicas (nodes 1, 2). ---
+    let primary = cluster.start_primary(AckPolicy::DiskAndRam, PrimaryClock::default_cadence());
     let replicas = cluster.start_replicas(AckPolicy::DiskAndRam, false);
 
     // --- Phase 1: cluster forms. ---
@@ -837,7 +886,7 @@ fn killed_primary_triggers_exactly_one_auto_promotion() {
     // data-plane handshake.
     let (revived_addrs, revived_endpoints) = (melin_test_node::addrs(0, port), [port(), port()]);
     let revived = {
-        let mut config = cluster.config(0, AckPolicy::DiskAndRam, 0);
+        let mut config = cluster.config(0, AckPolicy::DiskAndRam);
         config.health_bind = Some(revived_endpoints[0]);
         config.admin_bind = Some(revived_endpoints[1]);
         cluster.start(&revived_addrs, config)
@@ -878,7 +927,8 @@ fn killed_primary_triggers_exactly_one_auto_promotion() {
 fn a_weakening_streamed_between_ticks_stops_auto_promotion() {
     let cluster = Cluster::new();
     let health = cluster.nodes[0].health_addr;
-    let primary = cluster.start_primary(AckPolicy::DiskAndRam, TICK_MS);
+    let primary =
+        cluster.start_primary(AckPolicy::DiskAndRam, PrimaryClock::ticking_every(TICK_MS));
     // The replicas' own policy is `disk+ram`: only the stream can tell
     // them otherwise.
     let replicas = cluster.start_replicas(AckPolicy::DiskAndRam, false);
@@ -922,7 +972,7 @@ fn a_weakening_streamed_between_ticks_stops_auto_promotion() {
 fn a_strengthening_streamed_between_ticks_lets_the_failover_proceed() {
     let cluster = Cluster::new();
     let health = cluster.nodes[0].health_addr;
-    let primary = cluster.start_primary(AckPolicy::Disk, TICK_MS);
+    let primary = cluster.start_primary(AckPolicy::Disk, PrimaryClock::ticking_every(TICK_MS));
     let replicas = cluster.start_replicas(AckPolicy::Disk, true);
     cluster.wait_formed(&primary);
 
@@ -961,7 +1011,7 @@ fn replica_leader_promotes_when_the_primary_dies() {
         replicas,
         leader,
         ..
-    } = cluster.start_replicas_first(AckPolicy::DiskAndRam, 0);
+    } = cluster.start_replicas_first(AckPolicy::DiskAndRam, PrimaryClock::default_cadence());
 
     primary.stop();
     assert_eq!(
@@ -998,7 +1048,7 @@ fn a_replica_leader_alone_never_auto_promotes() {
         mut replicas,
         leader,
         term,
-    } = cluster.start_replicas_first(AckPolicy::DiskAndRam, 0);
+    } = cluster.start_replicas_first(AckPolicy::DiskAndRam, PrimaryClock::default_cadence());
 
     // `replicas` holds nodes 1 and 2 at 0 and 1.
     let survivor = replicas.remove(leader - 1);
@@ -1040,7 +1090,7 @@ fn a_replica_leader_alone_never_auto_promotes() {
 #[serial]
 fn an_isolated_replica_leader_is_replaced_by_the_primary_and_the_other_replica() {
     let cluster = Cluster::partitionable();
-    let led = cluster.start_replicas_first(AckPolicy::DiskAndRam, 0);
+    let led = cluster.start_replicas_first(AckPolicy::DiskAndRam, PrimaryClock::default_cadence());
 
     cluster.isolate(led.leader);
     cluster.wait_leader_above(led.term, &[0, led.other()]);
@@ -1049,69 +1099,58 @@ fn an_isolated_replica_leader_is_replaced_by_the_primary_and_the_other_replica()
     led.stop();
 }
 
-/// What the primary journals while its replica leader is cut from it
-/// alone ([`replica_leader_cut_from_the_primary_alone`]): whatever moves
-/// the other replica's tip, which still follows the primary, ahead of the
-/// leader's.
-#[derive(Clone, Copy, Debug)]
-enum PrimaryTraffic {
-    /// A client write after another, and no clock ticks: the writes alone
-    /// move the tip.
-    Writes,
-    /// No client write, and clock ticks at the default
-    /// `--tick-interval-ms`: an idle primary as deployed, whose ticks are
-    /// journal entries like any other and replicate as such.
-    TicksOnly,
-}
-
 /// The one-sided partition
-/// (`docs/internal/raft-control-plane-follow-ups.md`, item 4): the replica
-/// leader loses only its links to the primary, while the other replica
-/// still reaches both. Whatever the primary journals under `traffic`
-/// reaches the other replica only, so its tip moves ahead of the leader's
-/// and the peer-tip veto keeps the leader from promoting, and the other
-/// replica, whose own primary link is up, does not campaign: nobody
+/// (`docs/internal/raft-control-plane-follow-ups.md`, item 4) with an idle
+/// primary on `clock`, a cadence plus group-commit window at the slowest
+/// `--raft-auto-promote` accepts
+/// ([`ServerConfig::MAX_AUTO_PROMOTE_TICK_DELAY`]): the replica leader
+/// loses only its links to the primary, while the other replica still
+/// reaches both. No client writes during the watch, so the primary
+/// journals only its clock ticks; they reach the other replica only, so
+/// its tip moves ahead of the leader's inside the leader's primary-down
+/// grace and the peer-tip veto keeps the leader from promoting, and the
+/// other replica, whose own primary link is up, does not campaign: nobody
 /// promotes over [`NO_PROMOTION_WATCH`], and the primary still acks a
 /// write at its end. Once healed, the leader rejoins as a replica. That
 /// the partition took effect is checked too: the primary, hearing from no
 /// leader, campaigns above the leader's term, in vain.
 ///
-/// A characterisation of what the code does, not a guarantee: a primary
-/// that journals nothing at all (no writes, ticks disabled) leaves the
-/// tips equal, nothing vetoes, and the leader promotes (the known gap,
-/// left untested since the outcome is the defect).
-fn replica_leader_cut_from_the_primary_alone(traffic: PrimaryTraffic) {
+/// The end-to-end check of the bound's derivation (beside the constant in
+/// `raft_promotion.rs`): at the slowest accepted cadence and window a tick
+/// still lands, replicates and reaches the leader before its grace ends. A
+/// primary that journals nothing within the grace (ticks disabled, or a
+/// cadence above the bound, both refused at startup) leaves the tips
+/// equal, nothing vetoes, and the leader promotes (the known gap, left
+/// untested since the outcome is the defect).
+///
+/// There is no variant with writes flowing: client writes moved the tip on
+/// their own only on a primary with no tick inside the test, a cadence
+/// `--raft-auto-promote` now refuses, so beside the ticks they would pin
+/// nothing this test does not (the primary acking writes through the
+/// partition is the write after the watch).
+fn replica_leader_cut_from_the_primary_alone_while_it_is_idle(clock: PrimaryClock) {
     melin_test_node::logs::capture_if_requested();
-    let tick_interval_ms = match traffic {
-        PrimaryTraffic::Writes => 0,
-        PrimaryTraffic::TicksOnly => ServerConfig::default().tick_interval_ms,
-    };
     let cluster = Cluster::partitionable();
-    let led = cluster.start_replicas_first(AckPolicy::DiskAndRam, tick_interval_ms);
+    let led = cluster.start_replicas_first(AckPolicy::DiskAndRam, clock);
     let primary_health = cluster.nodes[0].health_addr;
-    // Connected at the first write: under `TicksOnly` that is after the
-    // watch, so an idle client cannot outlast the primary's connection
-    // timeout.
-    let mut conn = None;
 
     cluster.isolate_from_primary(led.leader);
     wait_for_gauge(primary_health, "melin_replicas_connected", 1);
     let deadline = Instant::now() + NO_PROMOTION_WATCH;
     while Instant::now() < deadline {
-        if let PrimaryTraffic::Writes = traffic {
-            acked_write(conn.get_or_insert_with(|| cluster.client(&led.primary)));
-        }
         // Also paces the loop: each replica's refusal waits out the
         // patience.
         assert_eq!(
             cluster.serving_replicas(Duration::from_millis(300)),
             Vec::<usize>::new(),
-            "a replica promoted while the leader was cut from the primary alone \
-             ({traffic:?})\n{}",
+            "a replica promoted while the leader was cut from the primary alone ({clock:?})\n{}",
             cluster.cluster_summary()
         );
     }
-    acked_write(conn.get_or_insert_with(|| cluster.client(&led.primary)));
+    // Connected only now, after the watch, so an idle client cannot
+    // outlast the primary's connection timeout.
+    let mut conn = cluster.client(&led.primary);
+    acked_write(&mut conn);
 
     // The partition took effect, and the leader kept its majority through
     // the other replica: the primary, hearing from no leader, campaigns
@@ -1130,7 +1169,7 @@ fn replica_leader_cut_from_the_primary_alone(traffic: PrimaryTraffic) {
 
     cluster.heal();
     wait_for_gauge(primary_health, "melin_replicas_connected", 2);
-    acked_write(conn.get_or_insert_with(|| cluster.client(&led.primary)));
+    acked_write(&mut conn);
     assert_eq!(
         cluster.serving_replicas(Duration::from_millis(300)),
         Vec::<usize>::new(),
@@ -1142,23 +1181,35 @@ fn replica_leader_cut_from_the_primary_alone(traffic: PrimaryTraffic) {
     led.stop();
 }
 
-/// [`replica_leader_cut_from_the_primary_alone`] with writes flowing and
-/// no ticks: the writes alone keep the leader from promoting.
-#[test]
-#[serial]
-fn a_replica_leader_cut_from_the_primary_alone_does_not_promote_while_writes_flow() {
-    replica_leader_cut_from_the_primary_alone(PrimaryTraffic::Writes);
-}
-
-/// [`replica_leader_cut_from_the_primary_alone`] with no client write and
-/// the default tick cadence: the primary's ticks alone keep the leader
-/// from promoting, each moving the other replica's tip ahead of the
-/// leader's well inside the primary-down grace. The idle-primary gap of
-/// item 4 needs ticks disabled.
+/// [`replica_leader_cut_from_the_primary_alone_while_it_is_idle`] with the
+/// whole bound in the cadence: the next tick is the latest it may be.
 #[test]
 #[serial]
 fn a_replica_leader_cut_from_the_primary_alone_does_not_promote_while_the_primary_is_idle() {
-    replica_leader_cut_from_the_primary_alone(PrimaryTraffic::TicksOnly);
+    replica_leader_cut_from_the_primary_alone_while_it_is_idle(
+        PrimaryClock::at_the_auto_promote_bound(Duration::ZERO),
+    );
+}
+
+/// [`replica_leader_cut_from_the_primary_alone_while_it_is_idle`] with all
+/// of the bound but a [`TICK_MS`] cadence in the group-commit window: the
+/// window outlasts the cadence, so ticks coalesce, each batch opens on a
+/// tick up to a cadence after the previous flush and then waits the whole
+/// window out, and ticks replicate a full bound apart through the window
+/// rather than the cadence. A window shorter than the cadence would not
+/// reach this: each tick would flush alone before the next, one cadence
+/// apart, and the test would pass with the window left out of the check.
+#[test]
+#[serial]
+fn a_replica_leader_cut_from_the_primary_alone_does_not_promote_while_an_idle_primary_group_commits()
+ {
+    replica_leader_cut_from_the_primary_alone_while_it_is_idle(
+        PrimaryClock::at_the_auto_promote_bound(
+            ServerConfig::MAX_AUTO_PROMOTE_TICK_DELAY
+                .checked_sub(Duration::from_millis(TICK_MS))
+                .expect("the bound outlasts the test cadence"),
+        ),
+    );
 }
 
 /// What [`an_isolated_replica_leader_never_deposes_a_healthy_primary`]
@@ -1209,7 +1260,7 @@ struct IsolationRecord {
 #[serial]
 fn an_isolated_replica_leader_never_deposes_a_healthy_primary() {
     let cluster = Cluster::partitionable();
-    let led = cluster.start_replicas_first(AckPolicy::DiskAndRam, 0);
+    let led = cluster.start_replicas_first(AckPolicy::DiskAndRam, PrimaryClock::default_cadence());
     let (leader, other, term) = (led.leader, led.other(), led.term);
     let primary_health = cluster.nodes[0].health_addr;
     let mut conn = cluster.client(&led.primary);
@@ -1322,7 +1373,7 @@ const FENCE_WATCH: Duration = Duration::from_secs(60);
 fn a_serving_leader_fences_on_a_followers_higher_epoch() {
     melin_test_node::logs::capture_if_requested();
     let cluster = Cluster::partitionable();
-    let primary = cluster.start_primary(AckPolicy::DiskAndRam, 0);
+    let primary = cluster.start_primary(AckPolicy::DiskAndRam, PrimaryClock::default_cadence());
     let replicas = cluster.start_replicas(AckPolicy::DiskAndRam, false);
     cluster.wait_formed(&primary);
 

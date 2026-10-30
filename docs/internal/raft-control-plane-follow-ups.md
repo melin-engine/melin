@@ -11,9 +11,11 @@ anchors; line numbers are left out because they go stale.
 The first three items are one follow-up branch, **in this order**: the
 raft protocol version (done), then mutual authentication in the same
 handshake change (done), then the stale-peer-tip stamp, which is the
-first envelope change the version protects (done). The one-sided partition gap
-after them turned out, by test, to need ticks disabled; its fix has only been
-sketched, for that case.
+first envelope change the version protects (done). The one-sided
+partition gap after them turned out, by test, to need no tick inside the
+failover grace, and is closed by configuration for a uniformly configured
+cluster (item 4); its envelope fix has only been sketched, for mixed or
+slow-ticking deployments.
 
 ## 1. A raft protocol version (done)
 
@@ -151,7 +153,7 @@ same boot wins over an earlier one; the counter and the tip are taken
 together (a unit test over the stamping helper); startup refuses when
 `boot_id` cannot be read (through a seam over the path).
 
-## 4. The one-sided partition with an idle primary (pinned: a gap only with ticks disabled)
+## 4. The one-sided partition with an idle primary (closed by configuration: auto-promotion refuses ticks outside the failover grace)
 
 **Gap.** The replica raft leader `L` loses only its link to the primary,
 while the other replica `O` still reaches both. `L` keeps a fresh lease
@@ -175,37 +177,62 @@ primary journals anything during `PRIMARY_DOWN_GRACE`:
   batch into its ring, before the entry is persisted
   (`receiver_transport.rs`); `TipSource::stamp` reads that tip into every
   envelope, so `O`'s next heartbeat reply to `L` carries it, while `L`'s
-  tip, its replication link cut, stays where it was. Pinned both ways by
-  `replica_leader_cut_from_the_primary_alone` in
-  `crates/core/server-runtime/tests/raft_failover.rs`:
-  `..._does_not_promote_while_writes_flow` (writes, ticks disabled) and
-  `..._does_not_promote_while_the_primary_is_idle` (no write, the default
-  tick cadence; with `RUST_LOG` set, `L`'s refusal once the grace ends is
-  the peer-tip veto's);
-- if it does not, that is with ticks disabled (`--tick-interval-ms 0`) and
-  no client write, the tips stay equal, nothing vetoes, and `L` promotes
-  and deposes a primary the rest of the cluster can see. Confirmed by
+  tip, its replication link cut, stays where it was. Pinned by
+  `replica_leader_cut_from_the_primary_alone_while_it_is_idle` in
+  `crates/core/server-runtime/tests/raft_failover.rs`: no write, the
+  primary at the slowest cadence plus group-commit window auto-promotion
+  accepts, run once with all of it in the cadence and once with all but
+  a few milliseconds of it in the window, so that the window outlasts
+  the cadence and the sum, not the larger of the two, is what is tested;
+  with `RUST_LOG` set, `L`'s refusal once the grace
+  ends is the peer-tip veto's. It had a twin with writes flowing and no
+  tick inside the test, which pinned that writes alone suffice; it went
+  with the cadence bound below, which forbids that configuration on an
+  auto-promoting node, leaving the twin nothing the idle test does not
+  pin;
+- if it does not, that is with ticks disabled (`--tick-interval-ms 0`) or
+  too slow for one to land inside the grace, and no client write, the tips
+  stay equal, nothing vetoes, and `L` promotes and deposes a primary the
+  rest of the cluster can see. Confirmed by
   running the idle-primary test once with the primary's ticks disabled (a
   scratch change, not kept): `L` auto-promoted as the grace ran out and
   minted its epoch. Not kept as a test, since it would pin the defect.
-  `docs/replication.md` tells operators so, beside the link grace.
 
 This is the documented one-sided-link limitation of `PRIMARY_DOWN_GRACE`
 (the link flag is this node's socket only). The same partition also
 reaches the one case the mint-time argument leaves open (see
 `raft-control-plane.md`): `L` steps down after its confirmation and
 before the mint, and the newer leader is the primary, which never mints.
-With ticks on, the peer-tip veto keeps `L` from reaching its
-confirmation through this partition at all, so reaching that case this
-way needs ticks disabled as well.
+With ticks inside the grace, the peer-tip veto keeps `L` from reaching
+its confirmation through this partition at all, so reaching that case this
+way needs ticks disabled or too slow as well.
 
-Whether auto-promotion should be supported with ticks disabled at all (and
-if not, whether to refuse or warn at startup) is open, for the maintainer.
-The fix below is for the case it is.
+**Closed by configuration (decided by the maintainer).** Ticks disabled is
+a benchmark option, and a cadence too slow for a tick to land inside the
+grace is as exposed, so auto-promotion supports neither: a node refuses to
+start with `--raft-auto-promote` and a `--tick-interval-ms` of 0 or above
+`MAX_AUTO_PROMOTE_TICK_DELAY`, half of `PRIMARY_DOWN_GRACE`, or whose
+`--group-commit-us` window, which every tick waits out before it
+replicates, takes the sum above it (`build_raft_config` in
+`crates/core/server-runtime/src/raft.rs`, beside the three-voter refusal,
+pinned by `auto_promote_refuses_ticks_outside_the_failover_grace`; the
+bound's derivation and its compile-time assertion are beside the constant
+in `raft_promotion.rs`, summarised in `raft-control-plane.md`). The
+refusal is per node, on every node that sets the flag, though the tick
+that protects is the primary's and the promotion that harms is a
+replica's: any node may become the primary, and no node can see another's
+flags. So it closes the gap for a cluster whose nodes share one
+configuration, the normal deployment, and `docs/replication.md` states
+the rule for the rest ("Run every node of a raft cluster with clock ticks,
+plus any group-commit window, within 1500 ms", under "Deployment
+rules"). What it does not close is a mixed cluster: a primary ticking
+outside the bound (its group-commit window counted) and without the
+flag, among replicas that carry it.
 
-**Sketched fix.** Carry each node's primary-link state in the raft
-envelope, beside the tip, and have a replica refuse to auto-promote while
-a fresh peer reports the primary up. It is an envelope change, so it
+**Sketched fix**, the way to support mixed deployments if it is ever
+needed. Carry each node's primary-link state in the raft envelope, beside
+the tip, and have a replica refuse to auto-promote while a fresh peer
+reports the primary up. It is an envelope change, so it
 comes after item 1. Open points for its design: how fresh "fresh" is
 (`PEER_TIP_GRACE` is the natural bound, and the item 3 stamp makes the
 report as trustworthy as the tip), how a primary reports itself (it has

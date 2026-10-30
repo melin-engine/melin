@@ -36,6 +36,12 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   orders a node's processes on one host; and **`melin_raft::SenderStamp`
   and `melin_raft::StampedTip`**, a control-plane frame's place in its
   sender's order and the journal tip it carried.
+- **`ServerConfig::MAX_AUTO_PROMOTE_TICK_DELAY`**: the slowest
+  `--tick-interval-ms`, its `--group-commit-us` window included, a node
+  accepts with `--raft-auto-promote` (see **Changed**), and
+  **`melin_raft::PEER_TIP_REPORT_MAX_DELAY`**, the longest a follower's
+  journal-tip change takes to reach the raft leader, which the bound is
+  derived from.
 
 ### Changed
 
@@ -56,6 +62,20 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   release shipped it before, so the version stays 1. See "Deployment
   rules" in `docs/replication.md`, which also warns against resuming a
   node from a VM snapshot.
+- **A node refuses to start with `--raft-auto-promote` and a
+  `--tick-interval-ms` of 0 or above 1500** (half the 3 s grace a replica
+  waits out before failing over). An idle primary's clock ticks are what
+  let the control plane refuse to promote a replica cut off from that
+  primary alone while the other replica still reaches it, provided one
+  lands, replicates and is reported back inside that grace; with ticks
+  disabled or slower, such a replica could depose a primary the rest of
+  the cluster still sees. A `--group-commit-us` window delays each tick's
+  replication, so it counts against the same bound: the node also refuses
+  a cadence plus window above 1500 ms. Keep the cadence plus window
+  within 1500 ms (the default 250 ms with no window does), or drop
+  `--raft-auto-promote` and promote manually, and run every node of a
+  raft cluster within that bound (see "Deployment rules" in
+  `docs/replication.md`).
 - **`melin_raft::TipSource` gains private fields** (its boot stamp and
   frame counter), so it is now built with `TipSource::new`, which takes a
   `melin_transport_core::boot_stamp::BootStamp` (`BootStamp::read`).

@@ -215,7 +215,9 @@ fn acked_events_survive_primary_death_under_ram_policy() {
             // while a spinner would starve whatever shares its core, the
             // test's own client included.
             cores: PipelineCores::unpinned(),
-            tick_interval_ms: 0,
+            // Ticks at the default cadence: `--raft-auto-promote` refuses
+            // them disabled or slower than
+            // `ServerConfig::MAX_AUTO_PROMOTE_TICK_DELAY`.
             snapshot_interval_ms: 0,
             health_bind: Some(nodes[i].health_addr),
             admin_bind: Some(nodes[i].admin_addr),
