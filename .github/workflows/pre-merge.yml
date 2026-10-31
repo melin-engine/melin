@@ -232,6 +232,23 @@ jobs:
         id: dpdk-builds
         run: cargo check -p melin-dpdk -p melin-server-runtime -p melin-test-node -p melin-client -p melin-example-echo -p melin-example-counter -p melin-example-notary -p melin-shm-proxy --all-targets --features melin-server-runtime/dpdk,melin-test-node/dpdk,melin-client/dpdk,melin-example-echo/dpdk,melin-example-counter/dpdk,melin-example-notary/dpdk,melin-shm-proxy/dpdk --locked
 
+      # The image's LLVM releases change under us: the bindings broke once
+      # when the default `clang` stopped being the release of the libclang
+      # bindgen loads. This puts on record the `clang` and the libclangs
+      # installed, pass or fail, and the libclang and headers the build
+      # script chose when it ran to completion. A build script that panics
+      # leaves no output file (any found then is a stale one rust-cache
+      # restored), but cargo prints its stdout, the choice included, in the
+      # failing "DPDK builds" step's log. Diagnostics only, so nothing here
+      # may fail the job: hence each `|| true` (a missing `clang`, no match
+      # for a glob).
+      - name: Show the LLVM toolchain the bindings were generated with
+        if: ${{ !cancelled() }}
+        run: |
+          clang --version || true
+          ls -l /usr/lib/x86_64-linux-gnu/libclang*.so* /usr/lib/llvm-*/lib/libclang*.so* || true
+          grep -h 'libclang' target/debug/build/melin-dpdk-*/output || true
+
       # The DPDK test runs put each test in new user, network and mount
       # namespaces (`unshare -rnm`), which Ubuntu 24.04 lets an unprivileged
       # process create only once AppArmor's restriction is lifted. The
