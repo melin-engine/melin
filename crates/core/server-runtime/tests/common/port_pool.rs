@@ -51,8 +51,8 @@ pub fn port(base: u16) -> SocketAddr {
 
 /// Hand a finished test's ports back: a node's addresses on kernel TCP (on
 /// DPDK they are the runner slot's, from no pool) and `endpoints`, each
-/// one taken from [`port`] and given as the address its listener bound. A test that failed keeps them: it may have
-/// left a node bound to one.
+/// one taken from [`port`] and given as the address its listener bound. A
+/// test that failed keeps them: it may have left a node bound to one.
 pub fn give_back(addrs: &Addrs, endpoints: impl IntoIterator<Item = SocketAddr>) {
     if std::thread::panicking() {
         return;

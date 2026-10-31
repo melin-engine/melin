@@ -32,7 +32,7 @@ use tracing::info;
 use tracing::warn;
 
 use crate::network::RaftClientFactory;
-use crate::network::plan_dial;
+use crate::network::undialable_members;
 use crate::recency::TipSource;
 use crate::rpc_server::RpcServerConfig;
 use crate::rpc_server::serve;
@@ -194,16 +194,16 @@ pub fn spawn(
     }
     // A control plane bound to a specific IP dials from it, so a peer it
     // could never reach that way is a misconfiguration to refuse at boot,
-    // not to retry in the background. This node's own entry is never
-    // dialled by it. The stored membership, dialled after first boot, is
-    // checked again on every connect by the same rule.
-    for peer in config.peers.iter().filter(|p| p.id != config.node_id) {
-        plan_dial(config.bind, &peer.addr).map_err(|refusal| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("--raft-peer id {}: {refusal}", peer.id),
-            )
-        })?;
+    // not to retry in the background. The stored membership, dialled
+    // after first boot, is checked against the same rule once the driver
+    // has read it, and again on every connect.
+    let configured = config.peers.iter().map(|p| (p.id, p.addr.as_str()));
+    if let Some((id, refusal)) = undialable_members(config.bind, config.node_id, configured).next()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("--raft-peer id {id}: {refusal}"),
+        ));
     }
 
     // Fail startup on a bad bind/dir, not in the background.
@@ -421,6 +421,20 @@ async fn driver_main(
                      stored membership and is being ignored (runtime membership changes are not \
                      supported); revert the flags, or re-provision --raft-dir to apply a new set"
                 );
+                // `spawn` checked the configured list, not this one, and
+                // a refused connect logs at debug only: without this, a
+                // stored member the bind can never reach would go
+                // unheard with nothing above `debug` to say why.
+                let stored = stored_nodes.iter().map(|(id, addr)| (*id, addr.as_str()));
+                for (peer_id, refusal) in undialable_members(config.bind, config.node_id, stored) {
+                    warn!(
+                        node_id = config.node_id,
+                        peer_id,
+                        %refusal,
+                        "control plane cannot dial a stored member and treats it as unreachable; \
+                         revert --raft-bind, or re-provision --raft-dir"
+                    );
+                }
             }
         }
         Err(e) => {

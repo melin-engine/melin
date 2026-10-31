@@ -18,6 +18,8 @@ use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
@@ -38,6 +40,8 @@ use openraft::raft::VoteResponse;
 use tokio::net::TcpSocket;
 use tokio::net::TcpStream;
 use tracing::debug;
+use tracing::info;
+use tracing::warn;
 
 use crate::auth::authenticate_outbound;
 use crate::recency::{JournalTip, PeerTips, TipSource};
@@ -119,9 +123,27 @@ impl From<DialRefusal> for io::Error {
     }
 }
 
+/// The members other than `node_id` that a node whose raft listener is
+/// bound to `bind` could never dial, each with why: [`plan_dial`] over a
+/// membership. `spawn` refuses to start on the first of the configured
+/// peers, and the driver warns of each in a stored membership that
+/// differs from them.
+pub(crate) fn undialable_members<'a>(
+    bind: SocketAddr,
+    node_id: NodeId,
+    members: impl IntoIterator<Item = (NodeId, &'a str)>,
+) -> impl Iterator<Item = (NodeId, DialRefusal)> {
+    members
+        .into_iter()
+        // A node never dials its own entry: it is what the others dial.
+        .filter(move |&(id, _)| id != node_id)
+        .filter_map(move |(id, addr)| plan_dial(bind, addr).err().map(|refusal| (id, refusal)))
+}
+
 /// Decide how to dial `peer` from a node whose raft listener is bound to
 /// `bind`. The one statement of the rule: `spawn` applies it to the
-/// configured peers at startup, [`RaftClient`] to every connect.
+/// configured peers at startup, the driver to a stored membership that
+/// differs from them, and [`RaftClient`] to every connect.
 pub(crate) fn plan_dial(bind: SocketAddr, peer: &str) -> Result<Dial, DialRefusal> {
     if bind.ip().is_unspecified() {
         return Ok(Dial::KernelSource);
@@ -145,9 +167,34 @@ pub(crate) fn plan_dial(bind: SocketAddr, peer: &str) -> Result<Dial, DialRefusa
     })
 }
 
-/// Open a TCP connection to `addr` as `dial` says. Not bounded in time:
-/// the caller wraps it in `CONNECT_TIMEOUT`.
-async fn connect(dial: Dial, addr: &str) -> io::Result<TcpStream> {
+/// Whether the raft listener's IP was last found unassigned to this host
+/// when dialling from it. A node-wide condition, so one flag per node,
+/// shared by every client: the warning fires once per loss, not once per
+/// peer, per client openraft creates, or per retry. An `AtomicBool` because
+/// clients run on the raft runtime's tasks; it is touched once per dial,
+/// never per event.
+#[derive(Debug, Default)]
+pub(crate) struct BindIp {
+    missing: AtomicBool,
+}
+
+impl BindIp {
+    /// Record a bind that failed with the IP unassigned: true on the first
+    /// since the IP was last usable.
+    fn lost(&self) -> bool {
+        !self.missing.swap(true, Ordering::Relaxed)
+    }
+
+    /// Record a bind that succeeded: true if the IP had been missing.
+    fn regained(&self) -> bool {
+        self.missing.swap(false, Ordering::Relaxed)
+    }
+}
+
+/// Open a TCP connection to `addr` as `dial` says, reporting through
+/// `bind_ip` when the listener's IP goes missing or comes back. Not
+/// bounded in time: the caller wraps it in `CONNECT_TIMEOUT`.
+async fn connect(dial: Dial, addr: &str, bind_ip: &BindIp) -> io::Result<TcpStream> {
     match dial {
         Dial::KernelSource => TcpStream::connect(addr).await,
         Dial::FromBind { local, peer } => {
@@ -161,12 +208,35 @@ async fn connect(dial: Dial, addr: &str) -> io::Result<TcpStream> {
             // never comes near exhausting the range. The kind is kept so
             // `AddrNotAvailable` (the IP is no longer assigned) still maps
             // to `Unreachable`.
-            socket.bind(local).map_err(|e| {
-                io::Error::new(
-                    e.kind(),
-                    format!("bind {local} to dial peer {addr} failed: {e}"),
-                )
-            })?;
+            match socket.bind(local) {
+                Ok(()) => {
+                    if bind_ip.regained() {
+                        info!(
+                            bind = %local.ip(),
+                            "raft listener IP is assigned again: the control plane can dial its \
+                             peers"
+                        );
+                    }
+                }
+                Err(e) => {
+                    // Every retry ends here while the IP is gone, and the
+                    // per-retry log is `debug!`: say it once, louder, since
+                    // the node's control plane can neither dial nor be
+                    // reached until the IP returns.
+                    if e.kind() == io::ErrorKind::AddrNotAvailable && bind_ip.lost() {
+                        warn!(
+                            bind = %local.ip(),
+                            error = %e,
+                            "raft listener IP is no longer assigned to this host: the control \
+                             plane can neither dial its peers nor be reached until it returns"
+                        );
+                    }
+                    return Err(io::Error::new(
+                        e.kind(),
+                        format!("bind {local} to dial peer {addr} failed: {e}"),
+                    ));
+                }
+            }
             socket.connect(peer).await
         }
     }
@@ -180,6 +250,8 @@ pub struct RaftClientFactory {
     /// connection is made from when it is not a wildcard (see
     /// [`plan_dial`]).
     bind: SocketAddr,
+    /// Shared with every client this factory makes (see [`BindIp`]).
+    bind_ip: Arc<BindIp>,
 }
 
 impl RaftClientFactory {
@@ -194,6 +266,7 @@ impl RaftClientFactory {
             tip,
             peer_tips,
             bind,
+            bind_ip: Arc::default(),
         }
     }
 }
@@ -209,6 +282,7 @@ impl RaftNetworkFactory<TypeConfig> for RaftClientFactory {
             tip: Arc::clone(&self.tip),
             peer_tips: Arc::clone(&self.peer_tips),
             bind: self.bind,
+            bind_ip: Arc::clone(&self.bind_ip),
             stream: None,
         }
     }
@@ -219,6 +293,8 @@ pub struct RaftClient {
     addr: String,
     /// See [`RaftClientFactory`]'s field of the same name.
     bind: SocketAddr,
+    /// See [`RaftClientFactory`]'s field of the same name.
+    bind_ip: Arc<BindIp>,
     signing_key: Arc<SigningKey>,
     tip: Arc<TipSource>,
     /// Sink for the target's tip, read off every reply envelope — this
@@ -239,14 +315,15 @@ impl RaftClient {
         // Refused before any syscall when the peer cannot be dialled from
         // the bind at all; the error names both.
         let dial = plan_dial(self.bind, &self.addr)?;
-        let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, connect(dial, &self.addr))
-            .await
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("connect to {} timed out", self.addr),
-                )
-            })??;
+        let mut stream =
+            tokio::time::timeout(CONNECT_TIMEOUT, connect(dial, &self.addr, &self.bind_ip))
+                .await
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("connect to {} timed out", self.addr),
+                    )
+                })??;
         // Control-plane frames are tiny and latency-sensitive relative to
         // their size; never batch them behind Nagle.
         stream.set_nodelay(true)?;
@@ -489,6 +566,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn undialable_members_skips_this_node_and_names_each_refused_peer() {
+        let members = [
+            (1, "node-1.internal:7001"),
+            (2, "10.0.0.6:7002"),
+            (3, "[fd00::7]:7003"),
+            (4, "node-4.internal:7004"),
+        ];
+        let refused: Vec<(NodeId, DialRefusalReason)> =
+            undialable_members(addr("10.0.0.5:7001"), 1, members)
+                .map(|(id, refusal)| (id, refusal.reason))
+                .collect();
+        assert_eq!(
+            refused,
+            [
+                (3, DialRefusalReason::FamilyMismatch),
+                (4, DialRefusalReason::NotIpLiteral),
+            ]
+        );
+        assert_eq!(
+            undialable_members(addr("0.0.0.0:7001"), 1, members).count(),
+            0,
+            "a wildcard bind dials anything"
+        );
+    }
+
     fn is_unreachable(e: io::Error) -> bool {
         matches!(
             to_rpc_error::<RaftError<NodeId>>(e),
@@ -507,6 +610,55 @@ mod tests {
         assert!(is_unreachable(io::Error::from(
             io::ErrorKind::AddrNotAvailable
         )));
+    }
+
+    #[test]
+    fn a_missing_bind_ip_is_reported_once_per_loss() {
+        let bind_ip = BindIp::default();
+        assert!(
+            !bind_ip.regained(),
+            "usable from the start: nothing regained"
+        );
+        assert!(bind_ip.lost(), "the first failure is the loss");
+        assert!(!bind_ip.lost(), "retries during the same loss stay quiet");
+        assert!(
+            bind_ip.regained(),
+            "the first success after it is the return"
+        );
+        assert!(!bind_ip.regained());
+        assert!(bind_ip.lost(), "a second loss is reported again");
+    }
+
+    #[tokio::test]
+    async fn dialling_from_an_unassigned_ip_marks_it_missing_until_a_bind_succeeds() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = listener.local_addr().unwrap();
+        let bind_ip = BindIp::default();
+
+        // 192.0.2.1 is TEST-NET-1, never assigned to a host; the bind fails
+        // with `AddrNotAvailable` unless `net.ipv4.ip_nonlocal_bind` is set.
+        let unassigned = Dial::FromBind {
+            local: addr("192.0.2.1:0"),
+            peer,
+        };
+        let e = connect(unassigned, &peer.to_string(), &bind_ip)
+            .await
+            .expect_err("192.0.2.1 is not assigned (is net.ipv4.ip_nonlocal_bind set?)");
+        assert_eq!(e.kind(), io::ErrorKind::AddrNotAvailable, "{e}");
+        assert!(is_unreachable(e));
+        assert!(!bind_ip.lost(), "the failed bind recorded the loss");
+
+        let assigned = Dial::FromBind {
+            local: addr("127.0.0.1:0"),
+            peer,
+        };
+        connect(assigned, &peer.to_string(), &bind_ip)
+            .await
+            .unwrap();
+        assert!(
+            !bind_ip.regained(),
+            "the successful bind recorded the return"
+        );
     }
 
     #[test]

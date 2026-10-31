@@ -28,7 +28,11 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   the address they dial. A wildcard bind behaves as before. A peer the
   bind cannot reach (one whose stored address is of the other address
   family, or, for a library caller, not an IP literal) is treated as
-  unreachable and backed off from, like a dead peer.
+  unreachable and backed off from, like a dead peer; a restarted node
+  whose stored membership holds one warns of it at startup. A bind IP
+  that stops being assigned to the host while the node runs is warned
+  of once, when a dial from it first fails, rather than only at debug
+  level on every retry.
 - **A node with a specific `--raft-bind` refuses to start if another
   `--raft-peer` address is of the other address family**, naming the
   bind and the peer: its control plane could never dial that peer. A

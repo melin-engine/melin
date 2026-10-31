@@ -470,16 +470,19 @@ impl Cluster {
     /// The replicas (under `ack_policy`, not replicating if promoted)
     /// first, until one of them leads the control plane, then the primary
     /// under `ack_policy` with no ticks. Neither replica can promote
-    /// meanwhile: one that never observed a primary refuses. This puts
-    /// raft leadership on a replica deterministically, which a normal
-    /// bring-up does not (the primary, raft id 1, ticks fastest and
-    /// usually wins the first election).
+    /// meanwhile: one that never observed a primary, with its journal
+    /// still empty, refuses. This puts raft leadership on a replica
+    /// deterministically, which a normal bring-up does not (the primary,
+    /// raft id 1, ticks fastest and usually wins the first election).
     ///
-    /// The primary's own first campaign must not disturb that leader: its
-    /// log is shorter, and the other replica's vote is held by the
-    /// leader's lease. Checked here on every bring-up: the cluster forms
-    /// with every node following the same leader at the same term, and no
-    /// node ever reports a higher term.
+    /// The primary must hear from that leader before its own election
+    /// timeout fires. A campaign of its own could not win (its log is
+    /// shorter, and the other replica's vote is held by the leader's
+    /// lease), but the higher term it reaches would still depose the
+    /// leader once a heartbeat reply carried it back. Checked here on
+    /// every bring-up: the cluster forms with every node following the
+    /// same leader at the same term, and no node ever reports a higher
+    /// term.
     fn start_replicas_first(&self, ack_policy: AckPolicy) -> ReplicaLed {
         let replicas = self.start_replicas(ack_policy, false);
         // Every term is above 0.
@@ -884,14 +887,13 @@ fn an_isolated_replica_leader_is_replaced_by_the_primary_and_the_other_replica()
 }
 
 /// The one-sided partition: the replica leader loses only its links to the
-/// primary, while the
-/// other replica still reaches both. With writes flowing, the other
-/// replica's tip moves ahead of the leader's, so the peer-tip veto keeps
-/// the leader from promoting, and the other replica, whose own primary
-/// link is up, does not campaign: nobody promotes and the primary keeps
-/// serving. Once healed, the leader rejoins as a replica. That the
-/// partition took effect is checked too: the primary, hearing from no
-/// leader, campaigns above the leader's term, in vain.
+/// primary, while the other replica still reaches both. With writes
+/// flowing, the other replica's tip moves ahead of the leader's, so the
+/// peer-tip veto keeps the leader from promoting, and the other replica,
+/// whose own primary link is up, does not campaign: nobody promotes and
+/// the primary keeps serving. Once healed, the leader rejoins as a
+/// replica. That the partition took effect is checked too: the primary,
+/// hearing from no leader, campaigns above the leader's term, in vain.
 ///
 /// A characterisation of what the code does, not a guarantee: it holds
 /// only while the other replica's journal tip moves ahead of the leader's,
