@@ -32,6 +32,7 @@ use tracing::info;
 use tracing::warn;
 
 use crate::network::RaftClientFactory;
+use crate::network::undialable_members;
 use crate::recency::TipSource;
 use crate::rpc_server::RpcServerConfig;
 use crate::rpc_server::serve;
@@ -99,6 +100,12 @@ pub struct RaftPeer {
 #[derive(Debug, Clone)]
 pub struct RaftConfig {
     pub node_id: NodeId,
+    /// The control-plane listener. When its IP is specific (not `0.0.0.0`
+    /// or `::`), outbound control-plane connections are made from that IP
+    /// too, so every other member's address in [`Self::peers`] must be an
+    /// IP literal of the same family: [`spawn`] refuses anything else.
+    /// A wildcard bind dials as the kernel routes, and a peer address may
+    /// then be a hostname.
     pub bind: std::net::SocketAddr,
     pub dir: PathBuf,
     /// All cluster members including this node — see [`RaftPeer`].
@@ -184,6 +191,19 @@ pub fn spawn(
                 "raft node ids must be non-zero (0 is the no-leader sentinel)",
             ));
         }
+    }
+    // A control plane bound to a specific IP dials from it, so a peer it
+    // could never reach that way is a misconfiguration to refuse at boot,
+    // not to retry in the background. The stored membership, dialled
+    // after first boot, is checked against the same rule once the driver
+    // has read it, and again on every connect.
+    let configured = config.peers.iter().map(|p| (p.id, p.addr.as_str()));
+    if let Some((id, refusal)) = undialable_members(config.bind, config.node_id, configured).next()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("--raft-peer id {id}: {refusal}"),
+        ));
     }
 
     // Fail startup on a bad bind/dir, not in the background.
@@ -304,6 +324,7 @@ async fn driver_main(
         Arc::clone(&signing_key),
         Arc::clone(&tip),
         Arc::clone(&peer_tips),
+        config.bind,
     );
     let raft: Raft<TypeConfig> = match Raft::new(
         config.node_id,
@@ -400,6 +421,20 @@ async fn driver_main(
                      stored membership and is being ignored (runtime membership changes are not \
                      supported); revert the flags, or re-provision --raft-dir to apply a new set"
                 );
+                // `spawn` checked the configured list, not this one, and
+                // a refused connect logs at debug only: without this, a
+                // stored member the bind can never reach would go
+                // unheard with nothing above `debug` to say why.
+                let stored = stored_nodes.iter().map(|(id, addr)| (*id, addr.as_str()));
+                for (peer_id, refusal) in undialable_members(config.bind, config.node_id, stored) {
+                    warn!(
+                        node_id = config.node_id,
+                        peer_id,
+                        %refusal,
+                        "control plane cannot dial a stored member and treats it as unreachable; \
+                         revert --raft-bind, or re-provision --raft-dir"
+                    );
+                }
             }
         }
         Err(e) => {

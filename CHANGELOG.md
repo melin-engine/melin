@@ -20,6 +20,25 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Changed
 
+- **A node sends its control-plane traffic from the address its
+  `--raft-bind` names.** When that is a specific IP rather than
+  `0.0.0.0` or `::`, outgoing control-plane connections are bound to it
+  instead of taking whatever source address the kernel routes them from,
+  so on a multi-homed host peers and firewalls see a node connect from
+  the address they dial. A wildcard bind behaves as before. A peer the
+  bind cannot reach (one whose stored address is of the other address
+  family, or, for a library caller, not an IP literal) is treated as
+  unreachable and backed off from, like a dead peer; a restarted node
+  whose stored membership holds one warns of it at startup. A bind IP
+  that stops being assigned to the host while the node runs is warned
+  of once, when a dial from it first fails, rather than only at debug
+  level on every retry.
+- **A node with a specific `--raft-bind` refuses to start if another
+  `--raft-peer` address is of the other address family**, naming the
+  bind and the peer: its control plane could never dial that peer. A
+  library caller of `melin_raft::spawn` is also refused a peer address
+  that is not an IP literal with such a bind, since the bound connection
+  cannot resolve a hostname; `RaftConfig::bind` documents the rule.
 - **Debug builds now panic on an impure `ResponseEncoder`**: one that
   leaves a body byte below the length it returns unwritten, or whose
   output depends on anything but the value it encodes (state of its own,

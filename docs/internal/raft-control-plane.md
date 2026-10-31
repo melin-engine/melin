@@ -138,6 +138,20 @@ node id — a request claiming another id closes the connection.
 itself (the self entry supplies the dialable address written into the
 first-boot membership).
 
+Outbound links are dialled from the IP of `--raft-bind` when it is not a
+wildcard (`plan_dial` in `network.rs`): the socket is bound to that IP on
+an ephemeral port before connecting, so a peer sees a node connect from
+the address it dials, and a test proxy can tell nodes apart by source.
+Such a bind cannot reach a peer that is not an IP literal of its own
+family; `spawn` refuses that for the configured peers, the driver warns
+of it for a stored membership that differs from them, and every connect
+refuses it again before any syscall, as `Unreachable` so openraft backs
+off. A wildcard bind dials as the kernel routes. A bind IP that goes
+unassigned while running fails every dial with `AddrNotAvailable`
+(also `Unreachable`); `BindIp`, one flag per node shared by every
+client, turns that into a single `warn!` per loss and an `info!` on
+return, where the per-retry log is only `debug!`.
+
 ## Storage (`storage.rs`)
 
 File-backed `RaftLogStorage`/`RaftStateMachine` under `--raft-dir`:
@@ -168,8 +182,10 @@ election plus a 100 ms poll), never order flow; stability wins.
 
 ## What the in-process tests cannot cover
 
-True power-loss fsync semantics of the raft files, asymmetric network
-partitions (tests kill threads and links, not selective packet loss),
-inter-node clock skew, and whole-process `kill -9` mid-append (covered
-indirectly by the storage crash tests). The venue for those is a manual
+True power-loss fsync semantics of the raft files, lossy or one-way
+links (`raft_failover.rs` partitions raft links pair by pair through
+proxies, but a severed link stalls both directions of a connection at
+once, and nothing drops or delays single packets), inter-node clock
+skew, and whole-process `kill -9` mid-append (covered indirectly by the
+storage crash tests). The venue for those is a manual
 multi-VM failover drill with the AWS bench scripts.

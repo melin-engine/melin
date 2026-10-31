@@ -4,6 +4,7 @@
 //! dispatches into a canned `RaftApi`.
 
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -12,12 +13,14 @@ use std::time::Duration;
 use crate::network::RaftClientFactory;
 use crate::recency::{PeerTips, TipSource};
 use crate::rpc_server::{RaftApi, RpcServerConfig, SupersessionPolicy, serve};
+use crate::tests::tip_at;
 use crate::types::{NodeId, TypeConfig};
 use base64::Engine;
 use ed25519_dalek::SigningKey;
 use melin_app::auth::{AuthorizedKeys, NoRoles};
 use melin_transport_core::cursors::AdvertisedJournalTip;
 use melin_transport_core::fence::FenceState;
+use openraft::error::RPCError;
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
@@ -113,6 +116,7 @@ async fn client_for(h: &Harness, key: &SigningKey) -> impl RaftNetwork<TypeConfi
         Arc::new(key.clone()),
         tip_at(0, 0),
         Arc::new(PeerTips::new()),
+        WILDCARD_BIND,
     );
     factory
         .new_client(
@@ -124,21 +128,12 @@ async fn client_for(h: &Harness, key: &SigningKey) -> impl RaftNetwork<TypeConfi
         .await
 }
 
+/// A client node whose raft listener is on a wildcard: it dials as the
+/// kernel routes, from no particular source address.
+const WILDCARD_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 7001);
+
 fn opt() -> RPCOption {
     RPCOption::new(Duration::from_secs(2))
-}
-
-/// A ready tip at (epoch, seq) — most tests want (0, 0) so nothing is
-/// filtered; the recency tests raise it.
-fn tip_at(epoch: u64, seq: u64) -> Arc<TipSource> {
-    let fence = Arc::new(FenceState::new(0));
-    fence.observe_epoch(epoch);
-    let tip = AdvertisedJournalTip::new(melin_transport_core::WireSeq::new(seq));
-    Arc::new(TipSource {
-        fence,
-        seq: tip,
-        ready: Arc::new(AtomicBool::new(true)),
-    })
 }
 
 /// Vote request from node 2 (matches the pinned identity of its key).
@@ -284,6 +279,7 @@ async fn votes_are_dropped_until_the_tip_is_ready() {
         Arc::new(client_key.clone()),
         tip_at(0, 0),
         Arc::new(PeerTips::new()),
+        WILDCARD_BIND,
     );
     let node = BasicNode { addr };
 
@@ -359,6 +355,7 @@ async fn serving_node_fences_on_higher_peer_epoch() {
         Arc::new(client_key.clone()),
         tip_at(7, 100),
         Arc::new(PeerTips::new()),
+        WILDCARD_BIND,
     );
     let mut client = factory.new_client(1, &BasicNode { addr }).await;
     // The RPC itself may succeed or fail (the server may begin shutting
@@ -374,4 +371,114 @@ async fn serving_node_fences_on_higher_peer_epoch() {
         "supersession must co-set the process shutdown flag"
     );
     shutdown.store(true, Ordering::Relaxed);
+}
+
+/// A client for `peer` on a node whose raft listener is on `bind`.
+async fn client_on(bind: SocketAddr, peer: &str) -> impl RaftNetwork<TypeConfig> {
+    RaftClientFactory::new(
+        Arc::new(SigningKey::from_bytes(&[0x11; 32])),
+        tip_at(0, 0),
+        Arc::new(PeerTips::new()),
+        bind,
+    )
+    .new_client(
+        1,
+        &BasicNode {
+            addr: peer.to_owned(),
+        },
+    )
+    .await
+}
+
+/// The source address a peer listening on 127.0.0.3 sees when a node
+/// whose raft listener is on `bind` dials it. The peer speaks no
+/// protocol: it accepts, notes the source, and hangs up, so the vote
+/// itself fails. A dial that never connects fails the test with the
+/// vote's error rather than leaving the accept waiting forever.
+async fn source_seen_by_peer(bind: SocketAddr) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.3:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let mut client = client_on(bind, &addr).await;
+    let vote = client.vote(vote_req_from(2), opt());
+    tokio::pin!(vote);
+    let from = tokio::select! {
+        accepted = listener.accept() => {
+            let (stream, from) = accepted.unwrap();
+            drop(stream);
+            from
+        }
+        result = &mut vote => panic!("the dial never reached the peer: {result:?}"),
+    };
+    vote.await
+        .expect_err("the peer hung up before authenticating");
+    from
+}
+
+/// Linux routes all of 127.0.0.0/8 to `lo`, so 127.0.0.2 and 127.0.0.3
+/// need no setup.
+#[tokio::test]
+async fn a_node_bound_to_a_specific_ip_dials_from_it() {
+    // The node's own raft listener holds its port: the dialer must bind
+    // the IP alone, on an ephemeral port.
+    let own_listener = TcpListener::bind("127.0.0.2:0").await.unwrap();
+    let bind = own_listener.local_addr().unwrap();
+    let from = source_seen_by_peer(bind).await;
+    assert_eq!(from.ip(), bind.ip());
+    assert_ne!(from.port(), bind.port());
+}
+
+#[tokio::test]
+async fn a_node_bound_to_a_wildcard_dials_from_a_local_ip() {
+    let from = source_seen_by_peer(WILDCARD_BIND).await;
+    assert!(from.ip().is_loopback(), "{from}");
+}
+
+/// Vote from a node whose raft listener is on `bind` to `peer`, which
+/// must fail as an unreachable peer with every one of `parts` in the
+/// message.
+async fn assert_unreachable_naming(bind: &str, peer: &str, parts: &[&str]) {
+    let err = client_on(bind.parse().unwrap(), peer)
+        .await
+        .vote(vote_req_from(2), opt())
+        .await
+        .unwrap_err();
+    let RPCError::Unreachable(unreachable) = err else {
+        panic!("expected Unreachable, got {err:?}");
+    };
+    let message = unreachable.to_string();
+    for part in parts {
+        assert!(message.contains(part), "{part:?} not in {message:?}");
+    }
+}
+
+/// A bind IP the host does not hold (192.0.2.0/24 and 2001:db8::/32 are
+/// reserved for documentation) fails the bind with `AddrNotAvailable`,
+/// which openraft must treat as an unreachable peer and back off from.
+/// The IPv6 case needs IPv6 sockets, not any IPv6 address on the host.
+/// Both cases assume the kernel default `net.ipv{4,6}.ip_nonlocal_bind=0`:
+/// a host that allows non-local binds (some keepalived setups) lets the
+/// bind succeed and the connect then fails or times out instead.
+#[tokio::test]
+async fn a_bind_ip_the_host_does_not_hold_makes_the_peer_unreachable() {
+    assert_unreachable_naming(
+        "192.0.2.1:7001",
+        "192.0.2.2:7002",
+        &["192.0.2.1:0", "192.0.2.2:7002"],
+    )
+    .await;
+    assert_unreachable_naming(
+        "[2001:db8::1]:7001",
+        "[2001:db8::2]:7002",
+        &["[2001:db8::1]:0", "[2001:db8::2]:7002"],
+    )
+    .await;
+}
+
+/// A stored peer address the bind can never dial is refused before any
+/// syscall, as an unreachable peer, naming the bind and the peer.
+#[tokio::test]
+async fn a_peer_the_bind_cannot_dial_is_unreachable() {
+    for peer in ["[::1]:7002", "localhost:7002"] {
+        assert_unreachable_naming("127.0.0.2:7001", peer, &["127.0.0.2", peer]).await;
+    }
 }

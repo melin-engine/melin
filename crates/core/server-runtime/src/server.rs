@@ -494,7 +494,10 @@ pub struct ServerConfig {
     /// and a `--raft-peer` entry for this node; requires
     /// `--replication-key` (peer links authenticate with the replication
     /// key, same trust domain as the data plane). Raft always runs on
-    /// kernel TCP, including on DPDK nodes.
+    /// kernel TCP, including on DPDK nodes. A specific IP (not `0.0.0.0`
+    /// or `::`) is also the source of this node's outgoing raft
+    /// connections, and every other `--raft-peer` must then be of its
+    /// address family.
     #[arg(long)]
     pub raft_bind: Option<SocketAddr>,
 
