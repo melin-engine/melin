@@ -306,22 +306,13 @@ fn find_system_clang() -> Option<String> {
 /// bindgen loads, or none, leaving libclang its built-in default.
 ///
 /// clang-sys picks the libclang (`LIBCLANG_PATH`, else the newest it finds),
-/// and a host with several LLVM releases installed can have it pick one
-/// that is not the `clang` binary's. Headers of another release fail the
-/// parse in the intrinsics (see `build/resource_dir.rs`), so a directory is
-/// passed only when its version is the loaded libclang's. Searched in
-/// order: beside the loaded library (as loaded, then with its symlinks
-/// resolved), the system clang's own directory, then the well-known
-/// locations. With no match, a `cargo:warning` lists what was passed over.
-///
-/// The default is not relied on when a match exists because libclang
-/// derives it from the path it was loaded through, and a distribution's
-/// symlink to it (Debian's multiarch `libclang-N.so.N`) can lead it to a
-/// directory that does not exist.
+/// which need not be the `clang` binary's release, and another release's
+/// headers fail the parse (see `build/resource_dir.rs`). The default is not
+/// relied on when a match exists: libclang derives it from the path it was
+/// loaded through, which a distribution's symlink can make a directory that
+/// does not exist.
 #[cfg(feature = "dpdk-sys")]
 fn bindgen_resource_dir_args() -> Vec<String> {
-    use std::path::Path;
-
     // Loads libclang on this thread, as `generate` does later: bindgen
     // keeps the one instance it loads for the process.
     let version = bindgen::clang_version();
@@ -337,76 +328,42 @@ fn bindgen_resource_dir_args() -> Vec<String> {
         );
         return Vec::new();
     };
-    // An unresolvable path still names the library as loaded, which is the
-    // first place searched anyway; resolving it only adds a second one.
+    // An unresolvable path still names the library as loaded, which is
+    // searched anyway; resolving it only adds a second place to look.
     let canonical = std::fs::canonicalize(libclang).unwrap_or_else(|_| libclang.to_path_buf());
-
-    let adjacent_roots = resource_dir::adjacent_roots(libclang, &canonical);
-    let system_dir = system_clang_resource_dir();
-    let well_known_roots = resource_dir::well_known_roots(major);
-    // Without repeats: the places searched overlap (see `unique`).
-    let candidates = resource_dir::unique(
-        resource_dir::subdirectories(&adjacent_roots)
-            .into_iter()
-            .chain(system_dir.clone())
-            .chain(resource_dir::subdirectories(&well_known_roots)),
-    );
-
-    // The choice depends on what is installed under these roots, so a
-    // build that found no match picks up headers installed afterwards (a
-    // new subdirectory changes its root's mtime), and one that did notices
-    // them removed. Only roots that exist: cargo re-runs on every build for
-    // a path that does not, and an absent root's nearest ancestor (`/usr/lib`)
-    // is too large a tree to have cargo scan each time.
-    let watched = resource_dir::unique(
-        adjacent_roots
-            .iter()
-            .cloned()
-            .chain(
-                system_dir
-                    .as_deref()
-                    .and_then(Path::parent)
-                    .map(Path::to_path_buf),
-            )
-            .chain(well_known_roots.iter().cloned()),
-    );
-    for root in watched.iter().filter(|root| root.is_dir()) {
-        println!("cargo:rerun-if-changed={}", root.display());
-    }
-
-    let target_arch =
-        std::env::var("CARGO_CFG_TARGET_ARCH").expect("cargo sets CARGO_CFG_TARGET_ARCH");
-    let required = resource_dir::required_headers(&target_arch);
-    let selection = resource_dir::select(major, candidates, |dir: &Path| {
-        resource_dir::missing_header(dir, required)
-    });
-    match selection.chosen.as_deref().and_then(Path::to_str) {
-        Some(dir) => {
+    let candidates =
+        resource_dir::subdirectories(&resource_dir::roots(libclang, &canonical, major));
+    match resource_dir::select(major, candidates, system_clang_resource_dir) {
+        Ok(dir) => {
             // Not a directive: cargo keeps it in the build script's output
-            // file and shows it under `-vv`, for a build that needs looking
-            // into without a warning on every one.
+            // file and shows it under `-vv`.
             println!(
                 "libclang {major}.{minor} at {}: clang resource directory {dir}",
                 libclang.display()
             );
             vec![format!("-resource-dir={dir}")]
         }
-        None => {
+        Err(skipped) => {
+            let skipped = if skipped.is_empty() {
+                "none found".to_string()
+            } else {
+                skipped.join(", ")
+            };
             println!(
-                "cargo:warning={}",
-                resource_dir::no_match_warning(
-                    libclang,
-                    &format!("{major}.{minor}"),
-                    &selection.rejected
-                )
+                "cargo:warning=bindgen loads libclang {major}.{minor} from {}, and no clang \
+                 resource directory of that version was found (examined: {skipped}); \
+                 generating the DPDK bindings with libclang's built-in headers. If that \
+                 fails, install the clang headers of that LLVM version, or point \
+                 LIBCLANG_PATH at a libclang whose headers are installed.",
+                libclang.display()
             );
             Vec::new()
         }
     }
 }
 
-/// The system clang's resource directory, as it reports it: a candidate
-/// like any other, chosen only if it is of the loaded libclang's version.
+/// The system clang's resource directory, as it reports it: the last
+/// candidate, consulted only when no primary candidate matched.
 /// `None` when there is no system clang or it does not answer.
 #[cfg(feature = "dpdk-sys")]
 fn system_clang_resource_dir() -> Option<std::path::PathBuf> {
