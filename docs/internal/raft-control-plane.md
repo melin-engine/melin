@@ -122,9 +122,9 @@ Under `--raft-auto-promote` the raft mesh doubles as a fencing channel
 or a replica whose promotion is already in flight — that reads a peer
 envelope (a request it serves, or the reply to one it sent: one policy,
 shared by the RPC server and the client factory) advertising a strictly
-higher fencing epoch self-fences and
-shuts down, exactly like the data-plane handshake path but without
-waiting for a data-plane connection to cross.
+higher fencing epoch self-fences and shuts down, exactly like the
+data-plane handshake path but without waiting for a data-plane
+connection to cross.
 
 ## RPC transport
 

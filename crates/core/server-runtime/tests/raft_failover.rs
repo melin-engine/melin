@@ -1007,16 +1007,15 @@ const FENCE_WATCH: Duration = Duration::from_secs(60);
 
 /// The one-way supersession check (finding 13 of the determinism audit),
 /// the split brain it allows reproduced on purpose: the primary leads the
-/// control plane and keeps serving while a
-/// replica that follows it is manually promoted (cut from the primary on
-/// the data plane, as an operator would promote a replica they believe
-/// orphaned). The promoted node, at the higher epoch, sends the primary
-/// no request: the replicas' raft requests are stalled at every proxy,
-/// while the primary's heartbeats reach them and their replies come back
-/// on the primary's own connections. Nothing on the data plane joins the
-/// two either. So the primary learns of the newer tenure only from a
-/// reply, and must fence on it, leaving the promoted node the only one
-/// serving.
+/// control plane and keeps serving while a replica that follows it is
+/// manually promoted (cut from the primary on the data plane, as an
+/// operator would promote a replica they believe orphaned).
+/// The promoted node, at the higher epoch, sends the primary no request:
+/// the replicas' raft requests are stalled at every proxy, while the
+/// primary's heartbeats reach them and their replies come back on the
+/// primary's own connections. Nothing on the data plane joins the two
+/// either. So the primary learns of the newer tenure only from a reply,
+/// and must fence on it, leaving the promoted node the only one serving.
 #[test]
 #[serial]
 fn a_serving_leader_fences_on_a_followers_higher_epoch() {
@@ -1074,8 +1073,10 @@ fn a_serving_leader_fences_on_a_followers_higher_epoch() {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
-    // We never write this flag ourselves: its being set proves the primary
-    // fenced itself (fence-on-supersession co-sets it).
+    // We never write this flag ourselves, and no admin command reaches the
+    // primary, so the node set it: a fence co-sets it, and its other
+    // self-stops are failures (a stage panicking, for one), which return an
+    // error that the clean join below rules out.
     assert!(
         primary.shutdown_requested(),
         "the primary stopped without fencing"
