@@ -30,16 +30,21 @@ pub fn dir_major(dir: &Path) -> Option<u32> {
 /// beside the loaded libclang, as loaded and with its symlinks resolved
 /// (Debian and Ubuntu reach `/usr/lib/llvm-N/lib/libclang*` through a
 /// multiarch symlink, in either direction), then the Debian/Ubuntu tree of
-/// that major. A root already listed is not listed again.
+/// that major, then `/usr/lib/clang`, where Fedora installs the headers
+/// while its libclang sits in `/usr/lib64`. A root already listed is not
+/// listed again.
 pub fn roots(libclang: &Path, canonical: &Path, major: u32) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     for root in [libclang, canonical]
         .into_iter()
         .filter_map(Path::parent)
         .map(|libdir| libdir.join("clang"))
-        .chain([PathBuf::from(format!("/usr/lib/llvm-{major}/lib/clang"))])
+        .chain([
+            PathBuf::from(format!("/usr/lib/llvm-{major}/lib/clang")),
+            PathBuf::from("/usr/lib/clang"),
+        ])
     {
-        // A `Vec` searched linearly: there are at most three roots.
+        // A `Vec` searched linearly: there are at most four roots.
         if !roots.contains(&root) {
             roots.push(root);
         }
@@ -259,29 +264,49 @@ mod tests {
             [
                 PathBuf::from("/usr/lib/x86_64-linux-gnu/clang"),
                 PathBuf::from("/usr/lib/llvm-18/lib/clang"),
+                PathBuf::from("/usr/lib/clang"),
             ]
         );
-        // A library that is not a link is not searched beside twice.
+        // Fedora: a library that is not a link is not searched beside
+        // twice, and the headers' `/usr/lib/clang` is searched after it.
         let lib = Path::new("/usr/lib64/libclang.so.18");
         assert_eq!(
             roots(lib, lib, 18),
             [
                 PathBuf::from("/usr/lib64/clang"),
                 PathBuf::from("/usr/lib/llvm-18/lib/clang"),
+                PathBuf::from("/usr/lib/clang"),
             ]
         );
         // Nor is the major tree, when the library is in it.
         let lib = Path::new("/usr/lib/llvm-18/lib/libclang.so.1");
         assert_eq!(
             roots(lib, lib, 18),
-            [PathBuf::from("/usr/lib/llvm-18/lib/clang")]
+            [
+                PathBuf::from("/usr/lib/llvm-18/lib/clang"),
+                PathBuf::from("/usr/lib/clang"),
+            ]
+        );
+        // Nor is `/usr/lib/clang`, when the library is in `/usr/lib`.
+        let lib = Path::new("/usr/lib/libclang.so.18");
+        assert_eq!(
+            roots(lib, lib, 18),
+            [
+                PathBuf::from("/usr/lib/clang"),
+                PathBuf::from("/usr/lib/llvm-18/lib/clang"),
+            ]
         );
         // Loaded from the major tree through a link resolving elsewhere.
         assert_eq!(
-            roots(lib, Path::new("/opt/llvm/lib/libclang.so.18.1"), 18),
+            roots(
+                Path::new("/usr/lib/llvm-18/lib/libclang.so.1"),
+                Path::new("/opt/llvm/lib/libclang.so.18.1"),
+                18
+            ),
             [
                 PathBuf::from("/usr/lib/llvm-18/lib/clang"),
                 PathBuf::from("/opt/llvm/lib/clang"),
+                PathBuf::from("/usr/lib/clang"),
             ]
         );
     }
