@@ -34,6 +34,12 @@
 //! their command lines, and its mapping onto a [`NicConfig`] with the one
 //! validation of them.
 
+// The build script's choice of clang headers for bindgen: pure logic over
+// paths, tested here on any host because a build script cannot host
+// tests. Only `build.rs` uses it outside the tests.
+#[cfg(test)]
+#[path = "../build/resource_dir.rs"]
+mod build_resource_dir;
 // Ungated: MAC parsing and the peer-MAC convention are pure logic with
 // no libdpdk dependency, and operators configure them through the same
 // CLI whether or not this build has the transport compiled in.

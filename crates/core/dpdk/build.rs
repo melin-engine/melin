@@ -8,6 +8,12 @@
 //!
 //! Requires DPDK >= 22.11 installed and discoverable via pkg-config.
 
+// Which clang headers bindgen parses with; its unit tests are in the crate
+// (see the module's documentation).
+#[cfg(feature = "dpdk-sys")]
+#[path = "build/resource_dir.rs"]
+mod resource_dir;
+
 fn main() {
     #[cfg(feature = "dpdk-sys")]
     generate_bindings();
@@ -23,7 +29,11 @@ fn generate_bindings() {
     // editing `inline_wrappers.c` silently does nothing until `cargo clean`,
     // and a binary can be built against a stale object.
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=build/resource_dir.rs");
     println!("cargo:rerun-if-changed=src/dpdk/inline_wrappers.c");
+    // clang-sys's choice of libclang, and so the headers chosen for it
+    // below. Its own build script declares this, but for itself only.
+    println!("cargo:rerun-if-env-changed=LIBCLANG_PATH");
 
     // Locate DPDK via pkg-config.
     let dpdk = pkg_config::Config::new()
@@ -96,25 +106,25 @@ fn generate_bindings() {
     }
     cc.compile("dpdk_wrappers");
 
-    // Find the system clang's resource directory for system headers (stddef.h,
-    // AVX intrinsics). Passing --resource-dir forces bindgen's internal
-    // libclang to use the system clang's headers instead of whichever clang
-    // happens to be first in PATH (e.g., Android NDK clang, which has
-    // broken AVX headers).
-    let clang_extra: Vec<String> = if let Some(resource_dir) = find_clang_resource_dir() {
-        vec![
-            format!("-I{}/include", resource_dir),
-            format!("-resource-dir={}", resource_dir),
-        ]
-    } else {
-        Vec::new()
-    };
+    // The clang headers (stddef.h, the intrinsics) of the libclang bindgen
+    // loads, which need not be the `clang` binary's: see
+    // `bindgen_resource_dir_args`.
+    let clang_extra = bindgen_resource_dir_args();
 
     // Generate bindings for:
     // - Non-inline DPDK functions (rte_eal_init, rte_eth_dev_configure, etc.)
     // - Our C wrapper functions (dpdk_eth_rx_burst, dpdk_pktmbuf_alloc, etc.)
     // - Struct types (rte_mbuf, rte_mempool, rte_eth_conf, etc.)
     let bindings = bindgen::Builder::default()
+        // bindgen otherwise runs the first `clang` it finds (`CLANG_PATH`,
+        // `llvm-config --bindir`, then `PATH`) and adds that compiler's
+        // search paths as `-isystem`, its resource headers among them — which
+        // outrank libclang's own, so a `clang` of another LLVM release (a
+        // distribution default newer than the libclang clang-sys picks, an
+        // Android NDK's first in PATH) breaks the parse in the intrinsics
+        // headers. libclang derives the system search paths itself, as the
+        // compiler of its release would, so nothing is lost.
+        .detect_include_paths(false)
         .clang_args(&clang_extra)
         .header_contents(
             "dpdk_wrapper.h",
@@ -292,32 +302,122 @@ fn find_system_clang() -> Option<String> {
     None
 }
 
+/// The `-resource-dir` argument naming the clang headers of the libclang
+/// bindgen loads, or none, leaving libclang its built-in default.
+///
+/// clang-sys picks the libclang (`LIBCLANG_PATH`, else the newest it finds),
+/// and a host with several LLVM releases installed can have it pick one
+/// that is not the `clang` binary's. Headers of another release fail the
+/// parse in the intrinsics (see `build/resource_dir.rs`), so a directory is
+/// passed only when its version is the loaded libclang's. Searched in
+/// order: beside the loaded library (as loaded, then with its symlinks
+/// resolved), the system clang's own directory, then the well-known
+/// locations. With no match, a `cargo:warning` lists what was passed over.
+///
+/// The default is not relied on when a match exists because libclang
+/// derives it from the path it was loaded through, and a distribution's
+/// symlink to it (Debian's multiarch `libclang-N.so.N`) can lead it to a
+/// directory that does not exist.
 #[cfg(feature = "dpdk-sys")]
-/// Find the clang resource directory containing stddef.h.
-fn find_clang_resource_dir() -> Option<String> {
-    // Use system clang to find the resource directory, matching the
-    // compiler used for the wrapper compilation above.
-    let clang = find_system_clang().unwrap_or_else(|| "clang".to_string());
-    if let Ok(output) = std::process::Command::new(&clang)
+fn bindgen_resource_dir_args() -> Vec<String> {
+    use std::path::Path;
+
+    // Loads libclang on this thread, as `generate` does later: bindgen
+    // keeps the one instance it loads for the process.
+    let version = bindgen::clang_version();
+    let library = clang_sys::get_library()
+        .expect("bindgen::clang_version loads libclang on the calling thread");
+    let libclang = library.path();
+    let Some((major, minor)) = version.parsed else {
+        println!(
+            "cargo:warning=bindgen loads libclang from {}, whose version ({:?}) could not \
+             be read; generating the DPDK bindings with libclang's built-in headers",
+            libclang.display(),
+            version.full,
+        );
+        return Vec::new();
+    };
+    // An unresolvable path still names the library as loaded, which is the
+    // first place searched anyway; resolving it only adds a second one.
+    let canonical = std::fs::canonicalize(libclang).unwrap_or_else(|_| libclang.to_path_buf());
+
+    let adjacent_roots = resource_dir::adjacent_roots(libclang, &canonical);
+    let system_dir = system_clang_resource_dir();
+    let well_known_roots = resource_dir::well_known_roots(major);
+    // Without repeats: the places searched overlap (see `unique`).
+    let candidates = resource_dir::unique(
+        resource_dir::subdirectories(&adjacent_roots)
+            .into_iter()
+            .chain(system_dir.clone())
+            .chain(resource_dir::subdirectories(&well_known_roots)),
+    );
+
+    // The choice depends on what is installed under these roots, so a
+    // build that found no match picks up headers installed afterwards (a
+    // new subdirectory changes its root's mtime), and one that did notices
+    // them removed. Only roots that exist: cargo re-runs on every build for
+    // a path that does not, and an absent root's nearest ancestor (`/usr/lib`)
+    // is too large a tree to have cargo scan each time.
+    let watched = resource_dir::unique(
+        adjacent_roots
+            .iter()
+            .cloned()
+            .chain(
+                system_dir
+                    .as_deref()
+                    .and_then(Path::parent)
+                    .map(Path::to_path_buf),
+            )
+            .chain(well_known_roots.iter().cloned()),
+    );
+    for root in watched.iter().filter(|root| root.is_dir()) {
+        println!("cargo:rerun-if-changed={}", root.display());
+    }
+
+    let target_arch =
+        std::env::var("CARGO_CFG_TARGET_ARCH").expect("cargo sets CARGO_CFG_TARGET_ARCH");
+    let required = resource_dir::required_headers(&target_arch);
+    let selection = resource_dir::select(major, candidates, |dir: &Path| {
+        resource_dir::missing_header(dir, required)
+    });
+    match selection.chosen.as_deref().and_then(Path::to_str) {
+        Some(dir) => {
+            // Not a directive: cargo keeps it in the build script's output
+            // file and shows it under `-vv`, for a build that needs looking
+            // into without a warning on every one.
+            println!(
+                "libclang {major}.{minor} at {}: clang resource directory {dir}",
+                libclang.display()
+            );
+            vec![format!("-resource-dir={dir}")]
+        }
+        None => {
+            println!(
+                "cargo:warning={}",
+                resource_dir::no_match_warning(
+                    libclang,
+                    &format!("{major}.{minor}"),
+                    &selection.rejected
+                )
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// The system clang's resource directory, as it reports it: a candidate
+/// like any other, chosen only if it is of the loaded libclang's version.
+/// `None` when there is no system clang or it does not answer.
+#[cfg(feature = "dpdk-sys")]
+fn system_clang_resource_dir() -> Option<std::path::PathBuf> {
+    let clang = find_system_clang()?;
+    // A clang that cannot run or answer offers no candidate; the search goes
+    // on without it, and a miss overall is reported with what was examined.
+    let output = std::process::Command::new(clang)
         .arg("--print-resource-dir")
         .output()
-        && output.status.success()
-    {
-        let dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if std::path::Path::new(&format!("{dir}/include/stddef.h")).exists() {
-            return Some(dir);
-        }
-    }
-
-    // Fallback: scan /usr/lib/clang/*/include/stddef.h.
-    if let Ok(entries) = std::fs::read_dir("/usr/lib/clang") {
-        for entry in entries.flatten() {
-            let candidate = entry.path().join("include/stddef.h");
-            if candidate.exists() {
-                return entry.path().to_str().map(String::from);
-            }
-        }
-    }
-
-    None
+        .ok()
+        .filter(|output| output.status.success())?;
+    let dir = String::from_utf8(output.stdout).ok()?;
+    Some(std::path::PathBuf::from(dir.trim()))
 }

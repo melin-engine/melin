@@ -1033,11 +1033,13 @@ version = "0.22.0"
 dependencies = [
  "bindgen",
  "cc",
+ "clang-sys",
  "clap",
  "fastcp",
  "libc",
  "pkg-config",
  "rustc-hash",
+ "tempfile",
  "tracing",
 ]
 

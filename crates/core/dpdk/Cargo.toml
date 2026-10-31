@@ -16,7 +16,7 @@ workspace = true
 default = []
 # Enable when libdpdk is installed. Without this feature the crate
 # compiles as an empty shell — no bindgen, no C compilation, no linking.
-dpdk-sys = ["dep:libc", "dep:bindgen", "dep:pkg-config", "dep:cc"]
+dpdk-sys = ["dep:libc", "dep:bindgen", "dep:clang-sys", "dep:pkg-config", "dep:cc"]
 # `DpdkArgs`: the `--dpdk-*` flags as a clap argument group, for a binary
 # to flatten into its command line. Needs no libdpdk; independent of
 # `dpdk-sys`, since a binary declares its flags in every build.
@@ -58,6 +58,16 @@ clap = { workspace = true, optional = true }
 # bindgen generates Rust FFI bindings from DPDK C headers at build time.
 # Requires DPDK to be installed (pkg-config --cflags --libs libdpdk).
 bindgen = { version = "0.72", optional = true }
+# The libclang bindgen loads, and so its location: bindgen reports the
+# version (`bindgen::clang_version`) but not the path, which the build
+# script needs to find the clang headers of that same libclang. bindgen
+# already depends on it, with `runtime` on, so this adds no crate.
+clang-sys = { version = "1", optional = true, features = ["runtime"] }
 pkg-config = { version = "0.3", optional = true }
 # cc compiles the C wrapper functions for DPDK inline functions.
 cc = { version = "1", optional = true }
+
+[dev-dependencies]
+# Directory trees for the build script's resource-directory search, whose
+# logic the unit tests take from `build/resource_dir.rs`.
+tempfile = "3"
