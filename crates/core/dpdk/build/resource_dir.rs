@@ -1,187 +1,63 @@
 //! Which clang resource directory (the compiler's own headers: `stddef.h`,
 //! the SIMD intrinsics) bindgen's libclang parses the DPDK headers with.
 //!
-//! A resource directory is tied to one LLVM release: its intrinsics headers
-//! call `__builtin_ia32_*` builtins that only a libclang of that release
-//! knows. A libclang handed a newer release's headers declares the unknown
-//! builtins implicitly, returning `int`, and fails with "invalid conversion
-//! between vector type '__m128' and integer type 'int'". So the directory is
-//! accepted only when its version is the loaded libclang's, wherever it was
-//! found; nothing is trusted for being first in `PATH`.
+//! A resource directory belongs to one LLVM release: its intrinsics call
+//! builtins only a libclang of that release knows, and a libclang handed
+//! another release's fails with "invalid conversion between vector type
+//! '__m128' and integer type 'int'". So a directory is accepted only when
+//! its name carries the loaded libclang's major version.
 //!
-//! The logic is pure over paths (and a directory listing), so it lives here
-//! rather than in `build.rs`: the build script takes it with `#[path]`, and
-//! the crate's unit tests take it the same way, since a build script cannot
-//! host tests.
+//! Pure over paths, so the build script and the crate's unit tests both take
+//! it with `#[path]` (a build script cannot host tests).
 
-use std::fmt;
 use std::path::{Path, PathBuf};
-
-/// Why a candidate resource directory was not chosen.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Rejection {
-    /// Its name is not a clang version (`21`, `14.0.6`), so its version is
-    /// unknown.
-    NotAVersion,
-    /// The LLVM major version its name carries, which is not the loaded
-    /// libclang's.
-    OtherVersion(u32),
-    /// A header the parse needs is missing: not a resource directory, or one
-    /// whose headers are not installed.
-    MissingHeader(&'static str),
-    /// Not valid UTF-8, which bindgen's string arguments cannot carry.
-    NotUtf8,
-}
-
-impl fmt::Display for Rejection {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotAVersion => write!(f, "not named after a clang version"),
-            Self::OtherVersion(major) => write!(f, "LLVM {major}"),
-            Self::MissingHeader(header) => write!(f, "no include/{header}"),
-            Self::NotUtf8 => write!(f, "path is not UTF-8"),
-        }
-    }
-}
-
-/// The outcome of [`select`]: the directory to pass as `-resource-dir`, if
-/// any, and every candidate examined before it with the reason it was
-/// passed over.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct Selection {
-    pub chosen: Option<PathBuf>,
-    pub rejected: Vec<(PathBuf, Rejection)>,
-}
 
 /// The LLVM major version a resource directory's name carries: `21` for
 /// `.../clang/21` (the layout since LLVM 16), `14` for `.../clang/14.0.6`
-/// (the full version, before it). `None` for any other name.
+/// (before it). `None` for any other name.
 pub fn dir_major(dir: &Path) -> Option<u32> {
     let name = dir.file_name()?.to_str()?;
+    let all_digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     let mut parts = name.split('.');
     let major = parts.next()?;
-    let all_digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     if !all_digits(major) || !parts.all(all_digits) {
         return None;
     }
     major.parse().ok()
 }
 
-/// The headers, relative to `<resource dir>/include`, that the DPDK parse
-/// needs from a resource directory on `target_arch` (cargo's
-/// `CARGO_CFG_TARGET_ARCH`): `stddef.h` on every target, and the header
-/// DPDK's vector code reaches the intrinsics through on the targets it has
-/// one for.
-pub fn required_headers(target_arch: &str) -> &'static [&'static str] {
-    match target_arch {
-        "x86_64" | "x86" => &["stddef.h", "immintrin.h"],
-        "aarch64" | "arm" => &["stddef.h", "arm_neon.h"],
-        _ => &["stddef.h"],
-    }
-}
-
-/// The first header of `required` missing from `dir/include`, if any.
-pub fn missing_header(dir: &Path, required: &[&'static str]) -> Option<&'static str> {
-    let include = dir.join("include");
-    required
-        .iter()
-        .copied()
-        .find(|header| !include.join(header).is_file())
-}
-
-/// Picks, in order, the first candidate whose version is `libclang_major`
-/// and whose headers are all present (`missing_header` returns the first
-/// one absent). The candidates examined before it are returned with the
-/// reason each was passed over; none chosen means no `-resource-dir` at
-/// all, and libclang's own default, which is of its own version.
-pub fn select(
-    libclang_major: u32,
-    candidates: impl IntoIterator<Item = PathBuf>,
-    missing_header: impl Fn(&Path) -> Option<&'static str>,
-) -> Selection {
-    let mut selection = Selection::default();
-    for dir in candidates {
-        let rejection = match dir_major(&dir) {
-            None => Some(Rejection::NotAVersion),
-            Some(major) if major != libclang_major => Some(Rejection::OtherVersion(major)),
-            Some(_) => match missing_header(&dir) {
-                Some(header) => Some(Rejection::MissingHeader(header)),
-                None if dir.to_str().is_none() => Some(Rejection::NotUtf8),
-                None => None,
-            },
-        };
-        match rejection {
-            Some(rejection) => selection.rejected.push((dir, rejection)),
-            None => {
-                selection.chosen = Some(dir);
-                break;
-            }
+/// The directories whose subdirectories are searched, in order: `clang`
+/// beside the loaded libclang, as loaded and with its symlinks resolved
+/// (Debian and Ubuntu reach `/usr/lib/llvm-N/lib/libclang*` through a
+/// multiarch symlink, in either direction), then the Debian/Ubuntu tree of
+/// that major. A root already listed is not listed again.
+pub fn roots(libclang: &Path, canonical: &Path, major: u32) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for root in [libclang, canonical]
+        .into_iter()
+        .filter_map(Path::parent)
+        .map(|libdir| libdir.join("clang"))
+        .chain([PathBuf::from(format!("/usr/lib/llvm-{major}/lib/clang"))])
+    {
+        // A `Vec` searched linearly: there are at most three roots.
+        if !roots.contains(&root) {
+            roots.push(root);
         }
     }
-    selection
+    roots
 }
 
-/// The directories, in order of preference, whose subdirectories are
-/// resource directories installed beside the loaded libclang:
-/// `<libdir>/clang` next to the library as loaded and next to the file its
-/// symlinks resolve to (`canonical`). Debian and Ubuntu install
-/// `/usr/lib/llvm-N/lib/libclang*.so*` beside `/usr/lib/llvm-N/lib/clang/N`,
-/// with the library also reachable through a symlink in the multiarch
-/// directory, in either direction depending on the release; Fedora installs
-/// `/usr/lib64/libclang.so*` beside `/usr/lib64/clang/N`.
-pub fn adjacent_roots(libclang: &Path, canonical: &Path) -> Vec<PathBuf> {
-    unique(
-        [libclang, canonical]
-            .into_iter()
-            .filter_map(Path::parent)
-            .map(|libdir| libdir.join("clang")),
-    )
-}
-
-/// `paths` in order with each repeat dropped, the first occurrence kept.
-/// The places searched overlap (clang-sys loads libclang from
-/// `/usr/lib/llvm-N/lib`, whose `clang` root is also the first well-known
-/// one, and the system clang may report one of its subdirectories), and a
-/// directory examined twice would be listed twice in the no-match warning.
-/// A `Vec` with a linear scan: a handful of paths, built once per build.
-pub fn unique(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
-    let mut seen: Vec<PathBuf> = Vec::new();
-    for path in paths {
-        if !seen.contains(&path) {
-            seen.push(path);
-        }
-    }
-    seen
-}
-
-/// The well-known directories holding resource directories for any LLVM
-/// release: the Debian/Ubuntu per-version tree for `libclang_major` and its
-/// compatibility links, and the Fedora and `/usr/local` locations. A
-/// directory found here is accepted only for its version, like any other.
-pub fn well_known_roots(libclang_major: u32) -> Vec<PathBuf> {
-    vec![
-        PathBuf::from(format!("/usr/lib/llvm-{libclang_major}/lib/clang")),
-        PathBuf::from("/usr/lib/clang"),
-        PathBuf::from("/usr/lib64/clang"),
-        PathBuf::from("/usr/local/lib/clang"),
-    ]
-}
-
-/// The subdirectories of each root, root by root, each root's sorted by
-/// name so the choice does not depend on the directory listing's order.
-/// A root that does not exist, or cannot be listed, contributes nothing:
-/// most of the well-known roots are absent on any given host, and a
-/// directory that cannot be listed cannot be a candidate.
+/// The subdirectories of each root, root by root, each root's sorted so the
+/// choice does not depend on listing order. A root that is absent or cannot
+/// be listed, and an entry that cannot be read, contribute nothing: neither
+/// can be a candidate, and a miss overall lists what was examined.
 pub fn subdirectories(roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     for root in roots {
-        // Absent or unreadable: no candidates here (see above). What was
-        // examined is reported when nothing matches, so the gap is visible.
         let Ok(entries) = std::fs::read_dir(root) else {
             continue;
         };
         let mut dirs: Vec<PathBuf> = entries
-            // An entry that cannot be read is skipped for the same reason.
             .filter_map(Result::ok)
             .map(|entry| entry.path())
             .filter(|path| path.is_dir())
@@ -192,38 +68,56 @@ pub fn subdirectories(roots: &[PathBuf]) -> Vec<PathBuf> {
     candidates
 }
 
-/// The `cargo:warning` text for a build where no candidate matched the
-/// loaded libclang, so bindgen runs with libclang's default headers.
-pub fn no_match_warning(
-    libclang: &Path,
-    libclang_version: &str,
-    rejected: &[(PathBuf, Rejection)],
-) -> String {
-    let examined = if rejected.is_empty() {
-        "none found".to_string()
-    } else {
-        rejected
-            .iter()
-            .map(|(dir, why)| format!("{} ({why})", dir.display()))
-            .collect::<Vec<_>>()
-            .join(", ")
+/// The first of `primary` named after `major` and holding `include/stddef.h`;
+/// only if there is none, `fallback`'s directory under the same rule. `Err`
+/// lists each directory skipped with why, for the build's warning.
+pub fn select(
+    major: u32,
+    primary: impl IntoIterator<Item = PathBuf>,
+    fallback: impl FnOnce() -> Option<PathBuf>,
+) -> Result<String, Vec<String>> {
+    let mut skipped = Vec::new();
+    let mut accept = |dir: PathBuf| {
+        let reason = match dir_major(&dir) {
+            None => "not a version".to_string(),
+            Some(other) if other != major => format!("LLVM {other}"),
+            Some(_) if !dir.join("include/stddef.h").is_file() => "no include/stddef.h".to_string(),
+            // bindgen's arguments are strings.
+            Some(_) => match dir.to_str() {
+                Some(dir) => return Some(dir.to_string()),
+                None => "not UTF-8".to_string(),
+            },
+        };
+        // The fallback may name a directory already skipped as a primary.
+        let entry = format!("{} ({reason})", dir.display());
+        if !skipped.contains(&entry) {
+            skipped.push(entry);
+        }
+        None
     };
-    format!(
-        "bindgen loads libclang {libclang_version} from {}, and no clang resource \
-         directory of that version was found (examined: {examined}); generating the \
-         DPDK bindings with libclang's built-in headers. If that fails, install the \
-         clang headers of that LLVM version, or point LIBCLANG_PATH at a libclang \
-         whose headers are installed.",
-        libclang.display()
-    )
+    let chosen = primary
+        .into_iter()
+        .find_map(&mut accept)
+        .or_else(|| fallback().and_then(&mut accept));
+    chosen.ok_or(skipped)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn paths(names: &[&str]) -> Vec<PathBuf> {
-        names.iter().map(PathBuf::from).collect()
+    /// `root/name`, with `include/stddef.h` when `headers`.
+    fn install(root: &Path, name: &str, headers: bool) -> PathBuf {
+        let dir = root.join(name);
+        std::fs::create_dir_all(dir.join("include")).expect("mkdir");
+        if headers {
+            std::fs::write(dir.join("include/stddef.h"), "").expect("write");
+        }
+        dir
+    }
+
+    fn no_fallback() -> Option<PathBuf> {
+        None
     }
 
     #[test]
@@ -232,22 +126,18 @@ mod tests {
             dir_major(Path::new("/usr/lib/llvm-21/lib/clang/21")),
             Some(21)
         );
-        assert_eq!(
-            dir_major(Path::new("/usr/lib/llvm-14/lib/clang/14.0.6")),
-            Some(14)
-        );
-        assert_eq!(dir_major(Path::new("/usr/lib64/clang/18")), Some(18));
+        assert_eq!(dir_major(Path::new("/usr/lib/clang/14.0.6")), Some(14));
     }
 
     #[test]
     fn dir_major_refuses_names_that_are_not_versions() {
         for name in [
-            "/usr/lib/clang/include",
-            "/usr/lib/clang/21git",
-            "/usr/lib/clang/21.",
-            "/usr/lib/clang/.21",
-            "/usr/lib/clang/21.0-rc1",
-            "/usr/lib/clang/99999999999",
+            "/c/include",
+            "/c/21git",
+            "/c/21.",
+            "/c/.21",
+            "/c/21.0-rc1",
+            "/c/99999999999",
             "/",
         ] {
             assert_eq!(dir_major(Path::new(name)), None, "{name}");
@@ -255,156 +145,149 @@ mod tests {
     }
 
     #[test]
-    fn select_takes_the_first_candidate_of_the_libclang_major() {
-        let selection = select(14, paths(&["/a/clang/14.0.6", "/b/clang/14"]), |_| None);
-        assert_eq!(selection.chosen, Some(PathBuf::from("/a/clang/14.0.6")));
-        assert!(selection.rejected.is_empty());
-
-        let selection = select(21, paths(&["/usr/lib/llvm-21/lib/clang/21"]), |_| None);
+    fn select_takes_the_first_installed_directory_of_the_major() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let full = install(root.path(), "14.0.6", true);
+        let short = install(root.path(), "14", true);
         assert_eq!(
-            selection.chosen,
-            Some(PathBuf::from("/usr/lib/llvm-21/lib/clang/21"))
+            select(14, [full.clone(), short.clone()], no_fallback),
+            Ok(full.display().to_string())
+        );
+        let dir = install(root.path(), "21", true);
+        assert_eq!(
+            select(21, [dir.clone()], no_fallback),
+            Ok(dir.display().to_string())
         );
     }
 
-    /// The CI failure: an LLVM 18 libclang and `clang` from LLVM 21. The 21
-    /// headers are passed over, whatever their position, for the 18 ones.
+    /// The CI failure: an LLVM 18 libclang with LLVM 21 headers installed.
     #[test]
-    fn select_rejects_another_major_and_keeps_looking() {
-        let selection = select(
-            18,
-            paths(&[
-                "/usr/lib/llvm-21/lib/clang/21",
-                "/usr/lib/clang/include",
-                "/usr/lib/llvm-18/lib/clang/18",
-            ]),
-            |_| None,
+    fn select_skips_another_major_and_names_without_headers_or_version() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let other = install(root.path(), "21", true);
+        let not_version = install(root.path(), "include", true);
+        let headerless = install(root.path(), "18", false);
+        let chosen = install(root.path(), "18.1.3", true);
+        assert_eq!(
+            select(
+                18,
+                [
+                    other.clone(),
+                    not_version.clone(),
+                    headerless.clone(),
+                    chosen.clone()
+                ],
+                no_fallback
+            ),
+            Ok(chosen.display().to_string())
         );
         assert_eq!(
-            selection.chosen,
-            Some(PathBuf::from("/usr/lib/llvm-18/lib/clang/18"))
+            select(
+                18,
+                [other.clone(), not_version.clone(), headerless.clone()],
+                no_fallback
+            ),
+            Err(vec![
+                format!("{} (LLVM 21)", other.display()),
+                format!("{} (not a version)", not_version.display()),
+                format!("{} (no include/stddef.h)", headerless.display()),
+            ])
         );
+    }
+
+    #[test]
+    fn select_without_a_candidate_chooses_nothing() {
+        assert_eq!(select(18, [], no_fallback), Err(Vec::new()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn select_skips_a_path_bindgen_cannot_carry() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = install(&root.path().join(OsStr::from_bytes(b"\xff")), "18", true);
         assert_eq!(
-            selection.rejected,
-            vec![
-                (
-                    PathBuf::from("/usr/lib/llvm-21/lib/clang/21"),
-                    Rejection::OtherVersion(21)
-                ),
-                (
-                    PathBuf::from("/usr/lib/clang/include"),
-                    Rejection::NotAVersion
-                ),
+            select(18, [dir.clone()], no_fallback),
+            Err(vec![format!("{} (not UTF-8)", dir.display())])
+        );
+    }
+
+    #[test]
+    fn select_consults_the_fallback_only_without_a_primary_match() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let primary = install(root.path(), "18", true);
+        let fallback = install(&root.path().join("system"), "18", true);
+        let unexpected = || -> Option<PathBuf> { panic!("fallback consulted despite a match") };
+        assert_eq!(
+            select(18, [primary.clone()], unexpected),
+            Ok(primary.display().to_string())
+        );
+
+        let other = install(root.path(), "21", true);
+        let fallback_dir = fallback.clone();
+        assert_eq!(
+            select(18, [other.clone()], move || Some(fallback_dir)),
+            Ok(fallback.display().to_string())
+        );
+        // The fallback is held to the same rule, and listed when it fails it.
+        let wrong = install(&root.path().join("system"), "21", true);
+        let wrong_dir = wrong.clone();
+        assert_eq!(
+            select(18, [other.clone()], move || Some(wrong_dir)),
+            Err(vec![
+                format!("{} (LLVM 21)", other.display()),
+                format!("{} (LLVM 21)", wrong.display())
+            ])
+        );
+        // A fallback naming a directory already skipped is listed once.
+        let other_dir = other.clone();
+        assert_eq!(
+            select(18, [other.clone()], move || Some(other_dir)),
+            Err(vec![format!("{} (LLVM 21)", other.display())])
+        );
+    }
+
+    #[test]
+    fn roots_look_beside_the_library_its_target_and_the_install_trees() {
+        assert_eq!(
+            roots(
+                Path::new("/usr/lib/x86_64-linux-gnu/libclang-18.so.18"),
+                Path::new("/usr/lib/llvm-18/lib/libclang.so.18.1"),
+                18,
+            ),
+            [
+                PathBuf::from("/usr/lib/x86_64-linux-gnu/clang"),
+                PathBuf::from("/usr/lib/llvm-18/lib/clang"),
+            ]
+        );
+        // A library that is not a link is not searched beside twice.
+        let lib = Path::new("/usr/lib64/libclang.so.18");
+        assert_eq!(
+            roots(lib, lib, 18),
+            [
+                PathBuf::from("/usr/lib64/clang"),
+                PathBuf::from("/usr/lib/llvm-18/lib/clang"),
+            ]
+        );
+        // Nor is the major tree, when the library is in it.
+        let lib = Path::new("/usr/lib/llvm-18/lib/libclang.so.1");
+        assert_eq!(
+            roots(lib, lib, 18),
+            [PathBuf::from("/usr/lib/llvm-18/lib/clang")]
+        );
+        // Loaded from the major tree through a link resolving elsewhere.
+        assert_eq!(
+            roots(lib, Path::new("/opt/llvm/lib/libclang.so.18.1"), 18),
+            [
+                PathBuf::from("/usr/lib/llvm-18/lib/clang"),
+                PathBuf::from("/opt/llvm/lib/clang"),
             ]
         );
     }
 
     #[test]
-    fn select_rejects_the_right_version_without_its_headers() {
-        let selection = select(18, paths(&["/a/clang/18", "/b/clang/18"]), |dir| {
-            dir.starts_with("/a").then_some("stddef.h")
-        });
-        assert_eq!(selection.chosen, Some(PathBuf::from("/b/clang/18")));
-        assert_eq!(
-            selection.rejected,
-            vec![(
-                PathBuf::from("/a/clang/18"),
-                Rejection::MissingHeader("stddef.h")
-            )]
-        );
-    }
-
-    #[test]
-    fn select_without_a_match_chooses_nothing() {
-        let selection = select(18, Vec::new(), |_| None);
-        assert_eq!(selection, Selection::default());
-
-        let selection = select(18, paths(&["/usr/lib/llvm-21/lib/clang/21"]), |_| None);
-        assert_eq!(selection.chosen, None);
-        assert_eq!(selection.rejected.len(), 1);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn select_rejects_a_path_bindgen_cannot_carry() {
-        use std::ffi::OsStr;
-        use std::os::unix::ffi::OsStrExt;
-        let dir = Path::new(OsStr::from_bytes(b"/opt/\xff/clang/18")).to_path_buf();
-        let selection = select(18, vec![dir.clone()], |_| None);
-        assert_eq!(selection.chosen, None);
-        assert_eq!(selection.rejected, vec![(dir, Rejection::NotUtf8)]);
-    }
-
-    #[test]
-    fn required_headers_follow_the_target() {
-        assert_eq!(required_headers("x86_64"), ["stddef.h", "immintrin.h"]);
-        assert_eq!(required_headers("aarch64"), ["stddef.h", "arm_neon.h"]);
-        assert_eq!(required_headers("riscv64"), ["stddef.h"]);
-    }
-
-    #[test]
-    fn missing_header_reports_the_first_absent_one() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let dir = root.path().join("18");
-        std::fs::create_dir_all(dir.join("include")).expect("mkdir");
-        let required = required_headers("x86_64");
-        assert_eq!(missing_header(&dir, required), Some("stddef.h"));
-        std::fs::write(dir.join("include/stddef.h"), "").expect("write");
-        assert_eq!(missing_header(&dir, required), Some("immintrin.h"));
-        std::fs::write(dir.join("include/immintrin.h"), "").expect("write");
-        assert_eq!(missing_header(&dir, required), None);
-    }
-
-    #[test]
-    fn adjacent_roots_look_beside_the_library_and_its_target() {
-        assert_eq!(
-            adjacent_roots(
-                Path::new("/usr/lib/x86_64-linux-gnu/libclang-18.so.18"),
-                Path::new("/usr/lib/llvm-18/lib/libclang.so.18.1"),
-            ),
-            paths(&[
-                "/usr/lib/x86_64-linux-gnu/clang",
-                "/usr/lib/llvm-18/lib/clang"
-            ])
-        );
-        // Not a symlink: one root, not the same one twice.
-        assert_eq!(
-            adjacent_roots(
-                Path::new("/usr/lib64/libclang.so.18"),
-                Path::new("/usr/lib64/libclang.so.18"),
-            ),
-            paths(&["/usr/lib64/clang"])
-        );
-    }
-
-    #[test]
-    fn unique_keeps_the_first_of_each_path_in_order() {
-        assert_eq!(
-            unique(paths(&[
-                "/usr/lib/llvm-18/lib/clang",
-                "/usr/lib/clang",
-                "/usr/lib/llvm-18/lib/clang",
-                "/usr/lib64/clang",
-                "/usr/lib/clang",
-            ])),
-            paths(&[
-                "/usr/lib/llvm-18/lib/clang",
-                "/usr/lib/clang",
-                "/usr/lib64/clang"
-            ])
-        );
-        assert_eq!(unique(Vec::new()), Vec::<PathBuf>::new());
-    }
-
-    #[test]
-    fn well_known_roots_include_the_per_version_tree() {
-        let roots = well_known_roots(18);
-        assert_eq!(roots[0], PathBuf::from("/usr/lib/llvm-18/lib/clang"));
-        assert!(roots.contains(&PathBuf::from("/usr/lib64/clang")));
-    }
-
-    #[test]
-    fn subdirectories_lists_each_root_in_order_and_skips_absent_ones() {
+    fn subdirectories_lists_each_root_sorted_and_skips_absent_ones() {
         let first = tempfile::tempdir().expect("tempdir");
         let second = tempfile::tempdir().expect("tempdir");
         for name in ["21", "14.0.6"] {
@@ -412,90 +295,18 @@ mod tests {
         }
         std::fs::write(first.path().join("not-a-dir"), "").expect("write");
         std::fs::create_dir(second.path().join("18")).expect("mkdir");
-        let roots = vec![
+        let roots = [
             first.path().to_path_buf(),
             first.path().join("absent"),
             second.path().to_path_buf(),
         ];
         assert_eq!(
             subdirectories(&roots),
-            vec![
+            [
                 first.path().join("14.0.6"),
                 first.path().join("21"),
-                second.path().join("18"),
+                second.path().join("18")
             ]
         );
-    }
-
-    /// The whole search over a real tree, as the build script runs it: in
-    /// listing order, a directory of another version and one of the right
-    /// version without its headers are skipped for the installed match.
-    #[test]
-    fn select_over_a_tree_finds_the_matching_installed_headers() {
-        let root = tempfile::tempdir().expect("tempdir");
-        for (version, headers) in [("17", true), ("18", false), ("18.1.3", true)] {
-            let include = root.path().join(version).join("include");
-            std::fs::create_dir_all(&include).expect("mkdir");
-            if headers {
-                std::fs::write(include.join("stddef.h"), "").expect("write");
-            }
-        }
-        let required = required_headers("riscv64");
-        let selection = select(18, subdirectories(&[root.path().to_path_buf()]), |dir| {
-            missing_header(dir, required)
-        });
-        assert_eq!(selection.chosen, Some(root.path().join("18.1.3")));
-        assert_eq!(
-            selection.rejected,
-            vec![
-                (root.path().join("17"), Rejection::OtherVersion(17)),
-                (root.path().join("18"), Rejection::MissingHeader("stddef.h")),
-            ]
-        );
-
-        let selection = select(19, subdirectories(&[root.path().to_path_buf()]), |dir| {
-            missing_header(dir, required)
-        });
-        assert_eq!(selection.chosen, None);
-        assert_eq!(
-            selection.rejected,
-            vec![
-                (root.path().join("17"), Rejection::OtherVersion(17)),
-                (root.path().join("18"), Rejection::OtherVersion(18)),
-                (root.path().join("18.1.3"), Rejection::OtherVersion(18)),
-            ]
-        );
-    }
-
-    #[test]
-    fn no_match_warning_names_the_library_and_every_rejection() {
-        let warning = no_match_warning(
-            Path::new("/usr/lib/x86_64-linux-gnu/libclang-18.so.18"),
-            "18.1",
-            &[
-                (
-                    PathBuf::from("/usr/lib/llvm-21/lib/clang/21"),
-                    Rejection::OtherVersion(21),
-                ),
-                (
-                    PathBuf::from("/usr/lib/clang/18"),
-                    Rejection::MissingHeader("immintrin.h"),
-                ),
-                (
-                    PathBuf::from("/usr/lib/clang/include"),
-                    Rejection::NotAVersion,
-                ),
-                (PathBuf::from("/opt/x"), Rejection::NotUtf8),
-            ],
-        );
-        assert!(warning.contains("libclang 18.1 from /usr/lib/x86_64-linux-gnu/libclang-18.so.18"));
-        assert!(warning.contains("/usr/lib/llvm-21/lib/clang/21 (LLVM 21)"));
-        assert!(warning.contains("/usr/lib/clang/18 (no include/immintrin.h)"));
-        assert!(warning.contains("/usr/lib/clang/include (not named after a clang version)"));
-        assert!(warning.contains("/opt/x (path is not UTF-8)"));
-        assert!(warning.contains("LIBCLANG_PATH"));
-
-        let warning = no_match_warning(Path::new("/l/libclang.so"), "19.0", &[]);
-        assert!(warning.contains("examined: none found"));
     }
 }
