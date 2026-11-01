@@ -3,8 +3,9 @@
 //! `AppEvent` is `Copy` and the hot path cannot allocate, so an event
 //! lives inline in every ring slot — and the rings hold a fixed number of
 //! slots (the node's ring capacity, pinned here at its default), so event
-//! width multiplies straight through by the ring capacity. Committing to a fixed 32-byte digest instead of carrying a
-//! document keeps that multiplier small, which is the main engineering
+//! width multiplies straight through by the ring capacity. Committing to
+//! a fixed 32-byte digest instead of carrying a document keeps that
+//! multiplier small, which is the main engineering
 //! consequence of the design and therefore worth asserting rather than
 //! assuming.
 

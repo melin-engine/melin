@@ -38,13 +38,13 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   with**, read from the ring itself, rather than a constant. On a
   replica, which has no client input ring, it now reads 0 instead of
   1048576.
-- **Ring capacity is a parameter** (breaking): `build_pipeline_with_replication`,
-  `build_replica_pipeline` and the replica receivers `run_receiver` and
-  `run_receiver_dpdk` take a `RingCapacity`, and `melin_pipeline::ring::QueueCursor`
-  gains a required `capacity()`. The `INPUT_RING_CAPACITY` and
+- **Ring capacity is a parameter** (breaking):
+  `build_pipeline_with_replication`, `build_replica_pipeline` and the
+  replica receivers `run_receiver` and `run_receiver_dpdk` take a
+  `RingCapacity`, and `melin_pipeline::ring::QueueCursor` gains a
+  required `capacity()`. The `INPUT_RING_CAPACITY` and
   `OUTPUT_RING_CAPACITY` constants are removed; `RingCapacity::DEFAULT`
   is their value.
-
 - **`melin_transport_core::health::RaftStatus` gains a private field**
   (the quorum-ack age, read and written through
   `millis_since_quorum_ack` and `set_millis_since_quorum_ack`), so it can

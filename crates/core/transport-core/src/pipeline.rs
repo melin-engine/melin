@@ -1004,7 +1004,7 @@ pub type StreamMarkQueue = Arc<StreamMarks>;
 /// against the data volume; at low rate checks are sparse, which is
 /// fine: handshake validation covers reconnects, and every rotation
 /// adoption is itself a chain check.
-const CHAIN_CHECK_INTERVAL_BATCHES: u32 = 64;
+pub(crate) const CHAIN_CHECK_INTERVAL_BATCHES: u32 = 64;
 
 /// Replication state for the journal stage. Boxed in JournalStage to
 /// avoid inflating the struct size on the hot path (standalone mode has

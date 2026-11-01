@@ -1966,6 +1966,92 @@ fn primary_journal_sequences_contiguous_across_many_batches() {
     }
 }
 
+/// Stand in for the replication link between a primary and a replica
+/// built in one process: pump the primary's replication ring into the
+/// replica's input ring until `stop` is set and both consumers are idle.
+///
+/// Input batches become replica input slots; Rotate and ChainCheck
+/// frames go into `marks` in stream order, pushed before any later slot
+/// is published (the receiver's ordering contract). Every frame kind the
+/// journal stage can put on the ring is routed, so a test's outcome does
+/// not depend on how many batches its run happens to take (a chain check
+/// is due every `CHAIN_CHECK_INTERVAL_BATCHES`). Joining the thread
+/// yields the number of chain checks it relayed.
+#[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
+fn spawn_replication_relay(
+    mut repl_c0: melin_journal::replication::ReplicationConsumer,
+    mut repl_c1: melin_journal::replication::ReplicationConsumer,
+    mut replica_input: ring::Producer<TestInput>,
+    marks: crate::pipeline::StreamMarkQueue,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<u64> {
+    use crate::replication::protocol::{PrimaryMessage, decode_primary_message};
+    use crate::replication_wire::{MSG_INPUT_BATCH, peek_frame_tag, try_decode_input_batch};
+    std::thread::spawn(move || {
+        // u64: a count of frames, which no test run approaches overflowing.
+        let mut chain_checks = 0u64;
+        loop {
+            let mut got_something = false;
+            if let Some(batch) = repl_c0.peek() {
+                let data = batch.data();
+                let payload_len =
+                    u32::from_le_bytes(data[..4].try_into().expect("4-byte length prefix"))
+                        as usize;
+                let payload = &data[4..4 + payload_len];
+                if peek_frame_tag(data).expect("relay frame tag") == MSG_INPUT_BATCH {
+                    let slots: Vec<TestInput> =
+                        try_decode_input_batch(payload).expect("relay InputBatch decode");
+                    for slot in slots {
+                        replica_input.publish(InputSlot {
+                            connection_id: 0,
+                            request_id: RequestId(0),
+                            key_hash: slot.key_hash,
+                            sequence: slot.sequence,
+                            timestamp_ns: slot.timestamp_ns,
+                            event: slot.event,
+                            publish_ts: mono_trace_ns(),
+                            recv_ts: mono_trace_ns(),
+                        });
+                    }
+                } else {
+                    match decode_primary_message(payload).expect("relay control decode") {
+                        PrimaryMessage::Rotate {
+                            boundary_seq,
+                            tail_hash,
+                        } => marks.push(StreamMark::Rotate(AdoptedRotation {
+                            boundary_seq,
+                            tail_hash,
+                        })),
+                        PrimaryMessage::ChainCheck {
+                            sequence,
+                            chain_hash,
+                        } => {
+                            chain_checks += 1;
+                            marks.push(StreamMark::ChainCheck {
+                                sequence,
+                                chain_hash,
+                            });
+                        }
+                        other => panic!("unexpected control frame on ring: {other:?}"),
+                    }
+                }
+                batch.commit();
+                got_something = true;
+            }
+            if let Some(batch) = repl_c1.peek() {
+                batch.commit();
+                got_something = true;
+            }
+            if !got_something {
+                if stop.load(Ordering::Relaxed) {
+                    return chain_checks;
+                }
+                std::hint::spin_loop();
+            }
+        }
+    })
+}
+
 /// Copy a failing journal to a stable `/tmp/` path keyed by test name +
 /// pid so the byte pattern at the read failure can be inspected with
 /// `xxd` after the test panics. Returns the dump path; on any I/O error
@@ -2027,7 +2113,7 @@ fn primary_and_replica_journals_contiguous_and_chain_identical() {
     // -------- replica --------
     let replica_writer =
         Writer::create_continuing(&replica_path, 1, shared_anchor, Some(0)).unwrap();
-    let replica = build_replica_pipeline(
+    let mut replica = build_replica_pipeline(
         TestApp::new(),
         replica_writer,
         MAX_JOURNAL_BATCH,
@@ -2037,6 +2123,10 @@ fn primary_and_replica_journals_contiguous_and_chain_identical() {
         false,
         Arc::new(crate::fence::FenceState::new(0)),
     );
+    let stream_marks = crate::pipeline::StreamMarks::shared();
+    replica
+        .journal_stage
+        .set_stream_marks(Arc::clone(&stream_marks));
 
     // Mark a replica as connected so the primary's journal stage
     // actually publishes to the replication ring.
@@ -2044,54 +2134,24 @@ fn primary_and_replica_journals_contiguous_and_chain_identical() {
         rp.active_flags[0].store(true, Ordering::Relaxed);
     }
 
-    let (mut repl_c0, mut repl_c1) = primary.replication_consumers.expect("replication enabled");
-    let mut replica_input = replica.input_producer;
+    let (repl_c0, repl_c1) = primary.replication_consumers.expect("replication enabled");
+    let replica_input = replica.input_producer;
 
     let primary_shutdown = Arc::new(AtomicBool::new(false));
     let replica_shutdown = Arc::new(AtomicBool::new(false));
     let relay_shutdown = Arc::new(AtomicBool::new(false));
 
-    // --- relay thread: pump primary replication ring → replica input ring ---
-    let relay_stop = Arc::clone(&relay_shutdown);
-    let t_relay = std::thread::spawn(move || {
-        loop {
-            let mut got_something = false;
-            if let Some(batch) = repl_c0.peek() {
-                let data = batch.data();
-                let payload_len =
-                    u32::from_le_bytes(data[..4].try_into().expect("4-byte length prefix"))
-                        as usize;
-                let payload = &data[4..4 + payload_len];
-                let slots: Vec<TestInput> =
-                    crate::replication_wire::try_decode_input_batch(payload)
-                        .expect("relay InputBatch decode");
-                for slot in slots {
-                    replica_input.publish(InputSlot {
-                        connection_id: 0,
-                        request_id: RequestId(0),
-                        key_hash: slot.key_hash,
-                        sequence: slot.sequence,
-                        timestamp_ns: slot.timestamp_ns,
-                        event: slot.event,
-                        publish_ts: mono_trace_ns(),
-                        recv_ts: mono_trace_ns(),
-                    });
-                }
-                batch.commit();
-                got_something = true;
-            }
-            if let Some(batch) = repl_c1.peek() {
-                batch.commit();
-                got_something = true;
-            }
-            if !got_something {
-                if relay_stop.load(Ordering::Relaxed) {
-                    return;
-                }
-                std::hint::spin_loop();
-            }
-        }
-    });
+    // The primary's periodic chain checks reach the replica's journal
+    // stage, so the run also checks the replica verifies them in step
+    // (a mismatch fails its journal stage); the relay counts them, so
+    // the run is shown to carry at least one.
+    let t_relay = spawn_replication_relay(
+        repl_c0,
+        repl_c1,
+        replica_input,
+        stream_marks,
+        Arc::clone(&relay_shutdown),
+    );
 
     // --- primary + replica pipeline threads ---
     let mut primary_output = primary.output_consumers.pop().unwrap();
@@ -2128,8 +2188,16 @@ fn primary_and_replica_journals_contiguous_and_chain_identical() {
     let t_r_journal = std::thread::spawn(move || replica.journal_stage.run(&r_j_stop));
     let t_r_matching = std::thread::spawn(move || replica.matching_stage.run(&r_m_stop));
 
-    // Enough events to span many fsync batches and replication frames.
-    let total: u64 = 50_250;
+    // Enough events to span many fsync batches and replication frames,
+    // and to force at least one chain check: with no group-commit delay
+    // (`Duration::ZERO` above) each batch is one ring read, which takes
+    // no more than the ring holds, so this many events take more than
+    // `CHAIN_CHECK_INTERVAL_BATCHES` batches however the run splits them.
+    // A nonzero delay would let one batch accumulate several reads (up
+    // to the batch limit) and void this bound.
+    let total: u64 = RingCapacity::MIN.slots() as u64
+        * (u64::from(crate::pipeline::CHAIN_CHECK_INTERVAL_BATCHES) + 1)
+        + 250;
     for i in 0..total {
         primary
             .input_producer
@@ -2142,7 +2210,11 @@ fn primary_and_replica_journals_contiguous_and_chain_identical() {
     let primary_journal_result = t_p_journal.join().unwrap();
     let _ = t_p_matching.join().unwrap();
     relay_shutdown.store(true, Ordering::Relaxed);
-    let _ = t_relay.join();
+    let chain_checks_relayed = t_relay.join().unwrap();
+    assert!(
+        chain_checks_relayed > 0,
+        "the run must carry at least one chain check to the replica"
+    );
     std::thread::sleep(Duration::from_millis(500));
     replica_shutdown.store(true, Ordering::Relaxed);
     let replica_journal_result = t_r_journal.join().unwrap();
@@ -3242,7 +3314,9 @@ fn primary_emits_chain_check_every_interval() {
     let handle = std::thread::spawn(move || stage.run(&s));
 
     // One slot per fsync batch: wait until each lands before the next.
-    let total = 70u64;
+    // A few batches past the first check, well short of the second.
+    let interval = crate::pipeline::CHAIN_CHECK_INTERVAL_BATCHES;
+    let total = u64::from(interval) + 6;
     for seq in 1..=total {
         producer.publish(add_slot(seq, 1_000_000_000 + seq));
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -3254,16 +3328,18 @@ fn primary_emits_chain_check_every_interval() {
             std::hint::spin_loop();
         }
     }
-    let chain_at_64 = {
-        // The check is emitted at the 64th batch boundary = sequence 64;
-        // recompute the expected hash from the journal file.
-        melin_journal::segment::chain_value_at(&path, 64).unwrap()
+    let chain_at_check = {
+        // The check is emitted at the `interval`th batch boundary, which
+        // with one slot per batch is sequence `interval`; recompute the
+        // expected hash from the journal file.
+        melin_journal::segment::chain_value_at(&path, u64::from(interval)).unwrap()
     };
     shutdown.store(true, Ordering::Relaxed);
     handle.join().unwrap().unwrap();
 
-    // Classify the ring: 70 input batches and exactly one ChainCheck
-    // (the 128th batch never happened), positioned after batch 64.
+    // Classify the ring: `total` input batches and exactly one
+    // ChainCheck (the second interval never completed), positioned
+    // right after batch `interval`.
     let mut input_batches = 0u32;
     let mut checks = Vec::new();
     while let Some(batch) = repl_consumers_0[0].peek() {
@@ -3282,13 +3358,16 @@ fn primary_emits_chain_check_every_interval() {
         batch.commit();
     }
     assert_eq!(input_batches, total as u32);
-    assert_eq!(checks.len(), 1, "exactly one check in 70 batches");
+    assert_eq!(checks.len(), 1, "exactly one check in {total} batches");
     let (sequence, chain_hash, after_batches) = checks[0];
-    assert_eq!(sequence, 64);
-    assert_eq!(after_batches, 64, "check rides right behind the 64th batch");
-    match chain_at_64 {
+    assert_eq!(sequence, u64::from(interval));
+    assert_eq!(
+        after_batches, interval,
+        "check rides right behind the {interval}th batch"
+    );
+    match chain_at_check {
         melin_journal::segment::ChainValueAt::Value(v) => assert_eq!(chain_hash, v),
-        other => panic!("chain at 64 must exist: {other:?}"),
+        other => panic!("chain at {interval} must exist: {other:?}"),
     }
 }
 
@@ -3368,82 +3447,20 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
         rp.active_flags[0].store(true, Ordering::Relaxed);
     }
 
-    let (mut repl_c0, mut repl_c1) = primary.replication_consumers.expect("replication enabled");
-    let mut replica_input = replica.input_producer;
+    let (repl_c0, repl_c1) = primary.replication_consumers.expect("replication enabled");
+    let replica_input = replica.input_producer;
 
     let primary_shutdown = Arc::new(AtomicBool::new(false));
     let replica_shutdown = Arc::new(AtomicBool::new(false));
     let relay_shutdown = Arc::new(AtomicBool::new(false));
 
-    // Relay: pump primary replication ring → replica input ring,
-    // routing Rotate frames into the adopted-rotation queue in stream
-    // order (push before any later slot is published — the receiver's
-    // ordering contract).
-    let relay_stop = Arc::clone(&relay_shutdown);
-    let relay_rotations = Arc::clone(&rotations);
-    let t_relay = std::thread::spawn(move || {
-        loop {
-            let mut got_something = false;
-            if let Some(batch) = repl_c0.peek() {
-                let data = batch.data();
-                let payload_len =
-                    u32::from_le_bytes(data[..4].try_into().expect("4-byte length prefix"))
-                        as usize;
-                let payload = &data[4..4 + payload_len];
-                if crate::replication_wire::peek_frame_tag(data).unwrap()
-                    == crate::replication_wire::MSG_INPUT_BATCH
-                {
-                    let slots: Vec<TestInput> =
-                        crate::replication_wire::try_decode_input_batch(payload)
-                            .expect("relay InputBatch decode");
-                    for slot in slots {
-                        replica_input.publish(InputSlot {
-                            connection_id: 0,
-                            request_id: RequestId(0),
-                            key_hash: slot.key_hash,
-                            sequence: slot.sequence,
-                            timestamp_ns: slot.timestamp_ns,
-                            event: slot.event,
-                            publish_ts: mono_trace_ns(),
-                            recv_ts: mono_trace_ns(),
-                        });
-                    }
-                } else {
-                    match crate::replication::protocol::decode_primary_message(payload)
-                        .expect("relay control decode")
-                    {
-                        crate::replication::protocol::PrimaryMessage::Rotate {
-                            boundary_seq,
-                            tail_hash,
-                        } => relay_rotations.push(StreamMark::Rotate(AdoptedRotation {
-                            boundary_seq,
-                            tail_hash,
-                        })),
-                        crate::replication::protocol::PrimaryMessage::ChainCheck {
-                            sequence,
-                            chain_hash,
-                        } => relay_rotations.push(StreamMark::ChainCheck {
-                            sequence,
-                            chain_hash,
-                        }),
-                        other => panic!("unexpected control frame on ring: {other:?}"),
-                    }
-                }
-                batch.commit();
-                got_something = true;
-            }
-            if let Some(batch) = repl_c1.peek() {
-                batch.commit();
-                got_something = true;
-            }
-            if !got_something {
-                if relay_stop.load(Ordering::Relaxed) {
-                    return;
-                }
-                std::hint::spin_loop();
-            }
-        }
-    });
+    let t_relay = spawn_replication_relay(
+        repl_c0,
+        repl_c1,
+        replica_input,
+        Arc::clone(&rotations),
+        Arc::clone(&relay_shutdown),
+    );
 
     let mut primary_output = primary.output_consumers.pop().unwrap();
     let primary_out_shutdown = Arc::new(AtomicBool::new(false));
@@ -3545,7 +3562,9 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
     // The relay exits only once the primary's ring is empty, so after
     // the join every slot and mark is on the replica's side.
     relay_shutdown.store(true, Ordering::Relaxed);
-    let _ = t_relay.join();
+    // How many chain checks rode along depends on how the run batched;
+    // this test pins segmentation, not checks.
+    let _chain_checks_relayed = t_relay.join().unwrap();
     let replica_caught_up = || {
         r_util.rotations_fast_path.load(Ordering::Relaxed)
             + r_util.rotations_sync_fallback.load(Ordering::Relaxed)

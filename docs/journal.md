@@ -287,7 +287,7 @@ Recovery walks archives in order, then the live segment. Old segments are kept f
 The journal participates in a 3-stage LMAX disruptor pipeline:
 
 ```
-            Input Disruptor (1M slots, lock-free ring buffer)
+     Input Disruptor (--ring-capacity slots, lock-free ring buffer)
                     │
         ┌───────────┴───────────┐
         │                       │

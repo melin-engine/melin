@@ -1551,6 +1551,16 @@ mod tests {
         assert!(!body.contains("melin_raft_quorum_ack_age_ms"), "{body}");
     }
 
+    /// A replica has no client input ring, so it reports neither a depth
+    /// nor a capacity for one: both gauges read 0, not the default ring's
+    /// capacity.
+    #[test]
+    fn a_replica_reports_no_input_ring() {
+        let body = replica_prometheus_body(&Arc::new(RaftStatus::new(1)));
+        assert!(body.contains("melin_input_queue_depth 0\n"), "{body}");
+        assert!(body.contains("melin_input_queue_capacity 0\n"), "{body}");
+    }
+
     #[test]
     fn replica_health_endpoint_reports_unhealthy_pipeline() {
         // The caller's live pipeline-health signal (the replica journal

@@ -9,7 +9,7 @@ The server uses a 3-stage pipeline plus a single reader thread, modeled after th
 ```
   Reader     -----+    +-------------------+
   (1 io_uring     +--->| Input Disruptor   |--+--> Journal Stage
-   thread, also   |    | (1M-slot ring)    |  |
+   thread, also   |    | (1M-slot ring*)   |  |
    emits Ticks    |    +-------------------+  +--> Matching Stage
    via io_uring   |                           |         |
    timeout)       |                           |         | Output Disruptor
@@ -23,6 +23,8 @@ The server uses a 3-stage pipeline plus a single reader thread, modeled after th
                                               +----> Shadow Stage --> Snapshots
                                                      (gated on journal)
 ```
+
+(*) At the default `--ring-capacity`; both rings take its value. See [Input disruptor](#input-disruptor).
 
 1. **Reader** -- a single thread multiplexes every TCP client connection and publishes decoded requests into the input disruptor. The same thread also generates the application's clock ticks at the configured cadence (**default 250 ms**). With this, the input ring is single-producer in steady state on both transports.
    - **io_uring**: the reader arms an `IORING_OP_TIMEOUT` SQE at the cadence; the deadline wakes `submit_and_wait` even when no client traffic is flowing, and the loop emits a `JournalEvent::Tick { now_ns }` when the deadline passes.
@@ -191,7 +193,7 @@ The input disruptor is a multi-producer, multi-consumer ring buffer defined in `
 2. The value is written to the claimed slot.
 3. A per-slot generation flag (stored in a parallel `AtomicI32` array) is set so consumers know the slot is ready.
 
-The `MultiProducer` is `Clone + Send + Sync` -- each reader thread holds its own clone. No mutex is needed. The per-slot generation array costs approximately 4 MiB (1M slots x 4 bytes).
+The `MultiProducer` is `Clone + Send + Sync` -- each reader thread holds its own clone. No mutex is needed. The per-slot generation array costs 4 bytes per slot, approximately 4 MiB at the default capacity.
 
 **Consumers**: Two or three consumers are registered in parallel, both gated on the producer only (not on each other):
 
