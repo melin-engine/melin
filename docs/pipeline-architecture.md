@@ -9,7 +9,7 @@ The server uses a 3-stage pipeline plus a single reader thread, modeled after th
 ```
   Reader     -----+    +-------------------+
   (1 io_uring     +--->| Input Disruptor   |--+--> Journal Stage
-   thread, also   |    | (1M-slot ring)    |  |
+   thread, also   |    | (1M-slot ring*)   |  |
    emits Ticks    |    +-------------------+  +--> Matching Stage
    via io_uring   |                           |         |
    timeout)       |                           |         | Output Disruptor
@@ -23,6 +23,8 @@ The server uses a 3-stage pipeline plus a single reader thread, modeled after th
                                               +----> Shadow Stage --> Snapshots
                                                      (gated on journal)
 ```
+
+(*) At the default `--ring-capacity`; both rings take its value. See [Input disruptor](#input-disruptor).
 
 1. **Reader** -- a single thread multiplexes every TCP client connection and publishes decoded requests into the input disruptor. The same thread also generates the application's clock ticks at the configured cadence (**default 250 ms**). With this, the input ring is single-producer in steady state on both transports.
    - **io_uring**: the reader arms an `IORING_OP_TIMEOUT` SQE at the cadence; the deadline wakes `submit_and_wait` even when no client traffic is flowing, and the loop emits a `JournalEvent::Tick { now_ns }` when the deadline passes.
@@ -61,7 +63,7 @@ The simplified diagram above shows the primary-side request path. The picture be
          |                                   |  events
          v                                   v
  +---------------------------------------------+
- |  INPUT RING -- disruptor, 1M InputSlot      |
+ |  INPUT RING -- disruptor, 1M InputSlot (*)  |
  +---+-------------+----------------+----------+
      |             |                |
      v             v                v (gated on journal)
@@ -124,7 +126,7 @@ The simplified diagram above shows the primary-side request path. The picture be
          |
          v
  +---------------------------------------------+
- |  INPUT RING -- disruptor, 1M InputSlot      |
+ |  INPUT RING -- disruptor, 1M InputSlot (*)  |
  +---+--------------+---------------+----------+
      |              |               |
      v              v               v (gated on journal)
@@ -146,6 +148,8 @@ The simplified diagram above shows the primary-side request path. The picture be
               | consumer|  promotion. See docs/replication.md.
               +---------+
 ```
+
+(*) At the default `--ring-capacity`; both rings take its value. See [Input disruptor](#input-disruptor).
 
 ### Responsibilities, at a glance
 
@@ -181,7 +185,7 @@ Journal replay and the shadow stage advance the clock by the same rules, from th
 
 The input disruptor is a multi-producer, multi-consumer ring buffer defined in `crates/core/pipeline/src/ring.rs`.
 
-**Capacity**: `INPUT_RING_CAPACITY = 1 << 20` (1,048,576 slots). A slot holds the application's widest event inline beside the runtime's own fields, so the ring's footprint grows with the event width the application declares — one reason to keep events narrow. Provides approximately 100 ms of buffering at 10M events/sec, enough headroom for fsync stalls without backpressure reaching the readers.
+**Capacity**: `--ring-capacity` slots, 1,048,576 by default: a power of two of at least 1024. A slot holds the application's widest event inline beside the runtime's own fields, so the ring's footprint grows with the event width the application declares, which is one reason to keep events narrow. Every slot is written when the node starts, so the footprint is resident from boot whether the ring ever fills or not. The default provides approximately 100 ms of buffering at 10M events/sec, enough headroom for fsync stalls without backpressure reaching the readers. A smaller ring holds less memory and absorbs shorter bursts: one that outlasts it is answered busy (see [A full ring](#a-full-ring)). The node reports the ring's capacity as `melin_input_queue_capacity`, beside its depth.
 
 **Publishing**: Reader threads publish via `MultiProducer`, which uses CAS-based slot claiming (the LMAX multi-producer pattern):
 
@@ -189,7 +193,7 @@ The input disruptor is a multi-producer, multi-consumer ring buffer defined in `
 2. The value is written to the claimed slot.
 3. A per-slot generation flag (stored in a parallel `AtomicI32` array) is set so consumers know the slot is ready.
 
-The `MultiProducer` is `Clone + Send + Sync` -- each reader thread holds its own clone. No mutex is needed. The per-slot generation array costs approximately 4 MiB (1M slots x 4 bytes).
+The `MultiProducer` is `Clone + Send + Sync` -- each reader thread holds its own clone. No mutex is needed. The per-slot generation array costs 4 bytes per slot, approximately 4 MiB at the default capacity.
 
 **Consumers**: Two or three consumers are registered in parallel, both gated on the producer only (not on each other):
 
@@ -376,7 +380,7 @@ When the output ring is empty, the response stage scans connections for heartbea
 
 The output SPSC queue connects the matching stage to the response stage. Defined in `crates/core/pipeline/src/spsc.rs`.
 
-**Capacity**: `OUTPUT_RING_CAPACITY = 1 << 20` (1,048,576 slots). Matches the input ring size because one input event can produce several reports, followed by a `BatchEnd`.
+**Capacity**: the same `--ring-capacity` as the input ring, because one input event can produce several reports, followed by a `BatchEnd`. Its slots hold the application's widest reply inline, so it adds the capacity times that to the node's resident memory.
 
 **Multi-consumer**: When `--event-bind` is set, the output ring has two consumers: (1) the response stage (per-client, gated on durability cursors), and (2) the event publisher (TCP broadcast to subscribers), chained behind the response stage: it reads an event only after the response stage has released its replies, so it never publishes what the ack policy has not confirmed. The producer is gated on the publisher, which is never ahead of the response stage, so a slow subscriber feed backpressures the matching stage just as a slow response stage does.
 
@@ -476,6 +480,7 @@ Because the journal and matching consumers run in parallel (not chained), the ma
 | `--heartbeat-interval-secs` | `10` | Heartbeat interval for idle connections (0 to disable) |
 | `--connection-timeout-secs` | `30` | Disconnect clients silent for this long (0 to disable) |
 | `--max-connections` | `1024` | Maximum concurrent authenticated connections, from 1 to 8192. The node's I/O rings are sized from it, and their memory counts against the locked-memory limit (see [Deployment](deployment.md#locked-memory)). There is no unlimited setting: `0` is refused at startup. |
+| `--ring-capacity` | `1048576` | Slots in each of the input and output rings: a power of two, at least 1024, anything else refused at startup. Both rings are written in full when the node starts, so this sets resident memory (see [Input disruptor](#input-disruptor)). |
 
 ## Feature Gates
 
@@ -490,10 +495,8 @@ Because the journal and matching consumers run in parallel (not chained), the ma
 
 | Constant | Value | Location |
 |----------|-------|----------|
-| `INPUT_RING_CAPACITY` | `1 << 20` (1,048,576) | `crates/core/transport-core/src/pipeline.rs` |
-| `OUTPUT_RING_CAPACITY` | `1 << 20` (1,048,576) | `crates/core/transport-core/src/pipeline.rs` |
 | `MAX_JOURNAL_BATCH` | `4096` (ceiling; the effective cap is the lesser of this and what fills one ring slot) | `crates/core/transport-core/src/pipeline.rs` |
 | `MAX_BATCH` (response) | `1024` | `crates/core/server-runtime/src/response_loop.rs` |
 | `MAX_RESPONSE_BODY` | `512` bytes (one response body, framing excluded) | `crates/core/server-runtime/src/response_frame.rs` |
 
-The reader's and response writer's io_uring rings, and the reader's provided-buffer pool (two buffers per connection), are not constants: they are sized from `--max-connections` at startup (`RingSizing` in `crates/core/server-runtime/src/connection_limit.rs`). At the default cap the sizes match the former fixed ones.
+The input and output rings are not constants either: both take `--ring-capacity`. The reader's and response writer's io_uring rings, and the reader's provided-buffer pool (two buffers per connection), are sized from `--max-connections` at startup (`RingSizing` in `crates/core/server-runtime/src/connection_limit.rs`). At the default cap the sizes match the former fixed ones.

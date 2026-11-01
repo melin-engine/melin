@@ -287,7 +287,7 @@ Recovery walks archives in order, then the live segment. Old segments are kept f
 The journal participates in a 3-stage LMAX disruptor pipeline:
 
 ```
-            Input Disruptor (1M slots, lock-free ring buffer)
+     Input Disruptor (--ring-capacity slots, lock-free ring buffer)
                     │
         ┌───────────┴───────────┐
         │                       │
@@ -311,7 +311,7 @@ The journal participates in a 3-stage LMAX disruptor pipeline:
 
 - **Journal and Matching run in parallel** on the same events. The matching stage — the thread that applies events to the application, `matching` in `--cores` — does not wait for the journal: it applies each event immediately. This overlaps the application's latency with journal I/O latency.
 - **Response Stage gates on the journal cursor** — it will not send a response to the client until the journal stage has committed (synced) that event's sequence number. This enforces persist-before-ack without blocking the application.
-- **Input ring capacity**: 1,048,576 slots. Each slot holds the application's widest event inline, so the ring's memory footprint follows how wide the application declares its events to be. At 10M events/sec, the ring provides ~100 ms of buffering.
+- **Input ring capacity**: `--ring-capacity` slots, 1,048,576 by default. Each slot holds the application's widest event inline, so the ring's memory footprint follows how wide the application declares its events to be. At 10M events/sec, the default ring provides ~100 ms of buffering.
 - **Max journal batch**: 4,096 events per batch handed to the disk thread. Limits encoding time before hand-off, bounding worst-case latency. One `fdatasync` may cover several such batches when the device is behind.
 
 ### Feature Gates

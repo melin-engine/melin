@@ -985,6 +985,9 @@ Tests:
   would be a new knob on a published API carried for one test, while the
   shed logic's edges (small rings, random capacities) are already covered
   by the unit tests and proptest above on the small fixture ring.
+  (Since superseded: the ring capacity is now an operator setting,
+  `--ring-capacity`, so this note records the reasoning at the time, not
+  the current code.)
 
 Left untested: the DPDK interim close on `Park`, a one-line arm replaced
 in step 5.

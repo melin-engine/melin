@@ -45,6 +45,26 @@ one above: raise the limit for the node's service, or grant
 (`--no-mlock` changes neither). Short of that, lower `--max-connections`
 to the clients the node actually serves.
 
+## Pipeline ring memory
+
+Requests and replies pass between the node's stages through two rings,
+each `--ring-capacity` slots (default 1048576). Every slot holds a whole
+event or reply, so a ring's size is the capacity times the width of the
+application's events (or replies) plus a fixed per-slot header, and
+both are written in full when the node starts: that memory is resident,
+and locked unless
+`--no-mlock` is given, from boot, however lightly the node is loaded.
+Replicas take the same `--ring-capacity`, and a replica promoted to
+primary builds its primary rings at promotion at that capacity, so give
+a replica the same ring memory as the primary it may replace.
+
+Lower the capacity (a power of two, at least 1024) to fit a node of an
+application with wide events into less memory. The cost is burst
+headroom: the default absorbs about 100 ms of input at 10M events/s, and
+a burst that outlasts a smaller ring is answered busy rather than
+queued. `melin_input_queue_depth` against `melin_input_queue_capacity`
+shows how much of it a node actually uses.
+
 ## A trusted network for DPDK
 
 On DPDK a node runs its own TCP stack, which lacks the kernel's defence

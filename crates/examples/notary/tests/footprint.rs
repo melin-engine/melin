@@ -2,16 +2,18 @@
 //!
 //! `AppEvent` is `Copy` and the hot path cannot allocate, so an event
 //! lives inline in every ring slot — and the rings hold a fixed number of
-//! slots, so event width multiplies straight through by the ring
-//! capacity. Committing to a fixed 32-byte digest instead of carrying a
-//! document keeps that multiplier small, which is the main engineering
+//! slots (the node's ring capacity, pinned here at its default), so event
+//! width multiplies straight through by the ring capacity. Committing to
+//! a fixed 32-byte digest instead of carrying a document keeps that
+//! multiplier small, which is the main engineering
 //! consequence of the design and therefore worth asserting rather than
 //! assuming.
 
-use melin_transport_core::pipeline::{
-    INPUT_RING_CAPACITY, InputSlot, OUTPUT_RING_CAPACITY, OutputSlot,
-};
+use melin_transport_core::pipeline::{InputSlot, OutputSlot, RingCapacity};
 use notary_server::{NotaryEvent, NotaryHead, NotaryReport};
+
+/// Both rings hold this many slots on a node at the default capacity.
+const SLOTS: usize = RingCapacity::DEFAULT.slots();
 
 /// Ceiling on the two rings' combined footprint, in bytes.
 ///
@@ -38,15 +40,15 @@ fn ring_footprint_is_within_budget() {
     let input_slot = size_of::<InputSlot<NotaryEvent>>();
     let output_slot = size_of::<OutputSlot<NotaryReport, NotaryHead>>();
 
-    let input_bytes = input_slot * INPUT_RING_CAPACITY;
-    let output_bytes = output_slot * OUTPUT_RING_CAPACITY;
+    let input_bytes = input_slot * SLOTS;
+    let output_bytes = output_slot * SLOTS;
     let total = input_bytes + output_bytes;
 
     // Printed so `cargo test -- --nocapture` reports the real figures;
     // the assertion only catches regressions past the budget.
     println!(
-        "input slot={input_slot}B x {INPUT_RING_CAPACITY} = {}MiB  \
-         output slot={output_slot}B x {OUTPUT_RING_CAPACITY} = {}MiB  total={}MiB",
+        "input slot={input_slot}B x {SLOTS} = {}MiB  \
+         output slot={output_slot}B x {SLOTS} = {}MiB  total={}MiB",
         input_bytes >> 20,
         output_bytes >> 20,
         total >> 20,

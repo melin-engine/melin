@@ -239,17 +239,104 @@ impl Default for StageUtilization {
     }
 }
 
-/// Ring buffer capacity for the input disruptor (journal + matching consumers).
-/// 2^20 = 1,048,576 slots. Each slot holds the event inline, so the
-/// ring's footprint scales with `size_of::<E>()`. Provides ~100 ms of
-/// buffering at 10M events/sec, enough headroom for fsync stalls without
-/// backpressure.
-pub const INPUT_RING_CAPACITY: usize = 1 << 20;
+/// How many slots each of the pipeline's two rings holds: the input ring
+/// (ingress to the journal, matching and shadow stages) and the output
+/// ring (matching to the response stage). One capacity for both: one
+/// input event can produce several output slots (reports, then the batch
+/// end), so the output ring is sized to the input's.
+///
+/// A slot holds its event or report inline, and a ring writes every slot
+/// when it is built, so a node's ring memory is resident from boot: the
+/// capacity times the input slot, plus the capacity times the output
+/// slot, both of which grow with the event width the application
+/// declares. [`DEFAULT`](Self::DEFAULT) buys about 100 ms of buffering at
+/// 10M events/s, enough to ride out an fsync stall without backpressure
+/// reaching the clients. A smaller ring trades that headroom for memory:
+/// a burst that outlasts it is answered busy instead of queued.
+///
+/// A newtype over a slot count rather than a bare `usize` so that only a
+/// valid capacity (a power of two, which the ring indexes by mask, of at
+/// least [`MIN`](Self::MIN)) can reach a builder. `usize`: a count of
+/// in-memory slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RingCapacity(usize);
 
-/// SPSC queue capacity for the output path (matching → response).
-/// Matches the input ring size since one input event can produce multiple
-/// output messages (e.g., several reports + BatchEnd).
-pub const OUTPUT_RING_CAPACITY: usize = 1 << 20;
+/// Why a slot count is not a [`RingCapacity`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RingCapacityError {
+    /// The ring indexes slots by mask, so its capacity is a power of two.
+    NotAPowerOfTwo(usize),
+    /// Below [`RingCapacity::MIN`].
+    TooSmall(usize),
+}
+
+impl std::fmt::Display for RingCapacityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAPowerOfTwo(slots) => {
+                write!(f, "ring capacity {slots} is not a power of two")
+            }
+            Self::TooSmall(slots) => write!(
+                f,
+                "ring capacity {slots} is below the minimum of {}",
+                RingCapacity::MIN.slots()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RingCapacityError {}
+
+impl RingCapacity {
+    /// 2^20 (1,048,576) slots per ring.
+    pub const DEFAULT: Self = Self(1 << 20);
+
+    /// 1024 slots: the smallest ring a node runs on. A client connection's
+    /// reader and a replica's receiver each write up to 16 slots before
+    /// making them visible, and a ring only a few such batches deep would
+    /// shed bursts a node is meant to absorb.
+    pub const MIN: Self = Self(1 << 10);
+
+    /// `slots`, if it is a power of two of at least [`MIN`](Self::MIN).
+    pub const fn new(slots: usize) -> Result<Self, RingCapacityError> {
+        if !slots.is_power_of_two() {
+            Err(RingCapacityError::NotAPowerOfTwo(slots))
+        } else if slots < Self::MIN.0 {
+            Err(RingCapacityError::TooSmall(slots))
+        } else {
+            Ok(Self(slots))
+        }
+    }
+
+    /// Slots per ring.
+    pub const fn slots(self) -> usize {
+        self.0
+    }
+}
+
+impl Default for RingCapacity {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl std::fmt::Display for RingCapacity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::str::FromStr for RingCapacity {
+    type Err = String;
+
+    /// A slot count, as `--ring-capacity` takes it.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let slots: usize = s
+            .parse()
+            .map_err(|e| format!("ring capacity {s:?} is not a slot count: {e}"))?;
+        Self::new(slots).map_err(|e| e.to_string())
+    }
+}
 
 /// Maximum number of events processed in one journal batch.
 /// Larger batches amortize the fixed cost of each NVMe write over more
@@ -917,7 +1004,7 @@ pub type StreamMarkQueue = Arc<StreamMarks>;
 /// against the data volume; at low rate checks are sparse, which is
 /// fine: handshake validation covers reconnects, and every rotation
 /// adoption is itself a chain check.
-const CHAIN_CHECK_INTERVAL_BATCHES: u32 = 64;
+pub(crate) const CHAIN_CHECK_INTERVAL_BATCHES: u32 = 64;
 
 /// Replication state for the journal stage. Boxed in JournalStage to
 /// avoid inflating the struct size on the hot path (standalone mode has
@@ -2812,6 +2899,14 @@ pub struct MatchingStage<A: Application> {
 }
 
 impl<A: Application> MatchingStage<A> {
+    /// Test-only probe: slots in the output ring this stage produces into,
+    /// so a test can check what a builder sized it to. Gated to match its
+    /// one caller, which needs a journal and so a persisting build.
+    #[cfg(all(test, not(feature = "no-persist")))]
+    pub(crate) fn output_capacity(&self) -> u64 {
+        self.output.capacity()
+    }
+
     /// Create a new matching stage.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -3408,8 +3503,9 @@ struct InputDisruptorParts<E: AppEvent> {
 fn build_input_disruptor<E: AppEvent + Send + 'static>(
     enable_shadow: bool,
     producer_wait: WaitStrategy,
+    capacity: RingCapacity,
 ) -> InputDisruptorParts<E> {
-    let mut builder = ring::DisruptorBuilder::<InputSlot<E>>::new(INPUT_RING_CAPACITY)
+    let mut builder = ring::DisruptorBuilder::<InputSlot<E>>::new(capacity.slots())
         .add_consumer() // consumer 0: journal, gated on producer
         .add_consumer(); // consumer 1: matching, gated on producer (parallel)
     if enable_shadow {
@@ -3526,6 +3622,7 @@ pub fn build_pipeline_with_replication<A>(
     enable_replication: bool,
     max_journal_batch: usize,
     replication_ring_size: usize,
+    ring_capacity: RingCapacity,
     waits: StageWaits,
     enable_event_publisher: bool,
     enable_shadow: bool,
@@ -3544,7 +3641,7 @@ where
         shadow_consumer,
         journal_cursor,
         matching_cursor,
-    } = build_input_disruptor::<A::Event>(enable_shadow, waits.ingress);
+    } = build_input_disruptor::<A::Event>(enable_shadow, waits.ingress, ring_capacity);
 
     // Output disruptor ring: matching → response (→ optional event publisher).
     // Single producer; consumer 0 is the response stage, consumer 1 (when
@@ -3564,7 +3661,7 @@ where
     // stage's, so the matching stage still waits for both.
     let mut output_builder =
         ring::DisruptorBuilder::<OutputSlot<A::Report, A::QueryResponse>>::new(
-            OUTPUT_RING_CAPACITY,
+            ring_capacity.slots(),
         )
         .add_consumer(); // consumer 0: response stage, gated on the producer
     if enable_event_publisher {
@@ -3720,6 +3817,7 @@ pub fn build_replica_pipeline<A>(
     app: A,
     writer: BufferedWriter<A::Event>,
     max_journal_batch: usize,
+    ring_capacity: RingCapacity,
     group_commit_delay: Duration,
     waits: StageWaits,
     enable_shadow: bool,
@@ -3738,11 +3836,11 @@ where
         shadow_consumer,
         journal_cursor,
         matching_cursor,
-    } = build_input_disruptor::<A::Event>(enable_shadow, waits.ingress);
+    } = build_input_disruptor::<A::Event>(enable_shadow, waits.ingress, ring_capacity);
 
     // Output disruptor: single drain consumer (no response stage on replica).
     let output_builder = ring::DisruptorBuilder::<OutputSlot<A::Report, A::QueryResponse>>::new(
-        OUTPUT_RING_CAPACITY,
+        ring_capacity.slots(),
     )
     .add_consumer();
     let (output_producer, mut output_consumers) = output_builder.build(waits.matching);

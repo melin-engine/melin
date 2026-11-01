@@ -558,6 +558,9 @@ pub fn run_receiver<A>(
     control: &super::ReplicaControlPlane,
     snapshot_interval_ms: u64,
     cores: crate::layout::PipelineCores,
+    // The node's `--ring-capacity`, for every pipeline this loop builds;
+    // see `build_replica_pipeline_with_threads`.
+    ring_capacity: melin_transport_core::pipeline::RingCapacity,
     // Passed straight to the replica's journal stage; see
     // `build_replica_pipeline_with_threads`.
     staging_mode: melin_journal::StagingMode,
@@ -886,6 +889,7 @@ where
                 cur_app,
                 cur_writer,
                 cores,
+                ring_capacity,
                 staging_mode,
                 snapshot_interval_ms,
                 store,
@@ -990,6 +994,10 @@ where
 mod tests {
     use super::*;
     use crate::uring_teardown::DRAIN_TIMEOUT;
+    // The smallest ring a node takes, for every replica pipeline a test
+    // here builds: a test's stream never fills it.
+    #[cfg(not(feature = "no-persist"))]
+    use melin_transport_core::pipeline::RingCapacity;
     use std::io::Read;
     use std::net::TcpListener;
     use std::time::{Duration, Instant};
@@ -1428,6 +1436,7 @@ mod tests {
                         // lineage check below).
                         SHADOW_INTERVAL_MS,
                         cores,
+                        RingCapacity::MIN,
                         melin_journal::StagingMode::ZeroFill,
                         Duration::ZERO,
                         64,
@@ -1682,6 +1691,7 @@ mod tests {
                         &control,
                         3_600_000,
                         cores,
+                        RingCapacity::MIN,
                         melin_journal::StagingMode::ZeroFill,
                         Duration::ZERO,
                         64,
@@ -1888,6 +1898,7 @@ mod tests {
                         &control,
                         3_600_000,
                         cores,
+                        RingCapacity::MIN,
                         melin_journal::StagingMode::ZeroFill,
                         Duration::ZERO,
                         64,
@@ -2175,6 +2186,7 @@ mod tests {
                         &control,
                         3_600_000,
                         crate::layout::PipelineCores::unpinned(),
+                        RingCapacity::MIN,
                         melin_journal::StagingMode::ZeroFill,
                         Duration::ZERO,
                         64,
@@ -2321,6 +2333,7 @@ mod tests {
                     &crate::replication::ReplicaControlPlane::new(),
                     3_600_000,
                     crate::layout::PipelineCores::unpinned(),
+                    RingCapacity::MIN,
                     melin_journal::StagingMode::ZeroFill,
                     group_commit_delay,
                     64,
@@ -2828,6 +2841,7 @@ mod tests {
                         &control,
                         3_600_000,
                         crate::layout::PipelineCores::unpinned(),
+                        RingCapacity::MIN,
                         melin_journal::StagingMode::ZeroFill,
                         Duration::ZERO,
                         64,
@@ -2963,6 +2977,7 @@ mod tests {
                         &control,
                         3_600_000,
                         crate::layout::PipelineCores::unpinned(),
+                        RingCapacity::MIN,
                         mode,
                         Duration::ZERO,
                         64,

@@ -38,7 +38,6 @@ use melin_server_runtime::StartupEvents;
 use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
 use melin_test_node::probe::wait_for_gauge;
-use melin_transport_core::pipeline::INPUT_RING_CAPACITY;
 use melin_transport_core::test_ports::free_addr;
 
 /// The writer's key, and the reader's.
@@ -403,8 +402,9 @@ fn every_pipelined_request_is_answered_and_paired_by_id() {
 /// slow reader.
 /// Nothing is answered until the ring is full, and the read deadline runs
 /// while any request is owed, so it is long enough to cover filling the
-/// ring on a slow host. The input ring is the node's fixed one, so more
-/// requests than it holds are sent, and journaled.
+/// ring on a slow host. More requests than the node's input ring holds
+/// are sent, its capacity read from the node's own health endpoint, so
+/// the test fills the ring the node actually runs with.
 #[test]
 fn a_full_input_ring_answers_busy_and_keeps_the_connection() {
     /// Requests sent past the ring's capacity, all of which find it full.
@@ -430,7 +430,14 @@ fn a_full_input_ring_answers_busy_and_keeps_the_connection() {
     let mut conn = StreamConnection::connect_timeout(node.addr(), &key, Duration::from_secs(60))
         .expect("the client connects");
 
-    let total = INPUT_RING_CAPACITY + PAST_THE_RING;
+    let capacity = melin_test_node::probe::gauge(health, "melin_input_queue_capacity")
+        .expect("the node reports its input ring's capacity");
+    assert_eq!(
+        capacity,
+        melin_test_node::config().ring_capacity.slots() as u64,
+        "the ring the node was configured with"
+    );
+    let total = capacity as usize + PAST_THE_RING;
     let body = increment_request(1);
     let mut busy: Vec<RequestId> = Vec::new();
     let mut applied: Vec<RequestId> = Vec::new();

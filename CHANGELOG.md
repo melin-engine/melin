@@ -35,6 +35,14 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 - **`melin_transport_core::replication::archive::lineage_archives_beside`**:
   the lineage archives a node made beside its journal or snapshot (the
   `<name>.<reason>.<n>` directories), for any reason, sorted.
+- **`--ring-capacity`**: slots in each of the pipeline's input and output
+  rings, a power of two of at least 1024 (default 1048576, as before).
+  Both rings are written in full at startup, so this sets their resident
+  memory, which grows with the application's event and reply widths; a
+  smaller ring holds less and absorbs shorter bursts, answering the rest
+  busy. `ServerConfig::ring_capacity` takes a
+  `melin_transport_core::pipeline::RingCapacity` (re-exported from
+  `melin_server_runtime::server`), which only a valid capacity can be.
 
 ### Changed
 
@@ -58,6 +66,17 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   promotion now logs `confirming leadership before injecting the epoch
   bump` where it logged `injecting epoch bump`, and every promotion logs
   `epoch bump applied` once its tenure has begun.
+- **`melin_input_queue_capacity` reports the input ring the node runs
+  with**, read from the ring itself, rather than a constant. On a
+  replica, which has no client input ring, it now reads 0 instead of
+  1048576.
+- **Ring capacity is a parameter** (breaking):
+  `build_pipeline_with_replication`, `build_replica_pipeline` and the
+  replica receivers `run_receiver` and `run_receiver_dpdk` take a
+  `RingCapacity`, and `melin_pipeline::ring::QueueCursor` gains a
+  required `capacity()`. The `INPUT_RING_CAPACITY` and
+  `OUTPUT_RING_CAPACITY` constants are removed; `RingCapacity::DEFAULT`
+  is their value.
 - **`melin_transport_core::health::RaftStatus` gains a private field**
   (the quorum-ack age, read and written through
   `millis_since_quorum_ack` and `set_millis_since_quorum_ack`), so it can
