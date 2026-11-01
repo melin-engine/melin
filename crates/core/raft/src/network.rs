@@ -5,8 +5,9 @@
 //! TCP connection, so requests on a client are strictly serial
 //! request/response — no correlation ids needed. Connections are lazy
 //! (`new_client` must not connect and cannot fail) and authenticate with the
-//! node's replication signing key on first use; any I/O error drops the
-//! connection and surfaces to openraft, whose backoff (500 ms default)
+//! node's replication signing key on first use, then exchange the raft
+//! protocol version (`crate::wire::exchange_version`); any I/O error drops
+//! the connection and surfaces to openraft, whose backoff (500 ms default)
 //! drives the retry.
 //!
 //! A node whose raft listener is bound to a specific IP dials its peers
@@ -51,12 +52,17 @@ use crate::types::NodeId;
 use crate::types::TypeConfig;
 use crate::wire::RpcBody;
 use crate::wire::RpcFrame;
+use crate::wire::VersionExchangeError;
+use crate::wire::VersionRefusal;
+use crate::wire::exchange_version;
 use crate::wire::read_frame;
 use crate::wire::write_frame;
 
-/// Bound on connect + auth, independent of the per-RPC ttl, so a black-holed
-/// SYN can't eat the entire RPC budget before the request is even sent.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Bound on the connect, and separately on the handshake that follows it
+/// (authentication, then the version exchange), independent of the per-RPC
+/// ttl, so a black-holed SYN can't eat the entire RPC budget before the
+/// request is even sent.
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// How an outbound raft connection to one peer is made, decided by
 /// [`plan_dial`] from the node's raft listener address and the peer's
@@ -317,7 +323,8 @@ pub struct RaftClient {
 }
 
 impl RaftClient {
-    /// Connect + authenticate if there is no live connection.
+    /// Connect, authenticate and exchange versions if there is no live
+    /// connection.
     async fn ensure_connected(&mut self) -> io::Result<()> {
         if self.stream.is_some() {
             return Ok(());
@@ -337,17 +344,36 @@ impl RaftClient {
         // Control-plane frames are tiny and latency-sensitive relative to
         // their size; never batch them behind Nagle.
         stream.set_nodelay(true)?;
-        tokio::time::timeout(
-            CONNECT_TIMEOUT,
-            authenticate_outbound(&mut stream, &self.signing_key),
-        )
-        .await
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("auth with {} timed out", self.addr),
-            )
-        })??;
+        // Authentication, then the protocol version both ways, under one
+        // bound: no envelope crosses before both have passed.
+        let handshake = async {
+            authenticate_outbound(&mut stream, &self.signing_key).await?;
+            match exchange_version(&mut stream).await {
+                Ok(()) => Ok(()),
+                Err(VersionExchangeError::Refused(refusal)) => {
+                    // `warn!`, as on the responding side (see
+                    // `rpc_server::handle_connection` for why): this end
+                    // may be the only one that knows versions, if the
+                    // peer runs a release from before them.
+                    warn!(
+                        target = self.target,
+                        addr = %self.addr,
+                        error = %refusal,
+                        "raft peer runs another release — closing"
+                    );
+                    Err(io::Error::from(refusal))
+                }
+                Err(VersionExchangeError::Io(e)) => Err(e),
+            }
+        };
+        tokio::time::timeout(CONNECT_TIMEOUT, handshake)
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("handshake with {} timed out", self.addr),
+                )
+            })??;
         debug!(target = self.target, addr = %self.addr, "raft peer link established");
         self.stream = Some(stream);
         Ok(())
@@ -421,11 +447,15 @@ impl RaftClient {
 /// a request could be sent mean the peer is unreachable (openraft backs off
 /// harder); failures mid-exchange are transient network errors.
 ///
-/// A [`DialRefusal`] and `AddrNotAvailable` (the bind IP is no longer
-/// assigned) are failures before sending too, and would otherwise be
-/// retried on every heartbeat: openraft backs off only on `Unreachable`.
+/// A [`DialRefusal`], a [`VersionRefusal`] (the peer runs another release)
+/// and `AddrNotAvailable` (the bind IP is no longer assigned) are failures
+/// before sending too, which no retry can cure until the operator acts,
+/// and would otherwise be retried on every heartbeat: openraft backs off
+/// only on `Unreachable`.
 fn to_rpc_error<E: std::error::Error + 'static>(e: io::Error) -> RPCError<NodeId, Node, E> {
-    let refused = e.get_ref().is_some_and(|inner| inner.is::<DialRefusal>());
+    let refused = e
+        .get_ref()
+        .is_some_and(|inner| inner.is::<DialRefusal>() || inner.is::<VersionRefusal>());
     match e.kind() {
         io::ErrorKind::TimedOut
         | io::ErrorKind::ConnectionRefused
@@ -678,6 +708,23 @@ mod tests {
             !bind_ip.regained(),
             "the successful bind recorded the return"
         );
+    }
+
+    #[test]
+    fn version_refusals_are_unreachable() {
+        for refusal in [
+            VersionRefusal::Mismatch { ours: 1, peer: 2 },
+            VersionRefusal::WrongLength { ours: 1, len: 40 },
+            VersionRefusal::WrongTag { ours: 1, tag: 0 },
+        ] {
+            assert!(is_unreachable(refusal.into()), "{refusal}");
+        }
+        // Their kind alone is not enough: other invalid data on the link
+        // (a frame that fails to decode) stays a transient network error.
+        assert!(!is_unreachable(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "decode rpc frame: unexpected end"
+        )));
     }
 
     #[test]

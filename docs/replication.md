@@ -1232,6 +1232,35 @@ normal-case post-recovery state.
   every node on its existing files. An existing history records no
   policy yet, so the first primary to serve it under protocol 8 (by boot
   or promotion) serves under the policy it requests and journals it.
+- **The control plane is versioned too, and needs the same.** Control-plane
+  links (`--raft-peer`) exchange a protocol version right after
+  authenticating, and a node refuses a peer that speaks another one,
+  logging a warning (`raft peer runs another release`) that names both
+  versions, then retrying with backoff as it would an unreachable peer.
+  The release that introduces the version is such a change: it and
+  earlier releases refuse each other's control-plane links in either
+  direction (an earlier release logs only that the connection failed,
+  so read the newer node's log). The control-plane version is separate
+  from the replication protocol's: a refused control-plane link leaves
+  replication and client traffic alone, which connect or refuse by the
+  rule above, exactly as they would with the control plane down.
+  During a roll across a control-plane version, nodes on different
+  releases never vote for each other, follow each other's control-plane
+  leader, or fence each other over the control plane:
+  - only the nodes of a release that alone holds a majority (two of
+    three) can elect a leader and fail over automatically; a node
+    outside that majority never auto-promotes (its leadership is never
+    acknowledged by a majority), and when the cluster is split with no
+    release holding a majority, nobody does;
+  - a primary on one release is not fenced by a promotion on the other
+    over the control plane, only once a data-plane connection carries
+    the new epoch to it, as for a node without `--raft-auto-promote`;
+  - manual `PROMOTE` works throughout, and `melin_raft_quorum_ack_age_ms`
+    on a leader cut off from its majority this way grows as it would
+    under a partition.
+
+  Upgrade the whole cluster in one window, as above, and treat automatic
+  failover as unreliable until the last node is upgraded.
 - **Snapshots are forward-compatible.** This release reads snapshots
   written by pre-fencing releases (their epoch is taken as 0, which
   is exact — they predate any promotion), snapshots written before

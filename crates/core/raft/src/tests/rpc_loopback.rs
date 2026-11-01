@@ -10,16 +10,23 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use crate::network::RaftClientFactory;
+use crate::auth::{authenticate_inbound, authenticate_outbound};
+use crate::network::{CONNECT_TIMEOUT, RaftClientFactory};
 use crate::recency::{PeerTips, TipSource};
-use crate::rpc_server::{RaftApi, RpcServerConfig, SupersessionPolicy, serve};
+use crate::rpc_server::{AUTH_TIMEOUT, RaftApi, RpcServerConfig, SupersessionPolicy, serve};
+use crate::tests::pre_version_wire;
 use crate::tests::tip_at;
 use crate::types::{NodeId, TypeConfig};
+use crate::wire::{
+    RAFT_PROTOCOL_VERSION, VERSION_FRAME_WIRE_LEN, VersionExchangeError, VersionRefusal,
+    encode_version_frame, exchange_version, exchange_version_as,
+};
 use base64::Engine;
 use ed25519_dalek::SigningKey;
 use melin_app::auth::{AuthorizedKeys, NoRoles};
 use melin_transport_core::cursors::AdvertisedJournalTip;
 use melin_transport_core::fence::FenceState;
+use melin_transport_core::test_logs::{Logs, level};
 use openraft::error::RPCError;
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
@@ -74,25 +81,47 @@ async fn start_server() -> Harness {
     start_server_with(tip_at(0, 0), None).await
 }
 
-/// A server advertising `tip`, under `supersession`.
-async fn start_server_with(
-    tip: Arc<TipSource>,
-    supersession: Option<Arc<SupersessionPolicy>>,
-) -> Harness {
-    let client_key = SigningKey::from_bytes(&[0x11; 32]);
-    let unlisted_peer_key = SigningKey::from_bytes(&[0x22; 32]);
-    let operator_key = SigningKey::from_bytes(&[0x33; 32]);
+/// The key node 2 authenticates with (see [`Harness::client_key`]).
+fn client_key() -> SigningKey {
+    SigningKey::from_bytes(&[0x11; 32])
+}
 
+/// See [`Harness::unlisted_peer_key`].
+fn unlisted_peer_key() -> SigningKey {
+    SigningKey::from_bytes(&[0x22; 32])
+}
+
+/// See [`Harness::operator_key`].
+fn operator_key() -> SigningKey {
+    SigningKey::from_bytes(&[0x33; 32])
+}
+
+/// The harness's authorized-keys table: [`client_key`] and
+/// [`unlisted_peer_key`] under the `replication` role, [`operator_key`]
+/// under the `operator` role.
+fn authorized_keys() -> Arc<AuthorizedKeys> {
     let b64 = |k: &SigningKey| {
         base64::engine::general_purpose::STANDARD.encode(k.verifying_key().to_bytes())
     };
     let table = format!(
         "replication {} node-2\nreplication {} not-a-peer\noperator {} ops\n",
-        b64(&client_key),
-        b64(&unlisted_peer_key),
-        b64(&operator_key),
+        b64(&client_key()),
+        b64(&unlisted_peer_key()),
+        b64(&operator_key()),
     );
-    let authorized_keys = Arc::new(AuthorizedKeys::parse::<NoRoles>(&table).unwrap());
+    Arc::new(AuthorizedKeys::parse::<NoRoles>(&table).unwrap())
+}
+
+/// A server advertising `tip`, under `supersession`.
+async fn start_server_with(
+    tip: Arc<TipSource>,
+    supersession: Option<Arc<SupersessionPolicy>>,
+) -> Harness {
+    let client_key = client_key();
+    let unlisted_peer_key = unlisted_peer_key();
+    let operator_key = operator_key();
+
+    let authorized_keys = authorized_keys();
     let peer_ids = Arc::new(HashMap::from([(
         client_key.verifying_key().to_bytes(),
         2u64,
@@ -242,22 +271,37 @@ async fn oversized_frame_is_refused() {
     let h = start_server().await;
     // Authenticate a raw connection, then send a pathological length prefix.
     let mut stream = tokio::net::TcpStream::connect(&h.addr).await.unwrap();
-    crate::auth::authenticate_outbound(&mut stream, &h.client_key)
+    authenticate_outbound(&mut stream, &h.client_key)
         .await
         .unwrap();
+    // Past the version exchange, so the oversized prefix lands in the
+    // envelope reader rather than being refused as a wrong-length version.
+    exchange_version(&mut stream).await.unwrap();
     stream.write_all(&u32::MAX.to_le_bytes()).await.unwrap();
     stream.flush().await.unwrap();
     // The server must drop the connection rather than allocate.
+    assert_closed_by_peer(&mut stream).await;
+    h.shutdown.store(true, Ordering::Relaxed);
+}
+
+/// The other end closes `stream` (EOF or a reset) without sending anything
+/// more, within a bound.
+async fn assert_closed_by_peer(stream: &mut tokio::net::TcpStream) {
+    assert_closed_by_peer_within(stream, Duration::from_secs(2)).await;
+}
+
+/// [`assert_closed_by_peer`], within `bound`.
+async fn assert_closed_by_peer_within(stream: &mut tokio::net::TcpStream, bound: Duration) {
     let mut buf = [0u8; 1];
-    let n = tokio::time::timeout(Duration::from_secs(2), async {
+    let n = tokio::time::timeout(bound, async {
         use tokio::io::AsyncReadExt;
         stream.read(&mut buf).await
     })
     .await
-    .expect("server should close, not hang")
+    .expect("the peer should close, not hang")
+    // A reset is a close too.
     .unwrap_or(0);
-    assert_eq!(n, 0, "expected EOF after oversized frame");
-    h.shutdown.store(true, Ordering::Relaxed);
+    assert_eq!(n, 0, "expected the peer to close the link");
 }
 
 /// Tip-readiness gate over a real socket: until journal recovery seeds
@@ -421,19 +465,14 @@ async fn a_reply_at_or_below_the_clients_epoch_does_not_fence() {
 
 /// A client for `peer` on a node whose raft listener is on `bind`.
 async fn client_on(bind: SocketAddr, peer: &str) -> impl RaftNetwork<TypeConfig> {
-    client_factory(
-        &SigningKey::from_bytes(&[0x11; 32]),
-        tip_at(0, 0),
-        bind,
-        None,
-    )
-    .new_client(
-        1,
-        &BasicNode {
-            addr: peer.to_owned(),
-        },
-    )
-    .await
+    client_factory(&client_key(), tip_at(0, 0), bind, None)
+        .new_client(
+            1,
+            &BasicNode {
+                addr: peer.to_owned(),
+            },
+        )
+        .await
 }
 
 /// The source address a peer listening on 127.0.0.3 sees when a node
@@ -527,4 +566,290 @@ async fn a_peer_the_bind_cannot_dial_is_unreachable() {
     for peer in ["[::1]:7002", "localhost:7002"] {
         assert_unreachable_naming("127.0.0.2:7001", peer, &["127.0.0.2", peer]).await;
     }
+}
+
+/// A version this build does not speak, for a peer on another release.
+const OTHER_VERSION: u16 = RAFT_PROTOCOL_VERSION + 1;
+
+/// A raw link to the harness's server, authenticated as node 2.
+async fn authenticated_link(h: &Harness) -> tokio::net::TcpStream {
+    let mut stream = tokio::net::TcpStream::connect(&h.addr).await.unwrap();
+    authenticate_outbound(&mut stream, &h.client_key)
+        .await
+        .unwrap();
+    stream
+}
+
+/// Capture this thread's log from here until the guard drops: the test's
+/// own, and on the current-thread runtime of `#[tokio::test]` the
+/// harness server's and stand-in responders' too, as their tasks run on
+/// this thread.
+fn capture_logs() -> (Logs, tracing::subscriber::DefaultGuard) {
+    let logs = Logs::default();
+    let guard = tracing::subscriber::set_default(logs.subscriber(tracing::Level::DEBUG));
+    (logs, guard)
+}
+
+/// The one log line a refused version exchange leaves on this end: a
+/// warning (another release is degraded operation needing the operator,
+/// not a malfunction of this node, so never `error!`) carrying every one
+/// of `parts`. Nothing on the link logged at `error!`.
+fn assert_version_refusal_logged(logs: &Logs, parts: &[&str]) {
+    let lines = logs.lines("raft peer runs another release");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(level(&lines[0]), tracing::Level::WARN, "{}", lines[0]);
+    for part in parts {
+        assert!(lines[0].contains(part), "{part:?} not in {:?}", lines[0]);
+    }
+    let errors: Vec<String> = logs
+        .lines("")
+        .into_iter()
+        .filter(|line| level(line) == tracing::Level::ERROR)
+        .collect();
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+/// The server refuses a dialer on another release once authenticated,
+/// after sending its own version (which is how the dialer can name both),
+/// logs both versions, and closes the link.
+#[tokio::test]
+async fn the_server_refuses_a_dialer_speaking_another_version() {
+    let (logs, _guard) = capture_logs();
+    let h = start_server().await;
+    let mut stream = authenticated_link(&h).await;
+    match exchange_version_as(&mut stream, OTHER_VERSION).await {
+        Err(VersionExchangeError::Refused(refusal)) => assert_eq!(
+            refusal,
+            VersionRefusal::Mismatch {
+                ours: OTHER_VERSION,
+                peer: RAFT_PROTOCOL_VERSION
+            }
+        ),
+        other => panic!("expected a version refusal, got {other:?}"),
+    }
+    assert_closed_by_peer(&mut stream).await;
+    // The server logs before it closes.
+    assert_version_refusal_logged(
+        &logs,
+        &[
+            &format!("speaks raft protocol v{OTHER_VERSION}"),
+            &format!("this node speaks v{RAFT_PROTOCOL_VERSION}"),
+            "peer_id=2",
+        ],
+    );
+    h.shutdown.store(true, Ordering::Relaxed);
+}
+
+/// A stand-in responder for one connection: it authenticates the dialer
+/// against the harness's table, then hands the link to `then`, playing a
+/// node on another release. Returns its address and `then`'s outcome.
+async fn responder_then<T, F, Fut>(then: F) -> (String, tokio::task::JoinHandle<T>)
+where
+    F: FnOnce(tokio::net::TcpStream) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T> + Send,
+    T: Send + 'static,
+{
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let outcome = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        authenticate_inbound(&mut stream, &authorized_keys())
+            .await
+            .unwrap();
+        then(stream).await
+    });
+    (addr, outcome)
+}
+
+/// A dialer that hangs up between authentication and the version exchange
+/// is a closed link like any other: the server drops it and goes on
+/// serving the next one.
+#[tokio::test]
+async fn a_dialer_hanging_up_before_its_version_leaves_the_server_serving() {
+    let h = start_server().await;
+    drop(authenticated_link(&h).await);
+    let mut client = client_for(&h, &h.client_key).await;
+    let resp = client.vote(vote_req_from(2), opt()).await.unwrap();
+    assert!(resp.vote_granted);
+    h.shutdown.store(true, Ordering::Relaxed);
+}
+
+/// A configured peer that authenticates and then sends no version is
+/// dropped at the version exchange's bound, as one that never finishes
+/// authenticating is at its own, and logged at `debug!` (a stalled link,
+/// not another release); the server goes on serving the next one.
+#[tokio::test]
+async fn a_dialer_silent_after_authenticating_is_dropped_at_the_version_bound() {
+    use tokio::io::AsyncReadExt;
+    let (logs, _guard) = capture_logs();
+    let h = start_server().await;
+    let mut stream = authenticated_link(&h).await;
+    // The server writes its version before it reads the dialer's, so its
+    // bound started before this one does.
+    let mut version = [0u8; VERSION_FRAME_WIRE_LEN];
+    stream.read_exact(&mut version).await.unwrap();
+    assert_eq!(version, encode_version_frame(RAFT_PROTOCOL_VERSION));
+    let started = tokio::time::Instant::now();
+    assert_closed_by_peer_within(&mut stream, AUTH_TIMEOUT + Duration::from_secs(2)).await;
+    assert!(
+        started.elapsed() >= AUTH_TIMEOUT - Duration::from_millis(500),
+        "closed after {:?}, before the bound",
+        started.elapsed()
+    );
+    let timed_out = logs.lines("raft peer version exchange timed out");
+    assert_eq!(timed_out.len(), 1, "{timed_out:?}");
+    assert_eq!(level(&timed_out[0]), tracing::Level::DEBUG);
+    assert!(logs.lines("raft peer runs another release").is_empty());
+
+    let mut client = client_for(&h, &h.client_key).await;
+    assert!(
+        client
+            .vote(vote_req_from(2), opt())
+            .await
+            .unwrap()
+            .vote_granted
+    );
+    h.shutdown.store(true, Ordering::Relaxed);
+}
+
+/// A responder that authenticates the dialer and then sends no version is
+/// given up on at the handshake's bound, as an unreachable peer whose
+/// error says the handshake timed out: the version exchange sits under
+/// the same bound as authentication, so a stalled peer cannot hold the
+/// dialer past it. The dialer sent its own version and then hung up.
+#[tokio::test]
+async fn a_responder_silent_after_authenticating_is_unreachable_at_the_handshake_bound() {
+    use tokio::io::AsyncReadExt;
+    let (addr, responder) = responder_then(|mut stream| async move {
+        // Everything the dialer sends until it hangs up.
+        let mut received = Vec::new();
+        stream.read_to_end(&mut received).await.map(|_| received)
+    })
+    .await;
+    // A ttl past the handshake's bound, so it is that bound which fires
+    // rather than the RPC's own.
+    let ttl = CONNECT_TIMEOUT + Duration::from_secs(3);
+    let started = tokio::time::Instant::now();
+    let err = client_on(WILDCARD_BIND, &addr)
+        .await
+        .vote(vote_req_from(2), RPCOption::new(ttl))
+        .await
+        .expect_err("a silent responder never answers");
+    let elapsed = started.elapsed();
+    let RPCError::Unreachable(unreachable) = err else {
+        panic!("expected Unreachable, got {err:?}");
+    };
+    let message = unreachable.to_string();
+    let expected = format!("handshake with {addr} timed out");
+    assert!(
+        message.contains(&expected),
+        "{expected:?} not in {message:?}"
+    );
+    assert!(
+        elapsed >= CONNECT_TIMEOUT - Duration::from_millis(500) && elapsed < ttl,
+        "gave up after {elapsed:?}, not at the handshake bound"
+    );
+    let received = responder.await.unwrap().unwrap();
+    assert_eq!(received, encode_version_frame(RAFT_PROTOCOL_VERSION));
+}
+
+/// A responder on another release, speaking `version`.
+async fn responder_speaking(
+    version: u16,
+) -> (
+    String,
+    tokio::task::JoinHandle<Result<(), VersionExchangeError>>,
+) {
+    responder_then(move |mut stream| async move { exchange_version_as(&mut stream, version).await })
+        .await
+}
+
+/// The dialer refuses a responder on another release, naming both
+/// versions, as an unreachable peer: openraft backs off rather than
+/// redialling on every heartbeat, as no retry can succeed until the
+/// operator finishes the upgrade.
+#[tokio::test]
+async fn the_dialer_refuses_a_responder_speaking_another_version_as_unreachable() {
+    let (logs, _guard) = capture_logs();
+    let (addr, responder) = responder_speaking(OTHER_VERSION).await;
+    let both_versions = [
+        format!("speaks raft protocol v{OTHER_VERSION}"),
+        format!("this node speaks v{RAFT_PROTOCOL_VERSION}"),
+    ];
+    let both_versions = both_versions.each_ref().map(String::as_str);
+    assert_unreachable_naming("0.0.0.0:7001", &addr, &both_versions).await;
+    // Logged as well as returned: the returned error goes to openraft,
+    // which decides what of it to log; this line is ours.
+    let mut logged = both_versions.to_vec();
+    let addr_field = format!("addr={addr}");
+    logged.push(&addr_field);
+    assert_version_refusal_logged(&logs, &logged);
+    match responder.await.unwrap() {
+        Err(VersionExchangeError::Refused(refusal)) => assert_eq!(
+            refusal,
+            VersionRefusal::Mismatch {
+                ours: OTHER_VERSION,
+                peer: RAFT_PROTOCOL_VERSION
+            }
+        ),
+        other => panic!("expected the responder to refuse too, got {other:?}"),
+    }
+}
+
+/// A dialer on a release from before the version, against this server:
+/// the version frame the server sends it fails to decode as a reply, and
+/// the request it sends is refused and the link closed. The old dialer
+/// reads before it writes here (a real one writes first) so the server's
+/// close cannot reset the link before the version frame is read. Only
+/// this end knows versions, so its log is the one that says why.
+#[tokio::test]
+async fn a_dialer_from_before_the_version_is_refused_and_cannot_read_the_server() {
+    let (logs, _guard) = capture_logs();
+    let h = start_server().await;
+    let mut stream = authenticated_link(&h).await;
+    let err = pre_version_wire::read_frame(&mut stream)
+        .await
+        .expect_err("an old dialer must not decode the version frame as a reply");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+    pre_version_wire::write_frame(
+        &mut stream,
+        &pre_version_wire::RpcFrame {
+            tip_epoch: 0,
+            tip_seq: 0,
+            body: pre_version_wire::RpcBody::VoteReq(vote_req_from(2)),
+        },
+    )
+    .await
+    .unwrap();
+    assert_closed_by_peer(&mut stream).await;
+    assert_version_refusal_logged(
+        &logs,
+        &[
+            "before raft protocol versions",
+            &format!("this node speaks v{RAFT_PROTOCOL_VERSION}"),
+        ],
+    );
+    h.shutdown.store(true, Ordering::Relaxed);
+}
+
+/// This build dialling a responder from before the version: the responder
+/// fails to decode the version frame as a request and hangs up, and the
+/// dialer's request fails. A hang-up is all this end sees, which it cannot
+/// tell from a dropped link, so it stays a network error.
+#[tokio::test]
+async fn a_responder_from_before_the_version_cannot_read_the_dialer() {
+    let (addr, responder) =
+        responder_then(|mut stream| async move { pre_version_wire::read_frame(&mut stream).await })
+            .await;
+    let err = client_on(WILDCARD_BIND, &addr)
+        .await
+        .vote(vote_req_from(2), opt())
+        .await
+        .expect_err("an old responder never answers");
+    assert!(matches!(err, RPCError::Network(_)), "{err:?}");
+    let decode = responder
+        .await
+        .unwrap()
+        .expect_err("an old responder must not decode the version frame as a request");
+    assert_eq!(decode.kind(), std::io::ErrorKind::InvalidData, "{decode}");
 }

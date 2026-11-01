@@ -6,6 +6,7 @@
 //! needs to start the driver.
 
 mod election;
+mod pre_version_wire;
 mod rpc_loopback;
 mod storage_suite;
 
