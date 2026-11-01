@@ -62,8 +62,11 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   bump` where it logged `injecting epoch bump`, and every promotion logs
   `epoch bump applied` once its tenure has begun.
 - **Control-plane links carry a protocol version (raft protocol 1), and
-  refuse a peer on another release.** Right after authenticating, both
-  ends of a `--raft-peer` link exchange their version; on a mismatch the
+  refuse a peer on another release.** Right after the connecting node
+  authenticates, both ends of a `--raft-peer` link exchange their version
+  (raft protocol 1 also authenticates the node reached, see **Fixed**,
+  so this release cannot complete a control-plane link with an earlier
+  one in either case); on a mismatch the
   link is closed, both ends log a warning naming both versions, and the
   dialer backs off as from an unreachable peer. This release and earlier
   ones refuse each other's control-plane links in either direction, so a
@@ -107,8 +110,38 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   error. Release builds do not run the check and pay nothing for it. The
   contract is now documented on `ResponseEncoder` and in the application
   guide's determinism rules.
+- **A `--raft-peer` list in which two entries name the same public key
+  is refused at startup**, naming both ids; it used to boot, with one of
+  those members pinned to the other's id. **Every member a node connects
+  to must have a `--raft-peer` entry naming its replication key:** a
+  stored member whose entry was removed is no longer connected to (it
+  was already refused when it connected), and a restarted node warns of
+  each such member at startup: with mutual authentication (see
+  **Fixed**), a member without an entry has no key to require of
+  whatever answers at its address.
 
 ### Fixed
+
+- **A forged control-plane reply can no longer stop a serving primary.**
+  A node checked the key of every control-plane peer that connected to
+  it, but not of the peer it connected to, so whatever answered at a
+  peer's `--raft-peer` address (for example a process that took the port
+  after the peer died) could reply with a higher fencing epoch and make
+  a serving primary under `--raft-auto-promote` fence and shut down, or
+  report a journal position of its choosing to the promotion checks.
+  Authentication is now mutual: the connecting node also requires the
+  node it reached to prove the `replication` key its `--raft-peer` entry
+  names, and reads no reply before then. A refused peer is logged as a
+  warning naming the node dialled (and the member whose key it proved,
+  if any: their addresses are likely swapped) and retried with backoff,
+  as from an unreachable peer. No key configuration changes for a
+  correctly configured cluster: every node already lists every member's
+  key, and must already list each node's key under the `replication`
+  role in `authorized_keys`. Part of raft protocol 1, so it needs the
+  same all-nodes-together upgrade (see **Changed**). This authenticates
+  the endpoints, not the traffic between them: control-plane frames are
+  neither encrypted nor integrity-checked after the handshake, so the
+  control-plane network must still be one an attacker cannot sit on.
 
 - **An isolated replica no longer promotes itself beside a healthy
   primary.** Under `--raft-auto-promote`, a replica that held

@@ -14,8 +14,27 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use crate::recency::TipSource;
+use base64::Engine;
+use ed25519_dalek::SigningKey;
+use melin_app::auth::{AuthorizedKeys, NoRoles};
 use melin_transport_core::cursors::AdvertisedJournalTip;
 use melin_transport_core::fence::FenceState;
+
+/// An authorized-keys table listing each `(key, role, name)` entry, in
+/// order. Roles are the runtime's own (`replication`, `operator`): the
+/// control plane needs no application roles.
+pub(crate) fn authorized_keys_table(entries: &[(&SigningKey, &str, &str)]) -> AuthorizedKeys {
+    let table: String = entries
+        .iter()
+        .map(|(key, role, name)| {
+            format!(
+                "{role} {} {name}\n",
+                base64::engine::general_purpose::STANDARD.encode(key.verifying_key().to_bytes())
+            )
+        })
+        .collect();
+    AuthorizedKeys::parse::<NoRoles>(&table).unwrap()
+}
 
 /// A ready advertised journal tip at (epoch, seq). Most tests want (0, 0)
 /// so recency filters nothing; the recency tests raise it.
