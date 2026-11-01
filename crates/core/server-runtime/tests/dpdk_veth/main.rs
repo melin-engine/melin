@@ -37,6 +37,7 @@ use counter_server::{
     increment_request,
 };
 use melin_client::{Connection, Handshake, SigningKey, Step, key};
+use melin_journal::test_utils::PREALLOC;
 use melin_journal::{BufferedWriter, JournalEvent, JournalWrite};
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
@@ -387,7 +388,7 @@ fn a_stalled_join_costs_the_other_replica_nothing() {
     // The joining replica's own history: one event the primary never had.
     let joining_journal = cluster.dir.path().join("joining.journal");
     let mut writer =
-        BufferedWriter::<CounterEvent>::create(&joining_journal).expect("create journal");
+        BufferedWriter::<CounterEvent>::create(&joining_journal, PREALLOC).expect("create journal");
     writer
         .append(&JournalEvent::App(CounterEvent::Increment { amount: 7 }))
         .expect("append");
@@ -468,9 +469,11 @@ fn large_joins_complete_a_tick_at_a_time() {
     // A history of a few MiB, written before the primary starts so that
     // it costs no round trips.
     const HISTORY: u64 = 150_000;
-    let mut writer =
-        BufferedWriter::<CounterEvent>::create(&cluster.dir.path().join("primary.journal"))
-            .expect("create journal");
+    let mut writer = BufferedWriter::<CounterEvent>::create(
+        &cluster.dir.path().join("primary.journal"),
+        PREALLOC,
+    )
+    .expect("create journal");
     for _ in 0..HISTORY {
         writer
             .append(&JournalEvent::App(CounterEvent::Increment { amount: 1 }))
@@ -508,8 +511,8 @@ fn large_joins_complete_a_tick_at_a_time() {
     // The divergent replica: its own one-event history, and a snapshot of
     // it in a directory of its own.
     let divergent_journal = cluster.dir.path().join("divergent.journal");
-    let mut writer =
-        BufferedWriter::<CounterEvent>::create(&divergent_journal).expect("create journal");
+    let mut writer = BufferedWriter::<CounterEvent>::create(&divergent_journal, PREALLOC)
+        .expect("create journal");
     writer
         .append(&JournalEvent::App(CounterEvent::Increment { amount: 7 }))
         .expect("append");
@@ -519,6 +522,7 @@ fn large_joins_complete_a_tick_at_a_time() {
     melin_transport_core::JournaledApp::<Counter, BufferedWriter<CounterEvent>>::recover(
         Counter::default(),
         &divergent_journal,
+        PREALLOC,
     )
     .expect("recover the divergent history")
     .save_snapshot(&divergent_snapshot)
@@ -1034,7 +1038,8 @@ fn write_history(path: &std::path::Path, wire_bytes: usize) -> usize {
 }
 
 fn append_increments(path: &std::path::Path, count: usize) {
-    let mut writer = BufferedWriter::<CounterEvent>::create(path).expect("create journal");
+    let mut writer =
+        BufferedWriter::<CounterEvent>::create(path, PREALLOC).expect("create journal");
     for _ in 0..count {
         writer
             .append(&JournalEvent::App(CounterEvent::Increment { amount: 1 }))

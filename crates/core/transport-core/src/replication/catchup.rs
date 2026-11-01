@@ -924,13 +924,14 @@ pub fn catch_up_from_journal<E: AppEvent>(
 mod tests {
     use super::*;
     use crate::test_support::TestEvent;
+    use melin_journal::test_utils::PREALLOC;
     use melin_journal::{BufferedWriter, JournalEvent, JournalWrite};
 
     /// Build a 3-segment journal (two rotations) with one event per
     /// phase, returning the live path.
     fn three_segment_journal(dir: &std::path::Path) -> std::path::PathBuf {
         let live = dir.join("j.journal");
-        let mut writer = BufferedWriter::<TestEvent>::create(&live).unwrap();
+        let mut writer = BufferedWriter::<TestEvent>::create(&live, PREALLOC).unwrap();
         writer
             .append(&JournalEvent::App(TestEvent::Add(1)))
             .unwrap();
@@ -990,7 +991,7 @@ mod tests {
 
         // Without rotations, the live segment itself is the origin.
         let solo = dir.path().join("solo.journal");
-        drop(BufferedWriter::<TestEvent>::create(&solo).unwrap());
+        drop(BufferedWriter::<TestEvent>::create(&solo, PREALLOC).unwrap());
         let solo_origin = lineage_origin(&solo).unwrap();
         let solo_info = melin_journal::segment::read_header_info(&solo).unwrap();
         assert_eq!(solo_origin.starting_sequence, 1);
@@ -1044,7 +1045,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("resumed.journal");
         drop(
-            BufferedWriter::<TestEvent>::create_continuing(&live, 34, [7u8; 32], Some(0)).unwrap(),
+            BufferedWriter::<TestEvent>::create_continuing(&live, 34, [7u8; 32], Some(0), PREALLOC)
+                .unwrap(),
         );
 
         assert!(can_catch_up_from_journal(&live, 33).unwrap());
@@ -1192,6 +1194,7 @@ mod tests {
             1,
             [0x5E; 32],
             Some(2),
+            PREALLOC,
         )
         .unwrap();
         let mut chain_at_4 = [0u8; 32];
@@ -1300,8 +1303,10 @@ mod tests {
         // the snapshot's hash (born aligned).
         let replica = dir.path().join("r.journal");
         std::fs::write(&replica, &seed_body).unwrap();
-        let replica_writer =
-            melin_journal::BufferedWriter::<TestEvent>::open_append(&replica, 4, seed_len).unwrap();
+        let replica_writer = melin_journal::BufferedWriter::<TestEvent>::open_append(
+            &replica, 4, seed_len, PREALLOC,
+        )
+        .unwrap();
         assert_eq!(replica_writer.chain_hash().unwrap(), chain_at_4);
         assert_eq!(
             replica_writer.read_header_info().unwrap().genesis_entries,
@@ -1315,7 +1320,7 @@ mod tests {
     /// A primary journal of entries `1..=5` in `dir`, one segment.
     fn journal_of_five(dir: &std::path::Path) -> std::path::PathBuf {
         let live = dir.join("p.journal");
-        let mut w = melin_journal::BufferedWriter::<TestEvent>::create(&live).unwrap();
+        let mut w = melin_journal::BufferedWriter::<TestEvent>::create(&live, PREALLOC).unwrap();
         for v in 1..=5u64 {
             w.append(&JournalEvent::App(TestEvent::Add(v))).unwrap();
         }
@@ -1413,7 +1418,7 @@ mod tests {
     fn a_pruned_boundary_fails_the_preflight() {
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("p.journal");
-        let mut w = melin_journal::BufferedWriter::<TestEvent>::create(&live).unwrap();
+        let mut w = melin_journal::BufferedWriter::<TestEvent>::create(&live, PREALLOC).unwrap();
         for v in 1..=5u64 {
             w.append(&JournalEvent::App(TestEvent::Add(v))).unwrap();
             if v == 2 {
@@ -1476,8 +1481,14 @@ mod tests {
         // header starts past 1 (no entries yet).
         let resumed = dir.path().join("resumed.journal");
         drop(
-            BufferedWriter::<TestEvent>::create_continuing(&resumed, 21, [7u8; 32], Some(0))
-                .unwrap(),
+            BufferedWriter::<TestEvent>::create_continuing(
+                &resumed,
+                21,
+                [7u8; 32],
+                Some(0),
+                PREALLOC,
+            )
+            .unwrap(),
         );
         assert!(
             !can_catch_up_from_journal(&resumed, 0).unwrap(),
@@ -1487,7 +1498,7 @@ mod tests {
         // An empty-but-complete journal (fresh primary, no events yet)
         // IS reachable: header starts at 1, nothing is missing.
         let fresh = dir.path().join("fresh.journal");
-        drop(BufferedWriter::<TestEvent>::create(&fresh).unwrap());
+        drop(BufferedWriter::<TestEvent>::create(&fresh, PREALLOC).unwrap());
         assert!(
             can_catch_up_from_journal(&fresh, 0).unwrap(),
             "fresh replica of a fresh primary needs no snapshot"

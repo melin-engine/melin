@@ -564,6 +564,9 @@ pub fn run_receiver<A>(
     // Passed straight to the replica's journal stage; see
     // `build_replica_pipeline_with_threads`.
     staging_mode: melin_journal::StagingMode,
+    // The node's journal reservation (`ServerConfig::journal_prealloc`):
+    // every journal this loop recovers or creates is opened with it.
+    prealloc: melin_journal::Prealloc,
     group_commit_delay: std::time::Duration,
     pipeline_depth: usize,
     fence_state: std::sync::Arc<melin_transport_core::fence::FenceState>,
@@ -596,6 +599,7 @@ where
             &fence_state,
             lineage_ack_policy,
             sizing,
+            prealloc,
         )?;
     // The fence epoch now reflects the recovered journal (a fresh replica
     // legitimately recovers epoch 0). Seed the advertised sequence from
@@ -656,6 +660,7 @@ where
                         // No session is open.
                         || {},
                         sizing,
+                        prealloc,
                     );
                     // A fatal exit never keeps the pipeline, so going
                     // round again dials only after a resync or not at all.
@@ -832,6 +837,7 @@ where
                     control,
                     &mut last_sequence,
                     &mut chain_hash,
+                    prealloc,
                 )
                 .map_err(|e| -> Box<dyn std::error::Error> { e })?;
                 match decision {
@@ -876,6 +882,7 @@ where
                 lineage_start,
                 lineage_anchor,
                 lineage_genesis,
+                prealloc,
             )?;
             app = Some(A::default());
             journal_writer = Some(writer);
@@ -974,6 +981,7 @@ where
             // replaces it.
             || {},
             sizing,
+            prealloc,
         );
         if let Some(r) = after.adopt(
             &mut app,
@@ -994,6 +1002,10 @@ where
 mod tests {
     use super::*;
     use crate::uring_teardown::DRAIN_TIMEOUT;
+    // Every journal these tests open runs a receiver on it, which a
+    // `no-persist` build has none of.
+    #[cfg(not(feature = "no-persist"))]
+    use melin_journal::test_utils::PREALLOC;
     // The smallest ring a node takes, for every replica pipeline a test
     // here builds: a test's stream never fills it.
     #[cfg(not(feature = "no-persist"))]
@@ -1373,7 +1385,8 @@ mod tests {
             // the real sender-side transfer code in session 2. Entries
             // 1..=5, rotation after 2, snapshot at 4 (mid-live-segment).
             let primary_journal = dir.path().join("primary.journal");
-            let mut w = BufferedWriter::<EvtAdd>::create(&primary_journal).expect("create");
+            let mut w =
+                BufferedWriter::<EvtAdd>::create(&primary_journal, PREALLOC).expect("create");
             let mut chain_at_4 = [0u8; 32];
             for v in 1..=5u64 {
                 w.append(&JournalEvent::App(EvtAdd(v))).expect("append");
@@ -1438,6 +1451,7 @@ mod tests {
                         cores,
                         RingCapacity::MIN,
                         melin_journal::StagingMode::ZeroFill,
+                        PREALLOC,
                         Duration::ZERO,
                         64,
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
@@ -1640,7 +1654,8 @@ mod tests {
             // drops before the seed; session 3 streams from genesis on
             // the same lineage identity.
             let primary_journal = dir.path().join("primary.journal");
-            let mut w = BufferedWriter::<EvtAdd>::create(&primary_journal).expect("create");
+            let mut w =
+                BufferedWriter::<EvtAdd>::create(&primary_journal, PREALLOC).expect("create");
             let mut chain_at_2 = [0u8; 32];
             for v in 1..=3u64 {
                 w.append(&JournalEvent::App(EvtAdd(v))).expect("append");
@@ -1693,6 +1708,7 @@ mod tests {
                         cores,
                         RingCapacity::MIN,
                         melin_journal::StagingMode::ZeroFill,
+                        PREALLOC,
                         Duration::ZERO,
                         64,
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
@@ -1847,7 +1863,8 @@ mod tests {
             let dir = tempfile::tempdir().expect("tempdir");
 
             let primary_journal = dir.path().join("primary.journal");
-            let mut w = BufferedWriter::<EvtAdd>::create(&primary_journal).expect("create");
+            let mut w =
+                BufferedWriter::<EvtAdd>::create(&primary_journal, PREALLOC).expect("create");
             let mut chain_at_4 = [0u8; 32];
             for v in 1..=5u64 {
                 w.append(&JournalEvent::App(EvtAdd(v))).expect("append");
@@ -1900,6 +1917,7 @@ mod tests {
                         cores,
                         RingCapacity::MIN,
                         melin_journal::StagingMode::ZeroFill,
+                        PREALLOC,
                         Duration::ZERO,
                         64,
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
@@ -2022,8 +2040,9 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let mut pipeline: Option<PromoteHandles> = None;
             let mut app = Some(App);
-            let mut journal_writer =
-                Some(BufferedWriter::<EvtAdd>::create(&dir.path().join("p.journal")).unwrap());
+            let mut journal_writer = Some(
+                BufferedWriter::<EvtAdd>::create(&dir.path().join("p.journal"), PREALLOC).unwrap(),
+            );
 
             let result = crate::replication::take_pipeline_for_promotion(
                 &mut pipeline,
@@ -2156,7 +2175,8 @@ mod tests {
             // Minimal primary journal — only its lineage identity is
             // needed for the StreamStart the fresh replica accepts.
             let primary_journal = dir.path().join("primary.journal");
-            let mut w = BufferedWriter::<EvtAdd>::create(&primary_journal).expect("create");
+            let mut w =
+                BufferedWriter::<EvtAdd>::create(&primary_journal, PREALLOC).expect("create");
             w.append(&JournalEvent::App(EvtAdd(1))).expect("append");
             drop(w);
             let origin = lineage_origin(&primary_journal).expect("lineage");
@@ -2188,6 +2208,7 @@ mod tests {
                         crate::layout::PipelineCores::unpinned(),
                         RingCapacity::MIN,
                         melin_journal::StagingMode::ZeroFill,
+                        PREALLOC,
                         Duration::ZERO,
                         64,
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
@@ -2307,7 +2328,7 @@ mod tests {
             dir: &std::path::Path,
         ) -> (std::path::PathBuf, melin_journal::FileHeaderInfo) {
             let path = dir.join("primary.journal");
-            let mut w = BufferedWriter::<EvtAdd>::create(&path).expect("create");
+            let mut w = BufferedWriter::<EvtAdd>::create(&path, PREALLOC).expect("create");
             w.append(&JournalEvent::App(EvtAdd(1))).expect("append");
             drop(w);
             let lineage = lineage_origin(&path).expect("lineage");
@@ -2335,6 +2356,7 @@ mod tests {
                     crate::layout::PipelineCores::unpinned(),
                     RingCapacity::MIN,
                     melin_journal::StagingMode::ZeroFill,
+                    PREALLOC,
                     group_commit_delay,
                     64,
                     Arc::new(melin_transport_core::fence::FenceState::new(0)),
@@ -2758,6 +2780,7 @@ mod tests {
                     1,
                     base.anchor_hash,
                     None,
+                    PREALLOC,
                 )
                 .expect("old-format empty replica journal"),
             );
@@ -2843,6 +2866,7 @@ mod tests {
                         crate::layout::PipelineCores::unpinned(),
                         RingCapacity::MIN,
                         melin_journal::StagingMode::ZeroFill,
+                        PREALLOC,
                         Duration::ZERO,
                         64,
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
@@ -2927,12 +2951,9 @@ mod tests {
         /// must be identical, or the staging mode is not a tuning knob
         /// but a behaviour change.
         fn boundary_adoption_rotates_and_streams_on(mode: melin_journal::StagingMode) {
-            // Shrink the prealloc chunk so the replica's preparer stages
-            // a few MiB (chunk + margin) instead of 256 MiB per test.
-            // The guard holds a process-wide lock, so the two mode
-            // variants serialise rather than race the global override.
-            let _prealloc_guard =
-                melin_journal::test_utils::PreallocOverrideGuard::new(1024 * 1024);
+            // The replica's journal takes the test reservation
+            // (`PREALLOC`), so its preparer stages a few MiB (chunk +
+            // margin) instead of 256 MiB per test.
             let dir = tempfile::tempdir().expect("tempdir");
 
             // Scripted primary journal: entries 1..=2 carrying the same
@@ -2941,7 +2962,8 @@ mod tests {
             // boundary equals the replica's — journals are byte-for-byte
             // mirrors, and `append`'s wall-clock stamp would fork them.
             let primary_journal = dir.path().join("primary.journal");
-            let mut w = BufferedWriter::<EvtAdd>::create(&primary_journal).expect("create");
+            let mut w =
+                BufferedWriter::<EvtAdd>::create(&primary_journal, PREALLOC).expect("create");
             for v in 1..=2u64 {
                 w.batch_append_with_ts(&JournalEvent::App(EvtAdd(v)), v, 0)
                     .expect("append");
@@ -2979,6 +3001,7 @@ mod tests {
                         crate::layout::PipelineCores::unpinned(),
                         RingCapacity::MIN,
                         mode,
+                        PREALLOC,
                         Duration::ZERO,
                         64,
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),

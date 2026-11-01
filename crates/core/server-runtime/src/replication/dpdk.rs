@@ -1573,6 +1573,8 @@ pub fn run_receiver_dpdk<A>(
     // Passed straight to the replica's journal stage; see
     // `build_replica_pipeline_with_threads`.
     staging_mode: melin_journal::StagingMode,
+    // As the kernel-TCP `run_receiver`'s.
+    prealloc: melin_journal::Prealloc,
     group_commit_delay: std::time::Duration,
     pipeline_depth: usize,
     fence_state: Arc<melin_transport_core::fence::FenceState>,
@@ -1595,6 +1597,7 @@ where
             &fence_state,
             &control.lineage_ack_policy,
             sizing,
+            prealloc,
         )?;
     // Fence epoch now reflects the recovered journal; seed the advertised
     // sequence from the same recovery, then let the raft driver trust
@@ -1684,6 +1687,7 @@ where
                         // closed by its own exit dispatch.
                         || {},
                         sizing,
+                        prealloc,
                     );
                     // A fatal exit never keeps the pipeline, so going
                     // round again dials only after a resync or not at all.
@@ -1984,6 +1988,7 @@ where
                                 control,
                                 &mut last_sequence,
                                 &mut chain_hash,
+                                prealloc,
                             );
                             match decision {
                                 Ok(ResyncDecision::Ready {
@@ -2058,6 +2063,7 @@ where
                 lineage_start,
                 lineage_anchor,
                 lineage_genesis,
+                prealloc,
             ) {
                 Ok(writer) => writer,
                 Err(e) => {
@@ -2182,6 +2188,7 @@ where
             // disconnect.
             || end_session(transport, handle),
             sizing,
+            prealloc,
         );
         if let Some(r) = after.adopt(
             &mut app,

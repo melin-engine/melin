@@ -976,8 +976,11 @@ mod tests {
         use std::time::Duration;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let writer = melin_journal::BufferedWriter::<CounterEvent>::create(&dir.path().join("j"))
-            .expect("create journal");
+        let writer = melin_journal::BufferedWriter::<CounterEvent>::create(
+            &dir.path().join("j"),
+            melin_journal::test_utils::PREALLOC,
+        )
+        .expect("create journal");
         let (_producer, mut consumers) = DisruptorBuilder::<InputSlot<CounterEvent>>::new(4)
             .add_consumer()
             .build(WaitStrategy::SpinThenYield);

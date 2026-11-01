@@ -196,7 +196,8 @@ mod tests {
     /// Two-segment journal (rotation after seq 2), entries 1..=4.
     fn journal(dir: &std::path::Path) -> (std::path::PathBuf, Vec<[u8; 32]>) {
         let live = dir.join("v.journal");
-        let mut w = BufferedWriter::<TestEvent>::create(&live).unwrap();
+        let mut w = BufferedWriter::<TestEvent>::create(&live, melin_journal::test_utils::PREALLOC)
+            .unwrap();
         let mut chains = Vec::new();
         for v in 1..=4u64 {
             w.append(&JournalEvent::App(TestEvent::Add(v))).unwrap();

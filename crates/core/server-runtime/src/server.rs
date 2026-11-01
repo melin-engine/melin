@@ -243,9 +243,14 @@ pub struct ServerConfig {
     /// See `AuthorizedKeys` for file format.
     #[arg(long, default_value = "authorized_keys")]
     pub authorized_keys: PathBuf,
-    /// Maximum journal size in MiB before automatic rotation at startup.
-    /// When the journal exceeds this threshold, the server saves a snapshot
-    /// and starts a fresh journal. Set to 0 to disable. Default: 256 MiB.
+    /// Size in MiB at which the live journal segment rotates: at the
+    /// next fsync boundary once it is exceeded, and at startup. Set to 0
+    /// to disable size-driven rotation. Default: 256 MiB.
+    ///
+    /// Also how far ahead the journal reserves disk: the threshold plus
+    /// an 8 MiB margin, at most 256 MiB at a time. A small threshold
+    /// therefore reserves little, which matters where the journal's
+    /// filesystem is backed by memory.
     #[arg(long, default_value_t = 256)]
     pub max_journal_mib: u64,
     /// How the background preparer materialises the next journal
@@ -668,6 +673,20 @@ impl ServerConfig {
     /// archives the snapshot.
     pub fn store(&self) -> Result<NodeStore, NodeStoreError> {
         NodeStore::resolve(self.journal.clone(), self.snapshot_path.clone())
+    }
+
+    /// `--max-journal-mib` in bytes: the live segment's size-rotation
+    /// threshold, `0` when size-driven rotation is off.
+    pub fn max_journal_bytes(&self) -> u64 {
+        self.max_journal_mib.saturating_mul(1024 * 1024)
+    }
+
+    /// How much disk this node's journal reserves at a time, from its
+    /// rotation threshold (see [`melin_journal::Prealloc::for_rotation`]).
+    /// Every journal the node opens takes it: the one it boots on, a
+    /// replica's copy of its primary's, the one a resync rebuilds.
+    pub fn journal_prealloc(&self) -> melin_journal::Prealloc {
+        melin_journal::Prealloc::for_rotation(self.max_journal_bytes())
     }
 
     /// What the response stage needs to release a halted primary's held
@@ -1224,6 +1243,7 @@ where
             config.cores,
             config.ring_capacity,
             config.journal_staging_mode.into(),
+            config.journal_prealloc(),
             config.group_commit_delay(),
             config.replication_pipeline_depth,
             Arc::clone(&fence_state),
@@ -1915,8 +1935,7 @@ where
     // the new primary's stage. The size threshold uses the same
     // `max_journal_mib` knob that drives startup rotation.
     let mut journal_stage = journal_stage;
-    let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
-    journal_stage.set_rotation(max_journal_bytes, rotate_flag.clone());
+    journal_stage.set_rotation(config.max_journal_bytes(), rotate_flag.clone());
     config.cores.place_journal_children(&mut journal_stage);
     journal_stage.set_staging_mode(config.journal_staging_mode.into());
     // On a primary the journal stage owns the control-plane advertised
@@ -2752,6 +2771,7 @@ where
             config.cores,
             config.ring_capacity,
             config.journal_staging_mode.into(),
+            config.journal_prealloc(),
             config.group_commit_delay(),
             config.replication_pipeline_depth,
             Arc::clone(&fence_state),
@@ -3128,8 +3148,7 @@ where
     // ROTATE shares `rotate_flag` with the admin endpoint the caller
     // spawned.
     let mut journal_stage = journal_stage;
-    let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
-    journal_stage.set_rotation(max_journal_bytes, rotate_flag.clone());
+    journal_stage.set_rotation(config.max_journal_bytes(), rotate_flag.clone());
     config.cores.place_journal_children(&mut journal_stage);
     journal_stage.set_staging_mode(config.journal_staging_mode.into());
     // On a primary the journal stage owns the control-plane advertised
@@ -3887,6 +3906,7 @@ where
     use melin_transport_core::journaled_app::write_genesis_journal;
 
     let journal = store.journal();
+    let prealloc = config.journal_prealloc();
     // Replay the journal at the configured path into a fresh instance,
     // sized before the history is applied to it, as a replica is before
     // it applies the stream: replay must not grow the collections the
@@ -3894,7 +3914,7 @@ where
     let recover_journal = || -> Result<JournaledApp<A, W>, Box<dyn std::error::Error>> {
         let mut app = A::default();
         <A as Application>::prefault(&mut app, sizing);
-        Ok(JournaledApp::<A, W>::recover(app, journal)?)
+        Ok(JournaledApp::<A, W>::recover(app, journal, prealloc)?)
     };
 
     let snap_path = store.snapshot();
@@ -3920,7 +3940,7 @@ where
         match choose_bootstrap(snapshot_exists, journal_exists, archives_exist) {
             BootstrapSource::SnapshotAndJournal => {
                 info!(snapshot = %snap_path.display(), "recovering from snapshot + journal");
-                JournaledApp::<A, W>::recover_from_snapshot(snap_path, journal)?
+                JournaledApp::<A, W>::recover_from_snapshot(snap_path, journal, prealloc)?
             }
             BootstrapSource::SnapshotOnly => {
                 // Snapshot exists but no journal segment survives at all —
@@ -3942,6 +3962,7 @@ where
                     snap.sequence + 1,
                     snap.chain_hash,
                     snap.genesis_entries,
+                    prealloc,
                 )?;
                 JournaledApp::<A, W>::from_parts(app, writer, snap.lineage)
             }
@@ -3974,7 +3995,12 @@ where
                              length: journaling genesis (an earlier release's \
                              first boot stopped before journaling it)"
                         );
-                        write_genesis_journal::<A::Event, W>(journal, Some(anchor), genesis)?;
+                        write_genesis_journal::<A::Event, W>(
+                            journal,
+                            Some(anchor),
+                            genesis,
+                            prealloc,
+                        )?;
                         began_history = true;
                         recover_journal()?
                     }
@@ -3982,7 +4008,7 @@ where
             }
             BootstrapSource::Fresh => {
                 info!("creating new journal");
-                write_genesis_journal::<A::Event, W>(journal, None, genesis)?;
+                write_genesis_journal::<A::Event, W>(journal, None, genesis, prealloc)?;
                 began_history = true;
                 recover_journal()?
             }
@@ -4005,7 +4031,7 @@ where
     // restarts. Recovery walks the archive chain forward from the
     // latest shadow snapshot.
     if config.max_journal_mib > 0 {
-        let threshold = config.max_journal_mib * 1024 * 1024;
+        let threshold = config.max_journal_bytes();
         let current_size = engine.journal_size();
         if current_size > threshold {
             info!(
@@ -5077,6 +5103,7 @@ mod genesis_tests {
     use std::path::Path;
 
     use counter_server::{Counter, CounterEvent};
+    use melin_journal::test_utils::PREALLOC;
     use melin_journal::{BufferedWriter, JournalEvent, JournalReader, JournalWrite};
     use melin_transport_core::journaled_app::genesis_staging_path;
 
@@ -5087,9 +5114,14 @@ mod genesis_tests {
 
     type Writer = BufferedWriter<CounterEvent>;
 
+    /// A node journaling into `dir`. Its rotation threshold is the
+    /// smallest there is, so the journals `init_engine` opens reserve a
+    /// few MiB rather than the default 256 (memory, when the temporary
+    /// directory is tmpfs); no test here writes enough to rotate.
     pub(super) fn config(dir: &Path) -> ServerConfig {
         ServerConfig {
             journal: dir.join("counter.journal"),
+            max_journal_mib: 1,
             ..ServerConfig::default()
         }
     }
@@ -5152,9 +5184,82 @@ mod genesis_tests {
         // journaling its genesis now begins the history.
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = config(dir.path());
-        drop(Writer::create_continuing(&cfg.journal, 1, [0x15; 32], None).expect("v15 journal"));
+        drop(
+            Writer::create_continuing(&cfg.journal, 1, [0x15; 32], None, PREALLOC)
+                .expect("v15 journal"),
+        );
         assert!(began_history(&cfg, &[1_000]));
         assert!(!began_history(&cfg, &[1_000]));
+    }
+
+    /// Whichever way a node boots, the journal it goes on to write
+    /// reserves disk from the node's own `--max-journal-mib`, not the
+    /// default: the reservation is memory where the journal sits on
+    /// tmpfs, and a boot arm that fell back to the default would reserve
+    /// 256 MiB a node with a small threshold never asked for.
+    #[test]
+    fn every_boot_opens_the_journal_with_the_nodes_reservation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = ServerConfig {
+            max_journal_mib: 3,
+            ..config(dir.path())
+        };
+        let expected = melin_journal::Prealloc::for_rotation(3 * 1024 * 1024);
+        assert_eq!(cfg.journal_prealloc(), expected);
+        let boot = |cfg: &ServerConfig| {
+            init_engine::<Counter, Writer>(
+                cfg,
+                &cfg.store().expect("store"),
+                &(),
+                increments(&[1_000]),
+            )
+            .expect("init_engine")
+            .writer
+        };
+        let len = |p: &Path| std::fs::metadata(p).expect("journal metadata").len();
+
+        // A new history: the genesis journal, created and recovered. A
+        // recovered journal reserves one chunk past where it resumes.
+        let writer = boot(&cfg);
+        assert_eq!(writer.prealloc(), expected, "a new history");
+        assert_eq!(
+            len(&cfg.journal),
+            writer.valid_end() + expected.chunk_bytes()
+        );
+        drop(writer);
+
+        // A journal on disk, recovered.
+        let writer = boot(&cfg);
+        assert_eq!(writer.prealloc(), expected, "journal only");
+        assert_eq!(
+            len(&cfg.journal),
+            writer.valid_end() + expected.chunk_bytes()
+        );
+        drop(writer);
+
+        // A snapshot beside it, recovered from both.
+        let store = cfg.store().expect("store");
+        melin_transport_core::JournaledApp::<Counter, Writer>::recover(
+            Counter::default(),
+            &cfg.journal,
+            PREALLOC,
+        )
+        .expect("recover")
+        .save_snapshot(store.snapshot())
+        .expect("save snapshot");
+        let writer = boot(&cfg);
+        assert_eq!(writer.prealloc(), expected, "snapshot and journal");
+        assert_eq!(
+            len(&cfg.journal),
+            writer.valid_end() + expected.chunk_bytes()
+        );
+        drop(writer);
+
+        // The snapshot alone: a fresh segment continuing it, one chunk.
+        std::fs::remove_file(&cfg.journal).expect("remove the journal");
+        let writer = boot(&cfg);
+        assert_eq!(writer.prealloc(), expected, "snapshot only");
+        assert_eq!(len(&cfg.journal), expected.chunk_bytes());
     }
 
     /// Every application amount in the journal file at `path`, in order —
@@ -5255,7 +5360,7 @@ mod genesis_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = config(dir.path());
         let staging = genesis_staging_path(&cfg.journal);
-        let mut partial = Writer::create(&staging).expect("staging journal");
+        let mut partial = Writer::create(&staging, PREALLOC).expect("staging journal");
         partial
             .append(&JournalEvent::App(CounterEvent::Increment {
                 amount: 1_000,
@@ -5280,7 +5385,7 @@ mod genesis_tests {
     fn an_empty_journal_with_a_recorded_length_is_not_rewritten() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = config(dir.path());
-        drop(Writer::create(&cfg.journal).expect("empty journal"));
+        drop(Writer::create(&cfg.journal, PREALLOC).expect("empty journal"));
         assert_eq!(genesis_entries(&cfg.journal), Some(0));
         let before = anchor(&cfg.journal);
 
@@ -5291,7 +5396,7 @@ mod genesis_tests {
 
         std::fs::remove_file(&cfg.journal).expect("move the journal aside");
         drop(
-            Writer::create_continuing(&cfg.journal, 1, [0x2C; 32], Some(2))
+            Writer::create_continuing(&cfg.journal, 1, [0x2C; 32], Some(2), PREALLOC)
                 .expect("a replica's empty copy"),
         );
         for configured in [&[][..], &[1_000, 2_000], &[1_000, 2_000, 4_000]] {
@@ -5323,7 +5428,10 @@ mod genesis_tests {
     fn an_empty_old_format_journal_gets_its_genesis_and_its_length() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = config(dir.path());
-        drop(Writer::create_continuing(&cfg.journal, 1, [0x15; 32], None).expect("v15 journal"));
+        drop(
+            Writer::create_continuing(&cfg.journal, 1, [0x15; 32], None, PREALLOC)
+                .expect("v15 journal"),
+        );
         assert_eq!(genesis_entries(&cfg.journal), None);
 
         assert_eq!(boot(&cfg, &[1_000, 2_000]), (3_000, 3));
@@ -5339,7 +5447,7 @@ mod genesis_tests {
         let cfg = config(dir.path());
         assert_eq!(boot(&cfg, &[1_000]), (1_000, 2));
         let staging = genesis_staging_path(&cfg.journal);
-        drop(Writer::create(&staging).expect("orphaned staging file"));
+        drop(Writer::create(&staging, PREALLOC).expect("orphaned staging file"));
 
         assert_eq!(boot(&cfg, &[1_000]), (1_000, 2));
         assert!(!staging.exists());
@@ -5351,7 +5459,7 @@ mod genesis_tests {
     fn an_empty_journal_without_genesis_is_left_alone() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = config(dir.path());
-        drop(Writer::create(&cfg.journal).expect("empty journal"));
+        drop(Writer::create(&cfg.journal, PREALLOC).expect("empty journal"));
         let before = anchor(&cfg.journal);
 
         assert_eq!(boot(&cfg, &[]), (0, 1));
@@ -5366,7 +5474,7 @@ mod genesis_tests {
     fn a_journal_with_history_never_gets_genesis() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = config(dir.path());
-        let mut writer = Writer::create(&cfg.journal).expect("journal");
+        let mut writer = Writer::create(&cfg.journal, PREALLOC).expect("journal");
         writer
             .append(&JournalEvent::App(CounterEvent::Increment { amount: 5 }))
             .expect("one entry");
@@ -5380,8 +5488,8 @@ mod genesis_tests {
     /// records the lineage's genesis of three entries (learned from the
     /// primary), and only the first two arrived.
     fn partial_replica_copy(path: &Path) {
-        let mut writer =
-            Writer::create_continuing(path, 1, [0x2B; 32], Some(3)).expect("replica journal");
+        let mut writer = Writer::create_continuing(path, 1, [0x2B; 32], Some(3), PREALLOC)
+            .expect("replica journal");
         for amount in [1_000, 2_000] {
             writer
                 .append(&JournalEvent::App(CounterEvent::Increment { amount }))
@@ -5420,6 +5528,7 @@ mod genesis_tests {
         melin_transport_core::JournaledApp::<Counter, Writer>::recover(
             Counter::default(),
             &cfg.journal,
+            PREALLOC,
         )
         .expect("recover the partial copy")
         .save_snapshot(cfg.store().expect("store").snapshot())
@@ -5462,8 +5571,8 @@ mod genesis_tests {
     fn an_old_format_journal_boots_without_the_check() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = config(dir.path());
-        let mut writer =
-            Writer::create_continuing(&cfg.journal, 1, [0x15; 32], None).expect("v15 journal");
+        let mut writer = Writer::create_continuing(&cfg.journal, 1, [0x15; 32], None, PREALLOC)
+            .expect("v15 journal");
         writer
             .append(&JournalEvent::App(CounterEvent::Increment { amount: 7 }))
             .expect("one entry");
@@ -5599,8 +5708,8 @@ mod genesis_tests {
         let path = dir.path().join("replica.journal");
         let genesis = increments(&[1_000, 2_000, 4_000]);
 
-        let mut writer =
-            Writer::create_continuing(&path, 1, [0x2B; 32], Some(3)).expect("replica journal");
+        let mut writer = Writer::create_continuing(&path, 1, [0x2B; 32], Some(3), PREALLOC)
+            .expect("replica journal");
         let refused = check_promotable(&writer).expect_err("an empty history");
         assert!(
             refused.to_string().contains("refusing promotion"),
@@ -5624,18 +5733,20 @@ mod genesis_tests {
 
         // No genesis: any history, even an empty one, is promotable.
         let none = dir.path().join("none.journal");
-        check_promotable(&Writer::create(&none).expect("journal")).expect("nothing to hold");
+        check_promotable(&Writer::create(&none, PREALLOC).expect("journal"))
+            .expect("nothing to hold");
         // Unknown (a lineage begun before the length was recorded): not
         // checked, as before.
         let unknown = dir.path().join("unknown.journal");
         check_promotable(
-            &Writer::create_continuing(&unknown, 1, [0x15; 32], None).expect("journal"),
+            &Writer::create_continuing(&unknown, 1, [0x15; 32], None, PREALLOC).expect("journal"),
         )
         .expect("unknown is not checked");
         // A history continuing a snapshot counts the snapshot's entries.
         let continued = dir.path().join("continued.journal");
         check_promotable(
-            &Writer::create_continuing(&continued, 10, [0x2B; 32], Some(3)).expect("journal"),
+            &Writer::create_continuing(&continued, 10, [0x2B; 32], Some(3), PREALLOC)
+                .expect("journal"),
         )
         .expect("snapshot covers genesis");
     }

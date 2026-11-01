@@ -503,7 +503,9 @@ mod tests {
             }
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("j.journal");
-            let writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+            let writer =
+                BufferedWriter::<TestEvent>::create(&path, melin_journal::test_utils::PREALLOC)
+                    .unwrap();
             TestJournal::Real {
                 _dir: dir,
                 path,

@@ -1,103 +1,114 @@
-//! Journal pre-allocation chunk size for `BufferedWriter`. Kept in its
-//! own module so the policy sits next to the test override that tunes
-//! it, rather than buried in the writer's hot path.
+//! How far ahead of its write position a journal segment reserves disk
+//! blocks: [`Prealloc`].
 //!
-//! Resolution order, highest precedence first:
-//!
-//! 1. Runtime override held by a `test_utils::PreallocOverrideGuard`
-//!    (only constructible when the `test-utils` feature is enabled). Used
-//!    by library tests that recover/append in tight loops where the
-//!    256 MiB `fallocate` dominates wall time.
-//! 2. Environment variable `MELIN_JOURNAL_PREALLOC_MIB`. Used by
-//!    integration tests that spawn the server binary and can't reach a
-//!    Rust API. Floored at 1 MiB.
-//! 3. `DEFAULT_PREALLOC_CHUNK` (256 MiB) — the production default.
+//! A value each writer carries, not a process-wide setting. One process
+//! can hold several journals (a test runs a cluster's nodes as threads
+//! of one process), and each is sized from its own node's rotation
+//! threshold, so a global would let one node's sizing leak into
+//! another's.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(any(test, feature = "test-utils"))]
-use std::sync::{Mutex, MutexGuard};
+use std::num::NonZeroU64;
 
-/// Default pre-allocation chunk size (256 MiB). Matches the journal
-/// rotation threshold so a freshly created journal never needs mid-run
-/// extension at production scale (~80 B/entry × 256 MiB ≈ 3.2 M entries
-/// per chunk).
-const DEFAULT_PREALLOC_CHUNK: u64 = 256 * 1024 * 1024;
+use crate::preparer::STAGE_MARGIN_BYTES;
 
-/// In-process override. 0 means "no override; consult env / default".
-/// `AtomicU64` so the override can be set from any thread without
-/// blocking — the value is read on each prealloc call (off the hot
-/// path) with `Relaxed` ordering: writers care that *some* value
-/// arrived, not that it synchronises with any specific event.
-static OVERRIDE_BYTES: AtomicU64 = AtomicU64::new(0);
+/// The chunk a journal with no smaller rotation threshold reserves at a
+/// time (256 MiB): the default rotation threshold, so a segment of the
+/// default size fills one chunk and rotates without ever extending.
+const DEFAULT_CHUNK_BYTES: NonZeroU64 = NonZeroU64::new(256 * 1024 * 1024).expect("not zero");
 
-/// Resolve the chunk size for the next prealloc call.
-pub(crate) fn prealloc_chunk_bytes() -> u64 {
-    let o = OVERRIDE_BYTES.load(Ordering::Relaxed);
-    if o > 0 {
-        return o;
-    }
-    std::env::var("MELIN_JOURNAL_PREALLOC_MIB")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .map(|m| m.max(1) * 1024 * 1024)
-        .unwrap_or(DEFAULT_PREALLOC_CHUNK)
-}
-
-/// Internal hook for [`PreallocOverrideGuard`] and in-crate tests that
-/// need to engineer specific prealloc-boundary scenarios (notably
-/// `ensure_allocated`'s zero-range invariant).
-/// `None` clears the override; `Some(0)` is treated as "clear".
-#[cfg(any(test, feature = "test-utils"))]
-pub(crate) fn set_override(bytes: Option<u64>) {
-    OVERRIDE_BYTES.store(bytes.unwrap_or(0), Ordering::Relaxed);
-}
-
-/// Process-wide lock serialising tests that mutate the prealloc chunk
-/// override. Acquired by [`PreallocOverrideGuard`] so concurrent tests
-/// can't observe each other's intermediate override state — without
-/// this, test A's `set_override(X)` could be overwritten by test B's
-/// `set_override(Y)` while A still expects X.
-#[cfg(any(test, feature = "test-utils"))]
-static OVERRIDE_LOCK: Mutex<()> = Mutex::new(());
-
-/// RAII guard scoping a prealloc chunk override to the lifetime of a
-/// test. Acquires a process-wide lock on construction (so two tests
-/// using this mechanism never race), sets the override, and clears it
-/// on drop — properly bounding the side effect.
+/// How many bytes a journal segment reserves (`fallocate`) ahead of its
+/// writes: once when the segment is created or reopened, and again each
+/// time a write would run past the reservation.
 ///
-/// Use this in any test that needs to shrink the prealloc chunk
-/// (typically to keep a recovery loop fast or to force
-/// `ensure_allocated` to fire). Falls back to inner-poisoning rather
-/// than panicking if a sibling test panicked while holding the guard,
-/// so one bad test doesn't cascade into the rest of the suite.
-#[cfg(any(test, feature = "test-utils"))]
-pub struct PreallocOverrideGuard {
-    // The lock is released on drop. Bind the guard to a *named*
-    // variable (`let _guard = PreallocOverrideGuard::new(N);`) — never
-    // to bare `_` (`let _ = ...`), which drops the guard immediately
-    // and releases both the lock and the override. The `_lock` field
-    // prefix is purely the standard rustc convention to suppress
-    // "field never read" warnings; the field's *existence* is what
-    // keeps the guard alive.
-    _lock: MutexGuard<'static, ()>,
+/// Reserving ahead keeps extent allocation off the flush path, and a
+/// segment never needs more than it holds when it rotates. So a journal
+/// that rotates at a size threshold reserves that threshold, plus the
+/// margin a segment can overshoot it by, and no more: anything past
+/// that is space no write reaches before rotation trims it away, and on
+/// a filesystem backed by memory (tmpfs) it is memory.
+///
+/// A newtype over a non-zero byte count rather than a bare `u64`: a zero
+/// reservation is not a smaller one but a broken one (`fallocate`
+/// refuses a zero length), and the type keeps a count of bytes from
+/// being confused with the MiB the operator configures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Prealloc {
+    chunk_bytes: NonZeroU64,
 }
 
-#[cfg(any(test, feature = "test-utils"))]
-impl PreallocOverrideGuard {
-    /// Acquire the override lock and install `bytes` as the chunk
-    /// size. Blocks if another guard is currently held. Poison is
-    /// recovered transparently (a panicking test only invalidates
-    /// itself, not the rest of the suite).
-    pub fn new(bytes: u64) -> Self {
-        let lock = OVERRIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        set_override(Some(bytes));
-        Self { _lock: lock }
+impl Prealloc {
+    /// The reservation of a journal with no size-driven rotation, and the
+    /// largest any rotation threshold leads to.
+    pub const DEFAULT: Self = Self {
+        chunk_bytes: DEFAULT_CHUNK_BYTES,
+    };
+
+    /// The reservation for a journal whose live segment rotates once it
+    /// reaches `max_journal_bytes` (`0`: no size-driven rotation, which
+    /// takes [`DEFAULT`](Self::DEFAULT)).
+    ///
+    /// The threshold plus the staging margin the background preparer
+    /// sizes the segments it stages with, so a node's first segment
+    /// reserves what every later one is staged with; capped at
+    /// [`DEFAULT`](Self::DEFAULT), past which a larger segment extends
+    /// one default chunk at a time, as it always has.
+    pub fn for_rotation(max_journal_bytes: u64) -> Self {
+        if max_journal_bytes == 0 {
+            return Self::DEFAULT;
+        }
+        let bytes = max_journal_bytes
+            .saturating_add(STAGE_MARGIN_BYTES)
+            .min(DEFAULT_CHUNK_BYTES.get());
+        Self {
+            chunk_bytes: NonZeroU64::new(bytes).expect("a threshold plus the margin is not zero"),
+        }
+    }
+
+    /// An explicit reservation, for tooling and tests that size a
+    /// journal directly rather than from a rotation threshold.
+    pub const fn from_bytes(chunk_bytes: NonZeroU64) -> Self {
+        Self { chunk_bytes }
+    }
+
+    /// Bytes reserved at a time.
+    pub const fn chunk_bytes(self) -> u64 {
+        self.chunk_bytes.get()
     }
 }
 
-#[cfg(any(test, feature = "test-utils"))]
-impl Drop for PreallocOverrideGuard {
-    fn drop(&mut self) {
-        set_override(None);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn no_size_driven_rotation_reserves_the_default() {
+        assert_eq!(Prealloc::for_rotation(0), Prealloc::DEFAULT);
+    }
+
+    /// A small threshold reserves the threshold and the staging margin:
+    /// what the segment can hold before it rotates, and what the
+    /// preparer stages every later segment with.
+    #[test]
+    fn a_small_threshold_reserves_the_threshold_and_the_margin() {
+        assert_eq!(
+            Prealloc::for_rotation(8 * MIB).chunk_bytes(),
+            8 * MIB + STAGE_MARGIN_BYTES
+        );
+        assert_eq!(
+            Prealloc::for_rotation(1).chunk_bytes(),
+            1 + STAGE_MARGIN_BYTES
+        );
+    }
+
+    /// The default threshold keeps the default reservation, and a larger
+    /// one is capped at it: a node configured as it always was reserves
+    /// what it always did.
+    #[test]
+    fn the_default_threshold_and_larger_ones_reserve_the_default() {
+        assert_eq!(Prealloc::for_rotation(256 * MIB), Prealloc::DEFAULT);
+        assert_eq!(Prealloc::for_rotation(4096 * MIB), Prealloc::DEFAULT);
+        assert_eq!(Prealloc::for_rotation(u64::MAX), Prealloc::DEFAULT);
     }
 }

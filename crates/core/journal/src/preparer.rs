@@ -80,6 +80,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::error::JournalError;
+use crate::prealloc::Prealloc;
 
 /// A fully-prepared journal segment file ready to be adopted by the
 /// writer on the next rotation.
@@ -141,8 +142,10 @@ pub enum StagingMode {
 /// writes inside the staged region. Writes past the margin fall back to
 /// `posix_fallocate` extension (rare; under `ZeroFill` it also costs the
 /// metadata-per-append behaviour that mode exists to avoid, and the
-/// writer logs the transition).
-const STAGE_MARGIN_BYTES: u64 = 8 * 1024 * 1024;
+/// writer logs the transition). A node's first segment, which no
+/// preparer staged, reserves the same margin (see
+/// [`Prealloc::for_rotation`]).
+pub(crate) const STAGE_MARGIN_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Manages a background thread that pre-stages the next segment.
 ///
@@ -168,7 +171,8 @@ struct State {
     mode: StagingMode,
     /// How many bytes the next staged segment is sized to (zeroed or
     /// allocated, per `mode`). Seeded at spawn (threshold + margin, or
-    /// one prealloc chunk + margin when the threshold is unknown) and
+    /// the journal's prealloc chunk + margin when the threshold is
+    /// unknown) and
     /// updated on
     /// every [`SegmentPreparer::arm_with_observed_len`] so the target
     /// tracks the segment sizes the deployment actually produces —
@@ -218,7 +222,8 @@ impl SegmentPreparer {
     /// that plus `STAGE_MARGIN_BYTES`. Pass `0` when the threshold
     /// is unknown locally (replica mode — rotation follows the primary's
     /// announced boundaries): the initial target falls back to one
-    /// prealloc chunk plus margin, and every
+    /// `prealloc` chunk (the journal's, from its own node's threshold)
+    /// plus margin, and every
     /// [`arm_with_observed_len`](Self::arm_with_observed_len) after a
     /// rotation retunes it to the segment sizes actually observed, so a
     /// replica converges on the primary's real segment size after its
@@ -232,6 +237,7 @@ impl SegmentPreparer {
     pub fn spawn(
         live_path: PathBuf,
         rotate_threshold_bytes: u64,
+        prealloc: Prealloc,
         pin_core: usize,
         mode: StagingMode,
     ) -> Self {
@@ -243,7 +249,7 @@ impl SegmentPreparer {
         let stage_target = if stage_floor > 0 {
             stage_floor
         } else {
-            crate::prealloc::prealloc_chunk_bytes() + STAGE_MARGIN_BYTES
+            prealloc.chunk_bytes() + STAGE_MARGIN_BYTES
         };
 
         cleanup_staging_orphan(&live_path);
@@ -858,6 +864,7 @@ pub(crate) fn staging_path(live: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::PREALLOC;
 
     /// Spawning, arming, and shutdown round-trips without leaking the
     /// worker thread or the staging file.
@@ -869,7 +876,8 @@ mod tests {
         // the staging sibling.
 
         let threshold: u64 = 1024 * 1024;
-        let preparer = SegmentPreparer::spawn(live.clone(), threshold, 0, StagingMode::ZeroFill);
+        let preparer =
+            SegmentPreparer::spawn(live.clone(), threshold, PREALLOC, 0, StagingMode::ZeroFill);
 
         // Wait up to 5 s for the worker to publish a prepared segment.
         // Staging a few MiB on tmpfs is milliseconds, but the bounded
@@ -916,7 +924,8 @@ mod tests {
         let live = dir.path().join("test.journal");
 
         let threshold: u64 = 1024 * 1024;
-        let preparer = SegmentPreparer::spawn(live.clone(), threshold, 0, StagingMode::Allocate);
+        let preparer =
+            SegmentPreparer::spawn(live.clone(), threshold, PREALLOC, 0, StagingMode::Allocate);
 
         let mut prepared = None;
         for _ in 0..500 {
@@ -957,7 +966,8 @@ mod tests {
         std::fs::write(&staging, b"orphan from prior crash").expect("write orphan");
         assert!(staging.exists());
 
-        let preparer = SegmentPreparer::spawn(live, 1024 * 1024, 0, StagingMode::ZeroFill);
+        let preparer =
+            SegmentPreparer::spawn(live, 1024 * 1024, PREALLOC, 0, StagingMode::ZeroFill);
 
         // The orphan should be gone immediately; the worker will then
         // create a fresh staging file.
@@ -989,7 +999,8 @@ mod tests {
 
         // 3 MiB threshold → staged size = threshold + margin.
         let threshold: u64 = 3 * 1024 * 1024;
-        let preparer = SegmentPreparer::spawn(live.clone(), threshold, 0, StagingMode::ZeroFill);
+        let preparer =
+            SegmentPreparer::spawn(live.clone(), threshold, PREALLOC, 0, StagingMode::ZeroFill);
 
         let mut prepared = None;
         for _ in 0..500 {
@@ -1040,8 +1051,7 @@ mod tests {
         let live = dir.path().join("test.journal");
 
         // Replica-style spawn: threshold unknown (0) → chunk fallback.
-        let _prealloc_guard = crate::prealloc::PreallocOverrideGuard::new(1024 * 1024);
-        let preparer = SegmentPreparer::spawn(live, 0, 0, StagingMode::ZeroFill);
+        let preparer = SegmentPreparer::spawn(live, 0, PREALLOC, 0, StagingMode::ZeroFill);
 
         let take_one = || {
             for _ in 0..500 {
@@ -1057,7 +1067,7 @@ mod tests {
         let first = take_one();
         assert_eq!(
             first.allocated_end,
-            1024 * 1024 + STAGE_MARGIN_BYTES,
+            PREALLOC.chunk_bytes() + STAGE_MARGIN_BYTES,
             "initial replica target = prealloc chunk + margin"
         );
         std::fs::remove_file(&first.path).expect("consume first staging");
@@ -1084,7 +1094,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let live = dir.path().join("test.journal");
 
-        let preparer = SegmentPreparer::spawn(live, 1024 * 1024, 0, StagingMode::ZeroFill);
+        let preparer =
+            SegmentPreparer::spawn(live, 1024 * 1024, PREALLOC, 0, StagingMode::ZeroFill);
 
         // First prepared segment.
         let mut first = None;

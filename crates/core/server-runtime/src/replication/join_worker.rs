@@ -818,7 +818,9 @@ mod tests {
 
         fn journal(dir: &std::path::Path, events: u64) -> std::path::PathBuf {
             let path = dir.join("primary.journal");
-            let mut w = BufferedWriter::<CounterEvent>::create(&path).expect("create");
+            let mut w =
+                BufferedWriter::<CounterEvent>::create(&path, melin_journal::test_utils::PREALLOC)
+                    .expect("create");
             for _ in 0..events {
                 w.append(&JournalEvent::App(CounterEvent::Increment { amount: 1 }))
                     .expect("append");

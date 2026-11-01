@@ -667,6 +667,7 @@ mod tests {
     use super::*;
     use crate::buffered_writer::BufferedWriter;
     use crate::event::JournalEvent;
+    use crate::test_utils::PREALLOC;
     use crate::write::JournalWrite;
     use melin_app::{AppEvent, CodecError};
 
@@ -700,7 +701,7 @@ mod tests {
     /// in the live segment). A phase count of 0 produces an empty
     /// segment.
     fn build_lineage(live: &Path, phases: &[u64]) {
-        let mut writer = BufferedWriter::<TestEvent>::create(live).unwrap();
+        let mut writer = BufferedWriter::<TestEvent>::create(live, PREALLOC).unwrap();
         let mut value = 0u64;
         for (i, &count) in phases.iter().enumerate() {
             for _ in 0..count {
@@ -789,7 +790,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("chain_at.journal");
 
-        let mut writer = BufferedWriter::<TestEvent>::create(&live).unwrap();
+        let mut writer = BufferedWriter::<TestEvent>::create(&live, PREALLOC).unwrap();
         let mut expected = Vec::new();
         for v in 1..=3u64 {
             writer.append(&JournalEvent::App(TestEvent(v))).unwrap();
@@ -981,14 +982,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("j.journal");
         // One segment with a forged gap, then rotate so it gets sealed.
-        let mut writer = BufferedWriter::<TestEvent>::create(&live).unwrap();
+        let mut writer = BufferedWriter::<TestEvent>::create(&live, PREALLOC).unwrap();
         writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
         writer.append(&JournalEvent::App(TestEvent(2))).unwrap();
         drop(writer);
         forge_entry(&live, 4, false); // expected 3, found 4
         std::fs::rename(&live, archive_path(&live, 1)).unwrap();
         // Recreate an (empty) live so the archive isn't the last word.
-        drop(BufferedWriter::<TestEvent>::create_continuing(&live, 5, [0u8; 32], Some(0)).unwrap());
+        drop(
+            BufferedWriter::<TestEvent>::create_continuing(&live, 5, [0u8; 32], Some(0), PREALLOC)
+                .unwrap(),
+        );
 
         let err = verify_lineage::<TestEvent>(&live).unwrap_err();
         assert!(

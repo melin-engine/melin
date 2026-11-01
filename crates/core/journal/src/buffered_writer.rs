@@ -49,6 +49,7 @@ use crate::codec;
 use crate::encoder::{JournalEncoder, entry_size};
 use crate::error::JournalError;
 use crate::event::JournalEvent;
+use crate::prealloc::Prealloc;
 use crate::segment_file::SegmentFile;
 
 /// Append-only journal writer that goes through the kernel page cache
@@ -77,9 +78,10 @@ impl<E: AppEvent> BufferedWriter<E> {
     /// Create a fresh journal file: a new lineage with no genesis
     /// (`genesis_entries` 0). The chain anchor is random salt so
     /// histories from different runs/clusters are never confusable.
-    pub fn create(path: &Path) -> Result<Self, JournalError> {
+    /// Every segment reserves disk `prealloc` at a time.
+    pub fn create(path: &Path, prealloc: Prealloc) -> Result<Self, JournalError> {
         crate::preparer::cleanup_staging_orphan(path);
-        Self::create_continuing(path, 1, crate::fresh_anchor()?, Some(0))
+        Self::create_continuing(path, 1, crate::fresh_anchor()?, Some(0), prealloc)
     }
 
     /// Create a fresh journal that continues a previous segment's sequence
@@ -87,12 +89,14 @@ impl<E: AppEvent> BufferedWriter<E> {
     /// or random salt for a brand-new journal), in a lineage whose
     /// genesis occupies `genesis_entries` entries (`None`: unknown, see
     /// [`codec::FileHeaderInfo::genesis_entries`]). All three are recorded
-    /// in the file header; no entries are written.
+    /// in the file header; no entries are written. Every segment reserves
+    /// disk `prealloc` at a time.
     pub fn create_continuing(
         path: &Path,
         starting_sequence: u64,
         anchor_hash: [u8; 32],
         genesis_entries: Option<u64>,
+        prealloc: Prealloc,
     ) -> Result<Self, JournalError> {
         Ok(Self {
             segment: SegmentFile::create_continuing(
@@ -100,6 +104,7 @@ impl<E: AppEvent> BufferedWriter<E> {
                 starting_sequence,
                 anchor_hash,
                 genesis_entries,
+                prealloc,
             )?,
             encoder: JournalEncoder::new(starting_sequence, anchor_hash),
             batch_buf: vec![0u8; BATCH_BUF_CAPACITY],
@@ -118,12 +123,19 @@ impl<E: AppEvent> BufferedWriter<E> {
     /// `[ENTRY_OFFSET, valid_end)` — the chain is a pure function of
     /// those two inputs, so no chain state needs to be threaded in from
     /// the recovery walk.
-    pub fn open_append(path: &Path, last_seq: u64, valid_end: u64) -> Result<Self, JournalError> {
+    ///
+    /// Every segment from here on reserves disk `prealloc` at a time.
+    pub fn open_append(
+        path: &Path,
+        last_seq: u64,
+        valid_end: u64,
+        prealloc: Prealloc,
+    ) -> Result<Self, JournalError> {
         // The segment half opens and scrubs the file, and hands back
         // the decoded header the stream half needs to resume: the
         // anchor to rebuild the chain from, and the segment's first
         // sequence.
-        let (segment, info) = SegmentFile::open_append(path, valid_end)?;
+        let (segment, info) = SegmentFile::open_append(path, valid_end, prealloc)?;
         let encoder = JournalEncoder::resume(
             path,
             info.starting_sequence,
@@ -241,6 +253,12 @@ impl<E: AppEvent> BufferedWriter<E> {
 
     pub fn path(&self) -> &Path {
         self.segment.path()
+    }
+
+    /// How much disk this journal reserves at a time: what it was opened
+    /// with.
+    pub fn prealloc(&self) -> Prealloc {
+        self.segment.prealloc()
     }
 
     /// Decoded file-header fields of the live segment (read from disk).
@@ -371,8 +389,8 @@ impl<E: AppEvent> BufferedWriter<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::prealloc::prealloc_chunk_bytes;
     use crate::reader::JournalReader;
+    use crate::test_utils::PREALLOC;
     use crate::write::JournalWrite;
     use melin_app::CodecError;
 
@@ -424,7 +442,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+        let writer = BufferedWriter::<TestEvent>::create(&path, PREALLOC).unwrap();
         assert_eq!(writer.next_sequence(), FIRST_SEQ);
         assert_eq!(writer.path(), path);
         #[cfg(feature = "hash-chain")]
@@ -432,11 +450,55 @@ mod tests {
         #[cfg(not(feature = "hash-chain"))]
         assert!(writer.chain_hash().is_none());
 
+        assert_eq!(writer.prealloc(), PREALLOC);
         let file_len = std::fs::metadata(&path).unwrap().len();
-        assert!(
-            file_len >= prealloc_chunk_bytes(),
-            "expected pre-allocated file, got {file_len} bytes"
+        assert_eq!(
+            file_len,
+            PREALLOC.chunk_bytes(),
+            "a fresh segment reserves exactly one chunk of the journal's prealloc"
         );
+    }
+
+    /// The reservation a journal is opened with is the one every later
+    /// allocation uses: extension past it, the segment it rotates into,
+    /// and a reopen. A segment that fell back to some other size would
+    /// reserve memory the node never asked for when the journal sits on
+    /// tmpfs, or extend on the flush path far more often than it chose.
+    #[test]
+    fn every_allocation_uses_the_journals_prealloc() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+        // Distinct from the test default, so a constructor that ignored
+        // its argument shows.
+        let prealloc = Prealloc::from_bytes(std::num::NonZeroU64::new(192 * 1024).unwrap());
+        let len = |p: &Path| std::fs::metadata(p).unwrap().len();
+
+        let mut writer = BufferedWriter::<TestEvent>::create(&path, prealloc).unwrap();
+        assert_eq!(len(&path), prealloc.chunk_bytes());
+
+        // Just past the first chunk, in small batches: extended by
+        // exactly one more.
+        while writer.valid_end() <= prealloc.chunk_bytes() {
+            for i in 0..64 {
+                writer.batch_append_with_ts(&sample(i), 0, 0).unwrap();
+            }
+            writer.flush_batch_sync().unwrap();
+        }
+        assert_eq!(len(&path), 2 * prealloc.chunk_bytes());
+
+        // The synchronous rotation installs a fresh segment of one chunk.
+        writer.rotate_segment().unwrap();
+        assert_eq!(writer.prealloc(), prealloc);
+        assert_eq!(len(&path), prealloc.chunk_bytes());
+
+        // A reopen reserves one chunk past where it resumes.
+        writer.append(&sample(0)).unwrap();
+        let (last_seq, valid_end) = (writer.next_sequence() - 1, writer.valid_end());
+        drop(writer);
+        let reopened =
+            BufferedWriter::<TestEvent>::open_append(&path, last_seq, valid_end, prealloc).unwrap();
+        assert_eq!(reopened.prealloc(), prealloc);
+        assert_eq!(len(&path), valid_end + prealloc.chunk_bytes());
     }
 
     #[test]
@@ -444,10 +506,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let w = BufferedWriter::<TestEvent>::create(&path).unwrap();
+        let w = BufferedWriter::<TestEvent>::create(&path, PREALLOC).unwrap();
         drop(w);
 
-        assert!(BufferedWriter::<TestEvent>::create(&path).is_err());
+        assert!(BufferedWriter::<TestEvent>::create(&path, PREALLOC).is_err());
     }
 
     /// An application narrower than the transport's own 8-byte payloads.
@@ -486,7 +548,7 @@ mod tests {
     fn a_tick_fits_the_headroom_a_narrow_app_reserves() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tiny.journal");
-        let mut w = BufferedWriter::<TinyEvent>::create(&path).unwrap();
+        let mut w = BufferedWriter::<TinyEvent>::create(&path, PREALLOC).unwrap();
 
         let tick = JournalEvent::Tick { now_ns: u64::MAX };
         let tick_len = {
@@ -510,7 +572,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+        let mut writer = BufferedWriter::<TestEvent>::create(&path, PREALLOC).unwrap();
         let seq1 = writer.append(&sample(1)).unwrap();
         let seq2 = writer.append(&sample(2)).unwrap();
         let seq3 = writer.append(&sample(3)).unwrap();
@@ -526,7 +588,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+        let mut writer = BufferedWriter::<TestEvent>::create(&path, PREALLOC).unwrap();
         for i in 1..=5u64 {
             writer.append(&sample(i)).unwrap();
         }
@@ -540,7 +602,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+        let mut writer = BufferedWriter::<TestEvent>::create(&path, PREALLOC).unwrap();
         for i in 1..=10u64 {
             writer.batch_append_with_ts(&sample(i), 0, 0).unwrap();
         }
@@ -557,7 +619,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+        let mut writer = BufferedWriter::<TestEvent>::create(&path, PREALLOC).unwrap();
         writer.batch_append_with_ts(&sample(1), 0, 0).unwrap();
         writer.batch_append_with_ts(&sample(2), 0, 0).unwrap();
         assert!(!writer.pending_batch_bytes().is_empty());
@@ -579,7 +641,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+        let mut writer = BufferedWriter::<TestEvent>::create(&path, PREALLOC).unwrap();
         writer.append(&sample(1)).unwrap();
         writer.append(&sample(2)).unwrap();
         let last_seq = writer.next_sequence() - 1;
@@ -587,7 +649,7 @@ mod tests {
         drop(writer);
 
         let mut reopened =
-            BufferedWriter::<TestEvent>::open_append(&path, last_seq, valid_end).unwrap();
+            BufferedWriter::<TestEvent>::open_append(&path, last_seq, valid_end, PREALLOC).unwrap();
         reopened.append(&sample(3)).unwrap();
         reopened.append(&sample(4)).unwrap();
         drop(reopened);
@@ -600,7 +662,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+        let mut writer = BufferedWriter::<TestEvent>::create(&path, PREALLOC).unwrap();
         writer.append(&sample(1)).unwrap();
         writer.append(&sample(2)).unwrap();
         let seq_before_rotate = writer.next_sequence();
@@ -637,7 +699,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+        let mut writer = BufferedWriter::<TestEvent>::create(&path, PREALLOC).unwrap();
         writer.append(&sample(1)).unwrap();
         writer.append(&sample(2)).unwrap();
         let seq_before_rotate = writer.next_sequence();
@@ -647,6 +709,7 @@ mod tests {
         let preparer = crate::preparer::SegmentPreparer::spawn(
             path.clone(),
             1024 * 1024,
+            PREALLOC,
             0,
             crate::preparer::StagingMode::ZeroFill,
         );
@@ -701,7 +764,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+        let mut writer = BufferedWriter::<TestEvent>::create(&path, PREALLOC).unwrap();
         writer.append(&sample(1)).unwrap();
         writer.append(&sample(2)).unwrap();
         let seq_before_rotate = writer.next_sequence();
@@ -709,6 +772,7 @@ mod tests {
         let preparer = crate::preparer::SegmentPreparer::spawn(
             path.clone(),
             1024 * 1024,
+            PREALLOC,
             0,
             crate::preparer::StagingMode::Allocate,
         );
@@ -757,12 +821,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+        let mut writer = BufferedWriter::<TestEvent>::create(&path, PREALLOC).unwrap();
         writer.append(&sample(7)).unwrap();
 
         let preparer = crate::preparer::SegmentPreparer::spawn(
             path.clone(),
             1024 * 1024,
+            PREALLOC,
             0,
             crate::preparer::StagingMode::ZeroFill,
         );
@@ -793,7 +858,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+        let mut writer = BufferedWriter::<TestEvent>::create(&path, PREALLOC).unwrap();
         let pos_before = writer.write_pos();
 
         // Flush twice in a row — second call has nothing pending and
@@ -812,13 +877,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+        let mut writer = BufferedWriter::<TestEvent>::create(&path, PREALLOC).unwrap();
         writer.append(&sample(1)).unwrap();
         let chain_before = writer.chain_hash().unwrap();
 
         let preparer = crate::preparer::SegmentPreparer::spawn(
             path.clone(),
             1024 * 1024,
+            PREALLOC,
             0,
             crate::preparer::StagingMode::ZeroFill,
         );
@@ -844,7 +910,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+        let mut writer = BufferedWriter::<TestEvent>::create(&path, PREALLOC).unwrap();
         writer.append(&sample(1)).unwrap();
         writer.append(&sample(2)).unwrap();
         let chain_before = writer.chain_hash().unwrap();
@@ -853,7 +919,7 @@ mod tests {
         drop(writer);
 
         let reopened =
-            BufferedWriter::<TestEvent>::open_append(&path, last_seq, valid_end).unwrap();
+            BufferedWriter::<TestEvent>::open_append(&path, last_seq, valid_end, PREALLOC).unwrap();
 
         // Without any new events, the chain hash must reproduce the
         // value captured before close — proves the self-contained
@@ -867,7 +933,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+        let mut writer = BufferedWriter::<TestEvent>::create(&path, PREALLOC).unwrap();
         writer.batch_append_with_ts(&sample(42), 0, 0).unwrap();
 
         // The full encoded entry is [magic(2) | header | payload | CRC(4)].
@@ -905,7 +971,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+        let mut writer = BufferedWriter::<TestEvent>::create(&path, PREALLOC).unwrap();
         writer.append(&sample(11)).unwrap();
         writer.append(&sample(22)).unwrap();
         let valid_end = writer.valid_end();
@@ -930,7 +996,7 @@ mod tests {
         // either fail with a CRC error past `valid_end` or worse, treat
         // the garbage as a valid frame.
         let reopened =
-            BufferedWriter::<TestEvent>::open_append(&path, last_seq, valid_end).unwrap();
+            BufferedWriter::<TestEvent>::open_append(&path, last_seq, valid_end, PREALLOC).unwrap();
         drop(reopened);
 
         // Fresh reader: must see exactly the two pre-crash entries —
@@ -950,7 +1016,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+        let mut writer = BufferedWriter::<TestEvent>::create(&path, PREALLOC).unwrap();
         writer.append(&sample(7)).unwrap();
         writer.append(&sample(8)).unwrap();
         let pre_rotate_chain = writer.chain_hash().expect("hash-chain enabled");
@@ -983,7 +1049,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+        let mut writer = BufferedWriter::<TestEvent>::create(&path, PREALLOC).unwrap();
         writer.append(&sample(1)).unwrap();
         writer.append(&sample(2)).unwrap();
         writer.append(&sample(3)).unwrap();
@@ -994,7 +1060,7 @@ mod tests {
         drop(writer);
 
         let mut reopened =
-            BufferedWriter::<TestEvent>::open_append(&path, last_seq, valid_end).unwrap();
+            BufferedWriter::<TestEvent>::open_append(&path, last_seq, valid_end, PREALLOC).unwrap();
         assert_eq!(reopened.chain_hash(), Some(chain_no_crash));
 
         // The rebuilt hasher must continue identically: append one more
