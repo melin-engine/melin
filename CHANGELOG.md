@@ -32,6 +32,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   and why it refused (not the leader, leading in another term, no
   majority, no answer in time, driver stopped). Reached through the new
   `RaftHandles::leader_confirm` field.
+- **`melin_transport_core::test_logs`** (behind `test-utils`, which now
+  pulls `tracing-subscriber`): a per-thread capture of `tracing` output
+  for tests that assert what was logged and at which level.
 - **`melin_transport_core::replication::archive::lineage_archives_beside`**:
   the lineage archives a node made beside its journal or snapshot (the
   `<name>.<reason>.<n>` directories), for any reason, sorted.
@@ -77,6 +80,15 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   required `capacity()`. The `INPUT_RING_CAPACITY` and
   `OUTPUT_RING_CAPACITY` constants are removed; `RingCapacity::DEFAULT`
   is their value.
+- **Control-plane links carry a protocol version (raft protocol 1), and
+  refuse a peer on another release.** Right after authenticating, both
+  ends of a `--raft-peer` link exchange their version; on a mismatch the
+  link is closed, both ends log a warning naming both versions, and the
+  dialer backs off as from an unreachable peer. This release and earlier
+  ones refuse each other's control-plane links in either direction, so a
+  cluster mixing them has no automatic failover across the two: upgrade
+  every node together (see "Upgrade and rollback notes" in
+  `docs/replication.md`).
 - **`melin_transport_core::health::RaftStatus` gains a private field**
   (the quorum-ack age, read and written through
   `millis_since_quorum_ack` and `set_millis_since_quorum_ack`), so it can
