@@ -7,7 +7,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::driver::{ELECTION_TIMEOUT_MAX_MS, RaftConfig, RaftHandles, RaftPeer, spawn};
+use crate::driver::{
+    ELECTION_TIMEOUT_MAX_MS, LEADER_CONFIRM_TIMEOUT, LeaderConfirmError, RaftConfig, RaftHandles,
+    RaftPeer, spawn,
+};
 use crate::tests::tip_at;
 use base64::Engine;
 use ed25519_dalek::SigningKey;
@@ -23,6 +26,8 @@ struct Cluster {
 
 struct Node {
     id: u64,
+    /// Its raft listener, where the others dial it.
+    addr: std::net::SocketAddr,
     handles: RaftHandles,
     shutdown: Arc<AtomicBool>,
 }
@@ -79,9 +84,10 @@ fn start_cluster_with_tips(tips: &[u64]) -> Cluster {
     for i in 0..n as usize {
         let dir = TempDir::new().unwrap();
         let shutdown = Arc::new(AtomicBool::new(false));
+        let addr = addrs[i].parse().unwrap();
         let config = RaftConfig {
             node_id: i as u64 + 1,
-            bind: addrs[i].parse().unwrap(),
+            bind: addr,
             dir: dir.path().to_path_buf(),
             peers: peers.clone(),
         };
@@ -96,6 +102,7 @@ fn start_cluster_with_tips(tips: &[u64]) -> Cluster {
         .expect("driver spawn");
         nodes.push(Node {
             id: i as u64 + 1,
+            addr,
             handles,
             shutdown,
         });
@@ -215,19 +222,37 @@ fn await_single_leader(nodes: &[&Node]) -> u64 {
 }
 
 impl Cluster {
+    fn handles(&self, id: u64) -> &RaftHandles {
+        &self.nodes.iter().find(|n| n.id == id).unwrap().handles
+    }
+
     fn status(&self, id: u64) -> &RaftStatus {
-        &self
-            .nodes
+        &self.handles(id).status
+    }
+
+    /// The node ids other than `id`.
+    fn others(&self, id: u64) -> Vec<u64> {
+        self.nodes
             .iter()
-            .find(|n| n.id == id)
-            .unwrap()
-            .handles
-            .status
+            .map(|n| n.id)
+            .filter(|&other| other != id)
+            .collect()
     }
 
     fn stop_node(&mut self, id: u64) {
         let node = self.nodes.iter_mut().find(|n| n.id == id).unwrap();
         node.shutdown.store(true, Ordering::Relaxed);
+    }
+
+    /// Stop node `id` and wait for its driver to exit, so its listener is
+    /// closed and connecting to it is refused. Returns that listener's
+    /// address.
+    fn stop_node_and_join(&mut self, id: u64) -> std::net::SocketAddr {
+        self.stop_node(id);
+        let at = self.nodes.iter().position(|n| n.id == id).unwrap();
+        let node = self.nodes.remove(at);
+        node.handles.join.join().expect("driver thread panicked");
+        node.addr
     }
 
     fn stop_all(&mut self) {
@@ -388,13 +413,7 @@ fn a_leader_that_loses_both_peers_keeps_leading_and_its_ack_ages() {
     let leader = await_single_leader(&refs);
     await_quorum_ack(cluster.status(leader));
 
-    let followers: Vec<u64> = cluster
-        .nodes
-        .iter()
-        .map(|n| n.id)
-        .filter(|&id| id != leader)
-        .collect();
-    for id in followers {
+    for id in cluster.others(leader) {
         cluster.stop_node(id);
     }
 
@@ -433,6 +452,122 @@ fn a_leader_that_loses_both_peers_keeps_leading_and_its_ack_ages() {
     cluster.stop_all();
 }
 
+/// The leader's quorum round trip confirms its own term and no other; a
+/// follower's is refused at once; a stopped driver's is refused too.
+#[test]
+fn leadership_is_confirmed_for_the_leaders_own_term_only() {
+    let mut cluster = start_cluster(3);
+    let refs: Vec<&Node> = cluster.nodes.iter().collect();
+    let leader = await_single_leader(&refs);
+    await_quorum_ack(cluster.status(leader));
+    let term = cluster.status(leader).term.load(Ordering::Relaxed);
+    let leader_confirm = cluster.handles(leader).leader_confirm.clone();
+
+    assert_eq!(leader_confirm.confirm(term), Ok(()));
+    // A term it no longer leads in, and one it never reached.
+    for other in [term - 1, term + 1] {
+        assert_eq!(
+            leader_confirm.confirm(other),
+            Err(LeaderConfirmError::TermMoved { now: term })
+        );
+    }
+
+    let follower = cluster.others(leader)[0];
+    let follower_term = cluster.status(follower).term.load(Ordering::Relaxed);
+    assert_eq!(
+        cluster
+            .handles(follower)
+            .leader_confirm
+            .confirm(follower_term),
+        Err(LeaderConfirmError::NotLeader)
+    );
+
+    cluster.stop_all();
+    assert_eq!(
+        leader_confirm.confirm(term),
+        Err(LeaderConfirmError::DriverStopped)
+    );
+}
+
+/// With both followers stopped, their connects are refused at once, so the
+/// leader's confirmation fails with exactly `NoQuorum` and well inside its
+/// deadline rather than timing out.
+#[test]
+fn a_leader_without_a_live_peer_is_refused_confirmation_for_lack_of_quorum() {
+    let mut cluster = start_cluster(3);
+    let refs: Vec<&Node> = cluster.nodes.iter().collect();
+    let leader = await_single_leader(&refs);
+    await_quorum_ack(cluster.status(leader));
+    let term = cluster.status(leader).term.load(Ordering::Relaxed);
+
+    for id in cluster.others(leader) {
+        cluster.stop_node_and_join(id);
+    }
+    let started = Instant::now();
+    assert_eq!(
+        cluster.handles(leader).leader_confirm.confirm(term),
+        Err(LeaderConfirmError::NoQuorum)
+    );
+    let took = started.elapsed();
+    assert!(
+        took < LEADER_CONFIRM_TIMEOUT,
+        "the refusal took {took:?}, past the {LEADER_CONFIRM_TIMEOUT:?} deadline"
+    );
+
+    cluster.stop_all();
+}
+
+/// A leader cut off from its majority by links gone silent (each follower's
+/// address accepts the connection, then never answers) is refused, and
+/// within the confirmation's deadline: the one case where nothing answers
+/// at all, so only openraft's per-voter wait or the deadline ends it.
+#[test]
+fn a_leader_whose_peers_went_silent_is_refused_within_the_deadline() {
+    /// What the waiting thread may overrun the deadline by on a loaded
+    /// host, between the deadline passing and it being scheduled again.
+    const WAKE_UP_ALLOWANCE: Duration = Duration::from_millis(250);
+
+    let mut cluster = start_cluster(3);
+    let refs: Vec<&Node> = cluster.nodes.iter().collect();
+    let leader = await_single_leader(&refs);
+    await_quorum_ack(cluster.status(leader));
+    let term = cluster.status(leader).term.load(Ordering::Relaxed);
+
+    // Listening on each follower's address and never accepting: the
+    // kernel completes the connect, and the leader's handshake then waits
+    // on a peer that never speaks.
+    let _silent: Vec<std::net::TcpListener> = cluster
+        .others(leader)
+        .into_iter()
+        .map(|id| {
+            let addr = cluster.stop_node_and_join(id);
+            std::net::TcpListener::bind(addr).expect("rebind the stopped follower's address")
+        })
+        .collect();
+
+    let started = Instant::now();
+    let refused = cluster.handles(leader).leader_confirm.confirm(term);
+    let took = started.elapsed();
+    // Reported so which bound ended the wait shows under `--nocapture`.
+    eprintln!("silent peers: {refused:?} after {took:?}");
+    // `NoQuorum` when openraft's per-voter wait ends first, as the
+    // liveness assertion on the deadline intends; `TimedOut` if a loaded
+    // host delays its answer past the deadline. Either refuses.
+    assert!(
+        matches!(
+            refused,
+            Err(LeaderConfirmError::NoQuorum | LeaderConfirmError::TimedOut)
+        ),
+        "a leader with no answering peer got {refused:?}"
+    );
+    assert!(
+        took < LEADER_CONFIRM_TIMEOUT + WAKE_UP_ALLOWANCE,
+        "the refusal took {took:?}, past the {LEADER_CONFIRM_TIMEOUT:?} deadline"
+    );
+
+    cluster.stop_all();
+}
+
 #[test]
 fn single_voter_elects_itself() {
     // Degenerate but useful: a 1-voter control plane (tests, dev) elects
@@ -440,6 +575,10 @@ fn single_voter_elects_itself() {
     let mut cluster = start_cluster(1);
     let refs: Vec<&Node> = cluster.nodes.iter().collect();
     assert_eq!(await_single_leader(&refs), 1);
+    // It is its own majority, so its leadership is confirmed with no
+    // round trip at all.
+    let term = cluster.status(1).term.load(Ordering::Relaxed);
+    assert_eq!(cluster.handles(1).leader_confirm.confirm(term), Ok(()));
     cluster.stop_all();
 }
 
