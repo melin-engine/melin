@@ -9,7 +9,7 @@
 //! conservative reason — the primary may have pruned the only other
 //! copy. Operators reclaim the space once reconciled.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -32,6 +32,12 @@ pub enum ArchiveReason {
 }
 
 impl ArchiveReason {
+    /// Every reason, for [`lineage_archives_beside`], which must recognise
+    /// an archive of any of them. An array rather than an iterator over the
+    /// enum: two entries, fixed at compile time. Kept complete by the
+    /// compile-time check after this `impl`.
+    const ALL: [Self; 2] = [Self::Divergent, Self::Resync];
+
     fn tag(self) -> &'static str {
         match self {
             Self::Divergent => "divergent",
@@ -39,6 +45,29 @@ impl ArchiveReason {
         }
     }
 }
+
+/// Compile-time check that [`ArchiveReason::ALL`] lists every variant. The
+/// match is exhaustive, so a variant added to the enum fails to compile
+/// here, beside the assertion that names each variant in `ALL`; a variant
+/// missing from it, or listed twice in place of another, fails the
+/// assertion. Without it, a forgotten entry would make
+/// [`lineage_archives_beside`] silently skip that reason's archives.
+const _: () = {
+    const fn listed(reason: ArchiveReason) -> bool {
+        let mut i = 0;
+        while i < ArchiveReason::ALL.len() {
+            if ArchiveReason::ALL[i] as u8 == reason as u8 {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+    match ArchiveReason::Divergent {
+        ArchiveReason::Divergent | ArchiveReason::Resync => {}
+    }
+    assert!(listed(ArchiveReason::Divergent) && listed(ArchiveReason::Resync));
+};
 
 /// Where [`archive_local_lineage`] put the old lineage. Each field is
 /// `Some` when that side had material to move. When the snapshot shares
@@ -172,12 +201,55 @@ pub fn archive_local_lineage(
 
 /// `<parent of path>/<file name of path>.<reason>.<n>`.
 fn archive_dir(path: &Path, reason: ArchiveReason, n: u32) -> io::Result<PathBuf> {
-    let name = path
-        .file_name()
-        .ok_or_else(|| io::Error::other(format!("{} names no file to archive", path.display())))?;
-    let mut dir_name = OsString::from(name);
+    let mut dir_name = OsString::from(archived_name(path)?);
     dir_name.push(format!(".{}.{n}", reason.tag()));
     Ok(parent_dir(path).join(dir_name))
+}
+
+/// The file name an archive of `path` is named after.
+fn archived_name(path: &Path) -> io::Result<&OsStr> {
+    path.file_name()
+        .ok_or_else(|| io::Error::other(format!("{} names no file to archive", path.display())))
+}
+
+/// The lineage archives beside `path` (a journal or a snapshot): its
+/// siblings named `<file name>.<reason>.<n>`, as [`archive_local_lineage`]
+/// names them, for any reason and index, sorted. Not a bare prefix match:
+/// rotated segments (`<file name>.NNNNNN`) and the snapshot's `.prev` and
+/// temp file share the stem and are not archives. For a caller that must
+/// tell whether a node archived its lineage.
+pub fn lineage_archives_beside(path: &Path) -> io::Result<Vec<PathBuf>> {
+    let name = archived_name(path)?;
+    let dir = parent_dir(path);
+    let mut archives = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let sibling = entry?.file_name();
+        if is_archive_of(name, &sibling) {
+            archives.push(dir.join(sibling));
+        }
+    }
+    archives.sort();
+    Ok(archives)
+}
+
+/// Whether `sibling` is exactly what [`archive_dir`] names an archive of
+/// `name`: `.<reason>.<n>` appended, `n` in its canonical decimal form.
+/// Compared as bytes: the suffix is ASCII, and `name` need not be UTF-8.
+fn is_archive_of(name: &OsStr, sibling: &OsStr) -> bool {
+    let Some(suffix) = sibling
+        .as_encoded_bytes()
+        .strip_prefix(name.as_encoded_bytes())
+        .and_then(|rest| rest.strip_prefix(b"."))
+    else {
+        return false;
+    };
+    let Ok(suffix) = std::str::from_utf8(suffix) else {
+        return false;
+    };
+    suffix.split_once('.').is_some_and(|(tag, n)| {
+        ArchiveReason::ALL.iter().any(|r| r.tag() == tag)
+            && n.parse::<u32>().is_ok_and(|parsed| parsed.to_string() == n)
+    })
 }
 
 /// Rename `src` into `dir`, keeping its file name.
@@ -481,6 +553,86 @@ mod tests {
             Some(snapshot_dir.path().join("a.snapshot.divergent.0"))
         );
         assert_archived(&store, &archived);
+    }
+
+    /// The archive scan matches both archive forms at any index, and nothing
+    /// else that shares the journal's stem: rotated segments, snapshot files,
+    /// another node's archives, or a name that only looks like one.
+    #[test]
+    fn lineage_archives_beside_matches_only_archive_forms() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("node-1.journal");
+        for name in [
+            "node-1.journal",
+            "node-1.journal.000001",
+            "node-1.journal.snap.tmp",
+            "node-1.journal.snapshot.prev",
+            "node-1.journal.divergent.0",
+            "node-1.journal.resync.12",
+            "node-1.journal.divergent.x",
+            "node-1.journal.resync.",
+            "node-1.journal.resync.+1",
+            "node-1.journal.resync.01",
+            "node-1.journal.resync.4294967296",
+            "node-1.journal.other.0",
+            "node-1.journaldivergent.0",
+            "node-2.journal.divergent.0",
+        ] {
+            std::fs::create_dir(dir.path().join(name)).unwrap();
+        }
+        assert_eq!(
+            lineage_archives_beside(&journal).unwrap(),
+            [
+                dir.path().join("node-1.journal.divergent.0"),
+                dir.path().join("node-1.journal.resync.12"),
+            ]
+        );
+    }
+
+    /// The scan finds exactly what archival produced, for every reason, so
+    /// the two cannot drift apart on the naming.
+    #[test]
+    fn lineage_archives_beside_finds_what_archival_made() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = NodeStore::resolve(dir.path().join("a.journal"), None).unwrap();
+        assert!(lineage_archives_beside(store.journal()).unwrap().is_empty());
+        let mut made = Vec::new();
+        for reason in ArchiveReason::ALL {
+            build_lineage(&store);
+            let archived = archive_local_lineage(&store, reason).unwrap().unwrap();
+            made.push(archived.journal_dir.expect("journal archived"));
+        }
+        made.sort();
+        assert_eq!(lineage_archives_beside(store.journal()).unwrap(), made);
+    }
+
+    /// Names are compared as bytes: a journal whose name is not UTF-8 has
+    /// its archives found, and a sibling whose suffix is not UTF-8 is not
+    /// one.
+    #[cfg(unix)]
+    #[test]
+    fn lineage_archives_beside_compares_names_as_bytes() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let named = |bytes: &[u8]| dir.path().join(OsStr::from_bytes(bytes));
+        let journal = named(b"j\xff.journal");
+        for bytes in [
+            &b"j\xff.journal.resync.3"[..],
+            b"j\xff.journal.\xff.0",
+            b"j\xff.journal.resync.\xff",
+        ] {
+            std::fs::create_dir(named(bytes)).unwrap();
+        }
+        assert_eq!(
+            lineage_archives_beside(&journal).unwrap(),
+            [named(b"j\xff.journal.resync.3")]
+        );
+    }
+
+    #[test]
+    fn lineage_archives_beside_refuses_a_path_naming_no_file() {
+        let err = lineage_archives_beside(Path::new("/")).unwrap_err();
+        assert!(err.to_string().contains("names no file"), "{err}");
     }
 
     #[test]

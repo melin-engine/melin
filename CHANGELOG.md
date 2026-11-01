@@ -23,14 +23,48 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   and once the node's control plane has stopped. A leader cut off from
   its peers keeps its role, so a growing value is the one sign that it
   has lost its majority.
+- **`melin_raft::QUORUM_ACK_MAX_AGE`**: the oldest quorum acknowledgement
+  the automatic-promotion policy accepts, half the control plane's
+  leader lease.
+- **`melin_raft::LeaderConfirm` and `melin_raft::LeaderConfirmError`**:
+  a blocking check, under a fixed deadline, that a majority of the
+  control plane still acknowledges this node as leader in a given term,
+  and why it refused (not the leader, leading in another term, no
+  majority, no answer in time, driver stopped). Reached through the new
+  `RaftHandles::leader_confirm` field.
+- **`melin_transport_core::replication::archive::lineage_archives_beside`**:
+  the lineage archives a node made beside its journal or snapshot (the
+  `<name>.<reason>.<n>` directories), for any reason, sorted.
 
 ### Changed
 
+- **The last surviving replica no longer auto-promotes.** The majority
+  check that stops an isolated replica promoting (see **Fixed**) cannot
+  tell dead peers from unreachable ones: under `--raft-auto-promote`, a
+  replica whose primary and other replica are both gone used to promote
+  after the grace period; it now refuses, saying it may be partitioned,
+  and recovery is a manual `PROMOTE`. A genuine failover waits one more
+  control-plane round trip after the election.
+- **An automatic promotion is abandoned, and the node exits with an
+  error, if a majority of the control plane does not confirm its
+  leadership just before it takes over.** The promoting node asks for
+  that confirmation, in the term it was elected at, after its pipeline
+  is ready and before it journals anything as primary, so an abandoned
+  promotion leaves the journal unchanged; restarted by its supervisor,
+  the node rejoins as a replica. This keeps a leader that lost its
+  majority after deciding to promote from deposing a primary the rest of
+  the cluster still reaches. A manual `PROMOTE` is not confirmed, and
+  stays available while the control plane is down. An election's
+  promotion now logs `confirming leadership before injecting the epoch
+  bump` where it logged `injecting epoch bump`, and every promotion logs
+  `epoch bump applied` once its tenure has begun.
 - **`melin_transport_core::health::RaftStatus` gains a private field**
   (the quorum-ack age, read and written through
   `millis_since_quorum_ack` and `set_millis_since_quorum_ack`), so it can
   no longer be built with a struct literal, nor destructured without `..`,
   outside the crate; build it with `RaftStatus::new`.
+- **`melin_raft::RaftHandles` gains a `leader_confirm` field**, which
+  breaks struct literals and exhaustive destructuring of it.
 - **A node sends its control-plane traffic from the address its
   `--raft-bind` names.** When that is a specific IP rather than
   `0.0.0.0` or `::`, outgoing control-plane connections are bound to it
@@ -64,6 +98,16 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Fixed
 
+- **An isolated replica no longer promotes itself beside a healthy
+  primary.** Under `--raft-auto-promote`, a replica that held
+  control-plane leadership and was cut off from both other nodes promoted
+  itself and served clients beside the healthy primary for as long as the
+  partition lasted; once the network healed, either it shut the healthy
+  primary down (a needless failover onto the node holding the least data,
+  the other replica left orphaned) or both kept serving, depending on
+  which control-plane message crossed first. An isolated replica now
+  refuses to promote once it has lost its majority, and one cut off
+  after deciding to promote abandons the promotion (see **Changed**).
 - **An auto-promotion at raft term 1 is now checked for term/epoch
   alignment like any other.** When a concurrent promotion raises the
   fencing epoch while a node is being promoted, the node logs a warning

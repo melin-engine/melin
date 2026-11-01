@@ -134,13 +134,19 @@ pub(crate) struct RaftDriverGuard {
 }
 
 /// Everything [`crate::raft_promotion::spawn_auto_promotion`] needs from
-/// the driver, returned by [`RaftDriverGuard::promotion_wiring`].
+/// the driver, and the leadership confirmation the promotion it files
+/// asks at mint time; returned by [`RaftDriverGuard::promotion_wiring`].
 pub(crate) struct PromotionWiring {
     pub(crate) status: Arc<melin_transport_core::health::RaftStatus>,
     pub(crate) peer_tips: Arc<melin_raft::PeerTips>,
     pub(crate) peer_ids: Vec<u64>,
     pub(crate) elect_requested: Arc<AtomicBool>,
     pub(crate) elect_enabled: Arc<AtomicBool>,
+    /// Not the promotion thread's: the confirmation an election's epoch
+    /// bump asks before it is published (`PromotedTenure`). Carried here
+    /// so the node holds it exactly when the thread that files elections
+    /// is armed.
+    pub(crate) leader_confirm: melin_raft::LeaderConfirm,
 }
 
 impl RaftDriverGuard {
@@ -168,6 +174,7 @@ impl RaftDriverGuard {
             peer_ids: self.peer_ids.clone(),
             elect_requested: Arc::clone(&h.elect_requested),
             elect_enabled: Arc::clone(&h.elect_enabled),
+            leader_confirm: h.leader_confirm.clone(),
         })
     }
 

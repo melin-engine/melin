@@ -3,7 +3,8 @@
 //! auth throughout.
 //!
 //! - Kill the primary (`disk+ram`); exactly one replica must win the
-//!   election and promote itself into a serving primary, and the other
+//!   election and promote itself into a serving primary (its leadership
+//!   confirmed by a quorum round trip as it mints its epoch), and the other
 //!   must keep following. Then the killed primary comes back on its stale
 //!   epoch-0 journal — the raft peer mesh must fence it
 //!   (fence-on-supersession) so it self-demotes rather than serving
@@ -18,9 +19,12 @@
 //!   proceeds, the promoted node's gate starting from that lineage policy.
 //! - Raft leadership held by a replica (the replicas start first and
 //!   elect one before the primary joins): it promotes when the primary
-//!   dies; isolated from both peers, the other two elect a new leader;
-//!   cut from the primary alone while writes flow, it does not promote,
-//!   and once healed rejoins as a replica.
+//!   dies, but not when the other replica died before it (a lone survivor
+//!   never auto-promotes); isolated from both peers, the other two elect a
+//!   new leader, the isolated one never promotes, and once healed the
+//!   primary is still unfenced and the only node serving; cut from the
+//!   primary alone while writes flow, it does not promote, and once healed
+//!   rejoins as a replica.
 //! - A primary that leads raft, with a replica manually promoted among its
 //!   followers and sending it no request, fences on the higher epoch the
 //!   follower's replies carry.
@@ -56,6 +60,7 @@ use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
 use melin_test_node::probe::{admin_command, gauge, http_metrics, wait_for_gauge};
 use melin_test_node::{Addrs, Node};
+use melin_transport_core::replication::archive::lineage_archives_beside;
 use melin_wire_protocol::control_codec::TAG_CHALLENGE;
 use proxy::Proxy;
 use serial_test::serial;
@@ -88,6 +93,10 @@ const TICK_MS: u64 = 5;
 /// judging by a stale `disk+ram` would have completed.
 const NO_PROMOTION_WATCH: Duration = Duration::from_secs(12);
 
+/// How long a healed cluster is watched for the fallout of a partition:
+/// several election timeouts, and a replica's reconnect and catch-up.
+const HEAL_WATCH: Duration = Duration::from_secs(15);
+
 /// Whether a client connect to `addr` is answered with the auth
 /// Challenge — the definitive "this node serves as primary" signal (a
 /// replica's client listener never accepts).
@@ -109,10 +118,21 @@ fn serves_clients(addr: SocketAddr, patience: Duration) -> bool {
 
 /// One increment on `conn`, which the node must ack.
 fn acked_write(conn: &mut melin_client::Connection) {
+    if let Err(e) = try_acked_write(conn) {
+        panic!("{e}");
+    }
+}
+
+/// One increment on `conn`: `Err` saying why if the node did not ack it,
+/// for a test that records the failure rather than stopping at it.
+fn try_acked_write(conn: &mut melin_client::Connection) -> Result<(), String> {
     let reply = conn
         .request_one(&increment_request(1))
-        .expect("a reply to the write");
-    assert_eq!(reply[0], KIND_RESP_ACK);
+        .map_err(|e| format!("no reply to the write: {e}"))?;
+    match reply.first() {
+        Some(&KIND_RESP_ACK) => Ok(()),
+        kind => Err(format!("the write was not acked: reply kind {kind:?}")),
+    }
 }
 
 /// Node `i`'s loopback IP in a partitionable cluster: its raft listener
@@ -423,13 +443,18 @@ impl Cluster {
         }
     }
 
+    /// Node `i`'s journal, the same on every boot.
+    fn journal(&self, i: usize) -> PathBuf {
+        self.tmp.path().join(format!("node-{i}.journal"))
+    }
+
     /// Node `i`'s configuration: the same journal, keys and raft identity
     /// on every boot, with health and admin endpoints.
     fn config(&self, i: usize, ack_policy: AckPolicy, tick_interval_ms: u64) -> ServerConfig {
         let key_path = self.tmp.path().join(format!("key-{i}"));
         std::fs::write(&key_path, self.nodes[i].key.to_bytes()).unwrap();
         ServerConfig {
-            journal: self.tmp.path().join(format!("node-{i}.journal")),
+            journal: self.journal(i),
             authorized_keys: self.auth_path.clone(),
             ack_policy,
             // Unpinned, and therefore yielding: three nodes run in this
@@ -565,15 +590,20 @@ impl Cluster {
         gauge(health, "melin_raft_term")
     }
 
+    /// One of the nodes `among` (by index) that leads the control plane at
+    /// a term above `term`, with its term.
+    fn leader_above(&self, term: u64, among: &[usize]) -> Option<(usize, u64)> {
+        among
+            .iter()
+            .find_map(|&i| self.leads_at(i).filter(|&t| t > term).map(|t| (i, t)))
+    }
+
     /// Wait until one of the nodes `among` (by index) leads the control
     /// plane at a term above `term`, and return it with its term.
     fn wait_leader_above(&self, term: u64, among: &[usize]) -> (usize, u64) {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            let leading = among
-                .iter()
-                .find_map(|&i| self.leads_at(i).filter(|&t| t > term).map(|t| (i, t)));
-            if let Some(leading) = leading {
+            if let Some(leading) = self.leader_above(term, among) {
                 return leading;
             }
             assert!(
@@ -891,7 +921,13 @@ fn a_strengthening_streamed_between_ticks_lets_the_failover_proceed() {
 /// A replica that leads the control plane when the primary dies promotes
 /// itself: leadership held *through* the failure, where
 /// `killed_primary_triggers_exactly_one_auto_promotion` usually has the
-/// primary leading and an election after it.
+/// primary leading and an election after it. The leader-lease filter lets
+/// this genuine failover through: the other replica keeps acknowledging
+/// the leadership, so a majority stands behind it without the primary.
+/// So does the confirmation the promotion asks just before minting its
+/// epoch: the other replica answers its round trip, while the dead
+/// primary does not, and a promotion it refused would exit the node
+/// instead of serving.
 #[test]
 #[serial]
 fn replica_leader_promotes_when_the_primary_dies() {
@@ -916,22 +952,58 @@ fn replica_leader_promotes_when_the_primary_dies() {
     }
 }
 
-/// A replica leader isolated from both peers is replaced: the primary and
-/// the other replica, which still reach each other, elect a new leader at
-/// a higher term, and the primary keeps serving. Proves that
-/// [`Cluster::isolate`] takes effect: with the leader's links up, it
-/// would keep its majority and nobody would campaign.
+/// The lone survivor: a replica that leads the control plane while the
+/// primary and the other replica both die never auto-promotes, since from
+/// where it stands that cannot be told from being partitioned; recovery is
+/// a manual `PROMOTE`. It keeps leading at its term throughout (openraft
+/// has no check-quorum step-down), so it is the leader-lease filter, not a
+/// lost leadership, that holds it back. Both peers are voters, so the
+/// lease lapses `QUORUM_ACK_MAX_AGE` after the second of them stops. The
+/// other replica is stopped first, and `stop` returns only once it is
+/// down, so the primary's acks end when the primary-down grace starts and
+/// the lease lapses well inside it. The reverse order would not be safe: a
+/// slow clean stop of the primary could let the other replica's acks keep
+/// the lease fresh past the grace.
 #[test]
 #[serial]
-fn an_isolated_replica_leader_is_replaced_by_the_primary_and_the_other_replica() {
-    let cluster = Cluster::partitionable();
-    let led = cluster.start_replicas_first(AckPolicy::DiskAndRam);
+fn a_replica_leader_alone_never_auto_promotes() {
+    let cluster = Cluster::new();
+    let ReplicaLed {
+        primary,
+        mut replicas,
+        leader,
+        term,
+    } = cluster.start_replicas_first(AckPolicy::DiskAndRam);
 
-    cluster.isolate(led.leader);
-    cluster.wait_leader_above(led.term, &[0, led.other()]);
-    acked_write(&mut cluster.client(&led.primary));
+    // `replicas` holds nodes 1 and 2 at 0 and 1.
+    let survivor = replicas.remove(leader - 1);
+    let other = replicas.pop().expect("the other replica");
+    other.stop();
+    primary.stop();
 
-    led.stop();
+    let deadline = Instant::now() + NO_PROMOTION_WATCH;
+    while Instant::now() < deadline {
+        assert!(
+            !serves_clients(
+                cluster.nodes[leader].addrs.client(),
+                Duration::from_millis(300)
+            ),
+            "node {} promoted itself with both other nodes gone\n{}",
+            leader + 1,
+            cluster.cluster_summary()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(
+        cluster.leads_at(leader),
+        Some(term),
+        "node {} should still lead at term {term}, alone: otherwise the refusal proves \
+         nothing about the lease\n{}",
+        leader + 1,
+        cluster.cluster_summary()
+    );
+
+    survivor.stop();
 }
 
 /// The one-sided partition: the replica leader loses only its links to the
@@ -946,6 +1018,9 @@ fn an_isolated_replica_leader_is_replaced_by_the_primary_and_the_other_replica()
 /// A characterisation of what the code does, not a guarantee: it holds
 /// only while the other replica's journal tip moves ahead of the leader's,
 /// as the writes here make it (and, on an idle primary, its clock ticks).
+/// The leader-lease filter does not enter into it: the leader keeps its
+/// majority through the other replica, so its lease stays fresh
+/// throughout.
 #[test]
 #[serial]
 fn a_replica_leader_cut_from_the_primary_alone_does_not_promote_while_writes_flow() {
@@ -997,6 +1072,150 @@ fn a_replica_leader_cut_from_the_primary_alone_does_not_promote_while_writes_flo
     led.stop();
 }
 
+/// What [`an_isolated_replica_leader_never_deposes_a_healthy_primary`]
+/// saw, recorded through both phases and asserted at the end, so that one
+/// failing run shows every consequence rather than the first. Nodes are
+/// numbered from 1, as in [`Cluster::cluster_summary`], so the record
+/// reads beside it without translation.
+#[derive(Debug)]
+struct IsolationRecord {
+    /// The isolated replica leader's node number, and the term it led at.
+    leader_node: usize,
+    term: u64,
+    /// While isolated: how long after the isolation a write to the primary
+    /// first went unacked, and why, if one did (no write is attempted
+    /// after it).
+    write_failed: Option<(Duration, String)>,
+    /// While isolated: the first leader the primary or the other replica
+    /// elected above `term`, by node number, with its term.
+    re_elected: Option<(usize, u64)>,
+    /// While isolated: how long after the isolation the isolated leader
+    /// was first seen serving clients, if it was.
+    leader_served_after: Option<Duration>,
+    /// Over the heal watch: how long after the heal the primary was first
+    /// seen stopped by itself (finished, or its shutdown flag set, which
+    /// only a fence does before the test stops it), if it was.
+    primary_fenced_after: Option<Duration>,
+    /// At the end of the heal watch: whether the primary serves clients,
+    /// and which replicas do, by node number.
+    primary_serves: bool,
+    replica_nodes_serving: Vec<usize>,
+    /// The primary's `melin_replicas_connected` and
+    /// `melin_replica_divergence_total` as last read over the heal watch
+    /// (`None`: its health endpoint never answered).
+    replicas_connected: Option<u64>,
+    divergence_total: Option<u64>,
+    /// Lineage archives beside the isolated leader's journal at the end.
+    archives: Vec<PathBuf>,
+}
+
+/// The isolated-leader bug: a replica that leads the control plane and is
+/// cut off from both peers must not promote itself, and once healed the
+/// primary, which the other replica kept reaching, must still serve, and
+/// be the only node that does, with both replicas back and nothing
+/// diverged or archived. That the partition took effect is part of it:
+/// the primary and the other replica elect a new leader above the
+/// isolated one's term, which proves [`Cluster::isolate`] works (with the
+/// leader's links up it would keep its majority and nobody would
+/// campaign).
+///
+/// Without the leader-lease filter the isolated leader, which keeps its
+/// role and term with no majority behind it, promoted itself once its
+/// primary link had been down past the grace and served clients beside
+/// the healthy primary; on the heal its higher epoch fenced the primary
+/// (or both kept serving, depending on which control-plane message crossed
+/// first).
+#[test]
+#[serial]
+fn an_isolated_replica_leader_never_deposes_a_healthy_primary() {
+    let cluster = Cluster::partitionable();
+    let led = cluster.start_replicas_first(AckPolicy::DiskAndRam);
+    let (leader, other, term) = (led.leader, led.other(), led.term);
+    let primary_health = cluster.nodes[0].health_addr;
+    let mut conn = cluster.client(&led.primary);
+
+    // Isolated, with writes flowing, so the primary's journal moves past
+    // the isolated leader's.
+    cluster.isolate(leader);
+    let isolated = Instant::now();
+    let mut write_failed = None;
+    let mut re_elected = None;
+    let mut leader_served_after = None;
+    while isolated.elapsed() < NO_PROMOTION_WATCH {
+        if write_failed.is_none()
+            && let Err(why) = try_acked_write(&mut conn)
+        {
+            write_failed = Some((isolated.elapsed(), why));
+        }
+        re_elected = re_elected.or_else(|| cluster.leader_above(term, &[0, other]));
+        if leader_served_after.is_none()
+            && cluster
+                .serving_replicas(Duration::from_millis(300))
+                .contains(&leader)
+        {
+            leader_served_after = Some(isolated.elapsed());
+        }
+    }
+    drop(conn);
+
+    cluster.heal();
+    let healed = Instant::now();
+    let mut primary_fenced_after = None;
+    let mut replicas_connected = None;
+    let mut divergence_total = None;
+    while healed.elapsed() < HEAL_WATCH {
+        if primary_fenced_after.is_none()
+            && (led.primary.is_finished() || led.primary.shutdown_requested())
+        {
+            primary_fenced_after = Some(healed.elapsed());
+        }
+        replicas_connected =
+            gauge(primary_health, "melin_replicas_connected").or(replicas_connected);
+        divergence_total =
+            gauge(primary_health, "melin_replica_divergence_total").or(divergence_total);
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let node = |i: usize| i + 1;
+    let record = IsolationRecord {
+        leader_node: node(leader),
+        term,
+        write_failed,
+        re_elected: re_elected.map(|(i, t)| (node(i), t)),
+        leader_served_after,
+        primary_fenced_after,
+        primary_serves: serves_clients(cluster.nodes[0].addrs.client(), Duration::from_secs(2)),
+        replica_nodes_serving: cluster
+            .serving_replicas(Duration::from_secs(2))
+            .into_iter()
+            .map(node)
+            .collect(),
+        replicas_connected,
+        divergence_total,
+        archives: lineage_archives_beside(&cluster.journal(leader))
+            .expect("list the isolated leader's archives"),
+    };
+
+    assert!(
+        record.write_failed.is_none()
+            && record.re_elected.is_some()
+            && record.leader_served_after.is_none()
+            && record.primary_fenced_after.is_none()
+            && record.primary_serves
+            && record.replica_nodes_serving.is_empty()
+            && record.replicas_connected == Some(2)
+            && record.divergence_total == Some(0)
+            && record.archives.is_empty(),
+        "expected the primary to ack every write while node {node} was isolated, the primary \
+         and the other replica to elect a leader above node {node}'s term {term}, node {node} never \
+         to serve, and the healed primary unfenced and the only node serving, with both \
+         replicas back, no divergence and no archive: {record:#?}\n{}",
+        cluster.cluster_summary(),
+        node = record.leader_node,
+        term = record.term,
+    );
+    led.stop();
+}
+
 /// How long a serving raft leader is given to fence once a follower's
 /// epoch rises above its own. The next heartbeat's reply carries the
 /// higher epoch back, so a passing run fences within one heartbeat
@@ -1006,10 +1225,14 @@ fn a_replica_leader_cut_from_the_primary_alone_does_not_promote_while_writes_flo
 const FENCE_WATCH: Duration = Duration::from_secs(60);
 
 /// The one-way supersession check (finding 13 of the determinism audit),
-/// the split brain it allows reproduced on purpose: the primary leads the
-/// control plane and keeps serving while a replica that follows it is
-/// manually promoted (cut from the primary on the data plane, as an
-/// operator would promote a replica they believe orphaned).
+/// the split brain it allowed reproduced on purpose. Auto-promotion no
+/// longer leads there (the leader-lease filter keeps an isolated replica
+/// leader from promoting, see
+/// `an_isolated_replica_leader_never_deposes_a_healthy_primary`), so a
+/// manual promotion does: the primary leads the control plane and keeps
+/// serving while a replica that follows it is manually promoted (cut from
+/// the primary on the data plane, as an operator would promote a replica
+/// they believe orphaned).
 /// The promoted node, at the higher epoch, sends the primary no request:
 /// the replicas' raft requests are stalled at every proxy, while the
 /// primary's heartbeats reach them and their replies come back on the

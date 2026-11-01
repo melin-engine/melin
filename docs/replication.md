@@ -732,6 +732,20 @@ Auto-promotion is deliberately conservative. The elected replica
   at the cost of a few seconds of extra failover latency. The grace
   period cannot vouch for a primary whose *startup* outlasts it — see
   the bring-up rule under "Deployment rules";
+- **a majority of the control plane has not acknowledged its leadership
+  recently.** A node cut off from both other nodes can still believe it
+  leads (the control plane does not make an isolated leader step down),
+  and promoting it would depose a healthy primary that the rest of the
+  cluster still reaches. This **includes the case where both other nodes
+  are dead**: a lone survivor cannot tell that from being partitioned, so
+  it never auto-promotes, and the operator decides with a manual
+  `PROMOTE`. The `melin_raft_quorum_ack_age_ms` gauge shows how long ago
+  a majority last acknowledged the leader; past a second, it does not
+  promote. The cost on a genuine failover is small: the new leader
+  promotes once a majority has acknowledged it, one control-plane round
+  trip after its election. The check is made when the promotion starts;
+  a leader cut off after it is stopped by the confirmation described
+  below;
 - it has never observed a primary since it booted **and** its own
   journal is empty — a blank node winning an election is a cluster
   bring-up race, not a failover, and must not depose a primary that is
@@ -764,6 +778,45 @@ Auto-promotion is deliberately conservative. The elected replica
 - manual promotions have outrun election terms (the term must be
   strictly above the epoch in force; the alignment heals as terms
   advance — promote manually in the interim).
+
+Passing these checks starts the promotion; it does not finish it. Just
+before taking over, after its pipeline is ready and before it journals
+anything as primary or serves any client, the promoting node confirms
+with a majority of the control plane that it still leads, in the term it
+was elected at. If it cannot (it has lost its majority, or a newer
+leader exists, or it now leads at a newer term than the one it was
+elected at, or the control plane did not answer within half a second),
+the promotion is **abandoned and the node exits with an
+error** naming the reason (`automatic promotion abandoned: …`), after a
+warning saying no epoch bump was published. Its journal is unchanged,
+and once its supervisor restarts it, it rejoins as a replica of its
+configured primary, so run nodes under a supervisor that restarts them
+(systemd's `Restart=on-failure`, say). This confirmation is what keeps a
+leader that lost its majority after deciding to promote from deposing a
+primary the rest of the cluster still reaches: the drain and the memory
+preparation between the decision and the takeover can take long enough
+for the cluster to move on. A confirmed takeover is journaled
+immediately after the answer, inside the window in which no other node
+can have been elected. A manual `PROMOTE` is not confirmed.
+
+An abandoned promotion rarely repeats. The restarted node may still
+lead the control plane, but before it files a promotion again it waits
+out the primary-down grace and the majority check above afresh; a node
+that cannot reach a majority stops there and stays a replica, and one
+that can usually passes the confirmation too. Every attempt leaves the
+journal unchanged, and the supervisor's restart delay and start limit
+bound how often a node can retry. While the node is down, the other
+nodes are free to elect a leader of their own.
+
+While the confirmation runs, the control plane's own library logs an
+error-level line ("timeout while confirming leadership for read
+request") for each peer that does not answer; a failover with a dead
+peer, the dead primary included, can show one, and it is expected then.
+Repeated abandonments with "did not answer" reasons while the control
+plane otherwise looks healthy point at new connections between the
+nodes failing while established ones still work (a firewall admitting
+only established flows, say): each confirmation opens fresh connections
+to its peers.
 
 Manual `PROMOTE` remains available at all times, including during a
 control-plane outage; whichever request is filed first wins, and a
@@ -1099,6 +1152,11 @@ Most failures resolve without operator action:
   `ACK-POLICY disk` after promotion if the new primary has no replica
   connected (forced, see "Runtime policy swap");
   restore the target policy once new replicas attach.
+  With the primary and the other replica both gone, recovery is manual
+  even under `--raft-auto-promote`: the last replica standing never
+  promotes itself (it cannot tell its peers' death from its own
+  isolation; see "Automatic failover"), so `PROMOTE` it once you have
+  confirmed the other two are down.
 - **One replica crashes, primary and other replica alive** — the
   cluster continues under the configured policy. Under `disk+ram` the
   gate is satisfied by whichever node fsyncs first plus the surviving
@@ -1301,7 +1359,9 @@ normal-case post-recovery state.
   peers keeps its role, so a value that keeps growing is the sign it has
   lost its majority (a majority it was cut off from elects a new leader
   within the 1–2 s election timeout, so two nodes can then report
-  `melin_raft_is_leader 1`). Alert on it staying above a second.
+  `melin_raft_is_leader 1`). Alert on it staying above a second: past
+  that level, a replica holding the leadership also refuses to
+  auto-promote (see "Automatic failover").
 
 ## Limitations
 

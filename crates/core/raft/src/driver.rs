@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use std::time::Instant;
 
 use ed25519_dalek::SigningKey;
 use melin_app::auth::AuthorizedKeys;
@@ -25,6 +26,7 @@ use openraft::Config;
 use openraft::Raft;
 use openraft::RaftMetrics;
 use openraft::ServerState;
+use openraft::error::CheckIsLeaderError;
 use openraft::error::InitializeError;
 use openraft::error::RaftError;
 use tracing::debug;
@@ -37,6 +39,7 @@ use crate::network::undialable_members;
 use crate::recency::TipSource;
 use crate::rpc_server::RpcServerConfig;
 use crate::rpc_server::serve;
+use crate::types::LogId;
 use crate::types::Node;
 use crate::types::NodeId;
 use crate::types::TypeConfig;
@@ -81,6 +84,96 @@ const HEARTBEAT_JITTER_MS: u64 = 150;
 /// and consecutive ids sit far apart instead of one tick-quantum
 /// (1 ms) from each other.
 const HEARTBEAT_JITTER_SPREAD: u64 = 37;
+
+/// openraft's follower lease: a follower whose vote is committed refuses
+/// every vote request until `leader_lease` has passed since it last
+/// accepted a vote-bearing RPC (`Engine::handle_vote_req`), and
+/// `EngineConfig::new` sets `leader_lease` to `election_timeout_max`.
+/// Read in openraft 0.9.25; re-derive on any upgrade (see the comment on
+/// the dependency in this crate's manifest).
+const LEADER_LEASE_MS: u64 = ELECTION_TIMEOUT_MAX_MS;
+
+/// The auto-promotion filter's threshold: a raft leader whose last
+/// majority acknowledgement is older than this does not start a
+/// promotion. Half the lease. The filter is an early refusal, not the
+/// safety mechanism, so the only constraint on it is liveness (the
+/// assertion below): it must not refuse a healthy leader. `u64`
+/// milliseconds like the timing constants it is derived from, so the
+/// derivation and the assertion stay integer arithmetic in `const`.
+const QUORUM_ACK_MAX_AGE_MS: u64 = LEADER_LEASE_MS / 2;
+
+/// The oldest majority acknowledgement the automatic-promotion policy
+/// accepts from a raft leader (half the control plane's leader lease),
+/// compared with the age the driver publishes in `RaftStatus`. An early
+/// filter, not a safety guarantee.
+pub const QUORUM_ACK_MAX_AGE: Duration = Duration::from_millis(QUORUM_ACK_MAX_AGE_MS);
+
+/// The largest heartbeat interval [`heartbeat_interval_ms`] gives any
+/// node: the base plus the largest offset.
+const MAX_HEARTBEAT_INTERVAL_MS: u64 = HEARTBEAT_INTERVAL_MS + HEARTBEAT_JITTER_MS - 1;
+
+/// The slowest node's raft tick period: openraft ticks every
+/// `heartbeat_interval * 3 / 2` (`Raft::new`, `Tick::spawn`), a leader
+/// heartbeats on every tick (`RaftCore`'s `Notify::Tick` arm) and flushes
+/// its metrics at least once per runtime-loop wake-up
+/// (`RaftCore::runtime_loop`), and the largest heartbeat interval is
+/// [`MAX_HEARTBEAT_INTERVAL_MS`].
+const MAX_TICK_PERIOD_MS: u64 = MAX_HEARTBEAT_INTERVAL_MS * 3 / 2;
+
+/// Allowance for one heartbeat round trip, for the liveness assertions
+/// only (the quorum-ack filter's below, and the leadership
+/// confirmation's).
+const RTT_BUDGET_MS: u64 = 100;
+
+// A healthy leader's reported quorum-ack age peaks at about one tick plus
+// a round trip (the flush just before a heartbeat's reply lands), so the
+// filter must allow at least that, or it refuses a healthy leader.
+const _: () = assert!(
+    QUORUM_ACK_MAX_AGE_MS >= MAX_TICK_PERIOD_MS + RTT_BUDGET_MS,
+    "QUORUM_ACK_MAX_AGE would refuse a healthy leader: it must cover the slowest tick plus a round trip"
+);
+
+/// The deadline of [`LeaderConfirm::confirm`], taken on the caller's
+/// thread before the request reaches the driver. openraft gives each
+/// voter one `heartbeat_interval` for the confirming heartbeat, a fresh
+/// connect and handshake included (`RaftCore::handle_check_is_leader_request`),
+/// so an answer later than this is a control plane in trouble, and
+/// refusing is the right answer. `u64` milliseconds like the timing
+/// constants the assertions below compare it with.
+const LEADER_CONFIRM_TIMEOUT_MS: u64 = 500;
+
+/// [`LEADER_CONFIRM_TIMEOUT_MS`] as the `Duration` `confirm` waits on.
+pub(crate) const LEADER_CONFIRM_TIMEOUT: Duration =
+    Duration::from_millis(LEADER_CONFIRM_TIMEOUT_MS);
+
+/// What the caller of [`LeaderConfirm::confirm`] may spend between
+/// accepting the reply and acting on it (preemption, the publish itself),
+/// plus clock-rate drift between this node's clock and the followers'
+/// lease clocks. Read only by the safety assertion below.
+const SCHEDULING_SLACK_MS: u64 = 200;
+
+// Safety. A confirmation is accepted before its deadline, which is taken
+// before the driver starts the round trip, and the caller acts on it
+// within the slack. Every follower that acknowledged the round trip
+// refuses other candidates for a lease from then, so the caller acts
+// while no other node can have been elected without this one's vote.
+const _: () = assert!(
+    LEADER_CONFIRM_TIMEOUT_MS + SCHEDULING_SLACK_MS < LEADER_LEASE_MS,
+    "a leadership confirmation could be acted on after the followers' lease lapsed: \
+     LEADER_CONFIRM_TIMEOUT_MS plus SCHEDULING_SLACK_MS must stay under LEADER_LEASE_MS"
+);
+
+// Liveness. openraft waits up to the leader's own heartbeat interval for
+// each voter's answer before counting it missing, so the deadline must
+// outlast the slowest node's interval plus a round trip: otherwise a
+// leader whose majority answers just inside openraft's per-voter timeout
+// is refused, and one with an unreachable voter times out instead of
+// hearing openraft's own `NoQuorum`.
+const _: () = assert!(
+    LEADER_CONFIRM_TIMEOUT_MS >= MAX_HEARTBEAT_INTERVAL_MS + RTT_BUDGET_MS,
+    "LEADER_CONFIRM_TIMEOUT_MS would cut off openraft's own per-voter wait: \
+     it must cover the slowest heartbeat interval plus a round trip"
+);
 
 /// Shutdown-flag poll cadence in the driver loop.
 const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
@@ -136,8 +229,198 @@ pub struct RaftHandles {
     /// the condition no longer holds. The explicit nudge
     /// (`elect_requested`) bypasses it by design.
     pub elect_enabled: Arc<AtomicBool>,
+    /// Blocking leadership confirmation with a quorum round trip, for the
+    /// moment a promotion's epoch is minted. See [`LeaderConfirm`].
+    pub leader_confirm: LeaderConfirm,
     /// The driver thread. Join on shutdown so storage I/O finishes cleanly.
     pub join: std::thread::JoinHandle<()>,
+}
+
+/// Why [`LeaderConfirm::confirm`] refused. A caller acting on leadership
+/// treats every variant alike; they exist to say which path ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaderConfirmError {
+    /// This node does not lead the control plane, or learned during the
+    /// round trip that a peer holds a newer vote.
+    NotLeader,
+    /// A majority confirmed this node's leadership, but in term `now`,
+    /// not the term asked about: it lost that term and has led again
+    /// since, or the caller asked about a term it never led.
+    TermMoved { now: u64 },
+    /// A majority of the voters did not acknowledge the round trip.
+    NoQuorum,
+    /// No answer came before the confirmation's deadline.
+    TimedOut,
+    /// The control-plane driver is not running.
+    DriverStopped,
+}
+
+impl std::fmt::Display for LeaderConfirmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotLeader => f.write_str("this node does not lead the control plane"),
+            Self::TermMoved { now } => write!(
+                f,
+                "a majority confirmed this node's leadership in term {now}, not the term asked about"
+            ),
+            Self::NoQuorum => f.write_str("a majority of the control plane did not answer"),
+            Self::TimedOut => write!(
+                f,
+                "the control plane did not answer within {LEADER_CONFIRM_TIMEOUT:?}"
+            ),
+            Self::DriverStopped => f.write_str("the control-plane driver is not running"),
+        }
+    }
+}
+
+impl std::error::Error for LeaderConfirmError {}
+
+/// What the driver answers one confirmation with.
+type ConfirmOutcome = Result<(), LeaderConfirmError>;
+
+/// One leadership confirmation for the driver's confirmation task.
+struct ConfirmRequest {
+    /// The term whose leadership is to be confirmed.
+    term: u64,
+    /// `std` rather than tokio, so the caller waits on it without a
+    /// runtime; capacity 1, so the driver's single answer never blocks
+    /// it, whether or not the caller is still waiting.
+    reply: std::sync::mpsc::SyncSender<ConfirmOutcome>,
+}
+
+/// Confirms, with a round trip to a majority of the control plane, that
+/// this node still leads it in a given term. Cloneable; every clone asks
+/// the same driver.
+///
+/// Only [`spawn`] makes one (the field is private and there is no other
+/// constructor), so every handle is wired to a running, or stopped,
+/// driver: none can exist that nothing answers.
+#[derive(Debug, Clone)]
+pub struct LeaderConfirm {
+    /// tokio's unbounded sender, because its `send` is synchronous and
+    /// needs no runtime, so tokio stays on the driver thread. Unbounded
+    /// because at most one promotion, and so one confirmation, is ever in
+    /// flight: the queue cannot grow, and a bounded sender would only add
+    /// a "full" refusal nothing can cause.
+    requests: tokio::sync::mpsc::UnboundedSender<ConfirmRequest>,
+}
+
+impl LeaderConfirm {
+    /// Ask the driver to confirm that this node leads the control plane in
+    /// `term`, with heartbeats a majority of the voters acknowledge, and
+    /// block for the answer for at most a fixed deadline
+    /// (`LEADER_CONFIRM_TIMEOUT`), well inside the control plane's leader
+    /// lease. `Ok` is returned only before that deadline, and the deadline
+    /// is taken before the round trip starts, so an accepted answer is at
+    /// most `LEADER_CONFIRM_TIMEOUT` after the earliest moment a follower's
+    /// lease could have been renewed, and the caller acting within
+    /// `SCHEDULING_SLACK_MS` of the return acts inside the lease that
+    /// round trip renewed (the safety assertion beside
+    /// `SCHEDULING_SLACK_MS`).
+    ///
+    /// `term` is openraft's raw term, the one this node was elected at;
+    /// the server runtime carries it as its `ElectionTerm`, which this
+    /// crate cannot name (the runtime depends on it, not the reverse).
+    ///
+    /// Blocks the calling thread; never call it from the driver's runtime.
+    pub fn confirm(&self, term: u64) -> ConfirmOutcome {
+        // The first statement, before the request is sent: the deadline
+        // must precede the moment the driver starts the round trip, which
+        // is what the safety assertion measures from. Sending is a
+        // non-blocking enqueue, so no test can tell the two orders apart;
+        // keep this line first.
+        let deadline = Instant::now() + LEADER_CONFIRM_TIMEOUT;
+        let (reply, answer) = std::sync::mpsc::sync_channel(1);
+        self.requests
+            .send(ConfirmRequest { term, reply })
+            .map_err(|_| LeaderConfirmError::DriverStopped)?;
+        let received = answer.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        accept_answer(received, Instant::now(), deadline)
+    }
+}
+
+/// What [`LeaderConfirm::confirm`] returns for what its wait received,
+/// read at `now` against `deadline`. Apart from the wait so the late-reply
+/// refusal, which the safety argument rests on, is testable without
+/// racing a scheduler.
+fn accept_answer(
+    received: Result<ConfirmOutcome, std::sync::mpsc::RecvTimeoutError>,
+    now: Instant,
+    deadline: Instant,
+) -> ConfirmOutcome {
+    match received {
+        // `recv_timeout` hands back a queued reply before it reads the
+        // clock, and times its own wait from when it is called, so a
+        // thread preempted before the wait could take a reply that came
+        // after the deadline. Accept only on a reading still inside it.
+        Ok(_) if now > deadline => Err(LeaderConfirmError::TimedOut),
+        Ok(outcome) => outcome,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(LeaderConfirmError::TimedOut),
+        // The driver dropped the request unanswered: it stopped.
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(LeaderConfirmError::DriverStopped)
+        }
+    }
+}
+
+/// The confirmation channel: the handle for [`RaftHandles`] and the
+/// receiver [`serve_confirmations`] drains.
+fn leader_confirm_channel() -> (
+    LeaderConfirm,
+    tokio::sync::mpsc::UnboundedReceiver<ConfirmRequest>,
+) {
+    let (requests, receiver) = tokio::sync::mpsc::unbounded_channel();
+    (LeaderConfirm { requests }, receiver)
+}
+
+/// Answer leadership confirmations, one at a time, until every
+/// [`LeaderConfirm`] is dropped or the driver aborts this task. A task of
+/// its own so the metrics bridge never waits on a round trip. No timeout
+/// here: openraft bounds each voter's heartbeat by its
+/// `heartbeat_interval`, and the caller's deadline bounds the whole.
+/// Nothing is logged: the caller decides what a refusal means and logs
+/// it, and openraft logs each voter that did not answer.
+async fn serve_confirmations(
+    raft: Raft<TypeConfig>,
+    mut requests: tokio::sync::mpsc::UnboundedReceiver<ConfirmRequest>,
+) {
+    while let Some(ConfirmRequest { term, reply }) = requests.recv().await {
+        let outcome = confirmation_outcome(term, raft.get_read_log_id().await);
+        // The buffer has room for this single answer, so the only failure
+        // is a caller that gave up (its deadline passed) and has already
+        // refused: there is nobody left to tell.
+        let _ = reply.try_send(outcome);
+    }
+}
+
+/// What `Raft::get_read_log_id` returns: the read log id and the applied
+/// log id, or why leadership could not be confirmed.
+type ReadLogIdAnswer =
+    Result<(Option<LogId>, Option<LogId>), RaftError<NodeId, CheckIsLeaderError<NodeId, Node>>>;
+
+/// What `Raft::get_read_log_id` answered, as a confirmation of `term`.
+/// openraft captures the vote and the read log id before sending, so
+/// `Ok` covers exactly the term in `read_log_id`, which is the confirming
+/// leader's (`LeaderHandler::get_read_log_id`, openraft 0.9.25).
+fn confirmation_outcome(term: u64, answer: ReadLogIdAnswer) -> ConfirmOutcome {
+    match answer {
+        Ok((read_log_id, _applied)) => match read_log_id.map(|l| l.leader_id.term) {
+            Some(confirmed) if confirmed == term => Ok(()),
+            Some(now) => Err(LeaderConfirmError::TermMoved { now }),
+            // Unreachable by openraft 0.9.25: a leader's read log id is
+            // the newer of its own blank entry's and the committed one,
+            // and the blank entry's is always set. Refused, not trusted.
+            None => Err(LeaderConfirmError::NotLeader),
+        },
+        // Also what a peer's higher vote during the round trip yields.
+        Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(_))) => {
+            Err(LeaderConfirmError::NotLeader)
+        }
+        Err(RaftError::APIError(CheckIsLeaderError::QuorumNotEnough(_))) => {
+            Err(LeaderConfirmError::NoQuorum)
+        }
+        Err(RaftError::Fatal(_)) => Err(LeaderConfirmError::DriverStopped),
+    }
 }
 
 /// Validate config coherence and spawn the driver thread.
@@ -217,6 +500,7 @@ pub fn spawn(
     let peer_tips = Arc::new(crate::recency::PeerTips::new());
     let elect_requested = Arc::new(AtomicBool::new(false));
     let elect_enabled = Arc::new(AtomicBool::new(true));
+    let (leader_confirm, confirm_requests) = leader_confirm_channel();
 
     let thread_status = Arc::clone(&status);
     let thread_tip = Arc::clone(&tip);
@@ -256,6 +540,7 @@ pub fn spawn(
                 thread_peer_tips,
                 thread_elect,
                 thread_elect_enabled,
+                confirm_requests,
                 supersession,
                 shutdown,
             ));
@@ -267,6 +552,7 @@ pub fn spawn(
         peer_tips,
         elect_requested,
         elect_enabled,
+        leader_confirm,
         join,
     })
 }
@@ -283,11 +569,22 @@ fn role_of(state: ServerState) -> u8 {
     }
 }
 
+/// This node's raft heartbeat interval: [`HEARTBEAT_INTERVAL_MS`] plus a
+/// deterministic per-node offset, so any two nodes with distinct ids
+/// (mod 150) get distinct tick periods by construction (see
+/// [`HEARTBEAT_JITTER_MS`]). Reduces before multiplying: node ids are
+/// arbitrary `u64`s and must not overflow.
+fn heartbeat_interval_ms(node_id: NodeId) -> u64 {
+    HEARTBEAT_INTERVAL_MS
+        + (node_id % HEARTBEAT_JITTER_MS) * HEARTBEAT_JITTER_SPREAD % HEARTBEAT_JITTER_MS
+}
+
 /// Publish one raft metrics report into the status atomics: term, leader
 /// (0 for none) and role, read by the gauges and the promotion policy, and
-/// the age of the last majority acknowledgement, read by its gauge
-/// (openraft reports `None` when this node is not leading or was never
-/// acknowledged).
+/// the age of the last majority acknowledgement, read by its gauge and by
+/// the promotion policy's leader-lease filter against
+/// [`QUORUM_ACK_MAX_AGE`] (openraft reports `None` when this node is not
+/// leading or was never acknowledged).
 fn publish_metrics(status: &RaftStatus, m: &RaftMetrics<NodeId, Node>) {
     status.term.store(m.current_term, Ordering::Relaxed);
     status
@@ -310,18 +607,13 @@ async fn driver_main(
     peer_tips: Arc<crate::recency::PeerTips>,
     elect_requested: Arc<AtomicBool>,
     elect_enabled: Arc<AtomicBool>,
+    confirm_requests: tokio::sync::mpsc::UnboundedReceiver<ConfirmRequest>,
     supersession: Option<crate::rpc_server::SupersessionPolicy>,
     shutdown: Arc<AtomicBool>,
 ) {
-    // See `HEARTBEAT_JITTER_MS`: deterministic per-node offset, so any
-    // two nodes with distinct ids (mod 150) get distinct tick periods
-    // by construction. Reduce before multiplying — node ids are
-    // arbitrary u64s and must not overflow.
-    let heartbeat_jitter =
-        (config.node_id % HEARTBEAT_JITTER_MS) * HEARTBEAT_JITTER_SPREAD % HEARTBEAT_JITTER_MS;
     let raft_config = Config {
         cluster_name: "melin-control-plane".to_owned(),
-        heartbeat_interval: HEARTBEAT_INTERVAL_MS + heartbeat_jitter,
+        heartbeat_interval: heartbeat_interval_ms(config.node_id),
         election_timeout_min: ELECTION_TIMEOUT_MIN_MS,
         election_timeout_max: ELECTION_TIMEOUT_MAX_MS,
         ..Config::default()
@@ -387,6 +679,7 @@ async fn driver_main(
         Arc::clone(&rpc_cfg),
         Arc::clone(&shutdown),
     ));
+    let confirm_task = tokio::spawn(serve_confirmations(raft.clone(), confirm_requests));
 
     // First-boot initialization with the static membership. A cluster that
     // is already initialized (any restart) refuses with `NotAllowed`, which
@@ -538,12 +831,45 @@ async fn driver_main(
     // core died instead (fatal above), abort it — its Raft handle is dead.
     rpc_task.abort();
     let _ = rpc_task.await;
+    // Waits on `LeaderConfirm`s that outlive the driver, so it never ends
+    // on its own. Aborting drops the receiver, so a later `confirm` fails
+    // its send, and a request in flight its reply: both `DriverStopped`.
+    // The join result is dropped: its only outcome is the cancellation
+    // just requested.
+    confirm_task.abort();
+    let _ = confirm_task.await;
     info!(node_id = config.node_id, "raft driver stopped");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heartbeat_offsets_are_distinct_and_bounded_by_the_slowest_tick() {
+        // `BTreeSet` to count distinct offsets; order only makes the
+        // failure message readable.
+        let intervals: std::collections::BTreeSet<u64> = (0..HEARTBEAT_JITTER_MS)
+            .map(heartbeat_interval_ms)
+            .collect();
+        assert_eq!(
+            intervals.len() as u64,
+            HEARTBEAT_JITTER_MS,
+            "ids 0..{HEARTBEAT_JITTER_MS} must get pairwise distinct heartbeat intervals: {intervals:?}"
+        );
+        let max = *intervals.last().expect("a non-empty id range");
+        // The bound the timing assertions use is the real maximum.
+        assert_eq!(max, MAX_HEARTBEAT_INTERVAL_MS);
+        // The liveness assertion's tick bound is the real formula's.
+        assert_eq!(MAX_TICK_PERIOD_MS, max * 3 / 2);
+        assert_eq!(
+            intervals.first().copied(),
+            Some(HEARTBEAT_INTERVAL_MS),
+            "the offset range starts at 0"
+        );
+        // Any u64 id stays in range without overflowing.
+        assert!(intervals.contains(&heartbeat_interval_ms(u64::MAX)));
+    }
 
     #[test]
     fn publish_metrics_bridges_a_leaders_quorum_ack_age() {
@@ -587,5 +913,178 @@ mod tests {
         m.current_leader = None;
         publish_metrics(&status, &m);
         assert_eq!(status.leader_id.load(Ordering::Relaxed), 0);
+    }
+
+    /// A `LeaderConfirm` whose driver is a thread taking one request and
+    /// handing it to `answer`.
+    fn stub_driver(
+        answer: impl FnOnce(ConfirmRequest) + Send + 'static,
+    ) -> (LeaderConfirm, std::thread::JoinHandle<()>) {
+        let (confirm, mut requests) = leader_confirm_channel();
+        let driver = std::thread::spawn(move || {
+            let request = requests.blocking_recv().expect("one request");
+            answer(request);
+        });
+        (confirm, driver)
+    }
+
+    #[test]
+    fn a_reply_past_the_deadline_is_timed_out() {
+        let (confirm, driver) = stub_driver(|request| {
+            assert_eq!(request.term, 7);
+            // The request was sent after the deadline was taken, so this
+            // answer lands past it, wherever the waiting thread is then.
+            std::thread::sleep(LEADER_CONFIRM_TIMEOUT + Duration::from_millis(20));
+            // The caller has given up, or is about to discard this.
+            let _ = request.reply.try_send(Ok(()));
+        });
+        let started = Instant::now();
+        assert_eq!(confirm.confirm(7), Err(LeaderConfirmError::TimedOut));
+        assert!(started.elapsed() >= LEADER_CONFIRM_TIMEOUT);
+        driver.join().unwrap();
+    }
+
+    #[test]
+    fn accept_answer_refuses_a_reply_read_past_the_deadline() {
+        use std::sync::mpsc::RecvTimeoutError;
+        let deadline = Instant::now();
+        let before = deadline - Duration::from_millis(1);
+        let after = deadline + Duration::from_millis(1);
+
+        // A reply already queued, taken after the deadline: refused,
+        // whatever it says.
+        for outcome in [Ok(()), Err(LeaderConfirmError::NoQuorum)] {
+            assert_eq!(
+                accept_answer(Ok(outcome), after, deadline),
+                Err(LeaderConfirmError::TimedOut)
+            );
+        }
+        // Taken before it, or exactly at it: passed through.
+        for now in [before, deadline] {
+            for outcome in [
+                Ok(()),
+                Err(LeaderConfirmError::NotLeader),
+                Err(LeaderConfirmError::TermMoved { now: 3 }),
+            ] {
+                assert_eq!(accept_answer(Ok(outcome), now, deadline), outcome);
+            }
+        }
+        // The wait's own failures, at any reading.
+        for now in [before, after] {
+            assert_eq!(
+                accept_answer(Err(RecvTimeoutError::Timeout), now, deadline),
+                Err(LeaderConfirmError::TimedOut)
+            );
+            assert_eq!(
+                accept_answer(Err(RecvTimeoutError::Disconnected), now, deadline),
+                Err(LeaderConfirmError::DriverStopped)
+            );
+        }
+    }
+
+    #[test]
+    fn a_reply_inside_the_deadline_is_returned() {
+        for outcome in [
+            Ok(()),
+            Err(LeaderConfirmError::NoQuorum),
+            Err(LeaderConfirmError::TermMoved { now: 9 }),
+        ] {
+            let (confirm, driver) = stub_driver(move |request| {
+                assert_eq!(request.term, 8);
+                request.reply.try_send(outcome).unwrap();
+            });
+            assert_eq!(confirm.confirm(8), outcome);
+            driver.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_stopped_driver_is_driver_stopped() {
+        // The driver's receiver is gone: the send fails.
+        let (confirm, requests) = leader_confirm_channel();
+        drop(requests);
+        assert_eq!(confirm.confirm(1), Err(LeaderConfirmError::DriverStopped));
+
+        // The driver drops a request it took without answering.
+        let (confirm, driver) = stub_driver(drop);
+        let started = Instant::now();
+        assert_eq!(confirm.confirm(1), Err(LeaderConfirmError::DriverStopped));
+        assert!(
+            started.elapsed() < LEADER_CONFIRM_TIMEOUT,
+            "a dropped reply must end the wait at once"
+        );
+        driver.join().unwrap();
+    }
+
+    #[test]
+    fn leader_confirm_errors_say_what_they_carry() {
+        assert!(
+            LeaderConfirmError::TermMoved { now: 12 }
+                .to_string()
+                .contains("term 12")
+        );
+        assert!(
+            LeaderConfirmError::TimedOut
+                .to_string()
+                .contains(&format!("{LEADER_CONFIRM_TIMEOUT:?}"))
+        );
+        // Every message is distinct, so a log line names its path.
+        // `BTreeSet` only to count distinct messages.
+        let messages: std::collections::BTreeSet<String> = [
+            LeaderConfirmError::NotLeader,
+            LeaderConfirmError::TermMoved { now: 12 },
+            LeaderConfirmError::NoQuorum,
+            LeaderConfirmError::TimedOut,
+            LeaderConfirmError::DriverStopped,
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        assert_eq!(messages.len(), 5);
+    }
+
+    #[test]
+    fn confirmation_outcome_maps_every_openraft_answer() {
+        let at_term = |term| Some(LogId::new(openraft::CommittedLeaderId::new(term, 1), 4));
+
+        assert_eq!(confirmation_outcome(5, Ok((at_term(5), None))), Ok(()));
+        // Asked about an older term, or one this node never reached.
+        assert_eq!(
+            confirmation_outcome(5, Ok((at_term(6), at_term(6)))),
+            Err(LeaderConfirmError::TermMoved { now: 6 })
+        );
+        assert_eq!(
+            confirmation_outcome(7, Ok((at_term(6), None))),
+            Err(LeaderConfirmError::TermMoved { now: 6 })
+        );
+        assert_eq!(
+            confirmation_outcome(5, Ok((None, None))),
+            Err(LeaderConfirmError::NotLeader)
+        );
+        assert_eq!(
+            confirmation_outcome(
+                5,
+                Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(
+                    openraft::error::ForwardToLeader::empty()
+                )))
+            ),
+            Err(LeaderConfirmError::NotLeader)
+        );
+        assert_eq!(
+            confirmation_outcome(
+                5,
+                Err(RaftError::APIError(CheckIsLeaderError::QuorumNotEnough(
+                    openraft::error::QuorumNotEnough {
+                        cluster: "{1, 2, 3}".to_owned(),
+                        got: [1].into(),
+                    }
+                )))
+            ),
+            Err(LeaderConfirmError::NoQuorum)
+        );
+        assert_eq!(
+            confirmation_outcome(5, Err(RaftError::Fatal(openraft::error::Fatal::Stopped))),
+            Err(LeaderConfirmError::DriverStopped)
+        );
     }
 }
