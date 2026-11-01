@@ -799,14 +799,14 @@ for the cluster to move on. A confirmed takeover is journaled
 immediately after the answer, inside the window in which no other node
 can have been elected. A manual `PROMOTE` is not confirmed.
 
-An abandoned promotion cannot loop into a run of exits. The restarted
-node may still lead the control plane, but before it files a promotion
-again it waits out the primary-down grace and the majority check above
-afresh; a node that cannot reach a majority stops there and stays a
-replica, and one that can usually passes the confirmation too. Every
-attempt leaves the journal unchanged, and the supervisor's restart
-delay and start limit bound how often a node can retry. While the node
-is down, the other nodes are free to elect a leader of their own.
+An abandoned promotion rarely repeats. The restarted node may still
+lead the control plane, but before it files a promotion again it waits
+out the primary-down grace and the majority check above afresh; a node
+that cannot reach a majority stops there and stays a replica, and one
+that can usually passes the confirmation too. Every attempt leaves the
+journal unchanged, and the supervisor's restart delay and start limit
+bound how often a node can retry. While the node is down, the other
+nodes are free to elect a leader of their own.
 
 While the confirmation runs, the control plane's own library logs an
 error-level line ("timeout while confirming leadership for read
