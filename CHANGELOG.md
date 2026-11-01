@@ -45,6 +45,19 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   after the grace period; it now refuses, saying it may be partitioned,
   and recovery is a manual `PROMOTE`. A genuine failover waits one more
   control-plane round trip after the election.
+- **An automatic promotion is abandoned, and the node exits with an
+  error, if a majority of the control plane does not confirm its
+  leadership just before it takes over.** The promoting node asks for
+  that confirmation, in the term it was elected at, after its pipeline
+  is ready and before it journals anything as primary, so an abandoned
+  promotion leaves the journal unchanged; restarted by its supervisor,
+  the node rejoins as a replica. This keeps a leader that lost its
+  majority after deciding to promote from deposing a primary the rest of
+  the cluster still reaches. A manual `PROMOTE` is not confirmed, and
+  stays available while the control plane is down. An election's
+  promotion now logs `confirming leadership before injecting the epoch
+  bump` where it logged `injecting epoch bump`, and every promotion logs
+  `epoch bump applied` once its tenure has begun.
 - **`melin_transport_core::health::RaftStatus` gains a private field**
   (the quorum-ack age, read and written through
   `millis_since_quorum_ack` and `set_millis_since_quorum_ack`), so it can
@@ -93,9 +106,8 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   primary down (a needless failover onto the node holding the least data,
   the other replica left orphaned) or both kept serving, depending on
   which control-plane message crossed first. An isolated replica now
-  refuses to promote once it has lost its majority. The check is made
-  when the promotion starts, so a replica cut off in the instant after
-  it can still promote.
+  refuses to promote once it has lost its majority, and one cut off
+  after deciding to promote abandons the promotion (see **Changed**).
 - **An auto-promotion at raft term 1 is now checked for term/epoch
   alignment like any other.** When a concurrent promotion raises the
   fencing epoch while a node is being promoted, the node logs a warning

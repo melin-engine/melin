@@ -3,7 +3,8 @@
 //! auth throughout.
 //!
 //! - Kill the primary (`disk+ram`); exactly one replica must win the
-//!   election and promote itself into a serving primary, and the other
+//!   election and promote itself into a serving primary (its leadership
+//!   confirmed by a quorum round trip as it mints its epoch), and the other
 //!   must keep following. Then the killed primary comes back on its stale
 //!   epoch-0 journal — the raft peer mesh must fence it
 //!   (fence-on-supersession) so it self-demotes rather than serving
@@ -923,6 +924,10 @@ fn a_strengthening_streamed_between_ticks_lets_the_failover_proceed() {
 /// primary leading and an election after it. The leader-lease filter lets
 /// this genuine failover through: the other replica keeps acknowledging
 /// the leadership, so a majority stands behind it without the primary.
+/// So does the confirmation the promotion asks just before minting its
+/// epoch: the other replica answers its round trip, while the dead
+/// primary does not, and a promotion it refused would exit the node
+/// instead of serving.
 #[test]
 #[serial]
 fn replica_leader_promotes_when_the_primary_dies() {
