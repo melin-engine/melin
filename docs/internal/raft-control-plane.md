@@ -61,7 +61,10 @@ Epoch allocation on promotion is `max(fence_epoch + 1, floor)`
 (`server.rs`), the floor coming from the request's `PromotionOrigin`: a
 manual `PROMOTE` files `Manual`, whose floor of 1 folds to the classic
 `epoch + 1`; an auto-promotion files `Election { term }`, whose floor is
-its term. Manual and automatic promotions coexist — first request wins
+its term. The request is one atomic word with 0 for "none" and
+`u64::MAX` for `Manual`, so an `ElectionTerm` cannot be either, and the
+policy refuses a term of `u64::MAX` (never reached in practice) rather
+than file it. Manual and automatic promotions coexist — first request wins
 the one-shot, and a manual promotion that outruns raft terms simply
 makes the policy refuse (`term <= fence_epoch`) until terms catch up.
 

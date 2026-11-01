@@ -26,14 +26,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 ///
 /// An enum rather than a bare number: an election at term 1 and a manual
 /// `PROMOTE` share an epoch floor of 1, so a number cannot tell them
-/// apart, and the mint must know whether it is honouring an election.
+/// apart, and the mint checks term/epoch alignment for an election only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PromotionOrigin {
     /// An operator's `PROMOTE`: no election backs it.
     Manual,
-    /// A raft election won at `term`. `u64` because that is openraft's
-    /// term type, carried unchanged.
-    Election { term: u64 },
+    /// A raft election won at `term`.
+    Election { term: ElectionTerm },
 }
 
 impl PromotionOrigin {
@@ -45,15 +44,61 @@ impl PromotionOrigin {
     pub fn epoch_floor(self) -> u64 {
         match self {
             Self::Manual => 1,
-            Self::Election { term } => term,
+            Self::Election { term } => term.get(),
         }
+    }
+
+    /// An election origin at `term`, for tests that name terms the
+    /// encoding carries.
+    #[cfg(test)]
+    pub(crate) fn election(term: u64) -> Self {
+        Self::Election {
+            term: ElectionTerm::new(term).expect("a term the request can carry"),
+        }
+    }
+}
+
+/// A raft term a promotion request can carry: neither 0 nor `u64::MAX`,
+/// the request words for "none" and [`PromotionOrigin::Manual`].
+///
+/// Checked once, at construction, so that [`PromotionRequest::request`]
+/// cannot be handed an origin it would misread: the raft driver meets the
+/// terms this refuses in its promotion decision, where the refusal is
+/// logged like any other. Neither arises in practice: openraft's first
+/// election is term 1, the decision only promotes on a term above the
+/// fencing epoch, and a term grows by one per election. `u64` inside
+/// because that is openraft's term type, carried unchanged.
+///
+/// `Debug` is the bare number, so an origin logged with `?origin` reads
+/// `Election { term: 7 }` rather than naming this wrapper.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ElectionTerm(u64);
+
+impl std::fmt::Debug for ElectionTerm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+impl ElectionTerm {
+    /// `term`, or `None` if a promotion request cannot carry it.
+    pub fn new(term: u64) -> Option<Self> {
+        match term {
+            NONE | MANUAL => None,
+            term => Some(Self(term)),
+        }
+    }
+
+    /// The raft term.
+    pub fn get(self) -> u64 {
+        self.0
     }
 }
 
 /// The stored word for "no request".
 const NONE: u64 = 0;
-/// The stored word for [`PromotionOrigin::Manual`]. No election files it:
-/// [`PromotionRequest::request`] refuses a term equal to it.
+/// The stored word for [`PromotionOrigin::Manual`]. No [`ElectionTerm`]
+/// takes it.
 const MANUAL: u64 = u64::MAX;
 
 /// Shared one-shot promotion request. First requester wins; the origin
@@ -65,10 +110,8 @@ const MANUAL: u64 = u64::MAX;
 /// every reader is a poll on a hot-ish loop (the receive loop checks it
 /// per iteration), and first-request-wins is one compare-exchange, which
 /// needs the whole request in one word. The word encodes the origin as
-/// `0` = none, `u64::MAX` = manual, any other value = the election term.
-/// An election term is never 0 (openraft's first election is term 1), and
-/// the one term the encoding cannot carry, `u64::MAX`, is refused rather
-/// than misread as manual.
+/// `0` = none, `u64::MAX` = manual, any other value = the election term,
+/// which [`ElectionTerm`] keeps off both sentinels.
 #[derive(Clone, Debug)]
 pub struct PromotionRequest(Arc<AtomicU64>);
 
@@ -88,20 +131,11 @@ impl PromotionRequest {
     /// call filed the request, `false` if one was already pending — the
     /// first request wins and later ones are ignored, so a manual
     /// `PROMOTE` racing an auto-promotion cannot retarget an in-flight
-    /// transition — or if `origin` is an election at term `u64::MAX`,
-    /// the manual sentinel's word, which this handle cannot carry.
+    /// transition.
     pub fn request(&self, origin: PromotionOrigin) -> bool {
         let word = match origin {
             PromotionOrigin::Manual => MANUAL,
-            // `u64::MAX` is the manual sentinel: filing it would read
-            // back as a manual promotion. No term gets there in
-            // practice; refusing (not asserting) keeps debug and release
-            // alike and the refusal testable.
-            PromotionOrigin::Election { term: MANUAL } => return false,
-            // Term 0 is never elected (openraft starts at term 1), and
-            // `NONE` would read back as unrequested: refuse it alike.
-            PromotionOrigin::Election { term: NONE } => return false,
-            PromotionOrigin::Election { term } => term,
+            PromotionOrigin::Election { term } => term.get(),
         };
         // AcqRel success ordering: pairs with the consumers'
         // `Acquire` polls, same convention as the old bool flag.
@@ -121,7 +155,11 @@ impl PromotionRequest {
         match self.0.load(Ordering::Acquire) {
             NONE => None,
             MANUAL => Some(PromotionOrigin::Manual),
-            term => Some(PromotionOrigin::Election { term }),
+            // Only `request` stores a word, and it stores a term only
+            // from an `ElectionTerm`.
+            term => Some(PromotionOrigin::Election {
+                term: ElectionTerm(term),
+            }),
         }
     }
 }
@@ -140,15 +178,15 @@ mod tests {
     #[test]
     fn first_request_wins_and_later_ones_are_ignored() {
         let r = PromotionRequest::new();
-        assert!(r.request(PromotionOrigin::Election { term: 7 }));
-        assert_eq!(r.pending(), Some(PromotionOrigin::Election { term: 7 }));
+        assert!(r.request(PromotionOrigin::election(7)));
+        assert_eq!(r.pending(), Some(PromotionOrigin::election(7)));
         // A racing manual PROMOTE must not retarget the in-flight
         // transition to a different epoch.
         assert!(!r.request(PromotionOrigin::Manual));
-        assert_eq!(r.pending(), Some(PromotionOrigin::Election { term: 7 }));
+        assert_eq!(r.pending(), Some(PromotionOrigin::election(7)));
         // Nor a newer election.
-        assert!(!r.request(PromotionOrigin::Election { term: 8 }));
-        assert_eq!(r.pending(), Some(PromotionOrigin::Election { term: 7 }));
+        assert!(!r.request(PromotionOrigin::election(8)));
+        assert_eq!(r.pending(), Some(PromotionOrigin::election(7)));
     }
 
     #[test]
@@ -158,7 +196,7 @@ mod tests {
         assert_eq!(r.pending(), Some(PromotionOrigin::Manual));
         assert!(r.is_requested());
         // An election racing it loses.
-        assert!(!r.request(PromotionOrigin::Election { term: 3 }));
+        assert!(!r.request(PromotionOrigin::election(3)));
         assert_eq!(r.pending(), Some(PromotionOrigin::Manual));
     }
 
@@ -166,8 +204,8 @@ mod tests {
     fn clones_share_the_request() {
         let r = PromotionRequest::new();
         let requester = r.clone();
-        assert!(requester.request(PromotionOrigin::Election { term: 42 }));
-        assert_eq!(r.pending(), Some(PromotionOrigin::Election { term: 42 }));
+        assert!(requester.request(PromotionOrigin::election(42)));
+        assert_eq!(r.pending(), Some(PromotionOrigin::election(42)));
     }
 
     /// The bug the enum closes: as a raw number, the first election after
@@ -175,36 +213,47 @@ mod tests {
     #[test]
     fn an_election_at_term_1_is_not_a_manual_promotion() {
         let r = PromotionRequest::new();
-        assert!(r.request(PromotionOrigin::Election { term: 1 }));
-        assert_eq!(r.pending(), Some(PromotionOrigin::Election { term: 1 }));
+        assert!(r.request(PromotionOrigin::election(1)));
+        assert_eq!(r.pending(), Some(PromotionOrigin::election(1)));
     }
 
+    /// Every term between the sentinels round-trips, the extremes
+    /// included.
     #[test]
-    fn a_term_equal_to_the_manual_sentinel_is_refused() {
-        let r = PromotionRequest::new();
-        assert!(!r.request(PromotionOrigin::Election { term: u64::MAX }));
-        assert!(!r.is_requested());
-        assert_eq!(r.pending(), None);
-        // The refusal leaves the one-shot free for a valid request.
-        assert!(r.request(PromotionOrigin::Election { term: u64::MAX - 1 }));
+    fn election_terms_round_trip_up_to_the_sentinel() {
+        for term in [1, 2, u64::MAX - 1] {
+            let r = PromotionRequest::new();
+            assert!(r.request(PromotionOrigin::election(term)));
+            assert_eq!(r.pending(), Some(PromotionOrigin::election(term)));
+        }
+    }
+
+    /// The two words a term cannot take: "none" and manual.
+    #[test]
+    fn the_sentinel_words_are_not_election_terms() {
+        assert_eq!(ElectionTerm::new(0), None);
+        assert_eq!(ElectionTerm::new(u64::MAX), None);
+        assert_eq!(ElectionTerm::new(1).map(ElectionTerm::get), Some(1));
         assert_eq!(
-            r.pending(),
-            Some(PromotionOrigin::Election { term: u64::MAX - 1 })
+            ElectionTerm::new(u64::MAX - 1).map(ElectionTerm::get),
+            Some(u64::MAX - 1)
         );
-    }
-
-    #[test]
-    fn a_term_0_election_is_refused() {
-        let r = PromotionRequest::new();
-        assert!(!r.request(PromotionOrigin::Election { term: 0 }));
-        assert!(!r.is_requested());
-        assert_eq!(r.pending(), None);
     }
 
     #[test]
     fn epoch_floor_per_origin() {
         assert_eq!(PromotionOrigin::Manual.epoch_floor(), 1);
-        assert_eq!(PromotionOrigin::Election { term: 1 }.epoch_floor(), 1);
-        assert_eq!(PromotionOrigin::Election { term: 9 }.epoch_floor(), 9);
+        assert_eq!(PromotionOrigin::election(1).epoch_floor(), 1);
+        assert_eq!(PromotionOrigin::election(9).epoch_floor(), 9);
+    }
+
+    /// The origin is logged with `?origin`; the term reads as a number.
+    #[test]
+    fn origin_debug_shows_the_bare_term() {
+        assert_eq!(format!("{:?}", PromotionOrigin::Manual), "Manual");
+        assert_eq!(
+            format!("{:?}", PromotionOrigin::election(7)),
+            "Election { term: 7 }"
+        );
     }
 }

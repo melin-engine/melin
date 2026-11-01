@@ -3471,7 +3471,7 @@ fn journal_promotion_epoch_bump<E: melin_app::AppEvent>(
 fn misaligned_election_term(origin: PromotionOrigin, new_epoch: u64) -> Option<u64> {
     match origin {
         PromotionOrigin::Manual => None,
-        PromotionOrigin::Election { term } => (new_epoch != term).then_some(term),
+        PromotionOrigin::Election { term } => (new_epoch != term.get()).then_some(term.get()),
     }
 }
 
@@ -5719,16 +5719,16 @@ mod promotion_epoch_tests {
 
     #[test]
     fn an_election_mints_its_term_when_above_the_fence() {
-        assert_eq!(minted_epoch(PromotionOrigin::Election { term: 1 }, 0), 1);
-        assert_eq!(minted_epoch(PromotionOrigin::Election { term: 9 }, 3), 9);
+        assert_eq!(minted_epoch(PromotionOrigin::election(1), 0), 1);
+        assert_eq!(minted_epoch(PromotionOrigin::election(9), 3), 9);
     }
 
     /// A concurrent promotion raised the fence past the term mid-drain:
     /// the epoch still moves forward, past the term.
     #[test]
     fn an_election_overtaken_by_the_fence_mints_the_next_epoch() {
-        assert_eq!(minted_epoch(PromotionOrigin::Election { term: 4 }, 4), 5);
-        assert_eq!(minted_epoch(PromotionOrigin::Election { term: 1 }, 1), 2);
+        assert_eq!(minted_epoch(PromotionOrigin::election(4), 4), 5);
+        assert_eq!(minted_epoch(PromotionOrigin::election(1), 1), 2);
     }
 
     /// An election whose minted epoch is not its term is reported, at term
@@ -5736,7 +5736,7 @@ mod promotion_epoch_tests {
     /// warning skipped it); a manual promotion never is.
     #[test]
     fn the_alignment_warning_names_only_a_misaligned_election() {
-        let election = |term| PromotionOrigin::Election { term };
+        let election = PromotionOrigin::election;
         assert_eq!(misaligned_election_term(election(1), 2), Some(1));
         assert_eq!(misaligned_election_term(election(4), 5), Some(4));
         assert_eq!(misaligned_election_term(election(1), 1), None);

@@ -21,7 +21,7 @@ use melin_journal::AckPolicyByte;
 
 use crate::ack_policy::AckPolicy;
 use crate::policy_control::AckPolicyControl;
-use crate::promotion::PromotionOrigin;
+use crate::promotion::{ElectionTerm, PromotionOrigin};
 use crate::replication::ReplicaControlPlane;
 
 /// Poll cadence for the promotion thread. Matches the codebase's
@@ -234,7 +234,10 @@ struct AutoPromotionInputs {
 ///   outrunning terms (a history of manual promotions) breaks the
 ///   alignment until enough elections pass — refuse rather than risk
 ///   an epoch collision.
-fn auto_promotion_decision(inputs: &AutoPromotionInputs) -> Result<(), &'static str> {
+/// - `ElectionTerm` — the term must be one a promotion request can carry
+///   (above, it is never 0; `u64::MAX` is not reached in practice). `Ok`
+///   hands it over, so the request filed is the term judged here.
+fn auto_promotion_decision(inputs: &AutoPromotionInputs) -> Result<ElectionTerm, &'static str> {
     if !inputs.tip_ready {
         return Err(TIP_NOT_READY);
     }
@@ -296,7 +299,8 @@ fn auto_promotion_decision(inputs: &AutoPromotionInputs) -> Result<(), &'static 
              terms) — promote manually; the alignment heals as terms advance",
         );
     }
-    Ok(())
+    ElectionTerm::new(inputs.term)
+        .ok_or("election term is past the largest a promotion can carry — promote manually")
 }
 
 /// One poll: if this node currently leads the control plane and the
@@ -365,7 +369,7 @@ fn consider_auto_promotion(
         fence_epoch,
     };
     match auto_promotion_decision(&inputs) {
-        Ok(()) => {
+        Ok(elected) => {
             // A silent peer whose *last known* tip was ahead cannot block
             // promotion — its data is unreachable, so nothing better is
             // available — but the operator must know acked events may be
@@ -385,11 +389,12 @@ fn consider_auto_promotion(
                     );
                 }
             }
-            // `request` can only lose to a racing manual PROMOTE: of the
-            // two terms it refuses, 0 fails the decision's
-            // `term > fence_epoch` and `u64::MAX` is never reached. Either
+            // `request` can only lose to a racing manual PROMOTE; either
             // way a promotion is now in flight.
-            if control.promote.request(PromotionOrigin::Election { term }) {
+            if control
+                .promote
+                .request(PromotionOrigin::Election { term: elected })
+            {
                 info!(
                     node_id = status.node_id,
                     term, "elected leader — auto-promoting this replica"
@@ -996,13 +1001,41 @@ mod tests {
                 "term {term} epoch {fence_epoch}"
             );
         }
-        // Strictly above passes.
+        // Strictly above passes, handing over the term judged.
         let inputs = AutoPromotionInputs {
             term: 4,
             fence_epoch: 3,
             ..ok_inputs()
         };
-        assert!(auto_promotion_decision(&inputs).is_ok());
+        assert_eq!(
+            auto_promotion_decision(&inputs).map(ElectionTerm::get),
+            Ok(4)
+        );
+    }
+
+    /// The one term above every epoch that a promotion request cannot
+    /// carry is refused with a reason, not filed as something else.
+    #[test]
+    fn refuses_a_term_a_promotion_cannot_carry() {
+        let inputs = AutoPromotionInputs {
+            term: u64::MAX,
+            fence_epoch: 3,
+            ..ok_inputs()
+        };
+        assert!(
+            auto_promotion_decision(&inputs)
+                .unwrap_err()
+                .contains("largest a promotion can carry")
+        );
+        // The term below it is still carried.
+        let inputs = AutoPromotionInputs {
+            term: u64::MAX - 1,
+            ..inputs
+        };
+        assert_eq!(
+            auto_promotion_decision(&inputs).map(ElectionTerm::get),
+            Ok(u64::MAX - 1)
+        );
     }
 
     // --- Peer-tip veto (the promotion-time journal-safety check) ---
@@ -1211,7 +1244,7 @@ mod tests {
         // minted is that term rather than `epoch + 1`.
         assert_eq!(
             control.promote.pending(),
-            Some(PromotionOrigin::Election { term: 7 })
+            Some(PromotionOrigin::election(7))
         );
     }
 
