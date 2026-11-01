@@ -694,7 +694,8 @@ data plane (the `replication` role in `authorized_keys`), so
 `--replication-key` is required on every raft-enabled node, primaries
 included. Election state is observable on every node's `--health-bind`
 endpoint via the `melin_raft_*` gauges (node id, term, leader, role,
-whether the driver is running) — raft-enabled replicas serve a minimal
+whether the driver is running, and on the leader the age of its last
+majority acknowledgement) — raft-enabled replicas serve a minimal
 `/metrics` for exactly this purpose.
 
 With `--raft-bind` alone the election is **observational**: leadership
@@ -1291,7 +1292,16 @@ normal-case post-recovery state.
   `melin_raft_driver_running` dropping to 0 (the control plane died —
   service continues, but automatic failover is offline) and on a
   sustained absence of any node reporting `melin_raft_is_leader 1`
-  (control-plane quorum lost).
+  (control-plane quorum lost). On the leading node,
+  `melin_raft_quorum_ack_age_ms` is the time since a majority of the
+  control plane last acknowledged its leadership (absent on other nodes,
+  before the first acknowledgement, and once the control plane has
+  stopped). On a healthy leader it rises and falls with the control
+  plane's heartbeats and stays under a second; a leader cut off from its
+  peers keeps its role, so a value that keeps growing is the sign it has
+  lost its majority (a majority it was cut off from elects a new leader
+  within the 1–2 s election timeout, so two nodes can then report
+  `melin_raft_is_leader 1`). Alert on it staying above a second.
 
 ## Limitations
 

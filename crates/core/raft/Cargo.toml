@@ -25,6 +25,13 @@ path = "src/lib.rs"
 #     allows two leaders to share a term.
 #   - `serde`: serializable RPC/log types for our postcard wire format.
 #   - `storage-v2`: the split RaftLogStorage/RaftStateMachine traits.
+# The quorum-ack age gauge's operator guidance assumes 0.9's leader
+# behaviour: no check-quorum, so a cut-off leader keeps its role while its
+# ack ages. Not pinned exactly: an `=` pin in a published library makes
+# resolution brittle for a consumer that also depends on openraft 0.9.
+# `Cargo.lock` holds the version our builds use, and the election test
+# `a_leader_that_loses_both_peers_keeps_leading_and_its_ack_ages` fails if
+# a release adds check-quorum or stops ageing the ack.
 openraft = { version = "0.9", features = ["serde", "single-term-leader", "storage-v2"] }
 # Current-thread runtime confined to the single raft-driver thread —
 # openraft requires an async runtime; the data plane stays synchronous.

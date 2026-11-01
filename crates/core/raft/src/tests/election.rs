@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::driver::{RaftConfig, RaftHandles, RaftPeer, spawn};
+use crate::driver::{ELECTION_TIMEOUT_MAX_MS, RaftConfig, RaftHandles, RaftPeer, spawn};
 use crate::tests::tip_at;
 use base64::Engine;
 use ed25519_dalek::SigningKey;
@@ -215,6 +215,16 @@ fn await_single_leader(nodes: &[&Node]) -> u64 {
 }
 
 impl Cluster {
+    fn status(&self, id: u64) -> &RaftStatus {
+        &self
+            .nodes
+            .iter()
+            .find(|n| n.id == id)
+            .unwrap()
+            .handles
+            .status
+    }
+
     fn stop_node(&mut self, id: u64) {
         let node = self.nodes.iter_mut().find(|n| n.id == id).unwrap();
         node.shutdown.store(true, Ordering::Relaxed);
@@ -273,6 +283,128 @@ fn three_nodes_elect_exactly_one_leader_and_reelect_on_leader_loss() {
         "re-election must advance the term ({second_term} vs {first_term}) — \
          term-mints-epoch depends on this"
     );
+
+    cluster.stop_all();
+}
+
+/// Wait until `status` reports a quorum-ack age: a new leader's first
+/// majority acknowledgement lands one round trip after its election.
+fn await_quorum_ack(status: &RaftStatus) -> u64 {
+    let deadline = Instant::now() + ELECTION_DEADLINE;
+    loop {
+        if let Some(age) = status.millis_since_quorum_ack() {
+            return age;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the leader reported no quorum ack within {ELECTION_DEADLINE:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// The `melin_raft_quorum_ack_age_ms` level `docs/replication.md` tells
+/// operators to alert on: a healthy leader stays below it and a leader
+/// cut off from its peers passes it.
+const QUORUM_ACK_ALERT_AGE: Duration = Duration::from_secs(1);
+
+/// Pins the operator guidance empirically: a leader whose peers all
+/// answer never reports an age at the alert level.
+#[test]
+fn a_healthy_leaders_quorum_ack_age_stays_under_the_alert_level() {
+    const SAMPLE_FOR: Duration = Duration::from_secs(3);
+    // The age peaks (about one tick) only between a heartbeat's send and
+    // its reply, a round trip, and reads near 0 the rest of the time: a
+    // coarse sampler never sees the peak this test is about. Even this one
+    // often misses it, idle machine or not: the driver publishes only what
+    // openraft's metrics reports carry, and those are mostly taken just
+    // after an ack, so the peak reaches the status only some of the time
+    // (and a loaded machine's overshooting sleep adds to the misses). That
+    // only weakens the bound for the run (the reported max shows it, under
+    // `--nocapture`: a maximum of 0 means the run proved nothing); it
+    // cannot fail a healthy cluster.
+    const SAMPLE_EVERY: Duration = Duration::from_millis(1);
+
+    let mut cluster = start_cluster(3);
+    let refs: Vec<&Node> = cluster.nodes.iter().collect();
+    let leader = await_single_leader(&refs);
+    let status = cluster.status(leader);
+    let mut max_age = await_quorum_ack(status);
+
+    let end = Instant::now() + SAMPLE_FOR;
+    while Instant::now() < end {
+        assert_eq!(
+            status.role.load(Ordering::Relaxed),
+            RaftStatus::ROLE_LEADER,
+            "node {leader} lost leadership in a healthy cluster"
+        );
+        let age = status
+            .millis_since_quorum_ack()
+            .expect("an acknowledged leader keeps reporting an age");
+        max_age = max_age.max(age);
+        std::thread::sleep(SAMPLE_EVERY);
+    }
+    // Reported so the margin can be re-measured on other hardware; the
+    // harness captures it on a passing run, so read it with `--nocapture`.
+    eprintln!("healthy leader {leader}: max quorum-ack age {max_age} ms");
+    assert!(
+        Duration::from_millis(max_age) < QUORUM_ACK_ALERT_AGE,
+        "a healthy leader reported a quorum-ack age of {max_age} ms, at or past \
+         the {QUORUM_ACK_ALERT_AGE:?} alert level"
+    );
+
+    cluster.stop_all();
+}
+
+/// Pins the premise of the gauge: openraft 0.9 has no check-quorum, so a
+/// leader cut off from every peer keeps its role, and only its ageing
+/// quorum ack tells it apart from a healthy one. If this fails, openraft
+/// changed and the gauge's operator guidance must be revisited.
+#[test]
+fn a_leader_that_loses_both_peers_keeps_leading_and_its_ack_ages() {
+    let mut cluster = start_cluster(3);
+    let refs: Vec<&Node> = cluster.nodes.iter().collect();
+    let leader = await_single_leader(&refs);
+    await_quorum_ack(cluster.status(leader));
+
+    let followers: Vec<u64> = cluster
+        .nodes
+        .iter()
+        .map(|n| n.id)
+        .filter(|&id| id != leader)
+        .collect();
+    for id in followers {
+        cluster.stop_node(id);
+    }
+
+    // Watch the leader until its age passes both the alert level and the
+    // longest election timeout, the point by which a check-quorum leader
+    // would have stepped down. Polled rather than slept: the age is
+    // published on the leader's ticks, so a fixed sleep would race a
+    // late tick on a loaded machine; the deadline bounds the wait.
+    let stale_for = QUORUM_ACK_ALERT_AGE.max(Duration::from_millis(ELECTION_TIMEOUT_MAX_MS));
+    let status = cluster.status(leader);
+    let deadline = Instant::now() + ELECTION_DEADLINE;
+    loop {
+        assert!(status.running.load(Ordering::Relaxed));
+        assert_eq!(
+            status.role.load(Ordering::Relaxed),
+            RaftStatus::ROLE_LEADER,
+            "a leader with no reachable peer stepped down: openraft gained check-quorum"
+        );
+        let age = status
+            .millis_since_quorum_ack()
+            .expect("a leader acknowledged once keeps reporting an age");
+        if Duration::from_millis(age) > stale_for {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the quorum-ack age ({age} ms) did not grow past {stale_for:?} within \
+             {ELECTION_DEADLINE:?} with both peers gone"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     cluster.stop_all();
 }

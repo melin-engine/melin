@@ -23,6 +23,7 @@ use melin_app::auth::AuthorizedKeys;
 use melin_transport_core::health::RaftStatus;
 use openraft::Config;
 use openraft::Raft;
+use openraft::RaftMetrics;
 use openraft::ServerState;
 use openraft::error::InitializeError;
 use openraft::error::RaftError;
@@ -45,7 +46,7 @@ use crate::types::TypeConfig;
 /// stability wins. 200 ms heartbeats, 1–2 s randomized election timeout.
 const HEARTBEAT_INTERVAL_MS: u64 = 200;
 const ELECTION_TIMEOUT_MIN_MS: u64 = 1000;
-const ELECTION_TIMEOUT_MAX_MS: u64 = 2000;
+pub(crate) const ELECTION_TIMEOUT_MAX_MS: u64 = 2000;
 
 /// Range of the per-node offset added to `HEARTBEAT_INTERVAL_MS`,
 /// breaking a split-vote livelock openraft 0.9 is prone to: it
@@ -282,6 +283,20 @@ fn role_of(state: ServerState) -> u8 {
     }
 }
 
+/// Publish one raft metrics report into the status atomics: term, leader
+/// (0 for none) and role, read by the gauges and the promotion policy, and
+/// the age of the last majority acknowledgement, read by its gauge
+/// (openraft reports `None` when this node is not leading or was never
+/// acknowledged).
+fn publish_metrics(status: &RaftStatus, m: &RaftMetrics<NodeId, Node>) {
+    status.term.store(m.current_term, Ordering::Relaxed);
+    status
+        .leader_id
+        .store(m.current_leader.unwrap_or(0), Ordering::Relaxed);
+    status.role.store(role_of(m.state), Ordering::Relaxed);
+    status.set_millis_since_quorum_ack(m.millis_since_quorum_ack);
+}
+
 #[allow(clippy::too_many_arguments)] // driver assembly point; a config struct would just restate it
 async fn driver_main(
     config: RaftConfig,
@@ -492,11 +507,7 @@ async fn driver_main(
             );
         }
         let m = metrics_rx.borrow().clone();
-        status.term.store(m.current_term, Ordering::Relaxed);
-        status
-            .leader_id
-            .store(m.current_leader.unwrap_or(0), Ordering::Relaxed);
-        status.role.store(role_of(m.state), Ordering::Relaxed);
+        publish_metrics(&status, &m);
         if m.current_leader.is_some() {
             // A leader exists — elections are working, so re-arm the
             // journal-tip vote filter's liveness escape. Without this a
@@ -528,4 +539,53 @@ async fn driver_main(
     rpc_task.abort();
     let _ = rpc_task.await;
     info!(node_id = config.node_id, "raft driver stopped");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn publish_metrics_bridges_a_leaders_quorum_ack_age() {
+        let status = RaftStatus::new(1);
+        let mut m = RaftMetrics::<NodeId, Node>::new_initial(1);
+        m.current_term = 3;
+        m.current_leader = Some(1);
+        m.state = ServerState::Leader;
+        m.millis_since_quorum_ack = Some(7);
+
+        publish_metrics(&status, &m);
+
+        assert_eq!(status.term.load(Ordering::Relaxed), 3);
+        assert_eq!(status.leader_id.load(Ordering::Relaxed), 1);
+        assert_eq!(status.role.load(Ordering::Relaxed), RaftStatus::ROLE_LEADER);
+        assert_eq!(status.millis_since_quorum_ack(), Some(7));
+    }
+
+    #[test]
+    fn publish_metrics_clears_the_age_of_a_follower() {
+        // The node led before (an age is published), then follows.
+        let status = RaftStatus::new(1);
+        status.set_millis_since_quorum_ack(Some(7));
+        let mut m = RaftMetrics::<NodeId, Node>::new_initial(1);
+        m.current_term = 4;
+        m.current_leader = Some(2);
+        m.state = ServerState::Follower;
+        m.millis_since_quorum_ack = None;
+
+        publish_metrics(&status, &m);
+
+        assert_eq!(status.term.load(Ordering::Relaxed), 4);
+        assert_eq!(status.leader_id.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            status.role.load(Ordering::Relaxed),
+            RaftStatus::ROLE_FOLLOWER
+        );
+        assert_eq!(status.millis_since_quorum_ack(), None);
+
+        // No leader known maps to the 0 sentinel.
+        m.current_leader = None;
+        publish_metrics(&status, &m);
+        assert_eq!(status.leader_id.load(Ordering::Relaxed), 0);
+    }
 }
