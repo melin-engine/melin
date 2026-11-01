@@ -45,6 +45,7 @@ use tracing::warn;
 
 use crate::auth::authenticate_outbound;
 use crate::recency::{JournalTip, PeerTips, TipSource};
+use crate::rpc_server::SupersessionPolicy;
 use crate::types::Node;
 use crate::types::NodeId;
 use crate::types::TypeConfig;
@@ -252,6 +253,10 @@ pub struct RaftClientFactory {
     bind: SocketAddr,
     /// Shared with every client this factory makes (see [`BindIp`]).
     bind_ip: Arc<BindIp>,
+    /// The same fence-on-supersession policy the RPC server holds (an
+    /// `Arc` clone of it), applied to every reply; `None` when
+    /// auto-promotion is off, as on the server.
+    supersession: Option<Arc<SupersessionPolicy>>,
 }
 
 impl RaftClientFactory {
@@ -260,6 +265,7 @@ impl RaftClientFactory {
         tip: Arc<TipSource>,
         peer_tips: Arc<PeerTips>,
         bind: SocketAddr,
+        supersession: Option<Arc<SupersessionPolicy>>,
     ) -> Self {
         Self {
             signing_key,
@@ -267,6 +273,7 @@ impl RaftClientFactory {
             peer_tips,
             bind,
             bind_ip: Arc::default(),
+            supersession,
         }
     }
 }
@@ -283,6 +290,7 @@ impl RaftNetworkFactory<TypeConfig> for RaftClientFactory {
             peer_tips: Arc::clone(&self.peer_tips),
             bind: self.bind,
             bind_ip: Arc::clone(&self.bind_ip),
+            supersession: self.supersession.clone(),
             stream: None,
         }
     }
@@ -301,6 +309,8 @@ pub struct RaftClient {
     /// is how a leader learns its followers' tips (followers make no
     /// outbound RPCs, so the server-side sampling never fires on them).
     peer_tips: Arc<PeerTips>,
+    /// See [`RaftClientFactory`]'s field of the same name.
+    supersession: Option<Arc<SupersessionPolicy>>,
     /// Live authenticated connection, established on first use and dropped
     /// on any I/O error.
     stream: Option<TcpStream>,
@@ -371,6 +381,15 @@ impl RaftClient {
 
         match result {
             Ok(frame) => {
+                // A reply carries the responder's fencing epoch exactly as
+                // a request carries the sender's, from the same
+                // `TipSource`, so it is the same evidence of a newer
+                // tenure. And a serving raft leader learns of a higher
+                // epoch among its followers only here: a follower sends
+                // its leader no request.
+                if let Some(policy) = &self.supersession {
+                    policy.observe(frame.tip_epoch);
+                }
                 // Every reply envelope carries the target's journal tip —
                 // feed the promotion-time safety check (see `PeerTips`).
                 self.peer_tips.record(
