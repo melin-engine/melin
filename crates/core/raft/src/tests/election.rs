@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::driver::{RaftConfig, RaftHandles, RaftPeer, spawn};
+use crate::driver::{ELECTION_TIMEOUT_MAX_MS, RaftConfig, RaftHandles, RaftPeer, spawn};
 use crate::tests::tip_at;
 use base64::Engine;
 use ed25519_dalek::SigningKey;
@@ -315,7 +315,14 @@ fn a_healthy_leaders_quorum_ack_age_stays_under_the_alert_level() {
     const SAMPLE_FOR: Duration = Duration::from_secs(3);
     // The age peaks (about one tick) only between a heartbeat's send and
     // its reply, a round trip, and reads near 0 the rest of the time: a
-    // coarse sampler never sees the peak this test is about.
+    // coarse sampler never sees the peak this test is about. Even this one
+    // often misses it, idle machine or not: the driver publishes only what
+    // openraft's metrics reports carry, and those are mostly taken just
+    // after an ack, so the peak reaches the status only some of the time
+    // (and a loaded machine's overshooting sleep adds to the misses). That
+    // only weakens the bound for the run (the reported max shows it, under
+    // `--nocapture`: a maximum of 0 means the run proved nothing); it
+    // cannot fail a healthy cluster.
     const SAMPLE_EVERY: Duration = Duration::from_millis(1);
 
     let mut cluster = start_cluster(3);
@@ -337,7 +344,8 @@ fn a_healthy_leaders_quorum_ack_age_stays_under_the_alert_level() {
         max_age = max_age.max(age);
         std::thread::sleep(SAMPLE_EVERY);
     }
-    // Reported so the margin can be re-measured on other hardware.
+    // Reported so the margin can be re-measured on other hardware; the
+    // harness captures it on a passing run, so read it with `--nocapture`.
     eprintln!("healthy leader {leader}: max quorum-ack age {max_age} ms");
     assert!(
         Duration::from_millis(max_age) < QUORUM_ACK_ALERT_AGE,
@@ -368,23 +376,35 @@ fn a_leader_that_loses_both_peers_keeps_leading_and_its_ack_ages() {
     for id in followers {
         cluster.stop_node(id);
     }
-    std::thread::sleep(QUORUM_ACK_ALERT_AGE + Duration::from_secs(1));
 
+    // Watch the leader until its age passes both the alert level and the
+    // longest election timeout, the point by which a check-quorum leader
+    // would have stepped down. Polled rather than slept: the age is
+    // published on the leader's ticks, so a fixed sleep would race a
+    // late tick on a loaded machine; the deadline bounds the wait.
+    let stale_for = QUORUM_ACK_ALERT_AGE.max(Duration::from_millis(ELECTION_TIMEOUT_MAX_MS));
     let status = cluster.status(leader);
-    assert!(status.running.load(Ordering::Relaxed));
-    assert_eq!(
-        status.role.load(Ordering::Relaxed),
-        RaftStatus::ROLE_LEADER,
-        "a leader with no reachable peer stepped down: openraft gained check-quorum"
-    );
-    let age = status
-        .millis_since_quorum_ack()
-        .expect("a leader acknowledged once keeps reporting an age");
-    assert!(
-        Duration::from_millis(age) > QUORUM_ACK_ALERT_AGE,
-        "the quorum-ack age ({age} ms) did not grow past the {QUORUM_ACK_ALERT_AGE:?} \
-         alert level with both peers gone"
-    );
+    let deadline = Instant::now() + ELECTION_DEADLINE;
+    loop {
+        assert!(status.running.load(Ordering::Relaxed));
+        assert_eq!(
+            status.role.load(Ordering::Relaxed),
+            RaftStatus::ROLE_LEADER,
+            "a leader with no reachable peer stepped down: openraft gained check-quorum"
+        );
+        let age = status
+            .millis_since_quorum_ack()
+            .expect("a leader acknowledged once keeps reporting an age");
+        if Duration::from_millis(age) > stale_for {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the quorum-ack age ({age} ms) did not grow past {stale_for:?} within \
+             {ELECTION_DEADLINE:?} with both peers gone"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     cluster.stop_all();
 }

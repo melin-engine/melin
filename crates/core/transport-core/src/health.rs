@@ -1071,6 +1071,9 @@ impl HealthSnapshot {
         // series entirely (rather than exporting zeros) keeps dashboards
         // from suggesting a one-node "cluster" on standalone deployments.
         if let Some(raft) = &self.raft {
+            // A stopped driver never leads, regardless of the last role
+            // it published.
+            let is_leader = raft.running && raft.role == RaftStatus::ROLE_LEADER;
             // Best-effort like the main block above: a write error only
             // means the fixed metrics buffer filled, which truncates the
             // exposition rather than being actionable here.
@@ -1098,16 +1101,17 @@ impl HealthSnapshot {
                 raft.term,
                 raft.leader_id,
                 raft.role,
-                // A stopped driver never leads, regardless of the last
-                // role it published.
-                u8::from(raft.running && raft.role == RaftStatus::ROLE_LEADER),
+                u8::from(is_leader),
                 u8::from(raft.running),
             );
             // Omitted rather than exported as a number when there is no
-            // age (not leading, never acknowledged), and when the driver
-            // has stopped: a dead control plane must not show a fresh
-            // lease. Best-effort like the block above.
-            if let Some(age) = raft.quorum_ack_age_ms.filter(|_| raft.running) {
+            // age (not leading, never acknowledged), and whenever the
+            // scrape's `melin_raft_is_leader` is 0: a dead control plane
+            // must not show a fresh acknowledgement, and the driver stores
+            // role and age separately, so a snapshot taken between the two
+            // could otherwise pair a follower's role with its last age as
+            // leader. Best-effort like the block above.
+            if let Some(age) = raft.quorum_ack_age_ms.filter(|_| is_leader) {
                 let _ = write!(
                     c,
                     "# HELP melin_raft_quorum_ack_age_ms Milliseconds since a majority of the control plane last acknowledged this node as leader; absent when not leading or not yet acknowledged.\n\
@@ -1398,7 +1402,7 @@ mod tests {
         );
         assert_eq!(status.leader_id.load(Ordering::Relaxed), 0);
         assert!(!status.running.load(Ordering::Relaxed));
-        // A dead driver must not leave a fresh lease behind.
+        // A dead driver must not leave a fresh acknowledgement behind.
         assert_eq!(status.millis_since_quorum_ack(), None);
         // Term is deliberately retained for outage correlation.
         assert_eq!(status.term.load(Ordering::Relaxed), 4);
@@ -1509,6 +1513,14 @@ mod tests {
 
     #[test]
     fn quorum_ack_age_gauge_only_on_a_running_acknowledged_leader() {
+        // A follower whose snapshot still holds its last age as leader
+        // (the driver stores role and age separately) exports no age.
+        let follower = Arc::new(RaftStatus::new(5));
+        follower.set_millis_since_quorum_ack(Some(9));
+        let body = replica_prometheus_body(&follower);
+        assert!(body.contains("melin_raft_is_leader 0\n"), "{body}");
+        assert!(!body.contains("melin_raft_quorum_ack_age_ms"), "{body}");
+
         let raft = Arc::new(RaftStatus::new(4));
         raft.role.store(RaftStatus::ROLE_LEADER, Ordering::Relaxed);
         raft.leader_id.store(4, Ordering::Relaxed);

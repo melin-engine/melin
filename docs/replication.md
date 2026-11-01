@@ -1294,11 +1294,14 @@ normal-case post-recovery state.
   sustained absence of any node reporting `melin_raft_is_leader 1`
   (control-plane quorum lost). On the leading node,
   `melin_raft_quorum_ack_age_ms` is the time since a majority of the
-  control plane last acknowledged its leadership (absent on other nodes
-  and before the first acknowledgement). A healthy leader keeps it well
-  under a second; a leader cut off from its peers keeps its role, so a
-  value that keeps growing is the sign it has lost its majority. Alert on
-  it staying above a second.
+  control plane last acknowledged its leadership (absent on other nodes,
+  before the first acknowledgement, and once the control plane has
+  stopped). On a healthy leader it rises and falls with the control
+  plane's heartbeats and stays under a second; a leader cut off from its
+  peers keeps its role, so a value that keeps growing is the sign it has
+  lost its majority (a majority it was cut off from elects a new leader
+  within the 1–2 s election timeout, so two nodes can then report
+  `melin_raft_is_leader 1`). Alert on it staying above a second.
 
 ## Limitations
 

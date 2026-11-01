@@ -46,7 +46,7 @@ use crate::types::TypeConfig;
 /// stability wins. 200 ms heartbeats, 1–2 s randomized election timeout.
 const HEARTBEAT_INTERVAL_MS: u64 = 200;
 const ELECTION_TIMEOUT_MIN_MS: u64 = 1000;
-const ELECTION_TIMEOUT_MAX_MS: u64 = 2000;
+pub(crate) const ELECTION_TIMEOUT_MAX_MS: u64 = 2000;
 
 /// Range of the per-node offset added to `HEARTBEAT_INTERVAL_MS`,
 /// breaking a split-vote livelock openraft 0.9 is prone to: it
@@ -283,10 +283,11 @@ fn role_of(state: ServerState) -> u8 {
     }
 }
 
-/// Publish what the gauges and the promotion policy read from one raft
-/// metrics report: term, leader (0 for none), role, and the age of the
-/// last majority acknowledgement (openraft reports `None` when this node
-/// is not leading or was never acknowledged).
+/// Publish one raft metrics report into the status atomics: term, leader
+/// (0 for none) and role, read by the gauges and the promotion policy, and
+/// the age of the last majority acknowledgement, read by its gauge
+/// (openraft reports `None` when this node is not leading or was never
+/// acknowledged).
 fn publish_metrics(status: &RaftStatus, m: &RaftMetrics<NodeId, Node>) {
     status.term.store(m.current_term, Ordering::Relaxed);
     status
