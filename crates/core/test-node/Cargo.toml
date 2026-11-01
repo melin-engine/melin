@@ -27,6 +27,9 @@ melin-client = { workspace = true }
 # journal carries the hash chain is the test crate's choice, made through
 # its own dependency on the runtime, not this crate's.
 melin-server-runtime = { workspace = true }
+# The journal batch cap a test node's rings are sized to (`RING_CAPACITY`).
+# Without default features too, for the same reason as the runtime.
+melin-transport-core = { workspace = true }
 melin-wire-protocol = { workspace = true }
 # Only the DPDK side needs this: the process-wide EAL and the per-node
 # devices on it.

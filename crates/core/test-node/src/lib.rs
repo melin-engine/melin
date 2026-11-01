@@ -68,7 +68,7 @@ use melin_app::decoder::RequestDecoder;
 use melin_app::encoder::ResponseEncoder;
 use melin_client::{Connection, SigningKey};
 use melin_server_runtime::StartupEvents;
-use melin_server_runtime::server::ServerConfig;
+use melin_server_runtime::server::{RingCapacity, ServerConfig};
 
 /// How long a test should give a node to start serving, from [`start`]
 /// to its first authenticated client.
@@ -413,6 +413,18 @@ impl Drop for Node {
 /// io_uring rings stay small (see [`config`]).
 pub const MAX_CONNECTIONS: u64 = 64;
 
+/// The slots in each of a test node's two pipeline rings unless its test
+/// says otherwise (see [`config`]): one full journal batch
+/// ([`MAX_JOURNAL_BATCH`]), so no test's batch is cut short by the ring
+/// rather than by the journal's own cap.
+///
+/// [`MAX_JOURNAL_BATCH`]: melin_transport_core::pipeline::MAX_JOURNAL_BATCH
+pub const RING_CAPACITY: RingCapacity =
+    match RingCapacity::new(melin_transport_core::pipeline::MAX_JOURNAL_BATCH) {
+        Ok(capacity) => capacity,
+        Err(_) => panic!("a journal batch is a valid ring capacity"),
+    };
+
 /// The configuration a test starts its nodes from: production defaults
 /// ([`ServerConfig::default`]), sized for a test rather than a
 /// deployment. Override fields on top of it as with the default:
@@ -436,12 +448,22 @@ pub const MAX_CONNECTIONS: u64 = 64;
 ///   which against the default limit fails (and warns) on every node.
 ///   [`start`] and [`start_at`] set it whatever the config says.
 ///
+/// And one more, for memory rather than the locked-memory limit:
+///
+/// - **`ring_capacity`** is [`RING_CAPACITY`]. Each node's two pipeline
+///   rings are written in full when it starts, so they are resident
+///   whether used or not: at the production capacity a node of an
+///   application with wide events holds most of a GiB in them, and a
+///   parallel suite runs dozens of nodes.
+///
 /// A test that exercises the connection cap sets its own
-/// `max_connections`.
+/// `max_connections`, and one that needs a deeper ring its own
+/// `ring_capacity`.
 pub fn config() -> ServerConfig {
     ServerConfig {
         max_connections: MAX_CONNECTIONS,
         no_mlock: true,
+        ring_capacity: RING_CAPACITY,
         ..ServerConfig::default()
     }
 }

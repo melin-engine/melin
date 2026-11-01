@@ -38,7 +38,7 @@ use melin_pipeline::ring::QueueCursor;
 use tracing::{debug, error, info};
 
 use crate::cursors::{PipelineCursors, RingPos, WireSeq};
-use crate::pipeline::{INPUT_RING_CAPACITY, StageUtilization};
+use crate::pipeline::StageUtilization;
 use crate::replica_presence::ReplicaPresence;
 use melin_wire_protocol::control::RefusalKind;
 
@@ -103,10 +103,14 @@ pub struct HealthState {
 
 /// A [`QueueCursor`] that always reads 0 — used for the pipeline-cursor
 /// slots of a replica's minimal [`HealthState`], which has no client
-/// input ring.
+/// input ring, so no capacity either.
 struct ZeroCursor;
 impl QueueCursor for ZeroCursor {
     fn load(&self) -> u64 {
+        0
+    }
+
+    fn capacity(&self) -> u64 {
         0
     }
 }
@@ -492,6 +496,9 @@ struct HealthSnapshot {
     journal_seq: u64,
     replication_lag: u64,
     input_queue_depth: u64,
+    /// Slots in the input ring, read from the ring itself
+    /// ([`QueueCursor::capacity`]): the node's configured capacity.
+    input_queue_capacity: u64,
     trading: bool,
     /// Writes refused at ingress while halted — see
     /// [`HealthState::refused_writes`].
@@ -776,6 +783,7 @@ impl HealthSnapshot {
             journal_seq: journal_seq.get(),
             replication_lag,
             input_queue_depth,
+            input_queue_capacity: state.input_cursor.capacity(),
             trading,
             refused_writes: state.refused_writes.load(Ordering::Relaxed),
             ingress: state.ingress.snapshot(),
@@ -1001,7 +1009,7 @@ impl HealthSnapshot {
             self.replication_lag,
             healthy_val,
             self.input_queue_depth,
-            INPUT_RING_CAPACITY,
+            self.input_queue_capacity,
             trading_val,
             self.refused_writes,
             self.replicas_connected,
@@ -1584,11 +1592,20 @@ mod tests {
         handle.join().unwrap();
     }
 
+    /// The capacity every [`MockCursor`] reports: not the default, so a
+    /// gauge that reported a constant rather than the ring's own capacity
+    /// shows.
+    const MOCK_CAPACITY: u64 = 4096;
+
     /// Test-only QueueCursor backed by an AtomicU64.
     struct MockCursor(AtomicU64);
     impl QueueCursor for MockCursor {
         fn load(&self) -> u64 {
             self.0.load(Ordering::Relaxed)
+        }
+
+        fn capacity(&self) -> u64 {
+            MOCK_CAPACITY
         }
     }
 
@@ -1979,7 +1996,7 @@ mod tests {
         assert!(response.contains("melin_replication_lag 2\n"));
         assert!(response.contains("melin_pipeline_healthy 1\n"));
         assert!(response.contains("melin_input_queue_depth 0\n"));
-        assert!(response.contains("melin_input_queue_capacity 1048576\n"));
+        assert!(response.contains(&format!("melin_input_queue_capacity {MOCK_CAPACITY}\n")));
         assert!(response.contains("melin_trading_active 1\n"));
 
         shutdown.store(true, Ordering::Relaxed);
@@ -2295,8 +2312,8 @@ mod tests {
             "expected depth 100, response: {response}"
         );
         assert!(
-            response.contains("melin_input_queue_capacity 1048576\n"),
-            "expected capacity metric, response: {response}"
+            response.contains(&format!("melin_input_queue_capacity {MOCK_CAPACITY}\n")),
+            "expected the ring's own capacity, response: {response}"
         );
 
         shutdown.store(true, Ordering::Relaxed);

@@ -25,6 +25,10 @@ use melin_journal::JournalWrite;
 use melin_transport_core::journaled_app::JournaledApp;
 use melin_transport_core::lineage::{Lineage, LineagePolicy};
 use melin_transport_core::node_store::{NodeStore, NodeStoreError};
+/// The type of [`ServerConfig::ring_capacity`], re-exported beside it so
+/// a caller configuring a node needs no dependency of its own on the
+/// transport crate.
+pub use melin_transport_core::pipeline::RingCapacity;
 use melin_transport_core::pipeline::{
     InputSlot, OutputSlot as GenericOutputSlot, Pipeline as GenericPipeline,
     build_pipeline_with_replication,
@@ -319,6 +323,20 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 256)]
     pub replication_ring_size: usize,
 
+    /// Slots in each of the pipeline's two rings: the input ring (client
+    /// writes on their way to the journal and the application) and the
+    /// output ring (replies on their way back). A power of two, at least
+    /// 1024. Default: 1048576, about 100 ms of buffering at 10M events/s.
+    ///
+    /// Both rings are allocated and written in full at startup, so this
+    /// sets resident memory: capacity times the application's input slot
+    /// plus capacity times its output slot, which grow with how wide the
+    /// application's events and replies are. A smaller ring uses less
+    /// memory and absorbs shorter bursts; a burst that outlasts it is
+    /// answered busy rather than queued.
+    #[arg(long, default_value_t = RingCapacity::DEFAULT)]
+    pub ring_capacity: RingCapacity,
+
     /// Ack policy: which copies of an event must exist before its
     /// response is released. One of:
     ///
@@ -576,6 +594,7 @@ impl Default for ServerConfig {
             replication_heartbeat_secs: 5,
             replication_pipeline_depth: DEFAULT_REPLICATION_PIPELINE_DEPTH,
             replication_ring_size: 256,
+            ring_capacity: RingCapacity::DEFAULT,
             ack_policy: crate::ack_policy::AckPolicy::DiskAndRam,
             no_degraded_acks: false,
             degraded_ack_grace_ms: crate::durability_gate::DEFAULT_DEGRADED_ACK_GRACE_MS,
@@ -1196,6 +1215,7 @@ where
             &control,
             config.snapshot_interval_ms,
             config.cores,
+            config.ring_capacity,
             config.journal_staging_mode.into(),
             config.group_commit_delay(),
             config.replication_pipeline_depth,
@@ -1813,6 +1833,7 @@ where
         enable_replication,
         config.max_journal_batch,
         config.replication_ring_size,
+        config.ring_capacity,
         config.cores.stage_waits(),
         enable_event_publisher,
         enable_shadow,
@@ -2708,6 +2729,7 @@ where
             &control,
             config.snapshot_interval_ms,
             config.cores,
+            config.ring_capacity,
             config.journal_staging_mode.into(),
             config.group_commit_delay(),
             config.replication_pipeline_depth,
@@ -3017,6 +3039,7 @@ where
         enable_replication,
         config.max_journal_batch,
         config.replication_ring_size,
+        config.ring_capacity,
         config.cores.stage_waits(),
         enable_event_publisher,
         enable_shadow,
@@ -4374,6 +4397,36 @@ mod tests {
             forgotten_value.is_err(),
             "a forgotten value must error, not swallow the next flag"
         );
+    }
+
+    /// `--ring-capacity` defaults to the pipeline's default, on a bare
+    /// command line and in `ServerConfig::default()` alike; a power of two
+    /// at or above the minimum parses, and anything else is refused at the
+    /// command line rather than reaching a ring builder.
+    #[test]
+    fn the_ring_capacity_flag_takes_only_a_valid_capacity() {
+        use clap::Parser;
+        use melin_transport_core::pipeline::RingCapacity;
+
+        let parsed = super::ServerConfig::try_parse_from(["melin-server"]).expect("parses");
+        assert_eq!(parsed.ring_capacity, RingCapacity::DEFAULT);
+        assert_eq!(
+            super::ServerConfig::default().ring_capacity,
+            RingCapacity::DEFAULT
+        );
+
+        let given =
+            super::ServerConfig::try_parse_from(["melin-server", "--ring-capacity", "4096"])
+                .expect("parses");
+        assert_eq!(given.ring_capacity.slots(), 4096);
+
+        for refused in ["4097", "512", "0", "-1", "many"] {
+            assert!(
+                super::ServerConfig::try_parse_from(["melin-server", "--ring-capacity", refused])
+                    .is_err(),
+                "--ring-capacity {refused} must be refused"
+            );
+        }
     }
 
     /// The `--dpdk-client-*-kib` defaults are the transport's own sizes,

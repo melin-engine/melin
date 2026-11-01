@@ -1568,6 +1568,8 @@ pub fn run_receiver_dpdk<A>(
     control: &super::ReplicaControlPlane,
     snapshot_interval_ms: u64,
     cores: crate::layout::PipelineCores,
+    // As the kernel-TCP `run_receiver`'s.
+    ring_capacity: melin_transport_core::pipeline::RingCapacity,
     // Passed straight to the replica's journal stage; see
     // `build_replica_pipeline_with_threads`.
     staging_mode: melin_journal::StagingMode,
@@ -2099,6 +2101,7 @@ where
                 cur_app,
                 cur_writer,
                 cores,
+                ring_capacity,
                 staging_mode,
                 snapshot_interval_ms,
                 store,

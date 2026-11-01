@@ -552,6 +552,9 @@ pub(super) fn build_replica_pipeline_with_threads<A>(
     mut app: A,
     writer: BufferedWriter<A::Event>,
     cores: crate::layout::PipelineCores,
+    // The node's `--ring-capacity`: a replica's rings are sized as its
+    // primary's would be, so it is ready to be promoted onto them.
+    ring_capacity: melin_transport_core::pipeline::RingCapacity,
     // How the replica's segment preparer materialises staged extents.
     // A replica's rotation stall sits on the ack path — under
     // `disk+ram`/`two-disks` it delays the primary's ack gate — so this
@@ -608,6 +611,7 @@ where
         app,
         writer,
         4096, // max_journal_batch
+        ring_capacity,
         group_commit_delay,
         cores.stage_waits(),
         enable_shadow,
@@ -3760,6 +3764,7 @@ mod tests {
                 counter_server::Counter::default(),
                 writer,
                 cores,
+                melin_transport_core::pipeline::RingCapacity::MIN,
                 melin_journal::StagingMode::Allocate,
                 // Non-zero so the shadow thread is spawned; long enough
                 // that it never takes a snapshot.

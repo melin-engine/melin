@@ -33,6 +33,9 @@ use crate::journaled_app::JournaledApp;
 #[cfg(not(feature = "no-persist"))]
 use crate::lineage::{Lineage, LineagePolicy};
 use crate::pipeline::StageWaits;
+// The smallest ring a node takes: a test's few events never fill it, and
+// the rings stay a few hundred KiB instead of the default's hundreds of MiB.
+use crate::pipeline::RingCapacity;
 #[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
 use crate::pipeline::build_replica_pipeline;
 #[cfg(not(feature = "no-persist"))]
@@ -857,6 +860,7 @@ fn allocator_wire_seq_and_gate_cursor_agree_across_rotation() {
         false,
         MAX_JOURNAL_BATCH,
         REPLICATION_RING_CAPACITY,
+        RingCapacity::MIN,
         StageWaits::uniform(WaitStrategy::SpinThenYield),
         false,
         false,
@@ -1041,6 +1045,7 @@ fn recovery_resumes_allocator_wire_and_gate_agreement() {
             false,
             MAX_JOURNAL_BATCH,
             REPLICATION_RING_CAPACITY,
+            RingCapacity::MIN,
             StageWaits::uniform(WaitStrategy::SpinThenYield),
             false,
             false,
@@ -1102,6 +1107,7 @@ fn recovery_resumes_allocator_wire_and_gate_agreement() {
         false,
         MAX_JOURNAL_BATCH,
         REPLICATION_RING_CAPACITY,
+        RingCapacity::MIN,
         StageWaits::uniform(WaitStrategy::SpinThenYield),
         false,
         false,
@@ -1205,6 +1211,7 @@ fn replica_fsync_state_starts_at_the_journal_it_was_built_over() {
         TestApp::new(),
         writer,
         MAX_JOURNAL_BATCH,
+        RingCapacity::MIN,
         Duration::ZERO,
         StageWaits::uniform(WaitStrategy::SpinThenYield),
         false,
@@ -1255,6 +1262,7 @@ fn replica_stage_at_3(
         TestApp::new(),
         writer,
         MAX_JOURNAL_BATCH,
+        RingCapacity::MIN,
         Duration::ZERO,
         StageWaits::uniform(WaitStrategy::SpinThenYield),
         false,
@@ -1414,6 +1422,7 @@ fn replica_ack_cursor_tracks_primary_sequences_across_local_rotation() {
         TestApp::new(),
         writer,
         MAX_JOURNAL_BATCH,
+        RingCapacity::MIN,
         Duration::ZERO,
         StageWaits::uniform(WaitStrategy::SpinThenYield),
         false,
@@ -1566,6 +1575,7 @@ fn full_pipeline_journal_and_matching_parallel() {
         false,
         MAX_JOURNAL_BATCH,
         REPLICATION_RING_CAPACITY,
+        RingCapacity::MIN,
         StageWaits::uniform(WaitStrategy::SpinThenYield),
         false,
         false,
@@ -1638,6 +1648,7 @@ fn journal_stage_sends_replication_batches() {
         true,
         MAX_JOURNAL_BATCH,
         REPLICATION_RING_CAPACITY,
+        RingCapacity::MIN,
         StageWaits::uniform(WaitStrategy::SpinThenYield),
         false,
         false,
@@ -1759,6 +1770,7 @@ fn replica_quorum_always_starts_disengaged() {
             false,
             MAX_JOURNAL_BATCH,
             REPLICATION_RING_CAPACITY,
+            RingCapacity::MIN,
             StageWaits::uniform(WaitStrategy::SpinThenYield),
             false,
             false,
@@ -1782,6 +1794,7 @@ fn replica_quorum_always_starts_disengaged() {
             true,
             MAX_JOURNAL_BATCH,
             REPLICATION_RING_CAPACITY,
+            RingCapacity::MIN,
             StageWaits::uniform(WaitStrategy::SpinThenYield),
             false,
             false,
@@ -1818,6 +1831,7 @@ fn event_publisher_reads_only_what_the_response_stage_committed() {
             false,
             MAX_JOURNAL_BATCH,
             REPLICATION_RING_CAPACITY,
+            RingCapacity::MIN,
             StageWaits::uniform(WaitStrategy::SpinThenYield),
             enable_event_publisher,
             false,
@@ -2003,6 +2017,7 @@ fn primary_and_replica_journals_contiguous_and_chain_identical() {
         true,
         MAX_JOURNAL_BATCH,
         REPLICATION_RING_CAPACITY,
+        RingCapacity::MIN,
         StageWaits::uniform(WaitStrategy::SpinThenYield),
         false,
         false,
@@ -2016,6 +2031,7 @@ fn primary_and_replica_journals_contiguous_and_chain_identical() {
         TestApp::new(),
         replica_writer,
         MAX_JOURNAL_BATCH,
+        RingCapacity::MIN,
         Duration::ZERO,
         StageWaits::uniform(WaitStrategy::SpinThenYield),
         false,
@@ -3310,6 +3326,7 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
         true,
         MAX_JOURNAL_BATCH,
         REPLICATION_RING_CAPACITY,
+        RingCapacity::MIN,
         StageWaits::uniform(WaitStrategy::SpinThenYield),
         false,
         false,
@@ -3332,6 +3349,7 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
         TestApp::new(),
         replica_writer,
         MAX_JOURNAL_BATCH,
+        RingCapacity::MIN,
         Duration::ZERO,
         StageWaits::uniform(WaitStrategy::SpinThenYield),
         false,
@@ -4585,6 +4603,7 @@ fn stats_query_reports_durable_wire_seq_across_recovery() {
             false,
             MAX_JOURNAL_BATCH,
             REPLICATION_RING_CAPACITY,
+            RingCapacity::MIN,
             StageWaits::uniform(WaitStrategy::SpinThenYield),
             false,
             false,
@@ -4639,6 +4658,7 @@ fn stats_query_reports_durable_wire_seq_across_recovery() {
         false,
         MAX_JOURNAL_BATCH,
         REPLICATION_RING_CAPACITY,
+        RingCapacity::MIN,
         StageWaits::uniform(WaitStrategy::SpinThenYield),
         false,
         false,
@@ -4690,6 +4710,7 @@ fn a_query_changes_no_matching_stage_state() {
         false,
         MAX_JOURNAL_BATCH,
         REPLICATION_RING_CAPACITY,
+        RingCapacity::MIN,
         StageWaits::uniform(WaitStrategy::SpinThenYield),
         false,
         false,
@@ -5005,6 +5026,7 @@ fn a_repeated_request_reaches_apply_on_live_replay_and_shadow() {
         false,
         MAX_JOURNAL_BATCH,
         REPLICATION_RING_CAPACITY,
+        RingCapacity::MIN,
         StageWaits::uniform(WaitStrategy::SpinThenYield),
         false,
         false,
@@ -5200,4 +5222,88 @@ fn the_shadow_records_its_initial_lineage_until_a_change() {
         shadow.total, 12,
         "only the application events reached the application"
     );
+}
+
+/// A ring capacity is a power of two of at least the minimum; anything
+/// else is refused, by value and from text alike, and a capacity shows as
+/// the slot count it parses from.
+#[test]
+fn a_ring_capacity_is_a_power_of_two_of_at_least_the_minimum() {
+    use crate::pipeline::RingCapacityError;
+
+    let min = RingCapacity::MIN.slots();
+    assert_eq!(RingCapacity::new(min), Ok(RingCapacity::MIN));
+    assert_eq!(
+        RingCapacity::new(min * 2).map(RingCapacity::slots),
+        Ok(min * 2)
+    );
+    assert_eq!(
+        RingCapacity::new(RingCapacity::DEFAULT.slots()),
+        Ok(RingCapacity::DEFAULT)
+    );
+    assert_eq!(
+        RingCapacity::new(min / 2),
+        Err(RingCapacityError::TooSmall(min / 2))
+    );
+    assert_eq!(
+        RingCapacity::new(min + 1),
+        Err(RingCapacityError::NotAPowerOfTwo(min + 1))
+    );
+    assert_eq!(
+        RingCapacity::new(0),
+        Err(RingCapacityError::NotAPowerOfTwo(0))
+    );
+
+    assert_eq!(
+        "4096".parse::<RingCapacity>().map(RingCapacity::slots),
+        Ok(4096)
+    );
+    assert_eq!(
+        RingCapacity::DEFAULT.to_string().parse(),
+        Ok(RingCapacity::DEFAULT)
+    );
+    for refused in ["4095", "512", "", "-4096", "four"] {
+        assert!(refused.parse::<RingCapacity>().is_err(), "{refused:?}");
+    }
+}
+
+/// Both builders size both rings, and what the health endpoint reads as
+/// the input ring's capacity, from the capacity they are given.
+#[cfg(not(feature = "no-persist"))]
+#[test]
+fn the_builders_size_both_rings_from_the_capacity_given() {
+    let capacity = RingCapacity::new(2 * RingCapacity::MIN.slots()).unwrap();
+    let slots = capacity.slots() as u64;
+    let dir = tempfile::tempdir().unwrap();
+
+    let primary = build_pipeline_with_replication(
+        TestApp::new(),
+        Writer::create(&dir.path().join("primary.journal")).unwrap(),
+        Duration::ZERO,
+        Arc::new(AtomicU64::new(0)),
+        false,
+        MAX_JOURNAL_BATCH,
+        REPLICATION_RING_CAPACITY,
+        capacity,
+        StageWaits::uniform(WaitStrategy::SpinThenYield),
+        false,
+        false,
+        Arc::new(crate::fence::FenceState::new(0)),
+    );
+    assert_eq!(primary.input_producer.capacity(), slots);
+    assert_eq!(primary.input_cursor.capacity(), slots);
+    assert_eq!(primary.matching_stage.output_capacity(), slots);
+
+    let replica = crate::pipeline::build_replica_pipeline(
+        TestApp::new(),
+        Writer::create(&dir.path().join("replica.journal")).unwrap(),
+        MAX_JOURNAL_BATCH,
+        capacity,
+        Duration::ZERO,
+        StageWaits::uniform(WaitStrategy::SpinThenYield),
+        false,
+        Arc::new(crate::fence::FenceState::new(0)),
+    );
+    assert_eq!(replica.input_producer.capacity(), slots);
+    assert_eq!(replica.matching_stage.output_capacity(), slots);
 }

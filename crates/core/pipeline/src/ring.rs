@@ -528,6 +528,10 @@ impl<'a, T: Copy + Default> Drop for Batch<'a, T> {
 pub trait QueueCursor: Send + Sync {
     /// Load the current cursor value (total items published).
     fn load(&self) -> u64;
+    /// Slots in the ring the cursor reads: what a depth read from
+    /// [`load`](Self::load) is a share of. Read from the ring itself, so
+    /// a report of it cannot disagree with the ring it describes.
+    fn capacity(&self) -> u64;
 }
 
 /// Type-erased wrapper around `Arc<Shared<T>>` for reading the producer cursor.
@@ -542,6 +546,10 @@ unsafe impl<T: Send> Sync for SharedCursor<T> {}
 impl<T: Send> QueueCursor for SharedCursor<T> {
     fn load(&self) -> u64 {
         self.0.cursor.get().load(Ordering::Relaxed)
+    }
+
+    fn capacity(&self) -> u64 {
+        self.0.buffer.mask + 1
     }
 }
 
@@ -929,6 +937,22 @@ impl<T: Copy + Default> DisruptorBuilder<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cursor reader reports the ring it reads: the producer's position
+    /// as it publishes, and the capacity the ring was built with.
+    #[test]
+    fn a_cursor_reader_reports_its_rings_position_and_capacity() {
+        let (mut producer, _consumers) = DisruptorBuilder::<u64>::new(8)
+            .add_consumer()
+            .build(WaitStrategy::BusySpin);
+        let reader = producer.cursor_reader();
+        assert_eq!(reader.capacity(), 8);
+        assert_eq!(reader.capacity(), producer.capacity());
+        assert_eq!(reader.load(), 0);
+        producer.publish(1);
+        producer.publish(2);
+        assert_eq!(reader.load(), 2);
+    }
 
     /// A producer blocked on a full ring resumes once the consumer frees
     /// a slot, under either wait strategy. The consumer runs on another
