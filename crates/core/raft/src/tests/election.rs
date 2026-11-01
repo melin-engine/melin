@@ -308,8 +308,19 @@ fn await_quorum_ack(status: &RaftStatus) -> u64 {
 /// cut off from its peers passes it.
 const QUORUM_ACK_ALERT_AGE: Duration = Duration::from_secs(1);
 
-/// Pins the operator guidance empirically: a leader whose peers all
-/// answer never reports an age at the alert level.
+// The same document tells operators that a leader past the alert level no
+// longer auto-promotes, which holds only while the level is the
+// promotion filter's threshold. That threshold is derived from the raft
+// timing constants, so a retuning that moves it breaks the build here
+// rather than leaving the documentation quietly wrong.
+const _: () = assert!(
+    QUORUM_ACK_ALERT_AGE.as_millis() == crate::QUORUM_ACK_MAX_AGE.as_millis(),
+    "QUORUM_ACK_MAX_AGE moved off the documented one-second alert level: update docs/replication.md"
+);
+
+/// Pins the operator guidance and the promotion filter's liveness
+/// empirically: a leader whose peers all answer never reports an age at
+/// the alert level, nor one the filter refuses.
 #[test]
 fn a_healthy_leaders_quorum_ack_age_stays_under_the_alert_level() {
     const SAMPLE_FOR: Duration = Duration::from_secs(3);
@@ -352,14 +363,24 @@ fn a_healthy_leaders_quorum_ack_age_stays_under_the_alert_level() {
         "a healthy leader reported a quorum-ack age of {max_age} ms, at or past \
          the {QUORUM_ACK_ALERT_AGE:?} alert level"
     );
+    // Implied by the alert bound while the two levels are equal (the
+    // assertion above them), and asserted anyway so the filter's liveness
+    // stays pinned should they ever part.
+    assert!(
+        Duration::from_millis(max_age) <= crate::QUORUM_ACK_MAX_AGE,
+        "a healthy leader reported a quorum-ack age of {max_age} ms, past the {:?} \
+         auto-promotion filter",
+        crate::QUORUM_ACK_MAX_AGE
+    );
 
     cluster.stop_all();
 }
 
-/// Pins the premise of the gauge: openraft 0.9 has no check-quorum, so a
-/// leader cut off from every peer keeps its role, and only its ageing
-/// quorum ack tells it apart from a healthy one. If this fails, openraft
-/// changed and the gauge's operator guidance must be revisited.
+/// Pins the premise of the gauge and of the auto-promotion leader-lease
+/// filter: openraft 0.9 has no check-quorum, so a leader cut off from
+/// every peer keeps its role, and only its ageing quorum ack tells it
+/// apart from a healthy one. If this fails, openraft changed and the
+/// gauge's operator guidance and the filter's design must be revisited.
 #[test]
 fn a_leader_that_loses_both_peers_keeps_leading_and_its_ack_ages() {
     let mut cluster = start_cluster(3);
@@ -377,12 +398,15 @@ fn a_leader_that_loses_both_peers_keeps_leading_and_its_ack_ages() {
         cluster.stop_node(id);
     }
 
-    // Watch the leader until its age passes both the alert level and the
-    // longest election timeout, the point by which a check-quorum leader
-    // would have stepped down. Polled rather than slept: the age is
-    // published on the leader's ticks, so a fixed sleep would race a
-    // late tick on a loaded machine; the deadline bounds the wait.
-    let stale_for = QUORUM_ACK_ALERT_AGE.max(Duration::from_millis(ELECTION_TIMEOUT_MAX_MS));
+    // Watch the leader until its age passes the alert level, the
+    // promotion filter's threshold, and the longest election timeout, the
+    // point by which a check-quorum leader would have stepped down. Polled
+    // rather than slept: the age is published on the leader's ticks, so a
+    // fixed sleep would race a late tick on a loaded machine; the
+    // deadline bounds the wait.
+    let stale_for = QUORUM_ACK_ALERT_AGE
+        .max(crate::QUORUM_ACK_MAX_AGE)
+        .max(Duration::from_millis(ELECTION_TIMEOUT_MAX_MS));
     let status = cluster.status(leader);
     let deadline = Instant::now() + ELECTION_DEADLINE;
     loop {

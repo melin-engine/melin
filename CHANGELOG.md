@@ -23,9 +23,22 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   and once the node's control plane has stopped. A leader cut off from
   its peers keeps its role, so a growing value is the one sign that it
   has lost its majority.
+- **`melin_raft::QUORUM_ACK_MAX_AGE`**: the oldest quorum acknowledgement
+  the automatic-promotion policy accepts, half the control plane's
+  leader lease.
+- **`melin_transport_core::replication::archive::lineage_archives_beside`**:
+  the lineage archives a node made beside its journal or snapshot (the
+  `<name>.<reason>.<n>` directories), for any reason, sorted.
 
 ### Changed
 
+- **The last surviving replica no longer auto-promotes.** The majority
+  check that stops an isolated replica promoting (see **Fixed**) cannot
+  tell dead peers from unreachable ones: under `--raft-auto-promote`, a
+  replica whose primary and other replica are both gone used to promote
+  after the grace period; it now refuses, saying it may be partitioned,
+  and recovery is a manual `PROMOTE`. A genuine failover waits one more
+  control-plane round trip after the election.
 - **`melin_transport_core::health::RaftStatus` gains a private field**
   (the quorum-ack age, read and written through
   `millis_since_quorum_ack` and `set_millis_since_quorum_ack`), so it can
@@ -64,6 +77,17 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Fixed
 
+- **An isolated replica no longer promotes itself beside a healthy
+  primary.** Under `--raft-auto-promote`, a replica that held
+  control-plane leadership and was cut off from both other nodes promoted
+  itself and served clients beside the healthy primary for as long as the
+  partition lasted; once the network healed, either it shut the healthy
+  primary down (a needless failover onto the node holding the least data,
+  the other replica left orphaned) or both kept serving, depending on
+  which control-plane message crossed first. An isolated replica now
+  refuses to promote once it has lost its majority. The check is made
+  when the promotion starts, so a replica cut off in the instant after
+  it can still promote.
 - **An auto-promotion at raft term 1 is now checked for term/epoch
   alignment like any other.** When a concurrent promotion raises the
   fencing epoch while a node is being promoted, the node logs a warning

@@ -732,6 +732,19 @@ Auto-promotion is deliberately conservative. The elected replica
   at the cost of a few seconds of extra failover latency. The grace
   period cannot vouch for a primary whose *startup* outlasts it — see
   the bring-up rule under "Deployment rules";
+- **a majority of the control plane has not acknowledged its leadership
+  recently.** A node cut off from both other nodes can still believe it
+  leads (the control plane does not make an isolated leader step down),
+  and promoting it would depose a healthy primary that the rest of the
+  cluster still reaches. This **includes the case where both other nodes
+  are dead**: a lone survivor cannot tell that from being partitioned, so
+  it never auto-promotes, and the operator decides with a manual
+  `PROMOTE`. The `melin_raft_quorum_ack_age_ms` gauge shows how long ago
+  a majority last acknowledged the leader; past a second, it does not
+  promote. The cost on a genuine failover is small: the new leader
+  promotes once a majority has acknowledged it, one control-plane round
+  trip after its election. The check is made when the promotion starts,
+  so a leader cut off in the instant after it cannot be stopped by it;
 - it has never observed a primary since it booted **and** its own
   journal is empty — a blank node winning an election is a cluster
   bring-up race, not a failover, and must not depose a primary that is
@@ -1099,6 +1112,11 @@ Most failures resolve without operator action:
   `ACK-POLICY disk` after promotion if the new primary has no replica
   connected (forced, see "Runtime policy swap");
   restore the target policy once new replicas attach.
+  With the primary and the other replica both gone, recovery is manual
+  even under `--raft-auto-promote`: the last replica standing never
+  promotes itself (it cannot tell its peers' death from its own
+  isolation; see "Automatic failover"), so `PROMOTE` it once you have
+  confirmed the other two are down.
 - **One replica crashes, primary and other replica alive** — the
   cluster continues under the configured policy. Under `disk+ram` the
   gate is satisfied by whichever node fsyncs first plus the surviving
@@ -1301,7 +1319,9 @@ normal-case post-recovery state.
   peers keeps its role, so a value that keeps growing is the sign it has
   lost its majority (a majority it was cut off from elects a new leader
   within the 1–2 s election timeout, so two nodes can then report
-  `melin_raft_is_leader 1`). Alert on it staying above a second.
+  `melin_raft_is_leader 1`). Alert on it staying above a second: past
+  that level, a replica holding the leadership also refuses to
+  auto-promote (see "Automatic failover").
 
 ## Limitations
 

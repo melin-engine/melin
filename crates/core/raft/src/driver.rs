@@ -82,6 +82,49 @@ const HEARTBEAT_JITTER_MS: u64 = 150;
 /// (1 ms) from each other.
 const HEARTBEAT_JITTER_SPREAD: u64 = 37;
 
+/// openraft's follower lease: a follower whose vote is committed refuses
+/// every vote request until `leader_lease` has passed since it last
+/// accepted a vote-bearing RPC (`Engine::handle_vote_req`), and
+/// `EngineConfig::new` sets `leader_lease` to `election_timeout_max`.
+/// Read in openraft 0.9.25; re-derive on any upgrade (see the comment on
+/// the dependency in this crate's manifest).
+const LEADER_LEASE_MS: u64 = ELECTION_TIMEOUT_MAX_MS;
+
+/// The auto-promotion filter's threshold: a raft leader whose last
+/// majority acknowledgement is older than this does not start a
+/// promotion. Half the lease. The filter is an early refusal, not the
+/// safety mechanism, so the only constraint on it is liveness (the
+/// assertion below): it must not refuse a healthy leader. `u64`
+/// milliseconds like the timing constants it is derived from, so the
+/// derivation and the assertion stay integer arithmetic in `const`.
+const QUORUM_ACK_MAX_AGE_MS: u64 = LEADER_LEASE_MS / 2;
+
+/// The oldest majority acknowledgement the automatic-promotion policy
+/// accepts from a raft leader (half the control plane's leader lease),
+/// compared with the age the driver publishes in `RaftStatus`. An early
+/// filter, not a safety guarantee.
+pub const QUORUM_ACK_MAX_AGE: Duration = Duration::from_millis(QUORUM_ACK_MAX_AGE_MS);
+
+/// The slowest node's raft tick period: openraft ticks every
+/// `heartbeat_interval * 3 / 2` (`Raft::new`, `Tick::spawn`), a leader
+/// heartbeats on every tick (`RaftCore`'s `Notify::Tick` arm) and flushes
+/// its metrics at least once per runtime-loop wake-up
+/// (`RaftCore::runtime_loop`), and the largest heartbeat interval is
+/// [`heartbeat_interval_ms`]'s maximum.
+const MAX_TICK_PERIOD_MS: u64 = (HEARTBEAT_INTERVAL_MS + HEARTBEAT_JITTER_MS - 1) * 3 / 2;
+
+/// Allowance for one heartbeat round trip, for the liveness assertion
+/// only.
+const RTT_BUDGET_MS: u64 = 100;
+
+// A healthy leader's reported quorum-ack age peaks at about one tick plus
+// a round trip (the flush just before a heartbeat's reply lands), so the
+// filter must allow at least that, or it refuses a healthy leader.
+const _: () = assert!(
+    QUORUM_ACK_MAX_AGE_MS >= MAX_TICK_PERIOD_MS + RTT_BUDGET_MS,
+    "QUORUM_ACK_MAX_AGE would refuse a healthy leader: it must cover the slowest tick plus a round trip"
+);
+
 /// Shutdown-flag poll cadence in the driver loop.
 const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
 
@@ -283,11 +326,22 @@ fn role_of(state: ServerState) -> u8 {
     }
 }
 
+/// This node's raft heartbeat interval: [`HEARTBEAT_INTERVAL_MS`] plus a
+/// deterministic per-node offset, so any two nodes with distinct ids
+/// (mod 150) get distinct tick periods by construction (see
+/// [`HEARTBEAT_JITTER_MS`]). Reduces before multiplying: node ids are
+/// arbitrary `u64`s and must not overflow.
+fn heartbeat_interval_ms(node_id: NodeId) -> u64 {
+    HEARTBEAT_INTERVAL_MS
+        + (node_id % HEARTBEAT_JITTER_MS) * HEARTBEAT_JITTER_SPREAD % HEARTBEAT_JITTER_MS
+}
+
 /// Publish one raft metrics report into the status atomics: term, leader
 /// (0 for none) and role, read by the gauges and the promotion policy, and
-/// the age of the last majority acknowledgement, read by its gauge
-/// (openraft reports `None` when this node is not leading or was never
-/// acknowledged).
+/// the age of the last majority acknowledgement, read by its gauge and by
+/// the promotion policy's leader-lease filter against
+/// [`QUORUM_ACK_MAX_AGE`] (openraft reports `None` when this node is not
+/// leading or was never acknowledged).
 fn publish_metrics(status: &RaftStatus, m: &RaftMetrics<NodeId, Node>) {
     status.term.store(m.current_term, Ordering::Relaxed);
     status
@@ -313,15 +367,9 @@ async fn driver_main(
     supersession: Option<crate::rpc_server::SupersessionPolicy>,
     shutdown: Arc<AtomicBool>,
 ) {
-    // See `HEARTBEAT_JITTER_MS`: deterministic per-node offset, so any
-    // two nodes with distinct ids (mod 150) get distinct tick periods
-    // by construction. Reduce before multiplying — node ids are
-    // arbitrary u64s and must not overflow.
-    let heartbeat_jitter =
-        (config.node_id % HEARTBEAT_JITTER_MS) * HEARTBEAT_JITTER_SPREAD % HEARTBEAT_JITTER_MS;
     let raft_config = Config {
         cluster_name: "melin-control-plane".to_owned(),
-        heartbeat_interval: HEARTBEAT_INTERVAL_MS + heartbeat_jitter,
+        heartbeat_interval: heartbeat_interval_ms(config.node_id),
         election_timeout_min: ELECTION_TIMEOUT_MIN_MS,
         election_timeout_max: ELECTION_TIMEOUT_MAX_MS,
         ..Config::default()
@@ -544,6 +592,31 @@ async fn driver_main(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heartbeat_offsets_are_distinct_and_bounded_by_the_slowest_tick() {
+        // `BTreeSet` to count distinct offsets; order only makes the
+        // failure message readable.
+        let intervals: std::collections::BTreeSet<u64> = (0..HEARTBEAT_JITTER_MS)
+            .map(heartbeat_interval_ms)
+            .collect();
+        assert_eq!(
+            intervals.len() as u64,
+            HEARTBEAT_JITTER_MS,
+            "ids 0..{HEARTBEAT_JITTER_MS} must get pairwise distinct heartbeat intervals: {intervals:?}"
+        );
+        let max = *intervals.last().expect("a non-empty id range");
+        assert_eq!(max, HEARTBEAT_INTERVAL_MS + HEARTBEAT_JITTER_MS - 1);
+        // The liveness assertion's tick bound is the real formula's.
+        assert_eq!(MAX_TICK_PERIOD_MS, max * 3 / 2);
+        assert_eq!(
+            intervals.first().copied(),
+            Some(HEARTBEAT_INTERVAL_MS),
+            "the offset range starts at 0"
+        );
+        // Any u64 id stays in range without overflowing.
+        assert!(intervals.contains(&heartbeat_interval_ms(u64::MAX)));
+    }
 
     #[test]
     fn publish_metrics_bridges_a_leaders_quorum_ack_age() {

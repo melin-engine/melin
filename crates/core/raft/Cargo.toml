@@ -25,9 +25,13 @@ path = "src/lib.rs"
 #     allows two leaders to share a term.
 #   - `serde`: serializable RPC/log types for our postcard wire format.
 #   - `storage-v2`: the split RaftLogStorage/RaftStateMachine traits.
-# The quorum-ack age gauge's operator guidance assumes 0.9's leader
-# behaviour: no check-quorum, so a cut-off leader keeps its role while its
-# ack ages. Not pinned exactly: an `=` pin in a published library makes
+# The quorum-ack age gauge's operator guidance, and the auto-promotion
+# leader-lease filter it feeds, assume 0.9's leader behaviour: no
+# check-quorum, so a cut-off leader keeps its role while its ack ages.
+# The filter's threshold, `QUORUM_ACK_MAX_AGE` (driver.rs), also relies on
+# the follower-lease semantics read in 0.9.25 (`Engine::handle_vote_req`,
+# `EngineConfig::new`) and must be re-derived on any upgrade (0.10 changes
+# elections). Not pinned exactly: an `=` pin in a published library makes
 # resolution brittle for a consumer that also depends on openraft 0.9.
 # `Cargo.lock` holds the version our builds use, and the election test
 # `a_leader_that_loses_both_peers_keeps_leading_and_its_ack_ages` fails if
