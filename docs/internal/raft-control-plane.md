@@ -509,19 +509,59 @@ stable within 0.9 is assumed.
 Length-prefixed postcard frames (`wire.rs`) carrying the tip envelope
 plus openraft's serde-enabled RPC types. Postcard over bincode: compact
 varints and no encoder/decoder configuration knobs to diverge between
-peers. Peer links authenticate with the replication Ed25519
-challenge-response (initiator proves; `Permission::Replication`;
-codecs shared with the data plane so the two paths cannot diverge), and
-the server pins each connection's authenticated key to its configured
-node id — a request claiming another id closes the connection.
-Authentication is one-way: the dialer never verifies the responder, so
-replies (votes, peer tips, and the epoch a serving node fences on) are
-trusted from whatever answers at the peer's configured address. A forged
-higher epoch can stop a serving primary (fail-safe, never a split
-brain); mutual authentication, which closes it, is follow-up work.
+peers. Peer links authenticate **mutually** with the replication Ed25519
+challenge-response (`auth.rs`; `Permission::Replication` on both keys;
+codecs shared with the data plane so the two paths cannot diverge, and
+one verification, `verify_challenge_response_identified`, for both
+directions). The dialer proves first (`answer_challenge` against the
+server's `challenge_peer`), and the server pins the authenticated key to
+its configured node id — a request claiming another id closes the
+connection. After the version exchange below, the dialer challenges the
+responder (`challenge_responder`) and accepts only the key the
+`--raft-peer` table maps to the node id it dialled: the same
+key → id table (`peer_ids`, one `Arc` shared by `RpcServerConfig` and
+`RaftClientFactory`) the server pins with, so a `--raft-peer` list that
+names one key twice is refused by `spawn` (it would collapse two members
+onto one id). Only a successful `challenge_responder` produces the
+`AuthenticatedResponder` the client sends requests and reads replies
+through, and `RaftClient` holds no other kind of link, so reading a reply
+(votes, peer tips, and the epoch the reply-path supersession fence acts
+on) from an unauthenticated responder does not compile. The stored
+membership's `Node` is openraft's `BasicNode`, an address only, so the
+key always comes from the live CLI list, and a stored node no
+`--raft-peer` entry names is not dialled at all
+(`KeyRefusal::NoKeyConfigured`, before any syscall; logged at `debug`
+per attempt, since it repeats at openraft's backoff cadence, and once at
+`warn` at startup by the driver, `unkeyed_members`, beside the warning
+that the stored membership differs from the list). A refusal (unknown
+key, another role, another peer's key, a bad signature, a frame that is
+not a challenge response) sends `AuthFailed` and closes the link before
+any request is sent, so nothing said by whatever answers at a peer's
+address can fence this node or enter `PeerTips`. The dialer logs it at
+`warn`, like the server a dialer's failed authentication
+(misconfiguration or impersonation, not a malfunction of this node), and
+`to_rpc_error` maps the typed `KeyRefusal` to `Unreachable` so openraft
+backs off. The responder logs the dialer's refusal of its key at `debug`
+only: the dialer, which knows why, has warned. Either side logs a link
+that fails *under* its own challenge (an I/O error, not a refusal) at
+`debug`, and a failure to draw the nonce (this node's own malfunction) at
+`error`. The second challenge costs one more round trip per new
+connection; raft links are long-lived, and a leadership confirmation's
+fresh connections are well inside its `heartbeat_interval` on a LAN.
 
-**The link carries a protocol version.** Right after authentication,
-and after the server has pinned the key, both ends send a version frame
+The limit that remains: the **endpoints** are authenticated, not the
+traffic. Nothing after the handshake is encrypted or integrity-checked,
+so an attacker who can sit on the control-plane network (read, inject
+or rewrite segments of an established link) can still forge a vote, a
+tip or an epoch. The control-plane network must be one an attacker
+cannot sit on; closing this would take a MAC on every frame keyed from
+the handshake, or TLS.
+
+**The link carries a protocol version.** Right after the dialer's
+authentication, and after the server has pinned its key (and before the
+dialer challenges the responder, so a peer on another release is refused
+by version, both named, rather than by a challenge it does not expect),
+both ends send a version frame
 carrying `RAFT_PROTOCOL_VERSION` (`wire.rs`) and read the other's
 (`exchange_version`; both write before reading, the frames being a few
 bytes). The frame is hand-encoded and fixed for good,

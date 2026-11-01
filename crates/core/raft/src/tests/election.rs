@@ -11,8 +11,8 @@ use crate::driver::{
     ELECTION_TIMEOUT_MAX_MS, LEADER_CONFIRM_TIMEOUT, LeaderConfirmError, RaftConfig, RaftHandles,
     RaftPeer, spawn,
 };
+use crate::tests::authorized_keys_table;
 use crate::tests::tip_at;
-use base64::Engine;
 use ed25519_dalek::SigningKey;
 use melin_app::auth::{AuthorizedKeys, NoRoles};
 use melin_transport_core::health::RaftStatus;
@@ -56,18 +56,13 @@ fn start_cluster_with_tips(tips: &[u64]) -> Cluster {
     // Reserve n distinct localhost ports — see `free_addr`.
     let addrs: Vec<String> = (0..n).map(|_| free_addr(PORT_BASE).to_string()).collect();
 
-    let table: String = keys
+    let names: Vec<String> = (1..=n).map(|id| format!("node-{id}")).collect();
+    let entries: Vec<(&SigningKey, &str, &str)> = keys
         .iter()
-        .enumerate()
-        .map(|(i, k)| {
-            format!(
-                "replication {} node-{}\n",
-                base64::engine::general_purpose::STANDARD.encode(k.verifying_key().to_bytes()),
-                i + 1
-            )
-        })
+        .zip(&names)
+        .map(|(k, name)| (k, "replication", name.as_str()))
         .collect();
-    let authorized_keys = Arc::new(AuthorizedKeys::parse::<NoRoles>(&table).unwrap());
+    let authorized_keys = Arc::new(authorized_keys_table(&entries));
 
     // Identical peer list on every node, self included — the production
     // configuration shape.
@@ -120,6 +115,18 @@ fn spawn_node_1(
     self_addr: &str,
     peer_addr: &str,
 ) -> std::io::Result<RaftHandles> {
+    let peer_key = SigningKey::from_bytes(&[2; 32]).verifying_key().to_bytes();
+    spawn_node_1_with_peer_key(dir, bind, self_addr, peer_addr, peer_key)
+}
+
+/// [`spawn_node_1`], with node 2's entry naming `peer_key`.
+fn spawn_node_1_with_peer_key(
+    dir: &TempDir,
+    bind: &str,
+    self_addr: &str,
+    peer_addr: &str,
+    peer_key: [u8; 32],
+) -> std::io::Result<RaftHandles> {
     let key = SigningKey::from_bytes(&[1; 32]);
     let peers = vec![
         RaftPeer {
@@ -130,7 +137,7 @@ fn spawn_node_1(
         RaftPeer {
             id: 2,
             addr: peer_addr.to_owned(),
-            pubkey: SigningKey::from_bytes(&[2; 32]).verifying_key().to_bytes(),
+            pubkey: peer_key,
         },
     ];
     let config = RaftConfig {
@@ -172,6 +179,29 @@ fn spawn_refuses_a_peer_a_specific_bind_cannot_dial() {
             "{message}"
         );
     }
+}
+
+/// A peer list naming this node's key for node 2 too is refused at
+/// startup, naming both entries, before the listener is bound.
+#[test]
+fn spawn_refuses_a_key_named_by_two_peer_entries() {
+    let dir = TempDir::new().unwrap();
+    let own_key = SigningKey::from_bytes(&[1; 32]).verifying_key().to_bytes();
+    let Err(e) = spawn_node_1_with_peer_key(
+        &dir,
+        "127.0.0.1:0",
+        "127.0.0.1:7001",
+        "127.0.0.1:7002",
+        own_key,
+    ) else {
+        panic!("a key shared by two --raft-peer entries must be refused");
+    };
+    assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(
+        e.to_string(),
+        "--raft-peer ids 1 and 2 name the same public key: each member needs its own \
+         replication key"
+    );
 }
 
 /// Only the peers this node dials are checked: its own entry is what the
