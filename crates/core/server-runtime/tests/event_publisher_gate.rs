@@ -38,7 +38,7 @@ use melin_pipeline::ring::Consumer;
 use melin_pipeline::wait::WaitStrategy;
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
-use melin_server_runtime::server::{JournalStagingMode, ServerConfig};
+use melin_server_runtime::server::ServerConfig;
 use melin_test_node::probe::{gauge, wait_for_gauge, wait_for_gauge_where};
 use melin_transport_core::pipeline::{OutputPayload, OutputSlot};
 use melin_transport_core::test_ports::free_addr;
@@ -151,7 +151,6 @@ fn the_publisher_sees_an_event_only_once_the_ack_policy_holds() {
         // the publisher can be given.
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,
-        journal_staging_mode: JournalStagingMode::Allocate,
         ..melin_test_node::config()
     };
     let primary = melin_test_node::start_at_with_publisher::<Counter>(

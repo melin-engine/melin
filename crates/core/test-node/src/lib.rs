@@ -68,7 +68,7 @@ use melin_app::decoder::RequestDecoder;
 use melin_app::encoder::ResponseEncoder;
 use melin_client::{Connection, SigningKey};
 use melin_server_runtime::StartupEvents;
-use melin_server_runtime::server::{PipelineCores, RingCapacity, ServerConfig};
+use melin_server_runtime::server::{JournalStagingMode, PipelineCores, RingCapacity, ServerConfig};
 
 /// How long a test should give a node to start serving, from [`start`]
 /// to its first authenticated client.
@@ -448,7 +448,8 @@ pub const RING_CAPACITY: RingCapacity =
 ///   which against the default limit fails (and warns) on every node.
 ///   [`start`] and [`start_at`] set it whatever the config says.
 ///
-/// And two more, for memory and CPU rather than the locked-memory limit:
+/// And three more, for memory, CPU and disk rather than the locked-memory
+/// limit:
 ///
 /// - **`ring_capacity`** is [`RING_CAPACITY`]. Each node's two pipeline
 ///   rings are written in full when it starts, so they are resident
@@ -461,17 +462,26 @@ pub const RING_CAPACITY: RingCapacity =
 ///   on one core, while a spinner would starve whatever shares its core,
 ///   the test's own client included. Unpinned, the scheduler places each
 ///   thread, and it waits the way an unpinned thread does.
+/// - **`journal_staging_mode`** is [`JournalStagingMode::Allocate`]. A
+///   zero fill writes over a whole staged segment with synchronous I/O,
+///   from every node at once, so a parallel suite queues on the disk: a
+///   test that needs under a second alone takes ten inside the suite. No
+///   node-level test measures the journal, and the zero fill keeps its own
+///   tests in `melin-journal`, including one that checks the two modes
+///   produce the same journal.
 ///
 /// A test that exercises the connection cap sets its own
 /// `max_connections`, one that needs a deeper ring its own
-/// `ring_capacity`, and one that needs a particular layout its own
-/// `cores`.
+/// `ring_capacity`, one that needs a particular layout its own `cores`,
+/// and one that needs the production staging its own
+/// `journal_staging_mode`.
 pub fn config() -> ServerConfig {
     ServerConfig {
         max_connections: MAX_CONNECTIONS,
         no_mlock: true,
         ring_capacity: RING_CAPACITY,
         cores: PipelineCores::unpinned(),
+        journal_staging_mode: JournalStagingMode::Allocate,
         ..ServerConfig::default()
     }
 }
@@ -1137,8 +1147,9 @@ mod tests {
 
     /// Every field [`config`] documents as differing from production
     /// does. Dropping one passes every other test, slowly or flakily:
-    /// nodes that pin and spin on the same cores, or that exhaust the
-    /// locked-memory limit, only show it under a parallel suite.
+    /// nodes that pin and spin on the same cores, that queue on the disk,
+    /// or that exhaust the locked-memory limit, only show it under a
+    /// parallel suite.
     #[test]
     fn config_sizes_a_node_for_a_parallel_suite() {
         let config = config();
@@ -1146,5 +1157,6 @@ mod tests {
         assert!(config.no_mlock);
         assert_eq!(config.ring_capacity, RING_CAPACITY);
         assert_eq!(config.cores, PipelineCores::unpinned());
+        assert_eq!(config.journal_staging_mode, JournalStagingMode::Allocate);
     }
 }
