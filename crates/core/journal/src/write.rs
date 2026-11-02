@@ -18,6 +18,7 @@ use melin_app::{AppEvent, unix_epoch_nanos};
 use crate::buffered_writer::BufferedWriter;
 use crate::error::JournalError;
 use crate::event::JournalEvent;
+use crate::prealloc::Prealloc;
 
 /// Operations a journal writer must support to be drivable by the
 /// pipeline's `JournalStage`. Excludes the `append`/`batch_append`
@@ -30,8 +31,13 @@ pub trait JournalWrite<E: AppEvent>: Sized {
     // build a writer of any concrete type without knowing which one.
     // Each implementor forwards to its inherent constructor.
 
+    // Each takes the journal's `Prealloc`: how much disk its segments
+    // reserve at a time, from the node's rotation threshold. A parameter
+    // rather than a default, so no writer is opened at a size its node
+    // did not choose.
+
     /// Create a fresh journal at `path`: a new lineage with no genesis.
-    fn create(path: &Path) -> Result<Self, JournalError>;
+    fn create(path: &Path, prealloc: Prealloc) -> Result<Self, JournalError>;
 
     /// Create a fresh journal that continues a previous segment's
     /// sequence numbers, anchored to `anchor_hash`, in a lineage whose
@@ -44,12 +50,18 @@ pub trait JournalWrite<E: AppEvent>: Sized {
         starting_sequence: u64,
         anchor_hash: [u8; 32],
         genesis_entries: Option<u64>,
+        prealloc: Prealloc,
     ) -> Result<Self, JournalError>;
 
     /// Open an existing journal for appending after recovery. The hash
     /// chain rebuilds itself from the header anchor plus the raw byte
     /// range up to `valid_end` — no chain state is threaded in.
-    fn open_append(path: &Path, last_seq: u64, valid_end: u64) -> Result<Self, JournalError>;
+    fn open_append(
+        path: &Path,
+        last_seq: u64,
+        valid_end: u64,
+        prealloc: Prealloc,
+    ) -> Result<Self, JournalError>;
 
     // ---- hot-path write API ----
 
@@ -87,6 +99,9 @@ pub trait JournalWrite<E: AppEvent>: Sized {
     fn valid_end(&self) -> u64;
     /// On-disk path of the active segment.
     fn path(&self) -> &Path;
+    /// How much disk the journal reserves at a time: what it was opened
+    /// with, and what a caller replacing it opens the replacement with.
+    fn prealloc(&self) -> Prealloc;
     /// Current chain value, `None` when the `hash-chain` feature is off.
     fn chain_hash(&self) -> Option<[u8; 32]>;
 
@@ -157,8 +172,8 @@ pub trait JournalWrite<E: AppEvent>: Sized {
 
 impl<E: AppEvent> JournalWrite<E> for BufferedWriter<E> {
     #[inline]
-    fn create(path: &Path) -> Result<Self, JournalError> {
-        BufferedWriter::create(path)
+    fn create(path: &Path, prealloc: Prealloc) -> Result<Self, JournalError> {
+        BufferedWriter::create(path, prealloc)
     }
 
     #[inline]
@@ -167,13 +182,25 @@ impl<E: AppEvent> JournalWrite<E> for BufferedWriter<E> {
         starting_sequence: u64,
         anchor_hash: [u8; 32],
         genesis_entries: Option<u64>,
+        prealloc: Prealloc,
     ) -> Result<Self, JournalError> {
-        BufferedWriter::create_continuing(path, starting_sequence, anchor_hash, genesis_entries)
+        BufferedWriter::create_continuing(
+            path,
+            starting_sequence,
+            anchor_hash,
+            genesis_entries,
+            prealloc,
+        )
     }
 
     #[inline]
-    fn open_append(path: &Path, last_seq: u64, valid_end: u64) -> Result<Self, JournalError> {
-        BufferedWriter::open_append(path, last_seq, valid_end)
+    fn open_append(
+        path: &Path,
+        last_seq: u64,
+        valid_end: u64,
+        prealloc: Prealloc,
+    ) -> Result<Self, JournalError> {
+        BufferedWriter::open_append(path, last_seq, valid_end, prealloc)
     }
 
     #[inline]
@@ -220,6 +247,11 @@ impl<E: AppEvent> JournalWrite<E> for BufferedWriter<E> {
     #[inline]
     fn path(&self) -> &Path {
         BufferedWriter::path(self)
+    }
+
+    #[inline]
+    fn prealloc(&self) -> Prealloc {
+        BufferedWriter::prealloc(self)
     }
 
     #[inline]
@@ -322,7 +354,8 @@ mod tests {
     fn trait_drives_buffered_writer() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("buf.journal");
-        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+        let mut writer =
+            BufferedWriter::<TestEvent>::create(&path, crate::test_utils::PREALLOC).unwrap();
         exercise(&mut writer, &path);
     }
 }

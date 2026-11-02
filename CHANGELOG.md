@@ -46,6 +46,12 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   busy. `ServerConfig::ring_capacity` takes a
   `melin_transport_core::pipeline::RingCapacity` (re-exported from
   `melin_server_runtime::server`), which only a valid capacity can be.
+- **`melin_journal::Prealloc`**: how much disk a journal reserves at a
+  time, from its rotation threshold (`Prealloc::for_rotation`) or given
+  outright (`Prealloc::from_bytes`); `ServerConfig::journal_prealloc` is
+  a node's, and `ServerConfig::max_journal_bytes` its threshold in bytes.
+  Under `test-utils`, `melin_journal::test_utils::PREALLOC` is the small
+  reservation a test's journal is created with.
 
 ### Changed
 
@@ -92,6 +98,21 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   cluster mixing them has no automatic failover across the two: upgrade
   every node together (see "Upgrade and rollback notes" in
   `docs/replication.md`).
+- **A journal reserves disk from its node's `--max-journal-mib`**: the
+  threshold plus an 8 MiB margin at a time, capped at the 256 MiB it
+  always reserved, instead of 256 MiB whatever the threshold. A node at
+  the default threshold, or above it, or with size-driven rotation off,
+  reserves what it did; one with a small threshold reserves little, which
+  is memory saved where the journal sits on tmpfs.
+- **Every journal writer is opened with a `Prealloc`** (breaking):
+  `BufferedWriter::{create, create_continuing, open_append}`, the same
+  constructors of `JournalWrite` (which also gains `prealloc()`),
+  `SegmentFile::{create_continuing, open_append}`,
+  `SegmentPreparer::spawn`, `JournaledApp::{create, recover,
+  recover_from_snapshot}`, `write_genesis_journal`, and the replica
+  receivers `run_receiver` and `run_receiver_dpdk` take one. A parameter
+  rather than a default, so a journal is never opened at a size its node
+  did not choose.
 - **`melin_transport_core::health::RaftStatus` gains a private field**
   (the quorum-ack age, read and written through
   `millis_since_quorum_ack` and `set_millis_since_quorum_ack`), so it can
@@ -138,6 +159,15 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   each such member at startup: with mutual authentication (see
   **Fixed**), a member without an entry has no key to require of
   whatever answers at its address.
+
+### Removed
+
+- **The process-wide journal reservation override**: the
+  `MELIN_JOURNAL_PREALLOC_MIB` environment variable and
+  `melin_journal::test_utils::PreallocOverrideGuard`. One setting for
+  every journal in the process let one node's sizing leak into another's
+  when several share a process; each journal now carries its own
+  `Prealloc`.
 
 ### Fixed
 

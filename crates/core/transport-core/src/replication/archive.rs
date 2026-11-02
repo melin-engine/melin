@@ -285,7 +285,8 @@ mod tests {
     }
 
     fn build_journal(live: &Path) {
-        let mut w = BufferedWriter::<TestEvent>::create(live).unwrap();
+        let mut w =
+            BufferedWriter::<TestEvent>::create(live, melin_journal::test_utils::PREALLOC).unwrap();
         w.append(&JournalEvent::App(TestEvent::Add(1))).unwrap();
         w.rotate_segment().unwrap();
         w.append(&JournalEvent::App(TestEvent::Add(2))).unwrap();

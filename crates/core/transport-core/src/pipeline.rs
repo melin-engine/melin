@@ -2683,6 +2683,7 @@ impl<E: AppEvent> JournalStage<E> {
             SegmentPreparer::spawn(
                 stage.writer.path().to_path_buf(),
                 stage.max_journal_bytes,
+                stage.writer.prealloc(),
                 stage.preparer_core,
                 stage.staging_mode,
             )

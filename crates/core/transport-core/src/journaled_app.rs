@@ -27,7 +27,7 @@
 use std::path::Path;
 
 use melin_app::{Application, ApplyCtx};
-use melin_journal::{JournalError, JournalReader, JournalWrite};
+use melin_journal::{JournalError, JournalReader, JournalWrite, Prealloc};
 
 use crate::dispatch::dispatch;
 use crate::lineage::Lineage;
@@ -223,9 +223,13 @@ pub struct JournaledApp<A: Application, W: JournalWrite<A::Event>> {
 impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
     /// Create a new journaled app with a fresh journal file, starting
     /// from `app` — the runtime passes the application's genesis state,
-    /// `A::default()`.
-    pub fn create(app: A, journal_path: &Path) -> Result<Self, JournaledAppError> {
-        let writer = W::create(journal_path)?;
+    /// `A::default()`. Its segments reserve disk `prealloc` at a time.
+    pub fn create(
+        app: A,
+        journal_path: &Path,
+        prealloc: Prealloc,
+    ) -> Result<Self, JournaledAppError> {
+        let writer = W::create(journal_path, prealloc)?;
         // Genesis node — no prior promotion, no policy journaled.
         Ok(Self {
             app,
@@ -238,22 +242,29 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
 
     /// Recover from an existing journal. Replays every archived segment
     /// in monotonic order, then the live segment, into the caller-
-    /// supplied empty app, then reopens the writer for appending.
-    pub fn recover(app: A, journal_path: &Path) -> Result<Self, JournaledAppError> {
-        Self::recover_inner(app, journal_path, None)
+    /// supplied empty app, then reopens the writer for appending, its
+    /// segments reserving disk `prealloc` at a time.
+    pub fn recover(
+        app: A,
+        journal_path: &Path,
+        prealloc: Prealloc,
+    ) -> Result<Self, JournaledAppError> {
+        Self::recover_inner(app, journal_path, None, prealloc)
     }
 
     /// Recover from a snapshot plus a journal directory.
     ///
     /// Loads the snapshot to restore state, then replays journal entries
     /// strictly after the snapshot's recorded sequence — across all
-    /// archived segments and the live segment.
+    /// archived segments and the live segment. The reopened writer's
+    /// segments reserve disk `prealloc` at a time.
     pub fn recover_from_snapshot(
         snapshot_path: &Path,
         journal_path: &Path,
+        prealloc: Prealloc,
     ) -> Result<Self, JournaledAppError> {
         let (app, header) = snapshot::load::<A>(snapshot_path)?;
-        Self::recover_inner(app, journal_path, Some(header))
+        Self::recover_inner(app, journal_path, Some(header), prealloc)
     }
 
     /// Shared multi-segment recovery driver.
@@ -272,6 +283,7 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         mut app: A,
         journal_path: &Path,
         snapshot: Option<snapshot::SnapshotHeader>,
+        prealloc: Prealloc,
     ) -> Result<Self, JournaledAppError> {
         let archives = melin_journal::segment::list_archives(journal_path)?;
         // The lineage as of the replayed position. Seeded from the
@@ -412,6 +424,7 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
                 anchor,
                 // Archives are non-empty here, so one was walked.
                 archived_genesis_entries.flatten(),
+                prealloc,
             )?;
             return Ok(Self {
                 app,
@@ -467,7 +480,7 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
             });
         }
 
-        let writer = W::open_append(journal_path, last_seq, valid_end)?;
+        let writer = W::open_append(journal_path, last_seq, valid_end, prealloc)?;
 
         // The writer rebuilt its chain self-containedly (header anchor +
         // raw byte re-absorption to `valid_end`); the reader accumulated
@@ -662,10 +675,15 @@ pub fn discard_genesis_staging(journal_path: &Path) -> Result<(), JournaledAppEr
 /// Writes nothing into an application: the caller recovers the installed
 /// journal, so genesis reaches the state through replay, the same path
 /// every later boot takes.
+///
+/// `prealloc` is the journal's reservation, the one the caller recovers
+/// it with: the staged file is created with it, so a genesis no larger
+/// than one chunk is written without extending it.
 pub fn write_genesis_journal<E, W>(
     journal_path: &Path,
     anchor: Option<[u8; 32]>,
     genesis: Vec<E>,
+    prealloc: Prealloc,
 ) -> Result<(), JournaledAppError>
 where
     E: melin_app::AppEvent,
@@ -689,7 +707,7 @@ where
     // staging path — it is never rotated, only renamed into place — so
     // there is no orphan of its own to sweep. The live path's is swept
     // when the installed journal is opened for appending.
-    let mut writer = W::create_continuing(&staging, 1, anchor, Some(genesis_entries))?;
+    let mut writer = W::create_continuing(&staging, 1, anchor, Some(genesis_entries), prealloc)?;
     // Flushed in batches no larger than the pipeline's own, which the
     // writer's batch buffer is sized for. Durability matters only at
     // the end — the file is not installed before then — but each flush
@@ -964,6 +982,7 @@ mod tests {
     use super::*;
     use crate::lineage::LineagePolicy;
     use crate::test_support::{TestApp, TestEvent, ack_policy_change};
+    use melin_journal::test_utils::PREALLOC;
     use melin_journal::{AckPolicyByte, BufferedWriter, JournalEvent, JournalReader};
     use std::collections::HashMap;
 
@@ -1022,14 +1041,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("journal.bin");
 
-        let ja = TestApp_::create(TestApp::new(), &path).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &path, PREALLOC).unwrap();
         // Sequences start at 1: seq=0 is the InputSlot "not yet allocated"
         // sentinel the journal stage branches on. Chain metadata lives in
         // the file header, so creation consumes no sequence.
         assert_eq!(ja.next_sequence(), 1);
         drop(ja);
 
-        let recovered = TestApp_::recover(TestApp::new(), &path).unwrap();
+        let recovered = TestApp_::recover(TestApp::new(), &path, PREALLOC).unwrap();
         assert_eq!(*recovered.app(), TestApp::new());
     }
 
@@ -1045,8 +1064,10 @@ mod tests {
         let mut genesis: Vec<TestEvent> = (1..=n).map(TestEvent::Add).collect();
         genesis.insert(1, TestEvent::Query);
 
-        write_genesis_journal::<TestEvent, BufferedWriter<TestEvent>>(&path, None, genesis)
-            .unwrap();
+        write_genesis_journal::<TestEvent, BufferedWriter<TestEvent>>(
+            &path, None, genesis, PREALLOC,
+        )
+        .unwrap();
         assert!(!genesis_staging_path(&path).exists());
 
         let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
@@ -1069,7 +1090,7 @@ mod tests {
             "the header records the journaled entries, the query not among them"
         );
 
-        let recovered = TestApp_::recover(TestApp::new(), &path).unwrap();
+        let recovered = TestApp_::recover(TestApp::new(), &path, PREALLOC).unwrap();
         assert_eq!(recovered.app().total, n * (n + 1) / 2);
         assert_eq!(recovered.next_sequence(), n + 1);
     }
@@ -1082,12 +1103,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("genesis.journal");
         let staging = genesis_staging_path(&path);
-        let mut stale = BufferedWriter::<TestEvent>::create(&staging).unwrap();
+        let mut stale = BufferedWriter::<TestEvent>::create(&staging, PREALLOC).unwrap();
         stale
             .append(&JournalEvent::App(TestEvent::Add(999)))
             .unwrap();
         drop(stale);
-        drop(BufferedWriter::<TestEvent>::create(&path).unwrap());
+        drop(BufferedWriter::<TestEvent>::create(&path, PREALLOC).unwrap());
         let anchor = melin_journal::segment::read_header_info(&path)
             .unwrap()
             .anchor_hash;
@@ -1096,6 +1117,7 @@ mod tests {
             &path,
             Some(anchor),
             vec![TestEvent::Add(2), TestEvent::Add(3)],
+            PREALLOC,
         )
         .unwrap();
 
@@ -1104,7 +1126,7 @@ mod tests {
         assert_eq!(info.anchor_hash, anchor);
         assert_eq!(info.starting_sequence, 1);
         assert_eq!(info.genesis_entries, Some(2));
-        let recovered = TestApp_::recover(TestApp::new(), &path).unwrap();
+        let recovered = TestApp_::recover(TestApp::new(), &path, PREALLOC).unwrap();
         assert_eq!(recovered.app().total, 5, "the stale prefix is gone");
         assert_eq!(recovered.next_sequence(), 3);
     }
@@ -1119,12 +1141,13 @@ mod tests {
             &path,
             None,
             vec![TestEvent::Query],
+            PREALLOC,
         )
         .unwrap();
         let info = melin_journal::segment::read_header_info(&path).unwrap();
         assert_eq!(info.genesis_entries, Some(0));
         assert_eq!(
-            TestApp_::recover(TestApp::new(), &path)
+            TestApp_::recover(TestApp::new(), &path, PREALLOC)
                 .unwrap()
                 .next_sequence(),
             1
@@ -1145,6 +1168,7 @@ mod tests {
                 1,
                 [0x3C; 32],
                 genesis_entries,
+                PREALLOC,
             )
             .unwrap();
             for k in 1..=3 {
@@ -1161,7 +1185,7 @@ mod tests {
             drop(writer);
             std::fs::remove_file(&path).unwrap();
 
-            let recovered = TestApp_::recover(TestApp::new(), &path).unwrap();
+            let recovered = TestApp_::recover(TestApp::new(), &path, PREALLOC).unwrap();
             assert_eq!(recovered.app().total, 6);
             assert_eq!(recovered.next_sequence(), 4);
             assert_eq!(
@@ -1183,9 +1207,10 @@ mod tests {
         for (lineage, swapped) in cases {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("genesis.journal");
-            let mut writer =
-                BufferedWriter::<TestEvent>::create_continuing(&path, 1, [0x5A; 32], lineage)
-                    .unwrap();
+            let mut writer = BufferedWriter::<TestEvent>::create_continuing(
+                &path, 1, [0x5A; 32], lineage, PREALLOC,
+            )
+            .unwrap();
             for k in 1..=3 {
                 writer
                     .append(&JournalEvent::App(TestEvent::Add(k)))
@@ -1203,11 +1228,12 @@ mod tests {
                     live.starting_sequence,
                     live.anchor_hash,
                     swapped,
+                    PREALLOC,
                 )
                 .unwrap(),
             );
 
-            let err = match TestApp_::recover(TestApp::new(), &path) {
+            let err = match TestApp_::recover(TestApp::new(), &path, PREALLOC) {
                 Err(e) => e,
                 Ok(_) => panic!("{lineage:?} then {swapped:?}: recovery must refuse"),
             };
@@ -1233,10 +1259,11 @@ mod tests {
                     live.starting_sequence,
                     live.anchor_hash,
                     lineage,
+                    PREALLOC,
                 )
                 .unwrap(),
             );
-            let recovered = TestApp_::recover(TestApp::new(), &path).unwrap();
+            let recovered = TestApp_::recover(TestApp::new(), &path, PREALLOC).unwrap();
             assert_eq!(recovered.app().total, 6);
         }
     }
@@ -1252,9 +1279,10 @@ mod tests {
             &path,
             None,
             vec![TestEvent::Add(1), TestEvent::Add(2), TestEvent::Add(3)],
+            PREALLOC,
         )
         .unwrap();
-        let recovered = TestApp_::recover(TestApp::new(), &path).unwrap();
+        let recovered = TestApp_::recover(TestApp::new(), &path, PREALLOC).unwrap();
         recovered.save_snapshot(&snap).unwrap();
         let (_, header) = snapshot::load::<TestApp>(&snap).unwrap();
         assert_eq!(header.genesis_entries, Some(3));
@@ -1284,7 +1312,7 @@ mod tests {
         let path = dir.path().join("epoch.journal");
 
         // Genesis: no promotion yet, so the recovered epoch is 0.
-        let ja = TestApp_::create(TestApp::new(), &path).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &path, PREALLOC).unwrap();
         assert_eq!(
             ja.recovered_lineage(),
             Lineage::GENESIS,
@@ -1302,7 +1330,7 @@ mod tests {
             ],
         ));
 
-        let recovered = TestApp_::recover(TestApp::new(), &path).unwrap();
+        let recovered = TestApp_::recover(TestApp::new(), &path, PREALLOC).unwrap();
         assert_eq!(
             recovered.recovered_lineage().epoch,
             3,
@@ -1343,7 +1371,7 @@ mod tests {
     fn recovers_the_ack_policy_from_journaled_changes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("policy.journal");
-        let ja = TestApp_::create(TestApp::new(), &path).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &path, PREALLOC).unwrap();
         drop(append_journal_events(
             ja,
             &[
@@ -1355,7 +1383,7 @@ mod tests {
             ],
         ));
 
-        let recovered = TestApp_::recover(TestApp::new(), &path).unwrap();
+        let recovered = TestApp_::recover(TestApp::new(), &path, PREALLOC).unwrap();
         assert_eq!(
             recovered.recovered_lineage(),
             Lineage {
@@ -1367,9 +1395,9 @@ mod tests {
 
         // A journal with no change recovers no policy, not a default one.
         let plain = dir.path().join("plain.journal");
-        let ja = TestApp_::create(TestApp::new(), &plain).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &plain, PREALLOC).unwrap();
         drop(append_events(ja, &[TestEvent::Add(1)]));
-        let recovered = TestApp_::recover(TestApp::new(), &plain).unwrap();
+        let recovered = TestApp_::recover(TestApp::new(), &plain, PREALLOC).unwrap();
         assert_eq!(recovered.recovered_lineage(), Lineage::GENESIS);
     }
 
@@ -1384,7 +1412,7 @@ mod tests {
         let journal_path = dir.path().join("journal.bin");
         let snap_path = dir.path().join("snap.bin");
 
-        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &journal_path, PREALLOC).unwrap();
         let mut ja = append_journal_events(
             ja,
             &[
@@ -1397,7 +1425,7 @@ mod tests {
 
         // Snapshot the recovered state (through sequence 3), then start
         // a new segment past it, so every archive is the snapshot's.
-        let mut recovered = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
+        let mut recovered = TestApp_::recover(TestApp::new(), &journal_path, PREALLOC).unwrap();
         assert_eq!(
             recovered.recovered_lineage().ack_policy,
             lineage_policy(1, false, 2, None)
@@ -1413,7 +1441,7 @@ mod tests {
             std::fs::remove_file(archive).unwrap();
         }
 
-        let re = TestApp_::recover_from_snapshot(&snap_path, &journal_path).unwrap();
+        let re = TestApp_::recover_from_snapshot(&snap_path, &journal_path, PREALLOC).unwrap();
         assert_eq!(
             re.recovered_lineage(),
             Lineage {
@@ -1428,7 +1456,7 @@ mod tests {
         // A newer change in the tail wins over the snapshot's, folded on
         // top of it: the policy before it is the snapshot's.
         drop(append_journal_events(re, &[ack_policy_change(3, false)]));
-        let re = TestApp_::recover_from_snapshot(&snap_path, &journal_path).unwrap();
+        let re = TestApp_::recover_from_snapshot(&snap_path, &journal_path, PREALLOC).unwrap();
         assert_eq!(
             re.recovered_lineage().ack_policy,
             lineage_policy(3, false, 5, Some(1))
@@ -1450,7 +1478,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("journal.bin");
 
-        let ja = TestApp_::create(TestApp::new(), &path).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &path, PREALLOC).unwrap();
         let ja = append_events(ja, &[TestEvent::Add(1), TestEvent::Add(2)]);
         drop(ja);
 
@@ -1476,7 +1504,7 @@ mod tests {
         }
         let len_before = std::fs::metadata(&path).unwrap().len();
 
-        match TestApp_::recover(TestApp::new(), &path) {
+        match TestApp_::recover(TestApp::new(), &path, PREALLOC) {
             Err(JournaledAppError::Journal(JournalError::UnsupportedVersion { version })) => {
                 assert_eq!(version, 13)
             }
@@ -1495,11 +1523,11 @@ mod tests {
         let path = dir.path().join("journal.bin");
 
         let events = [TestEvent::Add(3), TestEvent::Add(7), TestEvent::Add(100)];
-        let ja = TestApp_::create(TestApp::new(), &path).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &path, PREALLOC).unwrap();
         let ja = append_events(ja, &events);
         drop(ja);
 
-        let recovered = TestApp_::recover(TestApp::new(), &path).unwrap();
+        let recovered = TestApp_::recover(TestApp::new(), &path, PREALLOC).unwrap();
         assert_eq!(*recovered.app(), expected_state(&events));
     }
 
@@ -1515,7 +1543,7 @@ mod tests {
         let path = dir.path().join("journal.bin");
         let mut reports = Vec::new();
 
-        let mut ja = TestApp_::create(TestApp::new(), &path).unwrap();
+        let mut ja = TestApp_::create(TestApp::new(), &path, PREALLOC).unwrap();
         ja.apply_journaled(TestEvent::Add(3), &mut reports).unwrap();
         // A tick a minute ahead of the wall clock: the event after it is
         // older than the clock it set, so it must not fire due work.
@@ -1534,7 +1562,7 @@ mod tests {
         // clock.
         assert_eq!((live.total, live.ticks), (7, 3));
 
-        let recovered = TestApp_::recover(TestApp::new(), &path).unwrap();
+        let recovered = TestApp_::recover(TestApp::new(), &path, PREALLOC).unwrap();
         assert_eq!(
             *recovered.app(),
             live,
@@ -1549,9 +1577,9 @@ mod tests {
         let snap_path = dir.path().join("snap");
 
         let events = [TestEvent::Add(10), TestEvent::Add(20)];
-        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &journal_path, PREALLOC).unwrap();
         drop(append_events(ja, &events)); // journal write, writer drops
-        let ja = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
+        let ja = TestApp_::recover(TestApp::new(), &journal_path, PREALLOC).unwrap();
         ja.save_snapshot(&snap_path).unwrap();
 
         let (restored, header) = snapshot::load::<TestApp>(&snap_path).unwrap();
@@ -1571,10 +1599,10 @@ mod tests {
         let post = [TestEvent::Add(40), TestEvent::Add(50)];
 
         // Phase 1: create + pre events + snapshot.
-        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &journal_path, PREALLOC).unwrap();
         let ja = append_events(ja, &pre);
         drop(ja);
-        let ja = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
+        let ja = TestApp_::recover(TestApp::new(), &journal_path, PREALLOC).unwrap();
         ja.save_snapshot(&snap_path).unwrap();
 
         // Phase 2: append post events to the same journal file; no rotation.
@@ -1584,7 +1612,8 @@ mod tests {
         // Phase 3: recover_from_snapshot should load the snapshot (state
         // after `pre`) and replay only the entries strictly after the
         // snapshot's sequence (i.e. `post`).
-        let recovered = TestApp_::recover_from_snapshot(&snap_path, &journal_path).unwrap();
+        let recovered =
+            TestApp_::recover_from_snapshot(&snap_path, &journal_path, PREALLOC).unwrap();
 
         let all: Vec<TestEvent> = pre.iter().chain(post.iter()).copied().collect();
         assert_eq!(recovered.app().total, expected_state(&all).total);
@@ -1600,7 +1629,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("journal.bin");
 
-        let ja = TestApp_::create(TestApp::new(), &path).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &path, PREALLOC).unwrap();
         let (_app, mut writer) = ja.into_parts();
 
         // Two identical submissions under key 5, one under key 6.
@@ -1614,7 +1643,7 @@ mod tests {
         writer.flush_batch_sync().unwrap();
         drop(writer);
 
-        let recovered = TestApp_::recover(TestApp::new(), &path).unwrap();
+        let recovered = TestApp_::recover(TestApp::new(), &path, PREALLOC).unwrap();
         assert_eq!(recovered.app().total, 207);
         assert_eq!(
             recovered.app().per_key_total,
@@ -1630,7 +1659,7 @@ mod tests {
         let snap_path = dir.path().join("snap");
 
         let events = [TestEvent::Add(11), TestEvent::Add(22)];
-        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &journal_path, PREALLOC).unwrap();
         let mut ja = append_events(ja, &events);
         let pre_rotate_next_seq = ja.next_sequence();
         let pre_rotate_state = TestApp {
@@ -1657,7 +1686,8 @@ mod tests {
         // replay). recover_from_snapshot composes snapshot + (empty)
         // delta = pre_rotate_state.
         drop(ja);
-        let recovered = TestApp_::recover_from_snapshot(&snap_path, &journal_path).unwrap();
+        let recovered =
+            TestApp_::recover_from_snapshot(&snap_path, &journal_path, PREALLOC).unwrap();
         assert_eq!(*recovered.app(), pre_rotate_state);
     }
 
@@ -1680,7 +1710,7 @@ mod tests {
         let phase_c = [TestEvent::Add(100), TestEvent::Add(200)];
         let phase_d = [TestEvent::Add(1000)];
 
-        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &journal_path, PREALLOC).unwrap();
         let mut ja = append_events(ja, &phase_a);
         ja.save_snapshot(&snap_path).unwrap();
         ja.rotate_segment().unwrap();
@@ -1700,7 +1730,7 @@ mod tests {
         }
         assert!(journal_path.exists(), "live journal should exist");
 
-        let recovered = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
+        let recovered = TestApp_::recover(TestApp::new(), &journal_path, PREALLOC).unwrap();
         let expected_total = 1 + 2 + 10 + 20 + 100 + 200 + 1000;
         assert_eq!(recovered.app().total, expected_total);
         // append_events submits every event under key_hash 1.
@@ -1726,7 +1756,7 @@ mod tests {
         let phase_b = [TestEvent::Add(10), TestEvent::Add(20)];
         let phase_c = [TestEvent::Add(100), TestEvent::Add(200)];
 
-        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &journal_path, PREALLOC).unwrap();
         let mut ja = append_events(ja, &phase_a);
         ja.save_snapshot(&snap_path).unwrap();
         ja.rotate_segment().unwrap();
@@ -1737,7 +1767,7 @@ mod tests {
         drop(ja);
 
         // Replay everything to populate the app, then snapshot it.
-        let recovered = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
+        let recovered = TestApp_::recover(TestApp::new(), &journal_path, PREALLOC).unwrap();
         let expected = TestApp {
             total: recovered.app().total,
             ticks: recovered.app().ticks,
@@ -1751,7 +1781,7 @@ mod tests {
         // past every event in every archive and the live segment, so
         // all replays should be skipped — the resulting app must match
         // the snapshotted app exactly.
-        let re = TestApp_::recover_from_snapshot(&final_snap, &journal_path).unwrap();
+        let re = TestApp_::recover_from_snapshot(&final_snap, &journal_path, PREALLOC).unwrap();
         assert_eq!(*re.app(), expected);
     }
 
@@ -1777,7 +1807,7 @@ mod tests {
         let phase_a = [TestEvent::Add(1)];
         let phase_b = [TestEvent::Add(2)];
 
-        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &journal_path, PREALLOC).unwrap();
         let mut ja = append_events(ja, &phase_a);
         ja.save_snapshot(&snap_path).unwrap();
         ja.rotate_segment().unwrap(); // → archive 000001 sealed
@@ -1811,7 +1841,7 @@ mod tests {
         // check. The *absence* of any error would mean a tampered
         // archive replays silently, which is the regression this test
         // guards against.
-        let result = TestApp_::recover(TestApp::new(), &journal_path);
+        let result = TestApp_::recover(TestApp::new(), &journal_path, PREALLOC);
         let err = match result {
             Err(e) => e,
             Ok(_) => panic!("expected recovery to detect tampered archive, but it succeeded"),
@@ -1847,7 +1877,7 @@ mod tests {
                 _ => 0,
             })
             .sum();
-        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &journal_path, PREALLOC).unwrap();
         let ja = append_events(ja, &events);
         let pre_crash_seq = ja.next_sequence();
         // Drop the writer (closes the fd) before the rename so this is
@@ -1865,7 +1895,7 @@ mod tests {
         // app (test fixture limitation), so the only path that can
         // produce a populated app is the recovery replay — which is
         // exactly what this test validates.
-        let recovered = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
+        let recovered = TestApp_::recover(TestApp::new(), &journal_path, PREALLOC).unwrap();
         assert_eq!(
             recovered.app().total,
             expected_total,
@@ -1884,7 +1914,7 @@ mod tests {
         let post = [TestEvent::Add(100)];
         let ja = append_events(recovered, &post);
         drop(ja);
-        let re = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
+        let re = TestApp_::recover(TestApp::new(), &journal_path, PREALLOC).unwrap();
         assert_eq!(re.app().total, expected_total + 100);
     }
 
@@ -1897,7 +1927,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let journal_path = dir.path().join("journal.bin");
         // Path doesn't exist, no archives.
-        let result = TestApp_::recover(TestApp::new(), &journal_path);
+        let result = TestApp_::recover(TestApp::new(), &journal_path, PREALLOC);
         assert!(result.is_err(), "expected error, got Ok");
     }
 
@@ -1923,7 +1953,7 @@ mod tests {
         // Append events and run a full rotation, then drop without
         // writing anything else — Phase C state is "rotation finished,
         // no fresh events yet."
-        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &journal_path, PREALLOC).unwrap();
         let ja = append_events(ja, &events);
         let (app, mut writer) = ja.into_parts();
         writer.rotate_segment().unwrap();
@@ -1935,7 +1965,7 @@ mod tests {
         assert!(archive.exists(), "archive must exist post-rotation");
         assert!(journal_path.exists(), "live must exist post-rotation");
 
-        let recovered = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
+        let recovered = TestApp_::recover(TestApp::new(), &journal_path, PREALLOC).unwrap();
         assert_eq!(recovered.app().total, expected);
     }
 
@@ -1962,10 +1992,10 @@ mod tests {
 
         // pre events (seqs 1-2), recover to populate the app, snapshot
         // at seq 2, then post events (seqs 3-4) into the SAME segment.
-        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &journal_path, PREALLOC).unwrap();
         let ja = append_events(ja, &pre);
         drop(ja);
-        let ja = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
+        let ja = TestApp_::recover(TestApp::new(), &journal_path, PREALLOC).unwrap();
         let pre_total = ja.app().total;
         ja.save_snapshot(&snap_path).unwrap();
         let mut ja = append_events(ja, &post);
@@ -1977,7 +2007,8 @@ mod tests {
         drop(ja);
         std::fs::remove_file(&journal_path).unwrap();
 
-        let recovered = TestApp_::recover_from_snapshot(&snap_path, &journal_path).unwrap();
+        let recovered =
+            TestApp_::recover_from_snapshot(&snap_path, &journal_path, PREALLOC).unwrap();
         assert_eq!(
             recovered.app().total,
             pre_total + 10 + 20,
@@ -1997,7 +2028,7 @@ mod tests {
         // full lineage from the same snapshot.
         let ja = append_events(recovered, &[TestEvent::Add(100)]);
         drop(ja);
-        let re = TestApp_::recover_from_snapshot(&snap_path, &journal_path).unwrap();
+        let re = TestApp_::recover_from_snapshot(&snap_path, &journal_path, PREALLOC).unwrap();
         assert_eq!(re.app().total, pre_total + 10 + 20 + 100);
     }
 
@@ -2016,11 +2047,11 @@ mod tests {
 
         let pre = [TestEvent::Add(10), TestEvent::Add(20), TestEvent::Add(30)];
         let post = [TestEvent::Add(40)];
-        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &journal_path, PREALLOC).unwrap();
         let ja = append_events(ja, &pre);
         drop(ja);
         // Recover (populates app state), snapshot at the tail, rotate.
-        let mut ja = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
+        let mut ja = TestApp_::recover(TestApp::new(), &journal_path, PREALLOC).unwrap();
         let expected_pre_total = ja.app().total;
         ja.save_snapshot(&snap_path).unwrap();
         ja.rotate_segment().unwrap();
@@ -2033,7 +2064,8 @@ mod tests {
 
         // Recovery must accept (header evidence reaches the anchor) and
         // verify the snapshot hash against the live segment's anchor.
-        let recovered = TestApp_::recover_from_snapshot(&snap_path, &journal_path).unwrap();
+        let recovered =
+            TestApp_::recover_from_snapshot(&snap_path, &journal_path, PREALLOC).unwrap();
         assert_eq!(recovered.app().total, expected_pre_total + 40);
     }
 
@@ -2049,7 +2081,7 @@ mod tests {
         let snap_path = dir.path().join("snap.bin");
 
         let pre = [TestEvent::Add(1), TestEvent::Add(2)];
-        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &journal_path, PREALLOC).unwrap();
         let mut ja = append_events(ja, &pre);
         ja.save_snapshot(&snap_path).unwrap();
         ja.rotate_segment().unwrap();
@@ -2073,7 +2105,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = match TestApp_::recover_from_snapshot(&snap_path, &journal_path) {
+        let err = match TestApp_::recover_from_snapshot(&snap_path, &journal_path, PREALLOC) {
             Ok(_) => panic!("expected boundary-anchor mismatch rejection"),
             Err(e) => e,
         };
@@ -2096,8 +2128,6 @@ mod tests {
     /// journaled events — no control-entry inflation.
     #[test]
     fn snapshot_sequence_counts_only_journaled_events() {
-        let _prealloc_guard = melin_journal::test_utils::PreallocOverrideGuard::new(1024 * 1024);
-
         let dir = tempfile::tempdir().unwrap();
         let journal_path = dir.path().join("journal.bin");
         let snap_path = dir.path().join("snap.bin");
@@ -2112,10 +2142,10 @@ mod tests {
         ];
         let post = [TestEvent::Add(100), TestEvent::Add(200)];
 
-        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &journal_path, PREALLOC).unwrap();
         let ja = append_events(ja, &pre);
         drop(ja);
-        let ja = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
+        let ja = TestApp_::recover(TestApp::new(), &journal_path, PREALLOC).unwrap();
         ja.save_snapshot(&snap_path).unwrap();
 
         let (_, header) = snapshot::load::<TestApp>(&snap_path).unwrap();
@@ -2129,7 +2159,8 @@ mod tests {
         let ja = append_events(ja, &post);
         drop(ja);
 
-        let recovered = TestApp_::recover_from_snapshot(&snap_path, &journal_path).unwrap();
+        let recovered =
+            TestApp_::recover_from_snapshot(&snap_path, &journal_path, PREALLOC).unwrap();
         let all: Vec<TestEvent> = pre.iter().chain(post.iter()).copied().collect();
         assert_eq!(recovered.app().total, expected_state(&all).total);
     }
@@ -2149,7 +2180,7 @@ mod tests {
         let phase_b = [TestEvent::Add(10), TestEvent::Add(20)];
         let phase_c = [TestEvent::Add(100)];
 
-        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &journal_path, PREALLOC).unwrap();
         let mut ja = append_events(ja, &phase_a);
         ja.rotate_segment().unwrap();
         let mut ja = append_events(ja, &phase_b);
@@ -2161,7 +2192,7 @@ mod tests {
         // sequence 3, so history 1..=2 is provably missing.
         std::fs::remove_file(dir.path().join("journal.bin.000001")).unwrap();
 
-        let err = match TestApp_::recover(TestApp::new(), &journal_path) {
+        let err = match TestApp_::recover(TestApp::new(), &journal_path, PREALLOC) {
             Ok(recovered) => panic!(
                 "recovery must reject a trimmed history prefix; \
                  instead produced partial state with total = {}",
@@ -2196,7 +2227,7 @@ mod tests {
 
         // Snapshot at seq 2 (tail of phase_a), then two rotations so
         // the live segment starts at seq 5.
-        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &journal_path, PREALLOC).unwrap();
         let mut ja = append_events(ja, &phase_a);
         ja.save_snapshot(&snap_path).unwrap();
         ja.rotate_segment().unwrap();
@@ -2209,7 +2240,7 @@ mod tests {
         std::fs::remove_file(dir.path().join("journal.bin.000001")).unwrap();
         std::fs::remove_file(dir.path().join("journal.bin.000002")).unwrap();
 
-        let err = match TestApp_::recover_from_snapshot(&snap_path, &journal_path) {
+        let err = match TestApp_::recover_from_snapshot(&snap_path, &journal_path, PREALLOC) {
             Ok(_) => panic!("expected rejection of snapshot/segment gap"),
             Err(e) => e,
         };
@@ -2238,7 +2269,7 @@ mod tests {
         let phase_b = [TestEvent::Add(10), TestEvent::Add(20)];
         let phase_c = [TestEvent::Add(100)];
 
-        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &journal_path, PREALLOC).unwrap();
         let mut ja = append_events(ja, &phase_a);
         ja.rotate_segment().unwrap();
         let mut ja = append_events(ja, &phase_b);
@@ -2248,7 +2279,7 @@ mod tests {
 
         std::fs::remove_file(dir.path().join("journal.bin.000002")).unwrap();
 
-        let err = match TestApp_::recover(TestApp::new(), &journal_path) {
+        let err = match TestApp_::recover(TestApp::new(), &journal_path, PREALLOC) {
             Ok(_) => panic!("expected rejection of missing middle archive"),
             Err(e) => e,
         };
@@ -2272,7 +2303,7 @@ mod tests {
         let phase_a = [TestEvent::Add(1), TestEvent::Add(2)];
         let phase_b = [TestEvent::Add(10), TestEvent::Add(20)];
 
-        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &journal_path, PREALLOC).unwrap();
         let mut ja = append_events(ja, &phase_a);
         ja.rotate_segment().unwrap();
         ja.rotate_segment().unwrap(); // archive 000002 is empty
@@ -2286,7 +2317,7 @@ mod tests {
         let info = melin_journal::segment::read_header_info(&empty_archive).unwrap();
         assert_eq!(info.starting_sequence, 1 + phase_a.len() as u64);
 
-        let recovered = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
+        let recovered = TestApp_::recover(TestApp::new(), &journal_path, PREALLOC).unwrap();
         assert_eq!(recovered.app().total, 1 + 2 + 10 + 20);
     }
 
@@ -2300,14 +2331,15 @@ mod tests {
         let journal_path = dir.path().join("journal.bin");
         let snap_path = dir.path().join("snap.bin");
 
-        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &journal_path, PREALLOC).unwrap();
         ja.save_snapshot(&snap_path).unwrap();
         drop(ja);
 
         let (_, header) = snapshot::load::<TestApp>(&snap_path).unwrap();
         assert_eq!(header.sequence, 0, "fresh snapshot anchors at sequence 0");
 
-        let recovered = TestApp_::recover_from_snapshot(&snap_path, &journal_path).unwrap();
+        let recovered =
+            TestApp_::recover_from_snapshot(&snap_path, &journal_path, PREALLOC).unwrap();
         assert_eq!(*recovered.app(), TestApp::new());
         assert_eq!(recovered.next_sequence(), 1);
     }
@@ -2324,12 +2356,12 @@ mod tests {
         let journal_b = dir.path().join("b.journal");
         let snap_a = dir.path().join("a.snap");
 
-        let ja = TestApp_::create(TestApp::new(), &journal_a).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &journal_a, PREALLOC).unwrap();
         ja.save_snapshot(&snap_a).unwrap();
         drop(ja);
-        drop(TestApp_::create(TestApp::new(), &journal_b).unwrap());
+        drop(TestApp_::create(TestApp::new(), &journal_b, PREALLOC).unwrap());
 
-        let err = match TestApp_::recover_from_snapshot(&snap_a, &journal_b) {
+        let err = match TestApp_::recover_from_snapshot(&snap_a, &journal_b, PREALLOC) {
             Ok(_) => panic!("expected rejection of foreign empty snapshot"),
             Err(e) => e,
         };
@@ -2352,7 +2384,7 @@ mod tests {
         let journal_path = dir.path().join("journal.bin");
 
         let events = [TestEvent::Add(5), TestEvent::Add(7)];
-        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &journal_path, PREALLOC).unwrap();
         let mut ja = append_events(ja, &events);
         ja.rotate_segment().unwrap();
         ja.rotate_segment().unwrap(); // archive 000002 is empty
@@ -2360,7 +2392,7 @@ mod tests {
         // Simulate the crash window: the (empty) live vanishes.
         std::fs::remove_file(&journal_path).unwrap();
 
-        let recovered = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
+        let recovered = TestApp_::recover(TestApp::new(), &journal_path, PREALLOC).unwrap();
         assert_eq!(recovered.app().total, 5 + 7);
         assert_eq!(
             recovered.next_sequence(),
@@ -2372,7 +2404,7 @@ mod tests {
         // its anchor chained through the empty archive.
         let ja = append_events(recovered, &[TestEvent::Add(100)]);
         drop(ja);
-        let re = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
+        let re = TestApp_::recover(TestApp::new(), &journal_path, PREALLOC).unwrap();
         assert_eq!(re.app().total, 5 + 7 + 100);
     }
 
@@ -2391,7 +2423,7 @@ mod tests {
         let events = [TestEvent::Add(1), TestEvent::Add(2)];
 
         // Genuine lineage: events, snapshot at the tail, rotate.
-        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &journal_path, PREALLOC).unwrap();
         let mut ja = append_events(ja, &events);
         ja.save_snapshot(&snap_path).unwrap();
         ja.rotate_segment().unwrap();
@@ -2401,7 +2433,7 @@ mod tests {
         // request seqs — only the random anchor and payloads differ).
         let foreign_dir = tempfile::tempdir().unwrap();
         let foreign_live = foreign_dir.path().join("journal.bin");
-        let fja = TestApp_::create(TestApp::new(), &foreign_live).unwrap();
+        let fja = TestApp_::create(TestApp::new(), &foreign_live, PREALLOC).unwrap();
         let mut fja = append_events(fja, &[TestEvent::Add(9), TestEvent::Add(8)]);
         fja.rotate_segment().unwrap();
         drop(fja);
@@ -2411,7 +2443,7 @@ mod tests {
         std::fs::remove_file(&archive).unwrap();
         std::fs::copy(foreign_dir.path().join("journal.bin.000001"), &archive).unwrap();
 
-        let err = match TestApp_::recover_from_snapshot(&snap_path, &journal_path) {
+        let err = match TestApp_::recover_from_snapshot(&snap_path, &journal_path, PREALLOC) {
             Ok(_) => panic!("expected rejection of foreign covering archive"),
             Err(e) => e,
         };
@@ -2436,10 +2468,10 @@ mod tests {
 
         // Build state and snapshot at the journal's tail.
         let events = [TestEvent::Add(3), TestEvent::Add(5), TestEvent::Add(7)];
-        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &journal_path, PREALLOC).unwrap();
         let ja = append_events(ja, &events);
         drop(ja);
-        let ja = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
+        let ja = TestApp_::recover(TestApp::new(), &journal_path, PREALLOC).unwrap();
         ja.save_snapshot(&snap_path).unwrap();
         drop(ja);
 
@@ -2450,11 +2482,11 @@ mod tests {
         // Replace the journal with a stale copy that holds only the
         // first event — its tail sequence sits well below `snap_seq`.
         std::fs::remove_file(&journal_path).unwrap();
-        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &journal_path, PREALLOC).unwrap();
         let _ja = append_events(ja, &events[..1]);
         drop(_ja);
 
-        let err = match TestApp_::recover_from_snapshot(&snap_path, &journal_path) {
+        let err = match TestApp_::recover_from_snapshot(&snap_path, &journal_path, PREALLOC) {
             Ok(_) => panic!("expected recovery to reject snapshot/journal mismatch"),
             Err(e) => e,
         };
@@ -2490,10 +2522,10 @@ mod tests {
 
         // Three events → seqs 1,2,3. snap_seq = 3.
         let events = [TestEvent::Add(3), TestEvent::Add(5), TestEvent::Add(7)];
-        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &journal_path, PREALLOC).unwrap();
         let ja = append_events(ja, &events);
         drop(ja);
-        let ja = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
+        let ja = TestApp_::recover(TestApp::new(), &journal_path, PREALLOC).unwrap();
         ja.save_snapshot(&snap_path).unwrap();
         drop(ja);
 
@@ -2518,7 +2550,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = match TestApp_::recover_from_snapshot(&snap_path, &journal_path) {
+        let err = match TestApp_::recover_from_snapshot(&snap_path, &journal_path, PREALLOC) {
             Ok(_) => panic!("expected recovery to reject chain-hash mismatch"),
             Err(e) => e,
         };
@@ -2557,7 +2589,7 @@ mod tests {
         // Phase A: 2 events at seqs 1,2; snapshot anchors at seq 2 —
         // the last event before rotation, which ends up inside archive
         // 000001 after the rotate below.
-        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &journal_path, PREALLOC).unwrap();
         let mut ja = append_events(ja, &phase_a);
         ja.save_snapshot(&snap_path).unwrap();
         ja.rotate_segment().unwrap();
@@ -2585,7 +2617,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = match TestApp_::recover_from_snapshot(&snap_path, &journal_path) {
+        let err = match TestApp_::recover_from_snapshot(&snap_path, &journal_path, PREALLOC) {
             Ok(_) => panic!("expected recovery to reject archived chain-hash mismatch"),
             Err(e) => e,
         };
@@ -2617,15 +2649,6 @@ mod tests {
     /// negligible CPU pressure for neighbouring tests.
     #[test]
     fn crash_at_every_byte_offset_recovers() {
-        // Shrink the prealloc chunk so each recover()-then-append cycle
-        // doesn't pay the default 256 MiB fallocate cost. The guard
-        // scopes the override to this test and serialises with any
-        // sibling test using the same mechanism — without it, the old
-        // permanent setter could let an 8 KiB override (from
-        // sector_writer's regression test, were it in the same binary)
-        // leak across siblings and corrupt assumptions.
-        let _prealloc_guard = melin_journal::test_utils::PreallocOverrideGuard::new(1024 * 1024);
-
         let dir = tempfile::tempdir().unwrap();
         let original = dir.path().join("original.journal");
 
@@ -2637,7 +2660,7 @@ mod tests {
             TestEvent::Add(13),
             TestEvent::Add(17),
         ];
-        let ja = TestApp_::create(TestApp::new(), &original).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &original, PREALLOC).unwrap();
         let ja = append_events(ja, &events);
         drop(ja);
 
@@ -2676,14 +2699,14 @@ mod tests {
                             f.set_len(trunc_at).unwrap();
                         }
 
-                        let je = TestApp_::recover(TestApp::new(), &work).unwrap();
+                        let je = TestApp_::recover(TestApp::new(), &work, PREALLOC).unwrap();
                         assert!(je.next_sequence() >= 1, "seq underflow at byte {trunc_at}");
 
                         // Append + re-recover to prove the recovered
                         // writer is usable, not just readable.
                         let ja = append_events(je, &[TestEvent::Add(1)]);
                         drop(ja);
-                        let je2 = TestApp_::recover(TestApp::new(), &work).unwrap();
+                        let je2 = TestApp_::recover(TestApp::new(), &work, PREALLOC).unwrap();
                         assert!(
                             je2.next_sequence() >= 2,
                             "double-recovery seq too low at byte {trunc_at}"
@@ -2707,13 +2730,6 @@ mod tests {
     /// `create_continuing`.
     #[test]
     fn crash_during_snapshot_rotation_recovers() {
-        // Shrink the prealloc chunk so each iteration's
-        // `recover_from_snapshot` doesn't pay the default 256 MiB
-        // fallocate for the new live segment. RAII guard scopes the
-        // override to this test and serialises with any sibling test
-        // using the same mechanism.
-        let _prealloc_guard = melin_journal::test_utils::PreallocOverrideGuard::new(1024 * 1024);
-
         let dir = tempfile::tempdir().unwrap();
         let journal_path = dir.path().join("rotation.journal");
         let snap_path = dir.path().join("rotation.snapshot");
@@ -2721,14 +2737,14 @@ mod tests {
         let pre = [TestEvent::Add(3), TestEvent::Add(5), TestEvent::Add(7)];
         let post = [TestEvent::Add(11), TestEvent::Add(13)];
 
-        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &journal_path, PREALLOC).unwrap();
         let ja = append_events(ja, &pre);
         drop(ja);
         // Recover to populate app state from journal, then snapshot —
         // `append_events` doesn't apply to the app on the write path,
         // so an immediate snapshot would capture total=0 and trivialise
         // the missing-journal assertion at the end.
-        let mut ja = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
+        let mut ja = TestApp_::recover(TestApp::new(), &journal_path, PREALLOC).unwrap();
         ja.save_snapshot(&snap_path).unwrap();
         ja.rotate_segment().unwrap();
         let ja = append_events(ja, &post);
@@ -2772,7 +2788,7 @@ mod tests {
                 f.set_len(trunc_at).unwrap();
             }
 
-            let je = TestApp_::recover_from_snapshot(&snap_path, &work).unwrap();
+            let je = TestApp_::recover_from_snapshot(&snap_path, &work, PREALLOC).unwrap();
             assert!(
                 je.next_sequence() <= final_seq,
                 "seq overshoot at byte {trunc_at}: {} > {final_seq}",
@@ -2795,6 +2811,7 @@ mod tests {
             snap_seq + 1,
             snap_chain_hash,
             Some(0),
+            PREALLOC,
         )
         .unwrap();
         let je = JournaledApp::from_parts(snap_app, writer, header.lineage);
@@ -2830,7 +2847,7 @@ mod tests {
             })
             .sum();
 
-        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &journal_path, PREALLOC).unwrap();
         let ja = append_events(ja, &archived_events);
         let (app, mut writer) = ja.into_parts();
         writer.rotate_segment().unwrap();
@@ -2850,7 +2867,7 @@ mod tests {
         drop(writer);
         drop(app);
 
-        let recovered = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
+        let recovered = TestApp_::recover(TestApp::new(), &journal_path, PREALLOC).unwrap();
         // The 99_999 event was never durable; only the archived ones
         // count toward the recovered total.
         assert_eq!(recovered.app().total, expected_durable);
@@ -2900,7 +2917,7 @@ mod tests {
         /// A live segment holding `Add(1..=n)` at sequences `1..=n`, in
         /// its preallocated file. Returns the entry bounds.
         fn journal_with(path: &Path, n: u64) -> Vec<u64> {
-            let ja = TestApp_::create(TestApp::new(), path).unwrap();
+            let ja = TestApp_::create(TestApp::new(), path, PREALLOC).unwrap();
             drop(append_events(ja, &adds(n)));
             entry_bounds(path)
         }
@@ -2915,7 +2932,7 @@ mod tests {
         }
 
         fn refused(path: &Path) -> JournaledAppError {
-            match TestApp_::recover(TestApp::new(), path) {
+            match TestApp_::recover(TestApp::new(), path, PREALLOC) {
                 Ok(ja) => panic!(
                     "recovery accepted a corrupt journal and resumes at sequence {}",
                     ja.next_sequence()
@@ -2926,7 +2943,7 @@ mod tests {
 
         /// Recovery kept exactly `Add(1..=k)`.
         fn assert_recovers_first(path: &Path, k: u64, context: &str) {
-            let ja = TestApp_::recover(TestApp::new(), path)
+            let ja = TestApp_::recover(TestApp::new(), path, PREALLOC)
                 .unwrap_or_else(|e| panic!("{context}: recovery refused: {e}"));
             assert_eq!(ja.next_sequence(), k + 1, "{context}: resume point");
             assert_eq!(ja.app().total, k * (k + 1) / 2, "{context}: state");
@@ -2989,7 +3006,7 @@ mod tests {
         fn a_first_entry_off_the_header_starting_sequence_is_refused() {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("live.journal");
-            drop(TestApp_::create(TestApp::new(), &path).unwrap());
+            drop(TestApp_::create(TestApp::new(), &path, PREALLOC).unwrap());
             write_at(
                 &path,
                 melin_journal::codec::ENTRY_OFFSET,
@@ -3076,7 +3093,6 @@ mod tests {
         /// end, which is why the rule is bounded by one drain.
         #[test]
         fn a_drain_torn_out_of_order_recovers() {
-            let _prealloc = melin_journal::test_utils::PreallocOverrideGuard::new(1024 * 1024);
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("live.journal");
             let bounds = journal_with(&path, 10);
@@ -3099,7 +3115,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("live.journal");
             journal_with(&path, 10);
-            let mut ja = TestApp_::recover(TestApp::new(), &path).unwrap();
+            let mut ja = TestApp_::recover(TestApp::new(), &path, PREALLOC).unwrap();
             ja.rotate_segment().unwrap();
             drop(ja);
             std::fs::remove_file(&path).unwrap();
@@ -3127,7 +3143,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("live.journal");
             journal_with(&path, 5);
-            let mut ja = TestApp_::recover(TestApp::new(), &path).unwrap();
+            let mut ja = TestApp_::recover(TestApp::new(), &path, PREALLOC).unwrap();
             ja.rotate_segment().unwrap();
             drop(ja);
             std::fs::remove_file(&path).unwrap();
@@ -3157,7 +3173,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("live.journal");
             journal_with(&path, 5);
-            let mut ja = TestApp_::recover(TestApp::new(), &path).unwrap();
+            let mut ja = TestApp_::recover(TestApp::new(), &path, PREALLOC).unwrap();
             ja.rotate_segment().unwrap();
             drop(ja);
             std::fs::remove_file(&path).unwrap();
@@ -3179,7 +3195,6 @@ mod tests {
         /// cut must recover entries 1 to 5, and the whole entry 1 to 6.
         #[test]
         fn every_prefix_of_a_torn_final_entry_recovers() {
-            let _prealloc = melin_journal::test_utils::PreallocOverrideGuard::new(1024 * 1024);
             let dir = tempfile::tempdir().unwrap();
             let original = dir.path().join("original.journal");
             let bounds = journal_with(&original, 6);
@@ -3208,7 +3223,6 @@ mod tests {
         /// append and recover again.
         #[test]
         fn crash_at_every_byte_offset_in_preallocated_space_recovers() {
-            let _prealloc = melin_journal::test_utils::PreallocOverrideGuard::new(1024 * 1024);
             let dir = tempfile::tempdir().unwrap();
             let original = dir.path().join("original.journal");
             let bounds = journal_with(&original, 6);
@@ -3236,9 +3250,9 @@ mod tests {
                             let context = format!("cut at byte {cut}");
                             assert_recovers_first(&work, kept, &context);
 
-                            let ja = TestApp_::recover(TestApp::new(), &work).unwrap();
+                            let ja = TestApp_::recover(TestApp::new(), &work, PREALLOC).unwrap();
                             drop(append_events(ja, &[TestEvent::Add(1_000)]));
-                            let again = TestApp_::recover(TestApp::new(), &work)
+                            let again = TestApp_::recover(TestApp::new(), &work, PREALLOC)
                                 .unwrap_or_else(|e| panic!("{context}: re-recovery: {e}"));
                             assert_eq!(again.next_sequence(), kept + 2, "{context}");
                             cut += threads;

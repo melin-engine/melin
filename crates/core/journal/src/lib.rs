@@ -25,7 +25,7 @@ pub mod encoder;
 pub mod error;
 mod event;
 pub(crate) mod le;
-pub(crate) mod prealloc;
+mod prealloc;
 pub mod preparer;
 pub mod reader;
 pub mod replication;
@@ -34,7 +34,7 @@ mod segment_file;
 mod write;
 pub mod write_ring;
 
-#[cfg(feature = "test-utils")]
+#[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
 
 pub use buffered_writer::BufferedWriter;
@@ -42,6 +42,7 @@ pub use codec::FileHeaderInfo;
 pub use encoder::JournalEncoder;
 pub use error::JournalError;
 pub use event::{AckPolicyByte, AckPolicyChange, JournalEvent};
+pub use prealloc::Prealloc;
 pub use preparer::StagingMode;
 pub use reader::{JournalEntry, JournalReader, RawJournalScanner, SegmentKind, TornTail};
 pub use segment_file::SegmentFile;

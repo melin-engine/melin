@@ -425,6 +425,11 @@ pub const RING_CAPACITY: RingCapacity =
         Err(_) => panic!("a journal batch is a valid ring capacity"),
     };
 
+/// The size, in MiB, at which a test node's journal rotates unless its
+/// test says otherwise (see [`config`]): more than most tests write, and
+/// a test that writes past it rotates as a deployment would.
+pub const MAX_JOURNAL_MIB: u64 = 8;
+
 /// The configuration a test starts its nodes from: production defaults
 /// ([`ServerConfig::default`]), sized for a test rather than a
 /// deployment. Override fields on top of it as with the default:
@@ -448,22 +453,31 @@ pub const RING_CAPACITY: RingCapacity =
 ///   which against the default limit fails (and warns) on every node.
 ///   [`start`] and [`start_at`] set it whatever the config says.
 ///
-/// And one more, for memory rather than the locked-memory limit:
+/// And two more, for memory rather than the locked-memory limit:
 ///
 /// - **`ring_capacity`** is [`RING_CAPACITY`]. Each node's two pipeline
 ///   rings are written in full when it starts, so they are resident
 ///   whether used or not: at the production capacity a node of an
 ///   application with wide events holds most of a GiB in them, and a
 ///   parallel suite runs dozens of nodes.
+/// - **`max_journal_mib`** is [`MAX_JOURNAL_MIB`]. A journal reserves
+///   disk from its rotation threshold, a segment at a time, and the
+///   background preparer pre-writes the next segment at the same size.
+///   A test's journal sits in a temporary directory, which is often
+///   tmpfs, where both are memory: at the production threshold that is
+///   over half a GiB per node, written or not, and a parallel suite runs
+///   dozens of nodes.
 ///
 /// A test that exercises the connection cap sets its own
-/// `max_connections`, and one that needs a deeper ring its own
-/// `ring_capacity`.
+/// `max_connections`, one that needs a deeper ring its own
+/// `ring_capacity`, and one that exercises size-driven rotation its own
+/// `max_journal_mib`.
 pub fn config() -> ServerConfig {
     ServerConfig {
         max_connections: MAX_CONNECTIONS,
         no_mlock: true,
         ring_capacity: RING_CAPACITY,
+        max_journal_mib: MAX_JOURNAL_MIB,
         ..ServerConfig::default()
     }
 }

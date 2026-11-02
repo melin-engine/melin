@@ -89,7 +89,8 @@ fn handoff_must_not_skip_entries_journaled_before_ring_activation() {
     let live = dir.path().join("primary.journal");
 
     // Journal contents at the moment the replica reconnects.
-    let mut writer = BufferedWriter::<TestEvent>::create(&live).unwrap();
+    let mut writer =
+        BufferedWriter::<TestEvent>::create(&live, melin_journal::test_utils::PREALLOC).unwrap();
     for i in 1..=10u64 {
         writer
             .append(&JournalEvent::App(TestEvent::Add(i)))
@@ -192,7 +193,8 @@ fn bridge_with_no_window_traffic_is_a_plain_drain() {
     let dir = tempfile::tempdir().unwrap();
     let live = dir.path().join("primary.journal");
 
-    let mut writer = BufferedWriter::<TestEvent>::create(&live).unwrap();
+    let mut writer =
+        BufferedWriter::<TestEvent>::create(&live, melin_journal::test_utils::PREALLOC).unwrap();
     for i in 1..=10u64 {
         writer
             .append(&JournalEvent::App(TestEvent::Add(i)))

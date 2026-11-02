@@ -552,7 +552,14 @@ mod tests {
     }
 
     fn segment(dir: &std::path::Path) -> SegmentFile {
-        SegmentFile::create_continuing(&dir.join("test.journal"), 1, [0u8; 32], Some(0)).unwrap()
+        SegmentFile::create_continuing(
+            &dir.join("test.journal"),
+            1,
+            [0u8; 32],
+            Some(0),
+            melin_journal::test_utils::PREALLOC,
+        )
+        .unwrap()
     }
 
     fn submit(producer: &mut JournalWriteProducer, bytes: &[u8], meta: JournalWriteMeta) {

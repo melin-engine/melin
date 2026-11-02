@@ -19,6 +19,7 @@ use melin_journal::replication::REPLICATION_RING_CAPACITY;
 // under no-persist (every read needs a really-persisted journal file).
 #[cfg(not(feature = "no-persist"))]
 use melin_journal::JournalReader;
+use melin_journal::test_utils::PREALLOC;
 use melin_journal::{BufferedWriter, JournalEvent};
 use melin_pipeline::ring;
 use melin_pipeline::wait::WaitStrategy;
@@ -131,7 +132,7 @@ fn journal_stage_allocates_primary_sequences() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("pipeline_journal.journal");
 
-    let writer = Writer::create(&path).unwrap();
+    let writer = Writer::create(&path, PREALLOC).unwrap();
 
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
@@ -770,7 +771,8 @@ fn input_slots_differing_only_in_request_id_journal_and_replicate_identically() 
         let path = dir.path().join(name);
         // A fixed anchor rather than `create`'s random salt, so the two
         // files can be compared byte for byte, header and chain included.
-        let writer = Writer::create_continuing(&path, FIRST_SEQ, [0x5A; 32], Some(0)).unwrap();
+        let writer =
+            Writer::create_continuing(&path, FIRST_SEQ, [0x5A; 32], Some(0), PREALLOC).unwrap();
         let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
             .add_consumer()
             .build(WaitStrategy::SpinThenYield);
@@ -850,7 +852,7 @@ fn allocator_wire_seq_and_gate_cursor_agree_across_rotation() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("gate_space_agreement.journal");
 
-    let writer = Writer::create(&path).unwrap();
+    let writer = Writer::create(&path, PREALLOC).unwrap();
     let active_conns = Arc::new(AtomicU64::new(0));
     let mut out = build_pipeline_with_replication(
         TestApp::new(),
@@ -1035,7 +1037,7 @@ fn recovery_resumes_allocator_wire_and_gate_agreement() {
 
     // --- Phase 1: journal events 1..=5 across a rotation, shut down ---
     {
-        let writer = Writer::create(&path).unwrap();
+        let writer = Writer::create(&path, PREALLOC).unwrap();
         let active_conns = Arc::new(AtomicU64::new(0));
         let out = build_pipeline_with_replication(
             TestApp::new(),
@@ -1093,7 +1095,7 @@ fn recovery_resumes_allocator_wire_and_gate_agreement() {
     }
 
     // --- Phase 2: recover and continue ---
-    let engine = JournaledApp::<TestApp, Writer>::recover(TestApp::new(), &path).unwrap();
+    let engine = JournaledApp::<TestApp, Writer>::recover(TestApp::new(), &path, PREALLOC).unwrap();
     assert_eq!(engine.app().total, 1 + 2 + 3 + 4, "recovered state");
     assert_eq!(engine.next_sequence(), 6, "recovered allocator position");
     let (app, writer) = engine.into_parts();
@@ -1197,7 +1199,7 @@ fn recovery_resumes_allocator_wire_and_gate_agreement() {
 fn replica_fsync_state_starts_at_the_journal_it_was_built_over() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("replica_seeded.journal");
-    let mut writer = Writer::create_continuing(&path, 1, [0xB7u8; 32], Some(0)).unwrap();
+    let mut writer = Writer::create_continuing(&path, 1, [0xB7u8; 32], Some(0), PREALLOC).unwrap();
     for n in 1..=3u64 {
         let seq = writer.allocate_sequence();
         writer
@@ -1250,7 +1252,7 @@ fn replica_stage_at_3(
     JournalStage<TestEvent>,
     DurableWireSeqCursor,
 ) {
-    let mut writer = Writer::create_continuing(path, 1, [0xB7u8; 32], Some(0)).unwrap();
+    let mut writer = Writer::create_continuing(path, 1, [0xB7u8; 32], Some(0), PREALLOC).unwrap();
     for n in 1..=3u64 {
         let seq = writer.allocate_sequence();
         writer
@@ -1310,7 +1312,7 @@ fn replica_journal_refuses_a_restreamed_prefix() {
         [1, 2, 3],
         "nothing re-sent was written"
     );
-    let recovered = JournaledApp::<TestApp, Writer>::recover(TestApp::new(), &path)
+    let recovered = JournaledApp::<TestApp, Writer>::recover(TestApp::new(), &path, PREALLOC)
         .expect("the journal still recovers");
     assert_eq!(recovered.next_sequence(), 4);
 }
@@ -1417,7 +1419,7 @@ fn replica_ack_cursor_tracks_primary_sequences_across_local_rotation() {
 
     // Fresh-replica creation path: segment header identity comes from
     // the primary's StreamStart in production.
-    let writer = Writer::create_continuing(&path, 1, [0xB7u8; 32], Some(0)).unwrap();
+    let writer = Writer::create_continuing(&path, 1, [0xB7u8; 32], Some(0), PREALLOC).unwrap();
     let replica = build_replica_pipeline(
         TestApp::new(),
         writer,
@@ -1509,7 +1511,7 @@ fn journal_stage_uses_preassigned_sequences() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("preseq.journal");
 
-    let writer = Writer::create(&path).unwrap();
+    let writer = Writer::create(&path, PREALLOC).unwrap();
 
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
@@ -1565,7 +1567,7 @@ fn full_pipeline_journal_and_matching_parallel() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("full_pipeline.journal");
 
-    let writer = Writer::create(&path).unwrap();
+    let writer = Writer::create(&path, PREALLOC).unwrap();
     let active_conns = Arc::new(AtomicU64::new(0));
     let mut out = build_pipeline_with_replication(
         TestApp::new(),
@@ -1638,7 +1640,7 @@ fn journal_stage_sends_replication_batches() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("repl_pipeline.journal");
 
-    let writer = Writer::create(&path).unwrap();
+    let writer = Writer::create(&path, PREALLOC).unwrap();
     let active_conns = Arc::new(AtomicU64::new(0));
     let mut out = build_pipeline_with_replication(
         TestApp::new(),
@@ -1759,7 +1761,7 @@ fn replica_quorum_always_starts_disengaged() {
     // Standalone mode.
     {
         let path = dir.path().join("standalone.journal");
-        let writer = Writer::create(&path).unwrap();
+        let writer = Writer::create(&path, PREALLOC).unwrap();
         let active_conns = Arc::new(AtomicU64::new(0));
 
         let out = build_pipeline_with_replication(
@@ -1783,7 +1785,7 @@ fn replica_quorum_always_starts_disengaged() {
     // Replication enabled — the quorum still starts disengaged.
     {
         let path = dir.path().join("repl_enabled.journal");
-        let writer = Writer::create(&path).unwrap();
+        let writer = Writer::create(&path, PREALLOC).unwrap();
         let active_conns = Arc::new(AtomicU64::new(0));
 
         let out = build_pipeline_with_replication(
@@ -1825,7 +1827,7 @@ fn event_publisher_reads_only_what_the_response_stage_committed() {
     let build = |name: &str, enable_event_publisher: bool| {
         build_pipeline_with_replication(
             TestApp::new(),
-            Writer::create(&dir.path().join(name)).unwrap(),
+            Writer::create(&dir.path().join(name), PREALLOC).unwrap(),
             Duration::ZERO,
             Arc::new(AtomicU64::new(0)),
             false,
@@ -1911,7 +1913,7 @@ fn event_publisher_reads_only_what_the_response_stage_committed() {
 fn primary_journal_sequences_contiguous_across_many_batches() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("many_batches.journal");
-    let writer = Writer::create(&path).unwrap();
+    let writer = Writer::create(&path, PREALLOC).unwrap();
 
     let total: u64 = 200_100;
     let cap = ((total as usize) + MAX_JOURNAL_BATCH).next_power_of_two();
@@ -2093,7 +2095,7 @@ fn primary_and_replica_journals_contiguous_and_chain_identical() {
 
     // -------- primary --------
     let primary_writer =
-        Writer::create_continuing(&primary_path, 1, shared_anchor, Some(0)).unwrap();
+        Writer::create_continuing(&primary_path, 1, shared_anchor, Some(0), PREALLOC).unwrap();
     let primary_active_conns = Arc::new(AtomicU64::new(0));
     let mut primary = build_pipeline_with_replication(
         TestApp::new(),
@@ -2112,7 +2114,7 @@ fn primary_and_replica_journals_contiguous_and_chain_identical() {
 
     // -------- replica --------
     let replica_writer =
-        Writer::create_continuing(&replica_path, 1, shared_anchor, Some(0)).unwrap();
+        Writer::create_continuing(&replica_path, 1, shared_anchor, Some(0), PREALLOC).unwrap();
     let mut replica = build_replica_pipeline(
         TestApp::new(),
         replica_writer,
@@ -2293,7 +2295,7 @@ fn primary_and_replica_journals_contiguous_and_chain_identical() {
 fn journal_stage_rotates_on_manual_request() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("rotate_manual.journal");
-    let writer = Writer::create(&path).unwrap();
+    let writer = Writer::create(&path, PREALLOC).unwrap();
 
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
@@ -2378,8 +2380,12 @@ fn journal_stage_rotates_on_manual_request() {
 
     // Recovery via the multi-segment walker should produce a TestApp
     // with total = 100 + 200 + 50 + 1000 = 1350.
-    let recovered =
-        JournaledApp::<TestApp, BufferedWriter<TestEvent>>::recover(TestApp::new(), &path).unwrap();
+    let recovered = JournaledApp::<TestApp, BufferedWriter<TestEvent>>::recover(
+        TestApp::new(),
+        &path,
+        PREALLOC,
+    )
+    .unwrap();
     assert_eq!(
         recovered.app().total,
         1350,
@@ -2405,7 +2411,7 @@ fn adopted_rotation_splits_batch_at_announced_boundary() {
     // replica's local tail must equal it.
     let tail_at_2 = {
         let ref_path = dir.path().join("reference.journal");
-        let mut w = Writer::create_continuing(&ref_path, 1, anchor, Some(0)).unwrap();
+        let mut w = Writer::create_continuing(&ref_path, 1, anchor, Some(0), PREALLOC).unwrap();
         for seq in 1..=2u64 {
             assert_eq!(w.allocate_sequence(), seq);
             w.encode_event(
@@ -2420,7 +2426,7 @@ fn adopted_rotation_splits_batch_at_announced_boundary() {
         w.chain_hash().expect("hash-chain enabled")
     };
 
-    let writer = Writer::create_continuing(&path, 1, anchor, Some(0)).unwrap();
+    let writer = Writer::create_continuing(&path, 1, anchor, Some(0), PREALLOC).unwrap();
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
         .build(WaitStrategy::SpinThenYield);
@@ -2508,7 +2514,7 @@ fn mid_batch_barrier_commits_only_the_encoded_prefix() {
     let path = dir.path().join("barrier_progress.journal");
     let anchor = [0x5Cu8; 32];
 
-    let writer = Writer::create_continuing(&path, 1, anchor, Some(0)).unwrap();
+    let writer = Writer::create_continuing(&path, 1, anchor, Some(0), PREALLOC).unwrap();
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
         .build(WaitStrategy::SpinThenYield);
@@ -2612,7 +2618,7 @@ fn barrier_fsync_state_pair_is_self_consistent_for_the_shadow() {
     let snap_path = dir.path().join("shadow_window.snapshot");
     let anchor = [0x5Cu8; 32];
 
-    let writer = Writer::create_continuing(&path, 1, anchor, Some(0)).unwrap();
+    let writer = Writer::create_continuing(&path, 1, anchor, Some(0), PREALLOC).unwrap();
     // journal(0), shadow(1) gated on journal — the production wiring
     // (`build_input_disruptor`) minus the matching stage.
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
@@ -2776,9 +2782,14 @@ fn fsync_state_pairs_stay_consistent_across_adopted_rotations() {
     let tails: Vec<[u8; 32]> = {
         let ref_dir = dir.path().join("reference");
         std::fs::create_dir(&ref_dir).unwrap();
-        let mut w =
-            Writer::create_continuing(&ref_dir.join("reference.journal"), 1, anchor, Some(0))
-                .unwrap();
+        let mut w = Writer::create_continuing(
+            &ref_dir.join("reference.journal"),
+            1,
+            anchor,
+            Some(0),
+            PREALLOC,
+        )
+        .unwrap();
         let mut tails = Vec::new();
         for seq in 1..=N {
             assert_eq!(w.allocate_sequence(), seq);
@@ -2801,7 +2812,7 @@ fn fsync_state_pairs_stay_consistent_across_adopted_rotations() {
 
     let path = dir.path().join("sweep.journal");
     let snap_path = dir.path().join("sweep.snapshot");
-    let writer = Writer::create_continuing(&path, 1, anchor, Some(0)).unwrap();
+    let writer = Writer::create_continuing(&path, 1, anchor, Some(0), PREALLOC).unwrap();
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
         .add_consumer_after(0)
@@ -2961,10 +2972,11 @@ fn fsync_state_pairs_stay_consistent_across_adopted_rotations() {
     // Net 2: snapshot + replay ≡ full replay, for every snapshot taken.
     let full_total: u64 = N * (N + 1) / 2;
     for (seq, copy) in &snapshots {
-        let recovered = JournaledApp::<TestApp, Writer>::recover_from_snapshot(copy, &path)
-            .unwrap_or_else(|e| {
-                panic!("snapshot at seq {seq} must recover against the journal: {e}")
-            });
+        let recovered =
+            JournaledApp::<TestApp, Writer>::recover_from_snapshot(copy, &path, PREALLOC)
+                .unwrap_or_else(|e| {
+                    panic!("snapshot at seq {seq} must recover against the journal: {e}")
+                });
         assert_eq!(
             recovered.app().total,
             full_total,
@@ -2991,7 +3003,7 @@ fn adopted_rotation_honors_second_mark_in_same_batch() {
     // rotate too for its chain at 4 to be comparable.
     let (tail_at_2, tail_at_4) = {
         let ref_path = dir.path().join("reference.journal");
-        let mut w = Writer::create_continuing(&ref_path, 1, anchor, Some(0)).unwrap();
+        let mut w = Writer::create_continuing(&ref_path, 1, anchor, Some(0), PREALLOC).unwrap();
         let mut tail_at_2 = [0u8; 32];
         for seq in 1..=4u64 {
             assert_eq!(w.allocate_sequence(), seq);
@@ -3012,7 +3024,7 @@ fn adopted_rotation_honors_second_mark_in_same_batch() {
         (tail_at_2, w.chain_hash().expect("hash-chain enabled"))
     };
 
-    let writer = Writer::create_continuing(&path, 1, anchor, Some(0)).unwrap();
+    let writer = Writer::create_continuing(&path, 1, anchor, Some(0), PREALLOC).unwrap();
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
         .build(WaitStrategy::SpinThenYield);
@@ -3077,7 +3089,7 @@ fn adopted_rotation_with_zero_tail_skips_chain_comparison() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("adopt_zero_tail.journal");
 
-    let writer = Writer::create_continuing(&path, 1, [0x7Au8; 32], Some(0)).unwrap();
+    let writer = Writer::create_continuing(&path, 1, [0x7Au8; 32], Some(0), PREALLOC).unwrap();
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
         .build(WaitStrategy::SpinThenYield);
@@ -3124,7 +3136,7 @@ fn adopted_rotation_with_wrong_tail_hash_is_divergence() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("adopt_diverge.journal");
 
-    let writer = Writer::create_continuing(&path, 1, [0x7Au8; 32], Some(0)).unwrap();
+    let writer = Writer::create_continuing(&path, 1, [0x7Au8; 32], Some(0), PREALLOC).unwrap();
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
         .build(WaitStrategy::SpinThenYield);
@@ -3189,7 +3201,7 @@ fn chain_check_mark_verifies_at_exact_position() {
     // Reference chain value at sequence 2.
     let chain_at_2 = {
         let ref_path = dir.path().join("reference.journal");
-        let mut w = Writer::create_continuing(&ref_path, 1, anchor, Some(0)).unwrap();
+        let mut w = Writer::create_continuing(&ref_path, 1, anchor, Some(0), PREALLOC).unwrap();
         for seq in 1..=2u64 {
             assert_eq!(w.allocate_sequence(), seq);
             w.encode_event(
@@ -3206,7 +3218,7 @@ fn chain_check_mark_verifies_at_exact_position() {
 
     let run_with_check = |name: &str, expected: [u8; 32]| {
         let path = dir.path().join(format!("{name}.journal"));
-        let writer = Writer::create_continuing(&path, 1, anchor, Some(0)).unwrap();
+        let writer = Writer::create_continuing(&path, 1, anchor, Some(0), PREALLOC).unwrap();
         let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
             .add_consumer()
             .build(WaitStrategy::SpinThenYield);
@@ -3268,7 +3280,7 @@ fn primary_emits_chain_check_every_interval() {
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("checks.journal");
-    let writer = Writer::create(&path).unwrap();
+    let writer = Writer::create(&path, PREALLOC).unwrap();
 
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(256)
         .add_consumer()
@@ -3395,7 +3407,7 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
     let shared_anchor = [0xA5u8; 32];
 
     let primary_writer =
-        Writer::create_continuing(&primary_path, 1, shared_anchor, Some(0)).unwrap();
+        Writer::create_continuing(&primary_path, 1, shared_anchor, Some(0), PREALLOC).unwrap();
     let primary_active_conns = Arc::new(AtomicU64::new(0));
     let mut primary = build_pipeline_with_replication(
         TestApp::new(),
@@ -3423,7 +3435,7 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
     primary.journal_stage.set_chain_hash_lock(p_fsync_writer);
 
     let replica_writer =
-        Writer::create_continuing(&replica_path, 1, shared_anchor, Some(0)).unwrap();
+        Writer::create_continuing(&replica_path, 1, shared_anchor, Some(0), PREALLOC).unwrap();
     let mut replica = build_replica_pipeline(
         TestApp::new(),
         replica_writer,
@@ -3697,8 +3709,8 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
 fn trailing_stream_mark_is_adopted_promptly_on_a_starved_core() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     // Each adoption that misses the preparer allocates synchronously;
-    // keep that cheap on the starved core.
-    let _prealloc_guard = melin_journal::test_utils::PreallocOverrideGuard::new(1024 * 1024);
+    // the test's small reservation (`PREALLOC`) keeps that cheap on the
+    // starved core.
 
     /// Pin the calling thread to `cpu`, literally. Not
     /// `melin_app::affinity::pin_to_core`: that one records the home mask
@@ -3723,7 +3735,7 @@ fn trailing_stream_mark_is_adopted_promptly_on_a_starved_core() {
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("trailing_mark.journal");
-    let writer = Writer::create_continuing(&path, 1, [0x3Cu8; 32], Some(0)).unwrap();
+    let writer = Writer::create_continuing(&path, 1, [0x3Cu8; 32], Some(0), PREALLOC).unwrap();
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
         .build(WaitStrategy::SpinThenYield);
@@ -3848,7 +3860,7 @@ fn trailing_stream_mark_is_adopted_promptly_on_a_starved_core() {
 fn journal_stage_rotates_on_size_threshold() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("rotate_size.journal");
-    let writer = Writer::create(&path).unwrap();
+    let writer = Writer::create(&path, PREALLOC).unwrap();
 
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
@@ -3911,11 +3923,11 @@ fn size_rotation_uses_prepared_fast_path_after_warmup() {
     // at the default 256 MiB prealloc chunk each rotation would
     // materialize a full archive plus a staged sidecar (real memory on
     // tmpfs), and disk pressure would make failure self-reinforcing
-    // via the preparer's 30 s error backoff. Shrink the chunk.
-    let _prealloc_guard = melin_journal::test_utils::PreallocOverrideGuard::new(1024 * 1024);
+    // via the preparer's 30 s error backoff. The writer below is
+    // created with the test's small reservation (`PREALLOC`).
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("fast_rotate.journal");
-    let writer = Writer::create(&path).unwrap();
+    let writer = Writer::create(&path, PREALLOC).unwrap();
 
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(1024)
         .add_consumer()
@@ -3968,7 +3980,7 @@ fn size_rotation_uses_prepared_fast_path_after_warmup() {
 fn preparer_arms_for_size_and_replica_modes_only() {
     let dir = tempfile::tempdir().unwrap();
     let mk_stage = |name: &str| {
-        let writer = Writer::create(&dir.path().join(name)).unwrap();
+        let writer = Writer::create(&dir.path().join(name), PREALLOC).unwrap();
         let (_p, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
             .add_consumer()
             .build(WaitStrategy::SpinThenYield);
@@ -4024,10 +4036,9 @@ fn size_trigger_tracks_the_segments_real_size() {
     /// (`ENTRY_FRAMING_SIZE` plus `TestEvent::MAX_ENCODED_SIZE`).
     const ONE_ENTRY: u64 = 256;
 
-    let _prealloc_guard = melin_journal::test_utils::PreallocOverrideGuard::new(1024 * 1024);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("sized.journal");
-    let writer = Writer::create(&path).unwrap();
+    let writer = Writer::create(&path, PREALLOC).unwrap();
 
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(1024)
         .add_consumer()
@@ -4110,7 +4121,7 @@ fn fsync_state_carries_the_real_chain_hash_when_a_publisher_is_attached() {
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("observed_chain.journal");
-    let writer = Writer::create(&path).unwrap();
+    let writer = Writer::create(&path, PREALLOC).unwrap();
 
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
@@ -4186,7 +4197,7 @@ fn fsync_state_carries_the_real_chain_hash_when_a_publisher_is_attached() {
 fn cursor_only_batches_still_release_their_input_slots() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("queries_only.journal");
-    let writer = Writer::create(&path).unwrap();
+    let writer = Writer::create(&path, PREALLOC).unwrap();
 
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
@@ -4252,7 +4263,7 @@ fn cursor_only_batches_still_release_their_input_slots() {
 fn disk_lag_gauge_returns_to_zero_once_the_journal_quiesces() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("lag.journal");
-    let writer = Writer::create(&path).unwrap();
+    let writer = Writer::create(&path, PREALLOC).unwrap();
 
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(1024)
         .add_consumer()
@@ -4322,7 +4333,7 @@ fn disk_lag_gauge_returns_to_zero_once_the_journal_quiesces() {
 fn rotate_storm_collapses_to_single_rotation() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("storm.journal");
-    let writer = Writer::create(&path).unwrap();
+    let writer = Writer::create(&path, PREALLOC).unwrap();
 
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
@@ -4403,7 +4414,7 @@ fn rotate_storm_collapses_to_single_rotation() {
 fn post_rotation_events_land_in_live_not_archive() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("post_rot.journal");
-    let writer = Writer::create(&path).unwrap();
+    let writer = Writer::create(&path, PREALLOC).unwrap();
 
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(1024)
         .add_consumer()
@@ -4516,7 +4527,7 @@ fn post_rotation_events_land_in_live_not_archive() {
 fn pipeline_journals_every_event_in_order() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("parity.journal");
-    let writer = Writer::create(&path).unwrap();
+    let writer = Writer::create(&path, PREALLOC).unwrap();
 
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
@@ -4613,7 +4624,7 @@ fn stats_query_reports_durable_wire_seq_across_recovery() {
 
     // --- Phase 1: fresh journal — the query reports the live durable seq.
     {
-        let writer = Writer::create(&path).unwrap();
+        let writer = Writer::create(&path, PREALLOC).unwrap();
         let mut out = build_pipeline_with_replication(
             TestApp::new(),
             writer,
@@ -4667,7 +4678,7 @@ fn stats_query_reports_durable_wire_seq_across_recovery() {
 
     // --- Phase 2: recover — the ring cursor restarts at zero, but the
     // stats surface must keep reporting the recovered high-water mark.
-    let engine = JournaledApp::<TestApp, Writer>::recover(TestApp::new(), &path).unwrap();
+    let engine = JournaledApp::<TestApp, Writer>::recover(TestApp::new(), &path, PREALLOC).unwrap();
     let (app, writer) = engine.into_parts();
     let mut out = build_pipeline_with_replication(
         app,
@@ -4720,7 +4731,7 @@ fn stats_query_reports_durable_wire_seq_across_recovery() {
 fn a_query_changes_no_matching_stage_state() {
     const KEY: u64 = 0xC0FFEE;
     let dir = tempfile::tempdir().unwrap();
-    let writer = Writer::create(&dir.path().join("query_state.journal")).unwrap();
+    let writer = Writer::create(&dir.path().join("query_state.journal"), PREALLOC).unwrap();
     let mut out = build_pipeline_with_replication(
         TestApp::new(),
         writer,
@@ -4908,7 +4919,7 @@ fn batch_length_adapts_to_event_width() {
 fn a_wide_event_app_survives_a_full_batch_with_a_replica_attached() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("wide.journal");
-    let writer = melin_journal::BufferedWriter::<WideEvent>::create(&path).unwrap();
+    let writer = melin_journal::BufferedWriter::<WideEvent>::create(&path, PREALLOC).unwrap();
 
     // Room for every event plus the sentinel while nothing is consuming.
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<InputSlot<WideEvent>>::new(16384)
@@ -4988,6 +4999,7 @@ fn dropping_the_disk_thread_handle_stops_and_joins_the_thread() {
         1,
         [0u8; 32],
         Some(0),
+        PREALLOC,
     )
     .unwrap();
     let control = Arc::new(crate::journal_disk::DiskControl::new());
@@ -5036,7 +5048,7 @@ fn a_repeated_request_reaches_apply_on_live_replay_and_shadow() {
     const KEY: u64 = 0xD0D0;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("duplicate.journal");
-    let writer = Writer::create(&path).unwrap();
+    let writer = Writer::create(&path, PREALLOC).unwrap();
     let mut out = build_pipeline_with_replication(
         TestApp::new(),
         writer,
@@ -5103,9 +5115,10 @@ fn a_repeated_request_reaches_apply_on_live_replay_and_shadow() {
         "each one under the key that submitted it"
     );
 
-    let (replayed, _writer) = JournaledApp::<TestApp, Writer>::recover(TestApp::new(), &path)
-        .unwrap()
-        .into_parts();
+    let (replayed, _writer) =
+        JournaledApp::<TestApp, Writer>::recover(TestApp::new(), &path, PREALLOC)
+            .unwrap()
+            .into_parts();
     assert_eq!(
         replayed, live,
         "replay must apply every submission as live did"
@@ -5297,7 +5310,7 @@ fn the_builders_size_both_rings_from_the_capacity_given() {
 
     let primary = build_pipeline_with_replication(
         TestApp::new(),
-        Writer::create(&dir.path().join("primary.journal")).unwrap(),
+        Writer::create(&dir.path().join("primary.journal"), PREALLOC).unwrap(),
         Duration::ZERO,
         Arc::new(AtomicU64::new(0)),
         false,
@@ -5315,7 +5328,7 @@ fn the_builders_size_both_rings_from_the_capacity_given() {
 
     let replica = crate::pipeline::build_replica_pipeline(
         TestApp::new(),
-        Writer::create(&dir.path().join("replica.journal")).unwrap(),
+        Writer::create(&dir.path().join("replica.journal"), PREALLOC).unwrap(),
         MAX_JOURNAL_BATCH,
         capacity,
         Duration::ZERO,

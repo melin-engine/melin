@@ -815,6 +815,7 @@ mod tests {
 
     use super::*;
     use crate::buffered_writer::BufferedWriter;
+    use crate::test_utils::PREALLOC;
     use crate::write::JournalWrite;
     use melin_app::CodecError;
 
@@ -853,7 +854,7 @@ mod tests {
 
     fn write_sample(path: &Path) -> Vec<JournalEvent<TestEvent>> {
         let events = sample_events();
-        let mut writer = BufferedWriter::<TestEvent>::create(path).unwrap();
+        let mut writer = BufferedWriter::<TestEvent>::create(path, PREALLOC).unwrap();
         for event in &events {
             writer.append(event).unwrap();
         }
@@ -864,7 +865,7 @@ mod tests {
     fn open_validates_header() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
-        let _writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+        let _writer = BufferedWriter::<TestEvent>::create(&path, PREALLOC).unwrap();
         let _reader = JournalReader::<TestEvent>::open(&path).unwrap();
     }
 
@@ -944,7 +945,7 @@ mod tests {
         let path = dir.path().join("test.journal");
         const N: u64 = 100;
         {
-            let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+            let mut writer = BufferedWriter::<TestEvent>::create(&path, PREALLOC).unwrap();
             for i in 0..N {
                 writer.append(&JournalEvent::App(TestEvent(i))).unwrap();
             }
@@ -969,7 +970,7 @@ mod tests {
     fn no_entries_empty_journal() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
-        let _writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+        let _writer = BufferedWriter::<TestEvent>::create(&path, PREALLOC).unwrap();
 
         let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
         assert!(reader.next_entry().unwrap().is_none());
@@ -983,7 +984,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
         {
-            let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+            let mut writer = BufferedWriter::<TestEvent>::create(&path, PREALLOC).unwrap();
             writer.append(&JournalEvent::App(TestEvent(7))).unwrap();
         }
 
@@ -1010,7 +1011,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
         {
-            let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+            let mut writer = BufferedWriter::<TestEvent>::create(&path, PREALLOC).unwrap();
             writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
         }
 
@@ -1062,7 +1063,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
         {
-            let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+            let mut writer = BufferedWriter::<TestEvent>::create(&path, PREALLOC).unwrap();
             writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
             writer.append(&JournalEvent::App(TestEvent(2))).unwrap();
         }
@@ -1110,7 +1111,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
         {
-            let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+            let mut writer = BufferedWriter::<TestEvent>::create(&path, PREALLOC).unwrap();
             writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
             writer.append(&JournalEvent::App(TestEvent(2))).unwrap();
         }
@@ -1168,7 +1169,7 @@ mod tests {
         let path = dir.path().join("test.journal");
         {
             // Create the file header only; no user events.
-            let _writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+            let _writer = BufferedWriter::<TestEvent>::create(&path, PREALLOC).unwrap();
         }
 
         let mut scratch = [0u8; 256];
@@ -1210,7 +1211,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
         {
-            let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+            let mut writer = BufferedWriter::<TestEvent>::create(&path, PREALLOC).unwrap();
             writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
             writer.append(&JournalEvent::App(TestEvent(2))).unwrap();
         }
@@ -1289,7 +1290,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
         {
-            let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+            let mut writer = BufferedWriter::<TestEvent>::create(&path, PREALLOC).unwrap();
             writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
         }
         let valid_end = ENTRY_OFFSET + (codec::ENTRY_FRAMING_SIZE + 8) as u64;
@@ -1332,7 +1333,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
         {
-            let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+            let mut writer = BufferedWriter::<TestEvent>::create(&path, PREALLOC).unwrap();
             writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
         }
         let valid_end = ENTRY_OFFSET + (codec::ENTRY_FRAMING_SIZE + 8) as u64;
@@ -1366,7 +1367,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
         {
-            let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+            let mut writer = BufferedWriter::<TestEvent>::create(&path, PREALLOC).unwrap();
             writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
             writer.append(&JournalEvent::App(TestEvent(2))).unwrap();
         }
@@ -1401,7 +1402,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
         {
-            let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+            let mut writer = BufferedWriter::<TestEvent>::create(&path, PREALLOC).unwrap();
             writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
         }
         let mut reader = JournalReader::<TestEvent>::open_archived(&path).unwrap();
@@ -1451,9 +1452,14 @@ mod tests {
         let path = dir.path().join("test.journal");
         {
             // Continue from sequence 100 — header records 100.
-            let mut writer =
-                BufferedWriter::<TestEvent>::create_continuing(&path, 100, [0u8; 32], Some(0))
-                    .unwrap();
+            let mut writer = BufferedWriter::<TestEvent>::create_continuing(
+                &path,
+                100,
+                [0u8; 32],
+                Some(0),
+                PREALLOC,
+            )
+            .unwrap();
             writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
         }
 

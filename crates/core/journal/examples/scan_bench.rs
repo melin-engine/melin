@@ -15,7 +15,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use melin_app::{AppEvent, CodecError};
-use melin_journal::{BufferedWriter, JournalEvent, JournalReader, JournalWrite};
+use melin_journal::{BufferedWriter, JournalEvent, JournalReader, JournalWrite, Prealloc};
 
 // 40 bytes — sized like a compact fixed-width application event (a few
 // numeric fields) so the read buffer / decode ratio resembles real-world
@@ -54,7 +54,10 @@ impl AppEvent for BenchEvent {
 }
 
 fn write_synthetic(path: &Path, n: u64) {
-    let mut writer = BufferedWriter::<BenchEvent>::create(path).expect("create journal");
+    // A deployment's reservation: the bench reads a journal laid out as
+    // a node writes one.
+    let mut writer =
+        BufferedWriter::<BenchEvent>::create(path, Prealloc::DEFAULT).expect("create journal");
     for i in 0..n {
         let ev = JournalEvent::App(BenchEvent {
             fields: [i, i.wrapping_mul(7), i ^ 0xdead, i.rotate_left(13), i + 1],

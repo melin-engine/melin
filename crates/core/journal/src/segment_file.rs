@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use crate::codec::{self, ENTRY_OFFSET, FILE_HEADER_SIZE, MAX_SECTOR_SIZE};
 use crate::error::JournalError;
-use crate::prealloc::prealloc_chunk_bytes;
+use crate::prealloc::Prealloc;
 
 /// Fixed on-disk offset of the first journal entry. Defined in the codec
 /// (`ENTRY_OFFSET = MAX_SECTOR_SIZE = 4096`), independent of the
@@ -43,8 +43,11 @@ pub struct SegmentFile {
     // on-disk end and the logical end coincide.
     write_pos: u64,
     // Byte offset of the end of pre-allocated space. When `write_pos`
-    // approaches this, another `prealloc_chunk_bytes()` is allocated.
+    // approaches this, another `prealloc` chunk is allocated.
     allocated_end: u64,
+    // How much each allocation reserves, for this segment and every one
+    // it rotates into: the journal's, fixed when it was opened.
+    prealloc: Prealloc,
     // Whether `[0, allocated_end)` was physically pre-written by the
     // preparer (`StagingMode::ZeroFill`), so appends carry no
     // extent-conversion metadata. Cleared by the first extension past
@@ -67,8 +70,8 @@ pub struct SegmentFile {
 impl SegmentFile {
     /// Create a fresh segment whose header records `starting_sequence`,
     /// `anchor_hash` and the lineage's `genesis_entries` (see
-    /// [`codec::FileHeaderInfo::genesis_entries`]). Fails if a file
-    /// already exists at `path`.
+    /// [`codec::FileHeaderInfo::genesis_entries`]), reserving disk
+    /// `prealloc` at a time. Fails if a file already exists at `path`.
     ///
     /// Deliberately does **not** clear an orphan staging file: this is
     /// also the rotation fallback path, and by then a preparer is
@@ -80,6 +83,7 @@ impl SegmentFile {
         starting_sequence: u64,
         anchor_hash: [u8; 32],
         genesis_entries: Option<u64>,
+        prealloc: Prealloc,
     ) -> Result<Self, JournalError> {
         let file = OpenOptions::new()
             .read(true)
@@ -90,7 +94,7 @@ impl SegmentFile {
         // Pre-allocate the first chunk so flushes don't pay extent-tree
         // growth latency for a while. ext4/xfs/btrfs all back this with
         // unwritten extents (no zero-fill cost) on the supported targets.
-        let allocated_end = fallocate_chunk(&file, 0)?;
+        let allocated_end = fallocate_chunk(&file, 0, prealloc)?;
 
         write_header(&file, starting_sequence, anchor_hash, genesis_entries)?;
 
@@ -104,6 +108,7 @@ impl SegmentFile {
             path: path.to_path_buf(),
             write_pos: HEADER_OFFSET,
             allocated_end,
+            prealloc,
             pre_written: false,
             genesis_entries,
             dir_fsync_retry: crate::segment::DirFsyncRetry::new(),
@@ -111,7 +116,8 @@ impl SegmentFile {
     }
 
     /// Open an existing segment for appending at `valid_end`, the byte
-    /// offset immediately past the last entry recovery accepted.
+    /// offset immediately past the last entry recovery accepted,
+    /// reserving disk `prealloc` at a time.
     ///
     /// Returns the decoded file header alongside the open segment: the
     /// caller needs its `anchor_hash` and `starting_sequence` to
@@ -120,6 +126,7 @@ impl SegmentFile {
     pub fn open_append(
         path: &Path,
         valid_end: u64,
+        prealloc: Prealloc,
     ) -> Result<(Self, codec::FileHeaderInfo), JournalError> {
         crate::preparer::cleanup_staging_orphan(path);
         let file = OpenOptions::new().read(true).write(true).open(path)?;
@@ -151,7 +158,7 @@ impl SegmentFile {
         if pre_truncate_len > valid_end {
             file.set_len(valid_end)?;
         }
-        let allocated_end = fallocate_chunk(&file, valid_end)?;
+        let allocated_end = fallocate_chunk(&file, valid_end, prealloc)?;
         file.sync_all()?;
 
         Ok((
@@ -160,6 +167,7 @@ impl SegmentFile {
                 path: path.to_path_buf(),
                 write_pos: valid_end,
                 allocated_end,
+                prealloc,
                 pre_written: false,
                 genesis_entries: info.genesis_entries,
                 dir_fsync_retry: crate::segment::DirFsyncRetry::new(),
@@ -254,6 +262,11 @@ impl SegmentFile {
     /// On-disk path of the live segment.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// How much disk this journal reserves at a time.
+    pub fn prealloc(&self) -> Prealloc {
+        self.prealloc
     }
 
     /// Decoded file-header fields of the live segment (read from disk).
@@ -360,6 +373,7 @@ impl SegmentFile {
             starting_sequence,
             anchor_hash,
             self.genesis_entries,
+            self.prealloc,
         )?;
         // Commit point — nothing below can fail. Dropping the old
         // `self.file` closes the outgoing (now archived) segment's fd.
@@ -448,7 +462,7 @@ impl SegmentFile {
             return Ok(());
         }
         let from = self.allocated_end;
-        self.allocated_end = fallocate_chunk(&self.file, from)?;
+        self.allocated_end = fallocate_chunk(&self.file, from, self.prealloc)?;
         if self.pre_written {
             self.pre_written = false;
             // Degraded, not broken, and invisible until now: every
@@ -498,14 +512,14 @@ fn write_header(
     write_all_at(file, &header_buf, 0)
 }
 
-/// Pre-allocate one chunk of disk blocks starting at `from`. Returns
-/// the new end-of-allocation offset.
+/// Pre-allocate one `prealloc` chunk of disk blocks starting at `from`.
+/// Returns the new end-of-allocation offset.
 ///
 /// Allocates only the new range — not `[0, from + chunk)` — so the
 /// fallocate call doesn't walk the entire extent tree on every
 /// extension as the journal grows.
-fn fallocate_chunk(file: &File, from: u64) -> Result<u64, JournalError> {
-    let chunk = prealloc_chunk_bytes();
+fn fallocate_chunk(file: &File, from: u64, prealloc: Prealloc) -> Result<u64, JournalError> {
+    let chunk = prealloc.chunk_bytes();
     rustix::fs::fallocate(
         file.as_fd(),
         rustix::fs::FallocateFlags::empty(),
@@ -572,6 +586,12 @@ fn write_all_at(file: &File, buf: &[u8], offset: u64) -> Result<(), JournalError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::PREALLOC;
+
+    /// 64 KiB: small enough that one batch below exhausts the staged
+    /// region and forces an extension.
+    const SMALL: Prealloc =
+        Prealloc::from_bytes(std::num::NonZeroU64::new(64 * 1024).expect("not zero"));
 
     /// A prepared segment whose staging file has been unlinked: the
     /// header write and its sync land on the still-open inode, then the
@@ -621,11 +641,11 @@ mod tests {
     fn pre_written_tracks_adoption_and_is_cleared_by_extension() {
         // Small chunks so an extension is cheap on tmpfs and so the
         // staged region below is exhausted by one batch.
-        let _prealloc = crate::prealloc::PreallocOverrideGuard::new(64 * 1024);
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("test.journal");
 
-        let mut segment = SegmentFile::create_continuing(&live, 1, [0u8; 32], Some(0)).unwrap();
+        let mut segment =
+            SegmentFile::create_continuing(&live, 1, [0u8; 32], Some(0), SMALL).unwrap();
         assert!(
             !segment.pre_written(),
             "a fresh segment is allocated, not pre-written"
@@ -682,7 +702,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("test.journal");
 
-        let mut segment = SegmentFile::create_continuing(&live, 1, [7u8; 32], Some(0)).unwrap();
+        let mut segment =
+            SegmentFile::create_continuing(&live, 1, [7u8; 32], Some(0), PREALLOC).unwrap();
         segment.write_batch(b"first batch").unwrap();
         segment.sync().unwrap();
         let end_before = segment.valid_end();
@@ -789,14 +810,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         let one_at_a_time = dir.path().join("sequential.journal");
-        let mut a = SegmentFile::create_continuing(&one_at_a_time, 1, [5u8; 32], Some(0)).unwrap();
+        let mut a = SegmentFile::create_continuing(&one_at_a_time, 1, [5u8; 32], Some(0), PREALLOC)
+            .unwrap();
         for part in [b"first".as_slice(), b"second", b"third"] {
             a.write_batch(part).unwrap();
         }
         a.sync().unwrap();
 
         let vectored = dir.path().join("vectored.journal");
-        let mut b = SegmentFile::create_continuing(&vectored, 1, [5u8; 32], Some(0)).unwrap();
+        let mut b =
+            SegmentFile::create_continuing(&vectored, 1, [5u8; 32], Some(0), PREALLOC).unwrap();
         let mut bufs = [
             IoSlice::new(b"first"),
             IoSlice::new(b"second"),
@@ -822,7 +845,8 @@ mod tests {
     fn a_vectored_write_of_nothing_leaves_the_position_alone() {
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("empty.journal");
-        let mut segment = SegmentFile::create_continuing(&live, 1, [0u8; 32], Some(0)).unwrap();
+        let mut segment =
+            SegmentFile::create_continuing(&live, 1, [0u8; 32], Some(0), PREALLOC).unwrap();
         let before = segment.valid_end();
 
         segment.write_vectored(&mut []).unwrap();
@@ -838,7 +862,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("test.journal");
 
-        let mut segment = SegmentFile::create_continuing(&live, 1, [1u8; 32], Some(0)).unwrap();
+        let mut segment =
+            SegmentFile::create_continuing(&live, 1, [1u8; 32], Some(0), PREALLOC).unwrap();
         segment.write_batch(b"sealed content").unwrap();
         segment.sync().unwrap();
 
@@ -862,12 +887,12 @@ mod tests {
     /// and for an unknown length (a v15 lineage keeps v15 headers).
     #[test]
     fn rotation_carries_the_genesis_length_forward() {
-        let _prealloc = crate::prealloc::PreallocOverrideGuard::new(64 * 1024);
         for genesis_entries in [Some(0), Some(7), None] {
             let dir = tempfile::tempdir().unwrap();
             let live = dir.path().join("test.journal");
             let mut segment =
-                SegmentFile::create_continuing(&live, 1, [1u8; 32], genesis_entries).unwrap();
+                SegmentFile::create_continuing(&live, 1, [1u8; 32], genesis_entries, SMALL)
+                    .unwrap();
             assert_eq!(
                 segment.read_header_info().unwrap().genesis_entries,
                 genesis_entries
@@ -895,7 +920,8 @@ mod tests {
 
             // Reopened: the value comes back from the header itself.
             drop(segment);
-            let (mut reopened, info) = SegmentFile::open_append(&live, HEADER_OFFSET).unwrap();
+            let (mut reopened, info) =
+                SegmentFile::open_append(&live, HEADER_OFFSET, SMALL).unwrap();
             assert_eq!(info.genesis_entries, genesis_entries);
             reopened.rotate(None, 3, [4u8; 32]).unwrap();
             assert_eq!(

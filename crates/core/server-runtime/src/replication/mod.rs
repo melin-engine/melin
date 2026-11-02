@@ -813,6 +813,9 @@ pub(super) fn recover_replica_state<A, W>(
     // Applied to a genesis instance before the journal is replayed into
     // it — see `init_engine`. The pipeline build sizes the result again.
     sizing: &A::Sizing,
+    // What the recovered journal is reopened with: the node's reservation
+    // (`ServerConfig::journal_prealloc`).
+    prealloc: melin_journal::Prealloc,
 ) -> Result<(Option<A>, Option<W>, u64, [u8; 32]), Box<dyn std::error::Error>>
 where
     A: Application,
@@ -834,11 +837,12 @@ where
         melin_transport_core::JournaledApp::<A, W>::recover_from_snapshot(
             snapshot_path,
             journal_path,
+            prealloc,
         )?
     } else {
         let mut app = A::default();
         <A as Application>::prefault(&mut app, sizing);
-        melin_transport_core::JournaledApp::<A, W>::recover(app, journal_path)?
+        melin_transport_core::JournaledApp::<A, W>::recover(app, journal_path, prealloc)?
     };
     let next = engine.next_sequence();
     let last = next.saturating_sub(1);
@@ -966,6 +970,7 @@ pub(in crate::replication) fn handle_session_exit<A, W>(
     // For the resync path, which recovers the local journal afresh — see
     // `recover_replica_state`.
     sizing: &A::Sizing,
+    prealloc: melin_journal::Prealloc,
 ) -> AfterSession<A, W>
 where
     A: Application + Send + 'static,
@@ -1040,7 +1045,13 @@ where
                 max_attempts = MAX_INPROCESS_DIVERGENCE_RESYNCS,
                 "mid-stream chain divergence — re-deriving local state for in-process resync"
             );
-            match recover_replica_state::<A, W>(store, fence_state, lineage_policy, sizing) {
+            match recover_replica_state::<A, W>(
+                store,
+                fence_state,
+                lineage_policy,
+                sizing,
+                prealloc,
+            ) {
                 Ok((app, journal_writer, seq, hash)) => AfterSession::Resync {
                     app,
                     journal_writer,
@@ -1303,6 +1314,10 @@ pub(in crate::replication) fn handle_resync_verdict<A, W, S>(
     control: &ReplicaControlPlane,
     last_sequence: &mut u64,
     chain_hash: &mut [u8; 32],
+    // What the seeded journal is opened with: the node's reservation
+    // (`ServerConfig::journal_prealloc`). A parameter rather than the old
+    // writer's, which a fresh replica does not have.
+    prealloc: melin_journal::Prealloc,
 ) -> Result<ResyncDecision, Box<dyn std::error::Error + Send + Sync>>
 where
     A: Application + Send + 'static,
@@ -1410,7 +1425,8 @@ where
     // (nothing to tie); an all-zeros snapshot hash means the primary runs
     // without `hash-chain` (also nothing to tie).
     // Rebuilds the chain over the whole seed: serviced (see `serviced`).
-    let writer = source.serviced(|| W::open_append(journal_path, snap_sequence, seed_len))?;
+    let writer =
+        source.serviced(|| W::open_append(journal_path, snap_sequence, seed_len, prealloc))?;
     let seeded_chain = writer.chain_hash().unwrap_or(snap_chain_hash);
     if snap_chain_hash != [0u8; 32] && seeded_chain != snap_chain_hash {
         return Err(format!(
@@ -1580,17 +1596,19 @@ where
     if !melin_journal::segment::list_archives(&journal_path)?.is_empty() {
         return Ok(());
     }
+    // The replacement is the same journal, so it keeps its reservation.
+    let prealloc = writer.prealloc();
 
     let staging = restamp_staging_path(&journal_path);
     remove_restamp_staging(&journal_path)?;
-    let staged = W::create_continuing(&staging, 1, anchor_hash, advertised)?;
+    let staged = W::create_continuing(&staging, 1, anchor_hash, advertised, prealloc)?;
     let valid_end = staged.valid_end();
     drop(staged);
     // Close the old segment before its name is taken over.
     drop(journal_writer.take());
     std::fs::rename(&staging, &journal_path)?;
     melin_journal::segment::fsync_parent_dir(&journal_path)?;
-    *journal_writer = Some(W::open_append(&journal_path, 0, valid_end)?);
+    *journal_writer = Some(W::open_append(&journal_path, 0, valid_end, prealloc)?);
     tracing::info!(
         journal = %journal_path.display(),
         genesis_entries = ?advertised,
@@ -1729,6 +1747,7 @@ mod tests {
     // event type stands in for a production application's event and keeps
     // the runtime's test deps free of any application crate but the example.
     use counter_server::CounterEvent;
+    use melin_journal::test_utils::PREALLOC;
     type InputSlot = melin_transport_core::pipeline::InputSlot<CounterEvent>;
     use melin_transport_core::replication::protocol::{
         Ack, Handshake, MAX_CONTROL_FRAME, MAX_DATA_FRAME, MSG_AUTH_OK, MSG_CHALLENGE_RESPONSE,
@@ -1867,7 +1886,8 @@ mod tests {
 
         // The pre-upgrade empty journal: adopted, still empty, same anchor.
         let path = dir.path().join("empty.journal");
-        let mut w = Some(Writer::create_continuing(&path, 1, anchor, None).expect("create"));
+        let mut w =
+            Some(Writer::create_continuing(&path, 1, anchor, None, PREALLOC).expect("create"));
         adopt_genesis_into_empty_unknown_journal(&mut w, (1, anchor, Some(3))).expect("adopt");
         assert_eq!(header(&w), Some(3));
         let adopted = w.as_ref().expect("writer");
@@ -1883,26 +1903,30 @@ mod tests {
 
         // The primary's length is unknown too: nothing to adopt.
         let path = dir.path().join("both-unknown.journal");
-        let mut w = Some(Writer::create_continuing(&path, 1, anchor, None).expect("create"));
+        let mut w =
+            Some(Writer::create_continuing(&path, 1, anchor, None, PREALLOC).expect("create"));
         adopt_genesis_into_empty_unknown_journal(&mut w, (1, anchor, None)).expect("no-op");
         assert_eq!(header(&w), None);
 
         // Another lineage's anchor: not this primary's journal.
         let path = dir.path().join("other-anchor.journal");
-        let mut w = Some(Writer::create_continuing(&path, 1, [1; 32], None).expect("create"));
+        let mut w =
+            Some(Writer::create_continuing(&path, 1, [1; 32], None, PREALLOC).expect("create"));
         adopt_genesis_into_empty_unknown_journal(&mut w, (1, anchor, Some(3))).expect("no-op");
         assert_eq!(header(&w), None);
 
         // A known length is never rewritten (a mismatch is refused by
         // `check_advertised_genesis` instead).
         let path = dir.path().join("known.journal");
-        let mut w = Some(Writer::create_continuing(&path, 1, anchor, Some(2)).expect("create"));
+        let mut w =
+            Some(Writer::create_continuing(&path, 1, anchor, Some(2), PREALLOC).expect("create"));
         adopt_genesis_into_empty_unknown_journal(&mut w, (1, anchor, Some(3))).expect("no-op");
         assert_eq!(header(&w), Some(2));
 
         // A journal holding an entry has history: its header stays.
         let path = dir.path().join("history.journal");
-        let mut writer = Writer::create_continuing(&path, 1, anchor, None).expect("create");
+        let mut writer =
+            Writer::create_continuing(&path, 1, anchor, None, PREALLOC).expect("create");
         let seq = writer.allocate_sequence();
         writer
             .encode_event(seq, 0, &melin_journal::JournalEvent::Tick { now_ns: 0 }, 0)
@@ -1937,27 +1961,35 @@ mod tests {
             &fence,
             &SharedLineagePolicy::new(None),
             &(),
+            PREALLOC,
         )
         .expect("recover");
         assert!(app.is_none() && writer.is_none());
         assert!(!staging.exists(), "swept without a journal");
 
         // A journal that holds history, which the adopt guard never touches.
-        let mut w = Writer::create_continuing(&journal, 1, [0; 32], None).expect("create");
+        let mut w =
+            Writer::create_continuing(&journal, 1, [0; 32], None, PREALLOC).expect("create");
         let seq = w.allocate_sequence();
         w.encode_event(seq, 0, &melin_journal::JournalEvent::Tick { now_ns: 0 }, 0)
             .expect("encode");
         w.flush_batch_sync().expect("flush");
         drop(w);
         std::fs::write(&staging, b"debris").expect("write staging");
+        // Not the reservation the journal was created with: the recovered
+        // writer must take the node's, which it is handed, not keep the
+        // creator's or fall back to the default.
+        let node = melin_journal::Prealloc::for_rotation(2 * 1024 * 1024);
+        assert_ne!(node, PREALLOC);
         let (_, writer, last, _) = recover_replica_state::<counter_server::Counter, Writer>(
             &store,
             &fence,
             &SharedLineagePolicy::new(None),
             &(),
+            node,
         )
         .expect("recover");
-        assert!(writer.is_some());
+        assert_eq!(writer.expect("recovered").prealloc(), node);
         assert_eq!(last, 1);
         assert!(!staging.exists(), "swept beside a journal with history");
     }
@@ -1988,8 +2020,14 @@ mod tests {
         });
         let cell = SharedLineagePolicy::new(stale);
         let recover = |cell: &SharedLineagePolicy| {
-            recover_replica_state::<counter_server::Counter, Writer>(&store, &fence, cell, &())
-                .expect("recover")
+            recover_replica_state::<counter_server::Counter, Writer>(
+                &store,
+                &fence,
+                cell,
+                &(),
+                PREALLOC,
+            )
+            .expect("recover")
         };
 
         // No lineage: nothing held.
@@ -1997,7 +2035,8 @@ mod tests {
         assert_eq!(cell.load(), None);
 
         // A journal with no change: nothing held either.
-        let mut w = Writer::create_continuing(&journal, 1, [0; 32], None).expect("create");
+        let mut w =
+            Writer::create_continuing(&journal, 1, [0; 32], None, PREALLOC).expect("create");
         let append = |w: &mut Writer, event: JournalEvent<CounterEvent>| {
             let seq = w.allocate_sequence();
             w.encode_event(seq, 0, &event, 0).expect("encode");
@@ -2044,7 +2083,7 @@ mod tests {
         let path = dir.path().join("replica.journal");
         let anchor = [9u8; 32];
         let mut journal_writer =
-            Some(Writer::create_continuing(&path, 1, anchor, None).expect("create"));
+            Some(Writer::create_continuing(&path, 1, anchor, None, PREALLOC).expect("create"));
         let fence = melin_transport_core::fence::FenceState::new(5);
         let control = ReplicaControlPlane::new();
 
@@ -2084,7 +2123,7 @@ mod tests {
         let path = dir.path().join("replica.journal");
         let anchor = [9u8; 32];
         let mut journal_writer =
-            Some(Writer::create_continuing(&path, 1, anchor, None).expect("create"));
+            Some(Writer::create_continuing(&path, 1, anchor, None, PREALLOC).expect("create"));
         let fence = melin_transport_core::fence::FenceState::new(5);
         let control = ReplicaControlPlane::new();
         let held = Some(melin_transport_core::lineage::LineagePolicy::after(
@@ -2135,7 +2174,7 @@ mod tests {
         let path = dir.path().join("replica.journal");
         let anchor = [9u8; 32];
         let mut journal_writer =
-            Some(Writer::create_continuing(&path, 1, anchor, Some(2)).expect("create"));
+            Some(Writer::create_continuing(&path, 1, anchor, Some(2), PREALLOC).expect("create"));
         let fence = melin_transport_core::fence::FenceState::new(5);
         let control = ReplicaControlPlane::new();
 
@@ -2170,7 +2209,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("replica.journal");
 
-        let writer = Writer::create_continuing(&path, 1, [7; 32], Some(5)).expect("create");
+        let writer =
+            Writer::create_continuing(&path, 1, [7; 32], Some(5), PREALLOC).expect("create");
         let mut journal_writer = Some(writer);
         assert_eq!(
             local_lineage_genesis::<counter_server::Counter, Writer>(&None, &journal_writer)
@@ -3746,6 +3786,7 @@ mod tests {
                 1,
                 [7; 32],
                 Some(5),
+                PREALLOC,
             )
             .expect("create journal");
             // Every thread on the same core, yielding: what matters is
@@ -4006,6 +4047,7 @@ mod tests {
             &crate::promotion::PromotionRequest::new(),
             || closes += 1,
             &(),
+            PREALLOC,
         );
         let AfterSession::Return(Err(err)) = after else {
             panic!("a refused sequence stops the replica rather than reconnecting or resyncing");
@@ -4067,6 +4109,7 @@ mod tests {
                 &crate::promotion::PromotionRequest::new(),
                 || closes += 1,
                 &(),
+                PREALLOC,
             );
             assert_eq!(closes, 1, "{label}");
         }
@@ -4107,6 +4150,7 @@ mod tests {
             &promote,
             || {},
             &(),
+            PREALLOC,
         );
         assert!(matches!(after, AfterSession::Reconnect));
         backoff
@@ -4176,7 +4220,7 @@ mod tests {
             genesis_entries: None,
             journal_failed: Arc::new(AtomicBool::new(false)),
             pipeline_shutdown: Arc::new(AtomicBool::new(false)),
-            journal_handle: std::thread::spawn(move || Writer::create(&writer_path)),
+            journal_handle: std::thread::spawn(move || Writer::create(&writer_path, PREALLOC)),
             matching_handle: std::thread::spawn(counter_server::Counter::default),
             drain_handle: std::thread::spawn(|| {}),
             shadow_handle: None,
@@ -4204,6 +4248,7 @@ mod tests {
             &promote,
             || closed = true,
             &(),
+            PREALLOC,
         );
         assert!(
             matches!(after, AfterSession::Reconnect),
