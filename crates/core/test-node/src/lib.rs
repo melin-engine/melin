@@ -456,12 +456,13 @@ pub const RING_CAPACITY: RingCapacity =
 ///   whether used or not: at the production capacity a node of an
 ///   application with wide events holds most of a GiB in them, and a
 ///   parallel suite runs dozens of nodes.
-/// - **`cores`** is [`PipelineCores::unpinned`]. The production layout
-///   pins each pipeline thread to a fixed core and busy-spins there: with
-///   many nodes on one host it would stack every node's same-role thread
-///   on one core, while a spinner would starve whatever shares its core,
-///   the test's own client included. Unpinned, the scheduler places each
-///   thread, and it waits the way an unpinned thread does.
+/// - **`cores`** leaves every thread unpinned. The production layout pins
+///   each pipeline thread to a fixed core and busy-spins there: with many
+///   nodes on one host it would stack every node's same-role thread on one
+///   core, while a spinner would starve whatever shares its core, the
+///   test's own client included. Unpinned, the scheduler places each
+///   thread, and it parks when idle, as `--cores none` does; with
+///   [`WAIT_ENV`] set to `yield`, it yields instead (see there).
 /// - **`journal_staging_mode`** is [`JournalStagingMode::Allocate`]. A
 ///   zero fill writes over a whole staged segment with synchronous I/O,
 ///   from every node at once, so a parallel suite queues on the disk: a
@@ -480,9 +481,41 @@ pub fn config() -> ServerConfig {
         max_connections: MAX_CONNECTIONS,
         no_mlock: true,
         ring_capacity: RING_CAPACITY,
-        cores: PipelineCores::unpinned(),
+        cores: unpinned_cores(std::env::var_os(WAIT_ENV).as_deref())
+            .unwrap_or_else(|e| panic!("{e}")),
         journal_staging_mode: JournalStagingMode::Allocate,
         ..ServerConfig::default()
+    }
+}
+
+/// The environment variable that chooses how a test node's unpinned
+/// threads wait (see [`config`]): `park`, the default, or `yield`. Any
+/// other value fails the test that reads it, rather than running the
+/// suite under a policy nobody asked for.
+///
+/// Parking keeps a parallel suite's CPU low, which lets the cluster tests
+/// run several at a time, and is what `--cores none` does. But a parked
+/// stage looks at its ring only every so often after an idle spell, so
+/// two stages handing work to each other interleave far more coarsely
+/// than yielding ones, which look about every microsecond: a race that
+/// needs a narrow interleaving gets fewer chances to show. Yielding is
+/// also what a node's `y` threads do. The post-merge CI job runs the
+/// suite yielding, with the cluster tests one at a time, as every run did
+/// before nodes parked; local runs and the pre-merge gate park.
+pub const WAIT_ENV: &str = "MELIN_TEST_NODE_WAIT";
+
+/// Every thread unpinned, waiting as `wait` (the value of [`WAIT_ENV`])
+/// says, or why the value is refused.
+fn unpinned_cores(wait: Option<&std::ffi::OsStr>) -> Result<PipelineCores, String> {
+    let Some(wait) = wait else {
+        return Ok(PipelineCores::unpinned());
+    };
+    match wait.to_str() {
+        Some("park") => Ok(PipelineCores::unpinned()),
+        Some("yield") => Ok(PipelineCores::unpinned().all_yielding()),
+        _ => Err(format!(
+            "{WAIT_ENV}={wait:?}: expected `park` (the default) or `yield`"
+        )),
     }
 }
 
@@ -1156,7 +1189,38 @@ mod tests {
         assert_eq!(config.max_connections, MAX_CONNECTIONS);
         assert!(config.no_mlock);
         assert_eq!(config.ring_capacity, RING_CAPACITY);
-        assert_eq!(config.cores, PipelineCores::unpinned());
+        // Unpinned however the run waits: CI sets `WAIT_ENV` for a whole
+        // suite, this test included.
+        assert!(config.cores.pins_nothing());
         assert_eq!(config.journal_staging_mode, JournalStagingMode::Allocate);
+    }
+
+    /// The two waits `WAIT_ENV` names, the default when it is unset, and
+    /// a refusal for anything else: a misspelt value in CI must fail the
+    /// run, not quietly run the default.
+    #[test]
+    fn the_wait_variable_picks_park_or_yield_and_refuses_anything_else() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        assert_eq!(unpinned_cores(None), Ok(PipelineCores::unpinned()));
+        assert_eq!(
+            unpinned_cores(Some(OsStr::new("park"))),
+            Ok(PipelineCores::unpinned())
+        );
+        assert_eq!(
+            unpinned_cores(Some(OsStr::new("yield"))),
+            Ok(PipelineCores::unpinned().all_yielding())
+        );
+        for refused in [
+            OsStr::new(""),
+            OsStr::new("spin"),
+            OsStr::new("Yield"),
+            OsStr::from_bytes(b"\xff"),
+        ] {
+            let err = unpinned_cores(Some(refused)).expect_err("an unknown wait is refused");
+            assert!(err.contains(WAIT_ENV), "{err}");
+            assert!(err.contains("`park`") && err.contains("`yield`"), "{err}");
+        }
     }
 }
