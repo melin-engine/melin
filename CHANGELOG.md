@@ -46,8 +46,24 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   busy. `ServerConfig::ring_capacity` takes a
   `melin_transport_core::pipeline::RingCapacity` (re-exported from
   `melin_server_runtime::server`), which only a valid capacity can be.
+- **A `p` wait suffix in `--cores`** (`journal-seq=7p`): the thread spins,
+  yields, then sleeps between polls, each sleep longer than the last up
+  to 200 µs, so it costs next to no CPU while idle. In code,
+  `WaitStrategy::SpinYieldPark` and `Placement::parking`.
 
 ### Changed
+
+- **Unpinned pipeline threads sleep when idle** (`--cores none`, and any
+  entry of `0`): they park, as with the new `p` suffix, where they used
+  to yield in a loop and keep a core busy each. An idle node no longer
+  shows as busy cores, nor burns a container's CPU quota; the first
+  reply after an idle spell can come up to around a millisecond late.
+  `0y` keeps an unpinned thread yielding, and the boot log renders such a
+  layout with its suffixes rather than as `none`. Pinned threads are
+  unchanged.
+- **`melin_pipeline::wait::WaitStrategy` has a third variant,
+  `SpinYieldPark`**: an exhaustive `match` on it must handle the new
+  case.
 
 - **The last surviving replica no longer auto-promotes.** The majority
   check that stops an isolated replica promoting (see **Fixed**) cannot
