@@ -397,12 +397,7 @@ impl SegmentFile {
         starting_sequence: u64,
         anchor_hash: [u8; 32],
     ) -> Result<(), JournalError> {
-        let crate::preparer::PreparedSegment {
-            file,
-            path: staging_path,
-            allocated_end,
-            written,
-        } = prepared;
+        let file = prepared.file();
 
         // Write the file header into the staging file *before* the
         // rename, so the file appearing at the live path is always
@@ -412,7 +407,7 @@ impl SegmentFile {
         // of handling as the "no live file" Phase-B case. The staging
         // file covers `[0, ENTRY_OFFSET)` too, so this pwrite lands in
         // the same kind of extent as every append after it.
-        write_header(&file, starting_sequence, anchor_hash, self.genesis_entries)?;
+        write_header(file, starting_sequence, anchor_hash, self.genesis_entries)?;
         // Commit the header durably before the rename — a crash before
         // the next user write must still leave a parseable empty
         // journal, matching `create_continuing`. `sync_data`, not
@@ -433,9 +428,13 @@ impl SegmentFile {
 
         // Rename staging onto the live path. `archive_live` has already
         // moved the previous live segment aside, so the destination is
-        // free. On failure the fully-written staging file stays on disk
-        // for the next preparer cycle to reclaim.
-        std::fs::rename(&staging_path, live_path).map_err(JournalError::Io)?;
+        // free. The rename consumes `prepared`, whose hold on the
+        // staging path keeps the preparer from re-staging there until
+        // the rename is done. On failure the fully-written staging file
+        // stays on disk for the next preparer cycle to reclaim.
+        let allocated_end = prepared.allocated_end();
+        let written = prepared.written();
+        let file = prepared.rename_onto(live_path).map_err(JournalError::Io)?;
 
         // Commit point — nothing below can fail. Dropping the old
         // `self.file` closes the outgoing (now archived) segment's fd.
@@ -602,12 +601,7 @@ mod tests {
         let staging = dir.join("ghost.staging");
         let file = File::create(&staging).unwrap();
         std::fs::remove_file(&staging).unwrap();
-        crate::preparer::PreparedSegment {
-            file,
-            path: staging,
-            allocated_end: 4096,
-            written: true,
-        }
+        crate::preparer::PreparedSegment::for_test(file, staging, 4096, true)
     }
 
     /// A real staged file at the canonical staging path, `allocated_end`
@@ -622,12 +616,7 @@ mod tests {
             .open(&path)
             .unwrap();
         file.set_len(allocated_end).unwrap();
-        crate::preparer::PreparedSegment {
-            file,
-            path,
-            allocated_end,
-            written,
-        }
+        crate::preparer::PreparedSegment::for_test(file, path, allocated_end, written)
     }
 
     /// The pre-written property is what the "extended past its

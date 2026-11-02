@@ -713,16 +713,8 @@ mod tests {
             0,
             crate::preparer::StagingMode::ZeroFill,
         );
-        let mut prepared = None;
-        for _ in 0..500 {
-            if let Some(p) = preparer.take() {
-                prepared = Some(p);
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let prepared = prepared.expect("preparer should stage a segment within 5 s");
-        let zeroed_end = prepared.allocated_end;
+        let prepared = crate::preparer::take_within(&preparer);
+        let zeroed_end = prepared.allocated_end();
 
         let sealed_end = writer.valid_end();
         let archived = writer.rotate_segment_with_prepared(prepared).unwrap();
@@ -776,16 +768,8 @@ mod tests {
             0,
             crate::preparer::StagingMode::Allocate,
         );
-        let mut prepared = None;
-        for _ in 0..500 {
-            if let Some(p) = preparer.take() {
-                prepared = Some(p);
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let prepared = prepared.expect("preparer should stage a segment within 5 s");
-        let allocated_end = prepared.allocated_end;
+        let prepared = crate::preparer::take_within(&preparer);
+        let allocated_end = prepared.allocated_end();
 
         let sealed_end = writer.valid_end();
         let archived = writer.rotate_segment_with_prepared(prepared).unwrap();
@@ -831,15 +815,7 @@ mod tests {
             0,
             crate::preparer::StagingMode::ZeroFill,
         );
-        let mut prepared = None;
-        for _ in 0..500 {
-            if let Some(p) = preparer.take() {
-                prepared = Some(p);
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let prepared = prepared.expect("prepared segment");
+        let prepared = crate::preparer::take_within(&preparer);
 
         writer.rotate_segment_with_prepared(prepared).unwrap();
         // Simulate the crash: drop without appending.
@@ -888,16 +864,8 @@ mod tests {
             0,
             crate::preparer::StagingMode::ZeroFill,
         );
-        let mut prepared = None;
-        for _ in 0..500 {
-            if let Some(p) = preparer.take() {
-                prepared = Some(p);
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
         writer
-            .rotate_segment_with_prepared(prepared.expect("prepared segment"))
+            .rotate_segment_with_prepared(crate::preparer::take_within(&preparer))
             .unwrap();
         preparer.shutdown();
 

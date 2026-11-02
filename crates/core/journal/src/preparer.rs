@@ -19,9 +19,11 @@
 //!      parks the result in `slot`.
 //!   3. At rotation time the writer calls
 //!      [`SegmentPreparer::take`]; if it returns `Some`, the writer
-//!      renames the staging file into place and writes the file header
-//!      (which carries the boundary's sequence + chain anchor). Cost:
-//!      two renames + one dir fsync. The ~38 ms is gone.
+//!      writes the file header (which carries the boundary's sequence +
+//!      chain anchor) and renames the staging file into place. Cost:
+//!      two renames + one dir fsync. The ~38 ms is gone. Until that
+//!      rename, the taken segment holds the staging path and the worker
+//!      does not re-stage there (see [`PreparedSegment`]).
 //!   4. If `take` returns `None` (the worker hasn't caught up, manual
 //!      rotation arrived early, or preparation errored), the writer
 //!      falls back to today's synchronous path.
@@ -91,22 +93,129 @@ use crate::prealloc::Prealloc;
 /// for why that distinction matters.
 ///
 /// The file header is *not* yet written — the adopting writer
-/// (`BufferedWriter::install_prepared_segment`) writes it at adopt time
-/// so it reflects the rotation boundary's sequence + chain anchor.
+/// (`SegmentFile::install_prepared`) writes it at adopt time so it
+/// reflects the rotation boundary's sequence + chain anchor.
+///
+/// A taken segment holds the staging path for as long as it exists. The
+/// worker stages every segment at that one path, and it does not start
+/// the next preparation until the taken segment is gone; the only way to
+/// move the file into place, [`rename_onto`](Self::rename_onto), consumes
+/// it and releases the path after the rename. Nothing else could stop the
+/// worker from re-staging between [`SegmentPreparer::take`] and the
+/// adopter's rename (an arm coalesced during the previous preparation
+/// lets it start as soon as the slot is empty). That unlinked the taken
+/// file and created a header-less one in its place, the rename then
+/// installed the new file as the live segment, and the writer appended
+/// a whole segment's entries to the unlinked inode, gone from the journal.
 pub struct PreparedSegment {
-    /// File handle, reused by the writer after rename.
-    pub file: File,
-    /// Path of the staging file (`<live>.next-staging`). The adopter
-    /// renames it onto the live path.
-    pub path: PathBuf,
+    staged: Staged,
+    /// Released (dropped) by `rename_onto` after the rename, or with the
+    /// segment when it is dropped without being renamed.
+    lease: StagingLease,
+}
+
+impl PreparedSegment {
+    /// File handle, reused by the writer after the rename.
+    pub fn file(&self) -> &File {
+        &self.staged.file
+    }
+
+    /// Path of the staging file (`<live>.next-staging`).
+    pub fn path(&self) -> &Path {
+        &self.staged.path
+    }
+
     /// End of the staged region (matches the writer's `allocated_end`).
-    pub allocated_end: u64,
+    pub fn allocated_end(&self) -> u64 {
+        self.staged.allocated_end
+    }
+
     /// Whether `[0, allocated_end)` is physically written
     /// ([`StagingMode::ZeroFill`]) or only allocated
     /// ([`StagingMode::Allocate`]). The adopter uses it to tell a
     /// segment that *lost* its pre-written property by outgrowing the
     /// staged region from one that never had it.
-    pub written: bool,
+    pub fn written(&self) -> bool {
+        self.staged.written
+    }
+
+    /// Rename the staged file onto `live_path` and hand back its handle.
+    ///
+    /// Consumes the segment, so the staging path goes back to the worker
+    /// only once the rename has happened, or failed: on failure the file
+    /// stays at the staging path, and the next preparation removes it.
+    pub fn rename_onto(self, live_path: &Path) -> io::Result<File> {
+        let Self { staged, lease } = self;
+        let renamed = std::fs::rename(&staged.path, live_path);
+        // Not a moment earlier: until here the worker must not touch the
+        // staging path.
+        drop(lease);
+        renamed.map(|()| staged.file)
+    }
+
+    /// A segment no preparer staged, for tests that drive an adoption by
+    /// hand. Nothing waits on its release.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_test(file: File, path: PathBuf, allocated_end: u64, written: bool) -> Self {
+        Self {
+            staged: Staged {
+                file,
+                path,
+                allocated_end,
+                written,
+            },
+            lease: StagingLease { state: None },
+        }
+    }
+}
+
+/// A staged file before it is handed out: what the worker produces and
+/// parks in the slot.
+struct Staged {
+    file: File,
+    path: PathBuf,
+    allocated_end: u64,
+    written: bool,
+}
+
+/// The claim a taken [`PreparedSegment`] holds on the staging path.
+/// Dropping it frees the slot and wakes a worker waiting to re-stage.
+struct StagingLease {
+    /// `None` only for [`PreparedSegment::for_test`], which no worker
+    /// waits on. An `Option` rather than a dummy `State`: there is no
+    /// slot to free.
+    state: Option<Arc<State>>,
+}
+
+impl Drop for StagingLease {
+    fn drop(&mut self) {
+        let Some(state) = self.state.take() else {
+            return;
+        };
+        // A poisoned lock means some thread panicked while holding it;
+        // the slot is a plain enum, valid at every point, so free it
+        // anyway: left `Leased`, the worker would wait for good.
+        let mut slot = state
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(
+            matches!(*slot, Slot::Leased),
+            "a lease exists only while the slot is leased"
+        );
+        *slot = Slot::Free;
+        state.released.notify_one();
+    }
+}
+
+/// The preparer's one-entry hand-off, and who owns the staging path.
+enum Slot {
+    /// Nothing staged and nothing handed out: the path is the worker's.
+    Free,
+    /// Staged, waiting for [`SegmentPreparer::take`].
+    Ready(Staged),
+    /// Taken: the [`PreparedSegment`] owns the path until it drops.
+    Leased,
 }
 
 /// How the preparer materialises a staged segment's extents.
@@ -189,11 +298,24 @@ struct State {
     /// rotation (tiny observed segment) from shrinking the target below
     /// what size-driven rotation needs.
     stage_floor: u64,
-    /// Mutex<Option<…>> because the slot is mutated from two threads
-    /// (worker writes, adopter takes) and has at most one entry. No
-    /// contention on the hot path — the lock is only acquired at
-    /// rotation time and on prepare completion.
-    slot: Mutex<Option<PreparedSegment>>,
+    /// A mutex because the slot is mutated from three places (the
+    /// worker stages, the adopter takes, the lease frees) and holds at
+    /// most one entry. No contention on the hot path — the lock is only
+    /// acquired at rotation time and on prepare completion.
+    slot: Mutex<Slot>,
+    /// Paired with `slot`: wakes the worker when a lease is released or
+    /// `shutdown` flips to `true`.
+    released: Condvar,
+    /// Times the worker has waited on a lease — the observation that it
+    /// reached that point, which a test cannot get from the file system
+    /// (the waiting is the absence of an action).
+    #[cfg(test)]
+    lease_waits: AtomicU64,
+    /// Times the worker has skipped an arm because a staged segment was
+    /// still waiting to be taken — like `lease_waits`, an absence of
+    /// action a test can only observe through a counter.
+    #[cfg(test)]
+    ready_skips: AtomicU64,
     /// `true` when an arm has been requested. The mutex is paired with
     /// `notify` so the worker can block on a `Condvar::wait` without
     /// busy-spinning.
@@ -259,7 +381,12 @@ impl SegmentPreparer {
             mode,
             stage_target: AtomicU64::new(stage_target),
             stage_floor,
-            slot: Mutex::new(None),
+            slot: Mutex::new(Slot::Free),
+            released: Condvar::new(),
+            #[cfg(test)]
+            lease_waits: AtomicU64::new(0),
+            #[cfg(test)]
+            ready_skips: AtomicU64::new(0),
             // Pre-arm at startup so the worker prepares the first spare
             // segment in parallel with server warm-up. The first rotation
             // then has a ready segment to adopt.
@@ -320,15 +447,30 @@ impl SegmentPreparer {
     }
 
     /// Drain the prepared-segment slot. Returns `Some` only if the
-    /// worker has finished a preparation that has not yet been adopted.
-    /// Called by `BufferedWriter::rotate_segment` to decide between the
-    /// fast adopt path and the sync fallback.
+    /// worker has finished a preparation that has not yet been taken.
+    /// Called by the journal stage to decide between the fast adopt path
+    /// and the sync fallback. The returned segment holds the staging
+    /// path until it is renamed or dropped (see [`PreparedSegment`]).
     pub fn take(&self) -> Option<PreparedSegment> {
-        self.state
+        let mut slot = self
+            .state
             .slot
             .lock()
-            .expect("preparer slot mutex poisoned")
-            .take()
+            .expect("preparer slot mutex poisoned");
+        match std::mem::replace(&mut *slot, Slot::Leased) {
+            Slot::Ready(staged) => Some(PreparedSegment {
+                staged,
+                lease: StagingLease {
+                    state: Some(Arc::clone(&self.state)),
+                },
+            }),
+            // Nothing staged (`Free`), or already taken (`Leased`): put
+            // it back as it was.
+            other => {
+                *slot = other;
+                None
+            }
+        }
     }
 
     /// Signal the worker to exit and join the thread. Idempotent; safe
@@ -349,6 +491,19 @@ impl SegmentPreparer {
             *armed = true;
         }
         self.state.notify.notify_one();
+        // And if it's waiting on a lease. Notified under the slot lock,
+        // which the worker holds from its shutdown check until it waits,
+        // so the wakeup cannot fall between the two.
+        {
+            // A poisoned slot lock still guards a valid enum, and the
+            // wakeup is all that is needed here.
+            let _slot = self
+                .state
+                .slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.state.released.notify_one();
+        }
         if let Some(h) = self.handle.take() {
             // Best-effort join: a panic in the worker has already been
             // logged by Rust's default panic handler.
@@ -395,18 +550,45 @@ fn worker_loop(state: Arc<State>) {
         *armed = false;
         drop(armed);
 
-        // If a previous preparation is still waiting to be adopted, skip
-        // this cycle — the slot has capacity for one.
-        let occupied = state.slot.lock().map(|g| g.is_some()).unwrap_or(false);
-        if occupied {
-            continue;
+        // Claim the staging path. A preparation still waiting to be taken
+        // means this cycle has nothing to do — the slot has capacity for
+        // one. A taken one still owns the path until the adopter's rename
+        // (see `PreparedSegment`): wait it out, then prepare, since this
+        // arm asked for a segment and nothing has staged one since.
+        {
+            let Ok(mut slot) = state.slot.lock() else {
+                return; // poisoned; just exit
+            };
+            while matches!(*slot, Slot::Leased) {
+                if state.shutdown.load(Ordering::Acquire) {
+                    return;
+                }
+                #[cfg(test)]
+                state.lease_waits.fetch_add(1, Ordering::Relaxed);
+                slot = match state.released.wait(slot) {
+                    Ok(g) => g,
+                    Err(_) => return,
+                };
+            }
+            if matches!(*slot, Slot::Ready(_)) {
+                #[cfg(test)]
+                state.ready_skips.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
         }
+        // `Free` from here until this cycle stages: only the worker moves
+        // the slot out of `Free`, so no segment holds the staging path.
 
         match prepare_one(&state) {
-            Ok(prepared) => {
-                if let Ok(mut g) = state.slot.lock() {
-                    *g = Some(prepared);
-                }
+            Ok(staged) => {
+                let Ok(mut slot) = state.slot.lock() else {
+                    return; // poisoned; just exit
+                };
+                debug_assert!(
+                    matches!(*slot, Slot::Free),
+                    "only the worker moves the slot out of Free"
+                );
+                *slot = Slot::Ready(staged);
             }
             Err(e) => {
                 // A shutdown mid-prepare surfaces as an aborted zero
@@ -440,14 +622,18 @@ fn backoff_sleep(state: &State) {
 ///
 /// Neither mode writes a file header — the header is application data
 /// that depends on the rotation-boundary state and is written by the
-/// adopting writer after the rename.
-fn prepare_one(state: &State) -> Result<PreparedSegment, JournalError> {
+/// adopting writer, just before its rename.
+///
+/// Called only with the slot `Free`, so no taken segment holds the
+/// staging path: whatever is there is stale.
+fn prepare_one(state: &State) -> Result<Staged, JournalError> {
     let staging = staging_path(&state.live_path);
 
-    // Remove any stale staging file. A leftover here is normally
-    // cleaned by `SegmentPreparer::spawn`, but `create_new` would fail
-    // with AlreadyExists if a race or external operator left one
-    // behind. Treat NotFound as success.
+    // Remove any stale staging file: one a failed adoption left behind
+    // (its rename never happened), or an orphan an external operator
+    // left (a crashed run's is cleaned by `SegmentPreparer::spawn`).
+    // `create_new` would fail with AlreadyExists on either. Treat
+    // NotFound as success.
     match std::fs::remove_file(&staging) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -484,7 +670,7 @@ fn prepare_one(state: &State) -> Result<PreparedSegment, JournalError> {
 /// `sync_all`, not `sync_data`: the whole product of this function *is*
 /// metadata (the extent allocation), and it has to be durable before the
 /// adopting writer renames the file into place.
-fn prepare_allocated(staging: &Path, bytes: u64) -> Result<PreparedSegment, JournalError> {
+fn prepare_allocated(staging: &Path, bytes: u64) -> Result<Staged, JournalError> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -495,7 +681,7 @@ fn prepare_allocated(staging: &Path, bytes: u64) -> Result<PreparedSegment, Jour
         .map_err(|e| JournalError::Io(io::Error::from_raw_os_error(e.raw_os_error())))?;
     file.sync_all()?;
 
-    Ok(PreparedSegment {
+    Ok(Staged {
         file,
         path: staging.to_path_buf(),
         allocated_end: bytes,
@@ -635,7 +821,7 @@ fn prepare_zero_filled(
     staging: &Path,
     bytes: u64,
     shutdown: &AtomicBool,
-) -> Result<PreparedSegment, JournalError> {
+) -> Result<Staged, JournalError> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -675,7 +861,7 @@ fn prepare_zero_filled(
             Ok(())
         })?;
         file.sync_all()?;
-        return Ok(PreparedSegment {
+        return Ok(Staged {
             file,
             path: staging.to_path_buf(),
             allocated_end: bytes,
@@ -731,7 +917,7 @@ fn prepare_zero_filled(
     // metadata (plus timestamps) remains unforced here.
     file.sync_all()?;
 
-    Ok(PreparedSegment {
+    Ok(Staged {
         file,
         path: staging.to_path_buf(),
         allocated_end: bytes,
@@ -861,10 +1047,38 @@ pub(crate) fn staging_path(live: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// Wait for the worker to stage a segment, and take it. Staging a few
+/// MiB on tmpfs is milliseconds; the bound only keeps a broken preparer
+/// from hanging the suite.
+#[cfg(test)]
+pub(crate) fn take_within(preparer: &SegmentPreparer) -> PreparedSegment {
+    let mut taken = None;
+    wait_until(
+        || {
+            taken = preparer.take();
+            taken.is_some()
+        },
+        "preparer should stage a segment within 10 s",
+    );
+    taken.expect("wait_until returned, so take yielded a segment")
+}
+
+/// Poll `done` until it holds, failing with `msg` after 10 s: the one
+/// bound every preparer test waits under.
+#[cfg(test)]
+pub(crate) fn wait_until(mut done: impl FnMut() -> bool, msg: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !done() {
+        assert!(std::time::Instant::now() < deadline, "{msg}");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_utils::PREALLOC;
+    use std::os::unix::fs::MetadataExt;
 
     /// Spawning, arming, and shutdown round-trips without leaking the
     /// worker thread or the staging file.
@@ -879,25 +1093,14 @@ mod tests {
         let preparer =
             SegmentPreparer::spawn(live.clone(), threshold, PREALLOC, 0, StagingMode::ZeroFill);
 
-        // Wait up to 5 s for the worker to publish a prepared segment.
-        // Staging a few MiB on tmpfs is milliseconds, but the bounded
-        // wait protects against an unexpectedly slow CI host.
-        let mut prepared = None;
-        for _ in 0..500 {
-            if let Some(p) = preparer.take() {
-                prepared = Some(p);
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let prepared = prepared.expect("preparer should publish a segment within 5 s");
+        let prepared = take_within(&preparer);
 
-        assert_eq!(prepared.path, staging_path(&live));
-        assert_eq!(prepared.allocated_end, threshold + STAGE_MARGIN_BYTES);
+        assert_eq!(prepared.path(), staging_path(&live));
+        assert_eq!(prepared.allocated_end(), threshold + STAGE_MARGIN_BYTES);
 
         // Drop the file before shutdown so the staging file can be
         // cleaned by the test harness.
-        let staging = prepared.path.clone();
+        let staging = prepared.path().to_path_buf();
         drop(prepared);
 
         preparer.shutdown();
@@ -927,20 +1130,12 @@ mod tests {
         let preparer =
             SegmentPreparer::spawn(live.clone(), threshold, PREALLOC, 0, StagingMode::Allocate);
 
-        let mut prepared = None;
-        for _ in 0..500 {
-            if let Some(p) = preparer.take() {
-                prepared = Some(p);
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let prepared = prepared.expect("preparer should publish a segment within 5 s");
+        let prepared = take_within(&preparer);
 
-        assert_eq!(prepared.path, staging_path(&live));
-        assert_eq!(prepared.allocated_end, threshold + STAGE_MARGIN_BYTES);
+        assert_eq!(prepared.path(), staging_path(&live));
+        assert_eq!(prepared.allocated_end(), threshold + STAGE_MARGIN_BYTES);
 
-        let staging = prepared.path.clone();
+        let staging = prepared.path().to_path_buf();
         drop(prepared);
         preparer.shutdown();
 
@@ -973,18 +1168,8 @@ mod tests {
         // create a fresh staging file.
         // Wait for the worker to produce a fresh prepared segment to
         // confirm spawn() didn't fail mid-cleanup.
-        let mut prepared = None;
-        for _ in 0..500 {
-            if let Some(p) = preparer.take() {
-                prepared = Some(p);
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            prepared.is_some(),
-            "worker should produce a fresh segment after orphan cleanup"
-        );
+        let prepared = take_within(&preparer);
+        drop(prepared);
 
         preparer.shutdown();
     }
@@ -1002,20 +1187,12 @@ mod tests {
         let preparer =
             SegmentPreparer::spawn(live.clone(), threshold, PREALLOC, 0, StagingMode::ZeroFill);
 
-        let mut prepared = None;
-        for _ in 0..500 {
-            if let Some(p) = preparer.take() {
-                prepared = Some(p);
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let prepared = prepared.expect("preparer should publish a segment within 5 s");
+        let prepared = take_within(&preparer);
 
         let expected = threshold + STAGE_MARGIN_BYTES;
-        assert_eq!(prepared.allocated_end, expected);
+        assert_eq!(prepared.allocated_end(), expected);
         assert_eq!(
-            std::fs::metadata(&prepared.path)
+            std::fs::metadata(prepared.path())
                 .expect("stat staging")
                 .len(),
             expected,
@@ -1027,7 +1204,7 @@ mod tests {
         let mut buf = [0xAAu8; 4096];
         for offset in [0, expected / 2, expected - 4096] {
             prepared
-                .file
+                .file()
                 .read_exact_at(&mut buf, offset)
                 .expect("read staged bytes");
             assert!(
@@ -1053,32 +1230,22 @@ mod tests {
         // Replica-style spawn: threshold unknown (0) → chunk fallback.
         let preparer = SegmentPreparer::spawn(live, 0, PREALLOC, 0, StagingMode::ZeroFill);
 
-        let take_one = || {
-            for _ in 0..500 {
-                if let Some(p) = preparer.take() {
-                    return p;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            panic!("preparer should stage a segment within 5 s");
-        };
-
         // Initial staging uses the chunk fallback.
-        let first = take_one();
+        let first = take_within(&preparer);
         assert_eq!(
-            first.allocated_end,
+            first.allocated_end(),
             PREALLOC.chunk_bytes() + STAGE_MARGIN_BYTES,
             "initial replica target = prealloc chunk + margin"
         );
-        std::fs::remove_file(&first.path).expect("consume first staging");
+        std::fs::remove_file(first.path()).expect("consume first staging");
         drop(first);
 
         // Observation retunes the target (no floor when threshold is 0).
         let observed: u64 = 3 * 1024 * 1024;
         preparer.arm_with_observed_len(observed);
-        let second = take_one();
+        let second = take_within(&preparer);
         assert_eq!(
-            second.allocated_end,
+            second.allocated_end(),
             observed + STAGE_MARGIN_BYTES,
             "staged size must track the observed segment size"
         );
@@ -1098,34 +1265,190 @@ mod tests {
             SegmentPreparer::spawn(live, 1024 * 1024, PREALLOC, 0, StagingMode::ZeroFill);
 
         // First prepared segment.
-        let mut first = None;
-        for _ in 0..500 {
-            if let Some(p) = preparer.take() {
-                first = Some(p);
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let first = first.expect("first prepared segment");
+        let first = take_within(&preparer);
         // Simulate adoption by dropping + removing the staging file.
-        std::fs::remove_file(&first.path).expect("remove first staging file");
+        std::fs::remove_file(first.path()).expect("remove first staging file");
         drop(first);
 
         // Re-arm and wait for the second.
         preparer.arm();
-        let mut second = None;
-        for _ in 0..500 {
-            if let Some(p) = preparer.take() {
-                second = Some(p);
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            second.is_some(),
-            "preparer should produce a second segment after rearm"
-        );
+        drop(take_within(&preparer));
 
         preparer.shutdown();
+    }
+
+    /// Regression: an arm that is already pending when a segment is
+    /// taken (in the journal stage, one coalesced while the worker was
+    /// staging that segment, by a rotation that had to take the
+    /// synchronous path) must not let the worker re-stage before the
+    /// adopter has renamed the taken file onto the live path. It did:
+    /// the worker unlinked the taken file and created a new, header-less
+    /// one at the staging path, the adopter's rename installed that one
+    /// as the live segment, and the writer appended the segment's
+    /// entries to the unlinked inode. The next rotation then wrote its
+    /// header (the next segment's anchor) into the archive and failed
+    /// its own rename, and recovery found a segment chain break.
+    ///
+    /// Driven step by step: the worker's wait is observed through
+    /// `lease_waits`, so nothing here depends on how the threads are
+    /// scheduled.
+    #[test]
+    fn taken_segment_keeps_the_staging_path_until_renamed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let live = dir.path().join("test.journal");
+        let staging = staging_path(&live);
+        let preparer = SegmentPreparer::spawn(
+            live.clone(),
+            1024 * 1024,
+            PREALLOC,
+            0,
+            StagingMode::ZeroFill,
+        );
+
+        let taken = take_within(&preparer);
+        let taken_ino = taken.file().metadata().expect("fstat taken").ino();
+        preparer.arm();
+        wait_for_lease_wait(&preparer);
+
+        assert!(
+            preparer.take().is_none(),
+            "nothing can be staged while the staging path is leased"
+        );
+        assert_eq!(
+            ino(&staging),
+            taken_ino,
+            "the worker must leave the taken file at the staging path"
+        );
+
+        let file = taken.rename_onto(&live).expect("install the taken segment");
+        assert_eq!(
+            ino(&live),
+            taken_ino,
+            "the live segment must be the file the adopter took"
+        );
+        drop(file);
+
+        // Released: the worker serves the arm it waited with, at the
+        // same path, and leaves the installed segment alone.
+        let next = take_within(&preparer);
+        assert_eq!(next.path(), staging);
+        assert_ne!(ino(&staging), taken_ino);
+        assert_eq!(ino(&live), taken_ino);
+        drop(next);
+        preparer.shutdown();
+    }
+
+    /// A failed rename gives the staging path back too: the adoption is
+    /// over, and the worker removes the leftover and stages afresh.
+    #[test]
+    fn failed_rename_releases_the_staging_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let live = dir.path().join("test.journal");
+        let preparer = SegmentPreparer::spawn(
+            live.clone(),
+            1024 * 1024,
+            PREALLOC,
+            0,
+            StagingMode::ZeroFill,
+        );
+
+        let taken = take_within(&preparer);
+        let taken_ino = taken.file().metadata().expect("fstat taken").ino();
+        preparer.arm();
+        wait_for_lease_wait(&preparer);
+
+        let unreachable = dir.path().join("no-such-dir").join("test.journal");
+        assert!(
+            taken.rename_onto(&unreachable).is_err(),
+            "a rename into a missing directory fails"
+        );
+
+        let next = take_within(&preparer);
+        assert_eq!(next.path(), staging_path(&live));
+        assert_ne!(
+            ino(next.path()),
+            taken_ino,
+            "the next segment is a fresh file, not the failed adoption's"
+        );
+        drop(next);
+        preparer.shutdown();
+    }
+
+    /// Shutdown wakes a worker waiting on a lease; the join must not
+    /// wait for the adoption to finish.
+    #[test]
+    fn shutdown_wakes_a_worker_waiting_on_a_lease() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let live = dir.path().join("test.journal");
+        let preparer =
+            SegmentPreparer::spawn(live, 1024 * 1024, PREALLOC, 0, StagingMode::ZeroFill);
+
+        let taken = take_within(&preparer);
+        preparer.arm();
+        wait_for_lease_wait(&preparer);
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let joiner = std::thread::spawn(move || {
+            preparer.shutdown();
+            done_tx.send(()).expect("test thread is waiting");
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("shutdown must return while a lease is outstanding");
+        joiner.join().expect("shutdown thread");
+        // Released after the worker is gone: nothing left to wake.
+        drop(taken);
+    }
+
+    /// An arm arriving while a staged segment is still waiting to be
+    /// taken is a no-op: the slot holds one segment, so the worker skips
+    /// the cycle and leaves the staged file, inode and all, for `take`.
+    #[test]
+    fn arm_while_ready_keeps_the_staged_segment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let live = dir.path().join("test.journal");
+        let staging = staging_path(&live);
+        let preparer =
+            SegmentPreparer::spawn(live, 1024 * 1024, PREALLOC, 0, StagingMode::ZeroFill);
+
+        wait_until(
+            || matches!(*preparer.state.slot.lock().expect("slot"), Slot::Ready(_)),
+            "the startup arm should stage a segment within 10 s",
+        );
+        let staged_ino = ino(&staging);
+
+        preparer.arm();
+        wait_until(
+            || preparer.state.ready_skips.load(Ordering::Relaxed) > 0,
+            "the worker should skip the arm within 10 s",
+        );
+        assert_eq!(
+            ino(&staging),
+            staged_ino,
+            "the skipped arm must leave the staged file in place"
+        );
+
+        let taken = preparer.take().expect("the staged segment is still there");
+        assert_eq!(taken.path(), staging);
+        assert_eq!(
+            taken.file().metadata().expect("fstat taken").ino(),
+            staged_ino,
+            "take must yield the segment staged before the arm"
+        );
+        drop(taken);
+        preparer.shutdown();
+    }
+
+    /// Wait until the worker has consumed an arm and found the staging
+    /// path leased. Bounded like [`take_within`].
+    fn wait_for_lease_wait(preparer: &SegmentPreparer) {
+        wait_until(
+            || preparer.state.lease_waits.load(Ordering::Relaxed) > 0,
+            "the worker should wait on the lease within 10 s",
+        );
+    }
+
+    fn ino(path: &Path) -> u64 {
+        std::fs::metadata(path).expect("stat").ino()
     }
 }

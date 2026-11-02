@@ -174,6 +174,12 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   each such member at startup: with mutual authentication (see
   **Fixed**), a member without an entry has no key to require of
   whatever answers at its address.
+- **`melin_journal::preparer::PreparedSegment`'s fields are private**
+  (breaking): read them through `file()`, `path()`, `allocated_end()`
+  and `written()`, and install the segment with `rename_onto`, which
+  consumes it. Tests that build one by hand use
+  `PreparedSegment::for_test` under the `test-utils` feature. See
+  **Fixed** for why the staging file can only be moved that way.
 
 ### Removed
 
@@ -185,6 +191,32 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   `Prealloc`.
 
 ### Fixed
+
+- **A journal rotation that adopted a pre-staged segment could lose that
+  segment's entries from the node's journal.** The staging thread could
+  start preparing the next segment in the instant between a rotation
+  taking the staged one and moving it into place, replacing the file at
+  the staging path. The rotation then installed the new, empty file as
+  the live segment while every entry up to the next rotation went to the
+  deleted one: acknowledged, replicated and applied, but not on that
+  node's disk. The next rotation failed (an `error` log, `journal
+  segment rotation failed; continuing with current segment` on a
+  primary, which kept writing to the deleted file until a later rotation
+  succeeded, or `adopted rotation failed; stalling at the boundary until
+  retry` on a replica, which stalled for the 30 s retry backoff), and
+  left an archive holding no entries and the following segment's header.
+  It took a rotation that ran while the next segment was still being
+  staged (rotations closer together than staging takes, as on a primary
+  writing faster than the staging thread keeps up with, or a replica
+  adopting the primary's boundaries soon after it starts), followed by a
+  rotation at the moment that staging finished. Recovery detects the
+  damage and refuses to start (`segment chain break at archive N`, or a
+  sequence gap with the hash chain off) rather than replay a journal
+  with a hole; a node that reports it, or that logged either rotation
+  failure above with a `No such file or directory` error, should be
+  re-seeded from a healthy peer. Staging now waits until the taken
+  segment has been moved into place, and the segment can only be moved
+  by the call that releases it.
 
 - **A forged control-plane reply can no longer stop a serving primary.**
   A node checked the key of every control-plane peer that connected to
