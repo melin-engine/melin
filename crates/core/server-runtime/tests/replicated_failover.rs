@@ -55,7 +55,6 @@ use counter_server::{
 use melin_client::{Connection, SigningKey};
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
-use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
 use melin_test_node::Addrs;
 use melin_test_node::probe::{admin_until_ok, http_metrics, wait_for_gauge};
@@ -209,12 +208,6 @@ fn acked_events_survive_primary_death_under_ram_policy() {
             journal: tmp.path().join(format!("node-{i}.journal")),
             authorized_keys: auth_path.clone(),
             ack_policy: AckPolicy::Ram,
-            // Unpinned, and therefore yielding: three nodes run in this
-            // process alongside the rest of the suite, and the default
-            // layout would stack every node's same-role thread on one core
-            // while a spinner would starve whatever shares its core, the
-            // test's own client included.
-            cores: PipelineCores::unpinned(),
             tick_interval_ms: 0,
             snapshot_interval_ms: 0,
             health_bind: Some(nodes[i].health_addr),

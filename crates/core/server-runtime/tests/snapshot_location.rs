@@ -23,7 +23,6 @@ use counter_server::{
 use melin_client::{Connection, SigningKey, key};
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
-use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
 use melin_test_node::probe::{gauge, wait_for_gauge, wait_for_gauge_within};
 use melin_test_node::{Addrs, Node};
@@ -88,9 +87,6 @@ impl Site {
             snapshot_interval_ms: SHADOW_INTERVAL_MS,
             authorized_keys: self.path().join("authorized_keys"),
             ack_policy: AckPolicy::Disk,
-            // Unpinned, and therefore yielding: the nodes share this
-            // process with the test's own client.
-            cores: PipelineCores::unpinned(),
             tick_interval_ms: 0,
             health_bind: Some(free_addr(PORT_BASE)),
             replication_key: Some(key_path),

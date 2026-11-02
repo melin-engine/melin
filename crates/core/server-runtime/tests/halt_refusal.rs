@@ -35,7 +35,6 @@ use counter_server::{
 };
 use melin_client::{Ack, Connection, Error, Frame};
 use melin_server_runtime::ack_policy::AckPolicy;
-use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
 use melin_test_node::probe::{gauge, wait_for_gauge, wait_for_gauge_where};
 
@@ -129,7 +128,6 @@ fn a_write_refused_while_halted_is_not_replayed() {
         authorized_keys: fx.auth_path.clone(),
         standalone: true,
         ack_policy: AckPolicy::Disk,
-        cores: PipelineCores::unpinned(),
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,
         health_bind: None,

@@ -129,9 +129,6 @@ fn node_config(dir: &Path, name: &str, key: &SigningKey, keys_file: &Path) -> Se
     ServerConfig {
         journal: dir.join(format!("{name}.journal")),
         authorized_keys: keys_file.to_owned(),
-        // Unpinned, and therefore yielding, unless a test places them:
-        // the nodes share this process with the test's own client.
-        cores: PipelineCores::unpinned(),
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,
         // Off unless a test asks for one: the default is a fixed port,

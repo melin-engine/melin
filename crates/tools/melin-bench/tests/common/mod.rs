@@ -8,7 +8,6 @@ use melin_client::{SigningKey, key};
 use melin_journal::{JournalEvent, JournalReader};
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
-use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
 
 pub fn bench_key() -> SigningKey {
@@ -29,9 +28,6 @@ pub fn config(dir: &Path, journal: &str, role: &str) -> ServerConfig {
         authorized_keys: auth_path,
         standalone: true,
         ack_policy: AckPolicy::Disk,
-        // Unpinned and yielding: the node shares the host with the
-        // binary's spinning loop.
-        cores: PipelineCores::unpinned(),
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,
         health_bind: None,
