@@ -67,8 +67,9 @@ use port_pool::give_back;
 use raw_replica::RawReplica;
 
 /// Port range for `free_addr`, shared with the other cluster tests: every
-/// other range below the ephemeral floor is taken. Sharing is safe only
-/// because this binary is in nextest's `cluster-serial` group with them.
+/// other range below the ephemeral floor is taken. Their tests may run at
+/// the same time: `free_addr` keeps concurrent test processes apart
+/// within a range.
 const PORT_BASE: u16 = 10_000;
 
 /// How long anything a test waits on may take: generous, for a slow and

@@ -148,8 +148,9 @@ fn authorized_keys(dir: &Path) -> std::path::PathBuf {
 }
 
 /// Port range for the health endpoint's `free_addr`, shared with the
-/// other cluster tests (`halt_cluster.rs`): safe only because this binary
-/// is in nextest's `cluster-serial` group with them.
+/// other cluster tests (`halt_cluster.rs`), which may run at the same
+/// time: `free_addr` keeps concurrent test processes apart within a
+/// range.
 const PORT_BASE: u16 = 10_000;
 
 /// A standalone node's configuration on `dir`, its journal named `name`,

@@ -23,9 +23,9 @@ use melin_test_node::{Addrs, Node};
 use melin_transport_core::test_ports::free_addr;
 
 /// Port range for `free_addr`, shared with the other cluster tests: every
-/// other range below the ephemeral floor is taken. Sharing is safe only
-/// because every binary using it is in nextest's `cluster-serial` group,
-/// so they never run at the same time.
+/// other range below the ephemeral floor is taken. Their tests may run at
+/// the same time: `free_addr` keeps concurrent test processes apart
+/// within a range.
 const PORT_BASE: u16 = 10_000;
 
 /// Node `slot`'s addresses (`melin_test_node::addrs`), from this file's
