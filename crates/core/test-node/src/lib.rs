@@ -68,7 +68,7 @@ use melin_app::decoder::RequestDecoder;
 use melin_app::encoder::ResponseEncoder;
 use melin_client::{Connection, SigningKey};
 use melin_server_runtime::StartupEvents;
-use melin_server_runtime::server::{RingCapacity, ServerConfig};
+use melin_server_runtime::server::{PipelineCores, RingCapacity, ServerConfig};
 
 /// How long a test should give a node to start serving, from [`start`]
 /// to its first authenticated client.
@@ -453,7 +453,8 @@ pub const MAX_JOURNAL_MIB: u64 = 8;
 ///   which against the default limit fails (and warns) on every node.
 ///   [`start`] and [`start_at`] set it whatever the config says.
 ///
-/// And two more, for memory rather than the locked-memory limit:
+/// And three more, for memory and CPU rather than the locked-memory
+/// limit:
 ///
 /// - **`ring_capacity`** is [`RING_CAPACITY`]. Each node's two pipeline
 ///   rings are written in full when it starts, so they are resident
@@ -467,17 +468,25 @@ pub const MAX_JOURNAL_MIB: u64 = 8;
 ///   tmpfs, where both are memory: at the production threshold that is
 ///   over half a GiB per node, written or not, and a parallel suite runs
 ///   dozens of nodes.
+/// - **`cores`** is [`PipelineCores::unpinned`]. The production layout
+///   pins each pipeline thread to a fixed core and busy-spins there: with
+///   many nodes on one host it would stack every node's same-role thread
+///   on one core, while a spinner would starve whatever shares its core,
+///   the test's own client included. Unpinned, the scheduler places each
+///   thread, and it waits the way an unpinned thread does.
 ///
 /// A test that exercises the connection cap sets its own
 /// `max_connections`, one that needs a deeper ring its own
-/// `ring_capacity`, and one that exercises size-driven rotation its own
-/// `max_journal_mib`.
+/// `ring_capacity`, one that exercises size-driven rotation its own
+/// `max_journal_mib`, and one that needs a particular layout its own
+/// `cores`.
 pub fn config() -> ServerConfig {
     ServerConfig {
         max_connections: MAX_CONNECTIONS,
         no_mlock: true,
         ring_capacity: RING_CAPACITY,
         max_journal_mib: MAX_JOURNAL_MIB,
+        cores: PipelineCores::unpinned(),
         ..ServerConfig::default()
     }
 }
@@ -1134,5 +1143,24 @@ mod dpdk {
     fn first_allowed_cpu() -> usize {
         melin_app::affinity::first_allowed_cpu()
             .expect("this process's CPU mask is readable and holds a CPU")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every field [`config`] documents as differing from production
+    /// does. Dropping one passes every other test, slowly or flakily:
+    /// nodes that pin and spin on the same cores, or that exhaust the
+    /// locked-memory limit, only show it under a parallel suite.
+    #[test]
+    fn config_sizes_a_node_for_a_parallel_suite() {
+        let config = config();
+        assert_eq!(config.max_connections, MAX_CONNECTIONS);
+        assert!(config.no_mlock);
+        assert_eq!(config.ring_capacity, RING_CAPACITY);
+        assert_eq!(config.max_journal_mib, MAX_JOURNAL_MIB);
+        assert_eq!(config.cores, PipelineCores::unpinned());
     }
 }

@@ -35,7 +35,6 @@ use melin_app::decoder::Decoded;
 use melin_app::{Application, ApplyCtx, QueryCtx, RejectReason};
 use melin_client::{Connection, Frame, RefusalKind, RequestId, SigningKey, StreamConnection, key};
 use melin_server_runtime::StartupEvents;
-use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
 use melin_test_node::probe::wait_for_gauge;
 use melin_transport_core::test_ports::free_addr;
@@ -161,8 +160,6 @@ fn config(dir: &Path, name: &str) -> ServerConfig {
         authorized_keys: authorized_keys(dir),
         standalone: true,
         ack_policy: melin_server_runtime::ack_policy::AckPolicy::Disk,
-        // Unpinned, and therefore yielding: see `startup_events.rs`.
-        cores: PipelineCores::unpinned(),
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,
         health_bind: Some(free_addr(PORT_BASE)),

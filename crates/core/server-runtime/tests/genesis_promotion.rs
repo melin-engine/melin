@@ -33,7 +33,6 @@ use ed25519_dalek::SigningKey;
 use melin_journal::{JournalEvent, JournalReader};
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
-use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
 use melin_test_node::probe::admin_reply_when_up;
 use melin_test_node::{Addrs, Node};
@@ -119,9 +118,6 @@ impl Cluster {
             journal: self.tmp.path().join(format!("{name}.journal")),
             authorized_keys: self.auth_path.clone(),
             ack_policy: AckPolicy::Disk,
-            // Unpinned, and therefore yielding: the nodes share this
-            // process with the test's own clients.
-            cores: PipelineCores::unpinned(),
             tick_interval_ms: 0,
             snapshot_interval_ms: 0,
             // Off: the default port would collide between the nodes.

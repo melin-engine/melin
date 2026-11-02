@@ -41,7 +41,6 @@ use melin_journal::test_utils::PREALLOC;
 use melin_journal::{BufferedWriter, JournalEvent, JournalWrite};
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
-use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
 use melin_test_node::probe::{gauge, wait_for_gauge_within};
 use melin_wire_protocol::control_codec::{TAG_AUTH_FAILED, TAG_CHALLENGE};
@@ -1227,7 +1226,6 @@ impl Cluster {
             journal: self.dir.path().join(format!("{name}.journal")),
             authorized_keys: self.authorized_keys.clone(),
             ack_policy: AckPolicy::Disk,
-            cores: PipelineCores::unpinned(),
             tick_interval_ms: 0,
             snapshot_interval_ms: 0,
             health_bind: Some(Self::health(slot)),
@@ -1457,9 +1455,6 @@ fn with_node(body: fn(SocketAddr)) {
         authorized_keys,
         standalone: true,
         ack_policy: AckPolicy::Disk,
-        // Unpinned: the node shares the host with the test's client, and
-        // a CI runner with everything else.
-        cores: PipelineCores::unpinned(),
         snapshot_interval_ms: 0,
         health_bind: None,
         // One slot, so a test can tell whether a closed connection's slot

@@ -11,7 +11,6 @@ use std::path::Path;
 
 use melin_client::{SigningKey, key};
 use melin_server_runtime::ack_policy::AckPolicy;
-use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
 
 /// A standalone primary's configuration on `dir`'s journal, with an
@@ -32,11 +31,6 @@ pub fn standalone_config(dir: &Path, client_key: &SigningKey) -> ServerConfig {
         // The default policy waits on a replica, which a standalone node
         // has none of.
         ack_policy: AckPolicy::Disk,
-        // Unpinned, and therefore yielding: the suite runs many nodes at
-        // once, and the default layout would stack every node's same-role
-        // thread on one core while a spinner would starve whatever shares
-        // its core, the test's own client included.
-        cores: PipelineCores::unpinned(),
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,
         health_bind: None,

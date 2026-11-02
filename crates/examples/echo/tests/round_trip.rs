@@ -21,7 +21,6 @@ use std::io::{Read, Write};
 use melin_client::{Connection, Error, RefusalKind, SigningKey, key};
 use melin_journal::{JournalEvent, JournalReader};
 use melin_server_runtime::ack_policy::AckPolicy;
-use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
 use melin_test_node::Node as Server;
 use melin_wire_protocol::control_codec::{
@@ -112,11 +111,6 @@ fn start_server_with(dir: &Path, configure: impl FnOnce(&mut ServerConfig)) -> S
         authorized_keys: auth_path,
         standalone: true,
         ack_policy: AckPolicy::Disk,
-        // Unpinned, and therefore yielding: the suite runs many nodes at
-        // once, and the default layout would stack every node's same-role
-        // thread on one core while a spinner would starve whatever shares
-        // its core, the test's own client included.
-        cores: PipelineCores::unpinned(),
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,
         health_bind: None,

@@ -56,7 +56,6 @@ use base64::Engine;
 use counter_server::{Counter, KIND_RESP_ACK, RequestDecoder, ResponseEncoder, increment_request};
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
-use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
 use melin_test_node::probe::{admin_command, gauge, http_metrics, wait_for_gauge};
 use melin_test_node::{Addrs, Node};
@@ -457,12 +456,6 @@ impl Cluster {
             journal: self.journal(i),
             authorized_keys: self.auth_path.clone(),
             ack_policy,
-            // Unpinned, and therefore yielding: three nodes run in this
-            // process alongside the rest of the suite, and the default
-            // layout would stack every node's same-role thread on one core
-            // while a spinner would starve whatever shares its core, the
-            // test's own client included.
-            cores: PipelineCores::unpinned(),
             tick_interval_ms,
             snapshot_interval_ms: 0,
             health_bind: Some(self.nodes[i].health_addr),

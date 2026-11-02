@@ -31,7 +31,6 @@ use melin_app::{Application, ApplyCtx, QueryCtx, RejectReason};
 use melin_client::Connection;
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
-use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
 use melin_test_node::probe::wait_for_gauge;
 use melin_test_node::{Addrs, Node};
@@ -213,9 +212,6 @@ fn every_node_sizes_its_own_instances_before_serving() {
             journal: tmp.path().join(format!("{name}.journal")),
             authorized_keys: auth_path.clone(),
             ack_policy: AckPolicy::Disk,
-            // Unpinned, and therefore yielding: both nodes share this
-            // process with the test's own client.
-            cores: PipelineCores::unpinned(),
             tick_interval_ms: 0,
             snapshot_interval_ms: 0,
             health_bind: Some(free_addr(PORT_BASE)),
