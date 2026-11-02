@@ -9,7 +9,24 @@
 # processes per test, which is why they carry `#[serial]` (serial_test)
 # — but `#[serial]` only serialises *within* one test process, and
 # nextest forks per test, so the annotation has no effect here. The
-# test-group below is what actually holds them apart.
+# test-group below is what actually bounds them.
+#
+# Bounded, not serial. One at a time, this group was the suite's
+# critical path: its tests mostly wait out real raft and replication
+# timeouts, so run back to back they took several times as long as
+# everything else in the suite together. Four at a time is cheap now that
+# a test node's idle threads sleep (unpinned, they park) and its journal
+# is not zero-filled (`melin_test_node::config`): either one undone, and
+# a dozen nodes at once contend for CPU or for the disk, and timing-
+# sensitive tests start to flake. Checked by repeated full runs, on all of
+# a 16-thread host and confined to 4 CPUs as on a hosted CI runner.
+#
+# Except `raft_failover`, which has a group of its own and still runs one
+# test at a time. Run four at a time under full-suite load, one of its
+# tests (`a_serving_leader_fences_on_a_followers_higher_epoch`) failed
+# once in eleven runs: the primary never won the election the test waits
+# for after muting the replicas. Until that is understood, the binary
+# keeps its old limit, though it now overlaps with the `cluster` group.
 #
 # Binaries are named exactly rather than matched by pattern. `binary()`
 # is an equality predicate: the previous `binary(failover)` matched
@@ -33,26 +50,31 @@
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 [[profile.default.overrides]]
-filter = 'binary(raft_failover) + binary(raft_smoke) + binary(startup_events) + binary(replicated_failover) + binary(halt_refusal) + binary(degraded_acks) + binary(sizing) + binary(genesis_promotion) + binary(stall_guards) + binary(ack_policy_changes) + binary(event_publisher_gate) + binary(snapshot_location) + binary(request_ids) + binary(encoder_purity)'
-test-group = 'cluster-serial'
+filter = 'binary(raft_failover)'
+test-group = 'raft-failover'
+
+[[profile.default.overrides]]
+filter = 'binary(raft_smoke) + binary(startup_events) + binary(replicated_failover) + binary(halt_refusal) + binary(degraded_acks) + binary(sizing) + binary(genesis_promotion) + binary(stall_guards) + binary(ack_policy_changes) + binary(event_publisher_gate) + binary(snapshot_location) + binary(request_ids) + binary(encoder_purity)'
+test-group = 'cluster'
 
 # The DPDK transport on veth (`melin-server-runtime`, built only with its
 # `dpdk` feature). Each test runs a node whose poll thread busy-polls a
 # core, so they go one at a time. A group of their own rather than
-# `cluster-serial`: run under the netns runner, as they must be, each test
-# has a network of its own, so nothing keeps them apart from the cluster
-# tests but CPU.
+# `cluster`: run under the netns runner, as they must be, each test has a
+# network of its own, so nothing keeps them apart from the cluster tests
+# but CPU.
 #
 # The cluster tests above run on DPDK too, built with the same feature
 # and under the same runner, through the `dpdk` profile below
-# (`docs/internal/dpdk-testing.md`). Their group still applies, and holds
-# them to one at a time.
+# (`docs/internal/dpdk-testing.md`), which runs one test at a time
+# whatever the groups allow.
 [[profile.default.overrides]]
 filter = 'binary(dpdk_veth)'
 test-group = 'dpdk-serial'
 
 [test-groups]
-cluster-serial = { max-threads = 1 }
+cluster = { max-threads = 4 }
+raft-failover = { max-threads = 1 }
 dpdk-serial = { max-threads = 1 }
 
 # The suites on the DPDK transport: run with the `dpdk` features under

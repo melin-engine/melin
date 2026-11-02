@@ -44,8 +44,9 @@ use melin_transport_core::replication::protocol::{
 use melin_transport_core::replication_wire::encode_input_batch;
 use melin_transport_core::test_ports::free_addr;
 
-/// Port range for `free_addr`, shared with the other cluster binaries:
-/// safe because they are all in nextest's `cluster-serial` group.
+/// Port range for `free_addr`, shared with the other cluster binaries,
+/// whose tests may run at the same time: `free_addr` keeps concurrent
+/// test processes apart within a range.
 const PORT_BASE: u16 = 10_000;
 
 /// Node `slot`'s addresses (`melin_test_node::addrs`), from this file's
