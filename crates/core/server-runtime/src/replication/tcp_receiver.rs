@@ -3062,18 +3062,15 @@ mod tests {
             // the synchronous fallback — adoption is the path under
             // test. Both modes must produce it; a preparer that never
             // does is itself a failure.
-            let staging = {
-                // `<live>.next-staging` — the preparer's sibling-file
-                // convention (crate-private, so spelled out here the way
-                // the `.divergent.<n>` archive name is above).
-                let mut s = replica_journal.clone().into_os_string();
-                s.push(".next-staging");
-                std::path::PathBuf::from(s)
-            };
             let staged_len: u64 = (1 + 8) * 1024 * 1024;
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
-                if std::fs::metadata(&staging).is_ok_and(|m| m.len() == staged_len) {
+                let staged = melin_journal::preparer::staging_files(&replica_journal)
+                    .expect("list staging files");
+                if staged
+                    .iter()
+                    .any(|s| std::fs::metadata(s).is_ok_and(|m| m.len() == staged_len))
+                {
                     break;
                 }
                 assert!(

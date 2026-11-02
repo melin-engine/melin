@@ -351,8 +351,8 @@ impl<E: AppEvent> BufferedWriter<E> {
     ///   `docs/internal/journal-fsync-beat-2026-08.md`).
     ///
     /// On error the prepared file is consumed (renamed onto the live
-    /// path then rolled back, or left as staging for the next preparer
-    /// cycle to reclaim). Callers should re-arm the preparer after a
+    /// path then rolled back, or its staging file removed). Callers
+    /// should re-arm the preparer after a
     /// successful return so the next rotation can also be fast.
     pub fn rotate_segment_with_prepared(
         &mut self,
@@ -732,8 +732,9 @@ mod tests {
         // appends must not immediately re-fallocate.
         assert_eq!(writer.segment.allocated_end(), zeroed_end);
         assert!(writer.segment.pre_written());
-        // The staging file is gone (renamed onto the live path).
-        assert!(!crate::preparer::staging_path(&path).exists());
+        // The staging file is gone (renamed onto the live path), and
+        // nothing has re-armed the preparer to stage another.
+        assert!(crate::preparer::staging_files(&path).unwrap().is_empty());
 
         writer.append(&sample(3)).unwrap();
         drop(writer);
@@ -788,7 +789,7 @@ mod tests {
             !writer.segment.pre_written(),
             "allocate-mode extents are not pre-written, and must not be reported as such"
         );
-        assert!(!crate::preparer::staging_path(&path).exists());
+        assert!(crate::preparer::staging_files(&path).unwrap().is_empty());
 
         writer.append(&sample(3)).unwrap();
         drop(writer);

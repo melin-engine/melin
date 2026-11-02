@@ -121,8 +121,8 @@ pub trait JournalWrite<E: AppEvent>: Sized {
     /// creation/allocation on the calling thread).
     ///
     /// The default body discards the prepared segment and rotates
-    /// synchronously — correct (the orphaned staging file is reclaimed
-    /// by the next preparer cycle) but always the slow path, so real
+    /// synchronously — correct (dropping the segment removes its
+    /// staging file) but always the slow path, so real
     /// writers override it. It exists so adding this method is not a
     /// breaking change and so the fallback contract is spelled out in
     /// code.

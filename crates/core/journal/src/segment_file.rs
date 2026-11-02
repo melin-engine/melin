@@ -428,10 +428,9 @@ impl SegmentFile {
 
         // Rename staging onto the live path. `archive_live` has already
         // moved the previous live segment aside, so the destination is
-        // free. The rename consumes `prepared`, whose hold on the
-        // staging path keeps the preparer from re-staging there until
-        // the rename is done. On failure the fully-written staging file
-        // stays on disk for the next preparer cycle to reclaim.
+        // free. The rename consumes `prepared`; on failure it removes
+        // the staging file, as does dropping `prepared` on any early
+        // return above.
         let allocated_end = prepared.allocated_end();
         let written = prepared.written();
         let file = prepared.rename_onto(live_path).map_err(JournalError::Io)?;
@@ -608,7 +607,7 @@ mod tests {
     /// bytes long, flagged as `written` or not. Small enough that the
     /// first batch past `allocated_end` forces an extension.
     fn staged(live: &Path, allocated_end: u64, written: bool) -> crate::preparer::PreparedSegment {
-        let path = crate::preparer::staging_path(live);
+        let path = crate::preparer::staging_path(live, 0);
         let file = OpenOptions::new()
             .read(true)
             .write(true)

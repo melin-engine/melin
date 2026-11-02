@@ -14,16 +14,18 @@
 //!
 //!   1. At construction (and after every rotation) the journal stage
 //!      calls [`SegmentPreparer::arm`].
-//!   2. The worker opens `<live>.next-staging`, runs the same
+//!   2. The worker creates `<live>.next-staging.<n>`, a name no earlier
+//!      preparation in this run has used, runs the same
 //!      `preallocate + zero_range + prefault + sync_all` sequence, and
 //!      parks the result in `slot`.
 //!   3. At rotation time the writer calls
 //!      [`SegmentPreparer::take`]; if it returns `Some`, the writer
 //!      writes the file header (which carries the boundary's sequence +
 //!      chain anchor) and renames the staging file into place. Cost:
-//!      two renames + one dir fsync. The ~38 ms is gone. Until that
-//!      rename, the taken segment holds the staging path and the worker
-//!      does not re-stage there (see [`PreparedSegment`]).
+//!      two renames + one dir fsync. The ~38 ms is gone. The worker may
+//!      stage the next segment before that rename happens; it does so
+//!      at its own name, so it cannot touch the taken one (see
+//!      [`PreparedSegment`]).
 //!   4. If `take` returns `None` (the worker hasn't caught up, manual
 //!      rotation arrived early, or preparation errored), the writer
 //!      falls back to today's synchronous path.
@@ -73,6 +75,7 @@
 //! exists so it can be measured; `ZeroFill` remains the default because
 //! it is what the tracing in the document above was done against.
 
+use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -96,38 +99,44 @@ use crate::prealloc::Prealloc;
 /// (`SegmentFile::install_prepared`) writes it at adopt time so it
 /// reflects the rotation boundary's sequence + chain anchor.
 ///
-/// A taken segment holds the staging path for as long as it exists. The
-/// worker stages every segment at that one path, and it does not start
-/// the next preparation until the taken segment is gone; the only way to
-/// move the file into place, [`rename_onto`](Self::rename_onto), consumes
-/// it and releases the path after the rename. Nothing else could stop the
-/// worker from re-staging between [`SegmentPreparer::take`] and the
-/// adopter's rename (an arm coalesced during the previous preparation
-/// lets it start as soon as the slot is empty). That unlinked the taken
-/// file and created a header-less one in its place, the rename then
-/// installed the new file as the live segment, and the writer appended
-/// a whole segment's entries to the unlinked inode, gone from the journal.
+/// Every segment is staged at its own path, picked by the worker and
+/// never reused within a run, so nothing the worker does after
+/// [`SegmentPreparer::take`] can reach a taken segment's file before the
+/// adopter renames it. With one shared path it could: an arm coalesced
+/// during the previous preparation let the worker re-stage as soon as
+/// the slot was empty, unlinking the taken file and creating a
+/// header-less one in its place; the rename then installed the new file
+/// as the live segment, and the writer appended a whole segment's
+/// entries to the unlinked inode, gone from the journal. The fields are
+/// private and [`rename_onto`](Self::rename_onto) consumes the segment,
+/// so only the worker names a staging path and each name is installed
+/// at most once.
+///
+/// A segment dropped without being installed (a rotation that failed
+/// before its rename, a writer that discards it, a shutdown with one
+/// still staged) removes its staging file: with a fresh name per
+/// preparation, nothing else would.
 pub struct PreparedSegment {
-    staged: Staged,
-    /// Released (dropped) by `rename_onto` after the rename, or with the
-    /// segment when it is dropped without being renamed.
-    lease: StagingLease,
+    file: File,
+    staging: StagingFile,
+    allocated_end: u64,
+    written: bool,
 }
 
 impl PreparedSegment {
     /// File handle, reused by the writer after the rename.
     pub fn file(&self) -> &File {
-        &self.staged.file
+        &self.file
     }
 
-    /// Path of the staging file (`<live>.next-staging`).
+    /// Path of the staging file (`<live>.next-staging.<n>`).
     pub fn path(&self) -> &Path {
-        &self.staged.path
+        &self.staging.path
     }
 
     /// End of the staged region (matches the writer's `allocated_end`).
     pub fn allocated_end(&self) -> u64 {
-        self.staged.allocated_end
+        self.allocated_end
     }
 
     /// Whether `[0, allocated_end)` is physically written
@@ -136,86 +145,76 @@ impl PreparedSegment {
     /// segment that *lost* its pre-written property by outgrowing the
     /// staged region from one that never had it.
     pub fn written(&self) -> bool {
-        self.staged.written
+        self.written
     }
 
     /// Rename the staged file onto `live_path` and hand back its handle.
     ///
-    /// Consumes the segment, so the staging path goes back to the worker
-    /// only once the rename has happened, or failed: on failure the file
-    /// stays at the staging path, and the next preparation removes it.
+    /// Consumes the segment, so a staging file is installed at most once.
+    /// On failure the staging file is removed, as for any segment dropped
+    /// uninstalled.
     pub fn rename_onto(self, live_path: &Path) -> io::Result<File> {
-        let Self { staged, lease } = self;
-        let renamed = std::fs::rename(&staged.path, live_path);
-        // Not a moment earlier: until here the worker must not touch the
-        // staging path.
-        drop(lease);
-        renamed.map(|()| staged.file)
+        let Self { file, staging, .. } = self;
+        staging.rename_onto(live_path)?;
+        Ok(file)
     }
 
     /// A segment no preparer staged, for tests that drive an adoption by
-    /// hand. Nothing waits on its release.
+    /// hand. Like a staged one, it removes the file at `path` if dropped
+    /// uninstalled.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn for_test(file: File, path: PathBuf, allocated_end: u64, written: bool) -> Self {
         Self {
-            staged: Staged {
-                file,
-                path,
-                allocated_end,
-                written,
-            },
-            lease: StagingLease { state: None },
+            file,
+            staging: StagingFile { path },
+            allocated_end,
+            written,
         }
     }
 }
 
-/// A staged file before it is handed out: what the worker produces and
-/// parks in the slot.
-struct Staged {
-    file: File,
+/// The path of one staged segment, removing the file there when dropped
+/// unless [`rename_onto`](Self::rename_onto) moved it into place.
+///
+/// A field of its own rather than a `Drop` on [`PreparedSegment`], so
+/// that `PreparedSegment::rename_onto` can still move the `File` out.
+struct StagingFile {
+    /// Emptied by a successful rename, after which nothing is left at the
+    /// old path to remove. An empty `PathBuf` rather than an
+    /// `Option<PathBuf>`: the emptied state exists only inside
+    /// `rename_onto` and `drop`, and every other reader (`path()`) would
+    /// otherwise unwrap an option that is never `None` for them.
     path: PathBuf,
-    allocated_end: u64,
-    written: bool,
 }
 
-/// The claim a taken [`PreparedSegment`] holds on the staging path.
-/// Dropping it frees the slot and wakes a worker waiting to re-stage.
-struct StagingLease {
-    /// `None` only for [`PreparedSegment::for_test`], which no worker
-    /// waits on. An `Option` rather than a dummy `State`: there is no
-    /// slot to free.
-    state: Option<Arc<State>>,
-}
-
-impl Drop for StagingLease {
-    fn drop(&mut self) {
-        let Some(state) = self.state.take() else {
-            return;
-        };
-        // A poisoned lock means some thread panicked while holding it;
-        // the slot is a plain enum, valid at every point, so free it
-        // anyway: left `Leased`, the worker would wait for good.
-        let mut slot = state
-            .slot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        debug_assert!(
-            matches!(*slot, Slot::Leased),
-            "a lease exists only while the slot is leased"
-        );
-        *slot = Slot::Free;
-        state.released.notify_one();
+impl StagingFile {
+    fn rename_onto(mut self, live_path: &Path) -> io::Result<()> {
+        std::fs::rename(&self.path, live_path)?;
+        self.path = PathBuf::new();
+        Ok(())
     }
 }
 
-/// The preparer's one-entry hand-off, and who owns the staging path.
-enum Slot {
-    /// Nothing staged and nothing handed out: the path is the worker's.
-    Free,
-    /// Staged, waiting for [`SegmentPreparer::take`].
-    Ready(Staged),
-    /// Taken: the [`PreparedSegment`] owns the path until it drops.
-    Leased,
+impl Drop for StagingFile {
+    fn drop(&mut self) {
+        if self.path.as_os_str().is_empty() {
+            return;
+        }
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => {}
+            // Already gone (a test that unlinked it, an operator).
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            // Nothing to hand the error to from a drop. The file is
+            // reclaimed by the startup sweep (`cleanup_staging_orphan`)
+            // at the latest; until then it costs disk space, which is
+            // what the warning is for.
+            Err(e) => tracing::warn!(
+                error = %e,
+                path = %self.path.display(),
+                "could not remove an uninstalled journal staging file"
+            ),
+        }
+    }
 }
 
 /// How the preparer materialises a staged segment's extents.
@@ -270,8 +269,8 @@ pub struct SegmentPreparer {
 /// thread. Arc-wrapped so the worker keeps it alive even if the
 /// `SegmentPreparer` handle is moved/dropped mid-operation.
 struct State {
-    /// Path of the live journal segment. The staging path is derived as
-    /// `<live_path>.next-staging`.
+    /// Path of the live journal segment. Staging paths are derived as
+    /// `<live_path>.next-staging.<n>`.
     live_path: PathBuf,
     /// How staged extents are materialised. Fixed at spawn: changing it
     /// mid-run would leave already-staged segments in the other mode,
@@ -298,24 +297,11 @@ struct State {
     /// rotation (tiny observed segment) from shrinking the target below
     /// what size-driven rotation needs.
     stage_floor: u64,
-    /// A mutex because the slot is mutated from three places (the
-    /// worker stages, the adopter takes, the lease frees) and holds at
-    /// most one entry. No contention on the hot path — the lock is only
-    /// acquired at rotation time and on prepare completion.
-    slot: Mutex<Slot>,
-    /// Paired with `slot`: wakes the worker when a lease is released or
-    /// `shutdown` flips to `true`.
-    released: Condvar,
-    /// Times the worker has waited on a lease — the observation that it
-    /// reached that point, which a test cannot get from the file system
-    /// (the waiting is the absence of an action).
-    #[cfg(test)]
-    lease_waits: AtomicU64,
-    /// Times the worker has skipped an arm because a staged segment was
-    /// still waiting to be taken — like `lease_waits`, an absence of
-    /// action a test can only observe through a counter.
-    #[cfg(test)]
-    ready_skips: AtomicU64,
+    /// Mutex<Option<…>> because the slot is mutated from two threads
+    /// (worker writes, adopter takes) and has at most one entry. No
+    /// contention on the hot path — the lock is only acquired at
+    /// rotation time and on prepare completion.
+    slot: Mutex<Option<PreparedSegment>>,
     /// `true` when an arm has been requested. The mutex is paired with
     /// `notify` so the worker can block on a `Condvar::wait` without
     /// busy-spinning.
@@ -334,10 +320,20 @@ impl SegmentPreparer {
     /// Arms immediately so the first rotation can adopt instead of
     /// paying the sync cost.
     ///
-    /// Also clears any orphan `<live>.next-staging` file left behind by
-    /// a crashed prior run — these files have no header and are not
-    /// recognised by `segment::list_archives`, but leaving them on disk
-    /// would cause `create_new` to fail at the next prepare.
+    /// Also clears any orphan `<live>.next-staging.<n>` file left behind
+    /// by a crashed prior run — these files have no header and are not
+    /// recognised by `segment::list_archives`, but each holds a
+    /// segment's worth of disk, and this run numbers its staging files
+    /// from zero again, so `create_new` would fail on a leftover name.
+    ///
+    /// At most one preparer may be alive per `live_path`, counting the
+    /// [`PreparedSegment`]s it handed out. Every run numbers its staging
+    /// files from zero and a staging file removes itself by path on
+    /// drop, so an earlier preparer still alive beside a newer one could
+    /// unlink the newer one's file. The journal stage upholds this: it
+    /// spawns at most one preparer per writer, and the pipeline's `run`
+    /// consumes the stage, dropping that preparer before any reopen of
+    /// the same journal.
     ///
     /// `rotate_threshold_bytes` is the size trigger the pipeline rotates
     /// at (`max_journal_bytes`); the staged file is initially sized to
@@ -381,12 +377,7 @@ impl SegmentPreparer {
             mode,
             stage_target: AtomicU64::new(stage_target),
             stage_floor,
-            slot: Mutex::new(Slot::Free),
-            released: Condvar::new(),
-            #[cfg(test)]
-            lease_waits: AtomicU64::new(0),
-            #[cfg(test)]
-            ready_skips: AtomicU64::new(0),
+            slot: Mutex::new(None),
             // Pre-arm at startup so the worker prepares the first spare
             // segment in parallel with server warm-up. The first rotation
             // then has a ready segment to adopt.
@@ -449,28 +440,13 @@ impl SegmentPreparer {
     /// Drain the prepared-segment slot. Returns `Some` only if the
     /// worker has finished a preparation that has not yet been taken.
     /// Called by the journal stage to decide between the fast adopt path
-    /// and the sync fallback. The returned segment holds the staging
-    /// path until it is renamed or dropped (see [`PreparedSegment`]).
+    /// and the sync fallback.
     pub fn take(&self) -> Option<PreparedSegment> {
-        let mut slot = self
-            .state
+        self.state
             .slot
             .lock()
-            .expect("preparer slot mutex poisoned");
-        match std::mem::replace(&mut *slot, Slot::Leased) {
-            Slot::Ready(staged) => Some(PreparedSegment {
-                staged,
-                lease: StagingLease {
-                    state: Some(Arc::clone(&self.state)),
-                },
-            }),
-            // Nothing staged (`Free`), or already taken (`Leased`): put
-            // it back as it was.
-            other => {
-                *slot = other;
-                None
-            }
-        }
+            .expect("preparer slot mutex poisoned")
+            .take()
     }
 
     /// Signal the worker to exit and join the thread. Idempotent; safe
@@ -491,19 +467,6 @@ impl SegmentPreparer {
             *armed = true;
         }
         self.state.notify.notify_one();
-        // And if it's waiting on a lease. Notified under the slot lock,
-        // which the worker holds from its shutdown check until it waits,
-        // so the wakeup cannot fall between the two.
-        {
-            // A poisoned slot lock still guards a valid enum, and the
-            // wakeup is all that is needed here.
-            let _slot = self
-                .state
-                .slot
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            self.state.released.notify_one();
-        }
         if let Some(h) = self.handle.take() {
             // Best-effort join: a panic in the worker has already been
             // logged by Rust's default panic handler.
@@ -532,6 +495,15 @@ fn worker_loop(state: Arc<State>) {
     // `spawn_placed`, because a child of a pinned SCHED_FIFO parent cannot
     // reconfigure itself — it would have to run first, on a core whose
     // occupant never yields.
+    //
+    // The `<n>` of the next staging file. Owned here, so the worker is
+    // the only code that picks a staging path, and advanced on every
+    // attempt (failed ones included), so no two preparations in a run
+    // share a name, and a name found occupied is not retried. `u64`:
+    // at one preparation per rotation (or per 30 s backoff), wrapping
+    // it would take longer than the hardware lasts by many orders of
+    // magnitude, so the `+= 1` below cannot overflow.
+    let mut next_staging: u64 = 0;
     loop {
         // Wait for arm or shutdown.
         let mut armed = match state.armed.lock() {
@@ -550,45 +522,28 @@ fn worker_loop(state: Arc<State>) {
         *armed = false;
         drop(armed);
 
-        // Claim the staging path. A preparation still waiting to be taken
-        // means this cycle has nothing to do — the slot has capacity for
-        // one. A taken one still owns the path until the adopter's rename
-        // (see `PreparedSegment`): wait it out, then prepare, since this
-        // arm asked for a segment and nothing has staged one since.
+        // If a previous preparation is still waiting to be adopted, skip
+        // this cycle — the slot has capacity for one. A taken segment
+        // not yet renamed is no reason to wait: this preparation gets a
+        // path of its own.
         {
-            let Ok(mut slot) = state.slot.lock() else {
+            let Ok(slot) = state.slot.lock() else {
                 return; // poisoned; just exit
             };
-            while matches!(*slot, Slot::Leased) {
-                if state.shutdown.load(Ordering::Acquire) {
-                    return;
-                }
-                #[cfg(test)]
-                state.lease_waits.fetch_add(1, Ordering::Relaxed);
-                slot = match state.released.wait(slot) {
-                    Ok(g) => g,
-                    Err(_) => return,
-                };
-            }
-            if matches!(*slot, Slot::Ready(_)) {
-                #[cfg(test)]
-                state.ready_skips.fetch_add(1, Ordering::Relaxed);
+            if slot.is_some() {
                 continue;
             }
         }
-        // `Free` from here until this cycle stages: only the worker moves
-        // the slot out of `Free`, so no segment holds the staging path.
 
-        match prepare_one(&state) {
-            Ok(staged) => {
+        let staging = staging_path(&state.live_path, next_staging);
+        next_staging += 1;
+        match prepare_one(&state, staging) {
+            Ok(prepared) => {
                 let Ok(mut slot) = state.slot.lock() else {
                     return; // poisoned; just exit
                 };
-                debug_assert!(
-                    matches!(*slot, Slot::Free),
-                    "only the worker moves the slot out of Free"
-                );
-                *slot = Slot::Ready(staged);
+                debug_assert!(slot.is_none(), "only the worker fills the slot");
+                *slot = Some(prepared);
             }
             Err(e) => {
                 // A shutdown mid-prepare surfaces as an aborted zero
@@ -624,37 +579,38 @@ fn backoff_sleep(state: &State) {
 /// that depends on the rotation-boundary state and is written by the
 /// adopting writer, just before its rename.
 ///
-/// Called only with the slot `Free`, so no taken segment holds the
-/// staging path: whatever is there is stale.
-fn prepare_one(state: &State) -> Result<Staged, JournalError> {
-    let staging = staging_path(&state.live_path);
-
-    // Remove any stale staging file: one a failed adoption left behind
-    // (its rename never happened), or an orphan an external operator
-    // left (a crashed run's is cleaned by `SegmentPreparer::spawn`).
-    // `create_new` would fail with AlreadyExists on either. Treat
-    // NotFound as success.
-    match std::fs::remove_file(&staging) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        // Surface other errors via the create_new below — the caller
-        // will see the real fault and log it. Traced here anyway
-        // because the fault the caller reports is an unhelpful
-        // AlreadyExists, not the EACCES/EIO that actually happened.
-        Err(e) => {
-            tracing::debug!(
-                error = %e,
-                path = %staging.display(),
-                "could not remove stale staging file before prepare"
-            );
-        }
-    }
+/// `path` is a name no earlier preparation in this run has used, so
+/// nothing should be there: `create_new` refuses to stage over whatever
+/// is (the next attempt, after the backoff, uses the next name). A
+/// failure after the file is created removes it, so failed attempts
+/// leave nothing behind.
+fn prepare_one(state: &State, path: PathBuf) -> Result<PreparedSegment, JournalError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    // Created by us: from here, an early return drops `staging` and
+    // removes the file.
+    let staging = StagingFile { path };
 
     let bytes = state.stage_target.load(Ordering::Relaxed);
-    match state.mode {
-        StagingMode::ZeroFill => prepare_zero_filled(&staging, bytes, &state.shutdown),
-        StagingMode::Allocate => prepare_allocated(&staging, bytes),
-    }
+    let written = match state.mode {
+        StagingMode::ZeroFill => {
+            prepare_zero_filled(&file, bytes, &state.shutdown)?;
+            true
+        }
+        StagingMode::Allocate => {
+            prepare_allocated(&file, bytes)?;
+            false
+        }
+    };
+    Ok(PreparedSegment {
+        file,
+        staging,
+        allocated_end: bytes,
+        written,
+    })
 }
 
 /// Allocate-only staging: extents reserved, nothing materialised.
@@ -670,23 +626,11 @@ fn prepare_one(state: &State) -> Result<Staged, JournalError> {
 /// `sync_all`, not `sync_data`: the whole product of this function *is*
 /// metadata (the extent allocation), and it has to be durable before the
 /// adopting writer renames the file into place.
-fn prepare_allocated(staging: &Path, bytes: u64) -> Result<Staged, JournalError> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(staging)?;
-
-    rustix::fs::fallocate(&file, rustix::fs::FallocateFlags::empty(), 0, bytes)
+fn prepare_allocated(file: &File, bytes: u64) -> Result<(), JournalError> {
+    rustix::fs::fallocate(file, rustix::fs::FallocateFlags::empty(), 0, bytes)
         .map_err(|e| JournalError::Io(io::Error::from_raw_os_error(e.raw_os_error())))?;
     file.sync_all()?;
-
-    Ok(Staged {
-        file,
-        path: staging.to_path_buf(),
-        allocated_end: bytes,
-        written: false,
-    })
+    Ok(())
 }
 
 /// Fault a file range into the page cache, best-effort.
@@ -817,17 +761,7 @@ fn paced_over_segment(
 ///
 /// Both paths are paced by [`paced_over_segment`] and abort on
 /// `shutdown`.
-fn prepare_zero_filled(
-    staging: &Path,
-    bytes: u64,
-    shutdown: &AtomicBool,
-) -> Result<Staged, JournalError> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(staging)?;
-
+fn prepare_zero_filled(file: &File, bytes: u64, shutdown: &AtomicBool) -> Result<(), JournalError> {
     // Fast path: FALLOC_FL_WRITE_ZEROES (kernel ≥ 6.16 with filesystem
     // support) allocates *written* zeroed extents via the device's
     // Write Zeroes command. The fallocate itself moves no data over
@@ -855,18 +789,13 @@ fn prepare_zero_filled(
     // removes the possibility of a kernel upgrade silently
     // reintroducing a stall class; measure before assuming the pacing
     // is what makes it safe.
-    if try_fallocate_write_zeroes(&file, bytes) {
+    if try_fallocate_write_zeroes(file, bytes) {
         paced_over_segment(bytes, shutdown, |offset, n| {
-            prefault_pages(&file, offset, offset + n as u64);
+            prefault_pages(file, offset, offset + n as u64);
             Ok(())
         })?;
         file.sync_all()?;
-        return Ok(Staged {
-            file,
-            path: staging.to_path_buf(),
-            allocated_end: bytes,
-            written: true,
-        });
+        return Ok(());
     }
 
     // Fallback: physically write the zeros, paced against the DEVICE
@@ -900,8 +829,8 @@ fn prepare_zero_filled(
     let zeros = vec![0u8; STAGING_WINDOW_BYTES];
     let mut last_metadata_sync: u64 = 0;
     paced_over_segment(bytes, shutdown, |offset, n| {
-        std::os::unix::fs::FileExt::write_all_at(&file, &zeros[..n], offset)?;
-        wait_for_writeback(&file, offset, n as u64);
+        std::os::unix::fs::FileExt::write_all_at(file, &zeros[..n], offset)?;
+        wait_for_writeback(file, offset, n as u64);
         // Incremental log force for the extent-allocation metadata
         // accumulated since the last force (the data is already on
         // disk chunk-by-chunk). Runs inside the window so its wall
@@ -916,13 +845,7 @@ fn prepare_zero_filled(
     // Cheap by construction: at most the final < 64 MiB of allocation
     // metadata (plus timestamps) remains unforced here.
     file.sync_all()?;
-
-    Ok(Staged {
-        file,
-        path: staging.to_path_buf(),
-        allocated_end: bytes,
-        written: true,
-    })
+    Ok(())
 }
 
 /// Start writeback of `[offset, offset + len)` and wait for it to
@@ -996,14 +919,14 @@ fn try_fallocate_write_zeroes(file: &File, bytes: u64) -> bool {
     false
 }
 
-/// Remove a stale `<live>.next-staging` file left behind by a prior
-/// process that crashed mid-prepare or rotated without consuming the
-/// staged segment.
+/// Remove every stale staging file of `live_path` (see
+/// [`staging_files`]) left behind by a prior process that crashed
+/// mid-prepare or exited with a staged segment it never installed.
 ///
 /// Called from two places:
-///   - [`SegmentPreparer::spawn`] when rotation is enabled
-///     (the preparer would otherwise fail at `create_new` on the same
-///     path).
+///   - [`SegmentPreparer::spawn`] when rotation is enabled (the worker
+///     numbers its staging files from zero again, so `create_new` would
+///     fail on a leftover name).
 ///   - [`crate::buffered_writer::BufferedWriter::create`] and
 ///     `::open_append` so the orphan is reclaimed even when rotation is
 ///     disabled (no preparer ever runs).
@@ -1013,38 +936,100 @@ fn try_fallocate_write_zeroes(file: &File, bytes: u64) -> bool {
 /// unlink. The two startup entry points above are guaranteed to run
 /// before any preparer can be spawned.
 ///
-/// Best-effort: NotFound is the common case (no prior crash). Other
-/// errors are logged but not propagated — the next `create_new` will
-/// surface the real fault if cleanup truly failed.
+/// Best-effort: an empty list is the common case (no prior crash).
+/// Errors are logged but not propagated — a leftover costs disk space,
+/// not correctness, and the next `create_new` on a leftover name will
+/// surface the real fault.
 pub(crate) fn cleanup_staging_orphan(live_path: &Path) {
-    let staging = staging_path(live_path);
-    match std::fs::remove_file(&staging) {
-        Ok(()) => {
-            tracing::info!(
-                path = %staging.display(),
-                "removed orphan journal staging file from a prior run"
-            );
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+    let orphans = match staging_files(live_path) {
+        Ok(orphans) => orphans,
         Err(e) => {
             tracing::warn!(
                 error = %e,
-                path = %staging.display(),
-                "could not remove orphan journal staging file"
+                live = %live_path.display(),
+                "could not list orphan journal staging files"
             );
+            return;
+        }
+    };
+    for staging in orphans {
+        match std::fs::remove_file(&staging) {
+            Ok(()) => {
+                tracing::info!(
+                    path = %staging.display(),
+                    "removed orphan journal staging file from a prior run"
+                );
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    path = %staging.display(),
+                    "could not remove orphan journal staging file"
+                );
+            }
         }
     }
 }
 
-/// `<live>.next-staging` — sibling of the live segment, same directory.
+/// What every staging file name inserts after the live segment's name.
+const STAGING_INFIX: &str = ".next-staging";
+
+/// `<live>.next-staging.<n>` — sibling of the live segment, same
+/// directory, `n` the worker's per-preparation counter.
 ///
 /// Using `OsString::push` rather than `with_extension` because the live
 /// path normally already has an extension (`.journal`) and
 /// `with_extension` would replace it.
-pub(crate) fn staging_path(live: &Path) -> PathBuf {
+pub(crate) fn staging_path(live: &Path, n: u64) -> PathBuf {
     let mut s = live.as_os_str().to_owned();
-    s.push(".next-staging");
+    s.push(STAGING_INFIX);
+    s.push(format!(".{n}"));
     PathBuf::from(s)
+}
+
+/// The staging files of the journal whose live segment is `live`, in no
+/// particular order: every `<live>.next-staging.<n>` beside it, `n` a
+/// run of ASCII digits, plus `<live>.next-staging`, the single staging
+/// name earlier releases used (an upgrade must not strand one). Nothing
+/// else matches — not the live segment, its archives, or another
+/// journal's files. A missing directory has none.
+pub fn staging_files(live: &Path) -> io::Result<Vec<PathBuf>> {
+    let Some(live_name) = live.file_name() else {
+        return Ok(Vec::new());
+    };
+    let dir = crate::segment::parent_dir(live);
+    let read_dir = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    // Vec: collected once at startup (or by a test), and normally empty.
+    let mut out = Vec::new();
+    for entry in read_dir {
+        let name = entry?.file_name();
+        if is_staging_name_of(live_name, &name) {
+            out.push(dir.join(name));
+        }
+    }
+    Ok(out)
+}
+
+/// Whether `candidate` is a staging file name of the live segment
+/// `live_name` (see [`staging_files`]). Compared as bytes: the suffix
+/// is ASCII, and the names need not be UTF-8.
+fn is_staging_name_of(live_name: &OsStr, candidate: &OsStr) -> bool {
+    let Some(rest) = candidate
+        .as_encoded_bytes()
+        .strip_prefix(live_name.as_encoded_bytes())
+        .and_then(|rest| rest.strip_prefix(STAGING_INFIX.as_bytes()))
+    else {
+        return false;
+    };
+    match rest.strip_prefix(b".") {
+        Some(n) => !n.is_empty() && n.iter().all(u8::is_ascii_digit),
+        None => rest.is_empty(),
+    }
 }
 
 /// Wait for the worker to stage a segment, and take it. Staging a few
@@ -1081,7 +1066,8 @@ mod tests {
     use std::os::unix::fs::MetadataExt;
 
     /// Spawning, arming, and shutdown round-trips without leaking the
-    /// worker thread or the staging file.
+    /// worker thread or the staging file: a taken segment dropped
+    /// without being installed removes its file.
     #[test]
     fn spawn_prepare_shutdown_roundtrip() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1095,20 +1081,46 @@ mod tests {
 
         let prepared = take_within(&preparer);
 
-        assert_eq!(prepared.path(), staging_path(&live));
+        assert_eq!(prepared.path(), staging_path(&live, 0));
         assert_eq!(prepared.allocated_end(), threshold + STAGE_MARGIN_BYTES);
 
-        // Drop the file before shutdown so the staging file can be
-        // cleaned by the test harness.
         let staging = prepared.path().to_path_buf();
+        assert!(staging.exists());
         drop(prepared);
+        assert!(
+            !staging.exists(),
+            "an uninstalled segment must remove its staging file"
+        );
 
         preparer.shutdown();
+        assert_eq!(staging_files(&live).expect("list"), Vec::<PathBuf>::new());
+    }
 
-        // Staging file still on disk (we took ownership and dropped it
-        // without renaming). Cleanup is the adopter's responsibility in
-        // production; here we just verify nothing else leaked.
-        assert!(staging.exists(), "staging file should still exist on disk");
+    /// A segment still staged at shutdown, never taken, goes with the
+    /// preparer: nothing is left for the next startup to sweep.
+    #[test]
+    fn shutdown_removes_an_untaken_staged_segment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let live = dir.path().join("test.journal");
+        let preparer = SegmentPreparer::spawn(
+            live.clone(),
+            1024 * 1024,
+            PREALLOC,
+            0,
+            StagingMode::ZeroFill,
+        );
+
+        wait_until(
+            || preparer.state.slot.lock().expect("slot").is_some(),
+            "the startup arm should stage a segment within 10 s",
+        );
+        assert_eq!(
+            staging_files(&live).expect("list"),
+            [staging_path(&live, 0)]
+        );
+
+        preparer.shutdown();
+        assert_eq!(staging_files(&live).expect("list"), Vec::<PathBuf>::new());
     }
 
     /// `StagingMode::Allocate` stages a segment of the same size and
@@ -1132,46 +1144,130 @@ mod tests {
 
         let prepared = take_within(&preparer);
 
-        assert_eq!(prepared.path(), staging_path(&live));
+        assert_eq!(prepared.path(), staging_path(&live, 0));
         assert_eq!(prepared.allocated_end(), threshold + STAGE_MARGIN_BYTES);
-
-        let staging = prepared.path().to_path_buf();
-        drop(prepared);
-        preparer.shutdown();
 
         // `fallocate` extends the file to the allocated end, so the
         // adopter sees the same length a zero-filled stage would leave.
-        let len = std::fs::metadata(&staging).expect("staging metadata").len();
+        let len = std::fs::metadata(prepared.path())
+            .expect("staging metadata")
+            .len();
         assert_eq!(len, threshold + STAGE_MARGIN_BYTES);
 
-        let contents = std::fs::read(&staging).expect("read staging");
+        let contents = std::fs::read(prepared.path()).expect("read staging");
         assert!(
             contents.iter().all(|b| *b == 0),
             "an allocate-mode segment must read as zeros"
         );
+
+        drop(prepared);
+        preparer.shutdown();
     }
 
-    /// `spawn` removes a leftover staging file from a prior crash.
+    /// `spawn` removes the staging files a prior crash left, whose names
+    /// this run's worker would otherwise collide with, and the worker
+    /// then stages afresh at the first name.
     #[test]
-    fn spawn_cleans_orphan_staging_file() {
+    fn spawn_cleans_orphan_staging_files() {
         let dir = tempfile::tempdir().expect("tempdir");
         let live = dir.path().join("test.journal");
-        let staging = staging_path(&live);
+        let orphans = [staging_path(&live, 0), staging_path(&live, 7)];
+        for orphan in &orphans {
+            std::fs::write(orphan, b"orphan from prior crash").expect("write orphan");
+        }
 
-        std::fs::write(&staging, b"orphan from prior crash").expect("write orphan");
-        assert!(staging.exists());
+        let preparer = SegmentPreparer::spawn(
+            live.clone(),
+            1024 * 1024,
+            PREALLOC,
+            0,
+            StagingMode::ZeroFill,
+        );
+        assert!(
+            !orphans[1].exists(),
+            "spawn sweeps before the worker starts"
+        );
 
-        let preparer =
-            SegmentPreparer::spawn(live, 1024 * 1024, PREALLOC, 0, StagingMode::ZeroFill);
-
-        // The orphan should be gone immediately; the worker will then
-        // create a fresh staging file.
-        // Wait for the worker to produce a fresh prepared segment to
-        // confirm spawn() didn't fail mid-cleanup.
         let prepared = take_within(&preparer);
+        assert_eq!(prepared.path(), orphans[0]);
+        assert_eq!(
+            prepared.file().metadata().expect("fstat").len(),
+            1024 * 1024 + STAGE_MARGIN_BYTES,
+            "a freshly staged segment, not the orphan"
+        );
         drop(prepared);
-
         preparer.shutdown();
+    }
+
+    /// The startup sweep removes exactly the staging files of the live
+    /// segment it is given: `<live>.next-staging.<digits>`, and the
+    /// single `<live>.next-staging` of earlier releases. The live
+    /// segment, its archives, and every name merely resembling a staging
+    /// file survive.
+    #[test]
+    fn cleanup_removes_only_staging_files_of_the_live_segment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let live = dir.path().join("test.journal");
+        let removed = [
+            "test.journal.next-staging",
+            "test.journal.next-staging.0",
+            "test.journal.next-staging.17",
+            "test.journal.next-staging.007",
+            "test.journal.next-staging.18446744073709551616",
+        ];
+        let kept = [
+            "test.journal",
+            "test.journal.000001",
+            "test.journal.000002",
+            "test.journal.snap.tmp",
+            "test.journal.divergent.0",
+            "test.journal.next-staging.",
+            "test.journal.next-staging.x",
+            "test.journal.next-staging.+1",
+            "test.journal.next-staging.1.tmp",
+            "test.journal.next-staging.1x",
+            "test.journal.next-staging-1",
+            "test.journal.next-stagingx",
+            "test.journal.next-staging0",
+            "test.journalnext-staging.0",
+            "test.journal.next.staging.0",
+            "other.journal.next-staging.0",
+            "other.journal.next-staging",
+            "xtest.journal.next-staging.0",
+        ];
+        for name in removed.iter().chain(&kept) {
+            std::fs::write(dir.path().join(name), b"x").expect("write");
+        }
+
+        cleanup_staging_orphan(&live);
+
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("read_dir")
+            .map(|e| {
+                e.expect("entry")
+                    .file_name()
+                    .into_string()
+                    .expect("utf-8 name")
+            })
+            .collect();
+        left.sort();
+        let mut expected: Vec<String> = kept.iter().map(|s| s.to_string()).collect();
+        expected.sort();
+        assert_eq!(left, expected);
+    }
+
+    /// Neither listing nor sweeping trips over a journal directory that
+    /// does not exist yet, or a live path naming no file.
+    #[test]
+    fn staging_files_of_a_missing_directory_is_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let live = dir.path().join("absent").join("test.journal");
+        assert_eq!(staging_files(&live).expect("list"), Vec::<PathBuf>::new());
+        assert_eq!(
+            staging_files(Path::new("/")).expect("list"),
+            Vec::<PathBuf>::new()
+        );
+        cleanup_staging_orphan(&live);
     }
 
     /// Zero-fill mode physically writes zeros over the whole target
@@ -1237,7 +1333,6 @@ mod tests {
             PREALLOC.chunk_bytes() + STAGE_MARGIN_BYTES,
             "initial replica target = prealloc chunk + margin"
         );
-        std::fs::remove_file(first.path()).expect("consume first staging");
         drop(first);
 
         // Observation retunes the target (no floor when threshold is 0).
@@ -1266,37 +1361,37 @@ mod tests {
 
         // First prepared segment.
         let first = take_within(&preparer);
-        // Simulate adoption by dropping + removing the staging file.
-        std::fs::remove_file(first.path()).expect("remove first staging file");
+        let first_path = first.path().to_path_buf();
         drop(first);
 
-        // Re-arm and wait for the second.
+        // Re-arm and wait for the second, at a name of its own.
         preparer.arm();
-        drop(take_within(&preparer));
+        let second = take_within(&preparer);
+        assert_ne!(second.path(), first_path);
+        drop(second);
 
         preparer.shutdown();
     }
 
-    /// Regression: an arm that is already pending when a segment is
-    /// taken (in the journal stage, one coalesced while the worker was
-    /// staging that segment, by a rotation that had to take the
-    /// synchronous path) must not let the worker re-stage before the
-    /// adopter has renamed the taken file onto the live path. It did:
-    /// the worker unlinked the taken file and created a new, header-less
-    /// one at the staging path, the adopter's rename installed that one
-    /// as the live segment, and the writer appended the segment's
-    /// entries to the unlinked inode. The next rotation then wrote its
-    /// header (the next segment's anchor) into the archive and failed
-    /// its own rename, and recovery found a segment chain break.
+    /// Regression: the worker staging the next segment between a
+    /// rotation taking the staged one and renaming it onto the live
+    /// path (in the journal stage, on an arm coalesced while that
+    /// segment was being staged) must not touch the taken file. With a
+    /// single staging path it did: the worker unlinked the taken file
+    /// and created a new, header-less one in its place, the adopter's
+    /// rename installed that one as the live segment, and the writer
+    /// appended the segment's entries to the unlinked inode. The next
+    /// rotation then wrote its header (the next segment's anchor) into
+    /// the archive and failed its own rename, and recovery found a
+    /// segment chain break.
     ///
-    /// Driven step by step: the worker's wait is observed through
-    /// `lease_waits`, so nothing here depends on how the threads are
-    /// scheduled.
+    /// Deterministic: the next segment is fully staged (taken, even)
+    /// before the first is renamed, which is the interleaving that lost
+    /// the data.
     #[test]
-    fn taken_segment_keeps_the_staging_path_until_renamed() {
+    fn staging_the_next_segment_leaves_a_taken_one_intact() {
         let dir = tempfile::tempdir().expect("tempdir");
         let live = dir.path().join("test.journal");
-        let staging = staging_path(&live);
         let preparer = SegmentPreparer::spawn(
             live.clone(),
             1024 * 1024,
@@ -1304,20 +1399,18 @@ mod tests {
             0,
             StagingMode::ZeroFill,
         );
-
         let taken = take_within(&preparer);
+        let taken_path = taken.path().to_path_buf();
         let taken_ino = taken.file().metadata().expect("fstat taken").ino();
-        preparer.arm();
-        wait_for_lease_wait(&preparer);
 
-        assert!(
-            preparer.take().is_none(),
-            "nothing can be staged while the staging path is leased"
-        );
+        preparer.arm();
+        let next = take_within(&preparer);
+        let next_ino = next.file().metadata().expect("fstat next").ino();
+        assert_ne!(next.path(), taken_path, "each preparation has its own path");
         assert_eq!(
-            ino(&staging),
+            ino(&taken_path),
             taken_ino,
-            "the worker must leave the taken file at the staging path"
+            "staging the next segment must leave the taken file in place"
         );
 
         let file = taken.rename_onto(&live).expect("install the taken segment");
@@ -1328,20 +1421,25 @@ mod tests {
         );
         drop(file);
 
-        // Released: the worker serves the arm it waited with, at the
-        // same path, and leaves the installed segment alone.
-        let next = take_within(&preparer);
-        assert_eq!(next.path(), staging);
-        assert_ne!(ino(&staging), taken_ino);
-        assert_eq!(ino(&live), taken_ino);
+        assert_eq!(
+            ino(next.path()),
+            next_ino,
+            "installing the taken segment must leave the next one in place"
+        );
+        assert_eq!(
+            std::fs::metadata(next.path()).expect("stat next").len(),
+            next.allocated_end(),
+            "the next staged segment must be intact"
+        );
         drop(next);
         preparer.shutdown();
     }
 
-    /// A failed rename gives the staging path back too: the adoption is
-    /// over, and the worker removes the leftover and stages afresh.
+    /// A failed rename removes its staging file rather than leave a
+    /// segment's worth of disk behind for every failed rotation, and the
+    /// worker goes on staging at fresh names.
     #[test]
-    fn failed_rename_releases_the_staging_path() {
+    fn failed_rename_removes_its_staging_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let live = dir.path().join("test.journal");
         let preparer = SegmentPreparer::spawn(
@@ -1353,99 +1451,73 @@ mod tests {
         );
 
         let taken = take_within(&preparer);
-        let taken_ino = taken.file().metadata().expect("fstat taken").ino();
-        preparer.arm();
-        wait_for_lease_wait(&preparer);
-
+        let taken_path = taken.path().to_path_buf();
         let unreachable = dir.path().join("no-such-dir").join("test.journal");
         assert!(
             taken.rename_onto(&unreachable).is_err(),
             "a rename into a missing directory fails"
         );
-
-        let next = take_within(&preparer);
-        assert_eq!(next.path(), staging_path(&live));
-        assert_ne!(
-            ino(next.path()),
-            taken_ino,
-            "the next segment is a fresh file, not the failed adoption's"
+        assert!(
+            !taken_path.exists(),
+            "a failed rename must remove its staging file"
         );
+        assert!(!live.exists());
+
+        preparer.arm();
+        let next = take_within(&preparer);
+        assert_ne!(next.path(), taken_path);
+        assert_eq!(staging_files(&live).expect("list"), [next.path()]);
         drop(next);
         preparer.shutdown();
     }
 
-    /// Shutdown wakes a worker waiting on a lease; the join must not
-    /// wait for the adoption to finish.
+    /// A preparation that fails after creating its file removes it, so
+    /// the worker's retries (each at a new name) leave nothing behind:
+    /// here an allocation no filesystem can satisfy, and a zero fill
+    /// aborted by shutdown.
     #[test]
-    fn shutdown_wakes_a_worker_waiting_on_a_lease() {
+    fn failed_preparation_removes_its_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let live = dir.path().join("test.journal");
-        let preparer =
-            SegmentPreparer::spawn(live, 1024 * 1024, PREALLOC, 0, StagingMode::ZeroFill);
 
-        let taken = take_within(&preparer);
-        preparer.arm();
-        wait_for_lease_wait(&preparer);
+        let impossible = bare_state(live.clone(), StagingMode::Allocate, 1 << 62);
+        let path = staging_path(&live, 0);
+        assert!(prepare_one(&impossible, path.clone()).is_err());
+        assert!(!path.exists(), "a failed allocation must remove its file");
 
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let joiner = std::thread::spawn(move || {
-            preparer.shutdown();
-            done_tx.send(()).expect("test thread is waiting");
-        });
-        done_rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("shutdown must return while a lease is outstanding");
-        joiner.join().expect("shutdown thread");
-        // Released after the worker is gone: nothing left to wake.
-        drop(taken);
+        let stopping = bare_state(live.clone(), StagingMode::ZeroFill, 1024 * 1024);
+        stopping.shutdown.store(true, Ordering::Release);
+        let path = staging_path(&live, 1);
+        assert!(prepare_one(&stopping, path.clone()).is_err());
+        assert!(!path.exists(), "an aborted zero fill must remove its file");
     }
 
-    /// An arm arriving while a staged segment is still waiting to be
-    /// taken is a no-op: the slot holds one segment, so the worker skips
-    /// the cycle and leaves the staged file, inode and all, for `take`.
+    /// A preparation whose name is already taken fails without staging
+    /// over the file there, and without removing it: it is not the
+    /// preparation's to remove.
     #[test]
-    fn arm_while_ready_keeps_the_staged_segment() {
+    fn preparation_refuses_an_occupied_name() {
         let dir = tempfile::tempdir().expect("tempdir");
         let live = dir.path().join("test.journal");
-        let staging = staging_path(&live);
-        let preparer =
-            SegmentPreparer::spawn(live, 1024 * 1024, PREALLOC, 0, StagingMode::ZeroFill);
-
-        wait_until(
-            || matches!(*preparer.state.slot.lock().expect("slot"), Slot::Ready(_)),
-            "the startup arm should stage a segment within 10 s",
-        );
-        let staged_ino = ino(&staging);
-
-        preparer.arm();
-        wait_until(
-            || preparer.state.ready_skips.load(Ordering::Relaxed) > 0,
-            "the worker should skip the arm within 10 s",
-        );
-        assert_eq!(
-            ino(&staging),
-            staged_ino,
-            "the skipped arm must leave the staged file in place"
-        );
-
-        let taken = preparer.take().expect("the staged segment is still there");
-        assert_eq!(taken.path(), staging);
-        assert_eq!(
-            taken.file().metadata().expect("fstat taken").ino(),
-            staged_ino,
-            "take must yield the segment staged before the arm"
-        );
-        drop(taken);
-        preparer.shutdown();
+        let path = staging_path(&live, 0);
+        std::fs::write(&path, b"someone else's").expect("write");
+        let state = bare_state(live, StagingMode::Allocate, 1024 * 1024);
+        assert!(prepare_one(&state, path.clone()).is_err());
+        assert_eq!(std::fs::read(&path).expect("read"), b"someone else's");
     }
 
-    /// Wait until the worker has consumed an arm and found the staging
-    /// path leased. Bounded like [`take_within`].
-    fn wait_for_lease_wait(preparer: &SegmentPreparer) {
-        wait_until(
-            || preparer.state.lease_waits.load(Ordering::Relaxed) > 0,
-            "the worker should wait on the lease within 10 s",
-        );
+    /// A `State` with no worker, for driving `prepare_one` directly.
+    fn bare_state(live_path: PathBuf, mode: StagingMode, stage_target: u64) -> State {
+        State {
+            live_path,
+            mode,
+            stage_target: AtomicU64::new(stage_target),
+            stage_floor: 0,
+            slot: Mutex::new(None),
+            armed: Mutex::new(false),
+            notify: Condvar::new(),
+            shutdown: AtomicBool::new(false),
+        }
     }
 
     fn ino(path: &Path) -> u64 {
