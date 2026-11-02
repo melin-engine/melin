@@ -91,3 +91,47 @@ jobs:
 
       - name: dpdk builds on the MSRV
         run: cargo check -p melin-server-runtime --all-targets --features dpdk --locked
+
+  # The suite with test nodes' unpinned threads yielding rather than
+  # parking (`melin_test_node::WAIT_ENV`). Pre-merge runs them parked,
+  # which keeps the suite's CPU low enough to run the cluster tests four
+  # at a time, but a parked stage polls its ring coarsely after an idle
+  # spell, so a race that needs two stages to interleave narrowly gets
+  # fewer chances there. Yielding, they poll about every microsecond, and
+  # the cluster tests go one at a time, as every run did before nodes
+  # parked: yielding nodes keep their cores busy, and four clusters of
+  # them at once would contend on a hosted runner's 4 vCPUs. The split
+  # is two steps because a test group's limit is the same in every nextest
+  # profile; `group()` selects the group's tests without restating its
+  # members.
+  #
+  # Named `test`, as Pre-merge's test job is: rust-cache keys its entries
+  # by job id, toolchain and manifests, not by workflow, so this restores
+  # that job's entry, and `save-if: false` keeps it from adding one of its
+  # own to the repository's cache.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      MELIN_TEST_NODE_WAIT: yield
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
+
+      - name: Install cargo-nextest
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
+
+      - name: Tests, yielding, outside the cluster group
+        run: cargo nextest run --no-fail-fast --locked -E 'not group(cluster)'
+
+      # Whatever the step above found: its failures say nothing about
+      # these.
+      - name: Cluster tests, yielding, one at a time
+        if: ${{ !cancelled() }}
+        run: cargo nextest run --no-fail-fast --locked -E 'group(cluster)' --test-threads 1
