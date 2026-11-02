@@ -669,7 +669,7 @@ Enable it per node with:
 |---|---|
 | `--raft-bind <addr>` | Control-plane listener (kernel TCP, also on DPDK nodes). Enables the control plane. |
 | `--raft-node-id <id>` | This node's id (non-zero, unique per cluster). |
-| `--raft-peer <id@host:port#base64-pubkey>` | One cluster member (repeatable). Give **every node the same list, including an entry for the node itself**. The pubkey pins the peer's identity: a connection authenticated with a different key cannot speak for that id. |
+| `--raft-peer <id@host:port#base64-pubkey>` | One cluster member (repeatable). Give **every node the same list, including an entry for the node itself**. The pubkey pins the peer's identity in both directions: a connection authenticated with a different key cannot speak for that id, and when this node connects to that id, whatever answers at its address must prove that key or is refused. Each entry needs its own key: a list in which two entries share one is refused at startup. |
 | `--raft-dir <path>` | Durable election state. Defaults to the journal path with a `.raft` extension. |
 | `--raft-auto-promote` | Act on election wins (below). Off by default. |
 
@@ -692,7 +692,24 @@ line once it can again.
 Peer links authenticate with the same Ed25519 replication keys as the
 data plane (the `replication` role in `authorized_keys`), so
 `--replication-key` is required on every raft-enabled node, primaries
-included. Election state is observable on every node's `--health-bind`
+included. Authentication is mutual: the connecting node proves its key,
+then checks that the node it reached proves the key its `--raft-peer`
+entry names, and reads nothing from it before then. A process that took
+over a dead peer's address, or anything else answering there, therefore
+cannot vote, report a journal position, or make a serving primary step
+down. When the connecting node refuses the node it reached, it logs a
+warning (`raft peer failed authentication`) naming the node it dialled
+(and, if the key belongs to another configured member, that member:
+their addresses are likely swapped) and retries with backoff, as from an unreachable peer. Every
+member a node connects to therefore needs a `--raft-peer` entry naming
+its key, and each node's `authorized_keys` must list every other
+member's key under the `replication` role (as it already must for that
+member to connect to it). The handshake authenticates the two ends, not
+the traffic after it: control-plane messages are neither encrypted nor
+integrity-protected, so run peer links on a network an attacker cannot
+sit on (a private control-plane network or VLAN).
+
+Election state is observable on every node's `--health-bind`
 endpoint via the `melin_raft_*` gauges (node id, term, leader, role,
 whether the driver is running, and on the leader the age of its last
 majority acknowledgement) — raft-enabled replicas serve a minimal
@@ -870,7 +887,11 @@ nothing of its own.
   raft flags off.
 - **Membership is static on this release.** The `--raft-peer` list is
   fixed at first boot (later flag changes are ignored in favor of the
-  stored membership, with a warning). Surviving replicas do **not**
+  stored membership, with a warning). The public keys are the exception:
+  they are read from the flags on every start, so a key change takes
+  effect on restart, and a stored member whose entry is removed is
+  neither accepted nor connected to (a warning at startup names it).
+  Surviving replicas do **not**
   automatically re-point `--replica-of` at a newly promoted primary —
   reconnecting them is still operator work after a failover. Give
   every candidate `--replication-bind` (see the flags section) so the
@@ -1232,6 +1253,37 @@ normal-case post-recovery state.
   every node on its existing files. An existing history records no
   policy yet, so the first primary to serve it under protocol 8 (by boot
   or promotion) serves under the policy it requests and journals it.
+- **The control plane is versioned too, and needs the same.** Control-plane
+  links (`--raft-peer`) exchange a protocol version as part of the
+  handshake (after the connecting node proves its key, before the node
+  it reached proves its own), and a node refuses a peer that speaks another one,
+  logging a warning (`raft peer runs another release`) that names both
+  versions, then retrying with backoff as it would an unreachable peer.
+  The release that introduces the version is such a change, and also
+  the one that makes control-plane authentication mutual: it and
+  earlier releases refuse each other's control-plane links in either
+  direction (an earlier release logs only that the connection failed,
+  so read the newer node's log). The control-plane version is separate
+  from the replication protocol's: a refused control-plane link leaves
+  replication and client traffic alone, which connect or refuse by the
+  rule above, exactly as they would with the control plane down.
+  During a roll across a control-plane version, nodes on different
+  releases never vote for each other, follow each other's control-plane
+  leader, or fence each other over the control plane:
+  - only the nodes of a release that alone holds a majority (two of
+    three) can elect a leader and fail over automatically; a node
+    outside that majority never auto-promotes (its leadership is never
+    acknowledged by a majority), and when the cluster is split with no
+    release holding a majority, nobody does;
+  - a primary on one release is not fenced by a promotion on the other
+    over the control plane, only once a data-plane connection carries
+    the new epoch to it, as for a node without `--raft-auto-promote`;
+  - manual `PROMOTE` works throughout, and `melin_raft_quorum_ack_age_ms`
+    on a leader cut off from its majority this way grows as it would
+    under a partition.
+
+  Upgrade the whole cluster in one window, as above, and treat automatic
+  failover as unreliable until the last node is upgraded.
 - **Snapshots are forward-compatible.** This release reads snapshots
   written by pre-fencing releases (their epoch is taken as 0, which
   is exact — they predate any promotion), snapshots written before

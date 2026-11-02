@@ -61,6 +61,11 @@ pub mod snapshot;
 /// crate's tests and, under `test-utils`, any crate's.
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_fs;
+/// Test-only per-thread capture of `tracing` output, for tests asserting
+/// what was logged and at which level. For this crate's tests and, under
+/// `test-utils`, any crate's.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_logs;
 /// Test-only allocation of localhost listen addresses safe against the
 /// reserve-and-drop port race. For integration tests of any crate in the
 /// workspace; activate via `[dev-dependencies]` only.

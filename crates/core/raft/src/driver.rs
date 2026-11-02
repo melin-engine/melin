@@ -34,6 +34,7 @@ use tracing::error;
 use tracing::info;
 use tracing::warn;
 
+use crate::auth::unkeyed_members;
 use crate::network::RaftClientFactory;
 use crate::network::undialable_members;
 use crate::recency::TipSource;
@@ -187,6 +188,9 @@ const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
 pub struct RaftPeer {
     pub id: NodeId,
     pub addr: String,
+    /// The peer's replication public key, pinned to `id` both ways: a
+    /// connection from the peer must prove it, and so must whatever
+    /// answers when this node dials the peer.
     pub pubkey: [u8; 32],
 }
 
@@ -423,6 +427,46 @@ fn confirmation_outcome(term: u64, answer: ReadLogIdAnswer) -> ConfirmOutcome {
     }
 }
 
+/// Refuse a `--raft-peer` list whose ids or keys do not identify one
+/// member each: a repeated or zero id, or one key named by two entries.
+/// The key → id table (`peer_ids`) both sides pin with keeps one id per
+/// key, so a shared key would silently pin a dialer to the wrong id and
+/// make the dialer refuse the other member as having no key configured.
+fn validate_peer_list(peers: &[RaftPeer]) -> io::Result<()> {
+    // Sort-and-dedup over a short list (one entry per member): no hashing,
+    // one allocation per check, and only at startup.
+    let mut ids: Vec<NodeId> = peers.iter().map(|p| p.id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.len() != peers.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "duplicate node id in --raft-peer list",
+        ));
+    }
+    if ids.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "raft node ids must be non-zero (0 is the no-leader sentinel)",
+        ));
+    }
+    // Sorted by key, then id, so a shared key's entries sit side by side
+    // and the first such pair is named lowest id first.
+    let mut by_key: Vec<(&[u8; 32], NodeId)> = peers.iter().map(|p| (&p.pubkey, p.id)).collect();
+    by_key.sort_unstable();
+    if let Some(pair) = by_key.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "--raft-peer ids {} and {} name the same public key: each member needs its own \
+                 replication key",
+                pair[0].1, pair[1].1
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Validate config coherence and spawn the driver thread.
 ///
 /// Binds the RPC listener and opens raft storage *synchronously* so a bad
@@ -459,23 +503,7 @@ pub fn spawn(
             ),
         ));
     }
-    {
-        let mut ids: Vec<NodeId> = config.peers.iter().map(|p| p.id).collect();
-        ids.sort_unstable();
-        ids.dedup();
-        if ids.len() != config.peers.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "duplicate node id in --raft-peer list",
-            ));
-        }
-        if ids.contains(&0) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "raft node ids must be non-zero (0 is the no-leader sentinel)",
-            ));
-        }
-    }
+    validate_peer_list(&config.peers)?;
     // A control plane bound to a specific IP dials from it, so a peer it
     // could never reach that way is a misconfiguration to refuse at boot,
     // not to retry in the background. The stored membership, dialled
@@ -630,8 +658,16 @@ async fn driver_main(
     // One policy for both directions: the RPC server applies it to every
     // inbound request, the clients to every reply.
     let supersession = supersession.map(Arc::new);
+    // The `--raft-peer` table, key → id: one table for both pins, the RPC
+    // server's of each dialer and the clients' of each responder. Always
+    // the live CLI list, never the stored membership, whose nodes carry
+    // only an address: a key edit takes effect on restart.
+    let peer_ids: Arc<HashMap<[u8; 32], NodeId>> =
+        Arc::new(config.peers.iter().map(|p| (p.pubkey, p.id)).collect());
     let network = RaftClientFactory::new(
         Arc::clone(&signing_key),
+        Arc::clone(&authorized_keys),
+        Arc::clone(&peer_ids),
         Arc::clone(&tip),
         Arc::clone(&peer_tips),
         config.bind,
@@ -663,11 +699,10 @@ async fn driver_main(
             return;
         }
     };
-    let peer_ids: HashMap<[u8; 32], NodeId> =
-        config.peers.iter().map(|p| (p.pubkey, p.id)).collect();
     let rpc_cfg = Arc::new(RpcServerConfig {
+        signing_key,
         authorized_keys,
-        peer_ids: Arc::new(peer_ids),
+        peer_ids: Arc::clone(&peer_ids),
         tip: Arc::clone(&tip),
         peer_tips: Arc::clone(&peer_tips),
         supersession,
@@ -745,6 +780,18 @@ async fn driver_main(
                         %refusal,
                         "control plane cannot dial a stored member and treats it as unreachable; \
                          revert --raft-bind, or re-provision --raft-dir"
+                    );
+                }
+                // Likewise a stored member no `--raft-peer` entry gives a
+                // key: it is never dialled (nothing could check who answers
+                // at its address), and each skipped dial logs at debug only.
+                let stored = stored_nodes.keys().copied();
+                for refusal in unkeyed_members(&peer_ids, config.node_id, stored) {
+                    warn!(
+                        node_id = config.node_id,
+                        %refusal,
+                        "control plane will not dial a stored member and treats it as \
+                         unreachable; restore its --raft-peer entry, or re-provision --raft-dir"
                     );
                 }
             }
@@ -844,6 +891,50 @@ async fn driver_main(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn peer(id: NodeId, key: u8) -> RaftPeer {
+        RaftPeer {
+            id,
+            addr: format!("127.0.0.1:{}", 7000 + id),
+            pubkey: [key; 32],
+        }
+    }
+
+    fn peer_list_refusal(peers: &[RaftPeer]) -> io::Error {
+        validate_peer_list(peers).unwrap_err()
+    }
+
+    #[test]
+    fn peer_list_of_distinct_ids_and_keys_is_accepted() {
+        validate_peer_list(&[peer(1, 1), peer(2, 2), peer(3, 3)]).unwrap();
+    }
+
+    #[test]
+    fn peer_list_refuses_a_repeated_id() {
+        let e = peer_list_refusal(&[peer(1, 1), peer(1, 2)]);
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert!(e.to_string().contains("duplicate node id"), "{e}");
+    }
+
+    #[test]
+    fn peer_list_refuses_id_zero() {
+        let e = peer_list_refusal(&[peer(0, 1), peer(2, 2)]);
+        assert!(e.to_string().contains("non-zero"), "{e}");
+    }
+
+    /// Two members sharing a key would collapse onto one id in the key →
+    /// id table, so the dialer would refuse the other as having no key.
+    /// The refusal names both entries, so the operator knows which to fix.
+    #[test]
+    fn peer_list_refuses_a_key_named_twice_naming_both_ids() {
+        let e = peer_list_refusal(&[peer(1, 1), peer(3, 2), peer(2, 2)]);
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            e.to_string(),
+            "--raft-peer ids 2 and 3 name the same public key: each member needs its own \
+             replication key"
+        );
+    }
 
     #[test]
     fn heartbeat_offsets_are_distinct_and_bounded_by_the_slowest_tick() {

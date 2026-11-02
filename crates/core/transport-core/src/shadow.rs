@@ -395,11 +395,12 @@ mod tests {
     use super::*;
     use crate::cursors::{RingPos, WireSeq};
     use crate::pipeline::{InputSlot, RequestId};
+    use crate::test_logs::{Logs, field};
     use crate::test_support::{TestApp, TestEvent};
     use melin_journal::JournalEvent;
     use melin_pipeline::ring::DisruptorBuilder;
     use melin_pipeline::seqlock;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::thread::JoinHandle;
 
     // --- SnapshotSchedule ---
@@ -490,47 +491,6 @@ mod tests {
 
     // --- The shadow's save, threaded ---
 
-    /// The shadow thread's log, captured. A subscriber of the shadow's
-    /// thread alone, so tests running beside it neither see nor disturb
-    /// it. Not `melin_test_node::logs` nor `stall_guards`' sink: the one
-    /// crate is built on this one, the other is another crate's
-    /// integration test.
-    #[derive(Clone, Default)]
-    struct Logs(Arc<Mutex<Vec<u8>>>);
-
-    impl std::io::Write for Logs {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl Logs {
-        /// The captured lines carrying `message`.
-        fn lines(&self, message: &str) -> Vec<String> {
-            String::from_utf8(self.0.lock().unwrap().clone())
-                .unwrap()
-                .lines()
-                .filter(|line| line.contains(message))
-                .map(str::to_owned)
-                .collect()
-        }
-    }
-
-    /// The value of `field=` on a log line.
-    fn field<'a>(line: &'a str, field: &str) -> &'a str {
-        let start = line
-            .find(&format!(" {field}="))
-            .unwrap_or_else(|| panic!("no {field}= in {line:?}"))
-            + field.len()
-            + 2;
-        line[start..].split_whitespace().next().unwrap()
-    }
-
     /// A shadow stage on its own thread, its log captured, saving to
     /// `path` every `interval`.
     fn spawn_shadow(
@@ -541,16 +501,12 @@ mod tests {
         shutdown: &Arc<AtomicBool>,
     ) -> (JoinHandle<()>, Logs) {
         let logs = Logs::default();
-        let writer = logs.clone();
+        // A subscriber of the shadow's thread alone (see `test_logs`).
+        let subscriber = logs.subscriber(tracing::Level::INFO);
         let shutdown = Arc::clone(shutdown);
         let handle = std::thread::Builder::new()
             .name("test-shadow-logged".into())
             .spawn(move || {
-                let subscriber = tracing_subscriber::fmt()
-                    .with_ansi(false)
-                    .with_max_level(tracing::Level::INFO)
-                    .with_writer(move || writer.clone())
-                    .finish();
                 tracing::subscriber::with_default(subscriber, || {
                     run(
                         consumer,
