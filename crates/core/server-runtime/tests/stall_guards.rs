@@ -27,7 +27,7 @@ use melin_client::Connection;
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::layout::{PipelineCores, Placement};
-use melin_server_runtime::server::{JournalStagingMode, ServerConfig};
+use melin_server_runtime::server::ServerConfig;
 use melin_test_node::probe::{gauge, wait_for_gauge};
 use melin_test_node::sched::{first_pinnable_cpu, set_batch_policy, threads_named};
 use melin_test_node::{Addrs, Node};
@@ -135,10 +135,6 @@ fn node_config(dir: &Path, name: &str, key: &SigningKey, keys_file: &Path) -> Se
         // Off unless a test asks for one: the default is a fixed port,
         // which two nodes in one process would both take.
         health_bind: None,
-        // Staged segments allocated, not zero-filled: a zero fill is a pass
-        // over a whole segment, from every node at once, on a CI runner's
-        // disk, and nothing here measures the journal.
-        journal_staging_mode: JournalStagingMode::Allocate,
         replication_key: Some(key_path),
         ..melin_test_node::config()
     }
