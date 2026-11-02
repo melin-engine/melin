@@ -85,12 +85,12 @@ impl IdleHousekeeping {
     /// loop's whole cost. A stage that is nearly saturated reaches the idle
     /// path a handful of times between batches: there the read is already
     /// rare, and masking it would stretch the one-second heartbeat scan
-    /// into minutes. A yielding thread never masks either: the yield
+    /// into minutes. A yielding or sleeping thread never masks either: the
     /// syscall dwarfs a vDSO read.
     ///
-    /// "Busy-spinning, and has been for a while": under spin-then-yield a
-    /// loop past its budget is no longer spinning, so the conjunction is
-    /// only ever true under `BusySpin`.
+    /// "Busy-spinning, and has been for a while": under the other
+    /// strategies a loop past its budget is no longer spinning, so the
+    /// conjunction is only ever true under `BusySpin`.
     #[inline]
     pub(crate) fn tick(&mut self, waiter: &Waiter) -> Option<Due> {
         let masked = waiter.spinning() && waiter.past_spin_budget();
@@ -164,7 +164,11 @@ mod tests {
     /// spins only briefly between batches went many seconds unscanned.
     #[test]
     fn a_brief_spin_finds_the_heartbeat_scan_due_on_the_first_tick() {
-        for strategy in [WaitStrategy::BusySpin, WaitStrategy::SpinThenYield] {
+        for strategy in [
+            WaitStrategy::BusySpin,
+            WaitStrategy::SpinThenYield,
+            WaitStrategy::SpinYieldPark,
+        ] {
             let waiter = strategy.waiter();
             assert!(waiter.spinning() && !waiter.past_spin_budget());
             let mut housekeeping = overdue();
@@ -176,19 +180,21 @@ mod tests {
         }
     }
 
-    /// A thread that has yielded past its budget never masks: the yield
-    /// already paid more than a clock read.
+    /// A thread that has left its spin budget, to yield or to sleep,
+    /// never masks: the syscall already paid more than a clock read.
     #[test]
     fn a_yielding_waiter_finds_the_heartbeat_scan_due_on_the_first_tick() {
-        let mut waiter = WaitStrategy::SpinThenYield.waiter();
-        while waiter.spinning() {
-            waiter.idle();
+        for strategy in [WaitStrategy::SpinThenYield, WaitStrategy::SpinYieldPark] {
+            let mut waiter = strategy.waiter();
+            while waiter.spinning() {
+                waiter.idle();
+            }
+            let mut housekeeping = overdue();
+            let due = housekeeping
+                .tick(&waiter)
+                .expect("unmasked: the first tick fires");
+            assert!(due.heartbeat_scan, "{strategy:?}");
         }
-        let mut housekeeping = overdue();
-        let due = housekeeping
-            .tick(&waiter)
-            .expect("unmasked: the first tick fires");
-        assert!(due.heartbeat_scan);
     }
 
     /// Busy-spinning past its budget, the stage masks the clock read: the
