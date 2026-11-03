@@ -910,12 +910,7 @@ mod tests {
         let file = std::fs::File::create(&staging).unwrap();
         std::fs::remove_file(&staging).unwrap();
         disk.rotate(RotateRequest {
-            prepared: Some(PreparedSegment {
-                file,
-                path: staging,
-                allocated_end: 4096,
-                written: true,
-            }),
+            prepared: Some(PreparedSegment::for_test(file, staging, 4096, true)),
             starting_sequence: 7,
             anchor_hash: [1u8; 32],
         });
