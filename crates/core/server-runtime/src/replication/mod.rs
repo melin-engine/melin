@@ -65,6 +65,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use melin_journal::{BufferedWriter, JournalWrite};
 
 use melin_app::Application;
+use melin_transport_core::TickWatermark;
 use melin_transport_core::lineage::SharedLineagePolicy;
 use melin_transport_core::node_store::NodeStore;
 use melin_transport_core::pipeline::{InputSlot, OutputSlot};
@@ -550,6 +551,10 @@ pub(super) type ReplicaHandles<A> =
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_replica_pipeline_with_threads<A>(
     mut app: A,
+    // The tick watermark of the position `app` is at, carried with it
+    // from wherever the replica got it; the matching and shadow stages
+    // start from it.
+    tick_watermark: TickWatermark,
     writer: BufferedWriter<A::Event>,
     cores: crate::layout::PipelineCores,
     // The node's `--ring-capacity`: a replica's rings are sized as its
@@ -604,11 +609,9 @@ where
     // The lineage's genesis length, stamped into the replica's own
     // snapshots — the same value its journal header holds.
     let genesis_entries = writer.read_header_info()?.genesis_entries;
-    // The first sequence the stream will bring, which the shadow counts
-    // from (see `shadow::run`).
-    let starting_wire_seq = writer.next_sequence();
     let pipeline = melin_transport_core::pipeline::build_replica_pipeline(
         app,
+        tick_watermark,
         writer,
         4096, // max_journal_batch
         ring_capacity,
@@ -694,7 +697,7 @@ where
     })
     .map_err(|e| abandon(format!("start the replica's drain thread: {e}")))?;
 
-    let shadow_handle = if let Some(shadow_cons) = pipeline.shadow_consumer {
+    let shadow_handle = if let Some(shadow_feed) = pipeline.shadow_feed {
         let snap_path = store.snapshot().to_path_buf();
         let chain_lock = pipeline.chain_hash_lock.clone();
         let ps = Arc::clone(&pipeline_shutdown);
@@ -702,7 +705,7 @@ where
         Some(
             melin_app::affinity::spawn_placed("replica-shadow", shadow.core, move || {
                 melin_transport_core::shadow::run(
-                    shadow_cons,
+                    shadow_feed,
                     shadow_app,
                     snap_path,
                     std::time::Duration::from_millis(snapshot_interval_ms),
@@ -710,7 +713,6 @@ where
                     &ps,
                     shadow.wait,
                     shadow_initial_lineage,
-                    starting_wire_seq,
                     genesis_entries,
                 );
             })
@@ -796,8 +798,10 @@ pub(super) const MAX_INPROCESS_DIVERGENCE_RESYNCS: u32 = 1;
 /// leaves archives with no live segment, and recovery handles that
 /// layout; treating it as a fresh replica would discard local durable
 /// history and then fail `create_new` against the surviving lineage).
-/// Returns `(None, None, 0, zeros)` for a genuinely fresh replica.
-/// Also seeds the fencing epoch from the recovered journal.
+/// Returns `(None, None, 0, zeros)` for a genuinely fresh replica. The
+/// recovered application comes with the tick watermark of its position,
+/// which the pipeline built over it starts from. Also seeds the fencing
+/// epoch from the recovered journal.
 ///
 /// Called at receiver startup, and again after a mid-stream chain
 /// divergence tears the pipeline down: the on-disk journal is
@@ -816,7 +820,7 @@ pub(super) fn recover_replica_state<A, W>(
     // What the recovered journal is reopened with: the node's reservation
     // (`ServerConfig::journal_prealloc`).
     prealloc: melin_journal::Prealloc,
-) -> Result<(Option<A>, Option<W>, u64, [u8; 32]), Box<dyn std::error::Error>>
+) -> Result<(Option<(A, TickWatermark)>, Option<W>, u64, [u8; 32]), Box<dyn std::error::Error>>
 where
     A: Application,
     W: melin_journal::JournalWrite<A::Event>,
@@ -851,8 +855,9 @@ where
     // Streaming `EpochBump`s and the snapshot-resync path raise the epoch
     // later.
     adopt_recovered_lineage(fence_state, lineage_policy, engine.recovered_lineage());
+    let tick_watermark = engine.tick_watermark();
     let (app, writer) = engine.into_parts();
-    Ok((Some(app), Some(writer), last, hash))
+    Ok((Some((app, tick_watermark)), Some(writer), last, hash))
 }
 
 /// Adopt a lineage recovered from disk (a journal replay, or a snapshot
@@ -889,7 +894,7 @@ pub(in crate::replication) enum AfterSession<A, W> {
     /// and reconnects; the primary's `HashMismatch` verdict then routes
     /// the replica through archive + re-seed.
     Resync {
-        app: Option<A>,
+        app: Option<(A, TickWatermark)>,
         journal_writer: Option<W>,
         last_sequence: u64,
         chain_hash: [u8; 32],
@@ -907,7 +912,7 @@ impl<A, W> AfterSession<A, W> {
     /// dispatch site in both receivers, so they cannot drift apart.
     pub(in crate::replication) fn adopt(
         self,
-        app: &mut Option<A>,
+        app: &mut Option<(A, TickWatermark)>,
         journal_writer: &mut Option<W>,
         last_sequence: &mut u64,
         chain_hash: &mut [u8; 32],
@@ -993,7 +998,11 @@ where
 
         SessionExit::Promote => AfterSession::Return(match pipeline.take() {
             Some(p) => match teardown_replica_pipeline::<A, W>(p) {
-                TeardownOutcome::Clean(ex, wr) => Ok(Some((ex, wr))),
+                // The torn-down matching stage does not hand its
+                // watermark back yet.
+                TeardownOutcome::Clean(ex, wr) => {
+                    Ok(Some((ex, TickWatermark::not_yet_carried(), wr)))
+                }
                 _ => Err("pipeline failed during promotion".into()),
             },
             None => Err("pipeline missing on promote".into()),
@@ -1146,7 +1155,7 @@ where
 /// pair is a hard error — a promote with nothing to promote.
 pub(in crate::replication) fn take_pipeline_for_promotion<A, W>(
     pipeline: &mut Option<ReplicaPipelineHandles<A, W>>,
-    app: &mut Option<A>,
+    app: &mut Option<(A, TickWatermark)>,
     journal_writer: &mut Option<W>,
 ) -> ReceiverResult<A, W>
 where
@@ -1156,11 +1165,13 @@ where
     if let Some(p) = pipeline.take()
         && let TeardownOutcome::Clean(e, w) = teardown_replica_pipeline::<A, W>(p)
     {
-        *app = Some(e);
+        // The torn-down matching stage does not hand its watermark back
+        // yet.
+        *app = Some((e, TickWatermark::not_yet_carried()));
         *journal_writer = Some(w);
     }
     match (app.take(), journal_writer.take()) {
-        (Some(e), Some(w)) => Ok(Some((e, w))),
+        (Some((e, tick_watermark)), Some(w)) => Ok(Some((e, tick_watermark, w))),
         _ => Err("promotion requested but no local state available".into()),
     }
 }
@@ -1307,7 +1318,7 @@ pub(in crate::replication) fn handle_resync_verdict<A, W, S>(
     divergent: bool,
     source: &mut S,
     pipeline: &mut Option<ReplicaPipelineHandles<A, W>>,
-    app: &mut Option<A>,
+    app: &mut Option<(A, TickWatermark)>,
     journal_writer: &mut Option<W>,
     store: &NodeStore,
     fence_state: &melin_transport_core::fence::FenceState,
@@ -1416,7 +1427,8 @@ where
     // replica onto the primary's lineage, its epoch and ack policy
     // included. Only now: a transfer that failed part-way adopts nothing.
     adopt_recovered_lineage(fence_state, &control.lineage_ack_policy, snap_lineage);
-    *app = Some(snap_app);
+    // The transferred snapshot does not carry its watermark yet.
+    *app = Some((snap_app, TickWatermark::not_yet_carried()));
 
     // Open the seeded segment for appending at the snapshot position —
     // recovery's resume path: the chain rebuilds from the seeded bytes and
@@ -1992,6 +2004,51 @@ mod tests {
         assert_eq!(writer.expect("recovered").prealloc(), node);
         assert_eq!(last, 1);
         assert!(!staging.exists(), "swept beside a journal with history");
+    }
+
+    /// A replica recovered from its journal hands its pipeline the tick
+    /// watermark replay reached, with the application, not a fresh one:
+    /// the matching and shadow stages built over it continue the clock an
+    /// uninterrupted replica would hold.
+    #[test]
+    fn replica_recovery_carries_the_replayed_tick_watermark() {
+        type Writer = melin_journal::BufferedWriter<CounterEvent>;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = dir.path().join("replica.journal");
+        let store = NodeStore::resolve(journal.clone(), None).expect("store");
+        let mut w =
+            Writer::create_continuing(&journal, 1, [0; 32], None, PREALLOC).expect("create");
+        let event = melin_journal::JournalEvent::App(CounterEvent::Increment { amount: 1 });
+        for timestamp_ns in [100, 300] {
+            let seq = w.allocate_sequence();
+            w.encode_event(seq, timestamp_ns, &event, 0)
+                .expect("encode");
+        }
+        w.flush_batch_sync().expect("flush");
+        drop(w);
+
+        // What replay of this journal reaches, read independently.
+        let replayed =
+            melin_transport_core::JournaledApp::<counter_server::Counter, Writer>::recover(
+                counter_server::Counter::default(),
+                &journal,
+                PREALLOC,
+            )
+            .expect("replay")
+            .tick_watermark();
+        assert_ne!(replayed, TickWatermark::GENESIS);
+
+        let (app, _, last, _) = recover_replica_state::<counter_server::Counter, Writer>(
+            &store,
+            &melin_transport_core::fence::FenceState::new(0),
+            &SharedLineagePolicy::new(None),
+            &(),
+            PREALLOC,
+        )
+        .expect("recover");
+        assert_eq!(last, 2);
+        let (_, tick_watermark) = app.expect("recovered");
+        assert_eq!(tick_watermark, replayed);
     }
 
     /// Replica recovery adopts the recovered lineage: the epoch as a
@@ -3803,6 +3860,7 @@ mod tests {
             };
             let handles = build_replica_pipeline_with_threads(
                 counter_server::Counter::default(),
+                TickWatermark::GENESIS,
                 writer,
                 cores,
                 melin_transport_core::pipeline::RingCapacity::MIN,

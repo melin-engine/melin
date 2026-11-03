@@ -22,6 +22,7 @@ use tracing::{debug, error, info, warn};
 use melin_journal::BufferedWriter;
 use melin_journal::JournalError;
 use melin_journal::JournalWrite;
+use melin_transport_core::TickWatermark;
 use melin_transport_core::journaled_app::JournaledApp;
 use melin_transport_core::lineage::{Lineage, LineagePolicy};
 use melin_transport_core::node_store::{NodeStore, NodeStoreError};
@@ -34,6 +35,7 @@ use melin_transport_core::pipeline::{
     build_pipeline_with_replication,
 };
 use melin_transport_core::replica_presence::ReplicaPresence;
+use melin_transport_core::shadow::ShadowFeed;
 /// Internal alias for the disruptor-built pipeline, used only by
 /// destructuring `let Pipeline { … }` patterns inside the boot path.
 /// Not part of the public API — callers reach the underlying type
@@ -1253,7 +1255,7 @@ where
         )? {
             // Clean shutdown — the raft and health guards tear down on drop.
             None => return Ok(()),
-            Some((mut app, writer)) => {
+            Some((mut app, tick_watermark, writer)) => {
                 // Promotion! Transition to primary mode. Bump the epoch so a
                 // paused/partitioned ex-primary is fenced when it reconnects.
                 info!("replica promoted — transitioning to primary");
@@ -1282,6 +1284,7 @@ where
                 // channel for the whole primary tenure.
                 return run_as_primary::<A, L>(
                     app,
+                    tick_watermark,
                     writer,
                     listener,
                     repl_listener,
@@ -1336,6 +1339,7 @@ where
     // journaled here, as the journal is created.
     let InitializedEngine {
         mut app,
+        tick_watermark,
         writer,
         recovered_lineage,
         began_history,
@@ -1391,6 +1395,7 @@ where
     // The raft guard drops — stopping the driver — after this returns.
     run_as_primary::<A, L>(
         app,
+        tick_watermark,
         writer,
         listener,
         repl_listener,
@@ -1757,6 +1762,10 @@ fn shutdown_pipeline_stages<A: Send + 'static, W: Send + 'static>(
 #[allow(clippy::too_many_arguments)]
 fn run_as_primary<A, L>(
     app: A,
+    // The tick watermark of the position `app` is at, which the matching
+    // and shadow stages start from: the recovered one at boot, the
+    // replica's on a promotion.
+    tick_watermark: TickWatermark,
     writer: BufferedWriter<A::Event>,
     mut listener: L,
     // Pre-bound replication listener (non-blocking by construction),
@@ -1826,9 +1835,6 @@ where
     // The lineage's genesis length, read before the writer moves into
     // the pipeline: the shadow stage stamps it into every snapshot.
     let genesis_entries = writer.read_header_info()?.genesis_entries;
-    // The wire sequence of the first entry this tenure journals: the
-    // shadow stage counts from it.
-    let starting_wire_seq = writer.next_sequence();
     // Clone the application for the shadow snapshot stage before the pipeline
     // consumes it. `Application` does not require `Clone`, so this goes
     // through `clone_via_snapshot` (a snapshot round-trip unless the
@@ -1856,12 +1862,13 @@ where
         input_cursor,
         replication_consumers,
         replicas_connected,
-        shadow_consumer,
+        shadow_feed,
         chain_hash_lock,
         replication_ring_progress,
         cursors,
     } = build_pipeline_with_replication(
         app,
+        tick_watermark,
         writer,
         config.group_commit_delay(),
         Arc::clone(&active_connections),
@@ -2204,7 +2211,7 @@ where
     )?;
 
     stages.shadow = spawn_shadow_stage::<A>(
-        shadow_consumer,
+        shadow_feed,
         shadow_app,
         chain_hash_lock,
         config,
@@ -2215,7 +2222,6 @@ where
             epoch: fence_state.epoch(),
             ack_policy: lineage_ack_policy,
         },
-        starting_wire_seq,
         genesis_entries,
     )?;
 
@@ -2781,7 +2787,7 @@ where
         )? {
             // Clean shutdown — the raft and health guards tear down on drop.
             None => return Ok(()),
-            Some((mut app, writer)) => {
+            Some((mut app, tick_watermark, writer)) => {
                 // Promotion! Transition to primary mode, on DPDK: the node
                 // serves on the transport it ran on, as a promoted
                 // kernel-TCP replica does. The receiver tore its pipeline
@@ -2830,6 +2836,7 @@ where
                 // returns; see the kernel-TCP promotion path.
                 return run_as_primary_dpdk::<A>(
                     app,
+                    tick_watermark,
                     writer,
                     transport,
                     &dpdk_config,
@@ -2898,6 +2905,7 @@ where
     // cannot wait for one — see the replication note further down).
     let InitializedEngine {
         mut app,
+        tick_watermark,
         writer,
         recovered_lineage,
         began_history: _,
@@ -2964,6 +2972,7 @@ where
     // The raft guard and the admin endpoint drop after this returns.
     run_as_primary_dpdk::<A>(
         app,
+        tick_watermark,
         writer,
         transport,
         &dpdk_config,
@@ -3005,6 +3014,8 @@ where
 #[allow(clippy::too_many_arguments)] // boot assembly point, as run_as_primary
 fn run_as_primary_dpdk<A>(
     app: A,
+    // As `run_as_primary`'s.
+    tick_watermark: TickWatermark,
     writer: BufferedWriter<A::Event>,
     mut transport: melin_dpdk::DpdkTransport,
     dpdk_config: &melin_dpdk::DpdkConfig,
@@ -3038,7 +3049,6 @@ where
     // As on the kernel-TCP path: read before the writer moves into the
     // pipeline, for the shadow stage's snapshots.
     let genesis_entries = writer.read_header_info()?.genesis_entries;
-    let starting_wire_seq = writer.next_sequence();
 
     // Clone the application's state for the shadow snapshot stage before
     // moving it into the pipeline (same as the kernel TCP path).
@@ -3074,12 +3084,13 @@ where
         input_cursor,
         replication_consumers,
         replicas_connected,
-        shadow_consumer,
+        shadow_feed,
         chain_hash_lock,
         replication_ring_progress,
         cursors,
     } = build_pipeline_with_replication(
         app,
+        tick_watermark,
         writer,
         config.group_commit_delay(),
         Arc::clone(&active_connections),
@@ -3249,7 +3260,7 @@ where
     );
 
     stages.shadow = spawn_shadow_stage::<A>(
-        shadow_consumer,
+        shadow_feed,
         shadow_app,
         chain_hash_lock,
         config,
@@ -3260,7 +3271,6 @@ where
             epoch: fence_state.epoch(),
             ack_policy: lineage_ack_policy,
         },
-        starting_wire_seq,
         genesis_entries,
     )?;
 
@@ -3853,6 +3863,9 @@ fn genesis_target<E: melin_app::AppEvent>(
 /// What [`init_engine`] hands the boot path.
 pub(crate) struct InitializedEngine<A, W> {
     pub(crate) app: A,
+    /// The tick watermark of the position `app` is at: the pipeline's
+    /// matching and shadow stages start from it.
+    pub(crate) tick_watermark: TickWatermark,
     pub(crate) writer: W,
     /// The lineage recovered from the snapshot + journal (the genesis
     /// lineage for a new node): the caller seeds the node's `FenceState`
@@ -3966,7 +3979,12 @@ where
                     snap.genesis_entries,
                     prealloc,
                 )?;
-                JournaledApp::<A, W>::from_parts(app, writer, snap.lineage)
+                JournaledApp::<A, W>::from_parts(
+                    app,
+                    writer,
+                    snap.lineage,
+                    TickWatermark::not_yet_carried(),
+                )
             }
             BootstrapSource::JournalOnly => {
                 info!("recovering from journal");
@@ -4047,9 +4065,11 @@ where
     }
 
     let recovered_lineage = engine.recovered_lineage();
+    let tick_watermark = engine.tick_watermark();
     let (app, writer) = engine.into_parts();
     Ok(InitializedEngine {
         app,
+        tick_watermark,
         writer,
         recovered_lineage,
         began_history,
@@ -4104,7 +4124,9 @@ fn primary_gate_policy<A: Application>(
 
 #[allow(clippy::too_many_arguments)] // the stage's inputs, as `shadow::run`
 fn spawn_shadow_stage<A: Application + Send + 'static>(
-    shadow_consumer: Option<Consumer<InputSlot<A::Event>>>,
+    // The pipeline's shadow input, starting where its matching stage does
+    // (see `shadow::ShadowFeed`).
+    shadow_feed: Option<ShadowFeed<A::Event>>,
     shadow_app: Option<A>,
     chain_hash_lock: Option<
         melin_pipeline::seqlock::SeqLockReader<melin_transport_core::pipeline::FsyncState>,
@@ -4115,9 +4137,6 @@ fn spawn_shadow_stage<A: Application + Send + 'static>(
     cores: &PipelineCores,
     shutdown: &Arc<AtomicBool>,
     initial_lineage: Lineage,
-    // The wire sequence of the first entry the shadow will consume (see
-    // `shadow::run`).
-    starting_wire_seq: u64,
     // The lineage's genesis length, from the journal header — stamped
     // into every snapshot (see `shadow::run`).
     genesis_entries: Option<u64>,
@@ -4125,7 +4144,7 @@ fn spawn_shadow_stage<A: Application + Send + 'static>(
 where
     A::Event: Send + Sync + 'static,
 {
-    let Some(shadow_cons) = shadow_consumer else {
+    let Some(shadow_feed) = shadow_feed else {
         return Ok(None);
     };
     let snap_path = store.snapshot().to_path_buf();
@@ -4137,7 +4156,7 @@ where
     let shadow = cores.shadow;
     let handle = melin_app::affinity::spawn_placed("shadow", shadow.core, move || {
         melin_transport_core::shadow::run(
-            shadow_cons,
+            shadow_feed,
             shadow_ex,
             snap_path,
             interval,
@@ -4145,7 +4164,6 @@ where
             &s_shadow,
             shadow.wait,
             initial_lineage,
-            starting_wire_seq,
             genesis_entries,
         );
     })
@@ -5299,6 +5317,42 @@ mod genesis_tests {
         assert_eq!(journaled_amounts(&cfg.journal), vec![1_000, 2_000]);
     }
 
+    /// The primary's boot hands its pipeline the watermark replay reached,
+    /// not zero: a boot that dropped it would have the live and shadow
+    /// stages fire a tick before a first live event repeating the last
+    /// replayed timestamp, which an uninterrupted node never does.
+    #[test]
+    fn a_recovering_boot_carries_the_replayed_tick_watermark() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = config(dir.path());
+        let mut w =
+            Writer::create_continuing(&cfg.journal, 1, [0; 32], None, PREALLOC).expect("create");
+        let event = JournalEvent::App(CounterEvent::Increment { amount: 1 });
+        for timestamp_ns in [100, 300] {
+            let seq = w.allocate_sequence();
+            w.encode_event(seq, timestamp_ns, &event, 0)
+                .expect("encode");
+        }
+        w.flush_batch_sync().expect("flush");
+        drop(w);
+
+        // What replay of this journal reaches, read independently.
+        let replayed = melin_transport_core::JournaledApp::<Counter, Writer>::recover(
+            Counter::default(),
+            &cfg.journal,
+            PREALLOC,
+        )
+        .expect("replay")
+        .tick_watermark();
+        assert_ne!(replayed, melin_transport_core::TickWatermark::GENESIS);
+
+        let engine =
+            init_engine::<Counter, Writer>(&cfg, &cfg.store().expect("store"), &(), Vec::new())
+                .expect("init_engine");
+        assert!(!engine.began_history);
+        assert_eq!(engine.tick_watermark, replayed);
+    }
+
     /// Finding 3: the standard upgrade (snapshot, new binary, fresh
     /// journal) boots from the snapshot alone, whose state already holds
     /// the genesis.
@@ -5780,7 +5834,7 @@ mod primary_gate_policy_tests {
     use melin_transport_core::fence::FenceState;
     use melin_transport_core::lineage::ForcedPolicy;
     use melin_transport_core::pipeline::{InputSlot, MatchingStage, OutputSlot};
-    use melin_transport_core::{DurableWireSeqCursor, WireSeq};
+    use melin_transport_core::{DurableWireSeqCursor, TickWatermark, WireSeq};
 
     use super::primary_gate_policy;
     use crate::ack_policy::AckPolicy;
@@ -5800,6 +5854,7 @@ mod primary_gate_policy_tests {
         .build(WaitStrategy::SpinThenYield);
         MatchingStage::new(
             Counter::default(),
+            TickWatermark::GENESIS,
             inputs.pop().expect("one consumer"),
             output,
             Arc::new(AtomicU64::new(0)),

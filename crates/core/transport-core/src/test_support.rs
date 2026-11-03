@@ -182,26 +182,90 @@ impl Application for TestApp {
     }
 
     fn restore<R: Read>(r: &mut R) -> io::Result<Self> {
-        let mut u64_buf = [0u8; 8];
-        r.read_exact(&mut u64_buf)?;
-        let total = u64::from_le_bytes(u64_buf);
-        r.read_exact(&mut u64_buf)?;
-        let ticks = u64::from_le_bytes(u64_buf);
+        let total = read_u64(r)?;
+        let ticks = read_u64(r)?;
         let mut u32_buf = [0u8; 4];
         r.read_exact(&mut u32_buf)?;
         let len = u32::from_le_bytes(u32_buf) as usize;
         let mut per_key_total = HashMap::with_capacity(len);
         for _ in 0..len {
-            let mut kb = [0u8; 8];
-            r.read_exact(&mut kb)?;
-            let mut vb = [0u8; 8];
-            r.read_exact(&mut vb)?;
-            per_key_total.insert(u64::from_le_bytes(kb), u64::from_le_bytes(vb));
+            let key = read_u64(r)?;
+            per_key_total.insert(key, read_u64(r)?);
         }
         Ok(Self {
             total,
             ticks,
             per_key_total,
+        })
+    }
+}
+
+/// One little-endian `u64`, the unit every test application's snapshot
+/// is written in.
+fn read_u64<R: Read>(r: &mut R) -> io::Result<u64> {
+    let mut buf = [0u8; 8];
+    r.read_exact(&mut buf)?;
+    Ok(u64::from_le_bytes(buf))
+}
+
+/// An application whose `tick` breaks the rule every application must
+/// keep — a call for a time already passed changes nothing — and makes
+/// the break visible: it counts every call, an equal or earlier time
+/// included, and every report it emits carries the count.
+///
+/// The runtime must not depend on that rule for determinism, so two
+/// copies that apply the same journal must make the same tick calls, and
+/// two such copies of this application emit the same reports. A copy
+/// that made one call more or fewer, however harmless to a well-behaved
+/// application, reports a different count from then on.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct TickCountingApp {
+    /// Every `tick` call so far. `u64`: a count of calls, which a long
+    /// run could take past any narrower type.
+    pub ticks: u64,
+}
+
+/// What [`TickCountingApp`] reports for each event it applies: the tick
+/// calls made so far.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TickCount {
+    pub ticks: u64,
+}
+
+impl Application for TickCountingApp {
+    type Event = TestEvent;
+    type Report = TickCount;
+    type QueryResponse = TestQuery;
+    type Sizing = ();
+
+    const APP_VERSION: u16 = 43;
+
+    fn apply(&mut self, _event: Self::Event, _ctx: &ApplyCtx, out: &mut Vec<Self::Report>) {
+        out.push(TickCount { ticks: self.ticks });
+    }
+
+    fn query(&self, event: Self::Event, ctx: &QueryCtx) -> Option<Self::QueryResponse> {
+        event.is_query().then(|| TestQuery {
+            total: self.ticks,
+            journal_sequence: ctx.journal_sequence.get(),
+        })
+    }
+
+    fn tick(&mut self, _now_ns: u64, _out: &mut Vec<Self::Report>) {
+        self.ticks += 1;
+    }
+
+    fn build_reject(_event: &Self::Event, _reason: RejectReason) -> Self::Report {
+        TickCount { ticks: u64::MAX }
+    }
+
+    fn snapshot<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        w.write_all(&self.ticks.to_le_bytes())
+    }
+
+    fn restore<R: Read>(r: &mut R) -> io::Result<Self> {
+        Ok(Self {
+            ticks: read_u64(r)?,
         })
     }
 }

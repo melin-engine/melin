@@ -13,12 +13,12 @@ use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
 use crate::cursors::WireSeq;
-use crate::dispatch::dispatch;
+use crate::dispatch::{TickWatermark, dispatch};
 use crate::lineage::Lineage;
 use crate::pipeline::{FsyncState, InputSlot};
 use crate::snapshot;
 use melin_app::amortized_timer::AmortizedTimer;
-use melin_app::{Application, ApplyCtx};
+use melin_app::{AppEvent, Application, ApplyCtx};
 use melin_pipeline::ring;
 use melin_pipeline::seqlock::SeqLockReader;
 use melin_pipeline::wait::WaitStrategy;
@@ -26,6 +26,46 @@ use melin_pipeline::wait::WaitStrategy;
 /// Maximum events consumed per batch. Matches the journal stage batch size
 /// for consistent throughput characteristics.
 const SHADOW_BATCH_SIZE: usize = 4096;
+
+/// What the shadow stage consumes, and the position it starts from.
+///
+/// The shadow replays the events the live matching stage applies, on a
+/// copy of the same state, so it must start where that stage starts: the
+/// wire sequence of the first event it will consume, and the tick
+/// watermark of the state it copies. The pipeline builders make both
+/// from the values they give the matching stage, and nothing else can
+/// make one, so the shadow cannot start anywhere else — a shadow starting
+/// from a fresh watermark would fire ticks the live stage does not, and
+/// snapshot a state the primary never had.
+pub struct ShadowFeed<E: AppEvent> {
+    /// The input ring's shadow consumer, gated on the journal stage.
+    pub(crate) consumer: ring::Consumer<InputSlot<E>>,
+    /// The wire sequence the journal allocates to the first event the
+    /// shadow will consume (the journal writer's next sequence when the
+    /// pipeline is built). The shadow counts from it the way the journal
+    /// allocates, so a lineage event it folds is recorded at its own
+    /// entry's sequence (see
+    /// [`LineagePolicy::after`](crate::lineage::LineagePolicy::after)).
+    pub(crate) starting_wire_seq: u64,
+    /// The matching stage's starting watermark.
+    pub(crate) tick_watermark: TickWatermark,
+}
+
+impl<E: AppEvent> ShadowFeed<E> {
+    /// The feed over `consumer`, when the pipeline has a shadow, starting
+    /// at the matching stage's position.
+    pub(crate) fn at(
+        consumer: Option<ring::Consumer<InputSlot<E>>>,
+        starting_wire_seq: u64,
+        tick_watermark: TickWatermark,
+    ) -> Option<Self> {
+        consumer.map(|consumer| Self {
+            consumer,
+            starting_wire_seq,
+            tick_watermark,
+        })
+    }
+}
 
 /// Run the shadow snapshot stage.
 ///
@@ -41,15 +81,12 @@ const SHADOW_BATCH_SIZE: usize = 4096;
 /// still knows it. Constant for the stage's life: it is fixed when the
 /// lineage begins.
 ///
-/// `starting_wire_seq` is the wire sequence the journal allocates to the
-/// first event the shadow will consume (the journal writer's next
-/// sequence when the pipeline is built). The shadow counts from it the
-/// way the journal allocates, so a lineage event it folds is recorded at
-/// its own entry's sequence (see
-/// [`LineagePolicy::after`](crate::lineage::LineagePolicy::after)).
+/// `feed` is the input ring and the position the shadow starts from: the
+/// live matching stage's (see [`ShadowFeed`]). `app` must be a copy of
+/// the state that stage starts with.
 #[allow(clippy::too_many_arguments)]
 pub fn run<A: Application>(
-    mut consumer: ring::Consumer<InputSlot<A::Event>>,
+    feed: ShadowFeed<A::Event>,
     mut app: A,
     snapshot_path: PathBuf,
     snapshot_interval: Duration,
@@ -57,9 +94,16 @@ pub fn run<A: Application>(
     shutdown: &AtomicBool,
     wait: WaitStrategy,
     initial_lineage: Lineage,
-    starting_wire_seq: u64,
     genesis_entries: Option<u64>,
 ) {
+    let ShadowFeed {
+        mut consumer,
+        starting_wire_seq,
+        // Highest event timestamp the shadow's scheduler has drained
+        // against, from the live stage's start. See `dispatch::dispatch`
+        // for the per-event drain rationale.
+        mut tick_watermark,
+    } = feed;
     // Scratch buffer for app methods that require a reports Vec.
     // Cleared after each call — shadow discards all reports.
     let mut reports: Vec<A::Report> = Vec::with_capacity(64);
@@ -86,9 +130,6 @@ pub fn run<A: Application>(
     // Track whether any events have been consumed. Prevents snapshotting
     // empty state before the first event arrives.
     let mut has_events = false;
-    // Highest event timestamp the shadow's scheduler has drained against.
-    // See `dispatch::dispatch` for the per-event drain rationale.
-    let mut last_drain_ns: u64 = 0;
     // The lineage (fencing epoch and ack policy) as of the shadow's
     // consumed position. Seeded from the lineage the live pipeline started
     // at, because the shadow only sees events published *after* boot — a
@@ -115,7 +156,7 @@ pub fn run<A: Application>(
             has_events = true;
         }
 
-        // Replay each event on the shadow app. last_drain_ns lives
+        // Replay each event on the shadow app. tick_watermark lives
         // outside the loop so the per-event drain stays monotonic across
         // batches.
         for slot in &batch[..count] {
@@ -148,7 +189,7 @@ pub fn run<A: Application>(
                     now_ns: slot.timestamp_ns,
                     key_hash: slot.key_hash,
                 },
-                &mut last_drain_ns,
+                &mut tick_watermark,
                 |event| shadow_lineage.observe(WireSeq::new(wire_seq), event),
                 &mut reports,
             );
@@ -509,7 +550,7 @@ mod tests {
             .spawn(move || {
                 tracing::subscriber::with_default(subscriber, || {
                     run(
-                        consumer,
+                        genesis_feed(consumer),
                         TestApp::new(),
                         path,
                         interval,
@@ -517,13 +558,18 @@ mod tests {
                         &shutdown,
                         WaitStrategy::SpinThenYield,
                         Lineage::GENESIS,
-                        1,       // starting_wire_seq
                         Some(0), // genesis_entries
                     );
                 });
             })
             .unwrap();
         (handle, logs)
+    }
+
+    /// A feed over `consumer` starting a fresh journal: the first event
+    /// at wire sequence 1, nothing dispatched before it.
+    fn genesis_feed(consumer: ring::Consumer<InputSlot<TestEvent>>) -> ShadowFeed<TestEvent> {
+        ShadowFeed::at(Some(consumer), 1, TickWatermark::GENESIS).unwrap()
     }
 
     fn add(n: u64) -> InputSlot<TestEvent> {
@@ -746,7 +792,7 @@ mod tests {
             .name("test-shadow".into())
             .spawn(move || {
                 run(
-                    consumer,
+                    genesis_feed(consumer),
                     app,
                     snap_path,
                     Duration::from_secs(3600), // won't fire during test
@@ -754,7 +800,6 @@ mod tests {
                     &shutdown2,
                     WaitStrategy::SpinThenYield,
                     Lineage::GENESIS,
-                    1,       // starting_wire_seq
                     Some(0), // genesis_entries
                 );
             })
@@ -795,7 +840,7 @@ mod tests {
             .name("test-shadow".into())
             .spawn(move || {
                 run(
-                    consumer,
+                    genesis_feed(consumer),
                     app,
                     snap_path2,
                     Duration::from_millis(50),
@@ -803,7 +848,6 @@ mod tests {
                     &shutdown2,
                     WaitStrategy::SpinThenYield,
                     Lineage::GENESIS,
-                    1,       // starting_wire_seq
                     Some(0), // genesis_entries
                 );
             })
@@ -886,7 +930,7 @@ mod tests {
             .name("test-shadow".into())
             .spawn(move || {
                 run(
-                    consumer,
+                    genesis_feed(consumer),
                     TestApp::new(),
                     snap_path2,
                     Duration::from_millis(50),
@@ -894,7 +938,6 @@ mod tests {
                     &shutdown2,
                     WaitStrategy::SpinThenYield,
                     Lineage::GENESIS,
-                    1,       // starting_wire_seq
                     Some(0), // genesis_entries
                 );
             })
@@ -966,7 +1009,7 @@ mod tests {
             .name("test-shadow-idle".into())
             .spawn(move || {
                 run(
-                    consumer,
+                    genesis_feed(consumer),
                     app,
                     snap_path2,
                     Duration::from_millis(20),
@@ -974,7 +1017,6 @@ mod tests {
                     &shutdown2,
                     WaitStrategy::SpinThenYield,
                     Lineage::GENESIS,
-                    1,       // starting_wire_seq
                     Some(0), // genesis_entries
                 );
             })
@@ -1021,7 +1063,7 @@ mod tests {
             .name("test-shadow-chain".into())
             .spawn(move || {
                 run(
-                    consumer,
+                    genesis_feed(consumer),
                     app,
                     snap_path2,
                     Duration::from_millis(30),
@@ -1029,7 +1071,6 @@ mod tests {
                     &shutdown2,
                     WaitStrategy::SpinThenYield,
                     Lineage::GENESIS,
-                    1,       // starting_wire_seq
                     Some(0), // genesis_entries
                 );
             })
@@ -1097,7 +1138,7 @@ mod tests {
     fn multi_batch_replay_accumulates_into_snapshot() {
         // End-to-end: events arriving across multiple consume_batch
         // iterations all reach the shadow app and the eventual snapshot
-        // reflects the running total. last_drain_ns persists across
+        // reflects the running total. The tick watermark persists across
         // batches in the run loop, but the test focuses on the
         // accumulated app-event side — Add semantics make the sum
         // load-bearing and easy to assert.
@@ -1125,7 +1166,7 @@ mod tests {
             .name("test-shadow-batches".into())
             .spawn(move || {
                 run(
-                    consumer,
+                    genesis_feed(consumer),
                     app,
                     snap_path2,
                     Duration::from_millis(20),
@@ -1133,7 +1174,6 @@ mod tests {
                     &shutdown2,
                     WaitStrategy::SpinThenYield,
                     Lineage::GENESIS,
-                    1,       // starting_wire_seq
                     Some(0), // genesis_entries
                 );
             })

@@ -27,6 +27,7 @@ use melin_pipeline::wait::WaitStrategy;
 #[cfg(not(feature = "no-persist"))]
 use crate::cursors::SlotAcked;
 use crate::cursors::{DurableWireSeqCursor, WireSeq};
+use crate::dispatch::TickWatermark;
 // Recovery replays a journal from disk, so every use sits in a test that
 // no-persist gates off — same reason as `JournalReader` above.
 #[cfg(not(feature = "no-persist"))]
@@ -48,7 +49,9 @@ use crate::pipeline::{
     InputSlot, JournalStage, MAX_JOURNAL_BATCH, MatchingStage, OutputPayload, OutputSlot,
     RequestId, build_pipeline_with_replication, max_journal_batch,
 };
-use crate::test_support::{TestApp, TestEvent, TestQuery, TestReport, ack_policy_change};
+use crate::test_support::{
+    TestApp, TestEvent, TestQuery, TestReport, TickCount, TickCountingApp, ack_policy_change,
+};
 use crate::trace::mono_trace_ns;
 
 type Writer = BufferedWriter<TestEvent>;
@@ -202,6 +205,7 @@ fn matching_stage_processes_events() {
     let active_conns = Arc::new(AtomicU64::new(0));
     let stage = MatchingStage::new(
         app,
+        TickWatermark::GENESIS,
         consumer,
         output_producer,
         events_counter,
@@ -283,6 +287,7 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
     let fence = Arc::new(crate::fence::FenceState::new(0));
     let stage = MatchingStage::new(
         app,
+        TickWatermark::GENESIS,
         consumer,
         output_producer,
         events_counter,
@@ -403,12 +408,13 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
 }
 
 /// What a matching stage left behind: its output slots, the forced
-/// change it published for the response gate, and the policy it recorded
-/// as journaled last.
-struct MatchingRun {
-    outputs: Vec<TestOutput>,
+/// change it published for the response gate, the policy it recorded
+/// as journaled last, and the application it returned.
+struct MatchingRun<A: melin_app::Application> {
+    outputs: Vec<OutputSlot<A::Report, A::QueryResponse>>,
     forced: Option<crate::lineage::ForcedPolicy>,
     journaled: Option<melin_journal::AckPolicyByte>,
+    app: A,
 }
 
 /// The wire sequence the stages under [`run_matching_over`] start at:
@@ -444,7 +450,7 @@ fn run_matching_over<A>(
     events: &[(u64, JournalEvent<TestEvent>, u64)],
     expected: usize,
     on_shutdown: bool,
-) -> MatchingRun
+) -> MatchingRun<A>
 where
     A: melin_app::Application<Event = TestEvent, Report = TestReport, QueryResponse = TestQuery>
         + Send
@@ -465,21 +471,40 @@ fn run_matching_over_slots<A>(
     slots: &[TestInput],
     expected: usize,
     on_shutdown: bool,
-) -> MatchingRun
+) -> MatchingRun<A>
 where
-    A: melin_app::Application<Event = TestEvent, Report = TestReport, QueryResponse = TestQuery>
-        + Send
-        + 'static,
+    A: melin_app::Application<Event = TestEvent> + Send + 'static,
+    A::Report: Send,
+    A::QueryResponse: Send,
+{
+    run_matching_from(app, TickWatermark::GENESIS, slots, expected, on_shutdown)
+}
+
+/// [`run_matching_over_slots`], on a stage starting from `tick_watermark`
+/// rather than a fresh journal's.
+fn run_matching_from<A>(
+    app: A,
+    tick_watermark: TickWatermark,
+    slots: &[TestInput],
+    expected: usize,
+    on_shutdown: bool,
+) -> MatchingRun<A>
+where
+    A: melin_app::Application<Event = TestEvent> + Send + 'static,
+    A::Report: Send,
+    A::QueryResponse: Send,
 {
     let (mut input_producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
         .build(WaitStrategy::SpinThenYield);
-    let (output_producer, mut output_consumers) = ring::DisruptorBuilder::<TestOutput>::new(64)
-        .add_consumer()
-        .build(WaitStrategy::SpinThenYield);
+    let (output_producer, mut output_consumers) =
+        ring::DisruptorBuilder::<OutputSlot<A::Report, A::QueryResponse>>::new(64)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
     let mut output_consumer = output_consumers.pop().unwrap();
     let stage = MatchingStage::new(
         app,
+        tick_watermark,
         consumers.pop().unwrap(),
         output_producer,
         Arc::new(AtomicU64::new(0)),
@@ -510,7 +535,7 @@ where
         }
     }
     shutdown.store(true, Ordering::Relaxed);
-    let _app = handle.join().unwrap();
+    let app = handle.join().unwrap();
     assert!(
         output_consumer.try_consume().is_none(),
         "more output slots than expected"
@@ -519,6 +544,7 @@ where
         outputs,
         forced: forced.load(),
         journaled: utilization.ack_policy_journaled.load(),
+        app,
     }
 }
 
@@ -856,6 +882,7 @@ fn allocator_wire_seq_and_gate_cursor_agree_across_rotation() {
     let active_conns = Arc::new(AtomicU64::new(0));
     let mut out = build_pipeline_with_replication(
         TestApp::new(),
+        TickWatermark::GENESIS,
         writer,
         Duration::ZERO,
         active_conns,
@@ -1041,6 +1068,7 @@ fn recovery_resumes_allocator_wire_and_gate_agreement() {
         let active_conns = Arc::new(AtomicU64::new(0));
         let out = build_pipeline_with_replication(
             TestApp::new(),
+            TickWatermark::GENESIS,
             writer,
             Duration::ZERO,
             active_conns,
@@ -1098,11 +1126,13 @@ fn recovery_resumes_allocator_wire_and_gate_agreement() {
     let engine = JournaledApp::<TestApp, Writer>::recover(TestApp::new(), &path, PREALLOC).unwrap();
     assert_eq!(engine.app().total, 1 + 2 + 3 + 4, "recovered state");
     assert_eq!(engine.next_sequence(), 6, "recovered allocator position");
+    let tick_watermark = engine.tick_watermark();
     let (app, writer) = engine.into_parts();
 
     let active_conns = Arc::new(AtomicU64::new(0));
     let mut out = build_pipeline_with_replication(
         app,
+        tick_watermark,
         writer,
         Duration::ZERO,
         active_conns,
@@ -1211,6 +1241,7 @@ fn replica_fsync_state_starts_at_the_journal_it_was_built_over() {
 
     let replica = build_replica_pipeline(
         TestApp::new(),
+        TickWatermark::GENESIS,
         writer,
         MAX_JOURNAL_BATCH,
         RingCapacity::MIN,
@@ -1262,6 +1293,7 @@ fn replica_stage_at_3(
     writer.flush_batch_sync().unwrap();
     let replica = build_replica_pipeline(
         TestApp::new(),
+        TickWatermark::GENESIS,
         writer,
         MAX_JOURNAL_BATCH,
         RingCapacity::MIN,
@@ -1422,6 +1454,7 @@ fn replica_ack_cursor_tracks_primary_sequences_across_local_rotation() {
     let writer = Writer::create_continuing(&path, 1, [0xB7u8; 32], Some(0), PREALLOC).unwrap();
     let replica = build_replica_pipeline(
         TestApp::new(),
+        TickWatermark::GENESIS,
         writer,
         MAX_JOURNAL_BATCH,
         RingCapacity::MIN,
@@ -1571,6 +1604,7 @@ fn full_pipeline_journal_and_matching_parallel() {
     let active_conns = Arc::new(AtomicU64::new(0));
     let mut out = build_pipeline_with_replication(
         TestApp::new(),
+        TickWatermark::GENESIS,
         writer,
         Duration::ZERO,
         active_conns,
@@ -1644,6 +1678,7 @@ fn journal_stage_sends_replication_batches() {
     let active_conns = Arc::new(AtomicU64::new(0));
     let mut out = build_pipeline_with_replication(
         TestApp::new(),
+        TickWatermark::GENESIS,
         writer,
         Duration::ZERO,
         active_conns,
@@ -1766,6 +1801,7 @@ fn replica_quorum_always_starts_disengaged() {
 
         let out = build_pipeline_with_replication(
             TestApp::new(),
+            TickWatermark::GENESIS,
             writer,
             Duration::ZERO,
             active_conns,
@@ -1790,6 +1826,7 @@ fn replica_quorum_always_starts_disengaged() {
 
         let out = build_pipeline_with_replication(
             TestApp::new(),
+            TickWatermark::GENESIS,
             writer,
             Duration::ZERO,
             active_conns,
@@ -1827,6 +1864,7 @@ fn event_publisher_reads_only_what_the_response_stage_committed() {
     let build = |name: &str, enable_event_publisher: bool| {
         build_pipeline_with_replication(
             TestApp::new(),
+            TickWatermark::GENESIS,
             Writer::create(&dir.path().join(name), PREALLOC).unwrap(),
             Duration::ZERO,
             Arc::new(AtomicU64::new(0)),
@@ -2099,6 +2137,7 @@ fn primary_and_replica_journals_contiguous_and_chain_identical() {
     let primary_active_conns = Arc::new(AtomicU64::new(0));
     let mut primary = build_pipeline_with_replication(
         TestApp::new(),
+        TickWatermark::GENESIS,
         primary_writer,
         Duration::ZERO,
         primary_active_conns,
@@ -2117,6 +2156,7 @@ fn primary_and_replica_journals_contiguous_and_chain_identical() {
         Writer::create_continuing(&replica_path, 1, shared_anchor, Some(0), PREALLOC).unwrap();
     let mut replica = build_replica_pipeline(
         TestApp::new(),
+        TickWatermark::GENESIS,
         replica_writer,
         MAX_JOURNAL_BATCH,
         RingCapacity::MIN,
@@ -2686,7 +2726,7 @@ fn barrier_fsync_state_pair_is_self_consistent_for_the_shadow() {
         .name("test-shadow-window".into())
         .spawn(move || {
             shadow::run(
-                shadow_consumer,
+                shadow::ShadowFeed::at(Some(shadow_consumer), 1, TickWatermark::GENESIS).unwrap(),
                 TestApp::new(),
                 snap_path2,
                 Duration::from_millis(20),
@@ -2694,7 +2734,6 @@ fn barrier_fsync_state_pair_is_self_consistent_for_the_shadow() {
                 &shutdown2,
                 WaitStrategy::SpinThenYield,
                 crate::lineage::Lineage::GENESIS,
-                1,
                 Some(0),
             );
         })
@@ -2868,7 +2907,8 @@ fn fsync_state_pairs_stay_consistent_across_adopted_rotations() {
             .name("test-shadow-sweep".into())
             .spawn(move || {
                 shadow::run(
-                    shadow_consumer,
+                    shadow::ShadowFeed::at(Some(shadow_consumer), 1, TickWatermark::GENESIS)
+                        .unwrap(),
                     TestApp::new(),
                     snap_path,
                     Duration::ZERO,
@@ -2876,7 +2916,6 @@ fn fsync_state_pairs_stay_consistent_across_adopted_rotations() {
                     &shutdown,
                     WaitStrategy::SpinThenYield,
                     crate::lineage::Lineage::GENESIS,
-                    1,
                     Some(0),
                 );
             })
@@ -3411,6 +3450,7 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
     let primary_active_conns = Arc::new(AtomicU64::new(0));
     let mut primary = build_pipeline_with_replication(
         TestApp::new(),
+        TickWatermark::GENESIS,
         primary_writer,
         Duration::ZERO,
         primary_active_conns,
@@ -3438,6 +3478,7 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
         Writer::create_continuing(&replica_path, 1, shared_anchor, Some(0), PREALLOC).unwrap();
     let mut replica = build_replica_pipeline(
         TestApp::new(),
+        TickWatermark::GENESIS,
         replica_writer,
         MAX_JOURNAL_BATCH,
         RingCapacity::MIN,
@@ -4627,6 +4668,7 @@ fn stats_query_reports_durable_wire_seq_across_recovery() {
         let writer = Writer::create(&path, PREALLOC).unwrap();
         let mut out = build_pipeline_with_replication(
             TestApp::new(),
+            TickWatermark::GENESIS,
             writer,
             Duration::ZERO,
             Arc::new(AtomicU64::new(0)),
@@ -4679,9 +4721,11 @@ fn stats_query_reports_durable_wire_seq_across_recovery() {
     // --- Phase 2: recover — the ring cursor restarts at zero, but the
     // stats surface must keep reporting the recovered high-water mark.
     let engine = JournaledApp::<TestApp, Writer>::recover(TestApp::new(), &path, PREALLOC).unwrap();
+    let tick_watermark = engine.tick_watermark();
     let (app, writer) = engine.into_parts();
     let mut out = build_pipeline_with_replication(
         app,
+        tick_watermark,
         writer,
         Duration::ZERO,
         Arc::new(AtomicU64::new(0)),
@@ -4734,6 +4778,7 @@ fn a_query_changes_no_matching_stage_state() {
     let writer = Writer::create(&dir.path().join("query_state.journal"), PREALLOC).unwrap();
     let mut out = build_pipeline_with_replication(
         TestApp::new(),
+        TickWatermark::GENESIS,
         writer,
         Duration::ZERO,
         Arc::new(AtomicU64::new(0)),
@@ -5051,6 +5096,7 @@ fn a_repeated_request_reaches_apply_on_live_replay_and_shadow() {
     let writer = Writer::create(&path, PREALLOC).unwrap();
     let mut out = build_pipeline_with_replication(
         TestApp::new(),
+        TickWatermark::GENESIS,
         writer,
         Duration::ZERO,
         Arc::new(AtomicU64::new(0)),
@@ -5133,6 +5179,238 @@ fn a_repeated_request_reaches_apply_on_live_replay_and_shadow() {
     );
 }
 
+/// The timestamps of the history the restart tests below drive: the
+/// first [`RESTART_AT`] entries are journaled before the restart, and the
+/// first event after it repeats the last journaled timestamp, as a
+/// replica restarted under load, or a primary restarted after a clock
+/// step back, sees it.
+const RESTART_TIMESTAMPS: [u64; 5] = [100, 200, 300, 300, 400];
+
+/// How many of [`RESTART_TIMESTAMPS`] are journaled before the restart.
+#[cfg(not(feature = "no-persist"))]
+const RESTART_AT: usize = 3;
+
+/// One `Add` slot per timestamp in `timestamps`, on a client connection
+/// so each is answered with its report.
+fn slots_at(timestamps: &[u64]) -> Vec<TestInput> {
+    timestamps.iter().map(|&t| add_slot(1, t)).collect()
+}
+
+/// The uninterrupted run the restart tests compare against, pinned: the
+/// live stage fires one tick per timestamp newer than the last, and none
+/// for the one that repeats it, so an application that counts every
+/// call reports each event's count of newer timestamps so far.
+#[test]
+fn the_live_stage_ticks_once_per_newer_timestamp() {
+    let all = slots_at(&RESTART_TIMESTAMPS);
+    let run = run_matching_over_slots(TickCountingApp::default(), &all, all.len(), false);
+    assert_eq!(
+        tick_counts(&run.outputs),
+        [1, 2, 3, 3, 4].map(|ticks| TickCount { ticks }),
+    );
+    assert_eq!(run.app, TickCountingApp { ticks: 4 });
+}
+
+/// A journal at `path` holding one `Add` per timestamp in `timestamps`,
+/// each journaled under its own.
+#[cfg(not(feature = "no-persist"))]
+fn journal_at(path: &std::path::Path, timestamps: &[u64]) {
+    use melin_journal::JournalWrite;
+    let mut writer = Writer::create(path, PREALLOC).unwrap();
+    for &timestamp_ns in timestamps {
+        writer
+            .batch_append_with_ts(&JournalEvent::App(TestEvent::Add(1)), timestamp_ns, 0)
+            .unwrap();
+    }
+    writer.flush_batch_sync().unwrap();
+}
+
+/// The reports of the application events in `outputs`.
+fn tick_counts(outputs: &[OutputSlot<TickCount, TestQuery>]) -> Vec<TickCount> {
+    outputs
+        .iter()
+        .filter_map(|slot| match slot.payload {
+            OutputPayload::Report(report) => Some(report),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A node restarted at a journal position makes the tick calls one that
+/// ran through it uninterrupted makes: replay leaves the clock where the
+/// uninterrupted run had it, and the live stage built after it starts
+/// there. An event after the restart whose timestamp repeats the last
+/// replayed one is no newer than the clock, and fires no tick — on an
+/// application that counts every call, the restarted node would otherwise
+/// report one more from then on.
+#[cfg(not(feature = "no-persist"))]
+#[test]
+fn a_restarted_node_makes_the_tick_calls_an_uninterrupted_one_makes() {
+    let all = slots_at(&RESTART_TIMESTAMPS);
+    let uninterrupted = run_matching_over_slots(TickCountingApp::default(), &all, all.len(), false);
+
+    let dir = tempfile::tempdir().unwrap();
+    let (app, tick_watermark, _writer) = recover_restart_journal(dir.path());
+    let after = &all[RESTART_AT..];
+    let restarted = run_matching_from(app, tick_watermark, after, after.len(), false);
+
+    assert_eq!(
+        tick_counts(&restarted.outputs),
+        tick_counts(&uninterrupted.outputs)[RESTART_AT..],
+        "the restarted node reports what the uninterrupted one did"
+    );
+    assert_eq!(restarted.app, uninterrupted.app, "and ends in its state");
+}
+
+/// The first [`RESTART_AT`] entries of [`RESTART_TIMESTAMPS`], journaled
+/// in `dir` and recovered: the application, its tick watermark and the
+/// writer, as a restarted node's boot hands them to its pipeline.
+#[cfg(not(feature = "no-persist"))]
+fn recover_restart_journal(dir: &std::path::Path) -> (TickCountingApp, TickWatermark, Writer) {
+    let path = dir.join("restart.journal");
+    journal_at(&path, &RESTART_TIMESTAMPS[..RESTART_AT]);
+    let recovered = JournaledApp::<TickCountingApp, Writer>::recover(
+        TickCountingApp::default(),
+        &path,
+        PREALLOC,
+    )
+    .unwrap();
+    let tick_watermark = recovered.tick_watermark();
+    let (app, writer) = recovered.into_parts();
+    (app, tick_watermark, writer)
+}
+
+/// Both pipeline builders start the shadow where they start the live
+/// stage, over a recovered journal: from the replayed watermark, at the
+/// next wire sequence. Run over the events after the restart, the shadow
+/// therefore snapshots the state the live stage ends in — the state an
+/// uninterrupted node holds there — rather than one that fired a tick the
+/// live stage did not.
+#[cfg(not(feature = "no-persist"))]
+#[test]
+fn the_shadow_starts_where_the_live_stage_does() {
+    let all = slots_at(&RESTART_TIMESTAMPS);
+    let uninterrupted = run_matching_over_slots(TickCountingApp::default(), &all, all.len(), false);
+    for replica in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, tick_watermark, writer) = recover_restart_journal(dir.path());
+        assert_ne!(
+            tick_watermark,
+            TickWatermark::GENESIS,
+            "the restart is not at a fresh journal's position"
+        );
+        let shadow_app = melin_app::Application::clone_via_snapshot(&app).unwrap();
+        let fence = Arc::new(crate::fence::FenceState::new(0));
+        let waits = StageWaits::uniform(WaitStrategy::SpinThenYield);
+        let (mut input_producer, journal_stage, matching_stage, shadow_feed, fsync_state) =
+            if replica {
+                let p = crate::pipeline::build_replica_pipeline(
+                    app,
+                    tick_watermark,
+                    writer,
+                    MAX_JOURNAL_BATCH,
+                    RingCapacity::MIN,
+                    Duration::ZERO,
+                    waits,
+                    true,
+                    fence,
+                );
+                let fsync_state = p.chain_hash_lock;
+                (
+                    p.input_producer,
+                    p.journal_stage,
+                    p.matching_stage,
+                    p.shadow_feed,
+                    fsync_state,
+                )
+            } else {
+                let p = build_pipeline_with_replication(
+                    app,
+                    tick_watermark,
+                    writer,
+                    Duration::ZERO,
+                    Arc::new(AtomicU64::new(0)),
+                    false,
+                    MAX_JOURNAL_BATCH,
+                    REPLICATION_RING_CAPACITY,
+                    RingCapacity::MIN,
+                    waits,
+                    false,
+                    true,
+                    fence,
+                );
+                (
+                    p.input_producer,
+                    p.journal_stage,
+                    p.matching_stage,
+                    p.shadow_feed,
+                    p.chain_hash_lock.unwrap(),
+                )
+            };
+        let shadow_feed = shadow_feed.unwrap();
+        assert_eq!(matching_stage.tick_watermark(), tick_watermark, "{replica}");
+        assert_eq!(shadow_feed.tick_watermark, tick_watermark, "{replica}");
+        let first_after = RESTART_AT as u64 + 1;
+        assert_eq!(shadow_feed.starting_wire_seq, first_after, "{replica}");
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let t_journal = {
+            let shutdown = Arc::clone(&shutdown);
+            std::thread::spawn(move || journal_stage.run(&shutdown))
+        };
+        let t_matching = {
+            let shutdown = Arc::clone(&shutdown);
+            std::thread::spawn(move || matching_stage.run(&shutdown))
+        };
+        let snap_path = dir.path().join("restart.snapshot");
+        let t_shadow = {
+            let (shutdown, snap_path) = (Arc::clone(&shutdown), snap_path.clone());
+            std::thread::spawn(move || {
+                crate::shadow::run(
+                    shadow_feed,
+                    shadow_app,
+                    snap_path,
+                    Duration::from_millis(20),
+                    fsync_state,
+                    &shutdown,
+                    WaitStrategy::SpinThenYield,
+                    Lineage::GENESIS,
+                    Some(0),
+                )
+            })
+        };
+        let last = RESTART_TIMESTAMPS.len() as u64;
+        for (slot, sequence) in all[RESTART_AT..].iter().zip(first_after..) {
+            // A replica's slots carry the primary's sequence; a primary's
+            // journal stage allocates it.
+            let sequence = if replica { sequence } else { 0 };
+            input_producer.publish(InputSlot { sequence, ..*slot });
+        }
+
+        // The snapshot taken once the shadow has consumed every event.
+        let deadline = std::time::Instant::now() + DRAIN_TIMEOUT;
+        let shadow = loop {
+            if let Ok((shadow, header)) = crate::snapshot::load::<TickCountingApp>(&snap_path)
+                && header.sequence == last
+            {
+                break shadow;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no snapshot at {last}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        shutdown.store(true, Ordering::Relaxed);
+        t_journal.join().unwrap().unwrap();
+        let live = t_matching.join().unwrap();
+        t_shadow.join().unwrap();
+
+        assert_eq!(live, uninterrupted.app, "replica = {replica}");
+        assert_eq!(shadow, live, "replica = {replica}");
+    }
+}
+
 /// The wire sequence [`shadow_snapshot_from`]'s shadow allocates to its
 /// first slot: past a recovered history, as a primary's is.
 #[cfg(not(feature = "no-persist"))]
@@ -5152,12 +5430,39 @@ fn shadow_snapshot_from(
     let (mut shadow_producer, mut shadow_consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
         .build(WaitStrategy::SpinThenYield);
-    let shadow_consumer = shadow_consumers.pop().unwrap();
+    let feed = crate::shadow::ShadowFeed::at(
+        shadow_consumers.pop(),
+        SHADOW_FIRST_WIRE_SEQ,
+        TickWatermark::GENESIS,
+    )
+    .unwrap();
+    for slot in slots {
+        shadow_producer.publish(*slot);
+    }
+    shadow_snapshot_over(dir, initial, feed, TestApp::new(), slots.len())
+}
+
+/// Run the real shadow stage over `feed`, on `app`, from the lineage
+/// `initial`, until it has consumed the `published` slots published into
+/// the feed's ring, and return the application state and lineage of the
+/// snapshot it writes. The fsync pair claims every slot, so the only
+/// snapshot it can write is the one taken after consuming them all.
+#[cfg(not(feature = "no-persist"))]
+fn shadow_snapshot_over<A>(
+    dir: &std::path::Path,
+    initial: Lineage,
+    feed: crate::shadow::ShadowFeed<TestEvent>,
+    app: A,
+    published: usize,
+) -> (A, Lineage)
+where
+    A: melin_app::Application<Event = TestEvent> + Send + 'static,
+{
     let (_fsync_writer, fsync_reader) =
         melin_pipeline::seqlock::split(crate::pipeline::FsyncState {
-            journal_seq: WireSeq::new(slots.len() as u64),
+            journal_seq: WireSeq::new(published as u64),
             chain_hash: [0; 32],
-            input_ring_seq: crate::cursors::RingPos::new(slots.len() as u64),
+            input_ring_seq: crate::cursors::RingPos::new(published as u64),
         });
     let snap_path = dir.join("shadow.snapshot");
     let shadow_shutdown = Arc::new(AtomicBool::new(false));
@@ -5165,29 +5470,25 @@ fn shadow_snapshot_from(
         let (snap_path, shutdown) = (snap_path.clone(), Arc::clone(&shadow_shutdown));
         std::thread::spawn(move || {
             crate::shadow::run(
-                shadow_consumer,
-                TestApp::new(),
+                feed,
+                app,
                 snap_path,
                 Duration::from_millis(20),
                 fsync_reader,
                 &shutdown,
                 WaitStrategy::SpinThenYield,
                 initial,
-                SHADOW_FIRST_WIRE_SEQ,
                 Some(0),
             )
         })
     };
-    for slot in slots {
-        shadow_producer.publish(*slot);
-    }
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while !snap_path.exists() && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(5));
     }
     shadow_shutdown.store(true, Ordering::Relaxed);
     t_shadow.join().unwrap();
-    let (app, header) = crate::snapshot::load::<TestApp>(&snap_path).unwrap();
+    let (app, header) = crate::snapshot::load::<A>(&snap_path).unwrap();
     (app, header.lineage)
 }
 
@@ -5310,6 +5611,7 @@ fn the_builders_size_both_rings_from_the_capacity_given() {
 
     let primary = build_pipeline_with_replication(
         TestApp::new(),
+        TickWatermark::GENESIS,
         Writer::create(&dir.path().join("primary.journal"), PREALLOC).unwrap(),
         Duration::ZERO,
         Arc::new(AtomicU64::new(0)),
@@ -5328,6 +5630,7 @@ fn the_builders_size_both_rings_from_the_capacity_given() {
 
     let replica = crate::pipeline::build_replica_pipeline(
         TestApp::new(),
+        TickWatermark::GENESIS,
         Writer::create(&dir.path().join("replica.journal"), PREALLOC).unwrap(),
         MAX_JOURNAL_BATCH,
         capacity,

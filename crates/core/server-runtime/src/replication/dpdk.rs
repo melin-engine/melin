@@ -16,6 +16,7 @@ use tracing::{debug, error, info, warn};
 use melin_app::Application;
 use melin_journal::BufferedWriter;
 use melin_journal::replication::ReplicationConsumer;
+use melin_transport_core::TickWatermark;
 
 use super::auth::{
     AuthChallenge, AuthOutcome, AuthTransport, PolledAuthStream, authenticate_with_primary,
@@ -1590,7 +1591,8 @@ where
 {
     // Recover local state from journal whenever any segment survives —
     // live OR archived; fresh replicas get `(None, None, 0, zeros)`.
-    // See `recover_replica_state` for the lineage rules.
+    // See `recover_replica_state` for the lineage rules, and the
+    // kernel-TCP receiver for why `app` carries its tick watermark.
     let (mut app, mut journal_writer, mut last_sequence, mut chain_hash) =
         recover_replica_state::<A, BufferedWriter<A::Event>>(
             store,
@@ -2072,7 +2074,8 @@ where
                     return Err(e.into());
                 }
             };
-            app = Some(A::default());
+            // The genesis state, which nothing has been dispatched to.
+            app = Some((A::default(), TickWatermark::GENESIS));
             journal_writer = Some(writer);
         }
 
@@ -2089,7 +2092,7 @@ where
                 transport.reset(handle);
                 continue;
             }
-            let cur_app = app.take().expect("application initialized");
+            let (cur_app, tick_watermark) = app.take().expect("application initialized");
             let cur_writer = journal_writer.take().expect("journal_writer initialized");
 
             // On a post-snapshot rebuild this thread is pinned to
@@ -2105,6 +2108,7 @@ where
 
             pipeline = match build_replica_pipeline_with_threads::<A>(
                 cur_app,
+                tick_watermark,
                 cur_writer,
                 cores,
                 ring_capacity,

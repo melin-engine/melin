@@ -29,7 +29,7 @@ use std::path::Path;
 use melin_app::{Application, ApplyCtx};
 use melin_journal::{JournalError, JournalReader, JournalWrite, Prealloc};
 
-use crate::dispatch::dispatch;
+use crate::dispatch::{TickWatermark, dispatch};
 use crate::lineage::Lineage;
 use crate::snapshot;
 
@@ -209,15 +209,14 @@ pub struct JournaledApp<A: Application, W: JournalWrite<A::Event>> {
     /// before the pipeline starts. Not part of `(A, W)` — extracted
     /// separately.
     recovered_lineage: Lineage,
-    /// The per-event clock of the shared dispatch step (see
-    /// [`crate::dispatch`]) as replay left it: the newest timestamp an
-    /// entry was applied under. The test-only single-thread helpers
-    /// continue it, so a run through them and a replay of the journal
-    /// they wrote fire the same ticks. Production hands the application
-    /// to the matching stage, which keeps a clock of its own, so the
-    /// field exists only where the helpers do.
-    #[cfg(any(test, feature = "test-utils"))]
-    last_drain_ns: u64,
+    /// The tick watermark of the position `app` is at: as replay left it
+    /// (the newest timestamp an entry was applied under, or the one it
+    /// started from), [`TickWatermark::GENESIS`] for a fresh journal. The
+    /// boot site reads it via [`Self::tick_watermark`] and starts the
+    /// matching and shadow stages from it, so a restarted node makes the
+    /// tick calls an uninterrupted one makes. The test-only single-thread
+    /// helpers continue it too.
+    tick_watermark: TickWatermark,
 }
 
 impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
@@ -230,13 +229,13 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         prealloc: Prealloc,
     ) -> Result<Self, JournaledAppError> {
         let writer = W::create(journal_path, prealloc)?;
-        // Genesis node — no prior promotion, no policy journaled.
+        // Genesis node — no prior promotion, no policy journaled, and
+        // nothing dispatched: the journal is new.
         Ok(Self {
             app,
             writer,
             recovered_lineage: Lineage::GENESIS,
-            #[cfg(any(test, feature = "test-utils"))]
-            last_drain_ns: 0,
+            tick_watermark: TickWatermark::GENESIS,
         })
     }
 
@@ -302,7 +301,14 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         let snap_chain_check: Option<[u8; 32]> = snapshot.map(|s| s.chain_hash);
 
         let mut reports: Vec<A::Report> = Vec::new();
-        let mut last_drain_ns: u64 = 0;
+        // Replay continues the clock of the state it starts from: nothing
+        // dispatched before the first entry of a whole journal; whatever
+        // the uninterrupted run held at the snapshot's position, which the
+        // snapshot does not carry yet.
+        let mut tick_watermark = match snapshot {
+            None => TickWatermark::GENESIS,
+            Some(_) => TickWatermark::not_yet_carried(),
+        };
         // The oldest walked segment must start at or before this floor,
         // or a prefix of history is provably missing (see
         // [`Self::MissingHistoryPrefix`]).
@@ -357,7 +363,7 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
                 &mut app,
                 snap_sequence,
                 snap_chain_check,
-                &mut last_drain_ns,
+                &mut tick_watermark,
                 &mut recovered_lineage,
                 &mut reports,
             )?;
@@ -430,8 +436,7 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
                 app,
                 writer,
                 recovered_lineage,
-                #[cfg(any(test, feature = "test-utils"))]
-                last_drain_ns,
+                tick_watermark,
             });
         }
 
@@ -454,7 +459,7 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
             &mut app,
             snap_sequence,
             snap_chain_check,
-            &mut last_drain_ns,
+            &mut tick_watermark,
             &mut recovered_lineage,
             &mut reports,
         )?;
@@ -500,8 +505,7 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
             app,
             writer,
             recovered_lineage,
-            #[cfg(any(test, feature = "test-utils"))]
-            last_drain_ns,
+            tick_watermark,
         })
     }
 
@@ -576,22 +580,38 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
 
     /// Construct from pre-built parts. Used by the server's
     /// "snapshot-only" recovery path (journal missing post-rotation),
-    /// which supplies the lineage read from the snapshot it loaded.
-    pub fn from_parts(app: A, writer: W, recovered_lineage: Lineage) -> Self {
+    /// which supplies the lineage read from the snapshot it loaded, and
+    /// the tick watermark of the position `app` is at. Nothing is
+    /// replayed here, so nothing would move a watermark: the caller's is
+    /// the one the stages start from, and taking it rather than assuming
+    /// [`TickWatermark::GENESIS`] keeps a restored state from starting at
+    /// a fresh journal's.
+    pub fn from_parts(
+        app: A,
+        writer: W,
+        recovered_lineage: Lineage,
+        tick_watermark: TickWatermark,
+    ) -> Self {
         Self {
             app,
             writer,
             recovered_lineage,
-            // Nothing was replayed, so there is no replayed clock: zero,
-            // as the matching stage starts from at every boot.
-            #[cfg(any(test, feature = "test-utils"))]
-            last_drain_ns: 0,
+            tick_watermark,
         }
     }
 
-    /// Decompose into parts for the pipeline architecture.
+    /// Decompose into parts for the pipeline architecture. The tick
+    /// watermark the stages must start from is read first, via
+    /// [`Self::tick_watermark`].
     pub fn into_parts(self) -> (A, W) {
         (self.app, self.writer)
+    }
+
+    /// The tick watermark of the position the recovered application is
+    /// at: what the matching stage and the shadow built over it start
+    /// from (see [`TickWatermark`]).
+    pub fn tick_watermark(&self) -> TickWatermark {
+        self.tick_watermark
     }
 
     /// The lineage recovered from the snapshot + journal: its epoch seeds
@@ -798,7 +818,7 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
                 now_ns: timestamp_ns,
                 key_hash: 0,
             },
-            &mut self.last_drain_ns,
+            &mut self.tick_watermark,
             // Neither an application event nor a tick carries lineage
             // metadata.
             |_| {},
@@ -832,7 +852,7 @@ fn replay_segment<A: Application>(
     app: &mut A,
     snap_sequence: u64,
     snap_chain: Option<[u8; 32]>,
-    last_drain_ns: &mut u64,
+    tick_watermark: &mut TickWatermark,
     recovered_lineage: &mut Lineage,
     reports: &mut Vec<A::Report>,
 ) -> Result<(), JournaledAppError> {
@@ -867,7 +887,7 @@ fn replay_segment<A: Application>(
                             now_ns: entry.timestamp_ns,
                             key_hash: entry.key_hash,
                         },
-                        last_drain_ns,
+                        tick_watermark,
                         |event| recovered_lineage.observe(wire_seq, event),
                         reports,
                     );
@@ -1002,6 +1022,7 @@ mod tests {
     /// keeps the application state and recovered lineage it was given.
     fn append_journal_events(ja: TestApp_, events: &[JournalEvent<TestEvent>]) -> TestApp_ {
         let lineage = ja.recovered_lineage();
+        let tick_watermark = ja.tick_watermark();
         let (app, mut writer) = ja.into_parts();
         for (i, e) in events.iter().enumerate() {
             let seq = writer.allocate_sequence();
@@ -1015,7 +1036,7 @@ mod tests {
                 .unwrap();
         }
         writer.flush_batch_sync().unwrap();
-        JournaledApp::from_parts(app, writer, lineage)
+        JournaledApp::from_parts(app, writer, lineage, tick_watermark)
     }
 
     /// Compute the TestApp state that results from applying `events` in
@@ -1555,6 +1576,7 @@ mod tests {
             ticks: ja.app().ticks,
             per_key_total: ja.app().per_key_total.clone(),
         };
+        let live_watermark = ja.tick_watermark();
         drop(ja);
 
         // One firing for the first event, two for the tick (the clock
@@ -1568,6 +1590,36 @@ mod tests {
             live,
             "replay must reproduce the helpers' run"
         );
+        assert_eq!(
+            recovered.tick_watermark(),
+            live_watermark,
+            "and hand out the clock the run ended on, for the stages that continue it"
+        );
+        assert_ne!(live_watermark, TickWatermark::GENESIS);
+    }
+
+    /// A journal nothing was dispatched from — a new one, or one recovered
+    /// with no entry — is at the genesis watermark; `from_parts` keeps the
+    /// one it is given.
+    #[test]
+    fn an_empty_history_is_at_the_genesis_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.bin");
+        let created = TestApp_::create(TestApp::new(), &path, PREALLOC).unwrap();
+        assert_eq!(created.tick_watermark(), TickWatermark::GENESIS);
+        drop(created);
+
+        let recovered = TestApp_::recover(TestApp::new(), &path, PREALLOC).unwrap();
+        assert_eq!(recovered.tick_watermark(), TickWatermark::GENESIS);
+
+        let mut reports = Vec::new();
+        let mut ja = recovered;
+        ja.tick_journaled(500, &mut reports).unwrap();
+        let carried = ja.tick_watermark();
+        let lineage = ja.recovered_lineage();
+        let (app, writer) = ja.into_parts();
+        let rebuilt = JournaledApp::from_parts(app, writer, lineage, carried);
+        assert_eq!(rebuilt.tick_watermark(), carried);
     }
 
     #[test]
@@ -2814,7 +2866,12 @@ mod tests {
             PREALLOC,
         )
         .unwrap();
-        let je = JournaledApp::from_parts(snap_app, writer, header.lineage);
+        let je = JournaledApp::from_parts(
+            snap_app,
+            writer,
+            header.lineage,
+            TickWatermark::not_yet_carried(),
+        );
         assert_eq!(je.app().total, snap_total);
     }
 

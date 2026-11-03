@@ -16,6 +16,7 @@ use tracing::{info, warn};
 
 use melin_app::Application;
 use melin_journal::BufferedWriter;
+use melin_transport_core::TickWatermark;
 use melin_transport_core::node_store::NodeStore;
 
 use super::auth::authenticate_with_primary;
@@ -541,8 +542,10 @@ impl ControlFrameSource for TcpFrameSource<'_> {
     }
 }
 
-/// Outcome of `run_receiver`: `None` = clean shutdown, `Some` = promotion.
-pub type ReceiverResult<A, W> = Result<Option<(A, W)>, Box<dyn std::error::Error>>;
+/// Outcome of `run_receiver`: `None` = clean shutdown, `Some` = promotion,
+/// with the application, the tick watermark of its position (which the
+/// promoted primary's stages start from) and the journal writer.
+pub type ReceiverResult<A, W> = Result<Option<(A, TickWatermark, W)>, Box<dyn std::error::Error>>;
 
 #[allow(clippy::too_many_arguments)]
 pub fn run_receiver<A>(
@@ -592,7 +595,10 @@ where
     } = control;
     // Recover whenever any journal segment survives — live OR archived;
     // fresh replicas get `(None, None, 0, zeros)`. See
-    // `recover_replica_state` for the lineage rules.
+    // `recover_replica_state` for the lineage rules. `app` pairs the
+    // application with the tick watermark of its position, in one
+    // `Option`, so nothing that replaces the state can keep the old
+    // state's watermark.
     let (mut app, mut journal_writer, mut last_sequence, mut chain_hash) =
         recover_replica_state::<A, BufferedWriter<A::Event>>(
             store,
@@ -884,16 +890,18 @@ where
                 lineage_genesis,
                 prealloc,
             )?;
-            app = Some(A::default());
+            // The genesis state, which nothing has been dispatched to.
+            app = Some((A::default(), TickWatermark::GENESIS));
             journal_writer = Some(writer);
         }
 
         // --- Build pipeline if absent ---
         if pipeline.is_none() {
-            let cur_app = app.take().expect("application initialized");
+            let (cur_app, tick_watermark) = app.take().expect("application initialized");
             let cur_writer = journal_writer.take().expect("journal_writer initialized");
             pipeline = Some(build_replica_pipeline_with_threads::<A>(
                 cur_app,
+                tick_watermark,
                 cur_writer,
                 cores,
                 ring_capacity,
@@ -2039,7 +2047,7 @@ mod tests {
         fn promotion_hands_back_local_state_when_present() {
             let dir = tempfile::tempdir().unwrap();
             let mut pipeline: Option<PromoteHandles> = None;
-            let mut app = Some(App);
+            let mut app = Some((App, TickWatermark::GENESIS));
             let mut journal_writer = Some(
                 BufferedWriter::<EvtAdd>::create(&dir.path().join("p.journal"), PREALLOC).unwrap(),
             );
@@ -2050,7 +2058,10 @@ mod tests {
                 &mut journal_writer,
             );
 
-            assert!(matches!(result, Ok(Some(_))), "warm state must be promoted");
+            assert!(
+                matches!(result, Ok(Some((_, TickWatermark::GENESIS, _)))),
+                "warm state must be promoted, with the watermark it was held with"
+            );
             assert!(
                 app.is_none() && journal_writer.is_none(),
                 "state must be moved into the result"
@@ -2060,7 +2071,7 @@ mod tests {
         #[test]
         fn promotion_errs_when_no_local_state() {
             let mut pipeline: Option<PromoteHandles> = None;
-            let mut app: Option<App> = None;
+            let mut app: Option<(App, TickWatermark)> = None;
             let mut journal_writer: Option<BufferedWriter<EvtAdd>> = None;
 
             let result = crate::replication::take_pipeline_for_promotion(
@@ -2084,7 +2095,7 @@ mod tests {
         fn promotion_errs_on_partial_state() {
             // Application present, writer missing — not a usable hand-off.
             let mut pipeline: Option<PromoteHandles> = None;
-            let mut app = Some(App);
+            let mut app = Some((App, TickWatermark::GENESIS));
             let mut journal_writer: Option<BufferedWriter<EvtAdd>> = None;
 
             let result = crate::replication::take_pipeline_for_promotion(
@@ -2875,12 +2886,12 @@ mod tests {
                     // The promotion path's check, on the writer the
                     // receiver hands over.
                     .map(|promoted| {
-                        promoted.map(
-                            |(_, writer)| match crate::server::check_promotable(&writer) {
+                        promoted.map(|(_, _, writer)| {
+                            match crate::server::check_promotable(&writer) {
                                 Ok(()) => "promotable".to_string(),
                                 Err(e) => e.to_string(),
-                            },
-                        )
+                            }
+                        })
                     })
                     .map_err(|e| e.to_string())
                 })
