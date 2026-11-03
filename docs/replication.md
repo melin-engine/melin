@@ -791,7 +791,18 @@ Auto-promotion is deliberately conservative. The elected replica
   short grace it is treated as dead — nothing better is reachable —
   and promotion proceeds, with a loud log if that peer's last known
   position was ahead (its journal is then the reconciliation source
-  when it returns);
+  when it returns). This check is also what protects a healthy primary
+  when only the winner's link to it is cut while the other replica
+  still reaches it: the winner still holds its majority through that
+  replica, so the majority check above passes, but whatever the primary
+  journals now reaches only the other replica, which is then ahead,
+  and the winner refuses. An idle primary is covered too: it journals a
+  clock tick every `--tick-interval-ms` (250 ms by default), well inside
+  the few seconds the winner waits before acting on a dropped primary
+  link. With ticks disabled (`--tick-interval-ms 0`) a
+  primary that receives no client traffic journals nothing, the
+  positions stay equal, and such a cut **can depose it**; keep ticks on
+  in any deployment that runs `--raft-auto-promote`;
 - manual promotions have outrun election terms (the term must be
   strictly above the epoch in force; the alignment heals as terms
   advance — promote manually in the interim).

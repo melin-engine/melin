@@ -276,10 +276,16 @@ keeps its majority through that replica, so its lease stays fresh and
 both checks pass; the primary, hearing from no leader, campaigns in vain
 (the other replica's vote is held by L's lease). Only the peer-tip veto
 holds L back, and only while the other replica's journal tip moves ahead
-of L's, as it does with writes flowing.
-`a_replica_leader_cut_from_the_primary_alone_does_not_promote_while_writes_flow`
-characterises that case; nothing guarantees it on a primary whose tip
-does not move.
+of L's: it does whenever the primary journals anything, and a primary
+with no client traffic still journals a tick every `--tick-interval-ms`,
+which replicates like any other entry, so the other replica's tip moves
+ahead within a tick of the cut, well inside the primary-down grace. The
+`a_replica_leader_cut_from_the_primary_alone_*` tests pin both cases,
+writes with no ticks and an idle primary ticking at the default cadence.
+The gap is left only with ticks disabled (`--tick-interval-ms 0`) and
+no client writes: the tips stay equal, nothing vetoes, and L promotes
+once the grace has passed, deposing the primary (a scratch run of the
+idle test with ticks off showed exactly that).
 
 `LeaderConfirmError` is exhaustive: `NotLeader`, `TermMoved { now }`,
 `NoQuorum` (openraft's `QuorumNotEnough`), `TimedOut`, and
@@ -485,7 +491,8 @@ stable within 0.9 is assumed.
   serving, with both replicas back, no divergence and no lineage
   archive, checked with `lineage_archives_beside`),
   `a_replica_leader_alone_never_auto_promotes`, a leader cut from the
-  primary alone not promoting while writes flow, and the genuine
+  primary alone not promoting while writes flow nor while the primary is
+  idle but ticking at the default cadence, and the genuine
   failovers (`replica_leader_promotes_when_the_primary_dies`,
   `killed_primary_triggers_exactly_one_auto_promotion`), which run the
   real confirmation end to end, so a spurious refusal under load shows
@@ -501,8 +508,9 @@ stable within 0.9 is assumed.
   the mint-time assertion; openraft's lease internals, since `Raft`
   handles stay inside the driver thread; the nudged follower winning
   while L was just acknowledged (covered by the peer-tip veto's and
-  fencing's own tests); and the one-sided partition on a primary whose
-  tip does not move, a known gap.
+  fencing's own tests); and the one-sided partition on an idle primary
+  with ticks disabled, a known gap (not kept as a test, since the
+  outcome it would pin is the defect).
 
 ## RPC transport
 
