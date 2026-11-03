@@ -16,7 +16,7 @@ use tracing::{debug, error, info, warn};
 use melin_app::Application;
 use melin_journal::BufferedWriter;
 use melin_journal::replication::ReplicationConsumer;
-use melin_transport_core::TickWatermark;
+use melin_transport_core::WarmApp;
 
 use super::auth::{
     AuthChallenge, AuthOutcome, AuthTransport, PolledAuthStream, authenticate_with_primary,
@@ -2074,8 +2074,7 @@ where
                     return Err(e.into());
                 }
             };
-            // The genesis state, which nothing has been dispatched to.
-            app = Some((A::default(), TickWatermark::GENESIS));
+            app = Some(WarmApp::genesis(A::default()));
             journal_writer = Some(writer);
         }
 
@@ -2092,7 +2091,10 @@ where
                 transport.reset(handle);
                 continue;
             }
-            let (cur_app, tick_watermark) = app.take().expect("application initialized");
+            let WarmApp {
+                app: cur_app,
+                tick_watermark,
+            } = app.take().expect("application initialized");
             let cur_writer = journal_writer.take().expect("journal_writer initialized");
 
             // On a post-snapshot rebuild this thread is pinned to

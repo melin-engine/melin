@@ -22,7 +22,6 @@ use tracing::{debug, error, info, warn};
 use melin_journal::BufferedWriter;
 use melin_journal::JournalError;
 use melin_journal::JournalWrite;
-use melin_transport_core::TickWatermark;
 use melin_transport_core::journaled_app::JournaledApp;
 use melin_transport_core::lineage::{Lineage, LineagePolicy};
 use melin_transport_core::node_store::{NodeStore, NodeStoreError};
@@ -36,6 +35,7 @@ use melin_transport_core::pipeline::{
 };
 use melin_transport_core::replica_presence::ReplicaPresence;
 use melin_transport_core::shadow::ShadowFeed;
+use melin_transport_core::{TickWatermark, WarmApp};
 /// Internal alias for the disruptor-built pipeline, used only by
 /// destructuring `let Pipeline { … }` patterns inside the boot path.
 /// Not part of the public API — callers reach the underlying type
@@ -1255,7 +1255,13 @@ where
         )? {
             // Clean shutdown — the raft and health guards tear down on drop.
             None => return Ok(()),
-            Some((mut app, tick_watermark, writer)) => {
+            Some((
+                WarmApp {
+                    mut app,
+                    tick_watermark,
+                },
+                writer,
+            )) => {
                 // Promotion! Transition to primary mode. Bump the epoch so a
                 // paused/partitioned ex-primary is fenced when it reconnects.
                 info!("replica promoted — transitioning to primary");
@@ -2787,11 +2793,18 @@ where
         )? {
             // Clean shutdown — the raft and health guards tear down on drop.
             None => return Ok(()),
-            Some((mut app, tick_watermark, writer)) => {
+            Some((
+                WarmApp {
+                    mut app,
+                    tick_watermark,
+                },
+                writer,
+            )) => {
                 // Promotion! Transition to primary mode, on DPDK: the node
                 // serves on the transport it ran on, as a promoted
                 // kernel-TCP replica does. The receiver tore its pipeline
-                // down and handed over its application and journal writer;
+                // down and handed over its application (with the tick
+                // watermark its matching stage reached) and journal writer;
                 // every link it opened is reset.
                 info!("replica promoted (DPDK) — transitioning to primary");
                 // See the kernel-TCP promotion path.

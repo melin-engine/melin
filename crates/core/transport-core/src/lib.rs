@@ -85,8 +85,9 @@ pub use cursors::{
     AdvertisedJournalTip, DurableWireSeqCursor, PipelineCursors, ReplicaSlotCursors, RingPos,
     WireSeq,
 };
-// The one item of the dispatch module other crates name: every stage they
-// build starts from one, and only the module itself mints them.
-pub use dispatch::TickWatermark;
+// The items of the dispatch module other crates name: every stage they
+// build starts from a watermark, which only the module itself mints, and
+// a stopped matching stage hands its back with its application.
+pub use dispatch::{TickWatermark, WarmApp};
 pub use journaled_app::{JournaledApp, JournaledAppError};
 pub use node_store::{NodeStore, NodeStoreError};

@@ -28,6 +28,10 @@ use melin_pipeline::wait::WaitStrategy;
 use crate::cursors::SlotAcked;
 use crate::cursors::{DurableWireSeqCursor, WireSeq};
 use crate::dispatch::TickWatermark;
+// Only the tests that recover or promote over a journal name it, and
+// no-persist gates those off.
+#[cfg(not(feature = "no-persist"))]
+use crate::dispatch::WarmApp;
 // Recovery replays a journal from disk, so every use sits in a test that
 // no-persist gates off — same reason as `JournalReader` above.
 #[cfg(not(feature = "no-persist"))]
@@ -535,7 +539,7 @@ where
         }
     }
     shutdown.store(true, Ordering::Relaxed);
-    let app = handle.join().unwrap();
+    let app = handle.join().unwrap().app;
     assert!(
         output_consumer.try_consume().is_none(),
         "more output slots than expected"
@@ -4841,7 +4845,7 @@ fn a_query_changes_no_matching_stage_state() {
 
     shutdown.store(true, Ordering::Relaxed);
     let _writer = t_journal.join().unwrap();
-    let app = t_matching.join().unwrap();
+    let app = t_matching.join().unwrap().app;
     assert_eq!(app.ticks, 0, "a query must not drive the scheduler clock");
     assert_eq!(
         app.per_key_total,
@@ -5153,7 +5157,10 @@ fn a_repeated_request_reaches_apply_on_live_replay_and_shadow() {
 
     shutdown.store(true, Ordering::Relaxed);
     let _writer = t_journal.join().unwrap();
-    let live = t_matching.join().unwrap();
+    let WarmApp {
+        app: live,
+        tick_watermark: live_watermark,
+    } = t_matching.join().unwrap();
     assert_eq!(live.total, 17, "the live engine applied every submission");
     assert_eq!(
         live.per_key_total,
@@ -5161,10 +5168,14 @@ fn a_repeated_request_reaches_apply_on_live_replay_and_shadow() {
         "each one under the key that submitted it"
     );
 
-    let (replayed, _writer) =
-        JournaledApp::<TestApp, Writer>::recover(TestApp::new(), &path, PREALLOC)
-            .unwrap()
-            .into_parts();
+    let recovered =
+        JournaledApp::<TestApp, Writer>::recover(TestApp::new(), &path, PREALLOC).unwrap();
+    assert_eq!(
+        recovered.tick_watermark(),
+        live_watermark,
+        "replay must leave the clock where the live stage stopped it"
+    );
+    let (replayed, _writer) = recovered.into_parts();
     assert_eq!(
         replayed, live,
         "replay must apply every submission as live did"
@@ -5403,12 +5414,156 @@ fn the_shadow_starts_where_the_live_stage_does() {
         };
         shutdown.store(true, Ordering::Relaxed);
         t_journal.join().unwrap().unwrap();
-        let live = t_matching.join().unwrap();
+        let live = t_matching.join().unwrap().app;
         t_shadow.join().unwrap();
 
         assert_eq!(live, uninterrupted.app, "replica = {replica}");
         assert_eq!(shadow, live, "replica = {replica}");
     }
+}
+
+/// The timestamps of the history the promotion test below drives: the
+/// first [`PROMOTE_AT`] reach the node as a replica, the rest as the
+/// primary it is promoted to. The first event after the promotion repeats
+/// the last replicated timestamp, and the next is earlier than it, as a
+/// promoted node whose clock runs behind its old primary's stamps them.
+#[cfg(not(feature = "no-persist"))]
+const PROMOTION_TIMESTAMPS: [u64; 6] = [100, 200, 300, 300, 250, 400];
+
+/// How many of [`PROMOTION_TIMESTAMPS`] the node applies as a replica.
+#[cfg(not(feature = "no-persist"))]
+const PROMOTE_AT: usize = 3;
+
+/// A promoted node makes the tick calls one that applied the same history
+/// uninterrupted makes: the replica's matching stage, torn down for the
+/// promotion, hands back the watermark it reached with the application,
+/// and the primary stage built from that warm state starts there. Neither
+/// the event repeating the last replicated timestamp nor the earlier one
+/// after it is newer than that watermark, so neither fires a tick — on an
+/// application that counts every call, a promoted node starting from a
+/// fresh watermark would report one more from the promotion on.
+#[cfg(not(feature = "no-persist"))]
+#[test]
+fn a_promoted_node_makes_the_tick_calls_an_uninterrupted_one_makes() {
+    let all = slots_at(&PROMOTION_TIMESTAMPS);
+    let uninterrupted = run_matching_over_slots(TickCountingApp::default(), &all, all.len(), false);
+    assert_eq!(
+        tick_counts(&uninterrupted.outputs),
+        [1, 2, 3, 3, 3, 4].map(|ticks| TickCount { ticks }),
+        "the uninterrupted run compared against"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let (mut reports, warm, writer) =
+        replicate_then_tear_down(&dir.path().join("promoted.journal"), &all[..PROMOTE_AT]);
+    assert_ne!(
+        warm.tick_watermark,
+        TickWatermark::GENESIS,
+        "the replica's stage hands back the clock it advanced"
+    );
+    let (after, promoted) = run_promoted_primary(warm, writer, &all[PROMOTE_AT..]);
+    reports.extend(after);
+
+    assert_eq!(
+        reports,
+        tick_counts(&uninterrupted.outputs),
+        "the promoted node reports what the uninterrupted one did"
+    );
+    assert_eq!(promoted, uninterrupted.app, "and ends in its state");
+}
+
+/// A replica pipeline over a fresh journal at `path`, applying `slots`
+/// under the primary's sequences from 1, then torn down as a promotion
+/// tears it down — by the shutdown sentinel. Returns the replica's
+/// reports, what its matching stage handed back, and its journal writer.
+#[cfg(not(feature = "no-persist"))]
+fn replicate_then_tear_down(
+    path: &std::path::Path,
+    slots: &[TestInput],
+) -> (Vec<TickCount>, WarmApp<TickCountingApp>, Writer) {
+    let replica = crate::pipeline::build_replica_pipeline(
+        TickCountingApp::default(),
+        TickWatermark::GENESIS,
+        Writer::create(path, PREALLOC).unwrap(),
+        MAX_JOURNAL_BATCH,
+        RingCapacity::MIN,
+        Duration::ZERO,
+        StageWaits::uniform(WaitStrategy::SpinThenYield),
+        false,
+        Arc::new(crate::fence::FenceState::new(0)),
+    );
+    let (mut input, journal_stage, matching_stage) = (
+        replica.input_producer,
+        replica.journal_stage,
+        replica.matching_stage,
+    );
+    let shutdown = AtomicBool::new(false);
+    let (writer, warm) = std::thread::scope(|s| {
+        let journal = s.spawn(|| journal_stage.run(&shutdown));
+        let matching = s.spawn(|| matching_stage.run(&shutdown));
+        for (slot, sequence) in slots.iter().zip(1..) {
+            input.publish(InputSlot { sequence, ..*slot });
+        }
+        input.publish(InputSlot::shutdown_sentinel());
+        (
+            journal.join().unwrap().expect("clean exit via sentinel"),
+            matching.join().unwrap(),
+        )
+    });
+    let mut drain = replica.drain_consumer;
+    let outputs: Vec<_> =
+        std::iter::from_fn(|| drain.try_consume().map(|(_, slot)| slot)).collect();
+    (tick_counts(&outputs), warm, writer)
+}
+
+/// The primary pipeline a promotion builds from a replica's warm state,
+/// run over `slots`: its reports, and the application it ends with.
+#[cfg(not(feature = "no-persist"))]
+fn run_promoted_primary(
+    warm: WarmApp<TickCountingApp>,
+    writer: Writer,
+    slots: &[TestInput],
+) -> (Vec<TickCount>, TickCountingApp) {
+    let mut primary = build_pipeline_with_replication(
+        warm.app,
+        warm.tick_watermark,
+        writer,
+        Duration::ZERO,
+        Arc::new(AtomicU64::new(0)),
+        false,
+        MAX_JOURNAL_BATCH,
+        REPLICATION_RING_CAPACITY,
+        RingCapacity::MIN,
+        StageWaits::uniform(WaitStrategy::SpinThenYield),
+        false,
+        false,
+        Arc::new(crate::fence::FenceState::new(0)),
+    );
+    let mut output = primary.output_consumers.pop().unwrap();
+    let (mut input, journal_stage, matching_stage) = (
+        primary.input_producer,
+        primary.journal_stage,
+        primary.matching_stage,
+    );
+    let shutdown = AtomicBool::new(false);
+    std::thread::scope(|s| {
+        let journal = s.spawn(|| journal_stage.run(&shutdown));
+        let matching = s.spawn(|| matching_stage.run(&shutdown));
+        for slot in slots {
+            input.publish(*slot);
+        }
+        let mut outputs = Vec::with_capacity(slots.len());
+        let (start, mut spins) = (std::time::Instant::now(), 0);
+        while outputs.len() < slots.len() {
+            match output.try_consume() {
+                Some((_, slot)) => outputs.push(slot),
+                None => drain_backoff(&mut spins, start, "draining the promoted primary"),
+            }
+        }
+        shutdown.store(true, Ordering::Relaxed);
+        journal.join().unwrap().expect("clean exit on shutdown");
+        (tick_counts(&outputs), matching.join().unwrap().app)
+    })
 }
 
 /// The wire sequence [`shadow_snapshot_from`]'s shadow allocates to its

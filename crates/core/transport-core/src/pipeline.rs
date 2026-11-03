@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::dispatch::{LineageEvent, TickWatermark, dispatch};
+use crate::dispatch::{LineageEvent, TickWatermark, WarmApp, dispatch};
 use crate::lineage::{
     ForcedPolicy, ForcedPolicyReader, ForcedPolicyWriter, LineagePolicyCell, forced_policy_cell,
 };
@@ -2968,8 +2968,10 @@ impl<A: Application> MatchingStage<A> {
     /// per event. Events are still processed sequentially — only the
     /// disruptor I/O is batched.
     ///
-    /// Returns the application on shutdown for potential snapshot saving.
-    pub fn run(mut self, shutdown: &std::sync::atomic::AtomicBool) -> A {
+    /// Returns the application on shutdown, with the tick watermark the
+    /// stage reached: a replica promoted to primary builds its primary
+    /// stages from both (see [`WarmApp`]).
+    pub fn run(mut self, shutdown: &std::sync::atomic::AtomicBool) -> WarmApp<A> {
         // Pre-allocated report buffer, reused across commands.
         // Pre-allocate with generous capacity. One event may fan out into
         // many reports (how many is the application's business). 256
@@ -3007,7 +3009,7 @@ impl<A: Application> MatchingStage<A> {
                 self.utilization.idle.store(idle_count, Ordering::Relaxed);
                 #[cfg(feature = "pipeline-stats")]
                 print_utilization("matching", busy_count, idle_count);
-                return self.app;
+                return self.into_warm_app();
             }
 
             let batch_start = self.consumer.next_read();
@@ -3286,8 +3288,18 @@ impl<A: Application> MatchingStage<A> {
                 self.utilization.idle.store(idle_count, Ordering::Relaxed);
                 #[cfg(feature = "pipeline-stats")]
                 print_utilization("matching", busy_count, idle_count);
-                return self.app;
+                return self.into_warm_app();
             }
+        }
+    }
+
+    /// What the stopped stage hands back: its application and the
+    /// watermark its clock step reached. One exit for both of `run`'s
+    /// returns, so neither can hand the application back without it.
+    fn into_warm_app(self) -> WarmApp<A> {
+        WarmApp {
+            app: self.app,
+            tick_watermark: self.tick_watermark,
         }
     }
 

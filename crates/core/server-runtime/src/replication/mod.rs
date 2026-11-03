@@ -65,12 +65,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use melin_journal::{BufferedWriter, JournalWrite};
 
 use melin_app::Application;
-use melin_transport_core::TickWatermark;
 use melin_transport_core::lineage::SharedLineagePolicy;
 use melin_transport_core::node_store::NodeStore;
 use melin_transport_core::pipeline::{InputSlot, OutputSlot};
 use melin_transport_core::replication::archive::{ArchiveReason, archive_local_lineage};
 use melin_transport_core::replication::protocol::{MAX_CONTROL_FRAME, decode_primary_message};
+use melin_transport_core::{TickWatermark, WarmApp};
 
 mod auth;
 #[cfg(feature = "dpdk")]
@@ -298,8 +298,10 @@ pub(super) fn sleep_then_double_backoff(
 /// pipeline thread can still touch the journal or snapshot files.
 pub(super) enum TeardownOutcome<A, W> {
     /// Clean exit: both stages returned their state, reusable for the
-    /// next pipeline build (post-snapshot) or promotion.
-    Clean(A, W),
+    /// next pipeline build (post-snapshot) or promotion — the matching
+    /// stage's application with the tick watermark it reached, which the
+    /// next stages built over it start from.
+    Clean(WarmApp<A>, W),
     /// The journal stage exited with an error — its writer is gone and
     /// the matching stage's state is unusable (it may have applied
     /// events the journal never persisted). Carries the error so the
@@ -327,7 +329,7 @@ pub(super) enum TeardownOutcome<A, W> {
 pub(super) fn shutdown_pipeline<A: Send + 'static, W: Send + 'static>(
     shutdown_flag: &AtomicBool,
     journal_handle: std::thread::JoinHandle<Result<W, melin_journal::JournalError>>,
-    matching_handle: std::thread::JoinHandle<A>,
+    matching_handle: std::thread::JoinHandle<WarmApp<A>>,
     drain_handle: std::thread::JoinHandle<()>,
     shadow_handle: Option<std::thread::JoinHandle<()>>,
 ) -> TeardownOutcome<A, W> {
@@ -362,7 +364,7 @@ pub(super) fn shutdown_pipeline<A: Send + 'static, W: Send + 'static>(
         Err(_) => return TeardownOutcome::Panicked,
     };
     match matching_result {
-        Ok(app) => TeardownOutcome::Clean(app, writer),
+        Ok(warm) => TeardownOutcome::Clean(warm, writer),
         Err(_) => TeardownOutcome::Panicked,
     }
 }
@@ -409,7 +411,7 @@ pub(super) struct ReplicaPipelineHandles<A: Application, W: Send + 'static> {
     /// (Promote/Shutdown/Fatal/Snapshot). NOT flipped on `Disconnected`.
     pub(super) pipeline_shutdown: Arc<AtomicBool>,
     pub(super) journal_handle: std::thread::JoinHandle<Result<W, melin_journal::JournalError>>,
-    pub(super) matching_handle: std::thread::JoinHandle<A>,
+    pub(super) matching_handle: std::thread::JoinHandle<WarmApp<A>>,
     pub(super) drain_handle: std::thread::JoinHandle<()>,
     pub(super) shadow_handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -820,7 +822,7 @@ pub(super) fn recover_replica_state<A, W>(
     // What the recovered journal is reopened with: the node's reservation
     // (`ServerConfig::journal_prealloc`).
     prealloc: melin_journal::Prealloc,
-) -> Result<(Option<(A, TickWatermark)>, Option<W>, u64, [u8; 32]), Box<dyn std::error::Error>>
+) -> Result<(Option<WarmApp<A>>, Option<W>, u64, [u8; 32]), Box<dyn std::error::Error>>
 where
     A: Application,
     W: melin_journal::JournalWrite<A::Event>,
@@ -857,7 +859,11 @@ where
     adopt_recovered_lineage(fence_state, lineage_policy, engine.recovered_lineage());
     let tick_watermark = engine.tick_watermark();
     let (app, writer) = engine.into_parts();
-    Ok((Some((app, tick_watermark)), Some(writer), last, hash))
+    let warm = WarmApp {
+        app,
+        tick_watermark,
+    };
+    Ok((Some(warm), Some(writer), last, hash))
 }
 
 /// Adopt a lineage recovered from disk (a journal replay, or a snapshot
@@ -894,7 +900,7 @@ pub(in crate::replication) enum AfterSession<A, W> {
     /// and reconnects; the primary's `HashMismatch` verdict then routes
     /// the replica through archive + re-seed.
     Resync {
-        app: Option<(A, TickWatermark)>,
+        app: Option<WarmApp<A>>,
         journal_writer: Option<W>,
         last_sequence: u64,
         chain_hash: [u8; 32],
@@ -912,7 +918,7 @@ impl<A, W> AfterSession<A, W> {
     /// dispatch site in both receivers, so they cannot drift apart.
     pub(in crate::replication) fn adopt(
         self,
-        app: &mut Option<(A, TickWatermark)>,
+        app: &mut Option<WarmApp<A>>,
         journal_writer: &mut Option<W>,
         last_sequence: &mut u64,
         chain_hash: &mut [u8; 32],
@@ -998,11 +1004,9 @@ where
 
         SessionExit::Promote => AfterSession::Return(match pipeline.take() {
             Some(p) => match teardown_replica_pipeline::<A, W>(p) {
-                // The torn-down matching stage does not hand its
-                // watermark back yet.
-                TeardownOutcome::Clean(ex, wr) => {
-                    Ok(Some((ex, TickWatermark::not_yet_carried(), wr)))
-                }
+                // The application goes up with the watermark its matching
+                // stage reached, which the promoted primary's start from.
+                TeardownOutcome::Clean(warm, wr) => Ok(Some((warm, wr))),
                 _ => Err("pipeline failed during promotion".into()),
             },
             None => Err("pipeline missing on promote".into()),
@@ -1149,13 +1153,15 @@ where
 /// during reconnect backoff — and return the warm application + writer for
 /// the promoted primary. Shared by both receivers.
 ///
-/// A clean teardown hands back the warm state; if there is no pipeline
+/// A clean teardown hands back the warm state, the application with the
+/// tick watermark its matching stage reached; if there is no pipeline
 /// (promotion before the first connect, or after a resync that left the
-/// state in the receiver's locals) those locals carry it. A missing
-/// pair is a hard error — a promote with nothing to promote.
+/// state in the receiver's locals) those locals carry it, with the
+/// watermark they were recovered or received with. A missing pair is a
+/// hard error — a promote with nothing to promote.
 pub(in crate::replication) fn take_pipeline_for_promotion<A, W>(
     pipeline: &mut Option<ReplicaPipelineHandles<A, W>>,
-    app: &mut Option<(A, TickWatermark)>,
+    app: &mut Option<WarmApp<A>>,
     journal_writer: &mut Option<W>,
 ) -> ReceiverResult<A, W>
 where
@@ -1163,15 +1169,13 @@ where
     W: JournalWrite<A::Event> + Send + 'static,
 {
     if let Some(p) = pipeline.take()
-        && let TeardownOutcome::Clean(e, w) = teardown_replica_pipeline::<A, W>(p)
+        && let TeardownOutcome::Clean(warm, w) = teardown_replica_pipeline::<A, W>(p)
     {
-        // The torn-down matching stage does not hand its watermark back
-        // yet.
-        *app = Some((e, TickWatermark::not_yet_carried()));
+        *app = Some(warm);
         *journal_writer = Some(w);
     }
     match (app.take(), journal_writer.take()) {
-        (Some((e, tick_watermark)), Some(w)) => Ok(Some((e, tick_watermark, w))),
+        (Some(warm), Some(w)) => Ok(Some((warm, w))),
         _ => Err("promotion requested but no local state available".into()),
     }
 }
@@ -1318,7 +1322,7 @@ pub(in crate::replication) fn handle_resync_verdict<A, W, S>(
     divergent: bool,
     source: &mut S,
     pipeline: &mut Option<ReplicaPipelineHandles<A, W>>,
-    app: &mut Option<(A, TickWatermark)>,
+    app: &mut Option<WarmApp<A>>,
     journal_writer: &mut Option<W>,
     store: &NodeStore,
     fence_state: &melin_transport_core::fence::FenceState,
@@ -1428,7 +1432,10 @@ where
     // included. Only now: a transfer that failed part-way adopts nothing.
     adopt_recovered_lineage(fence_state, &control.lineage_ack_policy, snap_lineage);
     // The transferred snapshot does not carry its watermark yet.
-    *app = Some((snap_app, TickWatermark::not_yet_carried()));
+    *app = Some(WarmApp {
+        app: snap_app,
+        tick_watermark: TickWatermark::not_yet_carried(),
+    });
 
     // Open the seeded segment for appending at the snapshot position —
     // recovery's resume path: the chain rebuilds from the seeded bytes and
@@ -2012,12 +2019,28 @@ mod tests {
     /// uninterrupted replica would hold.
     #[test]
     fn replica_recovery_carries_the_replayed_tick_watermark() {
-        type Writer = melin_journal::BufferedWriter<CounterEvent>;
         let dir = tempfile::tempdir().expect("tempdir");
-        let journal = dir.path().join("replica.journal");
+        let (replayed, app, _) = recover_a_ticked_replica(dir.path());
+        assert_eq!(app.expect("recovered").tick_watermark, replayed);
+    }
+
+    /// A replica journal in `dir` holding two increments under distinct
+    /// timestamps, recovered as a replica's receiver recovers it at
+    /// startup: the tick watermark replay of it reaches (read
+    /// independently, and not the genesis one), then the recovered
+    /// application and writer, as the receiver's locals hold them.
+    #[allow(clippy::type_complexity)]
+    fn recover_a_ticked_replica(
+        dir: &std::path::Path,
+    ) -> (
+        TickWatermark,
+        Option<WarmApp<counter_server::Counter>>,
+        Option<CounterWriter>,
+    ) {
+        let journal = dir.join("replica.journal");
         let store = NodeStore::resolve(journal.clone(), None).expect("store");
         let mut w =
-            Writer::create_continuing(&journal, 1, [0; 32], None, PREALLOC).expect("create");
+            CounterWriter::create_continuing(&journal, 1, [0; 32], None, PREALLOC).expect("create");
         let event = melin_journal::JournalEvent::App(CounterEvent::Increment { amount: 1 });
         for timestamp_ns in [100, 300] {
             let seq = w.allocate_sequence();
@@ -2027,9 +2050,8 @@ mod tests {
         w.flush_batch_sync().expect("flush");
         drop(w);
 
-        // What replay of this journal reaches, read independently.
         let replayed =
-            melin_transport_core::JournaledApp::<counter_server::Counter, Writer>::recover(
+            melin_transport_core::JournaledApp::<counter_server::Counter, CounterWriter>::recover(
                 counter_server::Counter::default(),
                 &journal,
                 PREALLOC,
@@ -2038,17 +2060,118 @@ mod tests {
             .tick_watermark();
         assert_ne!(replayed, TickWatermark::GENESIS);
 
-        let (app, _, last, _) = recover_replica_state::<counter_server::Counter, Writer>(
-            &store,
+        let (app, writer, last, _) =
+            recover_replica_state::<counter_server::Counter, CounterWriter>(
+                &store,
+                &melin_transport_core::fence::FenceState::new(0),
+                &SharedLineagePolicy::new(None),
+                &(),
+                PREALLOC,
+            )
+            .expect("recover");
+        assert_eq!(last, 2);
+        (replayed, app, writer)
+    }
+
+    /// The journal writer of the counter application's replicas.
+    type CounterWriter = melin_journal::BufferedWriter<CounterEvent>;
+
+    /// A promotion with no pipeline running — before the first session,
+    /// or after a resync left the state in the receiver's locals — hands
+    /// the promoted primary the watermark those locals hold, not a fresh
+    /// one.
+    #[test]
+    fn promotion_from_the_receivers_locals_carries_their_tick_watermark() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (replayed, mut app, mut writer) = recover_a_ticked_replica(dir.path());
+        let mut pipeline = None;
+        let promoted = take_pipeline_for_promotion(&mut pipeline, &mut app, &mut writer);
+        let Ok(Some((warm, _))) = promoted else {
+            panic!("the locals must be promoted");
+        };
+        assert_eq!(warm.tick_watermark, replayed);
+    }
+
+    /// [`recover_a_ticked_replica`]'s state, running in a replica
+    /// pipeline built over it as the receiver builds one: the replayed
+    /// watermark, and the pipeline. Nothing streams into it, so its
+    /// matching stage stops at the watermark it started from.
+    fn a_running_ticked_replica(
+        dir: &std::path::Path,
+    ) -> (TickWatermark, ReplicaHandles<counter_server::Counter>) {
+        let (replayed, app, writer) = recover_a_ticked_replica(dir);
+        let WarmApp {
+            app,
+            tick_watermark,
+        } = app.expect("recovered");
+        let handles = build_replica_pipeline_with_threads(
+            app,
+            tick_watermark,
+            writer.expect("recovered"),
+            crate::layout::PipelineCores::unpinned(),
+            melin_transport_core::pipeline::RingCapacity::MIN,
+            melin_journal::StagingMode::Allocate,
+            // No shadow: only the matching stage's hand-back is under test.
+            0,
+            &NodeStore::resolve(dir.join("replica.journal"), None).expect("store"),
+            std::time::Duration::ZERO,
+            Arc::new(melin_transport_core::fence::FenceState::new(0)),
+            &SharedLineagePolicy::new(None),
+            Arc::new(AtomicBool::new(true)),
+            &(),
+        )
+        .expect("build the replica pipeline");
+        (replayed, handles)
+    }
+
+    /// A promotion that fires while the receiver is disconnected tears
+    /// the running pipeline down and hands the promoted primary the
+    /// watermark its matching stage held when it stopped, not a fresh one.
+    #[test]
+    fn promotion_from_a_running_pipeline_carries_its_stages_tick_watermark() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (replayed, handles) = a_running_ticked_replica(dir.path());
+        // The locals are empty while a pipeline holds the state.
+        let (mut app, mut writer) = (None, None);
+        let promoted = take_pipeline_for_promotion(&mut Some(handles), &mut app, &mut writer);
+        let Ok(Some((warm, _))) = promoted else {
+            panic!("the torn-down pipeline's state must be promoted");
+        };
+        assert_eq!(warm.tick_watermark, replayed);
+    }
+
+    /// The same, for a promotion that ends a streaming session: the
+    /// session's exit tears the pipeline down and hands its matching
+    /// stage's watermark up with the application.
+    #[test]
+    fn a_promoting_session_exit_carries_the_stages_tick_watermark() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (replayed, handles) = a_running_ticked_replica(dir.path());
+        let mut pipeline = Some(handles);
+        let (mut divergence_resyncs, mut backoff) = (0, MAX_BACKOFF);
+        let after = handle_session_exit::<counter_server::Counter, CounterWriter>(
+            StreamingResult {
+                exit: SessionExit::Promote,
+                heard_from_primary: true,
+            },
+            &mut pipeline,
+            &mut divergence_resyncs,
+            &mut backoff,
+            2,
+            &NodeStore::resolve(dir.path().join("replica.journal"), None).expect("store"),
             &melin_transport_core::fence::FenceState::new(0),
             &SharedLineagePolicy::new(None),
+            &AtomicBool::new(false),
+            &crate::promotion::PromotionRequest::new(),
+            || {},
             &(),
             PREALLOC,
-        )
-        .expect("recover");
-        assert_eq!(last, 2);
-        let (_, tick_watermark) = app.expect("recovered");
-        assert_eq!(tick_watermark, replayed);
+        );
+        let AfterSession::Return(Ok(Some((warm, _)))) = after else {
+            panic!("the torn-down pipeline's state must be promoted");
+        };
+        assert_eq!(warm.tick_watermark, replayed);
+        assert!(pipeline.is_none(), "the pipeline was torn down");
     }
 
     /// Replica recovery adopts the recovered lineage: the epoch as a
@@ -2292,7 +2415,9 @@ mod tests {
             journal_handle: std::thread::spawn(
                 move || -> Result<Writer, melin_journal::JournalError> { Ok(owned) },
             ),
-            matching_handle: std::thread::spawn(counter_server::Counter::default),
+            matching_handle: std::thread::spawn(|| {
+                WarmApp::genesis(counter_server::Counter::default())
+            }),
             drain_handle: std::thread::spawn(|| {}),
             shadow_handle: None,
         });
@@ -3663,7 +3788,7 @@ mod tests {
         });
         let matching = std::thread::spawn(move || {
             mj.store(true, Ordering::Release);
-            7u64
+            WarmApp::genesis(7u64)
         });
         let drain = std::thread::spawn(|| {});
 
@@ -3686,12 +3811,12 @@ mod tests {
         let flag = AtomicBool::new(false);
         let journal =
             std::thread::spawn(|| -> Result<u32, melin_journal::JournalError> { Ok(11u32) });
-        let matching = std::thread::spawn(|| 7u64);
+        let matching = std::thread::spawn(|| WarmApp::genesis(7u64));
         let drain = std::thread::spawn(|| {});
 
         match shutdown_pipeline::<u64, u32>(&flag, journal, matching, drain, None) {
-            TeardownOutcome::Clean(app, writer) => {
-                assert_eq!(app, 7);
+            TeardownOutcome::Clean(warm, writer) => {
+                assert_eq!(warm, WarmApp::genesis(7));
                 assert_eq!(writer, 11);
             }
             _ => panic!("expected Clean"),
@@ -3703,7 +3828,7 @@ mod tests {
         let flag = AtomicBool::new(false);
         let journal =
             std::thread::spawn(|| -> Result<u32, melin_journal::JournalError> { Ok(11u32) });
-        let matching = std::thread::spawn(|| -> u64 { panic!("matching stage died") });
+        let matching = std::thread::spawn(|| -> WarmApp<u64> { panic!("matching stage died") });
         let drain = std::thread::spawn(|| {});
 
         assert!(matches!(
@@ -3767,7 +3892,9 @@ mod tests {
             journal_handle: std::thread::spawn(|| -> Result<u32, melin_journal::JournalError> {
                 Ok(11)
             }),
-            matching_handle: std::thread::spawn(counter_server::Counter::default),
+            matching_handle: std::thread::spawn(|| {
+                WarmApp::genesis(counter_server::Counter::default())
+            }),
             drain_handle: std::thread::spawn(|| {}),
             shadow_handle: None,
         };
@@ -4084,7 +4211,9 @@ mod tests {
                     })
                 },
             ),
-            matching_handle: std::thread::spawn(counter_server::Counter::default),
+            matching_handle: std::thread::spawn(|| {
+                WarmApp::genesis(counter_server::Counter::default())
+            }),
             drain_handle: std::thread::spawn(|| {}),
             shadow_handle: None,
         };
@@ -4279,7 +4408,9 @@ mod tests {
             journal_failed: Arc::new(AtomicBool::new(false)),
             pipeline_shutdown: Arc::new(AtomicBool::new(false)),
             journal_handle: std::thread::spawn(move || Writer::create(&writer_path, PREALLOC)),
-            matching_handle: std::thread::spawn(counter_server::Counter::default),
+            matching_handle: std::thread::spawn(|| {
+                WarmApp::genesis(counter_server::Counter::default())
+            }),
             drain_handle: std::thread::spawn(|| {}),
             shadow_handle: None,
         };

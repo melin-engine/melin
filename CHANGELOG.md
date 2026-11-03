@@ -61,10 +61,16 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   **Changed**).
 - **`melin_transport_core::TickWatermark`**: the latest time already
   handed to `Application::tick`, which a pipeline's stages start from.
-  It is made only as `TickWatermark::GENESIS` (a fresh journal) or by
-  recovery, read with `JournaledApp::tick_watermark`, so a stage cannot
-  start at a fresh zero without saying so. `TickWatermark::not_yet_carried`
-  names the paths that cannot carry it yet (see **Fixed**).
+  It is made only as `TickWatermark::GENESIS` (a fresh journal), by
+  recovery, read with `JournaledApp::tick_watermark`, or by a matching
+  stage, which hands back the one it reached when it stops, so a stage
+  cannot start at a fresh zero without saying so.
+  `TickWatermark::not_yet_carried` names the snapshot paths that cannot
+  carry it yet (see **Fixed**).
+- **`melin_transport_core::WarmApp`**: an application together with the
+  tick watermark of its position, as a stopped matching stage hands it
+  back and a promoted primary is built from it.
+  `WarmApp::genesis` is an application nothing has been dispatched to.
 - **`melin_transport_core::shadow::ShadowFeed`**: the shadow stage's
   input ring together with the position it starts from, made only by the
   pipeline builders from the values they give the matching stage.
@@ -78,8 +84,10 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   takes one last. `shadow::run` takes the `ShadowFeed` the builders now
   return (`Pipeline::shadow_feed` and `ReplicaPipeline::shadow_feed`,
   replacing `shadow_consumer`) in place of the consumer and starting
-  wire sequence. `replication::ReceiverResult` hands a promotion's
-  watermark over with its application: `(A, TickWatermark, W)`.
+  wire sequence. `MatchingStage::run` returns a `WarmApp<A>`, the
+  application with the watermark the stage reached, in place of the bare
+  application, and `replication::ReceiverResult` hands a promotion's
+  warm application over with the journal writer: `(WarmApp<A>, W)`.
 
 - **Unpinned pipeline threads sleep when idle** (`--cores none`, and any
   entry of `0`): they park, as with the new `p` suffix, where they used
@@ -223,20 +231,24 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Fixed
 
-- **A node restarted by replaying its whole journal no longer makes tick
-  calls an uninterrupted node does not.** The time last handed to
-  `Application::tick` restarted at zero whenever a node built its
-  pipeline, so the first event after a restart fired a tick even when its
-  timestamp repeated the last one replayed: a replica restarted under
-  load, or a primary restarted after its clock stepped back. Its shadow
-  stage did the same, and snapshotted what it produced. An application
-  whose tick changes state when called for a time already passed then
-  diverged from its peers. Recovery now hands out the time replay
-  reached, and the matching and shadow stages of the pipeline built over
-  the recovered state, primary or replica, start from it. A node that
-  recovers from a snapshot and replays only the journal after it, a state
-  received from a primary's resync, and a replica promoted after it
-  streamed, still start from zero.
+- **A node restarted by replaying its whole journal, or a replica
+  promoted to primary, no longer makes tick calls an uninterrupted node
+  does not.** The time last handed to `Application::tick` restarted at
+  zero whenever a node built its pipeline, so the first event after a
+  restart or a promotion fired a tick even when its timestamp repeated
+  the last one applied: a replica restarted under load, a primary
+  restarted after its clock stepped back, or a promoted replica whose
+  first events are stamped at or behind its old primary's last. Its
+  shadow stage did the same, and snapshotted what it produced. An
+  application whose tick changes state when called for a time already
+  passed then diverged from its peers. Recovery now hands out the time
+  replay reached, and a replica's matching stage the time it reached
+  when torn down for a promotion; the matching and shadow stages of the
+  pipeline built over that state, primary or replica, start from it. A
+  node that recovers from a snapshot and replays only the journal after
+  it, and a state received from a primary's resync, still start from
+  zero; a replica promoted after one of those carries the zero-based
+  watermark its stages advanced from there.
 
 - **A journal rotation that adopted a pre-staged segment could lose that
   segment's entries from the node's journal.** The staging thread could

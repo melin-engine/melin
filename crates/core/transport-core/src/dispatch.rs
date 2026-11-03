@@ -30,8 +30,10 @@ use melin_journal::{AckPolicyChange, JournalEvent};
 /// passed diverges. So it cannot be minted from a bare number: a stage
 /// starts from [`Self::GENESIS`] (nothing dispatched yet), or from a
 /// value its source carried to it — replay's result, which recovery hands
-/// out with the application it rebuilt — and every value after that
-/// comes from the clock step advancing it.
+/// out with the application it rebuilt, or the one a matching stage held
+/// when it stopped, which it hands back with its application in a
+/// [`WarmApp`] — and every value after that comes from the clock step
+/// advancing it.
 ///
 /// A `u64` of nanoseconds, the unit and width of the journaled timestamp
 /// it is compared with. Not `Default`, and no `From<u64>`, so a stage
@@ -45,14 +47,46 @@ impl TickWatermark {
     /// non-zero timestamp fires a tick.
     pub const GENESIS: Self = Self(0);
 
-    /// The watermark of state whose source does not carry one yet: a
-    /// snapshot (a restore, a resync), or a replica's torn-down stage on
-    /// promotion. Zero, as every stage started before the watermark was
-    /// carried, so these paths still make the extra tick calls this type
-    /// exists to prevent; each call site names its source, and the value
-    /// moves to that source as it learns to carry it.
+    /// The watermark of state restored from a snapshot, which does not
+    /// carry one yet: a node recovering from its own snapshot, or a
+    /// replica loading the one a primary's resync sent. Zero, as every
+    /// stage started before the watermark was carried, so these paths
+    /// still make the extra tick calls this type exists to prevent; each
+    /// call site names its source, and the value moves to that source as
+    /// it learns to carry it.
     pub const fn not_yet_carried() -> Self {
         Self(0)
+    }
+}
+
+/// An application together with the tick watermark of the journal
+/// position its state is at: what a stopped matching stage hands back
+/// ([`MatchingStage::run`](crate::pipeline::MatchingStage::run)), and what
+/// the next stage built over that state starts from.
+///
+/// Named fields rather than a pair, so the watermark travels with the
+/// state it belongs to and no hand-over can keep one and drop the other:
+/// a primary promoted from a replica must start its stages where the
+/// replica's matching stage stopped, or it fires a tick for a time that
+/// stage had already handed to the application. Generic over any `A`, not
+/// only an [`Application`], so the runtime's stage-handle plumbing (and
+/// its tests) can carry it whole.
+#[derive(Debug, PartialEq, Eq)]
+pub struct WarmApp<A> {
+    /// The application state.
+    pub app: A,
+    /// The watermark of the position `app` is at.
+    pub tick_watermark: TickWatermark,
+}
+
+impl<A> WarmApp<A> {
+    /// `app` at the start of a fresh journal: nothing has been
+    /// dispatched to it, so it is at [`TickWatermark::GENESIS`].
+    pub const fn genesis(app: A) -> Self {
+        Self {
+            app,
+            tick_watermark: TickWatermark::GENESIS,
+        }
     }
 }
 
