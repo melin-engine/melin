@@ -374,13 +374,14 @@ missed both, but it costs the first application data in raft, a
 forwarding RPC, a persisted halted state and a raft storage version. The
 only case it would add is a partition around the detector (the limits).
 
-Two conditions hold this argument up, and the plan carries both. A raft
-leader cut off from its quorum can still auto-promote without an election
-(openraft 0.9 never steps a leader down on quorum loss). The fix is a
-quorum-contact gate on auto-promotion, being fixed separately on `main`,
-which is a release prerequisite (decision 14). And a cluster with more
-than three voters keeps a majority after two stop, which decision 14's
-voter cap refuses.
+Two conditions hold this argument up. First, a raft leader cut off from
+its quorum keeps its role (openraft 0.9 has no check-quorum step-down),
+so a replica already leading needs no election to promote. `main` now
+closes that: before a promotion journals its epoch, a fresh majority round
+trip must confirm the leadership, and with two nodes stopped nobody
+answers, so the promotion is abandoned and the node exits (decision 14).
+Second, a cluster with more than three voters keeps a majority after two
+stop, which decision 14's voter cap refuses.
 
 **7. The runtime still hands applications repeated and backwards ticks.**
 Determinism audit finding 17 and the roadmap item "Monotonic sequencer time"
@@ -1870,20 +1871,20 @@ one is a prerequisite:
   `ReplicaSlotCursors::SLOTS + 1` directly, through one `pub const
   MAX_VOTERS` in `melin-raft` that `build_raft_config` uses too, and
   `RaftConfig` is unchanged. It is checked twice: on the
-  `--raft-peer` flags in `build_raft_config` (`raft.rs:91`, beside the
+  `--raft-peer` flags in `build_raft_config` (`raft.rs:93`, beside the
   minimum), and on the *stored* membership, which overrides edited flags
   after the raft directory's first boot (`docs/replication.md`,
   "Membership is static"). The second check runs in `melin_raft::spawn`,
-  right after `storage::open` (`driver.rs:192`), over the membership the
+  right after `storage::open` (`driver.rs:524`), over the membership the
   opened store holds (the state machine's, or the log's `initialize` entry
   if it was never applied), so it fails the node's start before the
   driver thread exists. The store's only membership readers today are
   openraft's async trait methods (`applied_state`, `storage.rs:594`),
   and `spawn` is synchronous, so the step adds a small synchronous
   accessor on `FileStateMachine` and on `FileLogStore`, each reading
-  through the store's existing `std::sync::Mutex` (`storage.rs:243`,
-  `:319`), rather than a `block_on` in `spawn`. Not in `driver_main`
-  beside the existing stored-membership comparison (`driver.rs:376`): a
+  through the store's existing `std::sync::Mutex` (`storage.rs:239`,
+  `:315`), rather than a `block_on` in `spawn`. Not in `driver_main`
+  beside the existing stored-membership comparison (`driver.rs:738-768`): a
   refusal there can only
   `mark_stopped`, leaving a node that serves on without raft. A directory
   initialised with five otherwise keeps five. It applies whatever the
@@ -1894,18 +1895,35 @@ one is a prerequisite:
   already refused (`raft.rs`). Without
   raft, or with raft observational, nothing auto-promotes: only the
   operator paths of step 6 remain.
-- **The quorum-contact gate (prerequisite, fixed separately).** A raft
-  leader cut off from its quorum keeps reporting `Leader` (openraft 0.9
-  never steps a leader down on quorum loss). A replica can hold raft
-  leadership while the primary is healthy, and promotes without an
-  election once its link has been down past `PRIMARY_DOWN_GRACE`. So if
-  the replica that missed the stop is the raft leader, quorum loss alone
-  does not stop it. The fix refuses auto-promotion unless the leader heard
-  a majority recently (openraft's `millis_since_quorum_ack`). It is a bug
-  today, divergence or not, and it is being fixed on its own branch.
-  Steps 3 to 5 do not reach a release before it lands. Whether its bound
-  needs tightening here (a quorum ack taken after the grace ran out, so a
-  leader whose last ack predates the halt cannot pass) is open question 3.
+- **The leader lease and its confirmation (on `main`, the prerequisite
+  met).** A raft leader cut off from its quorum keeps reporting `Leader`
+  (openraft 0.9 has no check-quorum step-down). A replica can hold raft
+  leadership while the primary is healthy, and would promote without an
+  election once its link had been down past `PRIMARY_DOWN_GRACE`. So
+  quorum loss alone would not stop a raft-leading replica that missed
+  the stop. `main` closes this in two layers (`fix/raft-promotion-lease`,
+  `docs/internal/raft-control-plane.md`):
+  - **When deciding to promote**, `leader_lease_check`
+    (`raft_promotion.rs`) refuses unless a majority acknowledged this
+    leadership within `QUORUM_ACK_MAX_AGE`, half the leader lease
+    (`melin-raft`'s `driver.rs`). It is an early filter, not the safety
+    argument: a recent ack can predate the halt.
+  - **When the promotion takes effect**, `journal_promotion_epoch_bump`
+    (`server.rs`) asks the raft driver to confirm with a fresh majority
+    round trip (`LeaderConfirm::confirm`), at the term the election was
+    won at, before it journals the new epoch. Without the confirmation,
+    the promotion is abandoned, nothing is journaled, and the node exits
+    saying why.
+
+  The confirmation is what this plan rests on. It starts after the
+  decision, so after the grace ran out and after any halt that came
+  before. With both other nodes stopped, nobody answers it, and the
+  unaware leader's promotion is abandoned; that node then exits, so it
+  stops too. With only one other node stopped (both replicas between
+  sessions when the primary stopped), the other replica is still in raft
+  and answers, and the case is the documented limit. A manual `PROMOTE`
+  is deliberately not confirmed, so it stays usable during a raft outage:
+  the plan's "manual promotion overrides the stop".
 
 The stop cause added to `FenceState` lets raft's stand-down and refusal
 lines say "stopped: output divergence" rather than "fenced". Step 4
@@ -1999,8 +2017,9 @@ Each step builds, passes the full suite (kernel TCP, and the DPDK suite
 under the netns runner), and is committable on its own. Docs and
 `CHANGELOG.md` move with the behaviour they describe.
 
-**Steps 3 to 5 ship in one release, after the quorum-contact gate
-(decision 14).** Step 3 alone would stop a node whose shadow trips without
+**Steps 3 to 5 ship in one release.** Their raft prerequisite, the
+promotion's leadership confirmation, is already on `main` (decision 14).
+Step 3 alone would stop a node whose shadow trips without
 telling the others, so a primary would stop and its replicas fail over:
 the opposite of the decision. Step 4 brings the notice, and step 5 the
 cross-node check. Each stays its own commit, and the tree passes at each.
@@ -2571,6 +2590,17 @@ cross-node check. Each stays its own commit, and the tree passes at each.
     refused;
   - a replica's shadow detects: the primary stops on the flag, and the
     other replica on the primary's `Halt`;
+  - the unaware raft leader. A replica is made raft leader first. Only its
+    replication link is then cut by the test proxy, held past
+    `HALT_LINGER`, timed so its grace runs out just after the primary's
+    shadow detects; its raft links stay up. The primary and the other
+    replica stop without reaching it, and leave raft. The replica's last
+    majority ack is from just before the stop, so whether the lease
+    filter or the confirmation refuses it depends on timing the test does
+    not control. The test asserts the outcome both give: no `EpochBump`
+    is journaled, no node serves, and the refusal logged is one of the
+    two. `main`'s own tests pin each layer; this one pins that the stop
+    leaves a raft-leading survivor with nothing that confirms it;
   - a replica between sessions when the primary stops (held in reconnect
     backoff by the test proxy, `tests/common/proxy.rs`, then released
     inside `HALT_LINGER`): it meets the lingering primary's handshake
@@ -3088,21 +3118,17 @@ Beyond each step's own list:
    id, which a replica treats as matching any build, and logs `warn!` at
    startup: skipping the check on such hosts would lose it silently, while
    comparing at worst stops the cluster loudly.
-3. **Does the quorum-contact gate need tightening for the stop?** The gate
-   being fixed separately refuses auto-promotion unless the raft leader
-   heard a majority within the election timeout (1 s). A replica leading
-   raft whose primary link had been down for 2.5 s when the primary
-   stopped passes it: its grace ends 0.5 s later, while its last quorum
-   ack is under 1 s old, though both other nodes have left raft. (a) Keep
-   the gate as fixed, and count this inside the documented limit. (b)
-   Require a quorum ack received after the grace ran out
-   (`millis_since_quorum_ack < primary_link_down_for − PRIMARY_DOWN_GRACE`):
-   a live majority answers within one heartbeat, so a real failover waits
-   that much longer, and stopped peers never answer. Recommendation: (b),
-   proposed to the gate's branch rather than built here. It still relies
-   on the other replica having stopped: with both replicas between
-   sessions when the primary stops, the other keeps answering, and the
-   case falls inside the documented limit.
+3. **Does the promotion gate need tightening for the stop?** Settled by
+   `main`, no change needed. The concern was a raft-leading replica whose
+   primary link had been down about 2.5 s when the primary stopped: its
+   last majority ack, from before the stop, is still recent when its
+   grace ends, so an age-only check passes it. `main`'s lease check is
+   age-only, but it is only the early filter. The promotion is confirmed
+   by a fresh majority round trip that starts after the decision, so
+   after the stop, before its epoch is journaled (decision 14). Stopped
+   peers never answer it, so the promotion is abandoned. The case that
+   remains, both replicas between sessions when the primary stops, is
+   the documented limit, as before.
 4. **Clearing the marker.** Moving it aside, as one step of starting a
    new cluster (step 6), or an admin command. Recommendation: the file,
    moved and kept as the incident's record. It is an explicit act, it

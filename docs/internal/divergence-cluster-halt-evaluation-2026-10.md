@@ -19,9 +19,15 @@ to change [divergence-detection-2026-10.md](divergence-detection-2026-10.md)
   replication endpoint up for `2 × MAX_BACKOFF` (60 s), then exits. A node
   that cannot reach anyone in that time stops alone, a limit the plan
   documents. Keeping the notice alive until it is delivered, across
-  restarts, is a roadmap item. Problem 2's tightened gate is the plan's
-  open question 3. Problem 6 is the plan's "a failed marker write still
-  lingers".
+  restarts, is a roadmap item. Problem 6 is the plan's "a failed marker
+  write still lingers".
+- **Since landed on `main` (2026-11-03).** The stale leader (Part 1,
+  problem 2; Part 2, problem 2) is fixed by `fix/raft-promotion-lease`.
+  An age filter refuses at decision time, and a fresh majority round
+  trip confirms the leadership before the promotion journals its epoch.
+  The confirmation starts after the grace ran out, so it covers Part 2's
+  tightened-gate concern without the formula proposed there. The plan's
+  open question 3 is closed on that basis.
 
 Code is cited as `file:line` against branch `plan/state-divergence-detection`
 at 3d0ec3d4. Bare names are in `crates/core/raft/src` (`driver.rs`,
