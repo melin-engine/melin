@@ -52,8 +52,7 @@ use melin_client::Connection;
 use melin_journal::{AckPolicyByte, JournalEvent, JournalReader};
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
-use melin_server_runtime::layout::PipelineCores;
-use melin_server_runtime::server::{JournalStagingMode, ServerConfig};
+use melin_server_runtime::server::ServerConfig;
 use melin_test_node::probe::{
     admin_command, admin_reply_when_up, admin_until_ok, gauge, wait_for_gauge,
 };
@@ -68,8 +67,9 @@ use port_pool::give_back;
 use raw_replica::RawReplica;
 
 /// Port range for `free_addr`, shared with the other cluster tests: every
-/// other range below the ephemeral floor is taken. Sharing is safe only
-/// because this binary is in nextest's `cluster-serial` group with them.
+/// other range below the ephemeral floor is taken. Their tests may run at
+/// the same time: `free_addr` keeps concurrent test processes apart
+/// within a range.
 const PORT_BASE: u16 = 10_000;
 
 /// How long anything a test waits on may take: generous, for a slow and
@@ -227,14 +227,10 @@ impl Cluster {
             replication_key: Some(key_path),
             health_bind: Some(self.health),
             admin_bind: Some(self.admin),
-            // Unpinned, and therefore yielding: the node shares this
-            // process with the test's own client and replica.
-            cores: PipelineCores::unpinned(),
             // No tick: every journaled entry is one the test made, so it
             // knows each one's sequence.
             tick_interval_ms: 0,
             snapshot_interval_ms: 0,
-            journal_staging_mode: JournalStagingMode::Allocate,
             ..melin_test_node::config()
         }
     }

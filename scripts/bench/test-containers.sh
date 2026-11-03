@@ -21,8 +21,8 @@
 # Safe for a laptop: the containers are unprivileged (the suite's IRQ
 # pinning fails harmlessly inside them), though without a seccomp filter
 # (podman's refuses io_uring), each is capped at CPUS cores, and
-# the nodes run unpinned and yielding (`--cores none`) rather than
-# spinning on the default layout's cores.
+# the nodes run unpinned, sleeping when idle (`--cores none`), rather
+# than spinning on the default layout's cores.
 #
 # Usage:
 #   ./scripts/bench/test-containers.sh [echo|notary|ec]    # default echo
@@ -129,8 +129,8 @@ done
 
 echo ""
 # Short phases: the rehearsal is of the suite, not of the figures. The
-# nodes unpinned and yielding, without locking their memory (a container's
-# memlock limit is small), on small journal segments.
+# nodes unpinned, sleeping when idle, without locking their memory (a
+# container's memlock limit is small), on small journal segments.
 NODE_ARGS="--cores none --no-mlock --max-journal-mib 64"
 SSH_CONFIG="$SSH_CONFIG" \
 TRANSPORTS=kernel \

@@ -207,10 +207,12 @@ pub struct ServerConfig {
     ///
     /// Each core may carry a suffix saying how that thread waits: `7`
     /// (or `7s`) busy-spins and needs the core to itself, `7y` spins
-    /// briefly then yields and may share the core with other `y`
-    /// threads. `0` (unpinned) always yields. Two threads on one core
-    /// where either busy-spins is refused at startup — they would starve
-    /// each other. journal-prep never busy-waits and takes no suffix.
+    /// briefly then yields, and `7p` spins, yields, then sleeps; `y` and
+    /// `p` threads may share a core. `0` (unpinned) parks like `p`, and
+    /// `0y` keeps an unpinned thread yielding, never sleeping. Two threads
+    /// on one core where either busy-spins is refused at startup — they
+    /// would starve each other. journal-prep never busy-waits and takes
+    /// no suffix.
     #[arg(long, default_value = DEFAULT_CORES, value_parser = parse_cores)]
     pub cores: PipelineCores,
     /// Group commit coalescing delay in microseconds. Keep at 0 for TCP.
@@ -1015,7 +1017,7 @@ fn log_layout(cores: &PipelineCores) {
     info!(cores = %cores, "pipeline layout");
     if cores.pins_nothing() {
         warn!(
-            "--cores none: no pipeline thread is pinned. Every thread runs wherever the \
+            "no pipeline thread is pinned (--cores none). Every thread runs wherever the \
              scheduler puts it and shares that core with everything else on the host. A \
              development layout: latency measured under it is not representative. Name a \
              core per thread in --cores"

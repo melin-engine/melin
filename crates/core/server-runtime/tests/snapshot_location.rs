@@ -23,16 +23,15 @@ use counter_server::{
 use melin_client::{Connection, SigningKey, key};
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
-use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
 use melin_test_node::probe::{gauge, wait_for_gauge, wait_for_gauge_within};
 use melin_test_node::{Addrs, Node};
 use melin_transport_core::test_ports::free_addr;
 
 /// Port range for `free_addr`, shared with the other cluster tests: every
-/// other range below the ephemeral floor is taken. Sharing is safe only
-/// because they are all in nextest's `cluster-serial` group, so they never
-/// run at the same time.
+/// other range below the ephemeral floor is taken. Their tests may run at
+/// the same time: `free_addr` keeps concurrent test processes apart
+/// within a range.
 const PORT_BASE: u16 = 10_000;
 
 /// How long the test waits for a node to serve, a snapshot to be written,
@@ -88,9 +87,6 @@ impl Site {
             snapshot_interval_ms: SHADOW_INTERVAL_MS,
             authorized_keys: self.path().join("authorized_keys"),
             ack_policy: AckPolicy::Disk,
-            // Unpinned, and therefore yielding: the nodes share this
-            // process with the test's own client.
-            cores: PipelineCores::unpinned(),
             tick_interval_ms: 0,
             health_bind: Some(free_addr(PORT_BASE)),
             replication_key: Some(key_path),

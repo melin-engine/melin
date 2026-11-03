@@ -18,15 +18,14 @@ use ed25519_dalek::SigningKey;
 use melin_client::Connection;
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
-use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
 use melin_test_node::{Addrs, Node};
 use melin_transport_core::test_ports::free_addr;
 
 /// Port range for `free_addr`, shared with the other cluster tests: every
-/// other range below the ephemeral floor is taken. Sharing is safe only
-/// because every binary using it is in nextest's `cluster-serial` group,
-/// so they never run at the same time.
+/// other range below the ephemeral floor is taken. Their tests may run at
+/// the same time: `free_addr` keeps concurrent test processes apart
+/// within a range.
 const PORT_BASE: u16 = 10_000;
 
 /// Node `slot`'s addresses (`melin_test_node::addrs`), from this file's
@@ -89,8 +88,7 @@ impl Fixture {
     }
 
     /// The configuration every node of these tests shares: journal `name`,
-    /// the policy, no ticks, no snapshots, unpinned (every node shares this
-    /// process with the test's own clients), no health endpoint.
+    /// the policy, no ticks, no snapshots, no health endpoint.
     fn node_config(&self, name: &str, key: &SigningKey, policy: AckPolicy) -> ServerConfig {
         let key_path = self.tmp.path().join(format!("{name}.key"));
         std::fs::write(&key_path, key.to_bytes()).expect("write node key");
@@ -98,7 +96,6 @@ impl Fixture {
             journal: self.tmp.path().join(format!("{name}.journal")),
             authorized_keys: self.auth_path.clone(),
             ack_policy: policy,
-            cores: PipelineCores::unpinned(),
             tick_interval_ms: 0,
             snapshot_interval_ms: 0,
             health_bind: None,

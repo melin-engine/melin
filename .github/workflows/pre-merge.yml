@@ -106,9 +106,10 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
-    # The cluster tests are serialized to one at a time
-    # (`.config/nextest.toml`), so the tail is long on 4 vCPUs. Generous
-    # enough to finish, tight enough to fail rather than hang for six hours.
+    # The cluster tests are bounded to a few at a time
+    # (`.config/nextest.toml`), and wait out real timeouts, so the tail is
+    # long on 4 vCPUs. Generous enough to finish, tight enough to fail
+    # rather than hang for six hours.
     timeout-minutes: 60
 
     steps:

@@ -56,7 +56,6 @@ use base64::Engine;
 use counter_server::{Counter, KIND_RESP_ACK, RequestDecoder, ResponseEncoder, increment_request};
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
-use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
 use melin_test_node::probe::{admin_command, gauge, http_metrics, wait_for_gauge};
 use melin_test_node::{Addrs, Node};
@@ -457,12 +456,6 @@ impl Cluster {
             journal: self.journal(i),
             authorized_keys: self.auth_path.clone(),
             ack_policy,
-            // Unpinned, and therefore yielding: three nodes run in this
-            // process alongside the rest of the suite, and the default
-            // layout would stack every node's same-role thread on one core
-            // while a spinner would starve whatever shares its core, the
-            // test's own client included.
-            cores: PipelineCores::unpinned(),
             tick_interval_ms,
             snapshot_interval_ms: 0,
             health_bind: Some(self.nodes[i].health_addr),
@@ -1239,16 +1232,44 @@ const FENCE_WATCH: Duration = Duration::from_secs(60);
 /// primary's own connections. Nothing on the data plane joins the two
 /// either. So the primary learns of the newer tenure only from a reply,
 /// and must fence on it, leaving the promoted node the only one serving.
+///
+/// Leadership is put on the primary before the replicas are muted, from a
+/// cluster a replica leads, which is the hard case: a normal bring-up
+/// usually ends primary-led, but not always, and muting a replica-led
+/// cluster can leave no node able to win. A muted replica cannot win, and
+/// if the primary lacks the leader's latest entry, every node it reaches
+/// refuses its vote on the log check; even with the logs agreeing, a
+/// muted replica that keeps campaigning reaches ever higher terms, which
+/// its replies carry back to depose the primary, and openraft 0.9 fixes
+/// each node's election timeout at startup, so which one wins that race
+/// can repeat every round. Starting replica-led takes the hard case every
+/// time, rather than in the rare run where a bring-up happens to end
+/// there.
 #[test]
 #[serial]
 fn a_serving_leader_fences_on_a_followers_higher_epoch() {
     melin_test_node::logs::capture_if_requested();
     let cluster = Cluster::partitionable();
-    let primary = cluster.start_primary(AckPolicy::DiskAndRam, 0);
-    let replicas = cluster.start_replicas(AckPolicy::DiskAndRam, false);
-    cluster.wait_formed(&primary);
+    let ReplicaLed {
+        primary,
+        replicas,
+        leader,
+        ..
+    } = cluster.start_replicas_first(AckPolicy::DiskAndRam);
 
-    // Only the primary can lead now, and every node follows it.
+    // Hand leadership to the primary. The leader's requests stall at the
+    // primary's proxy alone, so the other replica still hears it: its
+    // lease stays fresh and it never campaigns, and no term races the
+    // primary's. The primary hears nobody, times out and campaigns. The
+    // other replica refuses it (its lease), the leader grants it (its own
+    // lease lapsed a lease after its election, and the logs agree: every
+    // node follows it at its term, the primary included), and so the
+    // leader steps down and the primary leads with its vote.
+    cluster.links().raft[0].1.block(raft_ip(leader));
+    cluster.wait_all_follow(0);
+
+    // Only the primary can lead now, and every node follows it. The block
+    // above is part of the mute, which stalls the leader at every proxy.
     cluster.mute_replicas();
     let term = cluster.wait_all_follow(0);
 

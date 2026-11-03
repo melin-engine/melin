@@ -50,7 +50,7 @@ const MANDATORY_THREADS: [&str; 5] = [
 ///
 /// The two are one value because they constrain each other: a thread
 /// that busy-spins needs a core to itself, and a thread with no core of
-/// its own (`core == 0`, the unpinned sentinel) can only ever yield — a
+/// its own (`core == 0`, the unpinned sentinel) can never busy-spin — a
 /// spinner the scheduler is free to place is the co-location bug with
 /// the victim chosen at random. [`PipelineCores::validate`] enforces the
 /// cross-thread half of that rule; the constructors here enforce the
@@ -79,7 +79,8 @@ impl Placement {
     }
 
     /// Pinned to `core`, spinning briefly then yielding: the thread may
-    /// share that core with other yielding threads.
+    /// share that core with other yielding threads. A `core` of `0` is
+    /// unpinned and yielding, which never sleeps: `0y` in `--cores`.
     pub const fn yielding(core: usize) -> Self {
         Self {
             core,
@@ -87,10 +88,23 @@ impl Placement {
         }
     }
 
+    /// Pinned to `core`, spinning briefly, yielding, then sleeping: the
+    /// thread may share that core, and costs next to no CPU while idle.
+    pub const fn parking(core: usize) -> Self {
+        Self {
+            core,
+            wait: WaitStrategy::SpinYieldPark,
+        }
+    }
+
     /// No core of its own: the OS scheduler places it within the CPU set
-    /// the process was started with — and therefore it yields.
+    /// the process was started with, and it parks when idle. It may share
+    /// whichever core it lands on with anything, so it gives that core up
+    /// when it has nothing to do; parking rather than only yielding means
+    /// an idle node does not show as busy cores, nor burn a container's
+    /// CPU quota.
     pub const fn unpinned() -> Self {
-        Self::yielding(0)
+        Self::parking(0)
     }
 
     /// Whether this thread is pinned to a core (`core != 0`).
@@ -109,8 +123,8 @@ pub enum ReaderThread {
     /// produces into.
     IoUring,
     /// The DPDK NIC poll thread. It polls the device unconditionally and
-    /// never idles, so it busy-spins whatever its entry says; a `y` on
-    /// the reader is refused rather than silently ignored.
+    /// never idles, so it busy-spins whatever its entry says; a `y` or a
+    /// `p` on the reader is refused rather than silently ignored.
     DpdkPoll,
 }
 
@@ -147,7 +161,8 @@ pub struct PipelineCores {
     /// I/O and sleeps between attempts, it never polls a ring. The parser
     /// only produces a yielding preparer, and the layout check and the
     /// rendering read it as yielding whatever this field holds, so a
-    /// busy-spin value set in code is ignored rather than refused. It is
+    /// busy-spin or parking value set in code is ignored rather than
+    /// refused; the layouts built in code hold it as yielding too. It is
     /// carried here so the layout check knows it is harmless to share a
     /// core with.
     pub journal_prep: Placement,
@@ -163,7 +178,11 @@ pub struct PipelineCores {
 }
 
 impl PipelineCores {
-    /// Every thread unpinned, and therefore yielding: `--cores none`.
+    /// Every thread unpinned, and therefore parking: `--cores none`.
+    ///
+    /// The preparer is held as yielding, the one form its field takes
+    /// (see [`journal_prep`](Self::journal_prep)), so that this equals
+    /// what the parser makes of an all-`0` list.
     pub fn unpinned() -> Self {
         let unpinned = Placement::unpinned();
         Self {
@@ -175,7 +194,7 @@ impl PipelineCores {
             shadow: unpinned,
             repl_handler_0: unpinned,
             repl_handler_1: unpinned,
-            journal_prep: unpinned,
+            journal_prep: Placement::yielding(0),
             journal_disk: unpinned,
         }
     }
@@ -278,7 +297,8 @@ impl PipelineCores {
             .collect()
     }
 
-    /// Whether no thread at all has a core: the `--cores none` layout.
+    /// Whether no thread at all has a core: `--cores none`, or a list
+    /// whose every entry is unpinned (`0`, `0p` or `0y`).
     pub fn pins_nothing(&self) -> bool {
         self.named()
             .iter()
@@ -292,23 +312,24 @@ impl PipelineCores {
     /// did not ask for.
     ///
     /// On DPDK the reader is the NIC poll thread, which busy-polls
-    /// whatever its entry says, so a `y` there is a contradiction and is
-    /// refused. An unpinned DPDK reader is accepted as written: it polls
-    /// flat out wherever the scheduler puts it, which is the one
-    /// placement this module cannot make honest, and the operator docs
-    /// say so.
+    /// whatever its entry says, so a `y` or a `p` there is a
+    /// contradiction and is refused. An unpinned DPDK reader is accepted
+    /// as written: it polls flat out wherever the scheduler puts it,
+    /// which is the one placement this module cannot make honest, and the
+    /// operator docs say so.
     ///
     /// An `Err` is a configuration the node refuses to start with.
     pub fn resolve(self, reader: ReaderThread) -> Result<Self, String> {
         if reader == ReaderThread::DpdkPoll
             && self.reader.is_pinned()
-            && self.reader.wait == WaitStrategy::SpinThenYield
+            && self.reader.wait != WaitStrategy::BusySpin
         {
             return Err(format!(
-                "--cores: the reader entry is `reader={core}y`, but on DPDK the reader is the \
-                 NIC poll thread, which busy-polls whatever its entry says. Drop the suffix and \
-                 give it core {core} to itself",
-                core = self.reader.core
+                "--cores: the reader entry is `reader={core}{suffix}`, but on DPDK the reader is \
+                 the NIC poll thread, which busy-polls whatever its entry says. Drop the suffix \
+                 and give it core {core} to itself",
+                core = self.reader.core,
+                suffix = wait_suffix(self.reader),
             ));
         }
         self.validate()?;
@@ -322,8 +343,8 @@ impl PipelineCores {
     /// Checked over every thread, whether or not today's flags spawn it
     /// — a layout is meant to be right independent of which features are
     /// on, and the message names the threads and the core so the fix is
-    /// obvious. Two yielding threads on one core is the supported way to
-    /// run on a small box and passes. The parser and the [`Placement`]
+    /// obvious. Yielding and parking threads sharing one core is the
+    /// supported way to run on a small box and passes. The parser and the [`Placement`]
     /// constructors never produce an unpinned spinner, but the fields are
     /// public, so the check does not rely on that.
     pub fn validate(&self) -> Result<(), String> {
@@ -351,7 +372,8 @@ impl PipelineCores {
                 return Err(format!(
                     "--cores: {name_a} and {name_b} share core {} but {spinner} busy-spins; \
                      a busy-spinning thread needs the core to itself. Give one of them \
-                     another core, or suffix both with `y` so they yield when idle",
+                     another core, or suffix both with `y` or `p` so they give the core up \
+                     when idle",
                     a.core
                 ));
             }
@@ -393,14 +415,15 @@ impl PipelineCores {
             repl_handler_1: Placement::unpinned(),
             // Preparer unpinned in compact — the embedded bench doesn't
             // rotate at production cadence, and raising compact's core
-            // minimum for it isn't worth a core.
-            journal_prep: Placement::unpinned(),
+            // minimum for it isn't worth a core. Held as yielding, the
+            // one form the field takes (see `journal_prep`).
+            journal_prep: Placement::yielding(0),
             // The disk thread IS hot, but compact exists for boxes that
-            // cannot spare a core per stage. Unpinned, it yields like
-            // every thread without a core of its own: on a box with an
-            // idle core to land on that costs one `sched_yield` per
-            // poll, not a timeslice. Give it `journal-disk=` on any box
-            // with the cores to spare.
+            // cannot spare a core per stage. Unpinned, it parks like
+            // every thread without a core of its own: it sleeps only once
+            // idle past its spin and yield budgets, and the first batch
+            // after such a spell waits for it to wake. Give it
+            // `journal-disk=` on any box with the cores to spare.
             journal_disk: Placement::unpinned(),
         };
         Ok((cores, 7))
@@ -409,39 +432,58 @@ impl PipelineCores {
 
 /// Renders the layout in `--cores` syntax, suffixes included, so what
 /// the node logs at boot can be pasted straight back onto a command
-/// line. Every thread is named, unpinned ones as `=0`, so the log shows
-/// the whole layout rather than only what was pinned; a layout with
-/// nothing pinned renders as `none`.
+/// line. Every thread is named, unpinned ones as `=0` (or `=0y`), so the
+/// log shows the whole layout rather than only what was pinned; the
+/// layout that `none` parses to renders as `none`.
 impl std::fmt::Display for PipelineCores {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.pins_nothing() {
+        if self.named() == PipelineCores::unpinned().named() {
             return f.write_str("none");
         }
         for (i, (name, placement)) in self.named().into_iter().enumerate() {
             if i > 0 {
                 f.write_str(",")?;
             }
-            match (name, placement.core, placement.wait) {
-                (_, 0, _) => write!(f, "{name}=0")?,
-                // The preparer takes no suffix — its entry is a core only.
-                ("journal-prep", core, _) => write!(f, "{name}={core}")?,
-                (_, core, WaitStrategy::BusySpin) => write!(f, "{name}={core}")?,
-                (_, core, WaitStrategy::SpinThenYield) => write!(f, "{name}={core}y")?,
-            }
+            // The preparer takes no suffix — its entry is a core only.
+            let suffix = if name == "journal-prep" {
+                ""
+            } else {
+                wait_suffix(placement)
+            };
+            write!(f, "{name}={}{suffix}", placement.core)?;
         }
         Ok(())
+    }
+}
+
+/// The `--cores` suffix that states `placement`'s wait policy, empty
+/// where the core's default is the policy: a pinned core busy-spins
+/// unless told otherwise, and an unpinned one parks. The inverse of
+/// [`parse_placement`]'s suffix, which the tests hold the two to.
+/// Unpinned busy-spin, which the parser refuses, renders as the `0s` it
+/// would have been written as.
+fn wait_suffix(placement: Placement) -> &'static str {
+    match (placement.core, placement.wait) {
+        (0, WaitStrategy::BusySpin) => "s",
+        (0, WaitStrategy::SpinYieldPark) => "",
+        (_, WaitStrategy::BusySpin) => "",
+        (_, WaitStrategy::SpinThenYield) => "y",
+        (_, WaitStrategy::SpinYieldPark) => "p",
     }
 }
 
 /// Parse the core of one `--cores` entry, the part after `=`: a core ID
 /// with an optional wait suffix.
 ///
-/// `7` and `7s` busy-spin, `7y` spins then yields, `0`/`0y` is unpinned
-/// (and yields — see [`Placement`]). `0s` is refused: it asks for a
-/// spinner with no core to spin on.
+/// `7` and `7s` busy-spin, `7y` spins then yields, `7p` spins, yields,
+/// then sleeps. `0` and `0p` are unpinned, and park (see
+/// [`Placement::unpinned`]); `0y` is unpinned and yields, never
+/// sleeping. `0s` is refused: it asks for a spinner with no core to spin
+/// on.
 fn parse_placement(entry: &str) -> Result<Placement, String> {
     let (digits, suffix) = match entry.as_bytes().last() {
         Some(b'y') => (&entry[..entry.len() - 1], Some(WaitStrategy::SpinThenYield)),
+        Some(b'p') => (&entry[..entry.len() - 1], Some(WaitStrategy::SpinYieldPark)),
         Some(b's') => (&entry[..entry.len() - 1], Some(WaitStrategy::BusySpin)),
         _ => (entry, None),
     };
@@ -453,9 +495,10 @@ fn parse_placement(entry: &str) -> Result<Placement, String> {
             "invalid core entry `{entry}`: 0 means unpinned, and a thread without a core \
              of its own cannot busy-spin"
         )),
-        (0, _) => Ok(Placement::unpinned()),
+        (0, None) => Ok(Placement::unpinned()),
         (core, Some(WaitStrategy::SpinThenYield)) => Ok(Placement::yielding(core)),
-        (core, _) => Ok(Placement::spinning(core)),
+        (core, Some(WaitStrategy::SpinYieldPark)) => Ok(Placement::parking(core)),
+        (core, Some(WaitStrategy::BusySpin) | None) => Ok(Placement::spinning(core)),
     }
 }
 
@@ -512,8 +555,8 @@ pub(crate) fn parse_cores(s: &str) -> Result<PipelineCores, String> {
             return Err(format!("{name} is named twice"));
         }
         // The preparer never busy-waits (it blocks in I/O), so its entry is
-        // a core and nothing else: a `y` is redundant and an `s` asks for
-        // something the thread cannot do.
+        // a core and nothing else: a `y` or `p` is redundant and an `s`
+        // asks for something the thread cannot do.
         let is_prep = name == "journal-prep";
         if is_prep && value.ends_with('s') {
             return Err(format!(
@@ -706,15 +749,19 @@ mod tests {
     }
 
     /// A bare core busy-spins (the production default, and what an entry
-    /// without a suffix means), `y` yields, `s` spells the default out,
-    /// and `0` is unpinned — which can only yield.
+    /// without a suffix means), `y` yields, `p` parks, `s` spells the
+    /// default out, and `0` is unpinned — which parks unless told to
+    /// yield, and can never spin.
     #[test]
     fn parse_placement_reads_the_wait_suffix() {
         assert_eq!(parse_placement("7"), Ok(Placement::spinning(7)));
         assert_eq!(parse_placement("7s"), Ok(Placement::spinning(7)));
         assert_eq!(parse_placement("7y"), Ok(Placement::yielding(7)));
+        assert_eq!(parse_placement("7p"), Ok(Placement::parking(7)));
         assert_eq!(parse_placement("0"), Ok(Placement::unpinned()));
-        assert_eq!(parse_placement("0y"), Ok(Placement::unpinned()));
+        assert_eq!(parse_placement("0p"), Ok(Placement::unpinned()));
+        assert_eq!(parse_placement("0y"), Ok(Placement::yielding(0)));
+        assert_eq!(Placement::unpinned(), Placement::parking(0));
         assert!(
             parse_placement("0s").is_err(),
             "a thread with no core of its own cannot busy-spin"
@@ -733,6 +780,8 @@ mod tests {
         assert_eq!(cores.journal_prep, Placement::yielding(10));
         let explicit = parse_cores(&complete("journal-prep=10y")).expect("parses");
         assert_eq!(explicit.journal_prep, Placement::yielding(10));
+        let parking = parse_cores(&complete("journal-prep=10p")).expect("parses");
+        assert_eq!(parking.journal_prep, Placement::yielding(10));
         let err = parse_cores(&complete("journal-prep=10s")).expect_err("must refuse");
         assert!(err.contains("journal-prep"), "{err}");
     }
@@ -761,6 +810,14 @@ mod tests {
         assert!(err.contains("shadow"), "{err}");
         assert!(err.contains("event-publisher busy-spins"), "{err}");
 
+        // A parker sleeps when idle, but the spinner never gives the core
+        // back for its wakeup.
+        let err = parse_cores(&complete("event-publisher=7,shadow=7p"))
+            .expect("parses")
+            .validate()
+            .expect_err("a spinner sharing with a parker must be refused");
+        assert!(err.contains("event-publisher busy-spins"), "{err}");
+
         // Which of the two spins does not matter.
         let err = parse_cores(&complete("event-publisher=6y,shadow=6"))
             .expect("parses")
@@ -776,18 +833,18 @@ mod tests {
         assert!(err.contains("journal-disk"), "{err}");
     }
 
-    /// The supported ways to share: two yielders on one core, the
+    /// The supported ways to share: yielders and parkers on one core, the
     /// preparer (which never spins) next to them, and unpinned threads,
     /// which are not on any core to collide on.
     #[test]
     fn validate_allows_yielders_to_share_a_core() {
         parse_cores(
-            "journal-seq=1,matching=2,response=3,reader=4,event-publisher=7y,shadow=7y,\
-             repl-handler-0=7y,repl-handler-1=7y,journal-prep=7,journal-disk=7y",
+            "journal-seq=1,matching=2,response=3,reader=4,event-publisher=7y,shadow=7p,\
+             repl-handler-0=7y,repl-handler-1=7p,journal-prep=7,journal-disk=7y",
         )
         .expect("parses")
         .validate()
-        .expect("yielders and the preparer may share core 7");
+        .expect("yielders, parkers and the preparer may share core 7");
         parse_cores("none")
             .expect("parses")
             .validate()
@@ -851,7 +908,7 @@ mod tests {
         assert_eq!(
             compact.journal_disk,
             Placement::unpinned(),
-            "compact leaves the disk thread unpinned, hence yielding"
+            "compact leaves the disk thread unpinned, hence parking"
         );
     }
 
@@ -907,7 +964,8 @@ mod tests {
 
     /// `all_yielding` is the programmatic "`y` on every entry": it turns
     /// a packed layout the check would refuse into one it accepts, and
-    /// leaves the cores where they were.
+    /// leaves the cores where they were. An unpinned entry takes the `y`
+    /// too, and yields rather than parks.
     #[test]
     fn all_yielding_makes_a_packed_layout_legal() {
         let packed = parse_cores(
@@ -924,31 +982,33 @@ mod tests {
             .resolve(ReaderThread::IoUring)
             .expect("the same cores, all yielding, are legal");
         assert_eq!(cores.journal_seq, Placement::yielding(1));
-        assert_eq!(cores.journal_disk, Placement::unpinned());
+        assert_eq!(cores.journal_disk, Placement::yielding(0));
         assert_eq!(
             cores.to_string(),
             "journal-seq=1y,matching=1y,response=1y,reader=1y,event-publisher=1y,shadow=1y,\
-             repl-handler-0=1y,repl-handler-1=1y,journal-prep=0,journal-disk=0",
-            "every pinned entry carries the suffix"
+             repl-handler-0=1y,repl-handler-1=1y,journal-prep=0,journal-disk=0y",
+            "every entry but the preparer's carries the suffix"
         );
     }
 
     /// The DPDK poll thread busy-polls whatever its entry says, so a
-    /// `y` on the reader is a contradiction and is refused there, while
-    /// the io_uring reader accepts it. A spinning reader sharing a core
-    /// is refused by the ordinary check. An unpinned reader is left as
-    /// the operator wrote it.
+    /// `y` or a `p` on the reader is a contradiction and is refused
+    /// there, while the io_uring reader accepts either. A spinning reader
+    /// sharing a core is refused by the ordinary check. An unpinned
+    /// reader is left as the operator wrote it.
     #[test]
     fn dpdk_reader_never_yields() {
-        let explicit = parse_cores(&complete("reader=4y")).expect("parses");
-        let err = explicit
-            .resolve(ReaderThread::DpdkPoll)
-            .expect_err("`4y` on the DPDK reader must be refused");
-        assert!(err.contains("reader=4y"), "{err}");
-        assert!(err.contains("poll"), "{err}");
-        explicit
-            .resolve(ReaderThread::IoUring)
-            .expect("the io_uring reader may yield");
+        for suffix in ["y", "p"] {
+            let explicit = parse_cores(&complete(&format!("reader=4{suffix}"))).expect("parses");
+            let err = explicit
+                .resolve(ReaderThread::DpdkPoll)
+                .expect_err("a suffix on the DPDK reader must be refused");
+            assert!(err.contains(&format!("reader=4{suffix}`")), "{err}");
+            assert!(err.contains("poll"), "{err}");
+            explicit
+                .resolve(ReaderThread::IoUring)
+                .expect("the io_uring reader may yield or park");
+        }
 
         let shared = parse_cores(&complete("reader=4,event-publisher=4y")).expect("parses");
         let err = shared
@@ -1017,6 +1077,8 @@ mod tests {
             MIXED.to_owned(),
             "none".to_owned(),
             complete("journal-seq=1y,matching=2y,response=3y,reader=4y,journal-disk=7y"),
+            complete("journal-seq=1p,matching=2p,response=3,reader=4y,shadow=0y,journal-disk=0p"),
+            PipelineCores::unpinned().all_yielding().to_string(),
         ] {
             let cores = parse_cores(&input).expect("parses");
             let rendered = cores.to_string();
@@ -1024,6 +1086,30 @@ mod tests {
             assert_eq!(reparsed, cores, "{input} -> {rendered}");
         }
         assert_eq!(PipelineCores::unpinned().to_string(), "none");
+        // The layouts built in code equal what their rendering parses
+        // back to, the preparer's field included.
+        let (compact, _) = PipelineCores::compact(16).expect("compact fits 16 cores");
+        for built in [PipelineCores::unpinned(), compact] {
+            assert_eq!(parse_cores(&built.to_string()).expect("parses"), built);
+        }
+        // Nothing pinned is not enough to render as `none`: that would
+        // parse back to threads that park where these yield.
+        let yielding = PipelineCores::unpinned().all_yielding();
+        assert!(yielding.pins_nothing());
+        assert_ne!(yielding.to_string(), "none");
+        assert!(yielding.to_string().contains("journal-seq=0y"));
+        // An unpinned spinner, which only code can build, renders as the
+        // `0s` it would have been written as, so a boot log of a layout
+        // the check refuses still says what was asked for.
+        let spinner = PipelineCores {
+            shadow: Placement {
+                core: 0,
+                wait: WaitStrategy::BusySpin,
+            },
+            ..PipelineCores::unpinned()
+        };
+        assert!(spinner.to_string().contains("shadow=0s"), "{spinner}");
+        assert!(spinner.validate().is_err());
         assert_eq!(
             ServerConfig::default().cores.to_string(),
             DEFAULT_CORES,

@@ -240,8 +240,9 @@ fn a_node_run_with_its_own_shutdown_flag_serves_and_stops_on_it() {
     use melin_server_runtime::server;
     use melin_transport_core::test_ports::free_addr;
 
-    /// Port range for `free_addr`, shared with the cluster binaries: safe
-    /// because this binary is in nextest's `cluster-serial` group too.
+    /// Port range for `free_addr`, shared with the cluster binaries, whose
+    /// tests may run at the same time: `free_addr` keeps concurrent test
+    /// processes apart within a range.
     const PORT_BASE: u16 = 10_000;
 
     let dir = tempfile::tempdir().expect("tempdir");

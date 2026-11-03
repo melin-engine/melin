@@ -27,7 +27,7 @@ use melin_client::Connection;
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::layout::{PipelineCores, Placement};
-use melin_server_runtime::server::{JournalStagingMode, ServerConfig};
+use melin_server_runtime::server::ServerConfig;
 use melin_test_node::probe::{gauge, wait_for_gauge};
 use melin_test_node::sched::{first_pinnable_cpu, set_batch_policy, threads_named};
 use melin_test_node::{Addrs, Node};
@@ -38,8 +38,9 @@ mod raw_replica;
 use raw_replica::RawReplica;
 
 /// Port range for `free_addr`, shared with the other cluster tests: every
-/// other range below the ephemeral floor is taken. Sharing is safe only
-/// because this binary is in nextest's `cluster-serial` group with them.
+/// other range below the ephemeral floor is taken. Their tests may run at
+/// the same time: `free_addr` keeps concurrent test processes apart
+/// within a range.
 const PORT_BASE: u16 = 10_000;
 
 /// How long anything a test waits on may take: generous, for a slow and
@@ -129,18 +130,11 @@ fn node_config(dir: &Path, name: &str, key: &SigningKey, keys_file: &Path) -> Se
     ServerConfig {
         journal: dir.join(format!("{name}.journal")),
         authorized_keys: keys_file.to_owned(),
-        // Unpinned, and therefore yielding, unless a test places them:
-        // the nodes share this process with the test's own client.
-        cores: PipelineCores::unpinned(),
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,
         // Off unless a test asks for one: the default is a fixed port,
         // which two nodes in one process would both take.
         health_bind: None,
-        // Staged segments allocated, not zero-filled: a zero fill is a pass
-        // over a whole segment, from every node at once, on a CI runner's
-        // disk, and nothing here measures the journal.
-        journal_staging_mode: JournalStagingMode::Allocate,
         replication_key: Some(key_path),
         ..melin_test_node::config()
     }

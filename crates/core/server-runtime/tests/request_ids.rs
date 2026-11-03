@@ -35,7 +35,6 @@ use melin_app::decoder::Decoded;
 use melin_app::{Application, ApplyCtx, QueryCtx, RejectReason};
 use melin_client::{Connection, Frame, RefusalKind, RequestId, SigningKey, StreamConnection, key};
 use melin_server_runtime::StartupEvents;
-use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
 use melin_test_node::probe::wait_for_gauge;
 use melin_transport_core::test_ports::free_addr;
@@ -149,8 +148,9 @@ fn authorized_keys(dir: &Path) -> std::path::PathBuf {
 }
 
 /// Port range for the health endpoint's `free_addr`, shared with the
-/// other cluster tests (`halt_cluster.rs`): safe only because this binary
-/// is in nextest's `cluster-serial` group with them.
+/// other cluster tests (`halt_cluster.rs`), which may run at the same
+/// time: `free_addr` keeps concurrent test processes apart within a
+/// range.
 const PORT_BASE: u16 = 10_000;
 
 /// A standalone node's configuration on `dir`, its journal named `name`,
@@ -161,8 +161,6 @@ fn config(dir: &Path, name: &str) -> ServerConfig {
         authorized_keys: authorized_keys(dir),
         standalone: true,
         ack_policy: melin_server_runtime::ack_policy::AckPolicy::Disk,
-        // Unpinned, and therefore yielding: see `startup_events.rs`.
-        cores: PipelineCores::unpinned(),
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,
         health_bind: Some(free_addr(PORT_BASE)),

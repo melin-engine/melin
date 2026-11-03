@@ -35,7 +35,7 @@ RUST_LOG=info cargo run --release --bin echo-server -- --standalone --ack-policy
 cargo run --release --bin echo-client -- --key /tmp/melin-key.pem --count 1000
 ```
 
-`--cores none` leaves the node's threads unpinned and yielding when idle, and `--no-mlock` skips locking its memory, which needs a privilege a development machine rarely grants; the node warns that nothing is pinned, which is expected here. A production node is laid out differently — see [Pipeline Architecture](pipeline-architecture.md#waiting).
+`--cores none` leaves the node's threads unpinned and asleep when idle, so an idle node costs next to no CPU, and `--no-mlock` skips locking its memory, which needs a privilege a development machine rarely grants; the node warns that nothing is pinned, which is expected here. A production node is laid out differently — see [Pipeline Architecture](pipeline-architecture.md#waiting).
 
 Every one of those requests was given a sequence number, written to `/tmp/echo.journal` and synced to disk before its reply left the node. Stop the node and start it again with the same command, and it replays that journal on the way up.
 

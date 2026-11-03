@@ -68,7 +68,7 @@ use melin_app::decoder::RequestDecoder;
 use melin_app::encoder::ResponseEncoder;
 use melin_client::{Connection, SigningKey};
 use melin_server_runtime::StartupEvents;
-use melin_server_runtime::server::{RingCapacity, ServerConfig};
+use melin_server_runtime::server::{PipelineCores, RingCapacity, ServerConfig};
 
 /// How long a test should give a node to start serving, from [`start`]
 /// to its first authenticated client.
@@ -453,7 +453,8 @@ pub const MAX_JOURNAL_MIB: u64 = 8;
 ///   which against the default limit fails (and warns) on every node.
 ///   [`start`] and [`start_at`] set it whatever the config says.
 ///
-/// And two more, for memory rather than the locked-memory limit:
+/// And three more, for memory and CPU rather than the locked-memory
+/// limit:
 ///
 /// - **`ring_capacity`** is [`RING_CAPACITY`]. Each node's two pipeline
 ///   rings are written in full when it starts, so they are resident
@@ -467,18 +468,59 @@ pub const MAX_JOURNAL_MIB: u64 = 8;
 ///   tmpfs, where both are memory: at the production threshold that is
 ///   over half a GiB per node, written or not, and a parallel suite runs
 ///   dozens of nodes.
+/// - **`cores`** leaves every thread unpinned. The production layout pins
+///   each pipeline thread to a fixed core and busy-spins there: with many
+///   nodes on one host it would stack every node's same-role thread on one
+///   core, while a spinner would starve whatever shares its core, the
+///   test's own client included. Unpinned, the scheduler places each
+///   thread, and it parks when idle, as `--cores none` does; with
+///   [`WAIT_ENV`] set to `yield`, it yields instead (see there).
 ///
 /// A test that exercises the connection cap sets its own
 /// `max_connections`, one that needs a deeper ring its own
-/// `ring_capacity`, and one that exercises size-driven rotation its own
-/// `max_journal_mib`.
+/// `ring_capacity`, one that exercises size-driven rotation its own
+/// `max_journal_mib`, and one that needs a particular layout its own
+/// `cores`.
 pub fn config() -> ServerConfig {
     ServerConfig {
         max_connections: MAX_CONNECTIONS,
         no_mlock: true,
         ring_capacity: RING_CAPACITY,
         max_journal_mib: MAX_JOURNAL_MIB,
+        cores: unpinned_cores(std::env::var_os(WAIT_ENV).as_deref())
+            .unwrap_or_else(|e| panic!("{e}")),
         ..ServerConfig::default()
+    }
+}
+
+/// The environment variable that chooses how a test node's unpinned
+/// threads wait (see [`config`]): `park`, the default, or `yield`. Any
+/// other value fails the test that reads it, rather than running the
+/// suite under a policy nobody asked for.
+///
+/// Parking keeps a parallel suite's CPU low, which lets the cluster tests
+/// run several at a time, and is what `--cores none` does. But a parked
+/// stage looks at its ring only every so often after an idle spell, so
+/// two stages handing work to each other interleave far more coarsely
+/// than yielding ones, which look about every microsecond: a race that
+/// needs a narrow interleaving gets fewer chances to show. Yielding is
+/// also what a node's `y` threads do. The post-merge CI job runs the
+/// suite yielding, with the cluster tests one at a time, as every run did
+/// before nodes parked; local runs and the pre-merge gate park.
+pub const WAIT_ENV: &str = "MELIN_TEST_NODE_WAIT";
+
+/// Every thread unpinned, waiting as `wait` (the value of [`WAIT_ENV`])
+/// says, or why the value is refused.
+fn unpinned_cores(wait: Option<&std::ffi::OsStr>) -> Result<PipelineCores, String> {
+    let Some(wait) = wait else {
+        return Ok(PipelineCores::unpinned());
+    };
+    match wait.to_str() {
+        Some("park") => Ok(PipelineCores::unpinned()),
+        Some("yield") => Ok(PipelineCores::unpinned().all_yielding()),
+        _ => Err(format!(
+            "{WAIT_ENV}={wait:?}: expected `park` (the default) or `yield`"
+        )),
     }
 }
 
@@ -1134,5 +1176,55 @@ mod dpdk {
     fn first_allowed_cpu() -> usize {
         melin_app::affinity::first_allowed_cpu()
             .expect("this process's CPU mask is readable and holds a CPU")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every field [`config`] documents as differing from production
+    /// does. Dropping one passes every other test, slowly or flakily:
+    /// nodes that pin and spin on the same cores, or that exhaust the
+    /// locked-memory limit, only show it under a parallel suite.
+    #[test]
+    fn config_sizes_a_node_for_a_parallel_suite() {
+        let config = config();
+        assert_eq!(config.max_connections, MAX_CONNECTIONS);
+        assert!(config.no_mlock);
+        assert_eq!(config.ring_capacity, RING_CAPACITY);
+        assert_eq!(config.max_journal_mib, MAX_JOURNAL_MIB);
+        // Unpinned however the run waits: CI sets `WAIT_ENV` for a whole
+        // suite, this test included.
+        assert!(config.cores.pins_nothing());
+    }
+
+    /// The two waits `WAIT_ENV` names, the default when it is unset, and
+    /// a refusal for anything else: a misspelt value in CI must fail the
+    /// run, not quietly run the default.
+    #[test]
+    fn the_wait_variable_picks_park_or_yield_and_refuses_anything_else() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        assert_eq!(unpinned_cores(None), Ok(PipelineCores::unpinned()));
+        assert_eq!(
+            unpinned_cores(Some(OsStr::new("park"))),
+            Ok(PipelineCores::unpinned())
+        );
+        assert_eq!(
+            unpinned_cores(Some(OsStr::new("yield"))),
+            Ok(PipelineCores::unpinned().all_yielding())
+        );
+        for refused in [
+            OsStr::new(""),
+            OsStr::new("spin"),
+            OsStr::new("Yield"),
+            OsStr::from_bytes(b"\xff"),
+        ] {
+            let err = unpinned_cores(Some(refused)).expect_err("an unknown wait is refused");
+            assert!(err.contains(WAIT_ENV), "{err}");
+            assert!(err.contains("`park`") && err.contains("`yield`"), "{err}");
+        }
     }
 }

@@ -39,7 +39,6 @@ use melin_client::{
 };
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
-use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
 
 // ---------------------------------------------------------------------------
@@ -379,9 +378,6 @@ fn start_node(dir: &Path) -> melin_test_node::Node {
         authorized_keys,
         standalone: true,
         ack_policy: AckPolicy::Disk,
-        // Unpinned, as every test node: the proxy's loop spins on a core
-        // of its own beside the node's threads.
-        cores: PipelineCores::unpinned(),
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,
         health_bind: None,
