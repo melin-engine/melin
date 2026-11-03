@@ -70,7 +70,6 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 - **`melin_pipeline::wait::WaitStrategy` has a third variant,
   `SpinYieldPark`**: an exhaustive `match` on it must handle the new
   case.
-
 - **The last surviving replica no longer auto-promotes.** The majority
   check that stops an isolated replica promoting (see **Fixed**) cannot
   tell dead peers from unreachable ones: under `--raft-auto-promote`, a

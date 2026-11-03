@@ -1,6 +1,7 @@
 name: Post-merge
 
 # Checks that run when a change lands on main rather than on every push.
+#
 # The MSRV can only break via a commit (a new std API in our code, or a
 # dependency bump in Cargo.lock), so checking at the fast-forward push
 # that lands a branch catches the breakage at zero lag on main's history
@@ -9,6 +10,12 @@ name: Post-merge
 # cache against the Pre-merge entries people actually wait on. Not in
 # Nightly for the same reason inverted: nothing here can go red while the
 # tree stands still, which is Nightly's admission criterion.
+#
+# The yielding test run (the `test` job) can go red on a rerun of an
+# unchanged tree, a race being a race, so it would pass that criterion;
+# it is here instead because a race it finds at landing time is tied to
+# the commit that brought it, where a nightly finding is tied to a day's
+# worth of them.
 #
 # Same caveat as Nightly: `workflow_dispatch` does not appear in the UI
 # until the file is on the default branch, and once it is, a dispatch runs

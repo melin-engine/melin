@@ -18,9 +18,10 @@
 # a test node's idle threads sleep (unpinned, they park) and its journal
 # zero-fills small segments (it rotates at 8 MiB, `melin_test_node::config`):
 # when every node zero-filled 256 MiB segments, a dozen nodes at once
-# queued on the disk, and a test that needs under a second alone took ten.
-# Checked by repeated full runs, on all of a 16-thread host and confined
-# to 4 CPUs as on a hosted CI runner.
+# queued on the disk, and a test took many times as long as it does alone
+# (measured in docs/internal/iteration-time-2026-11.md). Checked by
+# repeated full runs, on all of a 16-thread host and confined to 4 CPUs
+# as on a hosted CI runner.
 #
 # Binaries are named exactly rather than matched by pattern. `binary()`
 # is an equality predicate: the previous `binary(failover)` matched
