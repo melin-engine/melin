@@ -23,26 +23,24 @@
 //! kernel socket of the test's own, on the address the nodes reach the
 //! test at.
 
-use std::io::Write;
-use std::net::{SocketAddr, TcpListener, TcpStream};
+#[path = "common/scripted_primary.rs"]
+mod scripted_primary;
+
+use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
 use counter_server::{Counter, CounterEvent, RequestDecoder, ResponseEncoder};
 use ed25519_dalek::SigningKey;
-use melin_journal::{JournalEvent, JournalReader};
+use melin_journal::JournalReader;
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::server::ServerConfig;
 use melin_test_node::probe::admin_reply_when_up;
 use melin_test_node::{Addrs, Node};
-use melin_transport_core::pipeline::{InputSlot, RequestId};
-use melin_transport_core::replication::protocol::{
-    MAX_CONTROL_FRAME, ReplicaMessage, decode_replica_message, encode_auth_ok, encode_challenge,
-    encode_stream_start, read_frame,
-};
-use melin_transport_core::replication_wire::encode_input_batch;
 use melin_transport_core::test_ports::free_addr;
+
+use scripted_primary::ScriptedPrimary;
 
 /// Port range for `free_addr`, shared with the other cluster binaries,
 /// whose tests may run at the same time: `free_addr` keeps concurrent
@@ -167,61 +165,26 @@ fn a_replica_configured_without_genesis_refuses_promotion_mid_genesis() {
 
     // A scripted primary: a new cluster's, whose journal records a
     // genesis of three entries.
-    let primary =
-        TcpListener::bind((melin_test_node::local_ip(), 0)).expect("bind replication listener");
+    let primary = ScriptedPrimary::bind();
     let mut replica_config = cluster.config("replica");
-    replica_config.replica_of = Some(primary.local_addr().expect("addr"));
+    replica_config.replica_of = Some(primary.addr());
     let replica_admin = replica_config.admin_bind.expect("set above");
     let replica_journal = replica_config.journal.clone();
     let replica = spawn_node(&addrs(0), replica_config, StartupEvents::none());
     let replica_client = replica.addr();
 
-    let (mut stream, _) = primary.accept().expect("the replica connects");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .expect("read timeout");
-    // Authentication: the scripted primary takes the replica's word.
-    let mut buf = Vec::new();
-    encode_challenge(&[0x5A; 32], &mut buf);
-    stream.write_all(&buf).expect("challenge");
-    read_frame(&mut stream, MAX_CONTROL_FRAME).expect("challenge response");
-    buf.clear();
-    encode_auth_ok(&mut buf);
-    stream.write_all(&buf).expect("auth ok");
-    let handshake = read_frame(&mut stream, MAX_CONTROL_FRAME).expect("handshake");
-    match decode_replica_message(&handshake).expect("decode handshake") {
-        ReplicaMessage::Handshake(h) => assert_eq!(h.last_sequence, 0, "a fresh replica"),
-        other => panic!("expected a handshake, got {other:?}"),
-    }
-    buf.clear();
-    encode_stream_start(0, 1, [0x3D; 32], Some(3), 0, &mut buf);
-    stream.write_all(&buf).expect("StreamStart");
+    let mut stream = primary.accept(Some(3));
+    assert_eq!(stream.resumes_after(), 0, "a fresh replica");
     // The first two genesis entries.
-    let slots: Vec<InputSlot<CounterEvent>> = [1_000, 2_000]
-        .iter()
-        .zip(1u64..)
-        .map(|(&amount, sequence)| InputSlot {
-            connection_id: 0,
-            request_id: RequestId(0),
-            key_hash: 0,
-            sequence,
-            timestamp_ns: 1,
-            event: JournalEvent::App(CounterEvent::Increment { amount }),
-            publish_ts: Default::default(),
-            recv_ts: Default::default(),
-        })
-        .collect();
-    buf.clear();
-    encode_input_batch(&slots, &mut buf).expect("encode InputBatch");
-    stream.write_all(&buf).expect("InputBatch");
-    loop {
-        let frame = read_frame(&mut stream, MAX_CONTROL_FRAME).expect("ack");
-        if let ReplicaMessage::Ack(ack) = decode_replica_message(&frame).expect("decode ack")
-            && ack.acked_sequence >= 2
-        {
-            break;
-        }
-    }
+    stream.send(
+        1,
+        1,
+        &[
+            CounterEvent::Increment { amount: 1_000 },
+            CounterEvent::Increment { amount: 2_000 },
+        ],
+    );
+    stream.wait_acked(2);
     // The primary dies.
     drop(stream);
     drop(primary);

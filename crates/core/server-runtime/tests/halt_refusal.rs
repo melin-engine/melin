@@ -31,7 +31,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use counter_server::{
-    GET_VALUE_REQUEST, KIND_RESP_ACK, KIND_RESP_REJECTED, KIND_RESP_VALUE, increment_request,
+    Counter, GET_VALUE_REQUEST, KIND_RESP_ACK, KIND_RESP_REJECTED, KIND_RESP_VALUE,
+    increment_request,
 };
 use melin_client::{Ack, Connection, Error, Frame};
 use melin_server_runtime::ack_policy::AckPolicy;
@@ -61,10 +62,10 @@ fn a_write_refused_while_halted_is_not_replayed() {
     let primary_health = primary_config.health_bind.expect("set by the fixture");
     let primary_journal = primary_config.journal.clone();
 
-    let primary = spawn_node(&primary_addrs, primary_config);
-    let replica = spawn_node(
+    let primary = spawn_node::<Counter>(&primary_addrs, primary_config);
+    let replica = spawn_node::<Counter>(
         &addrs(1),
-        fx.replica_config("replica", &primary_addrs, AckPolicy::Disk),
+        fx.replica_config("replica", primary_addrs.replication(), AckPolicy::Disk),
     );
 
     // --- Taking writes: the replica is attached, the write is taken. ---
@@ -110,9 +111,9 @@ fn a_write_refused_while_halted_is_not_replayed() {
     wait_for_gauge(primary_health, "melin_writes_refused_total", 1);
 
     // --- Taking writes again: a replica attaches, the refused write is resent. ---
-    let replica = spawn_node(
+    let replica = spawn_node::<Counter>(
         &addrs(2),
-        fx.replica_config("replica2", &primary_addrs, AckPolicy::Disk),
+        fx.replica_config("replica2", primary_addrs.replication(), AckPolicy::Disk),
     );
     wait_for_gauge(primary_health, "melin_replicas_connected", 1);
     let ack = one_reply(&mut conn, &increment_request(5));
@@ -133,7 +134,7 @@ fn a_write_refused_while_halted_is_not_replayed() {
         health_bind: None,
         ..melin_test_node::config()
     };
-    let restarted = spawn_node(&addrs(0), restart_config);
+    let restarted = spawn_node::<Counter>(&addrs(0), restart_config);
     let mut conn = fx.client(&restarted);
     let replayed = value_of(&mut conn);
     drop(conn);
@@ -169,7 +170,7 @@ fn a_refusal_overtakes_a_held_write() {
     // the grace period passed.
     primary_config.no_degraded_acks = true;
     let health = primary_config.health_bind.expect("set by the fixture");
-    let primary = spawn_node(&primary_addrs, primary_config);
+    let primary = spawn_node::<Counter>(&primary_addrs, primary_config);
 
     // Up, so its replication endpoint is listening; then the replica,
     // caught up and acked, so the node takes writes and holds only W1.
@@ -292,10 +293,10 @@ fn a_disk_primary_keeps_answering_once_its_replica_is_gone() {
     primary_config.tick_interval_ms = 5;
     let health = primary_config.health_bind.expect("set by the fixture");
 
-    let primary = spawn_node(&primary_addrs, primary_config);
-    let replica = spawn_node(
+    let primary = spawn_node::<Counter>(&primary_addrs, primary_config);
+    let replica = spawn_node::<Counter>(
         &addrs(1),
-        fx.replica_config("replica", &primary_addrs, AckPolicy::Disk),
+        fx.replica_config("replica", primary_addrs.replication(), AckPolicy::Disk),
     );
     wait_for_gauge(health, "melin_replicas_connected", 1);
 

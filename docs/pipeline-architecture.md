@@ -179,7 +179,7 @@ The matching stage keeps a watermark of the latest time it has handed the applic
 
 A journaled tick advances the application's clock to the tick's own time whether or not it is past the watermark.
 
-Journal replay and the shadow stage advance the clock by the same rules, from the same journaled timestamps, so the live application, a recovered one and the shadow's copy see the same clock. One known exception: the watermark is not carried across a restart or snapshot restore, so after a wall clock that stepped backwards — or a failover to a node whose clock is behind — a node that restarted can advance the clock at points where one that kept running did not. An application whose clock handling does nothing for a time it has already passed — no due work fires again, no state records the earlier time — is unaffected.
+Journal replay and the shadow stage advance the clock by the same rules, from the same journaled timestamps, so the live application, a recovered one and the shadow's copy see the same clock. The watermark goes with the state it belongs to: a node that restarts goes on from the one replay reached, a snapshot records the one of its position, a replica resynced from a snapshot takes the snapshot's, and a promoted replica keeps its own. So a node that restarted, restored a snapshot or was promoted advances the clock at the same points as one that kept running, even where timestamps repeat or step backwards. A snapshot written in a framing before version 5 (see [the journal guide](journal.md)) records no watermark: restoring one starts from the timestamp of the journal entry at the snapshot's position, or from zero when the journal no longer holds that entry, and logs a warning; the next snapshot records it.
 
 ## Input Disruptor
 

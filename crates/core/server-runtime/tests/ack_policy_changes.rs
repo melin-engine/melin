@@ -55,6 +55,7 @@ use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::server::ServerConfig;
 use melin_test_node::probe::{
     admin_command, admin_reply_when_up, admin_until_ok, gauge, wait_for_gauge,
+    wait_for_snapshot_where, wait_released,
 };
 use melin_test_node::{Addrs, Node};
 use serial_test::serial;
@@ -94,22 +95,6 @@ const DURABLE: &str = "melin_journal_sequence";
 /// tests hand theirs back (`port_pool`).
 fn port() -> SocketAddr {
     port_pool::port(PORT_BASE)
-}
-
-/// Wait until a stopped node's health and admin endpoints are released.
-/// Both are reused on every boot, but `Node::stop` does not join their
-/// threads: the admin listener sees the shutdown flag only on its next
-/// 100ms poll, and a node restarted while it is still bound fails to bind
-/// it and never comes up. (Waiting here does not take the ports: each
-/// probe listener is dropped at once.)
-fn wait_released(endpoints: [SocketAddr; 2]) {
-    let deadline = Instant::now() + LIMIT;
-    for addr in endpoints {
-        while std::net::TcpListener::bind(addr).is_err() {
-            assert!(Instant::now() < deadline, "{addr} still bound");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
 }
 
 /// Node `slot`'s addresses, from [`port`] on kernel TCP.
@@ -236,7 +221,7 @@ impl Cluster {
     }
 
     fn start(&self, config: ServerConfig) -> Node {
-        wait_released([self.health, self.admin]);
+        wait_released(&[self.health, self.admin]);
         melin_test_node::start_at::<Counter>(
             &self.addrs,
             config,
@@ -275,7 +260,7 @@ impl Cluster {
     }
 
     fn start_replica(&self, endpoints: &ReplicaEndpoints, config: ServerConfig) -> Node {
-        wait_released([endpoints.health, endpoints.admin]);
+        wait_released(&[endpoints.health, endpoints.admin]);
         melin_test_node::start_at::<Counter>(
             &endpoints.addrs,
             config,
@@ -724,23 +709,17 @@ fn a_replica_restarted_from_its_own_snapshot_keeps_the_change_pending() {
         .expect("the replica's store")
         .snapshot()
         .to_path_buf();
-    let deadline = Instant::now() + LIMIT;
-    let lineage = loop {
-        let archived = !melin_journal::segment::list_archives(&journal)
-            .expect("list the replica's archives")
-            .is_empty();
-        if archived
-            && let Ok((_, header)) = melin_transport_core::snapshot::load::<Counter>(&snapshot)
-            && header.sequence >= 4
-        {
-            break header.lineage;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the replica never archived and snapshotted past the rotation"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let lineage = wait_for_snapshot_where::<Counter>(
+        &snapshot,
+        "went past the rotation with the replica's journal archived",
+        |header| {
+            header.sequence >= 4
+                && !melin_journal::segment::list_archives(&journal)
+                    .expect("list the replica's archives")
+                    .is_empty()
+        },
+    )
+    .lineage;
     assert_eq!(
         lineage.ack_policy,
         Some(LineagePolicy {

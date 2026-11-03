@@ -1,14 +1,18 @@
 //! Reading a running node from the outside, as an operator does: its
-//! health endpoint's gauges and its admin endpoint's replies.
+//! health endpoint's gauges, its admin endpoint's replies, the snapshot
+//! it writes, and whether its endpoints' ports are let go once it stops.
 //!
 //! Both endpoints are kernel TCP on either transport (see the crate docs),
 //! so the same calls read a node on DPDK.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
+use melin_app::Application;
 use melin_client::{Connection, SigningKey};
+use melin_transport_core::snapshot::{self, SnapshotHeader};
 
 /// How long a gauge may take to reach the value a test waits for, or an
 /// admin endpoint to answer as a test needs: generous, for a slow and
@@ -81,6 +85,52 @@ fn wait_for_gauge_matching(
             "{name} never {what} within {limit:?} (last: {last:?})"
         );
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Wait, at most [`PROBE_LIMIT`], until nothing listens on any of
+/// `endpoints`, health or admin endpoints of a node that has stopped,
+/// before a node is started on them again. Both are reused on every boot,
+/// but stopping a node does not join their threads: the admin listener
+/// sees the shutdown only on its next poll, and a node started while one
+/// is still bound fails to bind it and never comes up. (Waiting here does
+/// not take the ports: each probe listener is dropped at once.)
+pub fn wait_released(endpoints: &[SocketAddr]) {
+    let deadline = Instant::now() + PROBE_LIMIT;
+    for &addr in endpoints {
+        while TcpListener::bind(addr).is_err() {
+            assert!(Instant::now() < deadline, "{addr} was never let go");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+/// Wait, at most [`PROBE_LIMIT`], until the snapshot at `path` loads as
+/// one of `A` and its header is one `accept` takes, and return that
+/// header; the failure says the snapshot never `what`. A snapshot is
+/// written aside and renamed into place, so a load that fails is one not
+/// in place yet (none taken, or the last one being replaced), retried
+/// like any other not-yet.
+pub fn wait_for_snapshot_where<A: Application>(
+    path: &Path,
+    what: &str,
+    accept: impl Fn(&SnapshotHeader) -> bool,
+) -> SnapshotHeader {
+    let deadline = Instant::now() + PROBE_LIMIT;
+    loop {
+        let last = snapshot::load::<A>(path).map(|(_, header)| header);
+        if let Ok(header) = &last
+            && accept(header)
+        {
+            return *header;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the snapshot at {} never {what} within {PROBE_LIMIT:?} (last: {:?})",
+            path.display(),
+            last.map(|header| header.sequence)
+        );
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 

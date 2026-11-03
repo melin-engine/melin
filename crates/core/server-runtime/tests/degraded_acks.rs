@@ -37,7 +37,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use counter_server::{
-    GET_VALUE_REQUEST, KIND_RESP_ACK, KIND_RESP_REJECTED, KIND_RESP_VALUE, increment_request,
+    Counter, GET_VALUE_REQUEST, KIND_RESP_ACK, KIND_RESP_REJECTED, KIND_RESP_VALUE,
+    increment_request,
 };
 use melin_client::{Ack, Error, Frame};
 use melin_server_runtime::ack_policy::AckPolicy;
@@ -192,13 +193,12 @@ fn run(policy: AckPolicy, scenario: Scenario) {
         Scenario::SwitchedOff => primary_config.no_degraded_acks = true,
     }
     let health = primary_config.health_bind.expect("set by the fixture");
-    let primary = spawn_node(&primary_addrs, primary_config);
+    let primary = spawn_node::<Counter>(&primary_addrs, primary_config);
 
     // The replica reaches its primary through the relay.
     let proxy = Proxy::start(primary_addrs.replication());
-    let mut replica_config = fx.replica_config("replica", &primary_addrs, policy);
-    replica_config.replica_of = Some(proxy.addr());
-    let replica = spawn_node(&addrs(1), replica_config);
+    let replica_config = fx.replica_config("replica", proxy.addr(), policy);
+    let replica = spawn_node::<Counter>(&addrs(1), replica_config);
     wait_for_gauge(health, "melin_replicas_connected", 1);
     let (seen_connected, degraded_probes) = confirmed_in_full(&fx, &primary);
 

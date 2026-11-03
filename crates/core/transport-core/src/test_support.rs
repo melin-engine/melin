@@ -12,6 +12,9 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 
+use melin_app::auth::{ClientRole, NoRoles};
+use melin_app::decoder::{Decoded, RequestDecoder};
+use melin_app::encoder::ResponseEncoder;
 use melin_app::{AppEvent, Application, ApplyCtx, CodecError, QueryCtx, RejectReason};
 use melin_journal::{AckPolicyByte, AckPolicyChange, JournalEvent};
 
@@ -268,5 +271,137 @@ impl Application for TickCountingApp {
         Ok(Self {
             ticks: read_u64(r)?,
         })
+    }
+}
+
+/// The client codec of [`TickCountingApp`], for tests that serve it
+/// through a node and read its tick count from what its clients receive.
+///
+/// A request body is the event's journal encoding ([`AppEvent::encode`]),
+/// so a client builds one with [`Self::request`]. A report's body is its
+/// tick count, a query's the count then the journal sequence it was
+/// answered at, each a little-endian `u64`, read back with
+/// [`Self::report`] and [`Self::query`]. Only the operator is admitted
+/// ([`NoRoles`]): the tests that use it hold no other key.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TickCountingCodec;
+
+impl TickCountingCodec {
+    /// The body of a request for `event`.
+    pub fn request(event: TestEvent) -> Vec<u8> {
+        let mut body = vec![0u8; event.encoded_size()];
+        event.encode(&mut body);
+        body
+    }
+
+    /// The tick count a report's body carries.
+    pub fn report(body: &[u8]) -> Result<TickCount, CodecError> {
+        Ok(TickCount {
+            ticks: u64_body(body)?,
+        })
+    }
+
+    /// The tick count and journal sequence a query's body carries.
+    pub fn query(body: &[u8]) -> Result<TestQuery, CodecError> {
+        let (ticks, sequence) = body.split_at_checked(8).ok_or(CodecError::Truncated)?;
+        Ok(TestQuery {
+            total: u64_body(ticks)?,
+            journal_sequence: u64_body(sequence)?,
+        })
+    }
+}
+
+/// Exactly one little-endian `u64`: fewer bytes is a truncated body, more
+/// is one this codec did not write.
+fn u64_body(body: &[u8]) -> Result<u64, CodecError> {
+    match <[u8; 8]>::try_from(body) {
+        Ok(bytes) => Ok(u64::from_le_bytes(bytes)),
+        Err(_) if body.len() < 8 => Err(CodecError::Truncated),
+        Err(_) => Err(CodecError::InvalidField),
+    }
+}
+
+impl RequestDecoder for TickCountingCodec {
+    type Event = TestEvent;
+    type Role = NoRoles;
+
+    fn decode(&self, body: &[u8], _role: ClientRole<NoRoles>) -> Decoded<TestEvent> {
+        match TestEvent::decode(body) {
+            Ok(event) => Decoded::Permitted(event),
+            Err(_) => Decoded::DecodeError("not a test event"),
+        }
+    }
+}
+
+impl ResponseEncoder for TickCountingCodec {
+    type Report = TickCount;
+    type Query = TestQuery;
+
+    fn encode_report(&self, report: &TickCount, buf: &mut [u8]) -> Result<usize, &'static str> {
+        let body = buf.first_chunk_mut::<8>().ok_or("buffer too small")?;
+        *body = report.ticks.to_le_bytes();
+        Ok(8)
+    }
+
+    fn encode_query(&self, query: &TestQuery, buf: &mut [u8]) -> Result<usize, &'static str> {
+        let body = buf.first_chunk_mut::<16>().ok_or("buffer too small")?;
+        body[..8].copy_from_slice(&query.total.to_le_bytes());
+        body[8..].copy_from_slice(&query.journal_sequence.to_le_bytes());
+        Ok(16)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What a client sends decodes to the event it was built from, and
+    /// what the node encodes reads back as what it encoded; anything else
+    /// is refused rather than misread.
+    #[test]
+    fn the_tick_counting_codec_round_trips() {
+        for event in [TestEvent::Add(7), TestEvent::Query] {
+            let body = TickCountingCodec::request(event);
+            assert!(matches!(
+                TickCountingCodec.decode(&body, ClientRole::Operator),
+                Decoded::Permitted(decoded) if decoded == event
+            ));
+        }
+        assert!(matches!(
+            TickCountingCodec.decode(&[0x7F], ClientRole::Operator),
+            Decoded::DecodeError(_)
+        ));
+
+        let mut buf = [0u8; 32];
+        let report = TickCount { ticks: 41 };
+        let len = TickCountingCodec.encode_report(&report, &mut buf).unwrap();
+        assert_eq!(TickCountingCodec::report(&buf[..len]), Ok(report));
+        let query = TestQuery {
+            total: 3,
+            journal_sequence: 99,
+        };
+        let len = TickCountingCodec.encode_query(&query, &mut buf).unwrap();
+        assert_eq!(TickCountingCodec::query(&buf[..len]), Ok(query));
+
+        assert_eq!(
+            TickCountingCodec::report(&[0; 7]),
+            Err(CodecError::Truncated)
+        );
+        assert_eq!(
+            TickCountingCodec::report(&[0; 9]),
+            Err(CodecError::InvalidField)
+        );
+        assert_eq!(
+            TickCountingCodec::query(&[0; 15]),
+            Err(CodecError::Truncated)
+        );
+        assert_eq!(
+            TickCountingCodec.encode_report(&report, &mut [0; 7]),
+            Err("buffer too small")
+        );
+        assert_eq!(
+            TickCountingCodec.encode_query(&query, &mut [0; 15]),
+            Err("buffer too small")
+        );
     }
 }
