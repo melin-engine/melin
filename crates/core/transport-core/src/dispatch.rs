@@ -30,10 +30,11 @@ use melin_journal::{AckPolicyChange, JournalEvent};
 /// passed diverges. So it cannot be minted from a bare number: a stage
 /// starts from [`Self::GENESIS`] (nothing dispatched yet), or from a
 /// value its source carried to it — replay's result, which recovery hands
-/// out with the application it rebuilt, or the one a matching stage held
+/// out with the application it rebuilt, the one a matching stage held
 /// when it stopped, which it hands back with its application in a
-/// [`WarmApp`] — and every value after that comes from the clock step
-/// advancing it.
+/// [`WarmApp`], or the one a snapshot recorded for its position (see
+/// [`SnapshotHeader`](crate::snapshot::SnapshotHeader)) — and every value
+/// after that comes from the clock step advancing it.
 ///
 /// A `u64` of nanoseconds, the unit and width of the journaled timestamp
 /// it is compared with. Not `Default`, and no `From<u64>`, so a stage
@@ -47,15 +48,26 @@ impl TickWatermark {
     /// non-zero timestamp fires a tick.
     pub const GENESIS: Self = Self(0);
 
-    /// The watermark of state restored from a snapshot, which does not
-    /// carry one yet: a node recovering from its own snapshot, or a
-    /// replica loading the one a primary's resync sent. Zero, as every
-    /// stage started before the watermark was carried, so these paths
-    /// still make the extra tick calls this type exists to prevent; each
-    /// call site names its source, and the value moves to that source as
-    /// it learns to carry it.
-    pub const fn not_yet_carried() -> Self {
-        Self(0)
+    /// The watermark a snapshot header recorded for its position, read
+    /// back: the snapshot parser's alone, so the only number a stage can
+    /// start from is one a stage held.
+    pub(crate) const fn recorded(nanos: u64) -> Self {
+        Self(nanos)
+    }
+
+    /// The watermark at the position of a journal entry stamped
+    /// `timestamp_ns`, taken as the entry's timestamp: what restoring a
+    /// snapshot that predates the recorded watermark falls back on (see
+    /// [`SnapshotHeader::resume_tick_watermark`](crate::snapshot::SnapshotHeader::resume_tick_watermark)).
+    /// Exact unless an earlier entry carried a later timestamp, which the
+    /// watermark, the newest timestamp seen, would hold instead.
+    pub(crate) const fn at_entry(timestamp_ns: u64) -> Self {
+        Self(timestamp_ns)
+    }
+
+    /// The nanoseconds, for the snapshot header that records them.
+    pub(crate) const fn as_nanos(self) -> u64 {
+        self.0
     }
 }
 
@@ -285,12 +297,13 @@ mod tests {
         assert_eq!(watermark, TickWatermark(301));
     }
 
-    /// The interim watermark of state whose source carries none is the
-    /// genesis one: those paths behave as before the watermark was
-    /// carried, no worse.
+    /// A recorded watermark and an entry's timestamp read back as the
+    /// nanoseconds they were made from, which the snapshot header writes.
     #[test]
-    fn an_uncarried_watermark_is_genesis() {
-        assert_eq!(TickWatermark::not_yet_carried(), TickWatermark::GENESIS);
+    fn a_watermark_made_from_nanoseconds_reads_them_back() {
+        assert_eq!(TickWatermark::recorded(42).as_nanos(), 42);
+        assert_eq!(TickWatermark::at_entry(7).as_nanos(), 7);
+        assert_eq!(TickWatermark::GENESIS.as_nanos(), 0);
     }
 
     #[test]

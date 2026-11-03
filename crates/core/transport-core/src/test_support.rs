@@ -1,5 +1,6 @@
-//! Minimal `Application` implementation used by the transport-core test
-//! suite. Not part of the public API.
+//! Minimal `Application` implementations used by the transport-core test
+//! suite and, under `test-utils`, other crates' tests. Not part of the
+//! public API.
 //!
 //! `TestApp` tracks a running sum and a per-key running sum (keyed on
 //! `ApplyCtx::key_hash`) so round-trip tests can assert state equality

@@ -3992,12 +3992,11 @@ where
                     snap.genesis_entries,
                     prealloc,
                 )?;
-                JournaledApp::<A, W>::from_parts(
-                    app,
-                    writer,
-                    snap.lineage,
-                    TickWatermark::not_yet_carried(),
-                )
+                // No segment survives to hold the entry at the snapshot's
+                // sequence, so a snapshot from before the recorded
+                // watermark takes the fallback that needs none.
+                let tick_watermark = snap.resume_tick_watermark(snap_path, None);
+                JournaledApp::<A, W>::from_parts(app, writer, snap.lineage, tick_watermark)
             }
             BootstrapSource::JournalOnly => {
                 info!("recovering from journal");
@@ -5338,6 +5337,89 @@ mod genesis_tests {
     fn a_recovering_boot_carries_the_replayed_tick_watermark() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = config(dir.path());
+        let replayed = ticked_journal(&cfg);
+
+        let engine = boot_engine(&cfg);
+        assert!(!engine.began_history);
+        assert_eq!(engine.tick_watermark, replayed);
+    }
+
+    /// A boot from a snapshot hands its pipeline the watermark the
+    /// snapshot records, beside the journal or without it: no journal
+    /// segment survives on the snapshot-only path to fall back on, so
+    /// the record is the only exact source there.
+    #[test]
+    fn a_snapshot_boot_carries_the_snapshots_tick_watermark() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = config(dir.path());
+        let replayed = ticked_journal(&cfg);
+        let store = cfg.store().expect("store");
+        save_snapshot(&boot_engine(&cfg), store.snapshot());
+
+        assert_eq!(
+            boot_engine(&cfg).tick_watermark,
+            replayed,
+            "with the journal"
+        );
+        std::fs::remove_file(&cfg.journal).expect("move the journal aside");
+        assert_eq!(boot_engine(&cfg).tick_watermark, replayed, "snapshot only");
+    }
+
+    /// A boot from a snapshot that predates the recorded watermark: beside
+    /// the journal, the entry at the snapshot's sequence gives it exactly;
+    /// on the snapshot-only path no segment holds that entry, so the boot
+    /// takes a fresh watermark and says so, once.
+    #[test]
+    fn a_boot_from_an_older_snapshot_falls_back_and_warns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = config(dir.path());
+        let replayed = ticked_journal(&cfg);
+        let store = cfg.store().expect("store");
+        save_snapshot(&boot_engine(&cfg), store.snapshot());
+        let v5 = std::fs::read(store.snapshot()).expect("read snapshot");
+        std::fs::write(store.snapshot(), melin_transport_core::snapshot::as_v4(&v5))
+            .expect("rewrite snapshot");
+
+        let boot_logged = |cfg: &ServerConfig| {
+            let logs = melin_transport_core::test_logs::Logs::default();
+            let watermark =
+                tracing::subscriber::with_default(logs.subscriber(tracing::Level::DEBUG), || {
+                    boot_engine(cfg).tick_watermark
+                });
+            (
+                watermark,
+                logs.lines("predates the recorded tick watermark"),
+            )
+        };
+
+        let (watermark, warnings) = boot_logged(&cfg);
+        assert_eq!(watermark, replayed, "with the journal");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("WARN"), "{}", warnings[0]);
+        assert!(warnings[0].contains("timestamp of the journal entry"));
+
+        std::fs::remove_file(&cfg.journal).expect("move the journal aside");
+        let (watermark, warnings) = boot_logged(&cfg);
+        assert_eq!(
+            watermark,
+            melin_transport_core::TickWatermark::GENESIS,
+            "snapshot only"
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("WARN"), "{}", warnings[0]);
+        assert!(warnings[0].contains("no longer holds the entry"));
+    }
+
+    /// `init_engine` on `cfg` with no genesis.
+    fn boot_engine(cfg: &ServerConfig) -> super::InitializedEngine<Counter, Writer> {
+        init_engine::<Counter, Writer>(cfg, &cfg.store().expect("store"), &(), Vec::new())
+            .expect("init_engine")
+    }
+
+    /// A journal at `cfg`'s path holding two increments at 100 and 300
+    /// ns, and the watermark replay of it reaches, read independently of
+    /// any boot path (and not the genesis one).
+    fn ticked_journal(cfg: &ServerConfig) -> melin_transport_core::TickWatermark {
         let mut w =
             Writer::create_continuing(&cfg.journal, 1, [0; 32], None, PREALLOC).expect("create");
         let event = JournalEvent::App(CounterEvent::Increment { amount: 1 });
@@ -5349,7 +5431,6 @@ mod genesis_tests {
         w.flush_batch_sync().expect("flush");
         drop(w);
 
-        // What replay of this journal reaches, read independently.
         let replayed = melin_transport_core::JournaledApp::<Counter, Writer>::recover(
             Counter::default(),
             &cfg.journal,
@@ -5358,12 +5439,7 @@ mod genesis_tests {
         .expect("replay")
         .tick_watermark();
         assert_ne!(replayed, melin_transport_core::TickWatermark::GENESIS);
-
-        let engine =
-            init_engine::<Counter, Writer>(&cfg, &cfg.store().expect("store"), &(), Vec::new())
-                .expect("init_engine");
-        assert!(!engine.began_history);
-        assert_eq!(engine.tick_watermark, replayed);
+        replayed
     }
 
     /// Finding 3: the standard upgrade (snapshot, new binary, fresh
@@ -5409,6 +5485,7 @@ mod genesis_tests {
                 .read_header_info()
                 .expect("journal header")
                 .genesis_entries,
+            engine.tick_watermark,
             path,
         )
         .expect("save snapshot");

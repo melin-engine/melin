@@ -5223,9 +5223,11 @@ fn the_live_stage_ticks_once_per_newer_timestamp() {
 }
 
 /// A journal at `path` holding one `Add` per timestamp in `timestamps`,
-/// each journaled under its own.
+/// each journaled under its own. Returns the chain hash after the last,
+/// what a snapshot at that position records (zero with the hash chain
+/// off, as the journal stage publishes it).
 #[cfg(not(feature = "no-persist"))]
-fn journal_at(path: &std::path::Path, timestamps: &[u64]) {
+fn journal_at(path: &std::path::Path, timestamps: &[u64]) -> [u8; 32] {
     use melin_journal::JournalWrite;
     let mut writer = Writer::create(path, PREALLOC).unwrap();
     for &timestamp_ns in timestamps {
@@ -5234,6 +5236,7 @@ fn journal_at(path: &std::path::Path, timestamps: &[u64]) {
             .unwrap();
     }
     writer.flush_batch_sync().unwrap();
+    writer.chain_hash().unwrap_or([0; 32])
 }
 
 /// The reports of the application events in `outputs`.
@@ -5400,11 +5403,11 @@ fn the_shadow_starts_where_the_live_stage_does() {
 
         // The snapshot taken once the shadow has consumed every event.
         let deadline = std::time::Instant::now() + DRAIN_TIMEOUT;
-        let shadow = loop {
+        let (shadow, header) = loop {
             if let Ok((shadow, header)) = crate::snapshot::load::<TickCountingApp>(&snap_path)
                 && header.sequence == last
             {
-                break shadow;
+                break (shadow, header);
             }
             assert!(
                 std::time::Instant::now() < deadline,
@@ -5414,12 +5417,81 @@ fn the_shadow_starts_where_the_live_stage_does() {
         };
         shutdown.store(true, Ordering::Relaxed);
         t_journal.join().unwrap().unwrap();
-        let live = t_matching.join().unwrap().app;
+        let live = t_matching.join().unwrap();
         t_shadow.join().unwrap();
 
-        assert_eq!(live, uninterrupted.app, "replica = {replica}");
-        assert_eq!(shadow, live, "replica = {replica}");
+        assert_eq!(live.app, uninterrupted.app, "replica = {replica}");
+        assert_eq!(shadow, live.app, "replica = {replica}");
+        assert_eq!(
+            header.resume_tick_watermark(&snap_path, None),
+            live.tick_watermark,
+            "the snapshot records the shadow's watermark, the live stage's there; \
+             replica = {replica}"
+        );
     }
+}
+
+/// A node restored from a shadow snapshot makes the tick calls one that
+/// ran through the snapshot's position uninterrupted makes: the shadow
+/// records the watermark it reached in the snapshot, and recovery starts
+/// replay, and so the stages built after it, from that value. The first
+/// event after the snapshot repeats the last timestamp the snapshot
+/// covers, and fires no tick — on an application that counts every call,
+/// a node restored at a fresh watermark would report one more from then
+/// on.
+#[cfg(not(feature = "no-persist"))]
+#[test]
+fn a_node_restored_from_a_snapshot_makes_the_tick_calls_an_uninterrupted_one_makes() {
+    let all = slots_at(&RESTART_TIMESTAMPS);
+    let uninterrupted = run_matching_over_slots(TickCountingApp::default(), &all, all.len(), false);
+
+    let dir = tempfile::tempdir().unwrap();
+    let (snap_path, journal) = shadow_snapshot_of_restart_journal(dir.path());
+    let restored = JournaledApp::<TickCountingApp, Writer>::recover_from_snapshot(
+        &snap_path, &journal, PREALLOC,
+    )
+    .unwrap();
+    let tick_watermark = restored.tick_watermark();
+    let (app, _writer) = restored.into_parts();
+    let after = &all[RESTART_AT..];
+    let continued = run_matching_from(app, tick_watermark, after, after.len(), false);
+
+    assert_eq!(
+        tick_counts(&continued.outputs),
+        tick_counts(&uninterrupted.outputs)[RESTART_AT..],
+        "the restored node reports what the uninterrupted one did"
+    );
+    assert_eq!(continued.app, uninterrupted.app, "and ends in its state");
+}
+
+/// The first [`RESTART_AT`] entries of [`RESTART_TIMESTAMPS`] journaled
+/// in `dir`, and the snapshot the real shadow stage takes once it has
+/// applied them from a fresh journal's position: the snapshot's path,
+/// then the journal's.
+#[cfg(not(feature = "no-persist"))]
+fn shadow_snapshot_of_restart_journal(
+    dir: &std::path::Path,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let journal = dir.join("restart.journal");
+    let chain_hash = journal_at(&journal, &RESTART_TIMESTAMPS[..RESTART_AT]);
+    let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
+        .add_consumer()
+        .build(WaitStrategy::SpinThenYield);
+    let feed =
+        crate::shadow::ShadowFeed::at(consumers.pop(), FIRST_SEQ, TickWatermark::GENESIS).unwrap();
+    for slot in &slots_at(&RESTART_TIMESTAMPS[..RESTART_AT]) {
+        producer.publish(*slot);
+    }
+    let (_, header) = shadow_snapshot_at(
+        dir,
+        Lineage::GENESIS,
+        feed,
+        TickCountingApp::default(),
+        RESTART_AT,
+        chain_hash,
+    );
+    assert_eq!(header.sequence, RESTART_AT as u64);
+    (dir.join("shadow.snapshot"), journal)
 }
 
 /// The timestamps of the history the promotion test below drives: the
@@ -5613,10 +5685,30 @@ fn shadow_snapshot_over<A>(
 where
     A: melin_app::Application<Event = TestEvent> + Send + 'static,
 {
+    let (app, header) = shadow_snapshot_at(dir, initial, feed, app, published, [0; 32]);
+    (app, header.lineage)
+}
+
+/// [`shadow_snapshot_over`], with the journal's chain hash at the
+/// snapshot's position given (so recovery can pair the snapshot with a
+/// real journal), returning the whole header of the snapshot written. It
+/// is at `dir/shadow.snapshot`, at wire sequence `published`.
+#[cfg(not(feature = "no-persist"))]
+fn shadow_snapshot_at<A>(
+    dir: &std::path::Path,
+    initial: Lineage,
+    feed: crate::shadow::ShadowFeed<TestEvent>,
+    app: A,
+    published: usize,
+    chain_hash: [u8; 32],
+) -> (A, crate::snapshot::SnapshotHeader)
+where
+    A: melin_app::Application<Event = TestEvent> + Send + 'static,
+{
     let (_fsync_writer, fsync_reader) =
         melin_pipeline::seqlock::split(crate::pipeline::FsyncState {
             journal_seq: WireSeq::new(published as u64),
-            chain_hash: [0; 32],
+            chain_hash,
             input_ring_seq: crate::cursors::RingPos::new(published as u64),
         });
     let snap_path = dir.join("shadow.snapshot");
@@ -5643,8 +5735,7 @@ where
     }
     shadow_shutdown.store(true, Ordering::Relaxed);
     t_shadow.join().unwrap();
-    let (app, header) = crate::snapshot::load::<A>(&snap_path).unwrap();
-    (app, header.lineage)
+    crate::snapshot::load::<A>(&snap_path).unwrap()
 }
 
 /// The shadow starts from the lineage it is given — what the live

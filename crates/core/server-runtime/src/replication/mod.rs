@@ -1194,6 +1194,11 @@ struct ResyncTransfer<A> {
     /// The snapshot's lineage. Adopted by the caller once the whole
     /// transfer has succeeded, so a failed one leaves none behind.
     lineage: melin_transport_core::lineage::Lineage,
+    /// The tick watermark at the snapshot's sequence: the one the
+    /// primary's file records, or the fallback for an older file, from
+    /// the seed's entry at that sequence. What the replica's stages start
+    /// from, so it makes the tick calls the primary made.
+    tick_watermark: TickWatermark,
 }
 
 /// What [`handle_resync_verdict`] resolved a `NeedSnapshot` /
@@ -1284,24 +1289,33 @@ where
     // integrity, not that the primary sent a well-formed prefix ending at
     // the snapshot sequence. (With hash-chain on, the chain cross-check in
     // `handle_resync_verdict` subsumes this; without it, this is the only
-    // guard.) Reads the whole seed, so it runs serviced too.
-    source.serviced(|| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if let Err(e) =
-            melin_journal::segment::verify_segment_prefix(&seed_tmp, snap_sequence, seed_len)
-        {
-            let _ = std::fs::remove_file(&seed_tmp);
-            return Err(format!("segment seed failed structural verification: {e}").into());
-        }
-        std::fs::rename(&seed_tmp, journal_path)?;
-        melin_journal::segment::fsync_parent_dir(journal_path)?;
-        Ok(())
-    })?;
+    // guard.) Reads the whole seed, so it runs serviced too, as does the
+    // read of its last entry an older snapshot's watermark falls back on.
+    let tick_watermark = source.serviced(
+        || -> Result<TickWatermark, Box<dyn std::error::Error + Send + Sync>> {
+            if let Err(e) =
+                melin_journal::segment::verify_segment_prefix(&seed_tmp, snap_sequence, seed_len)
+            {
+                let _ = std::fs::remove_file(&seed_tmp);
+                return Err(format!("segment seed failed structural verification: {e}").into());
+            }
+            std::fs::rename(&seed_tmp, journal_path)?;
+            melin_journal::segment::fsync_parent_dir(journal_path)?;
+            // The primary sent its snapshot file whole, header included,
+            // so the watermark is the one it recorded. A file from before
+            // the field falls back on the seed's entry at the snapshot's
+            // sequence — absent when the snapshot sits on a segment
+            // boundary, whose seed is a header alone.
+            Ok(snap_header.resume_tick_watermark_over::<A::Event>(snapshot_path, journal_path)?)
+        },
+    )?;
     Ok(ResyncTransfer {
         app: snap_app,
         snap_sequence,
         snap_chain_hash,
         seed_len,
         lineage: snap_header.lineage,
+        tick_watermark,
     })
 }
 
@@ -1415,6 +1429,7 @@ where
         snap_chain_hash,
         seed_len,
         lineage: snap_lineage,
+        tick_watermark: snap_tick_watermark,
     } = match receive_resync_transfer::<A, S>(source, store) {
         Ok(v) => v,
         Err(e) => {
@@ -1431,10 +1446,11 @@ where
     // replica onto the primary's lineage, its epoch and ack policy
     // included. Only now: a transfer that failed part-way adopts nothing.
     adopt_recovered_lineage(fence_state, &control.lineage_ack_policy, snap_lineage);
-    // The transferred snapshot does not carry its watermark yet.
+    // The stages built over the snapshot's state start from its
+    // position's watermark, as the primary's held it there.
     *app = Some(WarmApp {
         app: snap_app,
-        tick_watermark: TickWatermark::not_yet_carried(),
+        tick_watermark: snap_tick_watermark,
     });
 
     // Open the seeded segment for appending at the snapshot position —
@@ -2172,6 +2188,152 @@ mod tests {
         };
         assert_eq!(warm.tick_watermark, replayed);
         assert!(pipeline.is_none(), "the pipeline was torn down");
+    }
+
+    /// The journal writer of the tick-counting application's nodes.
+    type TickWriter = melin_journal::BufferedWriter<melin_transport_core::test_support::TestEvent>;
+
+    /// A replica seeded by a snapshot transfer makes the tick calls its
+    /// primary makes: the watermark comes across with the snapshot the
+    /// primary serves, so the next event, which repeats the last timestamp
+    /// the snapshot covers, fires no clock tick on either. On an
+    /// application that counts every call, a replica seeded at a fresh
+    /// watermark would count one more from then on.
+    #[test]
+    fn a_resynced_replica_makes_the_tick_calls_its_primary_makes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logs = melin_transport_core::test_logs::Logs::default();
+        tracing::subscriber::with_default(logs.subscriber(tracing::Level::DEBUG), || {
+            resync_then_tick_both(dir.path(), false);
+        });
+        assert!(
+            logs.lines("tick watermark").is_empty(),
+            "nothing to fall back on"
+        );
+    }
+
+    /// The same from a primary whose snapshot file predates the recorded
+    /// watermark: the replica falls back on the timestamp of the seed's
+    /// entry at the snapshot's sequence — here exactly the primary's
+    /// watermark — and says so once.
+    #[test]
+    fn a_replica_resynced_from_an_older_snapshot_file_falls_back_on_the_seed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logs = melin_transport_core::test_logs::Logs::default();
+        tracing::subscriber::with_default(logs.subscriber(tracing::Level::DEBUG), || {
+            resync_then_tick_both(dir.path(), true);
+        });
+        let lines = logs.lines("predates the recorded tick watermark");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("WARN"), "{}", lines[0]);
+        assert!(lines[0].contains("timestamp of the journal entry"));
+    }
+
+    /// Resync a replica in `dir/replica` from [`primary_serving_a_ticked_snapshot`]
+    /// (its snapshot file rewritten as v4 when `v4`), then hand both the
+    /// next event, which repeats the snapshot's last timestamp: they must
+    /// make the same tick calls, and so hold the same watermark.
+    fn resync_then_tick_both(dir: &std::path::Path, v4: bool) {
+        use melin_transport_core::test_support::TickCountingApp;
+        let (mut primary, frames) = primary_serving_a_ticked_snapshot(dir, v4);
+
+        let replica_dir = dir.join("replica");
+        std::fs::create_dir(&replica_dir).expect("replica dir");
+        let store = NodeStore::resolve(replica_dir.join("r.journal"), None).expect("store");
+        let (mut pipeline, mut app, mut writer) = (None, None, None);
+        let (mut last_sequence, mut chain_hash) = (0, [0u8; 32]);
+        let decision = handle_resync_verdict::<TickCountingApp, TickWriter, _>(
+            false,
+            &mut receiver_transport::ScriptedFrames::from_published(&frames),
+            &mut pipeline,
+            &mut app,
+            &mut writer,
+            &store,
+            &melin_transport_core::fence::FenceState::new(0),
+            &ReplicaControlPlane::new(),
+            &mut last_sequence,
+            &mut chain_hash,
+            PREALLOC,
+        )
+        .expect("resync");
+        assert!(matches!(decision, ResyncDecision::Ready { .. }));
+        let WarmApp {
+            app,
+            tick_watermark,
+        } = app.expect("the resync leaves the snapshot's state");
+        assert_eq!(app, *primary.app(), "the snapshot's state");
+        let mut replica = melin_transport_core::JournaledApp::from_parts(
+            app,
+            writer.expect("the seeded journal"),
+            primary.recovered_lineage(),
+            tick_watermark,
+        );
+
+        // The next event repeats the snapshot's last timestamp.
+        let mut reports = Vec::new();
+        primary.tick_journaled(300, &mut reports).expect("primary");
+        replica.tick_journaled(300, &mut reports).expect("replica");
+        assert_eq!(replica.app(), primary.app(), "the same tick calls");
+        assert_eq!(replica.tick_watermark(), primary.tick_watermark());
+    }
+
+    /// A primary in `dir/primary` whose journal holds three increments at
+    /// 100, 200 and 300 ns, recovered, with the snapshot of that position
+    /// saved where it serves snapshots from (rewritten as a release before
+    /// v5 wrote it when `v4`); and the frames it publishes to a replica
+    /// that needs that snapshot, in order, each with its length prefix.
+    fn primary_serving_a_ticked_snapshot(
+        dir: &std::path::Path,
+        v4: bool,
+    ) -> (
+        melin_transport_core::JournaledApp<
+            melin_transport_core::test_support::TickCountingApp,
+            TickWriter,
+        >,
+        Vec<Vec<u8>>,
+    ) {
+        use melin_transport_core::test_support::{TestEvent, TickCountingApp};
+        let primary_dir = dir.join("primary");
+        std::fs::create_dir(&primary_dir).expect("primary dir");
+        let journal = primary_dir.join("p.journal");
+        let mut w = TickWriter::create(&journal, PREALLOC).expect("create");
+        for timestamp_ns in [100, 200, 300] {
+            w.batch_append_with_ts(
+                &melin_journal::JournalEvent::App(TestEvent::Add(1)),
+                timestamp_ns,
+                0,
+            )
+            .expect("append");
+        }
+        w.flush_batch_sync().expect("flush");
+        drop(w);
+        let primary = melin_transport_core::JournaledApp::<TickCountingApp, TickWriter>::recover(
+            TickCountingApp::default(),
+            &journal,
+            PREALLOC,
+        )
+        .expect("recover");
+        assert_ne!(primary.tick_watermark(), TickWatermark::GENESIS);
+        let store = NodeStore::resolve(journal, None).expect("store");
+        primary.save_snapshot(store.snapshot()).expect("snapshot");
+        if v4 {
+            let v5 = std::fs::read(store.snapshot()).expect("read snapshot");
+            std::fs::write(store.snapshot(), melin_transport_core::snapshot::as_v4(&v5))
+                .expect("rewrite snapshot");
+        }
+
+        let mut frames = Vec::new();
+        let mut publish = |frame: &[u8]| -> std::io::Result<()> {
+            frames.push(frame.to_vec());
+            Ok(())
+        };
+        melin_transport_core::replication::catchup::snapshot_transfer_with::<TestEvent>(
+            &store,
+            &mut publish,
+            &AtomicBool::new(false),
+        )
+        .expect("transfer");
+        (primary, frames)
     }
 
     /// Replica recovery adopts the recovered lineage: the epoch as a

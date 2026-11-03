@@ -257,21 +257,28 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
     /// strictly after the snapshot's recorded sequence — across all
     /// archived segments and the live segment. The reopened writer's
     /// segments reserve disk `prealloc` at a time.
+    ///
+    /// Replay continues the tick watermark the snapshot records; for a
+    /// snapshot from before the field, the one
+    /// [`SnapshotHeader::resume_tick_watermark`](snapshot::SnapshotHeader::resume_tick_watermark)
+    /// falls back on, from the journal entry at the snapshot's sequence
+    /// when the walk reaches it.
     pub fn recover_from_snapshot(
         snapshot_path: &Path,
         journal_path: &Path,
         prealloc: Prealloc,
     ) -> Result<Self, JournaledAppError> {
         let (app, header) = snapshot::load::<A>(snapshot_path)?;
-        Self::recover_inner(app, journal_path, Some(header), prealloc)
+        Self::recover_inner(app, journal_path, Some((header, snapshot_path)), prealloc)
     }
 
     /// Shared multi-segment recovery driver.
     ///
     /// `snapshot` carries the header of the snapshot the caller has
-    /// already restored from; events with `seq <= sequence` are skipped
-    /// during replay but still walked so per-segment chain validation
-    /// runs. Its lineage seeds the recovered-lineage accumulator.
+    /// already restored from, and its path; events with
+    /// `seq <= sequence` are skipped during replay but still walked so
+    /// per-segment chain validation runs. Its lineage seeds the
+    /// recovered-lineage accumulator, its tick watermark replay's clock.
     ///
     /// Cross-segment continuity is enforced before each segment is
     /// replayed: its header anchor must equal the previous segment's
@@ -281,9 +288,10 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
     fn recover_inner(
         mut app: A,
         journal_path: &Path,
-        snapshot: Option<snapshot::SnapshotHeader>,
+        snapshot_source: Option<(snapshot::SnapshotHeader, &Path)>,
         prealloc: Prealloc,
     ) -> Result<Self, JournaledAppError> {
+        let snapshot = snapshot_source.map(|(header, _)| header);
         let archives = melin_journal::segment::list_archives(journal_path)?;
         // The lineage as of the replayed position. Seeded from the
         // snapshot's (replay only walks entries strictly after the
@@ -304,10 +312,10 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         // Replay continues the clock of the state it starts from: nothing
         // dispatched before the first entry of a whole journal; whatever
         // the uninterrupted run held at the snapshot's position, which the
-        // snapshot does not carry yet.
-        let mut tick_watermark = match snapshot {
-            None => TickWatermark::GENESIS,
-            Some(_) => TickWatermark::not_yet_carried(),
+        // snapshot records (or, from before it did, the walk finds).
+        let mut tick_watermark = match snapshot_source {
+            None => ReplayClock::running_from(TickWatermark::GENESIS),
+            Some((header, path)) => ReplayClock::from_snapshot(header, path),
         };
         // The oldest walked segment must start at or before this floor,
         // or a prefix of history is provably missing (see
@@ -436,7 +444,7 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
                 app,
                 writer,
                 recovered_lineage,
-                tick_watermark,
+                tick_watermark: tick_watermark.finish(),
             });
         }
 
@@ -505,13 +513,14 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
             app,
             writer,
             recovered_lineage,
-            tick_watermark,
+            tick_watermark: tick_watermark.finish(),
         })
     }
 
     /// Save a snapshot of the current application state. The snapshot
     /// records the last journal sequence and current chain hash so
-    /// recovery can resume both.
+    /// recovery can resume both, and the tick watermark the application
+    /// is at.
     pub fn save_snapshot(&self, snapshot_path: &Path) -> Result<(), JournaledAppError> {
         // Wire-seq space: the allocator's last assigned sequence.
         let seq = crate::cursors::WireSeq::new(self.writer.next_sequence().saturating_sub(1));
@@ -525,6 +534,7 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
             chain_hash,
             self.recovered_lineage,
             self.genesis_entries()?,
+            self.tick_watermark,
             snapshot_path,
         )?;
         Ok(())
@@ -852,7 +862,7 @@ fn replay_segment<A: Application>(
     app: &mut A,
     snap_sequence: u64,
     snap_chain: Option<[u8; 32]>,
-    tick_watermark: &mut TickWatermark,
+    tick_watermark: &mut ReplayClock<'_>,
     recovered_lineage: &mut Lineage,
     reports: &mut Vec<A::Report>,
 ) -> Result<(), JournaledAppError> {
@@ -874,6 +884,9 @@ fn replay_segment<A: Application>(
                         actual_chain_hash: actual,
                     });
                 }
+                if entry.sequence == snap_sequence {
+                    tick_watermark.at_anchor(entry.timestamp_ns);
+                }
                 if entry.sequence > snap_sequence {
                     // Replay produces no output: the client got its reply
                     // when the event was live. A query is never journaled,
@@ -887,7 +900,7 @@ fn replay_segment<A: Application>(
                             now_ns: entry.timestamp_ns,
                             key_hash: entry.key_hash,
                         },
-                        tick_watermark,
+                        tick_watermark.running(),
                         |event| recovered_lineage.observe(wire_seq, event),
                         reports,
                     );
@@ -899,6 +912,74 @@ fn replay_segment<A: Application>(
         }
     }
     Ok(())
+}
+
+/// The tick watermark replay advances, from the one the state it starts
+/// from is at.
+///
+/// That start is known up front, except when restoring a snapshot from
+/// before the recorded watermark: then it is the timestamp of the journal
+/// entry at the snapshot's sequence, which the walk reaches before any
+/// entry it replays, or, when the walk passes that sequence (or ends)
+/// without it, the fallback
+/// [`SnapshotHeader::resume_tick_watermark`](snapshot::SnapshotHeader::resume_tick_watermark)
+/// takes. The watermark is reached only through [`Self::running`] and
+/// [`Self::finish`], which settle it first, so no entry is dispatched
+/// against a start not yet decided.
+///
+/// An enum rather than a watermark beside an optional pending snapshot:
+/// an undecided start then has no watermark to read by mistake.
+enum ReplayClock<'a> {
+    /// The watermark replay is at.
+    Settled(TickWatermark),
+    /// The snapshot whose watermark the anchor entry decides, and its
+    /// path for the log.
+    AwaitingAnchor(snapshot::SnapshotHeader, &'a Path),
+}
+
+impl<'a> ReplayClock<'a> {
+    /// A replay from `watermark`.
+    fn running_from(watermark: TickWatermark) -> Self {
+        Self::Settled(watermark)
+    }
+
+    /// A replay from the snapshot at `path` with `header`: settled now
+    /// when the header records the watermark (or needs no entry for it),
+    /// at the anchor entry otherwise.
+    fn from_snapshot(header: snapshot::SnapshotHeader, path: &'a Path) -> Self {
+        if header.tick_watermark.is_recorded() || header.sequence == 0 {
+            Self::Settled(header.resume_tick_watermark(path, None))
+        } else {
+            Self::AwaitingAnchor(header, path)
+        }
+    }
+
+    /// The walk reached the entry at the snapshot's sequence, stamped
+    /// `timestamp_ns`.
+    fn at_anchor(&mut self, timestamp_ns: u64) {
+        if let Self::AwaitingAnchor(header, path) = *self {
+            *self = Self::Settled(header.resume_tick_watermark(path, Some(timestamp_ns)));
+        }
+    }
+
+    /// The watermark the next replayed entry is dispatched against: the
+    /// walk is past the snapshot's sequence, so an anchor entry not met
+    /// by now is not in the journal.
+    fn running(&mut self) -> &mut TickWatermark {
+        match self {
+            Self::Settled(watermark) => watermark,
+            Self::AwaitingAnchor(header, path) => {
+                *self = Self::Settled(header.resume_tick_watermark(path, None));
+                // Settled just above: this call takes the first arm.
+                self.running()
+            }
+        }
+    }
+
+    /// The watermark replay ended on.
+    fn finish(mut self) -> TickWatermark {
+        *self.running()
+    }
 }
 
 /// Verify a segment's header links it to the previous segment in the
@@ -1622,6 +1703,148 @@ mod tests {
         assert_eq!(rebuilt.tick_watermark(), carried);
     }
 
+    /// The timestamps of the snapshot-restore tests below: the first
+    /// three entries precede the snapshot, the fourth repeats the last of
+    /// them.
+    const SNAPSHOT_TIMESTAMPS: [u64; 4] = [100, 200, 300, 300];
+
+    /// A journal at `path` whose first three entries, at
+    /// [`SNAPSHOT_TIMESTAMPS`], are covered by a snapshot at `snap_path`
+    /// that recovery saved there, written as a release before v5 wrote it
+    /// when `v4`. When `rotate`, the journal is rotated after the
+    /// snapshot's entry, so a later test can prune the segment holding
+    /// it. The fourth entry follows. Returns the snapshot's application
+    /// tick count, and the watermark recovery held when it saved it.
+    fn snapshot_after_three(
+        path: &Path,
+        snap_path: &Path,
+        v4: bool,
+        rotate: bool,
+    ) -> (u64, TickWatermark) {
+        let mut writer = BufferedWriter::<TestEvent>::create(path, PREALLOC).unwrap();
+        let journal_at = |writer: &mut BufferedWriter<TestEvent>, timestamps: &[u64]| {
+            for &timestamp_ns in timestamps {
+                writer
+                    .batch_append_with_ts(&JournalEvent::App(TestEvent::Add(1)), timestamp_ns, 0)
+                    .unwrap();
+            }
+            writer.flush_batch_sync().unwrap();
+        };
+        journal_at(&mut writer, &SNAPSHOT_TIMESTAMPS[..3]);
+        drop(writer);
+        let mut ja = TestApp_::recover(TestApp::new(), path, PREALLOC).unwrap();
+        ja.save_snapshot(snap_path).unwrap();
+        let saved = (ja.app().ticks, ja.tick_watermark());
+        if rotate {
+            ja.rotate_segment().unwrap();
+        }
+        journal_at(ja.writer_mut(), &SNAPSHOT_TIMESTAMPS[3..]);
+        drop(ja);
+        if v4 {
+            let v4 = crate::snapshot::as_v4(&std::fs::read(snap_path).unwrap());
+            std::fs::write(snap_path, v4).unwrap();
+        }
+        saved
+    }
+
+    /// Recover from the snapshot at `snap_path` over the journal at
+    /// `path`, capturing what recovery logs.
+    fn recover_logged(snap_path: &Path, path: &Path) -> (TestApp_, crate::test_logs::Logs) {
+        let logs = crate::test_logs::Logs::default();
+        let recovered =
+            tracing::subscriber::with_default(logs.subscriber(tracing::Level::DEBUG), || {
+                TestApp_::recover_from_snapshot(snap_path, path, PREALLOC).unwrap()
+            });
+        (recovered, logs)
+    }
+
+    /// Recovery from a v5 snapshot replays from the watermark it records:
+    /// the entry after it repeats the last timestamp the snapshot covers
+    /// and fires no tick, as on the copy that took it, and nothing is
+    /// logged about the watermark.
+    #[test]
+    fn recovery_from_a_snapshot_continues_its_recorded_tick_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, snap_path) = (dir.path().join("j.bin"), dir.path().join("snap"));
+        let (ticks, watermark) = snapshot_after_three(&path, &snap_path, false, false);
+        assert_ne!(watermark, TickWatermark::GENESIS);
+
+        let (recovered, logs) = recover_logged(&snap_path, &path);
+        assert_eq!(recovered.app().ticks, ticks, "no tick for a repeated time");
+        assert_eq!(recovered.tick_watermark(), watermark);
+        assert!(logs.lines("tick watermark").is_empty());
+    }
+
+    /// A v4 snapshot, which records no watermark, resumes from the
+    /// timestamp of the journal entry at its sequence when the journal
+    /// still holds it — here, exactly the watermark the copy that took it
+    /// held — with one warning naming it. The next save records the
+    /// watermark, so the file it writes needs no fallback.
+    #[test]
+    fn recovery_from_a_v4_snapshot_resumes_from_its_anchor_entrys_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, snap_path) = (dir.path().join("j.bin"), dir.path().join("snap"));
+        let (ticks, watermark) = snapshot_after_three(&path, &snap_path, true, false);
+
+        let (recovered, logs) = recover_logged(&snap_path, &path);
+        assert_eq!(recovered.app().ticks, ticks, "no tick for a repeated time");
+        assert_eq!(recovered.tick_watermark(), watermark);
+        let lines = logs.lines("predates the recorded tick watermark");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(crate::test_logs::level(&lines[0]), tracing::Level::WARN);
+        assert_eq!(
+            crate::test_logs::field(&lines[0], "snapshot"),
+            snap_path.display().to_string()
+        );
+        assert!(lines[0].contains("timestamp of the journal entry"));
+
+        recovered.save_snapshot(&snap_path).unwrap();
+        let (_, header) = crate::snapshot::load::<TestApp>(&snap_path).unwrap();
+        assert!(header.tick_watermark.is_recorded());
+        assert_eq!(header.resume_tick_watermark(&snap_path, None), watermark);
+    }
+
+    /// A v4 snapshot whose entry the journal no longer holds — its
+    /// segment pruned after a rotation at the snapshot — resumes from
+    /// genesis, with one warning saying so: the first entry after it
+    /// fires a tick even though its timestamp repeats the snapshot's
+    /// last, the documented cost of a fallback with nothing to fall back
+    /// on.
+    #[test]
+    fn recovery_from_a_v4_snapshot_whose_entry_is_pruned_resumes_from_genesis() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, snap_path) = (dir.path().join("j.bin"), dir.path().join("snap"));
+        let (ticks, watermark) = snapshot_after_three(&path, &snap_path, true, true);
+        std::fs::remove_file(dir.path().join("j.bin.000001")).unwrap();
+
+        let (recovered, logs) = recover_logged(&snap_path, &path);
+        assert_eq!(
+            recovered.app().ticks,
+            ticks + 1,
+            "the fallback's extra tick"
+        );
+        assert_eq!(recovered.tick_watermark(), watermark, "and on from there");
+        let lines = logs.lines("predates the recorded tick watermark");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(crate::test_logs::level(&lines[0]), tracing::Level::WARN);
+        assert!(lines[0].contains("no longer holds the entry"));
+    }
+
+    /// The same pruned layout with a v5 snapshot needs no entry: the
+    /// recorded watermark is exact, so the repeated time fires no tick.
+    #[test]
+    fn recovery_from_a_v5_snapshot_whose_entry_is_pruned_needs_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, snap_path) = (dir.path().join("j.bin"), dir.path().join("snap"));
+        let (ticks, watermark) = snapshot_after_three(&path, &snap_path, false, true);
+        std::fs::remove_file(dir.path().join("j.bin.000001")).unwrap();
+
+        let (recovered, logs) = recover_logged(&snap_path, &path);
+        assert_eq!(recovered.app().ticks, ticks);
+        assert_eq!(recovered.tick_watermark(), watermark);
+        assert!(logs.lines("tick watermark").is_empty());
+    }
+
     #[test]
     fn save_snapshot_round_trips_via_generic_load() {
         let dir = tempfile::tempdir().unwrap();
@@ -2153,6 +2376,7 @@ mod tests {
             bad_hash,
             header.lineage,
             Some(0),
+            header.resume_tick_watermark(&snap_path, None),
             &snap_path,
         )
         .unwrap();
@@ -2598,6 +2822,7 @@ mod tests {
             bad_hash,
             header.lineage,
             Some(0),
+            header.resume_tick_watermark(&snap_path, None),
             &snap_path,
         )
         .unwrap();
@@ -2665,6 +2890,7 @@ mod tests {
             bad_hash,
             header.lineage,
             Some(0),
+            header.resume_tick_watermark(&snap_path, None),
             &snap_path,
         )
         .unwrap();
@@ -2866,13 +3092,14 @@ mod tests {
             PREALLOC,
         )
         .unwrap();
-        let je = JournaledApp::from_parts(
-            snap_app,
-            writer,
-            header.lineage,
-            TickWatermark::not_yet_carried(),
-        );
+        let tick_watermark = header.resume_tick_watermark(&snap_path, None);
+        let je = JournaledApp::from_parts(snap_app, writer, header.lineage, tick_watermark);
         assert_eq!(je.app().total, snap_total);
+        assert_eq!(
+            je.tick_watermark(),
+            tick_watermark,
+            "the watermark the snapshot recorded"
+        );
     }
 
     /// Helper for the byte-sweep crash tests: walk every entry in the

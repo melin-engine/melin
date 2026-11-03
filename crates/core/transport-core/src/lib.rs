@@ -75,8 +75,11 @@ pub mod test_ports;
 pub mod tick;
 pub mod trace;
 
-#[cfg(test)]
-mod test_support;
+/// Test-only applications: the minimal `TestApp`, and `TickCountingApp`,
+/// which makes every tick call visible. For this crate's tests and, under
+/// `test-utils`, any crate's (the runtime's resync tests drive one).
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_support;
 
 #[cfg(test)]
 mod pipeline_tests;
@@ -86,8 +89,9 @@ pub use cursors::{
     WireSeq,
 };
 // The items of the dispatch module other crates name: every stage they
-// build starts from a watermark, which only the module itself mints, and
-// a stopped matching stage hands its back with its application.
+// build starts from a watermark, which only this crate mints (from
+// nothing, from replay, or from a snapshot header), and a stopped
+// matching stage hands its back with its application.
 pub use dispatch::{TickWatermark, WarmApp};
 pub use journaled_app::{JournaledApp, JournaledAppError};
 pub use node_store::{NodeStore, NodeStoreError};

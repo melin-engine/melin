@@ -1421,6 +1421,7 @@ mod tests {
                     ack_policy: Some(PRIMARY_LINEAGE_POLICY),
                 },
                 Some(0),
+                melin_transport_core::TickWatermark::GENESIS,
                 store(&primary_journal).snapshot(),
             )
             .expect("save snapshot");
@@ -1684,6 +1685,7 @@ mod tests {
                     ack_policy: Some(PRIMARY_LINEAGE_POLICY),
                 },
                 Some(0),
+                melin_transport_core::TickWatermark::GENESIS,
                 store(&primary_journal).snapshot(),
             )
             .expect("save snapshot");
@@ -1893,6 +1895,7 @@ mod tests {
                 chain_at_4,
                 melin_transport_core::lineage::Lineage::GENESIS,
                 Some(0),
+                melin_transport_core::TickWatermark::GENESIS,
                 store(&primary_journal).snapshot(),
             )
             .expect("save snapshot");

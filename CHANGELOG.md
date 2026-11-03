@@ -35,6 +35,11 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 - **`melin_transport_core::test_logs`** (behind `test-utils`, which now
   pulls `tracing-subscriber`): a per-thread capture of `tracing` output
   for tests that assert what was logged and at which level.
+- **`melin_transport_core::test_support`** and
+  **`melin_transport_core::snapshot::as_v4`** (behind `test-utils`): the
+  test applications, `TickCountingApp` among them, and a v5 snapshot's
+  bytes rewritten as a release before v5 wrote them, for other crates'
+  tests.
 - **`melin_transport_core::replication::archive::lineage_archives_beside`**:
   the lineage archives a node made beside its journal or snapshot (the
   `<name>.<reason>.<n>` directories), for any reason, sorted.
@@ -62,11 +67,17 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 - **`melin_transport_core::TickWatermark`**: the latest time already
   handed to `Application::tick`, which a pipeline's stages start from.
   It is made only as `TickWatermark::GENESIS` (a fresh journal), by
-  recovery, read with `JournaledApp::tick_watermark`, or by a matching
-  stage, which hands back the one it reached when it stops, so a stage
-  cannot start at a fresh zero without saying so.
-  `TickWatermark::not_yet_carried` names the snapshot paths that cannot
-  carry it yet (see **Fixed**).
+  recovery, read with `JournaledApp::tick_watermark`, by a matching
+  stage, which hands back the one it reached when it stops, or from a
+  snapshot header, so a stage cannot start at a fresh zero without
+  saying so.
+- **`melin_transport_core::snapshot::SnapshotWatermark`**: the tick
+  watermark a snapshot header records, or that it records none (a file
+  from before framing version 5). Turned into a `TickWatermark` only by
+  `SnapshotHeader::resume_tick_watermark`, which takes the timestamp of
+  the journal entry at the snapshot's sequence for the fallback, or
+  `SnapshotHeader::resume_tick_watermark_over`, which reads it from a
+  journal; either logs a warning when it falls back.
 - **`melin_transport_core::WarmApp`**: an application together with the
   tick watermark of its position, as a stopped matching stage hands it
   back and a promoted primary is built from it.
@@ -88,6 +99,19 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   application with the watermark the stage reached, in place of the bare
   application, and `replication::ReceiverResult` hands a promotion's
   warm application over with the journal writer: `(WarmApp<A>, W)`.
+- **Snapshots are written in framing version 5, which records the tick
+  watermark** (breaking for the file format): a release before this one
+  cannot read a snapshot this one writes, so a node downgraded past it
+  must restore from its journal or from a snapshot an older release
+  wrote, and a replica of an older release cannot load the snapshot a
+  primary of this one sends it on a resync. Versions 1 to 4 are still
+  read (see **Fixed** for their watermark); the layout no longer depends
+  on what the lineage records, so a history that records neither a
+  genesis length nor an ack policy is now written as version 5 rather
+  than 2. `snapshot::save` takes the `TickWatermark` of the saved
+  position after the genesis length, and `SnapshotHeader` has a
+  `tick_watermark: SnapshotWatermark` field (breaking for code that
+  builds or destructures one).
 
 - **Unpinned pipeline threads sleep when idle** (`--cores none`, and any
   entry of `0`): they park, as with the new `p` suffix, where they used
@@ -231,24 +255,30 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Fixed
 
-- **A node restarted by replaying its whole journal, or a replica
-  promoted to primary, no longer makes tick calls an uninterrupted node
-  does not.** The time last handed to `Application::tick` restarted at
-  zero whenever a node built its pipeline, so the first event after a
-  restart or a promotion fired a tick even when its timestamp repeated
-  the last one applied: a replica restarted under load, a primary
-  restarted after its clock stepped back, or a promoted replica whose
-  first events are stamped at or behind its old primary's last. Its
-  shadow stage did the same, and snapshotted what it produced. An
-  application whose tick changes state when called for a time already
-  passed then diverged from its peers. Recovery now hands out the time
-  replay reached, and a replica's matching stage the time it reached
-  when torn down for a promotion; the matching and shadow stages of the
-  pipeline built over that state, primary or replica, start from it. A
-  node that recovers from a snapshot and replays only the journal after
-  it, and a state received from a primary's resync, still start from
-  zero; a replica promoted after one of those carries the zero-based
-  watermark its stages advanced from there.
+- **A restarted node, a node restored from a snapshot, a replica
+  seeded by a resync, or a replica promoted to primary, no longer makes
+  tick calls an uninterrupted node does not.** The time last handed to
+  `Application::tick` restarted at zero whenever a node built its
+  pipeline, so the first event after a restart, a snapshot restore, a
+  resync or a promotion fired a tick even when its timestamp repeated
+  the last one applied: a replica restarted or resynced under load, a
+  primary restarted after its clock stepped back, a node restored from a
+  snapshot taken under load, or a promoted replica whose first events
+  are stamped at or behind its old primary's last. Its shadow stage did
+  the same, and snapshotted what it produced. An application whose tick
+  changes state when called for a time already passed then diverged
+  from its peers. Recovery now hands out the time replay reached,
+  starting from the time a snapshot records (see **Changed**); a replica
+  seeded by a resync takes the time recorded in the snapshot its
+  primary sends; a replica's matching stage hands back the time it
+  reached when torn down for a promotion; and the matching and shadow
+  stages of the pipeline built over that state, primary or replica,
+  start from it. A snapshot written by an earlier release records no
+  time: restoring one starts from the timestamp of the journal entry at
+  its sequence, exact unless timestamps went backwards before it, or,
+  when the journal no longer holds that entry, from zero as before, and
+  logs a warning naming the snapshot either way. The node's next
+  snapshot records the time.
 
 - **A journal rotation that adopted a pre-staged segment could lose that
   segment's entries from the node's journal.** The staging thread could

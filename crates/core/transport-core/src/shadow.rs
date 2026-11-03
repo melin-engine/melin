@@ -218,8 +218,11 @@ pub fn run<A: Application>(
                 &consumer,
                 &fsync_state,
                 &snapshot_path,
-                shadow_lineage,
-                genesis_entries,
+                SnapshotPosition {
+                    lineage: shadow_lineage,
+                    genesis_entries,
+                    tick_watermark,
+                },
             );
         }
 
@@ -309,6 +312,22 @@ fn tick_schedule(schedule: &mut SnapshotSchedule, path: &std::path::Path) {
     }
 }
 
+/// What the shadow knows of the position its application is at, beyond
+/// the journal sequence and chain hash the fsync boundary supplies: the
+/// header fields every snapshot it takes there records. Named fields, so
+/// a save cannot be handed one position's lineage with another's
+/// watermark in the wrong argument slot.
+#[derive(Debug, Clone, Copy)]
+struct SnapshotPosition {
+    /// The lineage at the shadow's consumed position.
+    lineage: Lineage,
+    /// The lineage's genesis length, constant for the stage's life.
+    genesis_entries: Option<u64>,
+    /// The shadow's own tick watermark at its consumed position: the one
+    /// a copy restored from the snapshot must start from.
+    tick_watermark: TickWatermark,
+}
+
 /// Attempt the due save and log what came of it.
 fn attempt_save<A: Application>(
     schedule: &mut SnapshotSchedule,
@@ -316,11 +335,10 @@ fn attempt_save<A: Application>(
     consumer: &ring::Consumer<InputSlot<A::Event>>,
     fsync_state: &SeqLockReader<FsyncState>,
     path: &std::path::Path,
-    lineage: Lineage,
-    genesis_entries: Option<u64>,
+    position: SnapshotPosition,
 ) {
     // Exhaustive: a new outcome must be decided here, not fall through.
-    match try_save_snapshot::<A>(app, consumer, fsync_state, path, lineage, genesis_entries) {
+    match try_save_snapshot::<A>(app, consumer, fsync_state, path, position) {
         SaveOutcome::Deferred => schedule.on_deferred(),
         SaveOutcome::Saved {
             journal_seq,
@@ -388,15 +406,14 @@ fn try_save_snapshot<A: Application>(
     consumer: &ring::Consumer<InputSlot<A::Event>>,
     fsync_state: &SeqLockReader<FsyncState>,
     path: &std::path::Path,
-    lineage: Lineage,
-    genesis_entries: Option<u64>,
+    position: SnapshotPosition,
 ) -> SaveOutcome {
     let state = fsync_state.load();
     // Both ring-index space — compare the raw positions.
     if state.input_ring_seq.get() != consumer.next_read() {
         return SaveOutcome::Deferred;
     }
-    save_aligned::<A>(app, &state, path, lineage, genesis_entries)
+    save_aligned::<A>(app, &state, path, position)
 }
 
 /// The save proper, at an fsync boundary. Cold and out of line: it runs
@@ -407,16 +424,16 @@ fn save_aligned<A: Application>(
     app: &A,
     state: &FsyncState,
     path: &std::path::Path,
-    lineage: Lineage,
-    genesis_entries: Option<u64>,
+    position: SnapshotPosition,
 ) -> SaveOutcome {
     let started = Instant::now();
     match snapshot::save::<A>(
         app,
         state.journal_seq,
         state.chain_hash,
-        lineage,
-        genesis_entries,
+        position.lineage,
+        position.genesis_entries,
+        position.tick_watermark,
         path,
     ) {
         Ok(bytes) => SaveOutcome::Saved {

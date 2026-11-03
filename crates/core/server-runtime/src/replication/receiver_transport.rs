@@ -221,6 +221,44 @@ pub(super) fn run_serviced<R: Send>(
     })
 }
 
+/// A [`ControlFrameSource`] that yields pre-built frame payloads in
+/// order, then errors (modelling a disconnect) once drained: a resync
+/// transfer driven without a live transport. A `VecDeque`: frames are
+/// taken from the front, in the order the primary sent them.
+#[cfg(test)]
+pub(super) struct ScriptedFrames {
+    frames: std::collections::VecDeque<Vec<u8>>,
+}
+
+#[cfg(test)]
+impl ScriptedFrames {
+    /// A source yielding `payloads`, each a frame's payload (no length
+    /// prefix), as [`ControlFrameSource::next_frame`] returns them.
+    pub(super) fn new(payloads: Vec<Vec<u8>>) -> Self {
+        Self {
+            frames: payloads.into(),
+        }
+    }
+
+    /// A source yielding the frames a primary published, each whole with
+    /// its length prefix, as the transport would deliver them.
+    pub(super) fn from_published(frames: &[Vec<u8>]) -> Self {
+        Self::new(frames.iter().map(|f| f[PREFIX_LEN..].to_vec()).collect())
+    }
+}
+
+#[cfg(test)]
+impl ControlFrameSource for ScriptedFrames {
+    fn next_frame(
+        &mut self,
+        _max_size: usize,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        self.frames
+            .pop_front()
+            .ok_or_else(|| "disconnected during transfer".into())
+    }
+}
+
 /// Receive a chunked body (`SnapshotChunk*` → `SnapshotEnd`) into
 /// `tmp_path`, verifying the byte length and CRC32C trailer — the
 /// framing shared by the snapshot payload and the segment seed. The tmp
@@ -3321,28 +3359,10 @@ mod tests {
     // now share, without a live transport.
     // -----------------------------------------------------------------
     mod chunked_body {
-        use super::super::{ControlFrameSource, receive_chunked_body};
+        use super::super::{ScriptedFrames, receive_chunked_body};
         use melin_transport_core::replication::protocol::{
             encode_snapshot_chunk, encode_snapshot_end, encode_stream_start,
         };
-        use std::collections::VecDeque;
-
-        /// Yields pre-built frame payloads in order, then errors
-        /// (modelling a disconnect) once drained.
-        struct Scripted {
-            frames: VecDeque<Vec<u8>>,
-        }
-
-        impl ControlFrameSource for Scripted {
-            fn next_frame(
-                &mut self,
-                _max_size: usize,
-            ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-                self.frames
-                    .pop_front()
-                    .ok_or_else(|| "disconnected during transfer".into())
-            }
-        }
 
         /// `next_frame` yields payloads, not framed bytes — strip the
         /// 4-byte length prefix an `encode_*` helper writes.
@@ -3360,10 +3380,8 @@ mod tests {
             payload(|b| encode_snapshot_end(crc, b))
         }
 
-        fn source(frames: Vec<Vec<u8>>) -> Scripted {
-            Scripted {
-                frames: frames.into(),
-            }
+        fn source(frames: Vec<Vec<u8>>) -> ScriptedFrames {
+            ScriptedFrames::new(frames)
         }
 
         #[test]
