@@ -44,14 +44,14 @@ fn openraft_storage_suite() {
     Suite::test_all(FileStoreBuilder).unwrap();
 }
 
-fn blank_entry(term: u64, index: u64) -> Entry<TypeConfig> {
+pub(super) fn blank_entry(term: u64, index: u64) -> Entry<TypeConfig> {
     Entry {
         log_id: LogId::new(CommittedLeaderId::new(term, 0), index),
         payload: EntryPayload::Blank,
     }
 }
 
-fn membership_entry(term: u64, index: u64) -> Entry<TypeConfig> {
+pub(super) fn membership_entry(term: u64, index: u64) -> Entry<TypeConfig> {
     Entry {
         log_id: LogId::new(CommittedLeaderId::new(term, 0), index),
         payload: EntryPayload::Membership(Membership::new(

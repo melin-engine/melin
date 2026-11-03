@@ -3,8 +3,10 @@
 //! Length-prefixed frames (`[len: u32 LE][postcard payload]`) carrying an
 //! [`RpcFrame`] envelope. The envelope always includes the sender's journal
 //! tip (fencing epoch + advertised journal sequence), read live from the
-//! node's `TipSource` — the voter side feeds it to the vote recency filter
-//! (see `crate::recency`).
+//! node's `TipSource` together with the frame's place in the sender's
+//! order (its stamp) — the voter side feeds the tip to the vote recency
+//! filter, and every receiver records it per peer unless a newer frame
+//! from that peer is already recorded (see `crate::recency`).
 //!
 //! Postcard over bincode: compact varint encoding, and no encoder/decoder
 //! configuration knobs (fixint vs varint, endianness, limits) that could
@@ -33,6 +35,9 @@ use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 
+use crate::recency::JournalTip;
+use crate::recency::SenderStamp;
+use crate::recency::StampedTip;
 use crate::types::NodeId;
 use crate::types::TypeConfig;
 
@@ -51,9 +56,17 @@ pub const MAX_RPC_FRAME: usize = 4 << 20;
 /// version frame's layout fixes its width for good.
 /// History: 1 = the first versioned link, authenticated both ways (after
 /// the version exchange the dialer challenges the responder, see
-/// `crate::auth::challenge_responder`). Releases before it send an
-/// `RpcFrame` straight after authentication, and refuse this one's
-/// version frame (see [`VERSION_FRAME_LEN`]).
+/// `crate::auth::challenge_responder`), whose envelope carries the sender
+/// stamp ([`RpcFrame::stamped_tip`]). The stamp joined version 1 after the
+/// version itself, without a bump, because no release had shipped version
+/// 1 when it did (the version exchange came in after 0.22.0): both land in
+/// the same release. A build from between the two speaks
+/// version 1 without the stamp; the stamp's place at the end of the
+/// envelope makes such a build and this one refuse or read each other
+/// correctly, never misread (see [`RpcFrame`]). Bump the version for the
+/// next change to the link once a release has shipped version 1. Releases before it send an `RpcFrame` straight
+/// after authentication, and refuse this one's version frame (see
+/// [`VERSION_FRAME_LEN`]).
 pub const RAFT_PROTOCOL_VERSION: u16 = 1;
 
 /// Tag byte of the version frame. The tag plays no part in old releases
@@ -225,13 +238,58 @@ pub(crate) async fn exchange_version_as<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 /// Every control-plane message, request or response, rides in this envelope.
+///
+/// The tip and its stamp are private: an envelope is built only from a
+/// [`StampedTip`] ([`RpcFrame::new`], fed by `TipSource::stamp`) and its tip
+/// read only as one ([`RpcFrame::stamped_tip`]), so no path can send a tip
+/// without the stamp taken with it, nor record one without the stamp that
+/// orders it.
+///
+/// **The stamp comes last, after the body**, and must stay there while
+/// builds of version 1 without it may be about (see
+/// [`RAFT_PROTOCOL_VERSION`]). Postcard frames nothing, so a field's place
+/// decides how a build without it reads the frame. Last, the stampless
+/// build reads every field it knows exactly as sent and ignores the rest
+/// (its `postcard::from_bytes` does not require the payload to be used
+/// up), and this build reads the stampless frame's fields as sent and
+/// then runs out of payload where the stamp's sixteen boot-id bytes
+/// belong, refusing it. Anywhere earlier, each would read body bytes as
+/// stamp, or stamp bytes as body. Pinned in `tests::unstamped_envelope`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RpcFrame {
     /// Sender's fencing epoch (journal-derived, not the raft term).
-    pub tip_epoch: u64,
+    tip_epoch: u64,
     /// Sender's journal tip sequence.
-    pub tip_seq: u64,
+    tip_seq: u64,
     pub body: RpcBody,
+    /// The frame's place in its sender's order, taken with the tip above,
+    /// so the receiver can drop the tip of a frame that arrives after a
+    /// newer one (see `crate::recency::PeerTips`).
+    stamp: SenderStamp,
+}
+
+impl RpcFrame {
+    /// The envelope for `body`, carrying `tip` as its sender stamped it
+    /// (`TipSource::stamp`).
+    pub fn new(tip: StampedTip, body: RpcBody) -> Self {
+        Self {
+            tip_epoch: tip.tip.epoch,
+            tip_seq: tip.tip.last_sequence,
+            body,
+            stamp: tip.stamp,
+        }
+    }
+
+    /// The sender's tip and stamp, as the envelope carries them.
+    pub fn stamped_tip(&self) -> StampedTip {
+        StampedTip {
+            tip: JournalTip {
+                epoch: self.tip_epoch,
+                last_sequence: self.tip_seq,
+            },
+            stamp: self.stamp,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -327,23 +385,28 @@ pub(crate) async fn read_bounded_payload<R: AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::stamped_at;
     use openraft::Vote;
+
+    /// `(epoch, seq)` on frame 42 of the hand-stamping sender.
+    fn stamped(epoch: u64, seq: u64) -> StampedTip {
+        stamped_at(epoch, seq, 42)
+    }
 
     #[tokio::test]
     async fn frame_round_trip() {
-        let frame = RpcFrame {
-            tip_epoch: 7,
-            tip_seq: 1234,
-            body: RpcBody::VoteReq(VoteRequest {
+        let sent = stamped(7, 1234);
+        let frame = RpcFrame::new(
+            sent,
+            RpcBody::VoteReq(VoteRequest {
                 vote: Vote::new(3, 42),
                 last_log_id: None,
             }),
-        };
+        );
         let mut buf = Vec::new();
         write_frame(&mut buf, &frame).await.unwrap();
         let decoded = read_frame(&mut buf.as_slice()).await.unwrap();
-        assert_eq!(decoded.tip_epoch, 7);
-        assert_eq!(decoded.tip_seq, 1234);
+        assert_eq!(decoded.stamped_tip(), sent);
         match decoded.body {
             RpcBody::VoteReq(r) => {
                 assert_eq!(r.vote, Vote::new(3, 42));
@@ -351,6 +414,33 @@ mod tests {
             }
             other => panic!("wrong body: {other:?}"),
         }
+    }
+
+    /// The envelope's bytes, in literals: the stampless envelope's fields
+    /// (tip epoch and sequence, the body's variant and contents, as
+    /// varints), then the stamp (sixteen raw boot-id bytes, the start and
+    /// the counter as varints) last. A change of field order, which would
+    /// let a stampless build of version 1 misread a frame (see
+    /// [`RpcFrame`]), fails here.
+    #[tokio::test]
+    async fn the_envelope_is_the_stampless_one_followed_by_the_stamp() {
+        let mut buf = Vec::new();
+        write_frame(
+            &mut buf,
+            &RpcFrame::new(stamped(7, 1234), RpcBody::Error("x".to_owned())),
+        )
+        .await
+        .unwrap();
+        #[rustfmt::skip]
+        let payload: &[u8] = &[
+            7, 0xd2, 0x09,          // tip_epoch 7, tip_seq 1234
+            6, 1, b'x',             // RpcBody::Error("x")
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, // boot id
+            0xac, 0x02,             // started_ns 300
+            42,                     // counter
+        ];
+        assert_eq!(&buf[..LEN_PREFIX], &(payload.len() as u32).to_le_bytes());
+        assert_eq!(&buf[LEN_PREFIX..], payload);
     }
 
     #[tokio::test]
@@ -526,11 +616,7 @@ mod tests {
         let mut envelope = Vec::new();
         write_frame(
             &mut envelope,
-            &RpcFrame {
-                tip_epoch: 0,
-                tip_seq: 0,
-                body: RpcBody::Error(String::new()),
-            },
+            &RpcFrame::new(stamped(0, 0), RpcBody::Error(String::new())),
         )
         .await
         .unwrap();

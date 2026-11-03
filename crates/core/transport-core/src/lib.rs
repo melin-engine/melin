@@ -20,6 +20,10 @@
 /// Application-agnostic — the operator-facing CLI enum that picks
 /// between named policies lives with the consuming application.
 pub mod ack_policy;
+/// The kernel boot stamp (boot id plus `CLOCK_BOOTTIME` at process start)
+/// that orders a node's processes on one host, read once at startup by the
+/// control plane.
+pub mod boot_stamp;
 /// Named sequence-space cursors (`WireSeq` / `RingPos` / `PipelineCursors`).
 /// Bundles the journal-progress atomics behind space-typed accessors so the
 /// compiler rejects mixing wire-seq and ring-index values.

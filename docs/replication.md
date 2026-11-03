@@ -783,7 +783,11 @@ Auto-promotion is deliberately conservative. The elected replica
   replica, so at the moment of a crash the slower replica legitimately
   lacks the newest acked events. Every raft message carries the
   sender's journal position; the winner refuses to promote while any
-  peer it can still hear advertises a position ahead of its own. The
+  peer it can still hear advertises a position ahead of its own. A
+  node's messages travel over several connections, and TCP keeps order
+  only within one, so a message delayed on one connection can arrive
+  after a newer one sent on another; such a message is ignored, so it can neither make that peer look behind
+  where it is nor make it look recently heard. The
   caught-up peer recognizes the standoff (it sees the leader's
   position on every heartbeat) and takes over leadership itself, so
   promotion lands on the node that holds every acked event. A peer
@@ -922,6 +926,33 @@ nothing of its own.
   the same term, undermining the epoch guarantee. If the dir is lost,
   restart that node last, after a leader is established, or with the
   raft flags off.
+- **The control plane needs the kernel's boot id.** A raft-enabled node
+  reads `/proc/sys/kernel/random/boot_id` at startup, with its other
+  configuration checks and before it touches its journal, and refuses to
+  start if it cannot (a container or sandbox that hides `/proc/sys`,
+  say), with an error that names the file and why it could not be read.
+  Its peers use the boot id, with the time the process started, to tell
+  its current control-plane messages from delayed ones. A node without
+  the raft flags does not read it. Nothing is stored, so a restart or a
+  host reboot needs no care. **On upgrade**, a raft node in an
+  environment that hides the file, which used to start, now refuses to;
+  expose the file to it (read-only is enough) before restarting it. Do
+  not run a node inside a Linux time namespace that offsets the
+  boot-time clock (as some checkpoint/restore tools set up): a restart
+  there can read an earlier start time than the process it replaces, and
+  its peers would take its messages for delayed ones and stop hearing it.
+  A peer that has taken every message from a node for a delayed one for
+  ten seconds logs a warning naming that node; it means the node looks
+  silent to automatic failover, and should be restarted outside the time
+  namespace (or, after a snapshot resume, restarted cleanly).
+- **Do not resume a running node from a VM snapshot.** Restoring one
+  rewinds the node's clock, memory and disk together, so the restored
+  process carries on from a past it already left: its journal and
+  `--raft-dir` go back to an older state, and its peers take its
+  control-plane messages for delayed ones they have already superseded,
+  so it looks silent to them for a while. It is the hazard of
+  rolling back the journal and `--raft-dir` (see "`--raft-dir` is
+  durable state" above), with the process still running on top.
 - **Membership is static on this release.** The `--raft-peer` list is
   fixed at first boot (later flag changes are ignored in favor of the
   stored membership, with a warning). The public keys are the exception:
@@ -1297,7 +1328,9 @@ normal-case post-recovery state.
   logging a warning (`raft peer runs another release`) that names both
   versions, then retrying with backoff as it would an unreachable peer.
   The release that introduces the version is such a change, and also
-  the one that makes control-plane authentication mutual: it and
+  the one that makes control-plane authentication mutual and stamps
+  every control-plane message with its sender's boot id (see
+  "Deployment rules"): it and
   earlier releases refuse each other's control-plane links in either
   direction (an earlier release logs only that the connection failed,
   so read the newer node's log). The control-plane version is separate

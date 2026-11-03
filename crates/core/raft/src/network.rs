@@ -57,7 +57,7 @@ use crate::auth::KeyRefusal;
 use crate::auth::answer_challenge;
 use crate::auth::challenge_responder;
 use crate::auth::key_configured_for;
-use crate::recency::{JournalTip, PeerTips, TipSource};
+use crate::recency::{PeerTips, TipSource};
 use crate::rpc_server::SupersessionPolicy;
 use crate::types::Node;
 use crate::types::NodeId;
@@ -476,16 +476,9 @@ impl RaftClient {
         let tip = Arc::clone(&self.tip);
         let result = tokio::time::timeout(ttl, async {
             let link = self.ensure_connected().await?;
-            // Read after the connect, which may take a while, so the
+            // Stamped after the connect, which may take a while, so the
             // envelope carries the tip as of sending.
-            let local = tip.local_tip();
-            let (tip_epoch, tip_seq) = (local.epoch, local.last_sequence);
-            link.send(&RpcFrame {
-                tip_epoch,
-                tip_seq,
-                body,
-            })
-            .await?;
+            link.send(&RpcFrame::new(tip.stamp(), body)).await?;
             link.read_reply().await
         })
         .await
@@ -498,19 +491,20 @@ impl RaftClient {
                 // `TipSource`, so it is the same evidence of a newer
                 // tenure. And a serving raft leader learns of a higher
                 // epoch among its followers only here: a follower sends
-                // its leader no request.
+                // its leader no request. Observed whatever the frame's
+                // stamp: a frame older than one already heard carries an
+                // epoch no higher than the newer one did (the fence epoch
+                // never falls), so fencing on it is never wrong.
+                let replier_tip = frame.stamped_tip();
                 if let Some(policy) = &self.supersession {
-                    policy.observe(frame.tip_epoch);
+                    policy.observe(replier_tip.tip.epoch);
                 }
                 // Every reply envelope carries the target's journal tip —
-                // feed the promotion-time safety check (see `PeerTips`).
-                self.peer_tips.record(
-                    self.target,
-                    JournalTip {
-                        epoch: frame.tip_epoch,
-                        last_sequence: frame.tip_seq,
-                    },
-                );
+                // feed the promotion-time safety check (see `PeerTips`),
+                // which drops it, and says so at `debug`, if a newer frame
+                // from the target is already recorded. The reply goes to
+                // raft either way: only its tip is stale.
+                self.peer_tips.record(self.target, replier_tip);
                 Ok(frame.body)
             }
             Err(e) => {

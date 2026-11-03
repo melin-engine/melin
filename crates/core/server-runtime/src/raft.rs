@@ -11,6 +11,7 @@ use std::sync::atomic::Ordering;
 
 use melin_app::auth::AuthorizedKeys;
 use melin_raft::{RaftConfig, RaftHandles, RaftPeer};
+use melin_transport_core::boot_stamp::{BOOT_ID_PATH, BootStamp};
 use tracing::info;
 
 use crate::server::ServerConfig;
@@ -156,15 +157,34 @@ fn format_ms(d: std::time::Duration) -> String {
 pub(crate) struct RaftSetup {
     pub(crate) config: RaftConfig,
     pub(crate) auto_promotion: Option<AutoPromotion>,
+    /// This process's boot stamp, read with the flags so a node that cannot
+    /// read it refuses to start before it touches the disk. Every
+    /// control-plane frame the node sends carries it (see
+    /// `melin_raft::TipSource`), so peers can drop a delayed frame's tip.
+    pub(crate) boot: BootStamp,
 }
 
-/// Validate the raft CLI flags into a [`RaftSetup`].
+/// Validate the raft CLI flags into a [`RaftSetup`], and read this
+/// process's boot stamp for it.
 ///
 /// `Ok(None)` when raft is not configured. Partial flag sets are refused —
 /// a node with `--raft-node-id` but no `--raft-bind` is a misconfiguration
-/// the operator must resolve, not a mode. Writes nothing, so a node calls
-/// it with its other configuration checks, before it touches the disk.
+/// the operator must resolve, not a mode — and so is a raft node whose
+/// boot stamp cannot be read ([`BootStamp::read`]): there is no weaker
+/// stamp its peers could order its frames by. Writes nothing, so a node
+/// calls it with its other configuration checks, before it touches the
+/// disk.
 pub(crate) fn build_raft_config(config: &ServerConfig) -> Result<Option<RaftSetup>, String> {
+    build_raft_config_reading(config, BootStamp::read)
+}
+
+/// [`build_raft_config`], taking the boot stamp from `read_boot`, which is
+/// called only for a raft node whose flags pass: the seam that lets a test
+/// make the boot id unreadable.
+fn build_raft_config_reading(
+    config: &ServerConfig,
+    read_boot: impl FnOnce() -> std::io::Result<BootStamp>,
+) -> Result<Option<RaftSetup>, String> {
     let Some(bind) = config.raft_bind else {
         if config.raft_node_id.is_some()
             || !config.raft_peer.is_empty()
@@ -203,6 +223,13 @@ pub(crate) fn build_raft_config(config: &ServerConfig) -> Result<Option<RaftSetu
         .raft_dir
         .clone()
         .unwrap_or_else(|| config.journal.with_extension("raft"));
+    let boot = read_boot().map_err(|e| {
+        format!(
+            "the raft control plane (--raft-bind) cannot start: {e}. Every control-plane message \
+             carries the host's boot id, which lets peers tell it from a delayed one; run the \
+             node where it can read {BOOT_ID_PATH}"
+        )
+    })?;
     Ok(Some(RaftSetup {
         config: RaftConfig {
             node_id,
@@ -211,6 +238,7 @@ pub(crate) fn build_raft_config(config: &ServerConfig) -> Result<Option<RaftSetu
             peers,
         },
         auto_promotion,
+        boot,
     }))
 }
 
@@ -360,6 +388,7 @@ pub(crate) fn spawn_raft_driver(
     let RaftSetup {
         config: raft_config,
         auto_promotion,
+        boot,
     } = setup;
     info!(
         node_id = raft_config.node_id,
@@ -368,11 +397,12 @@ pub(crate) fn spawn_raft_driver(
         dir = %raft_config.dir.display(),
         "starting control-plane raft driver"
     );
-    let tip = Arc::new(melin_raft::TipSource {
-        fence: Arc::clone(fence_state),
-        seq: journal_tip,
-        ready: tip_ready,
-    });
+    let tip = Arc::new(melin_raft::TipSource::new(
+        Arc::clone(fence_state),
+        journal_tip,
+        tip_ready,
+        boot,
+    ));
     // The raft mesh doubles as a fencing channel only under
     // auto-promotion: without automation, a serving node's fencing
     // stays a data-plane-contact concern exactly as documented.
@@ -550,6 +580,79 @@ mod tests {
             .map(|i| format!("{i}@10.0.0.{i}:7001#{}", b64_key(i)))
             .collect();
         c
+    }
+
+    /// A node without raft never reads the boot id: it needs none.
+    #[test]
+    fn a_node_without_raft_reads_no_boot_stamp() {
+        let setup = build_raft_config_reading(&base_config(), || {
+            panic!("a node without raft must not read the boot id")
+        });
+        assert!(setup.unwrap().is_none());
+    }
+
+    /// Nor does a raft node whose flags are refused: the flag error is the
+    /// one reported.
+    #[test]
+    fn a_flag_refusal_comes_before_the_boot_stamp() {
+        let mut c = three_voter_config();
+        c.replication_key = None;
+        let err = build_raft_config_reading(&c, || panic!("flags first")).unwrap_err();
+        assert!(err.contains("--replication-key"), "{err}");
+    }
+
+    /// The setup carries the stamp read for it, which the driver's frames
+    /// carry.
+    #[test]
+    fn a_raft_setup_carries_the_boot_stamp_it_read() {
+        let stamp = BootStamp::from_parts([3; 16], 77);
+        let setup = build_raft_config_reading(&three_voter_config(), || Ok(stamp))
+            .unwrap()
+            .expect("raft is configured");
+        assert_eq!(setup.boot, stamp);
+        // And on this host, the real one.
+        let real = build_raft_config(&three_voter_config())
+            .unwrap()
+            .expect("raft is configured");
+        assert_eq!(
+            real.boot.boot_id(),
+            BootStamp::read().unwrap().boot_id(),
+            "the host's own boot id"
+        );
+    }
+
+    /// The refusal of a raft node whose boot id cannot be read: it says
+    /// the control plane cannot start, why (the path and the reader's
+    /// error), and what to fix.
+    fn assert_boot_refusal(err: &str, path: &std::path::Path, cause: &str) {
+        for part in [
+            "the raft control plane (--raft-bind) cannot start",
+            &path.display().to_string(),
+            cause,
+            &format!("run the node where it can read {BOOT_ID_PATH}"),
+        ] {
+            assert!(err.contains(part), "{part:?} not in {err:?}");
+        }
+    }
+
+    #[test]
+    fn a_missing_boot_id_refuses_the_control_plane() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("boot_id");
+        let err =
+            build_raft_config_reading(&three_voter_config(), || BootStamp::read_from(&missing))
+                .unwrap_err();
+        assert_boot_refusal(&err, &missing, "cannot read the kernel boot id");
+    }
+
+    #[test]
+    fn a_malformed_boot_id_refuses_the_control_plane() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("boot_id");
+        std::fs::write(&path, "garbage\n").unwrap();
+        let err = build_raft_config_reading(&three_voter_config(), || BootStamp::read_from(&path))
+            .unwrap_err();
+        assert_boot_refusal(&err, &path, "does not hold a kernel boot id");
     }
 
     /// What `build_raft_config` makes of `c`: `Ok(armed)`, whether the

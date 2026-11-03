@@ -15,8 +15,9 @@
 //! the quorum-ack age the driver publishes, [`PEER_TIP_REPORT_MAX_DELAY`],
 //! how long a follower's journal-tip change takes to reach the leader, and
 //! [`LeaderConfirm`], the blocking quorum round trip that confirms this
-//! node still leads. The RPC server, wire format, authentication and file
-//! store stay private.
+//! node still leads; [`PeerTips`] holds what peers advertise, each tip
+//! with the [`SenderStamp`] that orders it ([`StampedTip`]). The RPC
+//! server, wire format, authentication and file store stay private.
 
 mod auth;
 mod driver;
@@ -34,5 +35,5 @@ pub use driver::{
     LeaderConfirm, LeaderConfirmError, PEER_TIP_REPORT_MAX_DELAY, QUORUM_ACK_MAX_AGE, RaftConfig,
     RaftHandles, RaftPeer, spawn,
 };
-pub use recency::{JournalTip, PeerTips, TipSource};
+pub use recency::{JournalTip, PeerTips, SenderStamp, StampedTip, TipSource};
 pub use rpc_server::SupersessionPolicy;

@@ -12,6 +12,7 @@ set -euo pipefail
 #     logic with journal I/O compiled out. Test modules that exercise
 #     real file/socket I/O are skipped (see SKIPS below) — Miri cannot
 #     run those syscalls, and they add no UB coverage anyway.
+#   - melin-raft: the `recency` module alone (see below).
 #
 # Out of scope (Miri cannot run them):
 #   - melin-dpdk / melin-server-runtime: FFI and real sockets.
@@ -76,9 +77,25 @@ SKIPS=(
     --skip replication::validate
     --skip replication::archive
     --skip replication::catchup
+    # Reads /proc and a temp file, and asks for CLOCK_BOOTTIME; the boot
+    # id parser beside them stays in.
+    --skip boot_stamp::tests::host::
 )
 
 echo "==> miri: melin-transport-core (no-persist)"
 cargo +nightly miri test -p melin-transport-core --features no-persist --lib -- "${SKIPS[@]}" "${FILTER[@]}"
+
+# melin-raft: only its recency module, the pure logic of the control plane
+# (the vote filter, the sender order of peer tips, and the frame counter
+# taken under one lock with the tip, which several threads stamp at once).
+# The rest of the crate drives sockets and files. The log-capture tests are
+# skipped: their formatter reads the wall clock, which isolation refuses.
+# A filter narrows this step only when it names a path under `recency`
+# (`scripts/miri.sh recency::tests::a_newer`): any other filter could
+# match the crate's socket tests, so the step is left out instead.
+if [[ -z "${1:-}" || "$1" == recency::* ]]; then
+    echo "==> miri: melin-raft (recency)"
+    cargo +nightly miri test -p melin-raft --lib -- "${1:-recency::}" --skip logs_capture_
+fi
 
 echo "==> Miri passed"

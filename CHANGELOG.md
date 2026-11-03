@@ -65,8 +65,37 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   **`melin_raft::PEER_TIP_REPORT_MAX_DELAY`**, the longest a follower's
   journal-tip change takes to reach the raft leader, which the bound is
   derived from.
+- **`melin_transport_core::boot_stamp::BootStamp`**: the host's boot id
+  and the process start on `CLOCK_BOOTTIME`, read once at startup
+  (`BootStamp::read`), which orders a node's processes on one host; and
+  **`melin_raft::SenderStamp` and `melin_raft::StampedTip`**, a
+  control-plane frame's place in its sender's order and the journal tip
+  it carried. Under `test-utils`, `BootStamp::from_parts` and
+  `BootStamp::read_from` build one by hand or from another path.
 
 ### Changed
+
+- **A raft-enabled node refuses to start if it cannot read the kernel's
+  boot id** (`/proc/sys/kernel/random/boot_id`), which its control-plane
+  messages now carry, with the process start time, so that peers can
+  order them (see **Fixed**). It is read with the other flag checks,
+  before the node touches its journal, and the error names the file and
+  why it could not be read; a node without the raft flags does not read
+  it. **Upgrading:** a raft node in a container or sandbox that hides
+  `/proc/sys` and used to start now refuses to; expose the file to it.
+  The envelope change is part of raft protocol 1 (no release shipped
+  protocol 1 before it, so the version stays 1), and needs no step beyond
+  that protocol's all-nodes-together upgrade (see **Control-plane links
+  carry a protocol version** below). See "Deployment rules" in
+  `docs/replication.md`, which also warns against resuming a node from a
+  VM snapshot or running it in a time namespace that offsets the
+  boot-time clock; a node whose peer's messages have all been taken for
+  delayed ones for ten seconds logs a warning naming the peer.
+- **`melin_raft::TipSource` gains private fields** (its boot stamp and
+  frame counter), so it is now built with `TipSource::new`, which takes a
+  `BootStamp`. **`PeerTips::record` and `record_at` take a `StampedTip`**
+  (the tip and the `SenderStamp` of the frame that carried it) and return
+  whether it was recorded.
 
 - **A node refuses to start with `--raft-auto-promote` and a
   `--tick-interval-ms` of 0, or a cadence plus `--group-commit-us`
@@ -226,6 +255,22 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   `Prealloc`.
 
 ### Fixed
+
+- **A delayed control-plane message can no longer let a replica missing
+  acknowledged writes pass the promotion check.** A node recorded each
+  peer's journal position from every control-plane message as it
+  arrived. TCP orders messages within one connection only, and a peer's
+  messages reach a node over several (its requests on its own
+  connections, its replies on the node's), so a message delayed on one
+  (waiting for a retransmission after a partition, say) could arrive
+  after a newer one sent on another and make that peer's position look
+  older than it was, and freshly heard. Under `--raft-auto-promote`, a slower replica
+  deciding at that moment could see the faster one as level with it and
+  promote, losing the acknowledged writes only the faster one held. Every
+  control-plane message now carries its place in the sender's order, and
+  a message older than one already heard from the same node no longer
+  updates that node's position or the time it was last heard (it is
+  logged at `debug`).
 
 - **A journal rotation that adopted a pre-staged segment could lose that
   segment's entries from the node's journal.** The staging thread could

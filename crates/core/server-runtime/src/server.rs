@@ -6289,6 +6289,8 @@ mod promotion_epoch_tests {
             crate::raft::RaftSetup {
                 config,
                 auto_promotion: None,
+                boot: melin_transport_core::boot_stamp::BootStamp::read()
+                    .expect("this host's boot stamp"),
             },
             &signing_key,
             &Arc::new(
