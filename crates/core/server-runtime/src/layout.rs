@@ -123,8 +123,8 @@ pub enum ReaderThread {
     /// produces into.
     IoUring,
     /// The DPDK NIC poll thread. It polls the device unconditionally and
-    /// never idles, so it busy-spins whatever its entry says; a `y` on
-    /// the reader is refused rather than silently ignored.
+    /// never idles, so it busy-spins whatever its entry says; a `y` or a
+    /// `p` on the reader is refused rather than silently ignored.
     DpdkPoll,
 }
 
@@ -161,7 +161,8 @@ pub struct PipelineCores {
     /// I/O and sleeps between attempts, it never polls a ring. The parser
     /// only produces a yielding preparer, and the layout check and the
     /// rendering read it as yielding whatever this field holds, so a
-    /// busy-spin value set in code is ignored rather than refused. It is
+    /// busy-spin or parking value set in code is ignored rather than
+    /// refused; the layouts built in code hold it as yielding too. It is
     /// carried here so the layout check knows it is harmless to share a
     /// core with.
     pub journal_prep: Placement,
@@ -296,7 +297,8 @@ impl PipelineCores {
             .collect()
     }
 
-    /// Whether no thread at all has a core: the `--cores none` layout.
+    /// Whether no thread at all has a core: `--cores none`, or a list
+    /// whose every entry is unpinned (`0`, `0p` or `0y`).
     pub fn pins_nothing(&self) -> bool {
         self.named()
             .iter()
@@ -341,8 +343,8 @@ impl PipelineCores {
     /// Checked over every thread, whether or not today's flags spawn it
     /// — a layout is meant to be right independent of which features are
     /// on, and the message names the threads and the core so the fix is
-    /// obvious. Two yielding threads on one core is the supported way to
-    /// run on a small box and passes. The parser and the [`Placement`]
+    /// obvious. Yielding and parking threads sharing one core is the
+    /// supported way to run on a small box and passes. The parser and the [`Placement`]
     /// constructors never produce an unpinned spinner, but the fields are
     /// public, so the check does not rely on that.
     pub fn validate(&self) -> Result<(), String> {
@@ -413,8 +415,9 @@ impl PipelineCores {
             repl_handler_1: Placement::unpinned(),
             // Preparer unpinned in compact — the embedded bench doesn't
             // rotate at production cadence, and raising compact's core
-            // minimum for it isn't worth a core.
-            journal_prep: Placement::unpinned(),
+            // minimum for it isn't worth a core. Held as yielding, the
+            // one form the field takes (see `journal_prep`).
+            journal_prep: Placement::yielding(0),
             // The disk thread IS hot, but compact exists for boxes that
             // cannot spare a core per stage. Unpinned, it parks like
             // every thread without a core of its own: it sleeps only once
@@ -431,7 +434,7 @@ impl PipelineCores {
 /// the node logs at boot can be pasted straight back onto a command
 /// line. Every thread is named, unpinned ones as `=0` (or `=0y`), so the
 /// log shows the whole layout rather than only what was pinned; the
-/// layout `none` parses to renders as `none`.
+/// layout that `none` parses to renders as `none`.
 impl std::fmt::Display for PipelineCores {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.named() == PipelineCores::unpinned().named() {
@@ -777,6 +780,8 @@ mod tests {
         assert_eq!(cores.journal_prep, Placement::yielding(10));
         let explicit = parse_cores(&complete("journal-prep=10y")).expect("parses");
         assert_eq!(explicit.journal_prep, Placement::yielding(10));
+        let parking = parse_cores(&complete("journal-prep=10p")).expect("parses");
+        assert_eq!(parking.journal_prep, Placement::yielding(10));
         let err = parse_cores(&complete("journal-prep=10s")).expect_err("must refuse");
         assert!(err.contains("journal-prep"), "{err}");
     }
@@ -1081,12 +1086,30 @@ mod tests {
             assert_eq!(reparsed, cores, "{input} -> {rendered}");
         }
         assert_eq!(PipelineCores::unpinned().to_string(), "none");
+        // The layouts built in code equal what their rendering parses
+        // back to, the preparer's field included.
+        let (compact, _) = PipelineCores::compact(16).expect("compact fits 16 cores");
+        for built in [PipelineCores::unpinned(), compact] {
+            assert_eq!(parse_cores(&built.to_string()).expect("parses"), built);
+        }
         // Nothing pinned is not enough to render as `none`: that would
         // parse back to threads that park where these yield.
         let yielding = PipelineCores::unpinned().all_yielding();
         assert!(yielding.pins_nothing());
         assert_ne!(yielding.to_string(), "none");
         assert!(yielding.to_string().contains("journal-seq=0y"));
+        // An unpinned spinner, which only code can build, renders as the
+        // `0s` it would have been written as, so a boot log of a layout
+        // the check refuses still says what was asked for.
+        let spinner = PipelineCores {
+            shadow: Placement {
+                core: 0,
+                wait: WaitStrategy::BusySpin,
+            },
+            ..PipelineCores::unpinned()
+        };
+        assert!(spinner.to_string().contains("shadow=0s"), "{spinner}");
+        assert!(spinner.validate().is_err());
         assert_eq!(
             ServerConfig::default().cores.to_string(),
             DEFAULT_CORES,

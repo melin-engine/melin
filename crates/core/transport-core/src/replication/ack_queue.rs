@@ -210,7 +210,10 @@ impl PendingAckQueue {
 /// never complete). Under `BusySpin` the wait stays on the CPU: ack RTT
 /// is on the primary's response-gate critical path, where a scheduler
 /// tick adds ~1ms to client p99. Under `SpinThenYield` a stalled cursor
-/// doesn't peg a core (tests / CI / shared boxes).
+/// doesn't peg a core (shared boxes). Under `SpinYieldPark` (unpinned
+/// threads, and so tests and CI) the wait also sleeps between polls, so
+/// once this wait has outlasted its spin and yield budgets it can see the
+/// cursor cross up to `PARK_MAX` plus timer slack late.
 pub fn wait_for_journal_cursor(
     journal_cursor: &Sequence,
     target: u64,

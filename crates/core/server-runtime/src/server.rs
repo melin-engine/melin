@@ -1017,7 +1017,7 @@ fn log_layout(cores: &PipelineCores) {
     info!(cores = %cores, "pipeline layout");
     if cores.pins_nothing() {
         warn!(
-            "--cores none: no pipeline thread is pinned. Every thread runs wherever the \
+            "no pipeline thread is pinned (--cores none). Every thread runs wherever the \
              scheduler puts it and shares that core with everything else on the host. A \
              development layout: latency measured under it is not representative. Name a \
              core per thread in --cores"
