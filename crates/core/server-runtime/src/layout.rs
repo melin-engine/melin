@@ -32,7 +32,10 @@ pub(crate) const DEFAULT_CORES: &str = "journal-seq=1,matching=2,response=3,read
 
 /// How many threads a layout places. `usize` because it is an array
 /// length: every per-thread list here is a fixed array of this size.
-const THREAD_COUNT: usize = 10;
+/// `pub(crate)` for the tick-cadence bound of automatic promotion, which
+/// allows for every thread of a layout parking
+/// (`raft_promotion::PARKED_THREADS_MAX_DELAY`).
+pub(crate) const THREAD_COUNT: usize = 10;
 
 /// The threads every node runs, whatever its flags, and that the operator
 /// docs say need a core to themselves: a request passes through each of

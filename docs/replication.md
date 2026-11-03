@@ -671,7 +671,7 @@ Enable it per node with:
 | `--raft-node-id <id>` | This node's id (non-zero, unique per cluster). |
 | `--raft-peer <id@host:port#base64-pubkey>` | One cluster member (repeatable). Give **every node the same list, including an entry for the node itself**. The pubkey pins the peer's identity in both directions: a connection authenticated with a different key cannot speak for that id, and when this node connects to that id, whatever answers at its address must prove that key or is refused. Each entry needs its own key: a list in which two entries share one is refused at startup. |
 | `--raft-dir <path>` | Durable election state. Defaults to the journal path with a `.raft` extension. |
-| `--raft-auto-promote` | Act on election wins (below). Off by default. |
+| `--raft-auto-promote` | Act on election wins (below). Off by default. Requires three voters, and `--tick-interval-ms` between 1 and 1500 with that cadence plus the `--group-commit-us` window at most 1500 ms (see "Deployment rules"). |
 
 When `--raft-bind` names a specific IP rather than `0.0.0.0` or `::`, a
 node sends its control-plane traffic from that IP, so peers and
@@ -797,12 +797,18 @@ Auto-promotion is deliberately conservative. The elected replica
   replica, so the majority check above passes, but whatever the primary
   journals now reaches only the other replica, which is then ahead,
   and the winner refuses. An idle primary is covered too: it journals a
-  clock tick every `--tick-interval-ms` (250 ms by default), well inside
-  the few seconds the winner waits before acting on a dropped primary
-  link. With ticks disabled (`--tick-interval-ms 0`) a
-  primary that receives no client traffic journals nothing, the
-  positions stay equal, and such a cut **can depose it**; keep ticks on
-  in any deployment that runs `--raft-auto-promote`;
+  clock tick every `--tick-interval-ms` (250 ms by default), and a tick
+  replicates like any other entry, provided one lands, replicates and is
+  reported back to the winner inside the 3 s grace it waits before
+  acting on a dropped primary link. With ticks disabled
+  (`--tick-interval-ms 0`), or too slow, a primary that receives no
+  client traffic journals nothing inside that grace, the positions stay
+  equal, and such a cut **can depose it**. That is why a node refuses to
+  start with `--raft-auto-promote` and ticks disabled, slower than
+  every 1500 ms (half the grace), or with a group-commit window
+  (`--group-commit-us`) that takes the cadence plus window above
+  1500 ms, and why every node of the cluster must tick within that bound
+  (see "Deployment rules");
 - manual promotions have outrun election terms (the term must be
   strictly above the epoch in force; the alignment heals as terms
   advance — promote manually in the interim).
@@ -890,6 +896,26 @@ nothing of its own.
   `--raft-auto-promote` and fewer than three configured voters.
   Two-node deployments keep today's manual `PROMOTE` playbook (the
   observational election still works).
+- **Run every node of a raft cluster with clock ticks, plus any
+  group-commit window, within 1500 ms.** An idle primary's ticks are the
+  only thing it journals, and they are what lets the peer check stop a
+  replica cut off from the primary alone from deposing it (see the
+  refusal list above), provided one lands, replicates and is reported
+  back inside the 3 s grace. 1500 ms, half the grace, leaves the rest for
+  that journey with a margin; the default 250 ms cadence with no window
+  is well inside it. A group-commit window delays every tick's
+  replication by its length, so it counts against the same 1500 ms. A
+  node refuses to start with `--raft-auto-promote` and a
+  `--tick-interval-ms` of 0, or one whose sum with `--group-commit-us`
+  is above 1500 ms; the error names both flags, the delay the node
+  computed and the bound. That covers a cluster whose nodes share one
+  configuration, but no node can see another's flags: a primary started
+  without the flag and with ticks disabled or slower, among replicas
+  that carry it, has the gap the refusal exists to close. Benchmarks
+  that disable or slow ticks run without `--raft-auto-promote` and
+  promote manually. **On upgrade**, a node configured outside this
+  range that used to start now refuses to; bring its flags within it
+  (or drop `--raft-auto-promote`) before restarting it.
 - **`--raft-dir` is durable state.** Keep it on the same durability
   class as the journal. Never restart a node with a wiped raft dir
   while its peers are live — a forgotten vote can be granted twice in

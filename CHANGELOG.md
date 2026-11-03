@@ -59,8 +59,31 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 - **`melin_journal::preparer::staging_files`**: the staging files beside
   a journal's live segment, in the current and the earlier naming (see
   **Changed**).
+- **`ServerConfig::MAX_AUTO_PROMOTE_TICK_DELAY`**: the slowest
+  `--tick-interval-ms`, its `--group-commit-us` window included, a node
+  accepts with `--raft-auto-promote` (see **Changed**), and
+  **`melin_raft::PEER_TIP_REPORT_MAX_DELAY`**, the longest a follower's
+  journal-tip change takes to reach the raft leader, which the bound is
+  derived from.
 
 ### Changed
+
+- **A node refuses to start with `--raft-auto-promote` and a
+  `--tick-interval-ms` of 0, or a cadence plus `--group-commit-us`
+  window above 1500 ms** (half the 3 s grace a replica waits out before
+  failing over). An idle primary's clock ticks are what let the control
+  plane refuse to promote a replica cut off from that primary alone
+  while the other replica still reaches it, provided one lands,
+  replicates and is reported back inside that grace; with ticks disabled
+  or slower, such a replica could depose a primary the rest of the
+  cluster still sees. A group-commit window delays each tick's
+  replication, so it counts against the same bound. The error names both
+  flags, the delay the node computed and the bound. **Upgrading:** a node
+  configured outside this range that used to start now refuses to; keep
+  the cadence plus window within 1500 ms (the default 250 ms with no
+  window is), or drop `--raft-auto-promote` and promote manually, and
+  run every node of a raft cluster within that bound (see "Deployment
+  rules" in `docs/replication.md`).
 
 - **Unpinned pipeline threads sleep when idle** (`--cores none`, and any
   entry of `0`): they park, as with the new `p` suffix, where they used

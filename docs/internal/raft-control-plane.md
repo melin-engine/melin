@@ -276,16 +276,17 @@ keeps its majority through that replica, so its lease stays fresh and
 both checks pass; the primary, hearing from no leader, campaigns in vain
 (the other replica's vote is held by L's lease). Only the peer-tip veto
 holds L back, and only while the other replica's journal tip moves ahead
-of L's: it does whenever the primary journals anything, and a primary
-with no client traffic still journals a tick every `--tick-interval-ms`,
-which replicates like any other entry, so the other replica's tip moves
-ahead within a tick of the cut, well inside the primary-down grace. The
-`a_replica_leader_cut_from_the_primary_alone_*` tests pin both cases,
-writes with no ticks and an idle primary ticking at the default cadence.
-The gap is left only with ticks disabled (`--tick-interval-ms 0`) and
-no client writes: the tips stay equal, nothing vetoes, and L promotes
-once the grace has passed, deposing the primary (a scratch run of the
-idle test with ticks off showed exactly that).
+of L's: it does whenever the primary journals anything within L's
+primary-down grace, and a primary with no client traffic still journals
+a tick every `--tick-interval-ms`, which replicates like any other
+entry. With ticks disabled, or too slow to land inside the grace, and no
+client writes, the tips stay equal, nothing vetoes, and L promotes once
+the grace has passed, deposing the primary (a scratch run of the idle
+test with ticks off showed exactly that). `--raft-auto-promote` refuses
+both at startup on the node that carries it ("The tick-cadence bound"
+below); what remains is a mixed cluster, the primary alone ticking
+outside the bound without the flag, which no node can see from its own
+flags.
 
 `LeaderConfirmError` is exhaustive: `NotLeader`, `TermMoved { now }`,
 `NoQuorum` (openraft's `QuorumNotEnough`), `TimedOut`, and
@@ -491,8 +492,9 @@ stable within 0.9 is assumed.
   serving, with both replicas back, no divergence and no lineage
   archive, checked with `lineage_archives_beside`),
   `a_replica_leader_alone_never_auto_promotes`, a leader cut from the
-  primary alone not promoting while writes flow nor while the primary is
-  idle but ticking at the default cadence, and the genuine
+  primary alone not promoting while the primary is idle but ticking at
+  the slowest cadence (and group-commit window) `--raft-auto-promote`
+  accepts, and the genuine
   failovers (`replica_leader_promotes_when_the_primary_dies`,
   `killed_primary_triggers_exactly_one_auto_promotion`), which run the
   real confirmation end to end, so a spurious refusal under load shows
@@ -509,8 +511,80 @@ stable within 0.9 is assumed.
   handles stay inside the driver thread; the nudged follower winning
   while L was just acknowledged (covered by the peer-tip veto's and
   fencing's own tests); and the one-sided partition on an idle primary
-  with ticks disabled, a known gap (not kept as a test, since the
-  outcome it would pin is the defect).
+  whose ticks are disabled or too slow to land inside the grace, a known
+  gap (not kept as a test, since the outcome it would pin is the
+  defect), which a uniformly configured cluster can no longer reach
+  ("The tick-cadence bound" below).
+
+### The tick-cadence bound
+
+`--raft-auto-promote` refuses a `--tick-interval-ms` of 0, or one whose
+sum with the `--group-commit-us` window is above
+`MAX_AUTO_PROMOTE_TICK_DELAY` (`raft_promotion.rs`, re-exported as
+`ServerConfig::MAX_AUTO_PROMOTE_TICK_DELAY`), defined as
+`PRIMARY_DOWN_GRACE / 2`. `build_raft_config` checks it, before the node
+touches its disk, and only a setup that passed carries the
+`AutoPromotion` proof that `spawn_auto_promotion` and the supersession
+policy take, so no path arms automation on unchecked flags. The
+requirement: in the one-sided partition (L, the replica raft leader, cut
+from the primary alone; O, the other replica, still reaching both), an
+idle primary's next tick must move O's tip ahead of L's, and L must see
+it, before L's grace ends. From the cut, the worst case is the sum of
+
+- the gap to the next tick: one cadence, plus the ingress loop's lateness
+  in noticing the deadline. `TickSchedule` keeps ticks on a one-cadence
+  grid; a loop that fell more than a cadence behind publishes the late
+  tick and restarts the grid from it, so ticks never fall further apart
+  than a cadence plus that lateness. A tick is dropped only on a full
+  input ring, whose queued entries move the tip anyway;
+- the group-commit window: the journal stage hands a batch to the
+  replication sender only once `--group-commit-us` has passed since its
+  first entry, so an idle primary's tick waits it out. The startup check
+  holds the cadence plus this window to the bound, so these first two
+  items together stay within `MAX_AUTO_PROMOTE_TICK_DELAY`. The sum, not
+  the larger of the two: a window longer than the cadence coalesces
+  ticks into a batch that opens up to a cadence after the previous flush
+  and then waits the whole window;
+- the tick's journey from the input ring to O's replication receiver,
+  which advances O's advertised tip on receipt, before persisting;
+  `TICK_DATA_PATH_BUDGET` covers it and the lateness above;
+- parking: under the `p` wait suffix, or unpinned, an idle pipeline
+  thread sleeps between polls, up to `PARK_MAX` plus the timer slack, and
+  an idle primary's threads are idle between ticks, so each thread on the
+  path may pick the tick up one sleep late. `PARKED_THREADS_MAX_DELAY`
+  allows that for every thread of both nodes' layouts
+  (`2 * THREAD_COUNT`), more than the path crosses; it is small beside
+  the other terms, but counted rather than folded into the budget, so a
+  longer `PARK_MAX` re-runs the check;
+- O's tip to L: every reply envelope carries the responder's tip as it
+  stands, and L heartbeats O once per raft tick, so at most
+  `melin_raft::PEER_TIP_REPORT_MAX_DELAY`, the slowest node's raft tick
+  period (`MAX_TICK_PERIOD_MS`) plus a round trip (`RTT_BUDGET_MS`).
+
+L's grace starts no earlier than the cut (its receiver must first see the
+link down, and the promotion poll after that), so the cut is the worst
+case for its start, and only the first tick after it matters: L's tip is
+frozen from the cut on, so once O is ahead it stays ahead. A
+compile-time assertion beside the constant checks that the terms sum
+under `PRIMARY_DOWN_GRACE`; half the grace rather than the largest
+cadence that fits leaves the rest as margin for what the budgets
+understate (a scheduling stall, a slow journal stage). Changing the
+grace, the raft heartbeat tuning or the parking backoff re-runs the
+check at build time.
+
+Tests: `auto_promote_refuses_ticks_outside_the_failover_grace` (unit:
+both edges of the range, one microsecond over, ticks disabled, flag
+values whose sum would overflow a `u64`, and the message), and
+`the_tick_bound_in_the_help_matches_the_constants`, since the `--help`
+of the three flags states the bound in figures;
+`a_node_refuses_to_start_with_auto_promotion_and_ticks_outside_the_grace`
+(the real startup path, in both roles, leaving no journal); and the two
+`a_replica_leader_cut_from_the_primary_alone_*` tests in
+`tests/raft_failover.rs`, which run the partition with the primary's
+cadence plus group-commit window at the bound, once all cadence and once
+all window but a few-millisecond cadence (a window longer than the
+cadence, the case that makes the sum rather than the larger of the two
+the bound): the derivation end to end.
 
 ## RPC transport
 

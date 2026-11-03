@@ -216,6 +216,9 @@ pub struct ServerConfig {
     #[arg(long, default_value = DEFAULT_CORES, value_parser = parse_cores)]
     pub cores: PipelineCores,
     /// Group commit coalescing delay in microseconds. Keep at 0 for TCP.
+    /// With `--raft-auto-promote`, keep this delay plus --tick-interval-ms
+    /// within 1500 ms: an idle primary's tick waits it out before it
+    /// replicates (see --tick-interval-ms).
     #[arg(long, default_value_t = 0)]
     pub group_commit_us: u64,
     /// Heartbeat interval in seconds. The server sends a heartbeat to idle
@@ -489,7 +492,12 @@ pub struct ServerConfig {
     /// transitions) fires in deterministic, journaled lockstep. There is
     /// no separate tick thread on either transport. Set to 0 to disable
     /// tick generation entirely (useful for benchmarks that don't
-    /// exercise time-driven features).
+    /// exercise time-driven features). With `--raft-auto-promote`, 0 and
+    /// any cadence above 1500 ms (half the 3 s failover grace) are
+    /// refused: an idle primary's ticks, landing inside that grace, are
+    /// part of what keeps automatic failover from deposing it (see
+    /// docs/replication.md). A `--group-commit-us` delay counts against
+    /// the same bound.
     ///
     /// Defaults to 250 ms. Under load the matching stage advances the
     /// application's clock at every-event resolution from `slot.timestamp_ns`
@@ -559,7 +567,11 @@ pub struct ServerConfig {
     /// operator policy decision. Requires `--raft-bind` and at least
     /// three configured voters (a two-node cluster cannot elect after
     /// losing either node, so automation would be dead weight with real
-    /// misconfiguration risk; see docs/replication.md).
+    /// misconfiguration risk; see docs/replication.md), and clock ticks at
+    /// `--tick-interval-ms` between 1 and 1500 ms (half the 3 s failover
+    /// grace), with that cadence plus the `--group-commit-us` window at
+    /// most 1500 ms: run every node of a raft cluster with ticks within
+    /// that bound.
     #[arg(long, default_value_t = false)]
     pub raft_auto_promote: bool,
 }
@@ -633,6 +645,17 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
+    /// The longest a node with `--raft-auto-promote` may take to hand an
+    /// idle primary's clock tick to replication: its `--tick-interval-ms`
+    /// plus its `--group-commit-us` window, summed. Half the primary-down
+    /// grace automatic failover waits out, so that an idle primary's next
+    /// clock tick moves a still-connected replica's journal tip ahead,
+    /// and the raft leader sees it, before a replica cut off from that
+    /// primary alone may promote (the derivation is beside its
+    /// definition).
+    pub const MAX_AUTO_PROMOTE_TICK_DELAY: std::time::Duration =
+        crate::raft_promotion::MAX_AUTO_PROMOTE_TICK_DELAY;
+
     /// Whether this node accepts replicas: whether `--replication-bind`
     /// is set, in either role (a replica holds the port from boot, and
     /// serves replicas on it once promoted). The one answer the
@@ -1085,6 +1108,9 @@ where
     // Resolved here, with the configuration's other checks: it refuses a
     // layout the node must not start on, and writes nothing.
     let store = config.store()?;
+    // The raft flags, refused here with the other checks for the same
+    // reason; spawned below, in whichever role the node boots.
+    let raft_setup = crate::raft::build_raft_config(&config)?;
 
     // Bind the replication listener up front, before any pipeline thread
     // exists and regardless of role: a bad or stolen --replication-bind
@@ -1178,11 +1204,10 @@ where
         // refuses to grant votes. The receiver owns the sequence half
         // until a promotion hands it to the new primary's journal stage.
         let journal_tip = control.journal_tip.clone();
-        let mut raft = match crate::raft::build_raft_config(&config)? {
+        let mut raft = match raft_setup {
             None => crate::raft::RaftDriverGuard::disabled(&shutdown),
-            Some(cfg) => crate::raft::spawn_raft_driver(
-                cfg,
-                config.raft_auto_promote,
+            Some(setup) => crate::raft::spawn_raft_driver(
+                setup,
                 &signing_key,
                 &authorized_keys,
                 &fence_state,
@@ -1197,16 +1222,19 @@ where
                 &shutdown,
             )?,
         };
-        // Act on election wins when the operator opted in. Genesis
-        // primaries have nothing to promote — replica paths only. The
-        // guard joins the thread on every exit path. The leadership
-        // confirmation goes to the promoted tenure (`PromotedTenure`).
+        // Act on election wins when the operator opted in (and the flags
+        // cleared `--raft-auto-promote`'s checks: the guard holds the
+        // proof only then). Genesis primaries have nothing to promote —
+        // replica paths only. The guard joins the thread on every exit
+        // path. The leadership confirmation goes to the promoted tenure
+        // (`PromotedTenure`).
         let mut leader_confirm = None;
-        if config.raft_auto_promote
+        if let Some(armed) = raft.auto_promotion()
             && let Some(wiring) = raft.promotion_wiring()
         {
             leader_confirm = Some(wiring.leader_confirm);
             raft.arm_promotion(crate::raft_promotion::spawn_auto_promotion(
+                armed,
                 wiring.status,
                 control.clone(),
                 Arc::clone(&fence_state),
@@ -1368,13 +1396,12 @@ where
     let journal_tip = melin_transport_core::AdvertisedJournalTip::new(
         melin_transport_core::WireSeq::new(writer.next_sequence().saturating_sub(1)),
     );
-    let raft = match crate::raft::build_raft_config(&config)? {
+    let raft = match raft_setup {
         None => crate::raft::RaftDriverGuard::disabled(&shutdown),
-        Some(cfg) => {
+        Some(setup) => {
             let signing_key = load_replication_key(&config)?;
             crate::raft::spawn_raft_driver(
-                cfg,
-                config.raft_auto_promote,
+                setup,
                 &signing_key,
                 &authorized_keys,
                 &fence_state,
@@ -2620,6 +2647,9 @@ where
     // As on the kernel-TCP path: the node's journal and snapshot, for
     // every role below, refused before anything touches the disk.
     let store = config.store()?;
+    // As on the kernel-TCP path: the raft flags, refused with the other
+    // checks.
+    let raft_setup = crate::raft::build_raft_config(&config)?;
     // Initialize shared DPDK resources (EAL, mempool, ports with N queues).
     let shared = melin_dpdk::DpdkShared::init(&dpdk_config)?;
     // Actual queue count may be less than requested (TAP only supports 1).
@@ -2692,11 +2722,10 @@ where
         // queue. Same promotion-surviving placement and tip ownership as
         // the kernel replica path.
         let journal_tip = control.journal_tip.clone();
-        let mut raft = match crate::raft::build_raft_config(&config)? {
+        let mut raft = match raft_setup {
             None => crate::raft::RaftDriverGuard::disabled(&shutdown),
-            Some(cfg) => crate::raft::spawn_raft_driver(
-                cfg,
-                config.raft_auto_promote,
+            Some(setup) => crate::raft::spawn_raft_driver(
+                setup,
                 &signing_key,
                 &authorized_keys,
                 &fence_state,
@@ -2711,16 +2740,18 @@ where
                 &shutdown,
             )?,
         };
-        // Act on election wins when the operator opted in. Genesis
-        // primaries have nothing to promote — replica paths only. The
-        // guard joins the thread on every exit path. The leadership
-        // confirmation goes to the promoted tenure, as on kernel TCP.
+        // Act on election wins when the operator opted in and the flags
+        // cleared the checks, as on kernel TCP. Genesis primaries have
+        // nothing to promote — replica paths only. The guard joins the
+        // thread on every exit path. The leadership confirmation goes to
+        // the promoted tenure, as on kernel TCP.
         let mut leader_confirm = None;
-        if config.raft_auto_promote
+        if let Some(armed) = raft.auto_promotion()
             && let Some(wiring) = raft.promotion_wiring()
         {
             leader_confirm = Some(wiring.leader_confirm);
             raft.arm_promotion(crate::raft_promotion::spawn_auto_promotion(
+                armed,
                 wiring.status,
                 control.clone(),
                 Arc::clone(&fence_state),
@@ -2922,13 +2953,12 @@ where
     let journal_tip = melin_transport_core::AdvertisedJournalTip::new(
         melin_transport_core::WireSeq::new(writer.next_sequence().saturating_sub(1)),
     );
-    let raft = match crate::raft::build_raft_config(&config)? {
+    let raft = match raft_setup {
         None => crate::raft::RaftDriverGuard::disabled(&shutdown),
-        Some(cfg) => {
+        Some(setup) => {
             let signing_key = load_replication_key(&config)?;
             crate::raft::spawn_raft_driver(
-                cfg,
-                config.raft_auto_promote,
+                setup,
                 &signing_key,
                 &authorized_keys,
                 &fence_state,
@@ -6256,8 +6286,10 @@ mod promotion_epoch_tests {
         };
         let shutdown = Arc::new(AtomicBool::new(false));
         let raft = crate::raft::spawn_raft_driver(
-            config,
-            false,
+            crate::raft::RaftSetup {
+                config,
+                auto_promotion: None,
+            },
             &signing_key,
             &Arc::new(
                 melin_app::auth::AuthorizedKeys::parse::<melin_app::auth::NoRoles>("")

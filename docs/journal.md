@@ -82,7 +82,7 @@ In the pipeline architecture, the journal stage reads a batch of events from the
 
 Batches that queue up behind a slow device coalesce further: the disk thread writes every batch waiting for it and then issues **one** `fdatasync` covering all of them. A backlog built up during a stall therefore costs a single sync to clear, not one per batch.
 
-An explicit group commit delay (`group_commit_delay`) can be configured but is set to zero for TCP. Testing showed that any delay hurts TCP throughput because it holds the journal cursor longer, stalling the response stage. It only helps with UDS transport where response sends are near-free.
+An explicit group commit delay (`group_commit_delay`) can be configured but is set to zero for TCP. Testing showed that any delay hurts TCP throughput because it holds the journal cursor longer, stalling the response stage. It only helps with UDS transport where response sends are near-free. The delay also holds back replication, so under `--raft-auto-promote` it plus `--tick-interval-ms` must stay within 1500 ms, or the node refuses to start (see [Deployment rules](replication.md#deployment-rules)).
 
 ## Crash Recovery
 

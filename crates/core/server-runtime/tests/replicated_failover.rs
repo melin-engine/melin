@@ -208,7 +208,9 @@ fn acked_events_survive_primary_death_under_ram_policy() {
             journal: tmp.path().join(format!("node-{i}.journal")),
             authorized_keys: auth_path.clone(),
             ack_policy: AckPolicy::Ram,
-            tick_interval_ms: 0,
+            // Ticks at the default cadence: `--raft-auto-promote` refuses
+            // them disabled or slower than
+            // `ServerConfig::MAX_AUTO_PROMOTE_TICK_DELAY`.
             snapshot_interval_ms: 0,
             health_bind: Some(nodes[i].health_addr),
             admin_bind: Some(nodes[i].admin_addr),
