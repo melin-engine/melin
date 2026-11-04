@@ -24,9 +24,10 @@ pub mod ack_policy;
 /// Bundles the journal-progress atomics behind space-typed accessors so the
 /// compiler rejects mixing wire-seq and ring-index values.
 pub mod cursors;
-/// The single event-dispatch sequence (duplicate check, scheduler clock,
-/// apply) shared by the live matching stage, journal replay and the shadow
-/// stage, so the three cannot rebuild different state from one stream.
+/// The single event-dispatch sequence (scheduler clock, apply) shared by
+/// the live matching stage, journal replay and the shadow stage, so the
+/// three cannot rebuild different state from one stream, and the clock's
+/// watermark ([`TickWatermark`]) each of them carries.
 mod dispatch;
 /// Replication fencing: the node's observed epoch and the one-way fenced
 /// latch that closes the split-brain window after a promotion.
@@ -74,8 +75,11 @@ pub mod test_ports;
 pub mod tick;
 pub mod trace;
 
-#[cfg(test)]
-mod test_support;
+/// Test-only applications: the minimal `TestApp`, and `TickCountingApp`,
+/// which makes every tick call visible. For this crate's tests and, under
+/// `test-utils`, any crate's (the runtime's resync tests drive one).
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_support;
 
 #[cfg(test)]
 mod pipeline_tests;
@@ -84,5 +88,10 @@ pub use cursors::{
     AdvertisedJournalTip, DurableWireSeqCursor, PipelineCursors, ReplicaSlotCursors, RingPos,
     WireSeq,
 };
+// The items of the dispatch module other crates name: every stage they
+// build starts from a watermark, which only this crate mints (from
+// nothing, from replay, or from a snapshot header), and a stopped
+// matching stage hands its back with its application.
+pub use dispatch::{TickWatermark, WarmApp};
 pub use journaled_app::{JournaledApp, JournaledAppError};
 pub use node_store::{NodeStore, NodeStoreError};

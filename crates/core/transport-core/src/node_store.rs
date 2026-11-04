@@ -537,6 +537,7 @@ mod tests {
                 [0; 32],
                 crate::lineage::Lineage::GENESIS,
                 None,
+                crate::dispatch::TickWatermark::GENESIS,
                 store.snapshot(),
             )
             .unwrap();
@@ -567,6 +568,7 @@ mod tests {
             [0; 32],
             crate::lineage::Lineage::GENESIS,
             None,
+            crate::dispatch::TickWatermark::GENESIS,
             store.snapshot(),
         );
         assert!(failed.is_err());

@@ -15,6 +15,7 @@
 //! | ack_policy       | u8       | 1     | Ack policy in force at snapshot (v4) |
 //! | previous_policy  | u8       | 1     | Policy before the transition to it (v4) |
 //! | policy_wire_seq  | u64      | 8     | Wire sequence of that transition (v4) |
+//! | tick_watermark   | u64      | 8     | Latest time handed to `tick` (v5) |
 //! | app_payload      | var      | var   | Bytes from `A::snapshot`       |
 //! | crc32c           | u32      | 4     | CRC32C over everything above   |
 //!
@@ -41,16 +42,24 @@
 //! `genesis_entries`; bit 1: `ack_policy` and `policy_wire_seq`; bit 2:
 //! `previous_policy`; bit 3: the transition was unwitnessed). Bits 2 and 3
 //! need bit 1, and an absent field is written as zero.
+//!
+//! `tick_watermark` is the latest time the copy that took the snapshot had
+//! handed to `Application::tick` at the snapshot's sequence (see
+//! [`TickWatermark`]), so a copy restored from it makes the tick calls an
+//! uninterrupted one makes. Files before v5 have no such field; a restore
+//! from one falls back on the timestamp of the journal entry at the
+//! snapshot's sequence (see [`SnapshotHeader::resume_tick_watermark`]).
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 
-use melin_app::Application;
-use melin_journal::{AckPolicyByte, AckPolicyChange};
+use melin_app::{AppEvent, Application};
+use melin_journal::{AckPolicyByte, AckPolicyChange, JournalError, JournalReader};
 
 use crate::cursors::WireSeq;
+use crate::dispatch::TickWatermark;
 use crate::lineage::{Lineage, LineagePolicy};
 use tracing::warn;
 
@@ -72,13 +81,20 @@ const SNAP_MAGIC: u32 = 0x534E_4150;
 //
 // v4 appended the lineage's ack policy, with a flags byte saying which
 // of it and the genesis length are known, so either can be unknown
-// without the other. Writes produce v4 whenever the lineage has
+// without the other. Releases before v5 wrote v4 whenever the lineage had
 // something v2 cannot hold, and v2 otherwise (both fields unknown: a
-// lineage from before either existed), keeping the rule that the layout
-// tracks the lineage. v3 is read only. The policy's transition (the
+// lineage from before either existed). The policy's transition (the
 // policy before it, its sequence, unwitnessed) is part of v4: no release
 // wrote v4 before it, so it needed no version of its own.
-const TRANSPORT_VERSION: u16 = 4;
+//
+// v5 appended the tick watermark at the snapshot's sequence. Every save
+// knows it, so writes always produce v5, whatever the lineage knows: the
+// flags still say which lineage fields hold a value. v1 to v4 are read
+// only, with the watermark unrecorded. An older binary refuses a v5 file
+// (`UnsupportedTransportVersion`), so a downgrade past v5 restores from
+// the journal or an older snapshot.
+const TRANSPORT_VERSION: u16 = 5;
+const TRANSPORT_VERSION_V4: u16 = 4;
 const TRANSPORT_VERSION_V3: u16 = 3;
 const TRANSPORT_VERSION_V2: u16 = 2;
 const TRANSPORT_VERSION_V1: u16 = 1;
@@ -86,7 +102,8 @@ const HEADER_SIZE_V1: usize = 4 + 2 + 2 + 8 + 32; // magic + t_ver + a_ver + seq
 const HEADER_SIZE_V2: usize = HEADER_SIZE_V1 + 8; // v2 appends the epoch
 const HEADER_SIZE_V3: usize = HEADER_SIZE_V2 + 8; // v3 appends genesis_entries
 // v4 appends lineage_flags + ack_policy + previous_policy + policy_wire_seq
-const HEADER_SIZE: usize = HEADER_SIZE_V3 + 1 + 1 + 1 + 8;
+const HEADER_SIZE_V4: usize = HEADER_SIZE_V3 + 1 + 1 + 1 + 8;
+const HEADER_SIZE: usize = HEADER_SIZE_V4 + 8; // v5 appends tick_watermark
 
 /// `lineage_flags` bit: the `genesis_entries` field holds a value.
 const LINEAGE_GENESIS_KNOWN: u8 = 1 << 0;
@@ -150,7 +167,7 @@ pub enum SnapshotError {
     /// payload: it and the `A::snapshot` that wrote the file disagree
     /// about the layout, so the state it returned is not the one saved.
     UnreadPayload(usize),
-    /// A v4 header's lineage fields are not what a save writes: a
+    /// A v4 or v5 header's lineage fields are not what a save writes: a
     /// reserved `lineage_flags` bit is set, or a field the flags mark
     /// absent is not zero. Refused rather than guessed at, so a header
     /// parses only if it re-encodes to the same bytes.
@@ -237,19 +254,117 @@ pub struct SnapshotHeader {
     pub lineage: Lineage,
     /// The lineage's genesis length, as the journal header records it
     /// (`melin_journal::FileHeaderInfo::genesis_entries`). `None` for v1
-    /// and v2 files, and v4 files that do not know it — unknown, never
-    /// "no genesis".
+    /// and v2 files, and v4 and v5 files that do not know it — unknown,
+    /// never "no genesis".
     pub genesis_entries: Option<u64>,
+    /// The tick watermark at the anchor sequence, if the file records
+    /// one (v5). Read through [`Self::resume_tick_watermark`], which
+    /// supplies the fallback for a file that does not.
+    pub tick_watermark: SnapshotWatermark,
     /// Bytes the header occupies in this file (version-dependent). The
     /// app payload starts at this offset.
     pub len: usize,
 }
 
+/// The tick watermark a snapshot header records for its sequence: the
+/// value (v5), or nothing (v1 to v4, which predate the field).
+///
+/// A type of its own rather than an `Option<TickWatermark>` so that no
+/// restore can take a default for an unrecorded one: the only way to a
+/// [`TickWatermark`] is [`SnapshotHeader::resume_tick_watermark`], which
+/// falls back on the journal and says so in the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotWatermark(Option<TickWatermark>);
+
+impl SnapshotWatermark {
+    /// Whether the header records the watermark. When it does not, a
+    /// restore must find the timestamp of the journal entry at the
+    /// snapshot's sequence for [`SnapshotHeader::resume_tick_watermark`].
+    pub fn is_recorded(self) -> bool {
+        self.0.is_some()
+    }
+}
+
 impl SnapshotHeader {
+    /// The tick watermark at the snapshot's sequence, which the copy
+    /// restored from it starts from: the one the header records (v5).
+    ///
+    /// A file from before the field (v1 to v4) falls back on
+    /// `anchor_entry_timestamp_ns`, the timestamp of the journal entry at
+    /// the snapshot's sequence: exact unless timestamps went backwards
+    /// before it (the watermark is the newest seen, which an earlier
+    /// entry would then hold). When that entry is no longer available
+    /// (`None`: its segment pruned, or the snapshot at a segment boundary
+    /// whose earlier segment is gone), the watermark is
+    /// [`TickWatermark::GENESIS`]: the first entry after the snapshot
+    /// then fires a tick, as it does on an uninterrupted copy unless its
+    /// timestamp is no newer than every one before it. Any later value —
+    /// the first replayed entry's timestamp, say — would instead suppress
+    /// the tick an uninterrupted copy almost always makes. A snapshot at
+    /// sequence 0 covers no entry, so its watermark is exactly genesis.
+    ///
+    /// A fallback logs one warning naming `snapshot`, the file the header
+    /// was read from (or received as). The copy's next snapshot records
+    /// the watermark, so the fallback is taken at most once per file.
+    pub fn resume_tick_watermark(
+        &self,
+        snapshot: &Path,
+        anchor_entry_timestamp_ns: Option<u64>,
+    ) -> TickWatermark {
+        if let Some(recorded) = self.tick_watermark.0 {
+            return recorded;
+        }
+        if self.sequence == 0 {
+            return TickWatermark::GENESIS;
+        }
+        match anchor_entry_timestamp_ns {
+            Some(timestamp_ns) => {
+                warn!(
+                    snapshot = %snapshot.display(),
+                    sequence = self.sequence,
+                    timestamp_ns,
+                    "snapshot predates the recorded tick watermark: resuming from the \
+                     timestamp of the journal entry at its sequence; the next snapshot \
+                     records it"
+                );
+                TickWatermark::at_entry(timestamp_ns)
+            }
+            None => {
+                warn!(
+                    snapshot = %snapshot.display(),
+                    sequence = self.sequence,
+                    "snapshot predates the recorded tick watermark and the journal no \
+                     longer holds the entry at its sequence: resuming from a fresh \
+                     watermark, so the first entry after it fires a tick even if its \
+                     timestamp is not newer; the next snapshot records it"
+                );
+                TickWatermark::GENESIS
+            }
+        }
+    }
+
+    /// [`Self::resume_tick_watermark`] for a snapshot restored over the
+    /// journal at `journal`, a live segment (a replica's seeded journal,
+    /// say): when the header does not record the watermark, the fallback
+    /// reads the journal for the entry at the snapshot's sequence. Reads
+    /// nothing when it does.
+    pub fn resume_tick_watermark_over<E: AppEvent>(
+        &self,
+        snapshot: &Path,
+        journal: &Path,
+    ) -> Result<TickWatermark, JournalError> {
+        let anchor_entry_timestamp_ns = if self.tick_watermark.is_recorded() || self.sequence == 0 {
+            None
+        } else {
+            entry_timestamp::<E>(journal, self.sequence)?
+        };
+        Ok(self.resume_tick_watermark(snapshot, anchor_entry_timestamp_ns))
+    }
+
     /// Decode and validate the framing header at the start of `bytes`.
     /// Accepts transport versions 1 (no epoch), 2 (no genesis length),
-    /// 3 (no ack policy) and 4. Does not touch the app payload or the
-    /// trailing CRC — callers own those checks.
+    /// 3 (no ack policy), 4 (no tick watermark) and 5. Does not touch the
+    /// app payload or the trailing CRC — callers own those checks.
     pub fn parse(bytes: &[u8]) -> Result<Self, SnapshotError> {
         if bytes.len() < HEADER_SIZE_V1 {
             return Err(SnapshotError::Truncated);
@@ -273,6 +388,7 @@ impl SnapshotHeader {
             TRANSPORT_VERSION_V1 => HEADER_SIZE_V1,
             TRANSPORT_VERSION_V2 => HEADER_SIZE_V2,
             TRANSPORT_VERSION_V3 => HEADER_SIZE_V3,
+            TRANSPORT_VERSION_V4 => HEADER_SIZE_V4,
             TRANSPORT_VERSION => HEADER_SIZE,
             other => return Err(SnapshotError::UnsupportedTransportVersion(other)),
         };
@@ -308,7 +424,7 @@ impl SnapshotHeader {
             )
         });
         let (genesis_entries, ack_policy) = match transport_version {
-            TRANSPORT_VERSION => {
+            TRANSPORT_VERSION_V4 | TRANSPORT_VERSION => {
                 let flags = bytes[64];
                 let policy = bytes[65];
                 let previous = bytes[66];
@@ -317,7 +433,7 @@ impl SnapshotHeader {
                         .try_into()
                         .expect("policy_wire_seq slice size fixed by header layout"),
                 );
-                let genesis = genesis_field.expect("v4 holds the genesis_entries field");
+                let genesis = genesis_field.expect("v4 and v5 hold the genesis_entries field");
                 let has = |bit: u8| flags & bit != 0;
                 let malformed = flags & !LINEAGE_FLAGS != 0
                     || (!has(LINEAGE_GENESIS_KNOWN) && genesis != 0)
@@ -344,15 +460,42 @@ impl SnapshotHeader {
             // v3 always knows the genesis length; v1 and v2 know neither.
             _ => (genesis_field, None),
         };
+        // Any value is one a save could have written: the watermark is a
+        // timestamp, zero included (nothing dispatched yet).
+        let tick_watermark = (transport_version == TRANSPORT_VERSION).then(|| {
+            TickWatermark::recorded(u64::from_le_bytes(
+                bytes[HEADER_SIZE_V4..HEADER_SIZE]
+                    .try_into()
+                    .expect("tick_watermark slice size fixed by header layout"),
+            ))
+        });
         Ok(Self {
             app_version,
             sequence,
             chain_hash,
             lineage: Lineage { epoch, ack_policy },
             genesis_entries,
+            tick_watermark: SnapshotWatermark(tick_watermark),
             len,
         })
     }
+}
+
+/// The timestamp of the entry at `sequence` in the live segment at
+/// `journal`, or `None` when the segment does not hold it. Reads from the
+/// start of the segment: only the restore of a snapshot from before the
+/// recorded watermark needs it, once.
+fn entry_timestamp<E: AppEvent>(
+    journal: &Path,
+    sequence: u64,
+) -> Result<Option<u64>, JournalError> {
+    let mut reader = JournalReader::<E>::open(journal)?;
+    while let Some(entry) = reader.next_entry()? {
+        if entry.sequence >= sequence {
+            return Ok((entry.sequence == sequence).then_some(entry.timestamp_ns));
+        }
+    }
+    Ok(None)
 }
 
 /// Save a snapshot of the current application state to `path`. Writes
@@ -370,8 +513,12 @@ impl SnapshotHeader {
 /// policy in force there.
 ///
 /// `genesis_entries` is the lineage's genesis length from the journal
-/// header. A lineage that knows neither it nor an ack policy writes a v2
-/// file, which has a field for neither; any other a v4 file.
+/// header.
+///
+/// `tick_watermark` is the watermark `app` is at, at `journal_sequence`:
+/// the one the copy being saved holds there (see [`TickWatermark`]).
+///
+/// Always writes the current version (v5).
 ///
 /// Returns the size of the file written, in bytes: the shadow stage logs
 /// it with each save, so an operator sees what a save costs. `u64`, the
@@ -382,6 +529,7 @@ pub fn save<A: Application>(
     chain_hash: [u8; 32],
     lineage: Lineage,
     genesis_entries: Option<u64>,
+    tick_watermark: TickWatermark,
     path: &Path,
 ) -> Result<u64, SnapshotError> {
     save_with_limit::<A>(
@@ -390,6 +538,7 @@ pub fn save<A: Application>(
         chain_hash,
         lineage,
         genesis_entries,
+        tick_watermark,
         path,
         SaveLimits::DEFAULT,
     )
@@ -500,60 +649,56 @@ fn write_bounded<F: WritebackTarget>(
 /// Internal form of [`save`] taking explicit [`SaveLimits`]. Factored out
 /// so tests can exercise the cap without allocating a payload that size,
 /// and the writeback chunking with a payload of a few bytes.
+#[allow(clippy::too_many_arguments)]
 fn save_with_limit<A: Application>(
     app: &A,
     journal_sequence: WireSeq,
     chain_hash: [u8; 32],
     lineage: Lineage,
     genesis_entries: Option<u64>,
+    tick_watermark: TickWatermark,
     path: &Path,
     limits: SaveLimits,
 ) -> Result<u64, SnapshotError> {
     let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
-    let v4 = genesis_entries.is_some() || lineage.ack_policy.is_some();
-    let transport_version = if v4 {
-        TRANSPORT_VERSION
-    } else {
-        TRANSPORT_VERSION_V2
-    };
     // Transport header.
     buf.extend_from_slice(&SNAP_MAGIC.to_le_bytes());
-    buf.extend_from_slice(&transport_version.to_le_bytes());
+    buf.extend_from_slice(&TRANSPORT_VERSION.to_le_bytes());
     buf.extend_from_slice(&A::APP_VERSION.to_le_bytes());
     buf.extend_from_slice(&journal_sequence.get().to_le_bytes());
     buf.extend_from_slice(&chain_hash);
     buf.extend_from_slice(&lineage.epoch.to_le_bytes());
-    if v4 {
-        let mut flags = 0u8;
-        if genesis_entries.is_some() {
-            flags |= LINEAGE_GENESIS_KNOWN;
-        }
-        if let Some(policy) = lineage.ack_policy {
-            flags |= LINEAGE_ACK_POLICY_KNOWN;
-            if policy.previous.is_some() {
-                flags |= LINEAGE_PREVIOUS_KNOWN;
-            }
-            if policy.change.unwitnessed {
-                flags |= LINEAGE_UNWITNESSED;
-            }
-        }
-        // An absent field is written as zero (see `SnapshotHeader::parse`).
-        buf.extend_from_slice(&genesis_entries.unwrap_or(0).to_le_bytes());
-        buf.push(flags);
-        buf.push(lineage.ack_policy.map_or(0, |p| p.policy().0));
-        buf.push(
-            lineage
-                .ack_policy
-                .and_then(|p| p.previous)
-                .map_or(0, |p| p.0),
-        );
-        buf.extend_from_slice(
-            &lineage
-                .ack_policy
-                .map_or(0, |p| p.wire_seq.get())
-                .to_le_bytes(),
-        );
+    let mut flags = 0u8;
+    if genesis_entries.is_some() {
+        flags |= LINEAGE_GENESIS_KNOWN;
     }
+    if let Some(policy) = lineage.ack_policy {
+        flags |= LINEAGE_ACK_POLICY_KNOWN;
+        if policy.previous.is_some() {
+            flags |= LINEAGE_PREVIOUS_KNOWN;
+        }
+        if policy.change.unwitnessed {
+            flags |= LINEAGE_UNWITNESSED;
+        }
+    }
+    // An absent field is written as zero (see `SnapshotHeader::parse`).
+    buf.extend_from_slice(&genesis_entries.unwrap_or(0).to_le_bytes());
+    buf.push(flags);
+    buf.push(lineage.ack_policy.map_or(0, |p| p.policy().0));
+    buf.push(
+        lineage
+            .ack_policy
+            .and_then(|p| p.previous)
+            .map_or(0, |p| p.0),
+    );
+    buf.extend_from_slice(
+        &lineage
+            .ack_policy
+            .map_or(0, |p| p.wire_seq.get())
+            .to_le_bytes(),
+    );
+    buf.extend_from_slice(&tick_watermark.as_nanos().to_le_bytes());
+    debug_assert_eq!(buf.len(), HEADER_SIZE, "the header is written whole");
     // App payload.
     app.snapshot(&mut buf)?;
     // CRC over everything written so far.
@@ -630,8 +775,9 @@ fn save_with_limit<A: Application>(
 
 /// Load a snapshot from `path`. Returns the restored application with the
 /// snapshot's [`SnapshotHeader`]: the journal sequence and chain hash to
-/// resume the journal from, the lineage to seed the node's with, and the
-/// genesis length.
+/// resume the journal from, the lineage to seed the node's with, the
+/// genesis length, and the tick watermark to start the stages from
+/// ([`SnapshotHeader::resume_tick_watermark`]).
 pub fn load<A: Application>(path: &Path) -> Result<(A, SnapshotHeader), SnapshotError> {
     let mut file = File::open(path)?;
     let file_size = file.seek(SeekFrom::End(0))?;
@@ -663,7 +809,7 @@ pub fn load<A: Application>(path: &Path) -> Result<(A, SnapshotHeader), Snapshot
         });
     }
 
-    // The header is parsed from the bytes before the CRC, so a v2–v4
+    // The header is parsed from the bytes before the CRC, so a v2–v5
     // header that would overlap the CRC region (a payload-less file whose
     // size passed the v1 minimum above) reads as truncated, never as
     // fields decoded from the checksum.
@@ -686,9 +832,31 @@ pub fn load<A: Application>(path: &Path) -> Result<(A, SnapshotHeader), Snapshot
     Ok((app, header))
 }
 
+/// Test-only: the bytes of the snapshot file `v5` (a whole v5 file, CRC
+/// included) as a release before v5 would have written the same state:
+/// the v4 layout, without the tick watermark, its CRC recomputed. For
+/// tests of restoring a snapshot from before the recorded watermark, in
+/// this crate and, under `test-utils`, any crate's (the runtime's resync).
+#[cfg(any(test, feature = "test-utils"))]
+pub fn as_v4(v5: &[u8]) -> Vec<u8> {
+    assert_eq!(
+        u16::from_le_bytes([v5[4], v5[5]]),
+        TRANSPORT_VERSION,
+        "a v5 file"
+    );
+    let mut v4 = Vec::with_capacity(v5.len() - (HEADER_SIZE - HEADER_SIZE_V4));
+    v4.extend_from_slice(&v5[..HEADER_SIZE_V4]);
+    v4[4..6].copy_from_slice(&TRANSPORT_VERSION_V4.to_le_bytes());
+    v4.extend_from_slice(&v5[HEADER_SIZE..v5.len() - CRC_SIZE]);
+    let crc = crc32c::crc32c(&v4);
+    v4.extend_from_slice(&crc.to_le_bytes());
+    v4
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_logs::{Logs, field};
     use crate::test_support::TestApp;
     use std::fs::OpenOptions;
 
@@ -696,9 +864,9 @@ mod tests {
     /// header fields and trailing app payload. Used by negative-path tests
     /// so each test can vary exactly one field while the CRC stays correct
     /// (i.e. the failure must come from the semantic check, not the CRC).
-    /// A v3 file gets a genesis length of 0, a current-version file a
-    /// known genesis length of 0 and no ack policy; any other version
-    /// gets the v2 layout.
+    /// A v3 file gets a genesis length of 0, a v4 file a known genesis
+    /// length of 0 and no ack policy, a current-version file the same and
+    /// a tick watermark of 0; any other version gets the v2 layout.
     fn craft_snapshot(
         magic: u32,
         transport_version: u16,
@@ -710,7 +878,12 @@ mod tests {
     ) -> Vec<u8> {
         let lineage_fields: Vec<u8> = match transport_version {
             TRANSPORT_VERSION_V3 => vec![0; 8],
-            TRANSPORT_VERSION => v4_lineage_fields(0, LINEAGE_GENESIS_KNOWN, 0, 0, 0),
+            TRANSPORT_VERSION_V4 => v4_lineage_fields(0, LINEAGE_GENESIS_KNOWN, 0, 0, 0),
+            TRANSPORT_VERSION => {
+                let mut fields = v4_lineage_fields(0, LINEAGE_GENESIS_KNOWN, 0, 0, 0);
+                fields.extend_from_slice(&0u64.to_le_bytes());
+                fields
+            }
             _ => Vec::new(),
         };
         craft_snapshot_with_lineage_fields(
@@ -725,7 +898,8 @@ mod tests {
         )
     }
 
-    /// A v4 header's bytes after the epoch, in layout order.
+    /// A v4 header's bytes after the epoch, in layout order: a v5
+    /// header's lineage fields, before its tick watermark.
     fn v4_lineage_fields(
         genesis: u64,
         flags: u8,
@@ -823,25 +997,84 @@ mod tests {
                 epoch: 7,
                 ack_policy: policy(1, false, 990, Some(2)),
             };
-            save::<TestApp>(&app, WireSeq::new(999), chain, lineage, Some(4), &path).unwrap();
+            let tick_watermark = TickWatermark::recorded(1_700_000_000_123_456_789);
+            save::<TestApp>(
+                &app,
+                WireSeq::new(999),
+                chain,
+                lineage,
+                Some(4),
+                tick_watermark,
+                &path,
+            )
+            .unwrap();
 
             let (restored, header) = load::<TestApp>(&path).unwrap();
             assert_eq!(header.sequence, 999, "{label}");
             assert_eq!(header.chain_hash, chain, "{label}");
             assert_eq!(header.lineage, lineage, "{label}");
             assert_eq!(header.genesis_entries, Some(4), "{label}");
+            assert!(header.tick_watermark.is_recorded(), "{label}");
+            assert_eq!(
+                header.resume_tick_watermark(&path, None),
+                tick_watermark,
+                "{label}"
+            );
             assert_eq!(restored, app, "{label}");
         }
     }
 
+    /// A recorded watermark is the one a restore starts from, at any
+    /// value, genesis included, and whatever the journal entry at the
+    /// snapshot's sequence says: no fallback, and nothing logged.
+    #[test]
+    fn a_recorded_tick_watermark_round_trips_and_wins_over_the_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snap");
+        let logs = Logs::default();
+        for nanos in [0, 1, 300, u64::MAX] {
+            let tick_watermark = TickWatermark::recorded(nanos);
+            save::<TestApp>(
+                &populated_app(),
+                WireSeq::new(3),
+                [0; 32],
+                at_epoch(0),
+                None,
+                tick_watermark,
+                &path,
+            )
+            .unwrap();
+            let (_, header) = load::<TestApp>(&path).unwrap();
+            tracing::subscriber::with_default(logs.subscriber(tracing::Level::DEBUG), || {
+                assert_eq!(
+                    header.resume_tick_watermark(&path, Some(nanos.wrapping_add(5))),
+                    tick_watermark,
+                    "{nanos}"
+                );
+                // The journal is not read: there is none at this path.
+                assert_eq!(
+                    header
+                        .resume_tick_watermark_over::<crate::test_support::TestEvent>(
+                            &path,
+                            &dir.path().join("no.journal"),
+                        )
+                        .unwrap(),
+                    tick_watermark,
+                    "{nanos}"
+                );
+            });
+        }
+        assert!(logs.lines("tick watermark").is_empty());
+    }
+
     /// Every combination of a known or unknown genesis length and ack
     /// policy (with or without a policy before its transition, witnessed
-    /// or not) round-trips: v4 for any that knows one of them, whose flags
-    /// say which, and v2 (which has a field for neither) for the one that
-    /// knows none. An unknown field reads back as unknown, never as a
-    /// default value.
+    /// or not) round-trips in v5, whose flags say which are known, the
+    /// lineage that knows none of them included (releases before v5 wrote
+    /// that one as v2, which has no field for the watermark). An unknown
+    /// field reads back as unknown, never as a default value.
     #[test]
-    fn lineage_fields_round_trip_and_only_a_lineage_knowing_neither_writes_v2() {
+    fn lineage_fields_round_trip_in_v5_whatever_the_lineage_knows() {
         let dir = tempfile::tempdir().unwrap();
         let app = populated_app();
         for genesis_entries in [Some(0), Some(12), None] {
@@ -860,58 +1093,43 @@ mod tests {
                     epoch: 3,
                     ack_policy,
                 };
+                let tick_watermark = TickWatermark::recorded(77);
                 save::<TestApp>(
                     &app,
                     WireSeq::new(5),
                     [0x42; 32],
                     lineage,
                     genesis_entries,
+                    tick_watermark,
                     &path,
                 )
                 .unwrap();
                 let bytes = std::fs::read(&path).unwrap();
                 let version = u16::from_le_bytes([bytes[4], bytes[5]]);
-                let knows_one = genesis_entries.is_some() || ack_policy.is_some();
-                let (expected_version, expected_len) = if knows_one {
-                    (4, HEADER_SIZE)
-                } else {
-                    (2, HEADER_SIZE_V2)
-                };
-                assert_eq!(version, expected_version, "{label}");
+                assert_eq!(version, 5, "{label}");
 
                 let (restored, header) = load::<TestApp>(&path).unwrap();
                 assert_eq!(restored, app, "{label}");
                 assert_eq!(header.genesis_entries, genesis_entries, "{label}");
                 assert_eq!(header.lineage, lineage, "{label}");
                 assert_eq!(header.sequence, 5, "{label}");
-                assert_eq!(header.len, expected_len, "{label}");
+                assert_eq!(header.len, HEADER_SIZE, "{label}");
+                assert_eq!(
+                    header.resume_tick_watermark(&path, None),
+                    tick_watermark,
+                    "{label}"
+                );
             }
         }
     }
 
-    /// The v4 header bytes, pinned: a layout change has to change this
-    /// test, not slip through a round trip that reads what it wrote.
-    #[test]
-    fn v4_header_golden_bytes() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("snap");
-        let lineage = Lineage {
-            epoch: 0x0102,
-            ack_policy: policy(3, true, 0x0908, Some(2)),
-        };
-        save::<TestApp>(
-            &TestApp::new(),
-            WireSeq::new(0x0A0B),
-            [0xCC; 32],
-            lineage,
-            Some(0x07),
-            &path,
-        )
-        .unwrap();
-        let bytes = std::fs::read(&path).unwrap();
+    /// The v4 header bytes every v5 header begins with: the golden
+    /// lineage below, after the shared prefix, at transport version
+    /// `version`.
+    fn golden_v4_header(version: u16) -> Vec<u8> {
         let mut expected = Vec::new();
         expected.extend_from_slice(&SNAP_MAGIC.to_le_bytes());
-        expected.extend_from_slice(&[4, 0]); // transport version
+        expected.extend_from_slice(&version.to_le_bytes()); // transport version
         expected.extend_from_slice(&TestApp::APP_VERSION.to_le_bytes());
         expected.extend_from_slice(&[0x0B, 0x0A, 0, 0, 0, 0, 0, 0]); // sequence
         expected.extend_from_slice(&[0xCC; 32]); // chain hash
@@ -921,8 +1139,40 @@ mod tests {
         expected.push(3); // ack_policy
         expected.push(2); // previous_policy
         expected.extend_from_slice(&[0x08, 0x09, 0, 0, 0, 0, 0, 0]); // policy_wire_seq
+        expected
+    }
+
+    /// The lineage [`golden_v4_header`] encodes.
+    fn golden_lineage() -> Lineage {
+        Lineage {
+            epoch: 0x0102,
+            ack_policy: policy(3, true, 0x0908, Some(2)),
+        }
+    }
+
+    /// The v5 header bytes, pinned: a layout change has to change this
+    /// test, not slip through a round trip that reads what it wrote.
+    #[test]
+    fn v5_header_golden_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snap");
+        save::<TestApp>(
+            &TestApp::new(),
+            WireSeq::new(0x0A0B),
+            [0xCC; 32],
+            golden_lineage(),
+            Some(0x07),
+            TickWatermark::recorded(0x1122_3344_5566_7788),
+            &path,
+        )
+        .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let mut expected = golden_v4_header(5);
+        expected.extend_from_slice(&[0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11]); // tick_watermark
         assert_eq!(&bytes[..HEADER_SIZE], &expected[..]);
-        assert_eq!(HEADER_SIZE, 75);
+        assert_eq!(HEADER_SIZE_V4, 75);
+        assert_eq!(HEADER_SIZE, 83);
+        assert_eq!(MAX_HEADER_SIZE, HEADER_SIZE);
 
         // A lineage whose first change is its policy: no previous, and
         // witnessed, so those flags and the previous byte stay clear.
@@ -936,59 +1186,84 @@ mod tests {
             [0; 32],
             lineage,
             None,
+            TickWatermark::GENESIS,
             &path,
         )
         .unwrap();
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(
             &bytes[HEADER_SIZE_V3..HEADER_SIZE],
-            &[0b10, 1, 0, 0x05, 0, 0, 0, 0, 0, 0, 0][..]
+            &[
+                0b10, 1, 0, 0x05, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+            ][..]
         );
     }
 
-    /// A v4 header whose lineage fields a save could not have written —
-    /// a reserved flag bit, or a value behind a cleared flag — is
-    /// refused, by the shared parser and so by `load`.
+    /// The v4 header bytes releases before v5 wrote, pinned, still read:
+    /// every field as written, and the tick watermark unrecorded.
     #[test]
-    fn malformed_v4_lineage_fields_are_refused() {
+    fn v4_golden_header_still_reads() {
+        let mut bytes = golden_v4_header(4);
+        assert_eq!(bytes.len(), HEADER_SIZE_V4);
+        bytes.extend_from_slice(&payload_of(&TestApp::new()));
+        let header = SnapshotHeader::parse(&bytes).unwrap();
+        assert_eq!(header.sequence, 0x0A0B);
+        assert_eq!(header.chain_hash, [0xCC; 32]);
+        assert_eq!(header.lineage, golden_lineage());
+        assert_eq!(header.genesis_entries, Some(0x07));
+        assert!(!header.tick_watermark.is_recorded());
+        assert_eq!(header.len, HEADER_SIZE_V4);
+    }
+
+    /// A v4 or v5 header whose lineage fields a save could not have
+    /// written — a reserved flag bit, or a value behind a cleared flag —
+    /// is refused, by the shared parser and so by `load`.
+    #[test]
+    fn malformed_lineage_fields_are_refused() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("snap");
         let payload = payload_of(&populated_app());
-        for (label, genesis, flags, policy, previous, policy_seq) in [
-            ("reserved flag bit", 0, 0b1_0000, 0, 0, 0),
-            ("high reserved bit", 0, 0b1000_0011, 0, 0, 1),
-            ("genesis behind a cleared flag", 5, 0b10, 1, 0, 1),
-            ("policy behind a cleared flag", 0, 0b01, 2, 0, 0),
-            ("policy seq behind a cleared flag", 0, 0b01, 0, 0, 3),
-            ("previous behind a cleared flag", 0, 0b11, 1, 2, 3),
-            ("previous without a policy", 0, 0b101, 0, 0, 0),
-            ("unwitnessed without a policy", 0, 0b1001, 0, 0, 0),
-        ] {
-            let fields = v4_lineage_fields(genesis, flags, policy, previous, policy_seq);
-            let bytes = craft_snapshot_with_lineage_fields(
-                SNAP_MAGIC,
-                TRANSPORT_VERSION,
-                TestApp::APP_VERSION,
-                9,
-                [0; 32],
-                1,
-                &fields,
-                &payload,
-            );
-            match SnapshotHeader::parse(&bytes) {
-                Err(SnapshotError::MalformedLineage { flags: got }) => {
-                    assert_eq!(got, flags, "{label}")
+        for version in [TRANSPORT_VERSION_V4, TRANSPORT_VERSION] {
+            for (label, genesis, flags, policy, previous, policy_seq) in [
+                ("reserved flag bit", 0, 0b1_0000, 0, 0, 0),
+                ("high reserved bit", 0, 0b1000_0011, 0, 0, 1),
+                ("genesis behind a cleared flag", 5, 0b10, 1, 0, 1),
+                ("policy behind a cleared flag", 0, 0b01, 2, 0, 0),
+                ("policy seq behind a cleared flag", 0, 0b01, 0, 0, 3),
+                ("previous behind a cleared flag", 0, 0b11, 1, 2, 3),
+                ("previous without a policy", 0, 0b101, 0, 0, 0),
+                ("unwitnessed without a policy", 0, 0b1001, 0, 0, 0),
+            ] {
+                let label = format!("v{version}: {label}");
+                let mut fields = v4_lineage_fields(genesis, flags, policy, previous, policy_seq);
+                if version == TRANSPORT_VERSION {
+                    fields.extend_from_slice(&300u64.to_le_bytes());
                 }
-                other => panic!("{label}: expected MalformedLineage, got {other:?}"),
+                let bytes = craft_snapshot_with_lineage_fields(
+                    SNAP_MAGIC,
+                    version,
+                    TestApp::APP_VERSION,
+                    9,
+                    [0; 32],
+                    1,
+                    &fields,
+                    &payload,
+                );
+                match SnapshotHeader::parse(&bytes) {
+                    Err(SnapshotError::MalformedLineage { flags: got }) => {
+                        assert_eq!(got, flags, "{label}")
+                    }
+                    other => panic!("{label}: expected MalformedLineage, got {other:?}"),
+                }
+                std::fs::write(&path, &bytes).unwrap();
+                assert!(
+                    matches!(
+                        load::<TestApp>(&path),
+                        Err(SnapshotError::MalformedLineage { .. })
+                    ),
+                    "{label}"
+                );
             }
-            std::fs::write(&path, &bytes).unwrap();
-            assert!(
-                matches!(
-                    load::<TestApp>(&path),
-                    Err(SnapshotError::MalformedLineage { .. })
-                ),
-                "{label}"
-            );
         }
         // The message names the flags, for an operator reading the log.
         assert!(
@@ -1025,6 +1300,177 @@ mod tests {
         assert_eq!(header.lineage, at_epoch(2));
         assert_eq!(header.genesis_entries, Some(12));
         assert_eq!(header.len, HEADER_SIZE_V3);
+        assert!(!header.tick_watermark.is_recorded());
+    }
+
+    /// A v4 snapshot — what releases before v5 wrote — still loads, with
+    /// its state and lineage, and with the tick watermark unrecorded.
+    #[test]
+    fn v4_snapshot_loads_with_an_unrecorded_tick_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snap");
+        let app = populated_app();
+        let lineage = Lineage {
+            epoch: 4,
+            ack_policy: policy(2, false, 6, Some(1)),
+        };
+        let tick_watermark = TickWatermark::recorded(300);
+        save::<TestApp>(
+            &app,
+            WireSeq::new(8),
+            [0x3C; 32],
+            lineage,
+            Some(1),
+            tick_watermark,
+            &path,
+        )
+        .unwrap();
+        let v4 = as_v4(&std::fs::read(&path).unwrap());
+        std::fs::write(&path, &v4).unwrap();
+
+        let (restored, header) = load::<TestApp>(&path).unwrap();
+        assert_eq!(restored, app);
+        assert_eq!(header.sequence, 8);
+        assert_eq!(header.chain_hash, [0x3C; 32]);
+        assert_eq!(header.lineage, lineage);
+        assert_eq!(header.genesis_entries, Some(1));
+        assert_eq!(header.len, HEADER_SIZE_V4);
+        assert!(!header.tick_watermark.is_recorded());
+    }
+
+    /// An unrecorded watermark (any version before v5) resumes from the
+    /// timestamp of the journal entry at the snapshot's sequence, or from
+    /// genesis when that entry is gone, each with one warning naming the
+    /// snapshot and its sequence. A snapshot at sequence 0 covers no
+    /// entry, so genesis is exact there and nothing is logged.
+    #[test]
+    fn an_unrecorded_tick_watermark_falls_back_on_the_anchor_entry() {
+        let path = Path::new("/var/lib/melin/node.snapshot");
+        let unrecorded_at = |sequence| {
+            let bytes = craft_snapshot(
+                SNAP_MAGIC,
+                TRANSPORT_VERSION_V4,
+                TestApp::APP_VERSION,
+                sequence,
+                [0; 32],
+                0,
+                &[],
+            );
+            SnapshotHeader::parse(&bytes).unwrap()
+        };
+        let logs = Logs::default();
+        tracing::subscriber::with_default(logs.subscriber(tracing::Level::DEBUG), || {
+            let header = unrecorded_at(3);
+            assert_eq!(
+                header.resume_tick_watermark(path, Some(300)),
+                TickWatermark::at_entry(300)
+            );
+            assert_eq!(
+                header.resume_tick_watermark(path, None),
+                TickWatermark::GENESIS
+            );
+            assert_eq!(
+                unrecorded_at(0).resume_tick_watermark(path, None),
+                TickWatermark::GENESIS
+            );
+        });
+
+        let from_entry = logs.lines("resuming from the timestamp of the journal entry");
+        assert_eq!(from_entry.len(), 1, "{from_entry:?}");
+        assert_eq!(
+            crate::test_logs::level(&from_entry[0]),
+            tracing::Level::WARN
+        );
+        assert_eq!(
+            field(&from_entry[0], "snapshot"),
+            "/var/lib/melin/node.snapshot"
+        );
+        assert_eq!(field(&from_entry[0], "sequence"), "3");
+        assert_eq!(field(&from_entry[0], "timestamp_ns"), "300");
+
+        let fresh = logs.lines("no longer holds the entry at its sequence");
+        assert_eq!(fresh.len(), 1, "{fresh:?}");
+        assert_eq!(crate::test_logs::level(&fresh[0]), tracing::Level::WARN);
+        assert_eq!(field(&fresh[0], "sequence"), "3");
+
+        assert_eq!(
+            logs.lines("predates the recorded tick watermark").len(),
+            2,
+            "one warning per fallback, none for sequence 0"
+        );
+    }
+
+    /// Over a journal, the fallback reads the entry at the snapshot's
+    /// sequence from it: its timestamp when the segment holds it, genesis
+    /// when the segment starts after it (a seed of a header alone, for a
+    /// snapshot on a segment boundary) or ends before it.
+    #[test]
+    fn the_fallback_over_a_journal_reads_the_anchor_entrys_timestamp() {
+        use crate::test_support::TestEvent;
+        use melin_journal::{BufferedWriter, JournalEvent, JournalWrite};
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir.path().join("snap");
+        let unrecorded_at = |sequence| {
+            let bytes = craft_snapshot(
+                SNAP_MAGIC,
+                TRANSPORT_VERSION_V4,
+                TestApp::APP_VERSION,
+                sequence,
+                [0; 32],
+                0,
+                &[],
+            );
+            SnapshotHeader::parse(&bytes).unwrap()
+        };
+
+        let journal = dir.path().join("j.journal");
+        let mut writer =
+            BufferedWriter::<TestEvent>::create(&journal, melin_journal::test_utils::PREALLOC)
+                .unwrap();
+        for timestamp_ns in [100, 250, 200] {
+            writer
+                .batch_append_with_ts(&JournalEvent::App(TestEvent::Add(1)), timestamp_ns, 0)
+                .unwrap();
+        }
+        writer.flush_batch_sync().unwrap();
+        drop(writer);
+        let over = |header: SnapshotHeader, journal: &Path| {
+            header
+                .resume_tick_watermark_over::<TestEvent>(&snapshot, journal)
+                .unwrap()
+        };
+        assert_eq!(
+            over(unrecorded_at(2), &journal),
+            TickWatermark::at_entry(250)
+        );
+        // The entry's own timestamp, not the newest before it: the
+        // documented inexactness when timestamps went backwards.
+        assert_eq!(
+            over(unrecorded_at(3), &journal),
+            TickWatermark::at_entry(200)
+        );
+        assert_eq!(over(unrecorded_at(4), &journal), TickWatermark::GENESIS);
+
+        // A header-only segment continuing after sequence 3.
+        let seed = dir.path().join("seed.journal");
+        drop(
+            BufferedWriter::<TestEvent>::create_continuing(
+                &seed,
+                4,
+                [0; 32],
+                None,
+                melin_journal::test_utils::PREALLOC,
+            )
+            .unwrap(),
+        );
+        assert_eq!(over(unrecorded_at(3), &seed), TickWatermark::GENESIS);
+
+        // An unreadable journal is an error, not a silent genesis.
+        assert!(
+            unrecorded_at(3)
+                .resume_tick_watermark_over::<TestEvent>(&snapshot, &dir.path().join("none"))
+                .is_err()
+        );
     }
 
     #[test]
@@ -1042,6 +1488,7 @@ mod tests {
             [0x11; 32],
             at_epoch(0),
             Some(0),
+            TickWatermark::GENESIS,
             &path,
         )
         .unwrap();
@@ -1066,6 +1513,7 @@ mod tests {
             [0x22; 32],
             at_epoch(0),
             Some(0),
+            TickWatermark::GENESIS,
             &path,
         )
         .unwrap();
@@ -1179,6 +1627,7 @@ mod tests {
         assert_eq!(header.lineage, at_epoch(0));
         assert_eq!(header.genesis_entries, None);
         assert_eq!(header.len, HEADER_SIZE_V1);
+        assert!(!header.tick_watermark.is_recorded());
     }
 
     #[test]
@@ -1240,6 +1689,7 @@ mod tests {
             [0u8; 32],
             at_epoch(0),
             Some(0),
+            TickWatermark::GENESIS,
             &path,
         )
         .unwrap();
@@ -1280,14 +1730,16 @@ mod tests {
         }
 
         // A v2 header cut off before its epoch field, a v3 one before its
-        // genesis length, or a v4 one before its policy's sequence, must also
-        // read as truncated, not as a short payload: the file passes the
-        // v1-size gate, so the version-aware header parse is what must
-        // catch it.
+        // genesis length, a v4 one before its policy's sequence, or a v5
+        // one before its tick watermark, must also read as truncated, not
+        // as a short payload: the file passes the v1-size gate, so the
+        // version-aware header parse is what must catch it.
         for (version, cut) in [
             (TRANSPORT_VERSION_V2, HEADER_SIZE_V2 - 4), // mid-epoch
             (TRANSPORT_VERSION_V3, HEADER_SIZE_V3 - 4), // mid-genesis_entries
-            (TRANSPORT_VERSION, HEADER_SIZE - 1),       // mid-policy_wire_seq
+            (TRANSPORT_VERSION_V4, HEADER_SIZE_V4 - 1), // mid-policy_wire_seq
+            (TRANSPORT_VERSION, HEADER_SIZE - 1),       // mid-tick_watermark
+            (TRANSPORT_VERSION, HEADER_SIZE_V4),        // before tick_watermark
         ] {
             let bytes = craft_snapshot(
                 SNAP_MAGIC,
@@ -1335,6 +1787,7 @@ mod tests {
         assert_eq!(header.lineage, at_epoch(6));
         assert_eq!(header.genesis_entries, None);
         assert_eq!(header.len, HEADER_SIZE_V2);
+        assert!(!header.tick_watermark.is_recorded());
     }
 
     #[test]
@@ -1353,6 +1806,7 @@ mod tests {
             [0u8; 32],
             at_epoch(0),
             Some(0),
+            TickWatermark::GENESIS,
             &path,
             capped_at(16),
         ) {
@@ -1389,6 +1843,7 @@ mod tests {
             [0x5A; 32],
             at_epoch(1),
             Some(0),
+            TickWatermark::GENESIS,
             &path,
             capped_at(expected),
         )
@@ -1406,6 +1861,7 @@ mod tests {
             [0x5A; 32],
             at_epoch(1),
             Some(0),
+            TickWatermark::GENESIS,
             &path,
             capped_at(expected - 1),
         ) {
@@ -1476,6 +1932,7 @@ mod tests {
                 [seq as u8; 32],
                 at_epoch(seq),
                 Some(seq),
+                TickWatermark::recorded(seq * 100),
                 path,
                 SaveLimits {
                     chunk,
@@ -1506,6 +1963,11 @@ mod tests {
                 let (restored, header) = load::<A>(&path).unwrap();
                 assert_eq!(&restored, app, "{label}");
                 assert_eq!(header.sequence, seq, "{label}");
+                assert_eq!(
+                    header.resume_tick_watermark(&path, None),
+                    TickWatermark::recorded(seq * 100),
+                    "{label}"
+                );
             }
             assert_eq!(std::fs::read(&prev_path).unwrap(), first_ref, "{label}");
             assert_eq!(load::<A>(&prev_path).unwrap().1.sequence, 1, "{label}");
@@ -1536,8 +1998,16 @@ mod tests {
         // 16 bytes an entry: a little over two and a half chunks.
         let entries = (WRITEBACK_CHUNK.get() * 5 / 2) / 16 + 7;
         app.per_key_total = (1..=entries as u64).map(|k| (k, k * 3)).collect();
-        let size =
-            save::<TestApp>(&app, WireSeq::new(8), [1; 32], at_epoch(0), None, &path).unwrap();
+        let size = save::<TestApp>(
+            &app,
+            WireSeq::new(8),
+            [1; 32],
+            at_epoch(0),
+            None,
+            TickWatermark::GENESIS,
+            &path,
+        )
+        .unwrap();
         assert!(size > 2 * WRITEBACK_CHUNK.get() as u64);
         assert_ne!(size % WRITEBACK_CHUNK.get() as u64, 0);
         assert_eq!(size, std::fs::metadata(&path).unwrap().len());

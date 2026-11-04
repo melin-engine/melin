@@ -445,18 +445,17 @@ pub trait Application: Sized + Default {
     /// handed the application, and for each journaled clock tick, which
     /// keeps time moving while no client traffic arrives. Live, on
     /// replay and on a replica, the calls follow the same rules from the
-    /// same journaled times.
+    /// same journaled times, and a node that restarts, restores a
+    /// snapshot or is promoted goes on from the latest time it had
+    /// handed out.
     ///
     /// `now_ns` is wall-clock time, so do not assume it strictly
     /// increases: the same value may arrive more than once, and a tick
     /// may carry a time earlier than one already seen — after the
     /// primary's clock steps back, or after a failover to a node whose
-    /// clock runs behind. In that case a node that restarted may also
-    /// make calls a node that kept running did not, since the latest
-    /// time handed out is not carried across a restart. So a call for a
-    /// time already passed must change nothing — no due work fires
-    /// again, no state records the earlier time — and elapsed-time
-    /// arithmetic must saturate.
+    /// clock runs behind. So a call for a time already passed must change
+    /// nothing — no due work fires again, no state records the earlier
+    /// time — and elapsed-time arithmetic must saturate.
     ///
     /// Default: nothing, right for an application with no time-driven
     /// work. Under load it runs ahead of nearly every event, so an

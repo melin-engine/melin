@@ -17,6 +17,91 @@
 use melin_app::{Application, ApplyCtx};
 use melin_journal::{AckPolicyChange, JournalEvent};
 
+/// The latest time already handed to the application's
+/// [`Application::tick`] by the clock step every journaled event goes
+/// through before it is applied: an event whose timestamp is newer fires
+/// a tick, one at or before it does not.
+///
+/// A function of the journal position, not of the process: at any
+/// position, every copy of the application — the live stage, replay, the
+/// shadow, a replica — must hold the value an uninterrupted copy holds
+/// there, or the copies make different tick calls on the same journal
+/// and an application whose tick is not idempotent on a time already
+/// passed diverges. So it cannot be minted from a bare number: a stage
+/// starts from [`Self::GENESIS`] (nothing dispatched yet), or from a
+/// value its source carried to it — replay's result, which recovery hands
+/// out with the application it rebuilt, the one a matching stage held
+/// when it stopped, which it hands back with its application in a
+/// [`WarmApp`], or the one a snapshot recorded for its position (see
+/// [`SnapshotHeader`](crate::snapshot::SnapshotHeader)) — and every value
+/// after that comes from the clock step advancing it.
+///
+/// A `u64` of nanoseconds, the unit and width of the journaled timestamp
+/// it is compared with. Not `Default`, and no `From<u64>`, so a stage
+/// cannot start at zero without naming [`Self::GENESIS`]; `Copy`, because
+/// the shadow stage starts from the same value as the live one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TickWatermark(u64);
+
+impl TickWatermark {
+    /// The watermark of a fresh journal: nothing dispatched, so any
+    /// non-zero timestamp fires a tick.
+    pub const GENESIS: Self = Self(0);
+
+    /// The watermark a snapshot header recorded for its position, read
+    /// back: the snapshot parser's alone, so the only number a stage can
+    /// start from is one a stage held.
+    pub(crate) const fn recorded(nanos: u64) -> Self {
+        Self(nanos)
+    }
+
+    /// The watermark at the position of a journal entry stamped
+    /// `timestamp_ns`, taken as the entry's timestamp: what restoring a
+    /// snapshot that predates the recorded watermark falls back on (see
+    /// [`SnapshotHeader::resume_tick_watermark`](crate::snapshot::SnapshotHeader::resume_tick_watermark)).
+    /// Exact unless an earlier entry carried a later timestamp, which the
+    /// watermark, the newest timestamp seen, would hold instead.
+    pub(crate) const fn at_entry(timestamp_ns: u64) -> Self {
+        Self(timestamp_ns)
+    }
+
+    /// The nanoseconds, for the snapshot header that records them.
+    pub(crate) const fn as_nanos(self) -> u64 {
+        self.0
+    }
+}
+
+/// An application together with the tick watermark of the journal
+/// position its state is at: what a stopped matching stage hands back
+/// ([`MatchingStage::run`](crate::pipeline::MatchingStage::run)), and what
+/// the next stage built over that state starts from.
+///
+/// Named fields rather than a pair, so the watermark travels with the
+/// state it belongs to and no hand-over can keep one and drop the other:
+/// a primary promoted from a replica must start its stages where the
+/// replica's matching stage stopped, or it fires a tick for a time that
+/// stage had already handed to the application. Generic over any `A`, not
+/// only an [`Application`], so the runtime's stage-handle plumbing (and
+/// its tests) can carry it whole.
+#[derive(Debug, PartialEq, Eq)]
+pub struct WarmApp<A> {
+    /// The application state.
+    pub app: A,
+    /// The watermark of the position `app` is at.
+    pub tick_watermark: TickWatermark,
+}
+
+impl<A> WarmApp<A> {
+    /// `app` at the start of a fresh journal: nothing has been
+    /// dispatched to it, so it is at [`TickWatermark::GENESIS`].
+    pub const fn genesis(app: A) -> Self {
+        Self {
+            app,
+            tick_watermark: TickWatermark::GENESIS,
+        }
+    }
+}
+
 /// Lineage metadata a journaled event carries instead of application
 /// state: what [`dispatch`] hands its lineage sink.
 ///
@@ -43,11 +128,12 @@ pub(crate) enum LineageEvent {
 /// because every path hands it the same event under the same key.
 ///
 /// In order:
-/// 1. **Clock.** A timestamp newer than `last_drain_ns` fires the
-///    application's due scheduled work, so under load time advances at
-///    every-event resolution rather than only on `Tick`. The strict
-///    greater-than tolerates the rare producer race that publishes a slot
-///    with an earlier timestamp than its predecessor.
+/// 1. **Clock.** A timestamp newer than `watermark` fires the
+///    application's due scheduled work and advances the watermark to it,
+///    so under load time advances at every-event resolution rather than
+///    only on `Tick`. The strict greater-than tolerates the rare producer
+///    race that publishes a slot with an earlier timestamp than its
+///    predecessor.
 /// 2. **The event itself.** `EpochBump` and `AckPolicyChange` are lineage
 ///    metadata, not application state, so they go to `on_lineage` as a
 ///    [`LineageEvent`] — on the live stage the fencing state (a replica
@@ -60,7 +146,7 @@ pub(crate) fn dispatch<A: Application>(
     app: &mut A,
     event: JournalEvent<A::Event>,
     ctx: &ApplyCtx,
-    last_drain_ns: &mut u64,
+    watermark: &mut TickWatermark,
     on_lineage: impl FnOnce(LineageEvent),
     reports: &mut Vec<A::Report>,
 ) {
@@ -69,8 +155,8 @@ pub(crate) fn dispatch<A: Application>(
         "a query is answered by Application::query, never dispatched"
     );
 
-    if ctx.now_ns > *last_drain_ns {
-        *last_drain_ns = ctx.now_ns;
+    if ctx.now_ns > watermark.0 {
+        watermark.0 = ctx.now_ns;
         app.tick(ctx.now_ns, reports);
     }
 
@@ -111,11 +197,12 @@ mod tests {
         timestamp_ns: u64,
         key_hash: u64,
     ) {
+        let mut watermark = TickWatermark::GENESIS;
         dispatch(
             app,
             event,
             &ctx(timestamp_ns, key_hash),
-            &mut 0,
+            &mut watermark,
             |_| {},
             &mut Vec::new(),
         );
@@ -167,22 +254,56 @@ mod tests {
     #[test]
     fn timestamp_drives_a_monotonic_clock() {
         let mut app = TestApp::new();
-        let mut drain = 0;
+        let mut watermark = TickWatermark::GENESIS;
         let mut reports = Vec::new();
-        // (timestamp, ticks after, drain after)
+        // (timestamp, ticks after, watermark after)
         let steps = [(100, 1, 100), (50, 1, 100), (100, 1, 100), (200, 2, 200)];
         for (timestamp_ns, ticks, drained) in steps {
             dispatch(
                 &mut app,
                 JournalEvent::App(TestEvent::Add(1)),
                 &ctx(timestamp_ns, KEY),
-                &mut drain,
+                &mut watermark,
                 |_| {},
                 &mut reports,
             );
             assert_eq!(app.ticks, ticks, "ticks after the event at {timestamp_ns}");
-            assert_eq!(drain, drained, "clock after the event at {timestamp_ns}");
+            assert_eq!(
+                watermark,
+                TickWatermark(drained),
+                "clock after the event at {timestamp_ns}"
+            );
         }
+    }
+
+    /// A copy that starts from a carried watermark makes the tick calls
+    /// the copy it continues would have: an event no newer than the
+    /// watermark fires none, the first newer one fires one.
+    #[test]
+    fn a_carried_watermark_fires_no_tick_at_or_before_it() {
+        let mut app = TestApp::new();
+        let mut watermark = TickWatermark(300);
+        for (timestamp_ns, ticks) in [(300, 0), (250, 0), (301, 1)] {
+            dispatch(
+                &mut app,
+                JournalEvent::App(TestEvent::Add(1)),
+                &ctx(timestamp_ns, KEY),
+                &mut watermark,
+                |_| {},
+                &mut Vec::new(),
+            );
+            assert_eq!(app.ticks, ticks, "ticks after the event at {timestamp_ns}");
+        }
+        assert_eq!(watermark, TickWatermark(301));
+    }
+
+    /// A recorded watermark and an entry's timestamp read back as the
+    /// nanoseconds they were made from, which the snapshot header writes.
+    #[test]
+    fn a_watermark_made_from_nanoseconds_reads_them_back() {
+        assert_eq!(TickWatermark::recorded(42).as_nanos(), 42);
+        assert_eq!(TickWatermark::at_entry(7).as_nanos(), 7);
+        assert_eq!(TickWatermark::GENESIS.as_nanos(), 0);
     }
 
     #[test]
@@ -198,11 +319,12 @@ mod tests {
     /// lineage sink.
     fn lineage_of(app: &mut TestApp, event: JournalEvent<TestEvent>) -> Option<LineageEvent> {
         let mut observed = None;
+        let mut watermark = TickWatermark::GENESIS;
         dispatch(
             app,
             event,
             &ctx(0, 0),
-            &mut 0,
+            &mut watermark,
             |lineage| observed = Some(lineage),
             &mut Vec::new(),
         );

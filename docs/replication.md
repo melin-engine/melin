@@ -1299,7 +1299,11 @@ normal-case post-recovery state.
   release journals an ack-policy entry on its first boot, and its
   snapshots record the policy in a framing earlier releases do not read:
   an older binary refuses to start on either (an unreadable entry, an
-  unsupported snapshot version) rather than discard anything. To
+  unsupported snapshot version) rather than discard anything. The
+  release that records the tick watermark in snapshots (framing
+  version 5) is the same: every snapshot it writes is one earlier
+  releases refuse, including the one a primary sends a resyncing
+  replica. To
   roll back anyway, restore the node from a snapshot taken by the older
   release, or re-sync it as a fresh replica of a node running the older
   version.

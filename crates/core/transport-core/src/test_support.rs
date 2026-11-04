@@ -1,5 +1,6 @@
-//! Minimal `Application` implementation used by the transport-core test
-//! suite. Not part of the public API.
+//! Minimal `Application` implementations used by the transport-core test
+//! suite and, under `test-utils`, other crates' tests. Not part of the
+//! public API.
 //!
 //! `TestApp` tracks a running sum and a per-key running sum (keyed on
 //! `ApplyCtx::key_hash`) so round-trip tests can assert state equality
@@ -11,6 +12,9 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 
+use melin_app::auth::{ClientRole, NoRoles};
+use melin_app::decoder::{Decoded, RequestDecoder};
+use melin_app::encoder::ResponseEncoder;
 use melin_app::{AppEvent, Application, ApplyCtx, CodecError, QueryCtx, RejectReason};
 use melin_journal::{AckPolicyByte, AckPolicyChange, JournalEvent};
 
@@ -182,26 +186,222 @@ impl Application for TestApp {
     }
 
     fn restore<R: Read>(r: &mut R) -> io::Result<Self> {
-        let mut u64_buf = [0u8; 8];
-        r.read_exact(&mut u64_buf)?;
-        let total = u64::from_le_bytes(u64_buf);
-        r.read_exact(&mut u64_buf)?;
-        let ticks = u64::from_le_bytes(u64_buf);
+        let total = read_u64(r)?;
+        let ticks = read_u64(r)?;
         let mut u32_buf = [0u8; 4];
         r.read_exact(&mut u32_buf)?;
         let len = u32::from_le_bytes(u32_buf) as usize;
         let mut per_key_total = HashMap::with_capacity(len);
         for _ in 0..len {
-            let mut kb = [0u8; 8];
-            r.read_exact(&mut kb)?;
-            let mut vb = [0u8; 8];
-            r.read_exact(&mut vb)?;
-            per_key_total.insert(u64::from_le_bytes(kb), u64::from_le_bytes(vb));
+            let key = read_u64(r)?;
+            per_key_total.insert(key, read_u64(r)?);
         }
         Ok(Self {
             total,
             ticks,
             per_key_total,
         })
+    }
+}
+
+/// One little-endian `u64`, the unit every test application's snapshot
+/// is written in.
+fn read_u64<R: Read>(r: &mut R) -> io::Result<u64> {
+    let mut buf = [0u8; 8];
+    r.read_exact(&mut buf)?;
+    Ok(u64::from_le_bytes(buf))
+}
+
+/// An application whose `tick` breaks the rule every application must
+/// keep — a call for a time already passed changes nothing — and makes
+/// the break visible: it counts every call, an equal or earlier time
+/// included, and every report it emits carries the count.
+///
+/// The runtime must not depend on that rule for determinism, so two
+/// copies that apply the same journal must make the same tick calls, and
+/// two such copies of this application emit the same reports. A copy
+/// that made one call more or fewer, however harmless to a well-behaved
+/// application, reports a different count from then on.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct TickCountingApp {
+    /// Every `tick` call so far. `u64`: a count of calls, which a long
+    /// run could take past any narrower type.
+    pub ticks: u64,
+}
+
+/// What [`TickCountingApp`] reports for each event it applies: the tick
+/// calls made so far.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TickCount {
+    pub ticks: u64,
+}
+
+impl Application for TickCountingApp {
+    type Event = TestEvent;
+    type Report = TickCount;
+    type QueryResponse = TestQuery;
+    type Sizing = ();
+
+    const APP_VERSION: u16 = 43;
+
+    fn apply(&mut self, _event: Self::Event, _ctx: &ApplyCtx, out: &mut Vec<Self::Report>) {
+        out.push(TickCount { ticks: self.ticks });
+    }
+
+    fn query(&self, event: Self::Event, ctx: &QueryCtx) -> Option<Self::QueryResponse> {
+        event.is_query().then(|| TestQuery {
+            total: self.ticks,
+            journal_sequence: ctx.journal_sequence.get(),
+        })
+    }
+
+    fn tick(&mut self, _now_ns: u64, _out: &mut Vec<Self::Report>) {
+        self.ticks += 1;
+    }
+
+    fn build_reject(_event: &Self::Event, _reason: RejectReason) -> Self::Report {
+        TickCount { ticks: u64::MAX }
+    }
+
+    fn snapshot<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        w.write_all(&self.ticks.to_le_bytes())
+    }
+
+    fn restore<R: Read>(r: &mut R) -> io::Result<Self> {
+        Ok(Self {
+            ticks: read_u64(r)?,
+        })
+    }
+}
+
+/// The client codec of [`TickCountingApp`], for tests that serve it
+/// through a node and read its tick count from what its clients receive.
+///
+/// A request body is the event's journal encoding ([`AppEvent::encode`]),
+/// so a client builds one with [`Self::request`]. A report's body is its
+/// tick count, a query's the count then the journal sequence it was
+/// answered at, each a little-endian `u64`, read back with
+/// [`Self::report`] and [`Self::query`]. Only the operator is admitted
+/// ([`NoRoles`]): the tests that use it hold no other key.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TickCountingCodec;
+
+impl TickCountingCodec {
+    /// The body of a request for `event`.
+    pub fn request(event: TestEvent) -> Vec<u8> {
+        let mut body = vec![0u8; event.encoded_size()];
+        event.encode(&mut body);
+        body
+    }
+
+    /// The tick count a report's body carries.
+    pub fn report(body: &[u8]) -> Result<TickCount, CodecError> {
+        Ok(TickCount {
+            ticks: u64_body(body)?,
+        })
+    }
+
+    /// The tick count and journal sequence a query's body carries.
+    pub fn query(body: &[u8]) -> Result<TestQuery, CodecError> {
+        let (ticks, sequence) = body.split_at_checked(8).ok_or(CodecError::Truncated)?;
+        Ok(TestQuery {
+            total: u64_body(ticks)?,
+            journal_sequence: u64_body(sequence)?,
+        })
+    }
+}
+
+/// Exactly one little-endian `u64`: fewer bytes is a truncated body, more
+/// is one this codec did not write.
+fn u64_body(body: &[u8]) -> Result<u64, CodecError> {
+    match <[u8; 8]>::try_from(body) {
+        Ok(bytes) => Ok(u64::from_le_bytes(bytes)),
+        Err(_) if body.len() < 8 => Err(CodecError::Truncated),
+        Err(_) => Err(CodecError::InvalidField),
+    }
+}
+
+impl RequestDecoder for TickCountingCodec {
+    type Event = TestEvent;
+    type Role = NoRoles;
+
+    fn decode(&self, body: &[u8], _role: ClientRole<NoRoles>) -> Decoded<TestEvent> {
+        match TestEvent::decode(body) {
+            Ok(event) => Decoded::Permitted(event),
+            Err(_) => Decoded::DecodeError("not a test event"),
+        }
+    }
+}
+
+impl ResponseEncoder for TickCountingCodec {
+    type Report = TickCount;
+    type Query = TestQuery;
+
+    fn encode_report(&self, report: &TickCount, buf: &mut [u8]) -> Result<usize, &'static str> {
+        let body = buf.first_chunk_mut::<8>().ok_or("buffer too small")?;
+        *body = report.ticks.to_le_bytes();
+        Ok(8)
+    }
+
+    fn encode_query(&self, query: &TestQuery, buf: &mut [u8]) -> Result<usize, &'static str> {
+        let body = buf.first_chunk_mut::<16>().ok_or("buffer too small")?;
+        body[..8].copy_from_slice(&query.total.to_le_bytes());
+        body[8..].copy_from_slice(&query.journal_sequence.to_le_bytes());
+        Ok(16)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What a client sends decodes to the event it was built from, and
+    /// what the node encodes reads back as what it encoded; anything else
+    /// is refused rather than misread.
+    #[test]
+    fn the_tick_counting_codec_round_trips() {
+        for event in [TestEvent::Add(7), TestEvent::Query] {
+            let body = TickCountingCodec::request(event);
+            assert!(matches!(
+                TickCountingCodec.decode(&body, ClientRole::Operator),
+                Decoded::Permitted(decoded) if decoded == event
+            ));
+        }
+        assert!(matches!(
+            TickCountingCodec.decode(&[0x7F], ClientRole::Operator),
+            Decoded::DecodeError(_)
+        ));
+
+        let mut buf = [0u8; 32];
+        let report = TickCount { ticks: 41 };
+        let len = TickCountingCodec.encode_report(&report, &mut buf).unwrap();
+        assert_eq!(TickCountingCodec::report(&buf[..len]), Ok(report));
+        let query = TestQuery {
+            total: 3,
+            journal_sequence: 99,
+        };
+        let len = TickCountingCodec.encode_query(&query, &mut buf).unwrap();
+        assert_eq!(TickCountingCodec::query(&buf[..len]), Ok(query));
+
+        assert_eq!(
+            TickCountingCodec::report(&[0; 7]),
+            Err(CodecError::Truncated)
+        );
+        assert_eq!(
+            TickCountingCodec::report(&[0; 9]),
+            Err(CodecError::InvalidField)
+        );
+        assert_eq!(
+            TickCountingCodec::query(&[0; 15]),
+            Err(CodecError::Truncated)
+        );
+        assert_eq!(
+            TickCountingCodec.encode_report(&report, &mut [0; 7]),
+            Err("buffer too small")
+        );
+        assert_eq!(
+            TickCountingCodec.encode_query(&query, &mut [0; 15]),
+            Err("buffer too small")
+        );
     }
 }

@@ -70,6 +70,7 @@ use melin_transport_core::node_store::NodeStore;
 use melin_transport_core::pipeline::{InputSlot, OutputSlot};
 use melin_transport_core::replication::archive::{ArchiveReason, archive_local_lineage};
 use melin_transport_core::replication::protocol::{MAX_CONTROL_FRAME, decode_primary_message};
+use melin_transport_core::{TickWatermark, WarmApp};
 
 mod auth;
 #[cfg(feature = "dpdk")]
@@ -292,13 +293,73 @@ pub(super) fn sleep_then_double_backoff(
     *backoff = (*backoff * 2).min(MAX_BACKOFF);
 }
 
+/// A replica's engine while no pipeline runs it: the application, with
+/// the tick watermark of its position, and the journal writer at the
+/// same position. What recovery yields, what a resync installs, what a
+/// clean teardown hands back, and what a pipeline is built over or a
+/// promotion hands up.
+///
+/// One value rather than an `Option` of each, because the two only make
+/// sense together: the receiver holds both (no pipeline built yet, or one
+/// just torn down) or neither (a fresh replica, or a running pipeline
+/// that owns them). Held as one value ([`ReplicaEngine::Idle`]), an
+/// application without its writer, or a writer without its application,
+/// cannot be represented, so no path has to check for one.
+pub(super) struct IdleEngine<A, W> {
+    pub(super) warm: WarmApp<A>,
+    pub(super) writer: W,
+}
+
+impl<A, W> IdleEngine<A, W> {
+    /// Split this engine into the application, with the watermark it
+    /// holds, and the journal writer: the pair a promotion hands up to the
+    /// primary, whose stages start from that watermark.
+    pub(super) fn into_parts(self) -> (WarmApp<A>, W) {
+        (self.warm, self.writer)
+    }
+}
+
+impl<A, W> IdleEngine<A, W>
+where
+    A: Application,
+    W: JournalWrite<A::Event>,
+{
+    /// The engine a fresh replica's first pipeline is built over: a
+    /// genesis application over a journal created at `journal` with the
+    /// primary's `lineage` — `(segment start, anchor, genesis length)`.
+    ///
+    /// Creating the local segment from the lineage the primary's
+    /// `StreamStart` announced makes the replica's segment byte-identical
+    /// to the primary's, and adopted `Rotate` boundaries keep it that way
+    /// across rotations (bitwise mirror). The header records the lineage's
+    /// genesis length too, so it survives this replica's restarts and is
+    /// there to check at promotion even with the primary gone.
+    ///
+    /// Called only from [`ReplicaEngine::ensure_running`] on a
+    /// [`ReplicaEngine::Fresh`] replica: one holding an engine, or running
+    /// a pipeline, has a journal this must not recreate.
+    fn create(
+        journal: &std::path::Path,
+        lineage: (u64, [u8; 32], Option<u64>),
+        prealloc: melin_journal::Prealloc,
+    ) -> Result<Self, melin_journal::JournalError> {
+        let (start, anchor, genesis) = lineage;
+        Ok(IdleEngine {
+            warm: WarmApp::genesis(A::default()),
+            writer: W::create_continuing(journal, start, anchor, genesis, prealloc)?,
+        })
+    }
+}
+
 /// Outcome of shutting down a replica pipeline. All stage threads are
 /// joined in every variant — by the time the caller sees this, no
 /// pipeline thread can still touch the journal or snapshot files.
 pub(super) enum TeardownOutcome<A, W> {
     /// Clean exit: both stages returned their state, reusable for the
-    /// next pipeline build (post-snapshot) or promotion.
-    Clean(A, W),
+    /// next pipeline build (post-snapshot) or promotion — the matching
+    /// stage's application with the tick watermark it reached, which the
+    /// next stages built over it start from.
+    Clean(IdleEngine<A, W>),
     /// The journal stage exited with an error — its writer is gone and
     /// the matching stage's state is unusable (it may have applied
     /// events the journal never persisted). Carries the error so the
@@ -326,7 +387,7 @@ pub(super) enum TeardownOutcome<A, W> {
 pub(super) fn shutdown_pipeline<A: Send + 'static, W: Send + 'static>(
     shutdown_flag: &AtomicBool,
     journal_handle: std::thread::JoinHandle<Result<W, melin_journal::JournalError>>,
-    matching_handle: std::thread::JoinHandle<A>,
+    matching_handle: std::thread::JoinHandle<WarmApp<A>>,
     drain_handle: std::thread::JoinHandle<()>,
     shadow_handle: Option<std::thread::JoinHandle<()>>,
 ) -> TeardownOutcome<A, W> {
@@ -361,7 +422,7 @@ pub(super) fn shutdown_pipeline<A: Send + 'static, W: Send + 'static>(
         Err(_) => return TeardownOutcome::Panicked,
     };
     match matching_result {
-        Ok(app) => TeardownOutcome::Clean(app, writer),
+        Ok(warm) => TeardownOutcome::Clean(IdleEngine { warm, writer }),
         Err(_) => TeardownOutcome::Panicked,
     }
 }
@@ -408,16 +469,76 @@ pub(super) struct ReplicaPipelineHandles<A: Application, W: Send + 'static> {
     /// (Promote/Shutdown/Fatal/Snapshot). NOT flipped on `Disconnected`.
     pub(super) pipeline_shutdown: Arc<AtomicBool>,
     pub(super) journal_handle: std::thread::JoinHandle<Result<W, melin_journal::JournalError>>,
-    pub(super) matching_handle: std::thread::JoinHandle<A>,
+    pub(super) matching_handle: std::thread::JoinHandle<WarmApp<A>>,
     pub(super) drain_handle: std::thread::JoinHandle<()>,
     pub(super) shadow_handle: Option<std::thread::JoinHandle<()>>,
 }
 
+/// A replica's handshake position: the last sequence its journal holds
+/// and the journal chain hash through it, which the primary checks
+/// against its own chain at that sequence.
+///
+/// One value rather than two loose ones because the pair is only
+/// meaningful whole: a sequence from one point of the journal and a hash
+/// from another is indistinguishable from divergence to the primary, and
+/// would have it resync a healthy replica. Every place that replaces the
+/// position (recovery, the reconnect's settled fsync state, a resync's
+/// reset) replaces both halves at once.
+///
+/// In-process only: the wire [`Handshake`] keeps its own fields and is
+/// built from this at the encode site ([`Self::handshake`]).
+///
+/// [`Handshake`]: melin_transport_core::replication::protocol::Handshake
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ChainPosition {
+    /// The last journaled sequence, 0 when nothing is held. `u64`, not
+    /// `WireSeq`: it is the handshake's field and the streaming session's
+    /// resume point, both plain `u64`s in the journal's sequence space.
+    pub(super) last_sequence: u64,
+    /// The journal's BLAKE3 chain hash through `last_sequence`; all zeros
+    /// when nothing is held or the `hash-chain` feature is off. `[u8; 32]`:
+    /// a BLAKE3 digest, as the journal and the wire both carry it.
+    pub(super) chain_hash: [u8; 32],
+}
+
+impl ChainPosition {
+    /// A replica holding nothing: a fresh one, or one whose lineage a
+    /// resync has just archived. The primary answers it with a snapshot
+    /// or a stream from genesis.
+    pub(super) const GENESIS: Self = Self {
+        last_sequence: 0,
+        chain_hash: [0u8; 32],
+    };
+
+    /// The wire handshake advertising this position under fencing `epoch`.
+    pub(super) fn handshake(
+        self,
+        epoch: u64,
+    ) -> melin_transport_core::replication::protocol::Handshake {
+        melin_transport_core::replication::protocol::Handshake {
+            last_sequence: self.last_sequence,
+            chain_hash: self.chain_hash,
+            epoch,
+        }
+    }
+}
+
+/// The position one fsync state records: its sequence and hash, taken
+/// from the one seqlock read, so they cannot tear.
+impl From<melin_transport_core::pipeline::FsyncState> for ChainPosition {
+    fn from(state: melin_transport_core::pipeline::FsyncState) -> Self {
+        Self {
+            last_sequence: state.journal_seq.get(),
+            chain_hash: state.chain_hash,
+        }
+    }
+}
+
 /// What [`ReplicaPipelineHandles::settled_resume_point`] found.
 pub(super) enum ResumePoint {
-    /// The fsync state, covering every slot published into the input
-    /// ring: the next handshake's pair.
-    Settled(melin_transport_core::pipeline::FsyncState),
+    /// The position of the fsync state covering every slot published
+    /// into the input ring: the next handshake's.
+    Settled(ChainPosition),
     /// The journal stage has died. The pipeline cannot take another
     /// session; the caller tears it down as a fatal session exit would
     /// (see [`journal_failed_while_disconnected`]) instead of dialing.
@@ -462,7 +583,7 @@ impl<A: Application, W: Send + 'static> ReplicaPipelineHandles<A, W> {
             }
             let state = self.chain_hash_lock.load();
             if state.input_ring_seq.get() >= published {
-                outcome = ResumePoint::Settled(state);
+                outcome = ResumePoint::Settled(state.into());
                 return true;
             }
             interrupted()
@@ -549,8 +670,10 @@ pub(super) type ReplicaHandles<A> =
 /// `Disconnected` reconnects.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_replica_pipeline_with_threads<A>(
-    mut app: A,
-    writer: BufferedWriter<A::Event>,
+    // The application comes with the tick watermark of its position,
+    // carried from wherever the replica got it; the matching and shadow
+    // stages start from it.
+    engine: IdleEngine<A, BufferedWriter<A::Event>>,
     cores: crate::layout::PipelineCores,
     // The node's `--ring-capacity`: a replica's rings are sized as its
     // primary's would be, so it is ready to be promoted onto them.
@@ -585,6 +708,13 @@ where
     A::Report: Send + 'static,
     A::QueryResponse: Send + 'static,
 {
+    let IdleEngine {
+        warm: WarmApp {
+            mut app,
+            tick_watermark,
+        },
+        writer,
+    } = engine;
     // Before the shadow copy is taken, so that neither the stream's
     // first events nor the copy's first snapshot grow the collections on
     // the matching thread. A replica's apply sits on the primary's ack
@@ -604,11 +734,9 @@ where
     // The lineage's genesis length, stamped into the replica's own
     // snapshots — the same value its journal header holds.
     let genesis_entries = writer.read_header_info()?.genesis_entries;
-    // The first sequence the stream will bring, which the shadow counts
-    // from (see `shadow::run`).
-    let starting_wire_seq = writer.next_sequence();
     let pipeline = melin_transport_core::pipeline::build_replica_pipeline(
         app,
+        tick_watermark,
         writer,
         4096, // max_journal_batch
         ring_capacity,
@@ -694,7 +822,7 @@ where
     })
     .map_err(|e| abandon(format!("start the replica's drain thread: {e}")))?;
 
-    let shadow_handle = if let Some(shadow_cons) = pipeline.shadow_consumer {
+    let shadow_handle = if let Some(shadow_feed) = pipeline.shadow_feed {
         let snap_path = store.snapshot().to_path_buf();
         let chain_lock = pipeline.chain_hash_lock.clone();
         let ps = Arc::clone(&pipeline_shutdown);
@@ -702,7 +830,7 @@ where
         Some(
             melin_app::affinity::spawn_placed("replica-shadow", shadow.core, move || {
                 melin_transport_core::shadow::run(
-                    shadow_cons,
+                    shadow_feed,
                     shadow_app,
                     snap_path,
                     std::time::Duration::from_millis(snapshot_interval_ms),
@@ -710,7 +838,6 @@ where
                     &ps,
                     shadow.wait,
                     shadow_initial_lineage,
-                    starting_wire_seq,
                     genesis_entries,
                 );
             })
@@ -736,9 +863,9 @@ where
 }
 
 /// Tear down the pipeline: publish the shutdown sentinel, join all
-/// threads, return the recovered (App, journal writer) so the orchestrator
-/// can use them for the next pipeline build (e.g., post-snapshot) or
-/// pass them up on promotion.
+/// threads, return the recovered [`IdleEngine`] so the orchestrator
+/// can use it for the next pipeline build (e.g., post-snapshot) or
+/// pass it up on promotion.
 pub(super) fn teardown_replica_pipeline<A: Application + Send + 'static, W: Send + 'static>(
     mut handles: ReplicaPipelineHandles<A, W>,
 ) -> TeardownOutcome<A, W> {
@@ -777,6 +904,141 @@ pub(super) fn teardown_replica_pipeline<A: Application + Send + 'static, W: Send
     )
 }
 
+/// Where a replica's application and journal writer are: nowhere yet,
+/// held idle by the receiver, or owned by a running pipeline.
+///
+/// One enum rather than an `Option` of the pipeline beside an `Option` of
+/// the idle engine: that pair could also hold a pipeline running *and* an
+/// idle engine — two owners of one journal — and every gate tested a
+/// combination of the two. Each variant here is a state the receiver can
+/// be in, every `match` on it names all three, and each transition is a
+/// method below, written once for both transports.
+pub(super) enum ReplicaEngine<A: Application, W: Send + 'static> {
+    /// No engine: a fresh replica before its first stream start, or one
+    /// whose engine has gone — its lineage archived by a resync, or its
+    /// pipeline torn down on an exit that replaces or ends the state.
+    Fresh,
+    /// No pipeline runs: the engine recovered from disk, installed by a
+    /// resync, or handed back by a clean teardown.
+    Idle(IdleEngine<A, W>),
+    /// A pipeline owns the application and the writer.
+    Running(ReplicaPipelineHandles<A, W>),
+}
+
+impl<A: Application, W: Send + 'static> ReplicaEngine<A, W> {
+    /// Take the state out, leaving [`Self::Fresh`]: for a transition whose
+    /// every outcome replaces the state or ends the receiver.
+    pub(super) fn take(&mut self) -> Self {
+        std::mem::replace(self, ReplicaEngine::Fresh)
+    }
+}
+
+impl<A, W> ReplicaEngine<A, W>
+where
+    A: Application,
+    W: JournalWrite<A::Event> + Send + 'static,
+{
+    /// The genesis length this replica's journal records, for the
+    /// `StreamStart` cross-check: `None` when the replica has no journal yet
+    /// (nothing to compare), `Some(None)` for a lineage whose length is
+    /// unknown, `Some(Some(n))` otherwise.
+    ///
+    /// Never reads the live segment by path while a pipeline runs: the
+    /// journal's disk thread owns the writer then and a rotation renames the
+    /// live segment away before installing its successor, so a read in that
+    /// window would find no file. The pipeline carries the value captured at
+    /// build time instead.
+    pub(in crate::replication) fn local_lineage_genesis(
+        &self,
+    ) -> Result<Option<Option<u64>>, melin_journal::JournalError> {
+        match self {
+            ReplicaEngine::Running(running) => Ok(Some(running.genesis_entries)),
+            // No pipeline: this thread owns the writer, so the header read
+            // cannot race a rotation.
+            ReplicaEngine::Idle(held) => Ok(Some(held.writer.read_header_info()?.genesis_entries)),
+            ReplicaEngine::Fresh => Ok(None),
+        }
+    }
+
+    /// The running pipeline, built first if none runs: over the engine
+    /// held, or for a fresh replica over a genesis application and a
+    /// journal created at `journal` from the primary's `lineage` —
+    /// `(segment start, anchor, genesis length)` (see
+    /// [`IdleEngine::create`]). A running pipeline is returned as it is:
+    /// it owns the engine, and its journal must not be recreated.
+    ///
+    /// `build` turns the engine into a pipeline. If it, or the fresh
+    /// journal's creation, fails, the error is returned and the state is
+    /// left [`Self::Fresh`]: the engine handed to `build` went with it, and
+    /// the receiver exits on the error.
+    pub(super) fn ensure_running<E>(
+        &mut self,
+        journal: &std::path::Path,
+        lineage: (u64, [u8; 32], Option<u64>),
+        prealloc: melin_journal::Prealloc,
+        build: impl FnOnce(IdleEngine<A, W>) -> Result<ReplicaPipelineHandles<A, W>, E>,
+    ) -> Result<&mut ReplicaPipelineHandles<A, W>, E>
+    where
+        E: From<melin_journal::JournalError>,
+    {
+        let running = match self.take() {
+            ReplicaEngine::Running(running) => running,
+            ReplicaEngine::Idle(held) => build(held)?,
+            ReplicaEngine::Fresh => build(IdleEngine::create(journal, lineage, prealloc)?)?,
+        };
+        *self = ReplicaEngine::Running(running);
+        match self {
+            ReplicaEngine::Running(running) => Ok(running),
+            ReplicaEngine::Fresh | ReplicaEngine::Idle(_) => {
+                unreachable!("a running pipeline was installed just above")
+            }
+        }
+    }
+}
+
+impl<A, W> ReplicaEngine<A, W>
+where
+    A: Application + Send + 'static,
+    W: JournalWrite<A::Event> + Send + 'static,
+{
+    /// Stop on the receiver's way out: a running pipeline is torn down
+    /// (the shutdown sentinel published, every stage thread joined), and
+    /// whatever engine there was is dropped.
+    pub(super) fn stop(self) {
+        if let ReplicaEngine::Running(running) = self {
+            // Nothing is left to take the engine back: the receiver is
+            // returning. A stage's failure was logged by the stage itself.
+            let _ = teardown_replica_pipeline::<A, W>(running);
+        }
+    }
+
+    /// Hand the engine up for a promotion that fired while the receiver
+    /// was disconnected — at the top of the reconnect loop or during
+    /// reconnect backoff — as the warm application + writer for the
+    /// promoted primary. Shared by both receivers.
+    ///
+    /// A running pipeline is torn down, and a clean teardown hands back the
+    /// application with the tick watermark its matching stage reached; an
+    /// idle engine (promotion before the first connect, or after a resync
+    /// left it idle) goes up with the watermark it was recovered or
+    /// received with. A fresh replica, or a failed teardown, is a hard
+    /// error — a promote with nothing to promote.
+    pub(in crate::replication) fn into_promotion(self) -> ReceiverResult<A, W> {
+        let held = match self {
+            ReplicaEngine::Running(running) => match teardown_replica_pipeline::<A, W>(running) {
+                TeardownOutcome::Clean(torn_down) => Some(torn_down),
+                TeardownOutcome::JournalFailed(_) | TeardownOutcome::Panicked => None,
+            },
+            ReplicaEngine::Idle(held) => Some(held),
+            ReplicaEngine::Fresh => None,
+        };
+        match held {
+            Some(held) => Ok(Some(held.into_parts())),
+            None => Err("promotion requested but no local state available".into()),
+        }
+    }
+}
+
 /// How many mid-stream divergence resyncs the receiver attempts
 /// in-process (per process lifetime) before giving up. Mid-stream
 /// divergence is never expected in a healthy cluster — it means
@@ -789,6 +1051,73 @@ pub(super) fn teardown_replica_pipeline<A: Application + Send + 'static, W: Send
 /// fault. Exit hard instead.
 pub(super) const MAX_INPROCESS_DIVERGENCE_RESYNCS: u32 = 1;
 
+/// A replica's state as recovered from disk by [`recover_replica_state`]:
+/// what a receiver starts from at boot, and adopts whole after an
+/// in-process divergence resync ([`AfterSession::Resync`]). One value, so
+/// neither path can take the recovered engine with an older position, or
+/// the reverse.
+pub(super) struct RecoveredReplica<A, W> {
+    /// The recovered application, with the tick watermark of its position,
+    /// and its journal writer. `None` for a fresh replica, which holds no
+    /// journal: the first session's stream start creates one.
+    pub(super) engine: Option<IdleEngine<A, W>>,
+    /// The next handshake's sequence and chain hash, read from the same
+    /// recovery; [`ChainPosition::GENESIS`] for a fresh replica.
+    pub(super) position: ChainPosition,
+}
+
+impl<A, W> RecoveredReplica<A, W> {
+    /// A replica with nothing on disk.
+    const FRESH: Self = RecoveredReplica {
+        engine: None,
+        position: ChainPosition::GENESIS,
+    };
+}
+
+/// A replica receiver's state across its reconnect loop: where its engine
+/// is, and the position the next handshake claims.
+///
+/// One value, because the two must move together: a resync's recovery,
+/// and a snapshot transfer's archive and install, replace both, by
+/// assigning the whole state, so no path can pair an engine with another
+/// state's position. Separate fields rather than a position inside each
+/// variant, because a running pipeline's position is not fixed with it:
+/// it is the point the pipeline last settled at, which the receiver
+/// reads into `position` before each handshake while the pipeline runs on,
+/// and the streaming session borrows the pipeline while it reads the
+/// position.
+pub(super) struct ReplicaState<A: Application, W: Send + 'static> {
+    pub(super) engine: ReplicaEngine<A, W>,
+    /// The next handshake's sequence and chain hash: the idle engine's,
+    /// [`ChainPosition::GENESIS`] with none, and while a pipeline runs, the
+    /// point it settled at, refreshed before each handshake.
+    pub(super) position: ChainPosition,
+}
+
+impl<A: Application, W: Send + 'static> ReplicaState<A, W> {
+    /// A replica holding no lineage: no engine, at genesis. What a replica
+    /// with nothing on disk recovers to, and what a resync leaves behind
+    /// once it has archived the local journal.
+    pub(super) const FRESH: Self = ReplicaState {
+        engine: ReplicaEngine::Fresh,
+        position: ChainPosition::GENESIS,
+    };
+}
+
+impl<A: Application, W: Send + 'static> From<RecoveredReplica<A, W>> for ReplicaState<A, W> {
+    /// The state a recovery yields: never a running pipeline, which is
+    /// why [`RecoveredReplica`] is a type of its own.
+    fn from(RecoveredReplica { engine, position }: RecoveredReplica<A, W>) -> Self {
+        ReplicaState {
+            engine: match engine {
+                Some(held) => ReplicaEngine::Idle(held),
+                None => ReplicaEngine::Fresh,
+            },
+            position,
+        }
+    }
+}
+
 /// Recover replica boot state from disk.
 ///
 /// Recovers whenever any journal segment survives — live OR archived
@@ -796,16 +1125,18 @@ pub(super) const MAX_INPROCESS_DIVERGENCE_RESYNCS: u32 = 1;
 /// leaves archives with no live segment, and recovery handles that
 /// layout; treating it as a fresh replica would discard local durable
 /// history and then fail `create_new` against the surviving lineage).
-/// Returns `(None, None, 0, zeros)` for a genuinely fresh replica.
-/// Also seeds the fencing epoch from the recovered journal.
+/// Returns a [`RecoveredReplica`] with no engine and the
+/// [`ChainPosition::GENESIS`] position for a genuinely fresh replica. The
+/// recovered application comes with the tick watermark of its position,
+/// which the pipeline built over it starts from. Also seeds the fencing
+/// epoch from the recovered journal.
 ///
 /// Called at receiver startup, and again after a mid-stream chain
 /// divergence tears the pipeline down: the on-disk journal is
 /// self-consistent (merely forked from the primary's history), so
-/// recovery re-derives a truthful handshake pair `(last_sequence,
-/// chain_hash)` and the next connection takes the primary's
+/// recovery re-derives a truthful handshake [`ChainPosition`] and the
+/// next connection takes the primary's
 /// HashMismatch → archive → reseed path in-process.
-#[allow(clippy::type_complexity)]
 pub(super) fn recover_replica_state<A, W>(
     store: &NodeStore,
     fence_state: &melin_transport_core::fence::FenceState,
@@ -816,7 +1147,7 @@ pub(super) fn recover_replica_state<A, W>(
     // What the recovered journal is reopened with: the node's reservation
     // (`ServerConfig::journal_prealloc`).
     prealloc: melin_journal::Prealloc,
-) -> Result<(Option<A>, Option<W>, u64, [u8; 32]), Box<dyn std::error::Error>>
+) -> Result<RecoveredReplica<A, W>, Box<dyn std::error::Error>>
 where
     A: Application,
     W: melin_journal::JournalWrite<A::Event>,
@@ -830,7 +1161,7 @@ where
         // Nothing held, so no policy either (the epoch stays: fencing
         // never moves it back).
         lineage_policy.store(None);
-        return Ok((None, None, 0u64, [0u8; 32]));
+        return Ok(RecoveredReplica::FRESH);
     }
     let engine = if snapshot_path.try_exists()? {
         tracing::info!("recovering replica from snapshot + journal");
@@ -844,15 +1175,26 @@ where
         <A as Application>::prefault(&mut app, sizing);
         melin_transport_core::JournaledApp::<A, W>::recover(app, journal_path, prealloc)?
     };
-    let next = engine.next_sequence();
-    let last = next.saturating_sub(1);
-    let hash = engine.chain_hash().unwrap_or([0u8; 32]);
+    let position = ChainPosition {
+        last_sequence: engine.next_sequence().saturating_sub(1),
+        // `None` only with `hash-chain` off, which the handshake
+        // advertises as all zeros.
+        chain_hash: engine.chain_hash().unwrap_or([0u8; 32]),
+    };
     // Seed the lineage from the replica's own recovered journal.
     // Streaming `EpochBump`s and the snapshot-resync path raise the epoch
     // later.
     adopt_recovered_lineage(fence_state, lineage_policy, engine.recovered_lineage());
+    let tick_watermark = engine.tick_watermark();
     let (app, writer) = engine.into_parts();
-    Ok((Some(app), Some(writer), last, hash))
+    let warm = WarmApp {
+        app,
+        tick_watermark,
+    };
+    Ok(RecoveredReplica {
+        engine: Some(IdleEngine { warm, writer }),
+        position,
+    })
 }
 
 /// Adopt a lineage recovered from disk (a journal replay, or a snapshot
@@ -888,42 +1230,30 @@ pub(in crate::replication) enum AfterSession<A, W> {
     /// on-disk state is the new handshake position. The caller adopts it
     /// and reconnects; the primary's `HashMismatch` verdict then routes
     /// the replica through archive + re-seed.
-    Resync {
-        app: Option<A>,
-        journal_writer: Option<W>,
-        last_sequence: u64,
-        chain_hash: [u8; 32],
-    },
+    Resync(RecoveredReplica<A, W>),
     /// A plain disconnect or a stream contiguity break — backoff has
     /// already been applied (and the flags checked); the caller
     /// reconnects, reusing the still-live pipeline.
     Reconnect,
 }
 
-impl<A, W> AfterSession<A, W> {
+impl<A: Application, W: Send + 'static> AfterSession<A, W> {
     /// Fold this outcome into the reconnect loop's state: the result
     /// `run_receiver*` must return, or `None` to go round the loop again
-    /// (having adopted a resync's recovered state). One copy for every
-    /// dispatch site in both receivers, so they cannot drift apart.
+    /// (having adopted a resync's recovered state, which replaces the
+    /// whole of `state`). One copy for every dispatch site in both
+    /// receivers, so they cannot drift apart.
+    ///
+    /// The state a resync replaces holds no pipeline: [`handle_session_exit`]
+    /// took it out and tore it down before recovering.
     pub(in crate::replication) fn adopt(
         self,
-        app: &mut Option<A>,
-        journal_writer: &mut Option<W>,
-        last_sequence: &mut u64,
-        chain_hash: &mut [u8; 32],
+        state: &mut ReplicaState<A, W>,
     ) -> Option<ReceiverResult<A, W>> {
         match self {
             AfterSession::Return(r) => Some(r),
-            AfterSession::Resync {
-                app: recovered_app,
-                journal_writer: recovered_writer,
-                last_sequence: recovered_sequence,
-                chain_hash: recovered_hash,
-            } => {
-                *app = recovered_app;
-                *journal_writer = recovered_writer;
-                *last_sequence = recovered_sequence;
-                *chain_hash = recovered_hash;
+            AfterSession::Resync(recovered) => {
+                *state = ReplicaState::from(recovered);
                 None
             }
             AfterSession::Reconnect => None,
@@ -951,16 +1281,18 @@ impl<A, W> AfterSession<A, W> {
 /// frees the local socket-set entry; the kernel-TCP receiver passes a
 /// no-op (its `TcpStream` is dropped by the caller, and the kernel tells
 /// the primary).
+///
+/// A terminal exit, and a fatal one, take the engine out of `state`,
+/// tearing a running pipeline down; a reconnecting one leaves it running.
 // A long argument list, but each is a distinct piece of the receiver
 // loop's state, borrowed from its locals; bundling them would only move
 // the noise.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::replication) fn handle_session_exit<A, W>(
     result: StreamingResult,
-    pipeline: &mut Option<ReplicaPipelineHandles<A, W>>,
+    state: &mut ReplicaState<A, W>,
     divergence_resyncs: &mut u32,
     backoff: &mut std::time::Duration,
-    last_sequence: u64,
     store: &NodeStore,
     fence_state: &melin_transport_core::fence::FenceState,
     lineage_policy: &SharedLineagePolicy,
@@ -980,31 +1312,41 @@ where
         exit,
         heard_from_primary,
     } = result;
+    // For the reconnecting exits' logs: the position the session started
+    // from.
+    let last_sequence = state.position.last_sequence;
 
     close();
 
     match exit {
         SessionExit::Shutdown => {
-            if let Some(p) = pipeline.take() {
-                let _ = teardown_replica_pipeline::<A, W>(p);
-            }
+            state.engine.take().stop();
             AfterSession::Return(Ok(None))
         }
 
-        SessionExit::Promote => AfterSession::Return(match pipeline.take() {
-            Some(p) => match teardown_replica_pipeline::<A, W>(p) {
-                TeardownOutcome::Clean(ex, wr) => Ok(Some((ex, wr))),
-                _ => Err("pipeline failed during promotion".into()),
+        SessionExit::Promote => AfterSession::Return(match state.engine.take() {
+            ReplicaEngine::Running(running) => match teardown_replica_pipeline::<A, W>(running) {
+                // The application goes up with the watermark its matching
+                // stage reached, which the promoted primary's start from.
+                TeardownOutcome::Clean(engine) => Ok(Some(engine.into_parts())),
+                TeardownOutcome::JournalFailed(_) | TeardownOutcome::Panicked => {
+                    Err("pipeline failed during promotion".into())
+                }
             },
-            None => Err("pipeline missing on promote".into()),
+            // A promoting session implies a pipeline, which owns the engine.
+            ReplicaEngine::Idle(_) | ReplicaEngine::Fresh => {
+                Err("pipeline missing on promote".into())
+            }
         }),
 
         SessionExit::Fatal(e) => {
-            let outcome = match pipeline.take() {
-                Some(p) => teardown_replica_pipeline::<A, W>(p),
+            let outcome = match state.engine.take() {
+                ReplicaEngine::Running(running) => teardown_replica_pipeline::<A, W>(running),
                 // Fatal implies a streaming session, which implies a
                 // pipeline — but don't turn a missing one into a resync.
-                None => return AfterSession::Return(Err(e)),
+                ReplicaEngine::Idle(_) | ReplicaEngine::Fresh => {
+                    return AfterSession::Return(Err(e));
+                }
             };
             // Mid-stream chain divergence is repairable in-process: the
             // on-disk journal is self-consistent (merely forked from the
@@ -1052,12 +1394,7 @@ where
                 sizing,
                 prealloc,
             ) {
-                Ok((app, journal_writer, seq, hash)) => AfterSession::Resync {
-                    app,
-                    journal_writer,
-                    last_sequence: seq,
-                    chain_hash: hash,
-                },
+                Ok(recovered) => AfterSession::Resync(recovered),
                 Err(e) => AfterSession::Return(Err(e)),
             }
         }
@@ -1135,36 +1472,6 @@ where
     }
 }
 
-/// Tear the live pipeline down for a promotion that fired while the
-/// receiver was disconnected — at the top of the reconnect loop or
-/// during reconnect backoff — and return the warm application + writer for
-/// the promoted primary. Shared by both receivers.
-///
-/// A clean teardown hands back the warm state; if there is no pipeline
-/// (promotion before the first connect, or after a resync that left the
-/// state in the receiver's locals) those locals carry it. A missing
-/// pair is a hard error — a promote with nothing to promote.
-pub(in crate::replication) fn take_pipeline_for_promotion<A, W>(
-    pipeline: &mut Option<ReplicaPipelineHandles<A, W>>,
-    app: &mut Option<A>,
-    journal_writer: &mut Option<W>,
-) -> ReceiverResult<A, W>
-where
-    A: Application + Send + 'static,
-    W: JournalWrite<A::Event> + Send + 'static,
-{
-    if let Some(p) = pipeline.take()
-        && let TeardownOutcome::Clean(e, w) = teardown_replica_pipeline::<A, W>(p)
-    {
-        *app = Some(e);
-        *journal_writer = Some(w);
-    }
-    match (app.take(), journal_writer.take()) {
-        (Some(e), Some(w)) => Ok(Some((e, w))),
-        _ => Err("promotion requested but no local state available".into()),
-    }
-}
-
 /// The facts a successful snapshot + segment-seed transfer yields.
 struct ResyncTransfer<A> {
     /// The application loaded from the transferred snapshot.
@@ -1179,22 +1486,27 @@ struct ResyncTransfer<A> {
     /// The snapshot's lineage. Adopted by the caller once the whole
     /// transfer has succeeded, so a failed one leaves none behind.
     lineage: melin_transport_core::lineage::Lineage,
+    /// The tick watermark at the snapshot's sequence: the one the
+    /// primary's file records, or the fallback for an older file, from
+    /// the seed's entry at that sequence. What the replica's stages start
+    /// from, so it makes the tick calls the primary made.
+    tick_watermark: TickWatermark,
 }
 
 /// What [`handle_resync_verdict`] resolved a `NeedSnapshot` /
 /// `HashMismatch` verdict to.
 pub(in crate::replication) enum ResyncDecision {
-    /// Resync complete — resume streaming from `resume_sequence` on the
-    /// re-seeded lineage `(segment_start_sequence, anchor_hash)`. The
-    /// recovered App + writer are left in the receiver's `app` /
-    /// `journal_writer` locals.
+    /// Resync complete — resume streaming on the re-seeded lineage
+    /// `(segment_start_sequence, anchor_hash)` from the receiver's
+    /// [`ReplicaState`], which now holds the snapshot's engine, idle, and
+    /// its position: its sequence, and the chain hash the primary
+    /// announced and the loaded snapshot confirmed.
     Ready {
         segment_start_sequence: u64,
         anchor_hash: [u8; 32],
         /// The lineage's genesis length, as the seeded segment's header
         /// (and the `StreamStart` that matched it) records it.
         genesis_entries: Option<u64>,
-        resume_sequence: u64,
     },
     /// The transfer failed network-shaped (drop / restart mid-body); the
     /// caller backs off and reconnects. The pre-resync lineage is already
@@ -1269,24 +1581,33 @@ where
     // integrity, not that the primary sent a well-formed prefix ending at
     // the snapshot sequence. (With hash-chain on, the chain cross-check in
     // `handle_resync_verdict` subsumes this; without it, this is the only
-    // guard.) Reads the whole seed, so it runs serviced too.
-    source.serviced(|| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if let Err(e) =
-            melin_journal::segment::verify_segment_prefix(&seed_tmp, snap_sequence, seed_len)
-        {
-            let _ = std::fs::remove_file(&seed_tmp);
-            return Err(format!("segment seed failed structural verification: {e}").into());
-        }
-        std::fs::rename(&seed_tmp, journal_path)?;
-        melin_journal::segment::fsync_parent_dir(journal_path)?;
-        Ok(())
-    })?;
+    // guard.) Reads the whole seed, so it runs serviced too, as does the
+    // read of its last entry an older snapshot's watermark falls back on.
+    let tick_watermark = source.serviced(
+        || -> Result<TickWatermark, Box<dyn std::error::Error + Send + Sync>> {
+            if let Err(e) =
+                melin_journal::segment::verify_segment_prefix(&seed_tmp, snap_sequence, seed_len)
+            {
+                let _ = std::fs::remove_file(&seed_tmp);
+                return Err(format!("segment seed failed structural verification: {e}").into());
+            }
+            std::fs::rename(&seed_tmp, journal_path)?;
+            melin_journal::segment::fsync_parent_dir(journal_path)?;
+            // The primary sent its snapshot file whole, header included,
+            // so the watermark is the one it recorded. A file from before
+            // the field falls back on the seed's entry at the snapshot's
+            // sequence — absent when the snapshot sits on a segment
+            // boundary, whose seed is a header alone.
+            Ok(snap_header.resume_tick_watermark_over::<A::Event>(snapshot_path, journal_path)?)
+        },
+    )?;
     Ok(ResyncTransfer {
         app: snap_app,
         snap_sequence,
         snap_chain_hash,
         seed_len,
         lineage: snap_header.lineage,
+        tick_watermark,
     })
 }
 
@@ -1297,23 +1618,20 @@ where
 /// segment and ties its chain to the snapshot, then validates the
 /// post-snapshot `StreamStart` inline before resuming.
 ///
-/// On success the recovered App + writer are left in `app` /
-/// `journal_writer` and [`ResyncDecision::Ready`] carries the resume
-/// lineage. A network-shaped transfer failure yields
-/// [`ResyncDecision::Retry`] (the caller backs off and reconnects). An
-/// inconsistent primary or a local install failure is fatal (`Err`).
-#[allow(clippy::too_many_arguments)]
+/// `state` is replaced whole at each step: by a fresh replica's once the
+/// local lineage is archived, then by the snapshot's engine, idle, at the
+/// snapshot's position once the seed is installed. On success
+/// [`ResyncDecision::Ready`] carries the resume lineage. A network-shaped
+/// transfer failure yields [`ResyncDecision::Retry`] (the caller backs off
+/// and reconnects, as a fresh replica). An inconsistent primary or a local
+/// install failure is fatal (`Err`).
 pub(in crate::replication) fn handle_resync_verdict<A, W, S>(
     divergent: bool,
     source: &mut S,
-    pipeline: &mut Option<ReplicaPipelineHandles<A, W>>,
-    app: &mut Option<A>,
-    journal_writer: &mut Option<W>,
+    state: &mut ReplicaState<A, W>,
     store: &NodeStore,
     fence_state: &melin_transport_core::fence::FenceState,
     control: &ReplicaControlPlane,
-    last_sequence: &mut u64,
-    chain_hash: &mut [u8; 32],
     // What the seeded journal is opened with: the node's reservation
     // (`ServerConfig::journal_prealloc`). A parameter rather than the old
     // writer's, which a fresh replica does not have.
@@ -1333,22 +1651,22 @@ where
     // suffix).
     if divergent {
         tracing::warn!(
-            last_sequence = *last_sequence,
+            last_sequence = state.position.last_sequence,
             "primary reports chain divergence — archiving local journal, resyncing from snapshot"
         );
     } else {
         tracing::info!("primary requires snapshot transfer — receiving snapshot");
     }
 
-    // Invalidate the in-memory App + writer before moving their backing
-    // files aside. On the in-process divergence repair path these still
-    // hold the recovered handles; a transfer failure returns `Retry`, and
-    // without this reset the stale writer — now pointing at an
-    // archived-away journal — would survive the fresh-replica create gate
-    // and get rebuilt into the next pipeline.
-    let old_pipeline = pipeline.take();
-    let old_app = app.take();
-    let old_writer = journal_writer.take();
+    // Invalidate the in-memory engine before moving its backing files
+    // aside. On the in-process divergence repair path it still holds the
+    // recovered handles; a transfer failure returns `Retry`, and without
+    // this reset the stale writer — now pointing at an archived-away
+    // journal — would survive the fresh-replica create gate and get
+    // rebuilt into the next pipeline. The whole state goes: once archived,
+    // a retried handshake must present as a fresh replica, holding no
+    // lineage.
+    let old_engine = std::mem::replace(state, ReplicaState::FRESH).engine;
 
     // Move the local lineage aside — never delete. Divergent journals are
     // audit-trail material; stale ones may be the last copy of pruned
@@ -1368,23 +1686,16 @@ where
     // The primary starts the transfer as soon as it has sent its verdict,
     // and the teardown waits on the journal: serviced (see `serviced`).
     source.serviced(move || {
-        if let Some(p) = old_pipeline {
-            // What the teardown hands back (the app and writer, or the
-            // stage's failure) is discarded: the resync archives this
-            // lineage and installs the primary's in its place.
-            let _ = teardown_replica_pipeline::<A, W>(p);
-        }
-        // Dropped after the teardown and before the archive, as before.
-        drop(old_app);
-        drop(old_writer);
+        // A running pipeline is torn down and an idle engine dropped,
+        // before the archive moves their files: what the teardown hands
+        // back is discarded, since the resync archives this lineage and
+        // installs the primary's in its place.
+        old_engine.stop();
         // Where the lineage went is logged by the archive itself; the
         // resync needs only the paths freed.
         archive_local_lineage(store, reason).map(drop)
     })?;
-    // Archived — a retried handshake must present as a fresh replica,
-    // holding no lineage, so no policy either.
-    *last_sequence = 0;
-    *chain_hash = [0u8; 32];
+    // Archived — no lineage held, so no policy either.
     control.lineage_ack_policy.store(None);
     // The advertised control-plane tip must shrink with the holdings:
     // the archived suffix is either divergent (never acked) or being
@@ -1400,6 +1711,7 @@ where
         snap_chain_hash,
         seed_len,
         lineage: snap_lineage,
+        tick_watermark: snap_tick_watermark,
     } = match receive_resync_transfer::<A, S>(source, store) {
         Ok(v) => v,
         Err(e) => {
@@ -1416,7 +1728,6 @@ where
     // replica onto the primary's lineage, its epoch and ack policy
     // included. Only now: a transfer that failed part-way adopts nothing.
     adopt_recovered_lineage(fence_state, &control.lineage_ack_policy, snap_lineage);
-    *app = Some(snap_app);
 
     // Open the seeded segment for appending at the snapshot position —
     // recovery's resume path: the chain rebuilds from the seeded bytes and
@@ -1436,7 +1747,22 @@ where
         .into());
     }
     let seeded_info = melin_journal::segment::read_header_info(journal_path)?;
-    *journal_writer = Some(writer);
+    // Installed whole, the snapshot's engine with its position.
+    *state = ReplicaState {
+        engine: ReplicaEngine::Idle(IdleEngine {
+            // The stages built over the snapshot's state start from its
+            // position's watermark, as the primary's held it there.
+            warm: WarmApp {
+                app: snap_app,
+                tick_watermark: snap_tick_watermark,
+            },
+            writer,
+        }),
+        position: ChainPosition {
+            last_sequence: snap_sequence,
+            chain_hash: snap_chain_hash,
+        },
+    };
 
     // Validate the post-snapshot StreamStart inline before resuming — its
     // lineage must agree with the seed the primary just transferred.
@@ -1484,7 +1810,6 @@ where
                 segment_start_sequence,
                 anchor_hash,
                 genesis_entries,
-                resume_sequence: snap_sequence,
             })
         }
         other => Err(format!("expected StreamStart after snapshot, got {other:?}").into()),
@@ -1497,33 +1822,6 @@ fn describe_genesis(genesis_entries: Option<u64>) -> String {
     match genesis_entries {
         Some(n) => format!("{n} entries"),
         None => "unknown".to_string(),
-    }
-}
-
-/// The genesis length this replica's journal records, for the
-/// `StreamStart` cross-check: `None` when the replica has no journal yet
-/// (nothing to compare), `Some(None)` for a lineage whose length is
-/// unknown, `Some(Some(n))` otherwise.
-///
-/// Never reads the live segment by path while a pipeline runs: the
-/// journal's disk thread owns the writer then and a rotation renames the
-/// live segment away before installing its successor, so a read in that
-/// window would find no file. The pipeline carries the value captured at
-/// build time instead.
-pub(in crate::replication) fn local_lineage_genesis<A, W>(
-    pipeline: &Option<ReplicaPipelineHandles<A, W>>,
-    journal_writer: &Option<W>,
-) -> Result<Option<Option<u64>>, melin_journal::JournalError>
-where
-    A: Application,
-    W: JournalWrite<A::Event> + Send + 'static,
-{
-    match (pipeline, journal_writer) {
-        (Some(p), _) => Ok(Some(p.genesis_entries)),
-        // No pipeline: this thread owns the writer, so the header read
-        // cannot race a rotation.
-        (None, Some(w)) => Ok(Some(w.read_header_info()?.genesis_entries)),
-        (None, None) => Ok(None),
     }
 }
 
@@ -1564,37 +1862,37 @@ fn remove_restamp_staging(journal_path: &std::path::Path) -> std::io::Result<()>
 /// changes no history. The new segment is staged and renamed over the old
 /// one, so a crash leaves one or the other. Anything else is left alone.
 ///
-/// Requires no running pipeline: the caller owns `journal_writer`. So it
+/// Requires no running pipeline: the caller owns the writer, and hands it
+/// over to get back the one to keep — the same writer when nothing was
+/// rewritten, else one over the new segment. An `Err` drops it, which is
+/// fatal for the receive loop anyway (see [`accept_stream_start`]). So it
 /// covers the upgrade that restarts the replica as well as the primary; a
 /// replica left running across the primary's re-genesis keeps the unknown
 /// length — the unchecked behaviour of earlier releases, never a wrong
 /// refusal.
 pub(in crate::replication) fn adopt_genesis_into_empty_unknown_journal<E, W>(
-    journal_writer: &mut Option<W>,
+    writer: W,
     lineage: (u64, [u8; 32], Option<u64>),
-) -> Result<(), melin_journal::JournalError>
+) -> Result<W, melin_journal::JournalError>
 where
     E: melin_app::AppEvent,
     W: JournalWrite<E>,
 {
     let (segment_start_sequence, anchor_hash, advertised) = lineage;
-    let Some(writer) = journal_writer.as_ref() else {
-        return Ok(());
-    };
     if advertised.is_none()
         || segment_start_sequence != 1
         || writer.segment_starting_sequence() != 1
         || writer.next_sequence() != 1
     {
-        return Ok(());
+        return Ok(writer);
     }
     let info = writer.read_header_info()?;
     if info.genesis_entries.is_some() || info.anchor_hash != anchor_hash {
-        return Ok(());
+        return Ok(writer);
     }
     let journal_path = writer.path().to_path_buf();
     if !melin_journal::segment::list_archives(&journal_path)?.is_empty() {
-        return Ok(());
+        return Ok(writer);
     }
     // The replacement is the same journal, so it keeps its reservation.
     let prealloc = writer.prealloc();
@@ -1605,16 +1903,16 @@ where
     let valid_end = staged.valid_end();
     drop(staged);
     // Close the old segment before its name is taken over.
-    drop(journal_writer.take());
+    drop(writer);
     std::fs::rename(&staging, &journal_path)?;
     melin_journal::segment::fsync_parent_dir(&journal_path)?;
-    *journal_writer = Some(W::open_append(&journal_path, 0, valid_end, prealloc)?);
+    let restamped = W::open_append(&journal_path, 0, valid_end, prealloc)?;
     tracing::info!(
         journal = %journal_path.display(),
         genesis_entries = ?advertised,
         "recorded the primary's genesis length in this replica's empty journal"
     );
-    Ok(())
+    Ok(restamped)
 }
 
 /// The replica's answer to a live `StreamStart` (not the post-snapshot
@@ -1667,8 +1965,7 @@ pub(in crate::replication) struct StreamStart {
 pub(in crate::replication) fn accept_stream_start<A, W>(
     start: StreamStart,
     transport: &'static str,
-    pipeline: &Option<ReplicaPipelineHandles<A, W>>,
-    journal_writer: &mut Option<W>,
+    engine: &mut ReplicaEngine<A, W>,
     fence_state: &melin_transport_core::fence::FenceState,
     control: &ReplicaControlPlane,
 ) -> Result<StreamStartVerdict, Box<dyn std::error::Error>>
@@ -1692,10 +1989,17 @@ where
     }
     // A replica with a journal already records its lineage's genesis
     // length; the primary's must agree with it.
-    if pipeline.is_none() {
-        adopt_genesis_into_empty_unknown_journal(journal_writer, lineage)?;
-    }
-    if let Some(local) = local_lineage_genesis(pipeline, journal_writer)? {
+    // Only an idle engine's writer is this thread's to rewrite; on an
+    // `Err` it is dropped (see `adopt_genesis_into_empty_unknown_journal`),
+    // leaving the state fresh for a receiver that exits on the error.
+    *engine = match engine.take() {
+        ReplicaEngine::Idle(IdleEngine { warm, writer }) => ReplicaEngine::Idle(IdleEngine {
+            warm,
+            writer: adopt_genesis_into_empty_unknown_journal(writer, lineage)?,
+        }),
+        unchanged @ (ReplicaEngine::Running(_) | ReplicaEngine::Fresh) => unchanged,
+    };
+    if let Some(local) = engine.local_lineage_genesis()? {
         check_advertised_genesis(local, lineage.2)?;
     }
     fence_state.observe_epoch(epoch);
@@ -1778,14 +2082,16 @@ mod tests {
         encode_input_batch(&[slot], buf).expect("encode InputBatch");
     }
 
+    /// Built from a position as the receivers build it: each half lands
+    /// in its own wire field, and the epoch beside them.
     #[test]
     fn handshake_encode_decode_round_trip() {
-        let handshake = Handshake {
+        let handshake = ChainPosition {
             last_sequence: 42,
             chain_hash: [0xAB; 32],
-            // Non-zero so a dropped/zeroed epoch field is caught.
-            epoch: 9,
-        };
+        }
+        // Non-zero so a dropped/zeroed epoch field is caught.
+        .handshake(9);
         let mut buf = Vec::new();
         encode_handshake(&handshake, &mut buf);
 
@@ -1876,21 +2182,19 @@ mod tests {
         type Writer = melin_journal::BufferedWriter<CounterEvent>;
         let dir = tempfile::tempdir().expect("tempdir");
         let anchor = [9u8; 32];
-        let header = |w: &Option<Writer>| {
-            w.as_ref()
-                .expect("writer")
-                .read_header_info()
-                .expect("header")
-                .genesis_entries
+        let header = |w: &Writer| w.read_header_info().expect("header").genesis_entries;
+        let create = |path: &std::path::Path, anchor, genesis| {
+            Writer::create_continuing(path, 1, anchor, genesis, PREALLOC).expect("create")
         };
 
         // The pre-upgrade empty journal: adopted, still empty, same anchor.
         let path = dir.path().join("empty.journal");
-        let mut w =
-            Some(Writer::create_continuing(&path, 1, anchor, None, PREALLOC).expect("create"));
-        adopt_genesis_into_empty_unknown_journal(&mut w, (1, anchor, Some(3))).expect("adopt");
-        assert_eq!(header(&w), Some(3));
-        let adopted = w.as_ref().expect("writer");
+        let adopted = adopt_genesis_into_empty_unknown_journal(
+            create(&path, anchor, None),
+            (1, anchor, Some(3)),
+        )
+        .expect("adopt");
+        assert_eq!(header(&adopted), Some(3));
         assert_eq!(adopted.next_sequence(), 1);
         assert_eq!(adopted.path(), path.as_path());
         assert_eq!(
@@ -1903,43 +2207,44 @@ mod tests {
 
         // The primary's length is unknown too: nothing to adopt.
         let path = dir.path().join("both-unknown.journal");
-        let mut w =
-            Some(Writer::create_continuing(&path, 1, anchor, None, PREALLOC).expect("create"));
-        adopt_genesis_into_empty_unknown_journal(&mut w, (1, anchor, None)).expect("no-op");
+        let w = adopt_genesis_into_empty_unknown_journal(
+            create(&path, anchor, None),
+            (1, anchor, None),
+        )
+        .expect("no-op");
         assert_eq!(header(&w), None);
 
         // Another lineage's anchor: not this primary's journal.
         let path = dir.path().join("other-anchor.journal");
-        let mut w =
-            Some(Writer::create_continuing(&path, 1, [1; 32], None, PREALLOC).expect("create"));
-        adopt_genesis_into_empty_unknown_journal(&mut w, (1, anchor, Some(3))).expect("no-op");
+        let w = adopt_genesis_into_empty_unknown_journal(
+            create(&path, [1; 32], None),
+            (1, anchor, Some(3)),
+        )
+        .expect("no-op");
         assert_eq!(header(&w), None);
 
         // A known length is never rewritten (a mismatch is refused by
         // `check_advertised_genesis` instead).
         let path = dir.path().join("known.journal");
-        let mut w =
-            Some(Writer::create_continuing(&path, 1, anchor, Some(2), PREALLOC).expect("create"));
-        adopt_genesis_into_empty_unknown_journal(&mut w, (1, anchor, Some(3))).expect("no-op");
+        let w = adopt_genesis_into_empty_unknown_journal(
+            create(&path, anchor, Some(2)),
+            (1, anchor, Some(3)),
+        )
+        .expect("no-op");
         assert_eq!(header(&w), Some(2));
 
         // A journal holding an entry has history: its header stays.
         let path = dir.path().join("history.journal");
-        let mut writer =
-            Writer::create_continuing(&path, 1, anchor, None, PREALLOC).expect("create");
+        let mut writer = create(&path, anchor, None);
         let seq = writer.allocate_sequence();
         writer
             .encode_event(seq, 0, &melin_journal::JournalEvent::Tick { now_ns: 0 }, 0)
             .expect("encode");
         writer.flush_batch_sync().expect("flush");
-        let mut w = Some(writer);
-        adopt_genesis_into_empty_unknown_journal(&mut w, (1, anchor, Some(3))).expect("no-op");
+        let w =
+            adopt_genesis_into_empty_unknown_journal(writer, (1, anchor, Some(3))).expect("no-op");
         assert_eq!(header(&w), None);
-
-        // No journal: nothing to do.
-        let mut none: Option<Writer> = None;
-        adopt_genesis_into_empty_unknown_journal(&mut none, (1, anchor, Some(3))).expect("no-op");
-        assert!(none.is_none());
+        assert_eq!(w.next_sequence(), 2, "the same writer, its entry kept");
     }
 
     /// A restamp staging file left by a crash before its rename is swept
@@ -1956,15 +2261,17 @@ mod tests {
 
         // No lineage at all.
         std::fs::write(&staging, b"debris").expect("write staging");
-        let (app, writer, _, _) = recover_replica_state::<counter_server::Counter, Writer>(
-            &store,
-            &fence,
-            &SharedLineagePolicy::new(None),
-            &(),
-            PREALLOC,
-        )
-        .expect("recover");
-        assert!(app.is_none() && writer.is_none());
+        let RecoveredReplica { engine, position } =
+            recover_replica_state::<counter_server::Counter, Writer>(
+                &store,
+                &fence,
+                &SharedLineagePolicy::new(None),
+                &(),
+                PREALLOC,
+            )
+            .expect("recover");
+        assert!(engine.is_none());
+        assert_eq!(position, ChainPosition::GENESIS, "a fresh replica");
         assert!(!staging.exists(), "swept without a journal");
 
         // A journal that holds history, which the adopt guard never touches.
@@ -1981,17 +2288,459 @@ mod tests {
         // creator's or fall back to the default.
         let node = melin_journal::Prealloc::for_rotation(2 * 1024 * 1024);
         assert_ne!(node, PREALLOC);
-        let (_, writer, last, _) = recover_replica_state::<counter_server::Counter, Writer>(
-            &store,
-            &fence,
+        let RecoveredReplica { engine, position } =
+            recover_replica_state::<counter_server::Counter, Writer>(
+                &store,
+                &fence,
+                &SharedLineagePolicy::new(None),
+                &(),
+                node,
+            )
+            .expect("recover");
+        let engine = engine.expect("recovered");
+        assert_eq!(engine.writer.prealloc(), node);
+        // The pair is the recovered journal's, read together.
+        assert_eq!(
+            position,
+            ChainPosition {
+                last_sequence: 1,
+                chain_hash: engine.writer.chain_hash().unwrap_or([0u8; 32]),
+            }
+        );
+        assert!(!staging.exists(), "swept beside a journal with history");
+    }
+
+    /// A replica recovered from its journal hands its pipeline the tick
+    /// watermark replay reached, with the application, not a fresh one:
+    /// the matching and shadow stages built over it continue the clock an
+    /// uninterrupted replica would hold.
+    #[test]
+    fn replica_recovery_carries_the_replayed_tick_watermark() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (replayed, engine) = recover_a_ticked_replica(dir.path());
+        assert_eq!(engine.expect("recovered").warm.tick_watermark, replayed);
+    }
+
+    /// A replica journal in `dir` holding two increments under distinct
+    /// timestamps, recovered as a replica's receiver recovers it at
+    /// startup: the tick watermark replay of it reaches (read
+    /// independently, and not the genesis one), then the recovered
+    /// engine, as recovery hands it to the receiver.
+    fn recover_a_ticked_replica(
+        dir: &std::path::Path,
+    ) -> (
+        TickWatermark,
+        Option<IdleEngine<counter_server::Counter, CounterWriter>>,
+    ) {
+        let journal = dir.join("replica.journal");
+        let store = NodeStore::resolve(journal.clone(), None).expect("store");
+        let mut w =
+            CounterWriter::create_continuing(&journal, 1, [0; 32], None, PREALLOC).expect("create");
+        let event = melin_journal::JournalEvent::App(CounterEvent::Increment { amount: 1 });
+        for timestamp_ns in [100, 300] {
+            let seq = w.allocate_sequence();
+            w.encode_event(seq, timestamp_ns, &event, 0)
+                .expect("encode");
+        }
+        w.flush_batch_sync().expect("flush");
+        drop(w);
+
+        let replayed =
+            melin_transport_core::JournaledApp::<counter_server::Counter, CounterWriter>::recover(
+                counter_server::Counter::default(),
+                &journal,
+                PREALLOC,
+            )
+            .expect("replay")
+            .tick_watermark();
+        assert_ne!(replayed, TickWatermark::GENESIS);
+
+        let RecoveredReplica { engine, position } =
+            recover_replica_state::<counter_server::Counter, CounterWriter>(
+                &store,
+                &melin_transport_core::fence::FenceState::new(0),
+                &SharedLineagePolicy::new(None),
+                &(),
+                PREALLOC,
+            )
+            .expect("recover");
+        assert_eq!(position.last_sequence, 2);
+        (replayed, engine)
+    }
+
+    /// The journal writer of the counter application's replicas.
+    type CounterWriter = melin_journal::BufferedWriter<CounterEvent>;
+
+    /// A replica holding `writer` with no pipeline running, its counter
+    /// at genesis: the receiver's engine, for tests of what reads or
+    /// rewrites the writer and leaves the application alone.
+    fn idle_counter(
+        writer: CounterWriter,
+    ) -> ReplicaEngine<counter_server::Counter, CounterWriter> {
+        ReplicaEngine::Idle(IdleEngine {
+            warm: WarmApp::genesis(counter_server::Counter::default()),
+            writer,
+        })
+    }
+
+    /// The idle engine `engine` holds; a test failure for any other state.
+    fn idle_in<A: Application, W: Send + 'static>(
+        engine: &ReplicaEngine<A, W>,
+    ) -> &IdleEngine<A, W> {
+        match engine {
+            ReplicaEngine::Idle(held) => held,
+            ReplicaEngine::Running(_) => panic!("expected an idle engine, found a pipeline"),
+            ReplicaEngine::Fresh => panic!("expected an idle engine, found none"),
+        }
+    }
+
+    /// A promotion with no pipeline running — before the first session,
+    /// or after a resync left the engine idle — hands the promoted primary
+    /// the watermark the idle engine holds, not a fresh one.
+    #[test]
+    fn promotion_from_an_idle_engine_carries_its_tick_watermark() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (replayed, engine) = recover_a_ticked_replica(dir.path());
+        let promoted = ReplicaEngine::Idle(engine.expect("recovered")).into_promotion();
+        let Ok(Some((warm, _))) = promoted else {
+            panic!("the idle engine must be promoted");
+        };
+        assert_eq!(warm.tick_watermark, replayed);
+    }
+
+    /// A resync's recovered state replaces the receiver's state whole,
+    /// engine and position together, and sends the loop round again; a
+    /// plain reconnect leaves both as they were.
+    #[test]
+    fn a_resync_adopts_the_recovered_engine_and_position_together() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (replayed, recovered_engine) = recover_a_ticked_replica(dir.path());
+        let recovered_position = ChainPosition {
+            last_sequence: 2,
+            chain_hash: [7; 32],
+        };
+        let mut state = ReplicaState::<counter_server::Counter, CounterWriter>::FRESH;
+
+        let after = AfterSession::Resync(RecoveredReplica {
+            engine: recovered_engine,
+            position: recovered_position,
+        });
+        assert!(after.adopt(&mut state).is_none());
+        assert_eq!(state.position, recovered_position);
+        assert_eq!(idle_in(&state.engine).warm.tick_watermark, replayed);
+
+        // A plain reconnect, with an engine held, leaves both alone.
+        let after = AfterSession::<counter_server::Counter, CounterWriter>::Reconnect;
+        assert!(after.adopt(&mut state).is_none());
+        assert_eq!(
+            state.position, recovered_position,
+            "a reconnect keeps the position"
+        );
+        assert_eq!(
+            idle_in(&state.engine).warm.tick_watermark,
+            replayed,
+            "a reconnect keeps the engine"
+        );
+
+        // A fresh recovery (nothing on disk) replaces them too.
+        let after = AfterSession::Resync(RecoveredReplica::FRESH);
+        assert!(after.adopt(&mut state).is_none());
+        assert!(matches!(state.engine, ReplicaEngine::Fresh));
+        assert_eq!(state.position, ChainPosition::GENESIS);
+    }
+
+    /// [`recover_a_ticked_replica`]'s state, running in a replica
+    /// pipeline built over it as the receiver builds one: the replayed
+    /// watermark, and the pipeline. Nothing streams into it, so its
+    /// matching stage stops at the watermark it started from.
+    fn a_running_ticked_replica(
+        dir: &std::path::Path,
+    ) -> (TickWatermark, ReplicaHandles<counter_server::Counter>) {
+        let (replayed, engine) = recover_a_ticked_replica(dir);
+        let handles = build_test_pipeline(engine.expect("recovered"), dir)
+            .expect("build the replica pipeline");
+        (replayed, handles)
+    }
+
+    /// A replica pipeline over `engine`, built as the receiver builds one,
+    /// for the store of [`recover_a_ticked_replica`]'s journal in `dir`.
+    fn build_test_pipeline(
+        engine: IdleEngine<counter_server::Counter, CounterWriter>,
+        dir: &std::path::Path,
+    ) -> Result<ReplicaHandles<counter_server::Counter>, Box<dyn std::error::Error>> {
+        build_replica_pipeline_with_threads(
+            engine,
+            crate::layout::PipelineCores::unpinned(),
+            melin_transport_core::pipeline::RingCapacity::MIN,
+            melin_journal::StagingMode::Allocate,
+            // No shadow: only the matching stage's hand-back is under test.
+            0,
+            &NodeStore::resolve(dir.join("replica.journal"), None).expect("store"),
+            std::time::Duration::ZERO,
+            Arc::new(melin_transport_core::fence::FenceState::new(0)),
             &SharedLineagePolicy::new(None),
+            Arc::new(AtomicBool::new(true)),
             &(),
-            node,
+        )
+    }
+
+    /// A promotion that fires while the receiver is disconnected tears
+    /// the running pipeline down and hands the promoted primary the
+    /// watermark its matching stage held when it stopped, not a fresh one.
+    #[test]
+    fn promotion_from_a_running_pipeline_carries_its_stages_tick_watermark() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (replayed, handles) = a_running_ticked_replica(dir.path());
+        let promoted = ReplicaEngine::Running(handles).into_promotion();
+        let Ok(Some((warm, _))) = promoted else {
+            panic!("the torn-down pipeline's state must be promoted");
+        };
+        assert_eq!(warm.tick_watermark, replayed);
+    }
+
+    /// The same, for a promotion that ends a streaming session: the
+    /// session's exit tears the pipeline down and hands its matching
+    /// stage's watermark up with the application.
+    #[test]
+    fn a_promoting_session_exit_carries_the_stages_tick_watermark() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (replayed, handles) = a_running_ticked_replica(dir.path());
+        let mut state = ReplicaState {
+            engine: ReplicaEngine::Running(handles),
+            position: ChainPosition {
+                last_sequence: 2,
+                chain_hash: [0; 32],
+            },
+        };
+        let (mut divergence_resyncs, mut backoff) = (0, MAX_BACKOFF);
+        let after = handle_session_exit::<counter_server::Counter, CounterWriter>(
+            StreamingResult {
+                exit: SessionExit::Promote,
+                heard_from_primary: true,
+            },
+            &mut state,
+            &mut divergence_resyncs,
+            &mut backoff,
+            &NodeStore::resolve(dir.path().join("replica.journal"), None).expect("store"),
+            &melin_transport_core::fence::FenceState::new(0),
+            &SharedLineagePolicy::new(None),
+            &AtomicBool::new(false),
+            &crate::promotion::PromotionRequest::new(),
+            || {},
+            &(),
+            PREALLOC,
+        );
+        let AfterSession::Return(Ok(Some((warm, _)))) = after else {
+            panic!("the torn-down pipeline's state must be promoted");
+        };
+        assert_eq!(warm.tick_watermark, replayed);
+        assert!(
+            matches!(state.engine, ReplicaEngine::Fresh),
+            "the pipeline was torn down, its engine handed up"
+        );
+    }
+
+    /// The journal writer of the tick-counting application's nodes.
+    type TickWriter = melin_journal::BufferedWriter<melin_transport_core::test_support::TestEvent>;
+
+    /// A replica seeded by a snapshot transfer makes the tick calls its
+    /// primary makes: the watermark comes across with the snapshot the
+    /// primary serves, so the next event, which repeats the last timestamp
+    /// the snapshot covers, fires no clock tick on either. On an
+    /// application that counts every call, a replica seeded at a fresh
+    /// watermark would count one more from then on.
+    #[test]
+    fn a_resynced_replica_makes_the_tick_calls_its_primary_makes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logs = melin_transport_core::test_logs::Logs::default();
+        tracing::subscriber::with_default(logs.subscriber(tracing::Level::DEBUG), || {
+            resync_then_tick_both(dir.path(), false);
+        });
+        assert!(
+            logs.lines("tick watermark").is_empty(),
+            "nothing to fall back on"
+        );
+    }
+
+    /// The same from a primary whose snapshot file predates the recorded
+    /// watermark: the replica falls back on the timestamp of the seed's
+    /// entry at the snapshot's sequence — here exactly the primary's
+    /// watermark — and says so once.
+    #[test]
+    fn a_replica_resynced_from_an_older_snapshot_file_falls_back_on_the_seed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logs = melin_transport_core::test_logs::Logs::default();
+        tracing::subscriber::with_default(logs.subscriber(tracing::Level::DEBUG), || {
+            resync_then_tick_both(dir.path(), true);
+        });
+        let lines = logs.lines("predates the recorded tick watermark");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("WARN"), "{}", lines[0]);
+        assert!(lines[0].contains("timestamp of the journal entry"));
+    }
+
+    /// Resync a replica in `dir/replica` from [`primary_serving_a_ticked_snapshot`]
+    /// (its snapshot file rewritten as v4 when `v4`), then hand both the
+    /// next event, which repeats the snapshot's last timestamp: they must
+    /// make the same tick calls, and so hold the same watermark.
+    fn resync_then_tick_both(dir: &std::path::Path, v4: bool) {
+        use melin_transport_core::test_support::TickCountingApp;
+        let (mut primary, frames) = primary_serving_a_ticked_snapshot(dir, v4);
+
+        let replica_dir = dir.join("replica");
+        std::fs::create_dir(&replica_dir).expect("replica dir");
+        let store = NodeStore::resolve(replica_dir.join("r.journal"), None).expect("store");
+        let mut state = ReplicaState {
+            engine: ReplicaEngine::Fresh,
+            // A position the resync must replace whole: the archived
+            // lineage's.
+            position: ChainPosition {
+                last_sequence: 7,
+                chain_hash: [0x5A; 32],
+            },
+        };
+        let decision = handle_resync_verdict::<TickCountingApp, TickWriter, _>(
+            false,
+            &mut receiver_transport::ScriptedFrames::from_published(&frames),
+            &mut state,
+            &store,
+            &melin_transport_core::fence::FenceState::new(0),
+            &ReplicaControlPlane::new(),
+            PREALLOC,
+        )
+        .expect("resync");
+        assert!(
+            matches!(decision, ResyncDecision::Ready { .. }),
+            "the transfer completes"
+        );
+        // The state holds the snapshot's position, sequence and hash
+        // together, with its engine.
+        assert_eq!(
+            state.position,
+            ChainPosition {
+                last_sequence: 3,
+                chain_hash: primary.chain_hash().unwrap_or([0u8; 32]),
+            }
+        );
+        let ReplicaEngine::Idle(IdleEngine {
+            warm: WarmApp {
+                app,
+                tick_watermark,
+            },
+            writer,
+        }) = state.engine
+        else {
+            panic!("the resync leaves the snapshot's state and seeded journal, idle");
+        };
+        assert_eq!(app, *primary.app(), "the snapshot's state");
+        let mut replica = melin_transport_core::JournaledApp::from_parts(
+            app,
+            writer,
+            primary.recovered_lineage(),
+            tick_watermark,
+        );
+
+        // The next event repeats the snapshot's last timestamp.
+        let mut reports = Vec::new();
+        primary.tick_journaled(300, &mut reports).expect("primary");
+        replica.tick_journaled(300, &mut reports).expect("replica");
+        assert_eq!(replica.app(), primary.app(), "the same tick calls");
+        assert_eq!(replica.tick_watermark(), primary.tick_watermark());
+    }
+
+    /// A transfer that fails after the local lineage is archived leaves
+    /// the replica wholly fresh — no engine over the archived-away journal,
+    /// and the genesis position — so the retried handshake presents as a
+    /// fresh replica and the next pipeline is built over a journal created
+    /// from the primary's lineage, not the stale writer.
+    #[test]
+    fn a_failed_resync_transfer_leaves_the_replica_fresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_, recovered) = recover_a_ticked_replica(dir.path());
+        let store = NodeStore::resolve(dir.path().join("replica.journal"), None).expect("store");
+        let mut state = ReplicaState::from(RecoveredReplica {
+            engine: recovered,
+            position: ChainPosition {
+                last_sequence: 2,
+                chain_hash: [1; 32],
+            },
+        });
+
+        // The primary disconnects before sending anything.
+        let decision = handle_resync_verdict::<counter_server::Counter, CounterWriter, _>(
+            true,
+            &mut receiver_transport::ScriptedFrames::new(Vec::new()),
+            &mut state,
+            &store,
+            &melin_transport_core::fence::FenceState::new(0),
+            &ReplicaControlPlane::new(),
+            PREALLOC,
+        )
+        .expect("a network-shaped failure is retried, not fatal");
+
+        assert!(matches!(decision, ResyncDecision::Retry));
+        assert!(matches!(state.engine, ReplicaEngine::Fresh));
+        assert_eq!(state.position, ChainPosition::GENESIS);
+        assert!(!store.journal().exists(), "the local lineage was archived");
+    }
+
+    /// A primary in `dir/primary` whose journal holds three increments at
+    /// 100, 200 and 300 ns, recovered, with the snapshot of that position
+    /// saved where it serves snapshots from (rewritten as a release before
+    /// v5 wrote it when `v4`); and the frames it publishes to a replica
+    /// that needs that snapshot, in order, each with its length prefix.
+    fn primary_serving_a_ticked_snapshot(
+        dir: &std::path::Path,
+        v4: bool,
+    ) -> (
+        melin_transport_core::JournaledApp<
+            melin_transport_core::test_support::TickCountingApp,
+            TickWriter,
+        >,
+        Vec<Vec<u8>>,
+    ) {
+        use melin_transport_core::test_support::{TestEvent, TickCountingApp};
+        let primary_dir = dir.join("primary");
+        std::fs::create_dir(&primary_dir).expect("primary dir");
+        let journal = primary_dir.join("p.journal");
+        let mut w = TickWriter::create(&journal, PREALLOC).expect("create");
+        for timestamp_ns in [100, 200, 300] {
+            w.batch_append_with_ts(
+                &melin_journal::JournalEvent::App(TestEvent::Add(1)),
+                timestamp_ns,
+                0,
+            )
+            .expect("append");
+        }
+        w.flush_batch_sync().expect("flush");
+        drop(w);
+        let primary = melin_transport_core::JournaledApp::<TickCountingApp, TickWriter>::recover(
+            TickCountingApp::default(),
+            &journal,
+            PREALLOC,
         )
         .expect("recover");
-        assert_eq!(writer.expect("recovered").prealloc(), node);
-        assert_eq!(last, 1);
-        assert!(!staging.exists(), "swept beside a journal with history");
+        assert_ne!(primary.tick_watermark(), TickWatermark::GENESIS);
+        let store = NodeStore::resolve(journal, None).expect("store");
+        primary.save_snapshot(store.snapshot()).expect("snapshot");
+        if v4 {
+            let v5 = std::fs::read(store.snapshot()).expect("read snapshot");
+            std::fs::write(store.snapshot(), melin_transport_core::snapshot::as_v4(&v5))
+                .expect("rewrite snapshot");
+        }
+
+        let mut frames = Vec::new();
+        let mut publish = |frame: &[u8]| -> std::io::Result<()> {
+            frames.push(frame.to_vec());
+            Ok(())
+        };
+        melin_transport_core::replication::catchup::snapshot_transfer_with::<TestEvent>(
+            &store,
+            &mut publish,
+            &AtomicBool::new(false),
+        )
+        .expect("transfer");
+        (primary, frames)
     }
 
     /// Replica recovery adopts the recovered lineage: the epoch as a
@@ -2082,8 +2831,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("replica.journal");
         let anchor = [9u8; 32];
-        let mut journal_writer =
-            Some(Writer::create_continuing(&path, 1, anchor, None, PREALLOC).expect("create"));
+        let mut engine = idle_counter(
+            Writer::create_continuing(&path, 1, anchor, None, PREALLOC).expect("create"),
+        );
         let fence = melin_transport_core::fence::FenceState::new(5);
         let control = ReplicaControlPlane::new();
 
@@ -2094,8 +2844,7 @@ mod tests {
                 epoch: 4,
             },
             "test",
-            &None,
-            &mut journal_writer,
+            &mut engine,
             &fence,
             &control,
         )
@@ -2104,12 +2853,152 @@ mod tests {
         assert!(matches!(verdict, StreamStartVerdict::StalePrimary));
         assert_eq!(fence.epoch(), 5);
         assert!(!control.primary_observed.load(Ordering::Acquire));
-        let header = journal_writer
-            .as_ref()
-            .expect("writer")
-            .read_header_info()
-            .expect("header");
+        let header = idle_in(&engine).writer.read_header_info().expect("header");
         assert_eq!(header.genesis_entries, None, "journal left untouched");
+    }
+
+    /// A fresh replica, holding no engine, follows the primary with
+    /// nothing to adopt into or check against: the fresh-journal path
+    /// creates its journal from the lineage handed back.
+    #[test]
+    fn a_fresh_replica_follows_a_primary_without_an_engine() {
+        let fence = melin_transport_core::fence::FenceState::new(0);
+        let control = ReplicaControlPlane::new();
+        let mut engine = ReplicaEngine::<counter_server::Counter, CounterWriter>::Fresh;
+
+        let verdict = accept_stream_start(
+            StreamStart {
+                start_sequence: 1,
+                lineage: (1, [9; 32], Some(3)),
+                epoch: 2,
+            },
+            "test",
+            &mut engine,
+            &fence,
+            &control,
+        )
+        .expect("nothing to disagree with");
+
+        let StreamStartVerdict::Follow(lineage) = verdict else {
+            panic!("expected Follow");
+        };
+        assert_eq!(lineage, (1, [9; 32], Some(3)));
+        assert!(
+            matches!(engine, ReplicaEngine::Fresh),
+            "nothing created here"
+        );
+        assert_eq!(fence.epoch(), 2);
+        assert!(control.primary_observed.load(Ordering::Acquire));
+    }
+
+    /// Run [`ReplicaEngine::ensure_running`] on `engine` with a `build`
+    /// that keeps the engine it is handed and refuses to build: what a
+    /// pipeline would have been built over, and the refusal.
+    fn engine_handed_to_build(
+        engine: &mut ReplicaEngine<counter_server::Counter, CounterWriter>,
+        journal: &std::path::Path,
+        lineage: (u64, [u8; 32], Option<u64>),
+    ) -> (
+        Option<IdleEngine<counter_server::Counter, CounterWriter>>,
+        Box<dyn std::error::Error>,
+    ) {
+        let mut handed = None;
+        let refused = engine
+            .ensure_running(journal, lineage, PREALLOC, |held| {
+                handed = Some(held);
+                Err::<ReplicaHandles<counter_server::Counter>, Box<dyn std::error::Error>>(
+                    "not built".into(),
+                )
+            })
+            .err()
+            .expect("the build refuses");
+        (handed, refused)
+    }
+
+    /// A pipeline is built over the engine held, untouched, or for a fresh
+    /// replica over a genesis application and a journal created from the
+    /// primary's lineage, which then holds that lineage's identity. A
+    /// journal that cannot be created is an error, with nothing built. A
+    /// failed build leaves the replica fresh.
+    #[test]
+    fn a_pipeline_is_built_over_the_held_engine_or_a_fresh_journal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let anchor = [9u8; 32];
+
+        // Held: handed over as is, nothing created at the path given.
+        let held_path = dir.path().join("held.journal");
+        let (_, recovered) = recover_a_ticked_replica(dir.path());
+        let recovered_watermark = recovered.as_ref().expect("recovered").warm.tick_watermark;
+        let mut engine = ReplicaEngine::Idle(recovered.expect("recovered"));
+        let (taken, refused) =
+            engine_handed_to_build(&mut engine, &held_path, (1, anchor, Some(3)));
+        let taken = taken.expect("the held engine is built over");
+        assert_eq!(refused.to_string(), "not built", "the build's own error");
+        assert!(matches!(engine, ReplicaEngine::Fresh), "taken by the build");
+        assert_eq!(taken.warm.tick_watermark, recovered_watermark);
+        assert_eq!(taken.writer.next_sequence(), 3, "the recovered writer");
+        assert!(!held_path.exists(), "no journal created");
+
+        // None held: a fresh journal from the lineage, at genesis.
+        let fresh_path = dir.path().join("fresh.journal");
+        let mut engine = ReplicaEngine::Fresh;
+        let (created, _) = engine_handed_to_build(&mut engine, &fresh_path, (1, anchor, Some(3)));
+        let created = created.expect("a fresh journal is built over");
+        assert!(matches!(engine, ReplicaEngine::Fresh));
+        assert_eq!(created.warm.tick_watermark, TickWatermark::GENESIS);
+        assert_eq!(created.writer.path(), fresh_path.as_path());
+        assert_eq!(created.writer.next_sequence(), 1);
+        let info = melin_journal::segment::read_header_info(&fresh_path).expect("on disk");
+        assert_eq!(
+            (
+                info.starting_sequence,
+                info.anchor_hash,
+                info.genesis_entries
+            ),
+            (1, anchor, Some(3))
+        );
+
+        // A journal that cannot be created: an error, nothing built.
+        let mut engine = ReplicaEngine::Fresh;
+        let missing_dir = dir.path().join("no-such-dir").join("r.journal");
+        let (built_over, refused) =
+            engine_handed_to_build(&mut engine, &missing_dir, (1, anchor, Some(3)));
+        assert!(built_over.is_none(), "the build never ran");
+        assert_ne!(refused.to_string(), "not built", "the journal's error");
+        assert!(matches!(engine, ReplicaEngine::Fresh));
+    }
+
+    /// An idle engine is built into a running pipeline, which the replica
+    /// then holds; a pipeline already running is reused as it is, never
+    /// rebuilt, its journal never recreated.
+    #[test]
+    fn a_running_pipeline_is_built_once_and_then_reused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_, recovered) = recover_a_ticked_replica(dir.path());
+        let mut engine = ReplicaEngine::Idle(recovered.expect("recovered"));
+        // Where a fresh replica's journal would be created: never, here.
+        let unused = dir.path().join("unused.journal");
+        let built = engine
+            .ensure_running(&unused, (1, [9; 32], Some(3)), PREALLOC, |held| {
+                build_test_pipeline(held, dir.path())
+            })
+            .expect("built");
+        // Tells this pipeline apart from any other.
+        let marker = Arc::clone(&built.journal_failed);
+        assert!(matches!(engine, ReplicaEngine::Running(_)));
+
+        let reused = engine
+            .ensure_running(&unused, (1, [9; 32], Some(3)), PREALLOC, |_| {
+                panic!("a running pipeline is never rebuilt")
+            })
+            .map_err(|e: Box<dyn std::error::Error>| e.to_string())
+            .expect("reused");
+        assert!(
+            Arc::ptr_eq(&reused.journal_failed, &marker),
+            "the same pipeline"
+        );
+        assert!(!unused.exists(), "no journal created");
+        engine.stop();
     }
 
     /// Following a primary adopts its epoch, records it as observed and
@@ -2122,8 +3011,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("replica.journal");
         let anchor = [9u8; 32];
-        let mut journal_writer =
-            Some(Writer::create_continuing(&path, 1, anchor, None, PREALLOC).expect("create"));
+        let mut engine = idle_counter(
+            Writer::create_continuing(&path, 1, anchor, None, PREALLOC).expect("create"),
+        );
         let fence = melin_transport_core::fence::FenceState::new(5);
         let control = ReplicaControlPlane::new();
         let held = Some(melin_transport_core::lineage::LineagePolicy::after(
@@ -2143,8 +3033,7 @@ mod tests {
                 epoch: 7,
             },
             "test",
-            &None,
-            &mut journal_writer,
+            &mut engine,
             &fence,
             &control,
         )
@@ -2157,12 +3046,11 @@ mod tests {
         assert_eq!(fence.epoch(), 7);
         assert!(control.primary_observed.load(Ordering::Acquire));
         assert_eq!(control.lineage_ack_policy.load(), held, "untouched");
-        let header = journal_writer
-            .as_ref()
-            .expect("writer")
-            .read_header_info()
-            .expect("header");
+        // The engine is kept, its writer restamped.
+        let held_engine = idle_in(&engine);
+        let header = held_engine.writer.read_header_info().expect("header");
         assert_eq!(header.genesis_entries, Some(3));
+        assert_eq!(held_engine.writer.path(), path.as_path());
     }
 
     /// A primary whose genesis length disagrees with ours is fatal, and
@@ -2173,8 +3061,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("replica.journal");
         let anchor = [9u8; 32];
-        let mut journal_writer =
-            Some(Writer::create_continuing(&path, 1, anchor, Some(2), PREALLOC).expect("create"));
+        let mut engine = idle_counter(
+            Writer::create_continuing(&path, 1, anchor, Some(2), PREALLOC).expect("create"),
+        );
         let fence = melin_transport_core::fence::FenceState::new(5);
         let control = ReplicaControlPlane::new();
 
@@ -2185,8 +3074,7 @@ mod tests {
                 epoch: 7,
             },
             "test",
-            &None,
-            &mut journal_writer,
+            &mut engine,
             &fence,
             &control,
         )
@@ -2209,12 +3097,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("replica.journal");
 
-        let writer =
-            Writer::create_continuing(&path, 1, [7; 32], Some(5), PREALLOC).expect("create");
-        let mut journal_writer = Some(writer);
+        let mut engine = idle_counter(
+            Writer::create_continuing(&path, 1, [7; 32], Some(5), PREALLOC).expect("create"),
+        );
         assert_eq!(
-            local_lineage_genesis::<counter_server::Counter, Writer>(&None, &journal_writer)
-                .expect("header read"),
+            engine.local_lineage_genesis().expect("header read"),
             Some(Some(5)),
         );
 
@@ -2223,8 +3110,14 @@ mod tests {
                 .add_consumer()
                 .build(melin_pipeline::wait::WaitStrategy::SpinThenYield);
         let _consumer = consumers.pop().expect("one consumer");
-        let owned = journal_writer.take().expect("writer");
-        let pipeline = Some(ReplicaPipelineHandles {
+        let ReplicaEngine::Idle(IdleEngine {
+            warm,
+            writer: owned,
+        }) = engine.take()
+        else {
+            panic!("an idle engine");
+        };
+        engine = ReplicaEngine::Running(ReplicaPipelineHandles {
             input_producer,
             journal_cursor: Arc::new(make_journal_cursor(0)),
             chain_hash_lock: fsync_state_at(0, 0).1,
@@ -2235,18 +3128,19 @@ mod tests {
             journal_handle: std::thread::spawn(
                 move || -> Result<Writer, melin_journal::JournalError> { Ok(owned) },
             ),
-            matching_handle: std::thread::spawn(counter_server::Counter::default),
+            matching_handle: std::thread::spawn(move || warm),
             drain_handle: std::thread::spawn(|| {}),
             shadow_handle: None,
         });
         std::fs::remove_file(&path).expect("simulate the rotation gap");
         assert_eq!(
-            local_lineage_genesis(&pipeline, &journal_writer).expect("no file read"),
+            engine.local_lineage_genesis().expect("no file read"),
             Some(Some(5)),
         );
 
         assert_eq!(
-            local_lineage_genesis::<counter_server::Counter, Writer>(&None, &None)
+            ReplicaEngine::<counter_server::Counter, Writer>::Fresh
+                .local_lineage_genesis()
                 .expect("nothing to read"),
             None,
         );
@@ -3606,7 +4500,7 @@ mod tests {
         });
         let matching = std::thread::spawn(move || {
             mj.store(true, Ordering::Release);
-            7u64
+            WarmApp::genesis(7u64)
         });
         let drain = std::thread::spawn(|| {});
 
@@ -3629,12 +4523,12 @@ mod tests {
         let flag = AtomicBool::new(false);
         let journal =
             std::thread::spawn(|| -> Result<u32, melin_journal::JournalError> { Ok(11u32) });
-        let matching = std::thread::spawn(|| 7u64);
+        let matching = std::thread::spawn(|| WarmApp::genesis(7u64));
         let drain = std::thread::spawn(|| {});
 
         match shutdown_pipeline::<u64, u32>(&flag, journal, matching, drain, None) {
-            TeardownOutcome::Clean(app, writer) => {
-                assert_eq!(app, 7);
+            TeardownOutcome::Clean(IdleEngine { warm, writer }) => {
+                assert_eq!(warm, WarmApp::genesis(7));
                 assert_eq!(writer, 11);
             }
             _ => panic!("expected Clean"),
@@ -3646,7 +4540,7 @@ mod tests {
         let flag = AtomicBool::new(false);
         let journal =
             std::thread::spawn(|| -> Result<u32, melin_journal::JournalError> { Ok(11u32) });
-        let matching = std::thread::spawn(|| -> u64 { panic!("matching stage died") });
+        let matching = std::thread::spawn(|| -> WarmApp<u64> { panic!("matching stage died") });
         let drain = std::thread::spawn(|| {});
 
         assert!(matches!(
@@ -3710,7 +4604,9 @@ mod tests {
             journal_handle: std::thread::spawn(|| -> Result<u32, melin_journal::JournalError> {
                 Ok(11)
             }),
-            matching_handle: std::thread::spawn(counter_server::Counter::default),
+            matching_handle: std::thread::spawn(|| {
+                WarmApp::genesis(counter_server::Counter::default())
+            }),
             drain_handle: std::thread::spawn(|| {}),
             shadow_handle: None,
         };
@@ -3802,8 +4698,10 @@ mod tests {
                 ..crate::layout::PipelineCores::unpinned()
             };
             let handles = build_replica_pipeline_with_threads(
-                counter_server::Counter::default(),
-                writer,
+                IdleEngine {
+                    warm: WarmApp::genesis(counter_server::Counter::default()),
+                    writer,
+                },
                 cores,
                 melin_transport_core::pipeline::RingCapacity::MIN,
                 melin_journal::StagingMode::Allocate,
@@ -3873,14 +4771,19 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
             fsync.store(melin_transport_core::pipeline::FsyncState {
                 journal_seq: melin_transport_core::WireSeq::new(13),
-                chain_hash: [0u8; 32],
+                chain_hash: [0xC3; 32],
                 input_ring_seq: melin_transport_core::cursors::RingPos::new(3),
             });
         });
         let outcome = handles.settled_resume_point(|| false);
         journal.join().unwrap();
+        // The sequence and the hash of the one fsync state, together.
+        let covering = ChainPosition {
+            last_sequence: 13,
+            chain_hash: [0xC3; 32],
+        };
         assert!(
-            matches!(outcome, ResumePoint::Settled(s) if s.journal_seq.get() == 13),
+            matches!(outcome, ResumePoint::Settled(s) if s == covering),
             "resumes past the ring's slots"
         );
     }
@@ -3893,7 +4796,7 @@ mod tests {
         let (handles, _consumer) = handles_fixture(8, reader);
         assert!(matches!(
             handles.settled_resume_point(|| false),
-            ResumePoint::Settled(s) if s.journal_seq.get() == 10
+            ResumePoint::Settled(s) if s.last_sequence == 10
         ));
     }
 
@@ -4005,41 +4908,15 @@ mod tests {
     fn a_journal_found_dead_by_the_wait_takes_the_fatal_path() {
         let dir = tempfile::tempdir().expect("tempdir");
         type Writer = melin_journal::BufferedWriter<CounterEvent>;
-        let (input_producer, mut consumers) =
-            melin_pipeline::ring::DisruptorBuilder::<InputSlot>::new(4)
-                .add_consumer()
-                .build(melin_pipeline::wait::WaitStrategy::SpinThenYield);
-        let _consumer = consumers.pop().expect("one consumer");
-        let handles = ReplicaPipelineHandles {
-            input_producer,
-            journal_cursor: Arc::new(make_journal_cursor(0)),
-            chain_hash_lock: fsync_state_at(0, 0).1,
-            stream_marks: melin_transport_core::pipeline::StreamMarks::shared(),
-            genesis_entries: None,
-            journal_failed: Arc::new(AtomicBool::new(true)),
-            pipeline_shutdown: Arc::new(AtomicBool::new(false)),
-            journal_handle: std::thread::spawn(
-                || -> Result<Writer, melin_journal::JournalError> {
-                    Err(melin_journal::JournalError::ReplicaSequenceMismatch {
-                        expected: 4,
-                        actual: 1,
-                    })
-                },
-            ),
-            matching_handle: std::thread::spawn(counter_server::Counter::default),
-            drain_handle: std::thread::spawn(|| {}),
-            shadow_handle: None,
-        };
-        let mut pipeline = Some(handles);
+        let mut state = at_genesis(ReplicaEngine::Running(a_pipeline_whose_journal_died()));
         let mut divergence_resyncs = 0u32;
         let mut backoff = MAX_BACKOFF;
         let mut closes = 0;
         let after = handle_session_exit::<counter_server::Counter, Writer>(
             journal_failed_while_disconnected(),
-            &mut pipeline,
+            &mut state,
             &mut divergence_resyncs,
             &mut backoff,
-            0,
             &NodeStore::resolve(dir.path().join("r.journal"), None).expect("store"),
             &melin_transport_core::fence::FenceState::new(0),
             &SharedLineagePolicy::new(None),
@@ -4057,11 +4934,105 @@ mod tests {
                 .contains("refused to journal sequence 1: the next sequence is 4"),
             "the returned error names the journal's cause, got: {err}"
         );
-        assert!(pipeline.is_none(), "the dead pipeline was torn down");
+        assert!(
+            matches!(state.engine, ReplicaEngine::Fresh),
+            "the dead pipeline was torn down"
+        );
         assert_eq!(divergence_resyncs, 0);
         // Once, as on every exit (the receivers pass a no-op here, as no
         // session is open while the wait runs).
         assert_eq!(closes, 1);
+    }
+
+    /// A replica pipeline whose journal stage has died, refusing a
+    /// sequence (the failure latched, as the stage latches it), so that
+    /// its teardown hands back no engine.
+    fn a_pipeline_whose_journal_died() -> ReplicaHandles<counter_server::Counter> {
+        let (input_producer, consumers) =
+            melin_pipeline::ring::DisruptorBuilder::<InputSlot>::new(4)
+                .add_consumer()
+                .build(melin_pipeline::wait::WaitStrategy::SpinThenYield);
+        // Dropped: with the failure latched, the teardown publishes no
+        // sentinel for a consumer to read.
+        drop(consumers);
+        ReplicaPipelineHandles {
+            input_producer,
+            journal_cursor: Arc::new(make_journal_cursor(0)),
+            chain_hash_lock: fsync_state_at(0, 0).1,
+            stream_marks: melin_transport_core::pipeline::StreamMarks::shared(),
+            genesis_entries: None,
+            journal_failed: Arc::new(AtomicBool::new(true)),
+            pipeline_shutdown: Arc::new(AtomicBool::new(false)),
+            journal_handle: std::thread::spawn(
+                || -> Result<CounterWriter, melin_journal::JournalError> {
+                    Err(melin_journal::JournalError::ReplicaSequenceMismatch {
+                        expected: 4,
+                        actual: 1,
+                    })
+                },
+            ),
+            matching_handle: std::thread::spawn(|| {
+                WarmApp::genesis(counter_server::Counter::default())
+            }),
+            drain_handle: std::thread::spawn(|| {}),
+            shadow_handle: None,
+        }
+    }
+
+    /// A promotion over a pipeline whose teardown fails is an error, not
+    /// a promotion of a fresh application: the stage's state is unusable.
+    /// Both ways a promotion arrives — while disconnected, and as a
+    /// session's exit.
+    #[test]
+    fn a_promotion_over_a_failed_teardown_is_an_error() {
+        let Err(err) = ReplicaEngine::Running(a_pipeline_whose_journal_died()).into_promotion()
+        else {
+            panic!("a failed teardown must not promote");
+        };
+        assert!(
+            err.to_string().contains("no local state available"),
+            "{err}"
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = at_genesis(ReplicaEngine::Running(a_pipeline_whose_journal_died()));
+        let (mut divergence_resyncs, mut backoff) = (0, MAX_BACKOFF);
+        let after = handle_session_exit::<counter_server::Counter, CounterWriter>(
+            StreamingResult {
+                exit: SessionExit::Promote,
+                heard_from_primary: true,
+            },
+            &mut state,
+            &mut divergence_resyncs,
+            &mut backoff,
+            &NodeStore::resolve(dir.path().join("r.journal"), None).expect("store"),
+            &melin_transport_core::fence::FenceState::new(0),
+            &SharedLineagePolicy::new(None),
+            &AtomicBool::new(false),
+            &crate::promotion::PromotionRequest::new(),
+            || {},
+            &(),
+            PREALLOC,
+        );
+        let AfterSession::Return(Err(err)) = after else {
+            panic!("a failed teardown must not promote");
+        };
+        assert!(
+            err.to_string().contains("pipeline failed during promotion"),
+            "{err}"
+        );
+        assert!(matches!(state.engine, ReplicaEngine::Fresh));
+    }
+
+    /// A receiver's state holding `engine` at the genesis position: for
+    /// the exit-dispatch tests, which read the position only to log it.
+    fn at_genesis<A: Application, W: Send + 'static>(
+        engine: ReplicaEngine<A, W>,
+    ) -> ReplicaState<A, W> {
+        ReplicaState {
+            engine,
+            position: ChainPosition::GENESIS,
+        }
     }
 
     /// Every exit ends the connection, exactly once, terminal or not:
@@ -4083,8 +5054,7 @@ mod tests {
         ];
         for (label, exit) in exits {
             let dir = tempfile::tempdir().expect("tempdir");
-            let mut pipeline: Option<ReplicaPipelineHandles<counter_server::Counter, Writer>> =
-                None;
+            let mut state = at_genesis(ReplicaEngine::<counter_server::Counter, Writer>::Fresh);
             let mut divergence_resyncs = 0u32;
             let mut backoff = MAX_BACKOFF;
             // Latched so the reconnecting exits' backoff sleep returns
@@ -4098,10 +5068,9 @@ mod tests {
                     exit: exit(),
                     heard_from_primary: true,
                 },
-                &mut pipeline,
+                &mut state,
                 &mut divergence_resyncs,
                 &mut backoff,
-                0,
                 &NodeStore::resolve(dir.path().join("r.journal"), None).expect("store"),
                 &melin_transport_core::fence::FenceState::new(0),
                 &SharedLineagePolicy::new(None),
@@ -4129,7 +5098,7 @@ mod tests {
     fn backoff_after_exit(exit: SessionExit, heard_from_primary: bool) -> std::time::Duration {
         let dir = tempfile::tempdir().expect("tempdir");
         type Writer = melin_journal::BufferedWriter<CounterEvent>;
-        let mut pipeline: Option<ReplicaPipelineHandles<counter_server::Counter, Writer>> = None;
+        let mut state = at_genesis(ReplicaEngine::<counter_server::Counter, Writer>::Fresh);
         let mut divergence_resyncs = 0u32;
         let mut backoff = MAX_BACKOFF;
         let shutdown = AtomicBool::new(true);
@@ -4139,10 +5108,9 @@ mod tests {
                 exit,
                 heard_from_primary,
             },
-            &mut pipeline,
+            &mut state,
             &mut divergence_resyncs,
             &mut backoff,
-            0,
             &NodeStore::resolve(dir.path().join("r.journal"), None).expect("store"),
             &melin_transport_core::fence::FenceState::new(0),
             &SharedLineagePolicy::new(None),
@@ -4221,12 +5189,19 @@ mod tests {
             journal_failed: Arc::new(AtomicBool::new(false)),
             pipeline_shutdown: Arc::new(AtomicBool::new(false)),
             journal_handle: std::thread::spawn(move || Writer::create(&writer_path, PREALLOC)),
-            matching_handle: std::thread::spawn(counter_server::Counter::default),
+            matching_handle: std::thread::spawn(|| {
+                WarmApp::genesis(counter_server::Counter::default())
+            }),
             drain_handle: std::thread::spawn(|| {}),
             shadow_handle: None,
         };
-        let mut pipeline: Option<ReplicaPipelineHandles<counter_server::Counter, Writer>> =
-            Some(handles);
+        let mut state = ReplicaState::<counter_server::Counter, Writer> {
+            engine: ReplicaEngine::Running(handles),
+            position: ChainPosition {
+                last_sequence: 2,
+                chain_hash: [0; 32],
+            },
+        };
         let mut divergence_resyncs = 0u32;
         let mut backoff = MAX_BACKOFF;
         let shutdown = AtomicBool::new(true);
@@ -4237,10 +5212,9 @@ mod tests {
                 exit: SessionExit::StreamGap("sequence gap: expected 3, got 5".into()),
                 heard_from_primary: true,
             },
-            &mut pipeline,
+            &mut state,
             &mut divergence_resyncs,
             &mut backoff,
-            2,
             &NodeStore::resolve(dir.path().join("r.journal"), None).expect("store"),
             &melin_transport_core::fence::FenceState::new(0),
             &SharedLineagePolicy::new(None),
@@ -4255,9 +5229,10 @@ mod tests {
             "a stream gap must reconnect, not return an error"
         );
         assert!(
-            pipeline.is_some(),
+            matches!(state.engine, ReplicaEngine::Running(_)),
             "the pipeline must survive for the reconnect"
         );
+        assert_eq!(state.position.last_sequence, 2, "the position too");
         assert!(closed, "the transport must be closed before redialing");
         assert_eq!(
             backoff,
@@ -4265,9 +5240,7 @@ mod tests {
             "backoff reset to 1s then doubled by the shared helper"
         );
         assert_eq!(divergence_resyncs, 0, "not a resync");
-        if let Some(p) = pipeline.take() {
-            let _ = teardown_replica_pipeline::<counter_server::Counter, Writer>(p);
-        }
+        state.engine.stop();
     }
 
     /// With the journal-failure latch set and the ring full — the state

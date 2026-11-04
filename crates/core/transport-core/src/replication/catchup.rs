@@ -1219,6 +1219,7 @@ mod tests {
                 ack_policy: None,
             },
             Some(2),
+            crate::dispatch::TickWatermark::GENESIS,
             snap_path,
         )
         .unwrap();
@@ -1335,6 +1336,7 @@ mod tests {
             [0; 32],
             crate::lineage::Lineage::GENESIS,
             None,
+            crate::dispatch::TickWatermark::GENESIS,
             path,
         )
         .unwrap();

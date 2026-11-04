@@ -14,7 +14,7 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use counter_server::{
     Counter, GET_VALUE_REQUEST, KIND_RESP_ACK, KIND_RESP_VALUE, RequestDecoder, ResponseEncoder,
@@ -24,7 +24,9 @@ use melin_client::{Connection, SigningKey, key};
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::server::ServerConfig;
-use melin_test_node::probe::{gauge, wait_for_gauge, wait_for_gauge_within};
+use melin_test_node::probe::{
+    gauge, wait_for_gauge, wait_for_gauge_within, wait_for_snapshot_where,
+};
 use melin_test_node::{Addrs, Node};
 use melin_transport_core::test_ports::free_addr;
 
@@ -157,20 +159,9 @@ fn increment(addr: SocketAddr, amounts: &[u64]) {
 /// its health endpoint reports it.
 fn wait_for_snapshot(health: SocketAddr, path: &Path) {
     let head = gauge(health, "melin_journal_sequence").expect("the node's sequence");
-    let deadline = Instant::now() + LIMIT;
-    loop {
-        if let Ok((_, header)) = melin_transport_core::snapshot::load::<Counter>(path)
-            && header.sequence >= head
-        {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "no snapshot at {} reached sequence {head}",
-            path.display()
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_for_snapshot_where::<Counter>(path, &format!("reached sequence {head}"), |header| {
+        header.sequence >= head
+    });
 }
 
 /// A primary given `--snapshot-path` in a directory of its own, beside a

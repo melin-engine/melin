@@ -30,11 +30,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::dispatch::{LineageEvent, dispatch};
+use crate::dispatch::{LineageEvent, TickWatermark, WarmApp, dispatch};
 use crate::lineage::{
     ForcedPolicy, ForcedPolicyReader, ForcedPolicyWriter, LineagePolicyCell, forced_policy_cell,
 };
 use crate::replica_presence::ReplicaPresence;
+use crate::shadow::ShadowFeed;
 use crate::trace::{MonoTraceInstant, mono_trace_ns};
 use melin_app::{AppEvent, Application, ApplyCtx, QueryCtx};
 use melin_journal::BufferedWriter;
@@ -2876,9 +2877,9 @@ pub struct MatchingStage<A: Application> {
     /// (including non-Tick events) advances this whenever its `slot.timestamp_ns`
     /// is newer, so the scheduler fires due tasks at every-event resolution under
     /// load. Tick events become a quiet-period safety net rather than the only
-    /// thing that moves time forward. Derived state — not snapshotted; recovery
-    /// catches up at the first replayed event with a non-zero timestamp.
-    last_drain_ns: u64,
+    /// thing that moves time forward. Starts where the state handed to the
+    /// stage is (see [`TickWatermark`]), never at a fresh zero of its own.
+    tick_watermark: TickWatermark,
     /// Wire-seq counter shadowing the journal stage's allocator. Stamped
     /// into `OutputSlot.wire_seq` so the response stage's durability gate
     /// can compare against replica metrics in the same space. Initialised
@@ -2908,10 +2909,20 @@ impl<A: Application> MatchingStage<A> {
         self.output.capacity()
     }
 
-    /// Create a new matching stage.
+    /// Test-only probe: the tick watermark the stage holds (before it
+    /// runs, the one it starts from). Gated to match its one caller,
+    /// which builds over a recovered journal and so a persisting build.
+    #[cfg(all(test, not(feature = "no-persist")))]
+    pub(crate) fn tick_watermark(&self) -> TickWatermark {
+        self.tick_watermark
+    }
+
+    /// Create a new matching stage over `app`, whose state is at the
+    /// journal position `tick_watermark` belongs to.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         app: A,
+        tick_watermark: TickWatermark,
         consumer: ring::Consumer<InputSlot<A::Event>>,
         output: ring::Producer<OutputSlot<A::Report, A::QueryResponse>>,
         events_processed: Arc<AtomicU64>,
@@ -2932,7 +2943,7 @@ impl<A: Application> MatchingStage<A> {
             fence_state,
             wait,
             utilization: Arc::new(StageUtilization::new()),
-            last_drain_ns: 0,
+            tick_watermark,
             next_wire_seq: starting_wire_seq,
             forced_policy,
             forced_policy_reader,
@@ -2957,8 +2968,10 @@ impl<A: Application> MatchingStage<A> {
     /// per event. Events are still processed sequentially — only the
     /// disruptor I/O is batched.
     ///
-    /// Returns the application on shutdown for potential snapshot saving.
-    pub fn run(mut self, shutdown: &std::sync::atomic::AtomicBool) -> A {
+    /// Returns the application on shutdown, with the tick watermark the
+    /// stage reached: a replica promoted to primary builds its primary
+    /// stages from both (see [`WarmApp`]).
+    pub fn run(mut self, shutdown: &std::sync::atomic::AtomicBool) -> WarmApp<A> {
         // Pre-allocated report buffer, reused across commands.
         // Pre-allocate with generous capacity. One event may fan out into
         // many reports (how many is the application's business). 256
@@ -2996,7 +3009,7 @@ impl<A: Application> MatchingStage<A> {
                 self.utilization.idle.store(idle_count, Ordering::Relaxed);
                 #[cfg(feature = "pipeline-stats")]
                 print_utilization("matching", busy_count, idle_count);
-                return self.app;
+                return self.into_warm_app();
             }
 
             let batch_start = self.consumer.next_read();
@@ -3120,7 +3133,7 @@ impl<A: Application> MatchingStage<A> {
                             now_ns: slot.timestamp_ns,
                             key_hash: slot.key_hash,
                         },
-                        &mut self.last_drain_ns,
+                        &mut self.tick_watermark,
                         |lineage| {
                             observe_live_lineage(
                                 &self.fence_state,
@@ -3275,8 +3288,18 @@ impl<A: Application> MatchingStage<A> {
                 self.utilization.idle.store(idle_count, Ordering::Relaxed);
                 #[cfg(feature = "pipeline-stats")]
                 print_utilization("matching", busy_count, idle_count);
-                return self.app;
+                return self.into_warm_app();
             }
+        }
+    }
+
+    /// What the stopped stage hands back: its application and the
+    /// watermark its clock step reached. One exit for both of `run`'s
+    /// returns, so neither can hand the application back without it.
+    fn into_warm_app(self) -> WarmApp<A> {
+        WarmApp {
+            app: self.app,
+            tick_watermark: self.tick_watermark,
         }
     }
 
@@ -3321,7 +3344,7 @@ impl<A: Application> MatchingStage<A> {
                     now_ns: slot.timestamp_ns,
                     key_hash: slot.key_hash,
                 },
-                &mut self.last_drain_ns,
+                &mut self.tick_watermark,
                 |lineage| {
                     observe_live_lineage(
                         &self.fence_state,
@@ -3420,7 +3443,9 @@ pub struct Pipeline<A: Application> {
     pub input_cursor: Box<dyn ring::QueueCursor>,
     pub replication_consumers: Option<(ReplicationConsumer, ReplicationConsumer)>,
     pub replicas_connected: Option<Arc<ReplicaPresence>>,
-    pub shadow_consumer: Option<ring::Consumer<InputSlot<A::Event>>>,
+    /// The shadow stage's input, starting where the matching stage does
+    /// (see [`ShadowFeed`]); `None` without a shadow.
+    pub shadow_feed: Option<ShadowFeed<A::Event>>,
     pub chain_hash_lock: Option<SeqLockReader<FsyncState>>,
     pub replication_ring_progress: Option<ReplicationRingProgress>,
     /// Journal-progress cursors, space-typed. Bundles the durable wire seq
@@ -3438,7 +3463,9 @@ pub struct ReplicaPipeline<A: Application> {
     pub journal_stage: JournalStage<A::Event>,
     pub matching_stage: MatchingStage<A>,
     pub drain_consumer: ring::Consumer<OutputSlot<A::Report, A::QueryResponse>>,
-    pub shadow_consumer: Option<ring::Consumer<InputSlot<A::Event>>>,
+    /// The shadow stage's input, starting where the matching stage does
+    /// (see [`ShadowFeed`]); `None` without a shadow.
+    pub shadow_feed: Option<ShadowFeed<A::Event>>,
     /// Journal-progress cursors, space-typed. The replica slot cursors
     /// stay disengaged (no downstream replica). Updated by `JournalStage`
     /// after each fsync. The reconnect handshake reads `chain_hash_lock`
@@ -3614,9 +3641,14 @@ impl StageWaits {
 ///
 /// When replication is disabled, the replica slot cursors stay disengaged
 /// (standalone mode) and the derived quorum view reads "no replica".
+///
+/// `tick_watermark` is that of the position `app` is at (the one its
+/// recovery handed out with it); the matching stage and the shadow both
+/// start from it.
 #[allow(clippy::too_many_arguments)]
 pub fn build_pipeline_with_replication<A>(
     app: A,
+    tick_watermark: TickWatermark,
     writer: BufferedWriter<A::Event>,
     group_commit_delay: Duration,
     active_connections: Arc<AtomicU64>,
@@ -3776,6 +3808,7 @@ where
 
     let matching_stage = MatchingStage::<A>::new(
         app,
+        tick_watermark,
         matching_consumer,
         output_producer,
         Arc::clone(&events_processed),
@@ -3795,7 +3828,7 @@ where
         input_cursor,
         replication_consumers,
         replicas_connected,
-        shadow_consumer,
+        shadow_feed: ShadowFeed::at(shadow_consumer, starting_wire_seq, tick_watermark),
         chain_hash_lock,
         replication_ring_progress,
         cursors,
@@ -3814,8 +3847,13 @@ where
 /// events) but not byte-identical (each node stamps its own wall-clock
 /// on the batch when `slot.sequence == 0`, and checkpoint timing may
 /// vary after journal rotation).
+///
+/// `tick_watermark` is that of the position `app` is at, as for
+/// [`build_pipeline_with_replication`].
+#[allow(clippy::too_many_arguments)]
 pub fn build_replica_pipeline<A>(
     app: A,
+    tick_watermark: TickWatermark,
     writer: BufferedWriter<A::Event>,
     max_journal_batch: usize,
     ring_capacity: RingCapacity,
@@ -3896,6 +3934,7 @@ where
     let active_connections = Arc::new(AtomicU64::new(0));
     let matching_stage = MatchingStage::<A>::new(
         app,
+        tick_watermark,
         matching_consumer,
         output_producer,
         Arc::clone(&events_processed),
@@ -3911,7 +3950,7 @@ where
         journal_stage,
         matching_stage,
         drain_consumer,
-        shadow_consumer,
+        shadow_feed: ShadowFeed::at(shadow_consumer, starting_wire_seq, tick_watermark),
         cursors,
         chain_hash_lock,
     }

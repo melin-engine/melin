@@ -67,7 +67,7 @@ Severity is a judgement from code reading.
 | 14 | A replica adopts its primary's epoch before it holds that epoch's entries | Medium | Confirmed |
 | 15 | Promotion can drop a rotation boundary | Medium | Confirmed |
 | 16 | A torn, never-acknowledged final entry can block startup | Medium | Reproduced (fixed) |
-| 17 | The tick contract is untested and has no working example | Medium | Confirmed |
+| 17 | The tick contract is untested and has no working example | Medium | Confirmed (partially fixed: the watermark is carried across restart, snapshot restore, resync and promotion; the double call per journaled `Tick`, which can hand the application a time behind the watermark, and the tick-driven example remain) |
 | 18 | A ServerBusy reply can overtake replies to earlier requests | Medium | Confirmed (fixed) |
 | 19 | Recovery trusts the page cache after a failed fsync | Medium | Reported |
 | 20 | A failed directory fsync after rotation does not hold back acks | Medium | Confirmed |
