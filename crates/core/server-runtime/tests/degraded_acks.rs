@@ -43,7 +43,10 @@ use counter_server::{
 use melin_client::{Ack, Error, Frame};
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_test_node::Node;
-use melin_test_node::probe::{gauge, wait_for_gauge};
+use melin_test_node::probe::{
+    PROBE_LIMIT, gauge, journal_head, replica_acked_sequences, wait_for_gauge,
+    wait_for_replica_acks,
+};
 
 use halt_cluster::{Fixture, addrs, spawn_node};
 use proxy::Proxy;
@@ -204,14 +207,34 @@ fn run(policy: AckPolicy, scenario: Scenario) {
 
     // --- At load: two connections of pipelined writes. ---
     let stop = Arc::new(AtomicBool::new(false));
+    let before_load = journal_head(health);
     let writers: Vec<_> = (0..2)
         .map(|_| writer(&fx, &primary, Arc::clone(&stop)))
         .collect();
-    std::thread::sleep(Duration::from_millis(300));
+    // Under way: the replica has acked a write past the probe.
+    wait_for_replica_acks(health, before_load + 1, 1);
 
     // --- The link goes silent: the writes in flight stay unconfirmed. ---
     proxy.freeze();
-    std::thread::sleep(Duration::from_millis(200));
+    // Wait until the primary has journaled writes the replica has not
+    // acked. With the link silent no ack can come back for them, so they
+    // are in flight at the cut. (Fixed sleeps stood in for this and for
+    // the wait above; a host too loaded to run the writers in time left
+    // nothing in flight.)
+    let deadline = Instant::now() + PROBE_LIMIT;
+    loop {
+        let acked = replica_acked_sequences(health).into_iter().flatten().max();
+        let head = journal_head(health);
+        if acked.is_some_and(|acked| head > acked) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no write was left unacked under the frozen link within {PROBE_LIMIT:?} \
+             (journaled through {head}, acked through {acked:?})"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 
     // --- Then it breaks: the primary halts. ---
     proxy.cut();
