@@ -24,7 +24,7 @@ use super::receiver_transport::{
     ControlFrameSource, ReceiverTransport, SessionExit, streaming_loop,
 };
 use super::{
-    ReplicaPipelineHandles, ResumePoint, ResyncDecision, StreamStartVerdict,
+    IdleEngine, ReplicaPipelineHandles, ResumePoint, ResyncDecision, StreamStartVerdict,
     build_replica_pipeline_with_threads, handle_resync_verdict, handle_session_exit,
     journal_failed_while_disconnected, recover_replica_state, sleep_then_double_backoff,
     take_pipeline_for_promotion, teardown_replica_pipeline,
@@ -594,12 +594,12 @@ where
         pipeline_healthy,
     } = control;
     // Recover whenever any journal segment survives — live OR archived;
-    // fresh replicas get `(None, None, 0, zeros)`. See
-    // `recover_replica_state` for the lineage rules. `app` pairs the
-    // application with the tick watermark of its position, in one
+    // fresh replicas get `(None, 0, zeros)`. See `recover_replica_state`
+    // for the lineage rules. `engine` holds the application, with the
+    // tick watermark of its position, and its journal writer, in one
     // `Option`, so nothing that replaces the state can keep the old
-    // state's watermark.
-    let (mut app, mut journal_writer, mut last_sequence, mut chain_hash) =
+    // state's watermark or writer.
+    let (mut engine, mut last_sequence, mut chain_hash) =
         recover_replica_state::<A, BufferedWriter<A::Event>>(
             store,
             &fence_state,
@@ -670,12 +670,7 @@ where
                     );
                     // A fatal exit never keeps the pipeline, so going
                     // round again dials only after a resync or not at all.
-                    if let Some(r) = after.adopt(
-                        &mut app,
-                        &mut journal_writer,
-                        &mut last_sequence,
-                        &mut chain_hash,
-                    ) {
+                    if let Some(r) = after.adopt(&mut engine, &mut last_sequence, &mut chain_hash) {
                         return r;
                     }
                     continue;
@@ -695,7 +690,7 @@ where
         }
         if promote.is_requested() {
             info!("promotion triggered while disconnected");
-            return take_pipeline_for_promotion(&mut pipeline, &mut app, &mut journal_writer);
+            return take_pipeline_for_promotion(&mut pipeline, &mut engine);
         }
 
         // --- Connect and authenticate ---
@@ -809,7 +804,7 @@ where
                 },
                 "tcp",
                 &pipeline,
-                &mut journal_writer,
+                &mut engine,
                 &fence_state,
                 control,
             )? {
@@ -836,8 +831,7 @@ where
                         reader: &mut reader,
                     },
                     &mut pipeline,
-                    &mut app,
-                    &mut journal_writer,
+                    &mut engine,
                     store,
                     &fence_state,
                     control,
@@ -871,40 +865,14 @@ where
             }
         };
 
-        // --- Create journal for fresh replica ---
-        // The StreamStart lineage gives the segment header identity
-        // (starting sequence + chain anchor) the primary's own journal
-        // lineage began with; creating the local segment from the same
-        // identity makes the replica's segment byte-identical to the
-        // primary's, and adopted `Rotate` boundaries keep it that way
-        // across rotations (bitwise mirror). The header records the
-        // lineage's genesis length too, so it survives this replica's
-        // restarts and is there to check at promotion even with the
-        // primary gone.
-        if pipeline.is_none() && journal_writer.is_none() {
-            let (lineage_start, lineage_anchor, lineage_genesis) = stream_lineage;
-            let writer = BufferedWriter::create_continuing(
-                store.journal(),
-                lineage_start,
-                lineage_anchor,
-                lineage_genesis,
-                prealloc,
-            )?;
-            app = Some(WarmApp::genesis(A::default()));
-            journal_writer = Some(writer);
-        }
-
         // --- Build pipeline if absent ---
+        // Over the engine held, or for a fresh replica over a journal
+        // created from the StreamStart lineage (see `take_or_create`).
         if pipeline.is_none() {
-            let WarmApp {
-                app: cur_app,
-                tick_watermark,
-            } = app.take().expect("application initialized");
-            let cur_writer = journal_writer.take().expect("journal_writer initialized");
+            let held =
+                IdleEngine::take_or_create(&mut engine, store.journal(), stream_lineage, prealloc)?;
             pipeline = Some(build_replica_pipeline_with_threads::<A>(
-                cur_app,
-                tick_watermark,
-                cur_writer,
+                held,
                 cores,
                 ring_capacity,
                 staging_mode,
@@ -993,12 +961,7 @@ where
             sizing,
             prealloc,
         );
-        if let Some(r) = after.adopt(
-            &mut app,
-            &mut journal_writer,
-            &mut last_sequence,
-            &mut chain_hash,
-        ) {
+        if let Some(r) = after.adopt(&mut engine, &mut last_sequence, &mut chain_hash) {
             return r;
         }
     }
@@ -1642,12 +1605,12 @@ mod tests {
         /// A resync whose snapshot transfer drops mid-flight must retry
         /// as a fresh replica with NO leftover in-memory state. On the
         /// in-process divergence repair path `recover_replica_state`
-        /// leaves `app`/`journal_writer` populated; the resync arm
+        /// leaves the receiver's engine populated; the resync arm
         /// archives the live journal (renaming it aside) before the
-        /// transfer. If the transfer then fails and those handles are not
+        /// transfer. If the transfer then fails and the engine is not
         /// nulled, the stale writer — its backing file now under the
         /// `.divergent.<n>` archive — survives the fresh-replica create
-        /// gate (`journal_writer.is_none()` false) and is rebuilt into the
+        /// gate (an engine held, so none created) and is rebuilt into the
         /// next pipeline, so the live journal is never recreated and the
         /// new session streams onto an archived-away inode. This pins the
         /// fix (mirrors the DPDK receiver): after the failed transfer the
@@ -1759,7 +1722,7 @@ mod tests {
             // --- Session 1: fresh sync, event 1, poisoned rotation —
             // the journal stage detects divergence and the receiver
             // repairs in-process (`recover_replica_state` repopulates
-            // `app`/`journal_writer`).
+            // the engine).
             let mut buf = Vec::new();
             let mut s1 = accept_within(&listener, 30);
             let mut s1r = s1.try_clone().expect("clone");
@@ -2054,16 +2017,14 @@ mod tests {
         fn promotion_hands_back_local_state_when_present() {
             let dir = tempfile::tempdir().unwrap();
             let mut pipeline: Option<PromoteHandles> = None;
-            let mut app = Some(WarmApp::genesis(App));
-            let mut journal_writer = Some(
-                BufferedWriter::<EvtAdd>::create(&dir.path().join("p.journal"), PREALLOC).unwrap(),
-            );
+            let mut engine = Some(crate::replication::IdleEngine {
+                warm: WarmApp::genesis(App),
+                writer: BufferedWriter::<EvtAdd>::create(&dir.path().join("p.journal"), PREALLOC)
+                    .unwrap(),
+            });
 
-            let result = crate::replication::take_pipeline_for_promotion(
-                &mut pipeline,
-                &mut app,
-                &mut journal_writer,
-            );
+            let result =
+                crate::replication::take_pipeline_for_promotion(&mut pipeline, &mut engine);
 
             assert!(
                 matches!(
@@ -2078,23 +2039,17 @@ mod tests {
                 ),
                 "warm state must be promoted, with the watermark it was held with"
             );
-            assert!(
-                app.is_none() && journal_writer.is_none(),
-                "state must be moved into the result"
-            );
+            assert!(engine.is_none(), "state must be moved into the result");
         }
 
         #[test]
         fn promotion_errs_when_no_local_state() {
             let mut pipeline: Option<PromoteHandles> = None;
-            let mut app: Option<WarmApp<App>> = None;
-            let mut journal_writer: Option<BufferedWriter<EvtAdd>> = None;
+            let mut engine: Option<crate::replication::IdleEngine<App, BufferedWriter<EvtAdd>>> =
+                None;
 
-            let result = crate::replication::take_pipeline_for_promotion(
-                &mut pipeline,
-                &mut app,
-                &mut journal_writer,
-            );
+            let result =
+                crate::replication::take_pipeline_for_promotion(&mut pipeline, &mut engine);
 
             // Not `expect_err` — the Ok payload (App) isn't `Debug`.
             let err = match result {
@@ -2105,22 +2060,6 @@ mod tests {
                 err.to_string().contains("no local state available"),
                 "{err}"
             );
-        }
-
-        #[test]
-        fn promotion_errs_on_partial_state() {
-            // Application present, writer missing — not a usable hand-off.
-            let mut pipeline: Option<PromoteHandles> = None;
-            let mut app = Some(WarmApp::genesis(App));
-            let mut journal_writer: Option<BufferedWriter<EvtAdd>> = None;
-
-            let result = crate::replication::take_pipeline_for_promotion(
-                &mut pipeline,
-                &mut app,
-                &mut journal_writer,
-            );
-
-            assert!(result.is_err(), "partial state is not a valid promotion");
         }
     }
 

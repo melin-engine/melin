@@ -16,7 +16,6 @@ use tracing::{debug, error, info, warn};
 use melin_app::Application;
 use melin_journal::BufferedWriter;
 use melin_journal::replication::ReplicationConsumer;
-use melin_transport_core::WarmApp;
 
 use super::auth::{
     AuthChallenge, AuthOutcome, AuthTransport, PolledAuthStream, authenticate_with_primary,
@@ -31,11 +30,11 @@ use super::receiver_transport::{
 };
 use super::validation_worker::ValidationWorker;
 use super::{
-    ReceiverResult, ReplicaCursors, ReplicaPipelineHandles, ReplicationMetrics, ResumePoint,
-    ResyncDecision, SentHighWater, StreamStartVerdict, build_replica_pipeline_with_threads,
-    handle_resync_verdict, handle_session_exit, journal_failed_while_disconnected,
-    recover_replica_state, sleep_then_double_backoff, take_pipeline_for_promotion,
-    teardown_replica_pipeline,
+    IdleEngine, ReceiverResult, ReplicaCursors, ReplicaPipelineHandles, ReplicationMetrics,
+    ResumePoint, ResyncDecision, SentHighWater, StreamStartVerdict,
+    build_replica_pipeline_with_threads, handle_resync_verdict, handle_session_exit,
+    journal_failed_while_disconnected, recover_replica_state, sleep_then_double_backoff,
+    take_pipeline_for_promotion, teardown_replica_pipeline,
 };
 use melin_app::auth::AuthorizedKeys;
 use melin_transport_core::node_store::NodeStore;
@@ -1590,10 +1589,10 @@ where
     A::QueryResponse: Send + 'static,
 {
     // Recover local state from journal whenever any segment survives —
-    // live OR archived; fresh replicas get `(None, None, 0, zeros)`.
+    // live OR archived; fresh replicas get `(None, 0, zeros)`.
     // See `recover_replica_state` for the lineage rules, and the
-    // kernel-TCP receiver for why `app` carries its tick watermark.
-    let (mut app, mut journal_writer, mut last_sequence, mut chain_hash) =
+    // kernel-TCP receiver for why `engine` is one `Option`.
+    let (mut engine, mut last_sequence, mut chain_hash) =
         recover_replica_state::<A, BufferedWriter<A::Event>>(
             store,
             &fence_state,
@@ -1693,12 +1692,7 @@ where
                     );
                     // A fatal exit never keeps the pipeline, so going
                     // round again dials only after a resync or not at all.
-                    if let Some(r) = after.adopt(
-                        &mut app,
-                        &mut journal_writer,
-                        &mut last_sequence,
-                        &mut chain_hash,
-                    ) {
+                    if let Some(r) = after.adopt(&mut engine, &mut last_sequence, &mut chain_hash) {
                         return r;
                     }
                     continue;
@@ -1718,7 +1712,7 @@ where
         }
         if promote.is_requested() {
             info!("promotion triggered while disconnected");
-            return take_pipeline_for_promotion(&mut pipeline, &mut app, &mut journal_writer);
+            return take_pipeline_for_promotion(&mut pipeline, &mut engine);
         }
 
         info!(
@@ -1950,7 +1944,7 @@ where
                                 },
                                 "dpdk",
                                 &pipeline,
-                                &mut journal_writer,
+                                &mut engine,
                                 &fence_state,
                                 control,
                             ) {
@@ -1983,8 +1977,7 @@ where
                                     shutdown,
                                 },
                                 &mut pipeline,
-                                &mut app,
-                                &mut journal_writer,
+                                &mut engine,
                                 store,
                                 &fence_state,
                                 control,
@@ -2038,64 +2031,32 @@ where
 
         // `None` means the handshake loop exited via a failure path
         // (disconnect or snapshot error) — reconnect.
-        let Some((lineage_start, lineage_anchor, lineage_genesis)) = stream_lineage else {
+        let Some(stream_lineage) = stream_lineage else {
             continue;
         };
 
-        // Create journal for fresh replica (first connection only).
+        // --- Build pipeline if absent ---
         //
-        // Gate on `pipeline.is_none()` rather than `journal_writer.is_none()`:
-        // the writer is moved into the pipeline on first connect and never
-        // returned, so on every subsequent reconnect `journal_writer` is
-        // `None` even though a live writer is still mid-stream inside the
-        // pipeline. `pipeline.is_none()` distinguishes "true first connect or
-        // post-snapshot rebuild" from "reconnect against an existing
-        // pipeline" — the latter must not recreate the journal file.
-        //
-        // The StreamStart lineage carries the segment header identity
-        // (starting sequence + chain anchor); creating the local segment
-        // from the same identity makes the replica's segment
-        // byte-identical to the primary's, and adopted `Rotate`
-        // boundaries keep it that way across rotations (bitwise mirror).
-        // The header records the lineage's genesis length too, for the
-        // promotion check (see the kernel-TCP receiver).
-        if pipeline.is_none() && journal_writer.is_none() {
-            let writer = match BufferedWriter::create_continuing(
+        // Built once on first connect, or after a snapshot transfer tore
+        // the previous one down. On disconnect the pipeline lives, so
+        // this branch is skipped: a running pipeline owns the writer, and
+        // its journal must not be recreated. Over the engine held, or for
+        // a fresh replica over a journal created from the StreamStart
+        // lineage (see `take_or_create`).
+        if pipeline.is_none() {
+            let held = match IdleEngine::take_or_create(
+                &mut engine,
                 store.journal(),
-                lineage_start,
-                lineage_anchor,
-                lineage_genesis,
+                stream_lineage,
                 prealloc,
             ) {
-                Ok(writer) => writer,
+                Ok(held) => held,
                 Err(e) => {
                     // Leaving: tell the primary now (see `REPLICATION_LIVENESS`).
                     transport.reset(handle);
                     return Err(e.into());
                 }
             };
-            app = Some(WarmApp::genesis(A::default()));
-            journal_writer = Some(writer);
-        }
-
-        // --- Build pipeline if absent ---
-        //
-        // Built once on first connect, or after a snapshot transfer tore
-        // the previous one down. On disconnect the pipeline lives, so
-        // this branch is skipped.
-        if pipeline.is_none() {
-            // If we still have no state after all the handshake logic,
-            // reconnect — on a fresh socket, so this one is reset first
-            // (left open, it would hold a slot on the primary).
-            if app.is_none() || journal_writer.is_none() {
-                transport.reset(handle);
-                continue;
-            }
-            let WarmApp {
-                app: cur_app,
-                tick_watermark,
-            } = app.take().expect("application initialized");
-            let cur_writer = journal_writer.take().expect("journal_writer initialized");
 
             // On a post-snapshot rebuild this thread is pinned to
             // `cores.reader`, at real-time priority on an isolated core.
@@ -2109,9 +2070,7 @@ where
             }
 
             pipeline = match build_replica_pipeline_with_threads::<A>(
-                cur_app,
-                tick_watermark,
-                cur_writer,
+                held,
                 cores,
                 ring_capacity,
                 staging_mode,
@@ -2196,12 +2155,7 @@ where
             sizing,
             prealloc,
         );
-        if let Some(r) = after.adopt(
-            &mut app,
-            &mut journal_writer,
-            &mut last_sequence,
-            &mut chain_hash,
-        ) {
+        if let Some(r) = after.adopt(&mut engine, &mut last_sequence, &mut chain_hash) {
             return r;
         }
     }
