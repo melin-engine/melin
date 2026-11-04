@@ -920,6 +920,29 @@ pub(super) fn teardown_replica_pipeline<A: Application + Send + 'static, W: Send
 /// fault. Exit hard instead.
 pub(super) const MAX_INPROCESS_DIVERGENCE_RESYNCS: u32 = 1;
 
+/// A replica's state as recovered from disk by [`recover_replica_state`]:
+/// what a receiver starts from at boot, and adopts whole after an
+/// in-process divergence resync ([`AfterSession::Resync`]). One value, so
+/// neither path can take the recovered engine with an older position, or
+/// the reverse.
+pub(super) struct RecoveredReplica<A, W> {
+    /// The recovered application, with the tick watermark of its position,
+    /// and its journal writer. `None` for a fresh replica, which holds no
+    /// journal: the first session's stream start creates one.
+    pub(super) engine: Option<IdleEngine<A, W>>,
+    /// The next handshake's sequence and chain hash, read from the same
+    /// recovery; [`ChainPosition::GENESIS`] for a fresh replica.
+    pub(super) position: ChainPosition,
+}
+
+impl<A, W> RecoveredReplica<A, W> {
+    /// A replica with nothing on disk.
+    const FRESH: Self = RecoveredReplica {
+        engine: None,
+        position: ChainPosition::GENESIS,
+    };
+}
+
 /// Recover replica boot state from disk.
 ///
 /// Recovers whenever any journal segment survives — live OR archived
@@ -927,10 +950,11 @@ pub(super) const MAX_INPROCESS_DIVERGENCE_RESYNCS: u32 = 1;
 /// leaves archives with no live segment, and recovery handles that
 /// layout; treating it as a fresh replica would discard local durable
 /// history and then fail `create_new` against the surviving lineage).
-/// Returns `(None, ChainPosition::GENESIS)` for a genuinely fresh
-/// replica. The recovered application comes with the tick watermark of
-/// its position, which the pipeline built over it starts from. Also
-/// seeds the fencing epoch from the recovered journal.
+/// Returns a [`RecoveredReplica`] with no engine and the
+/// [`ChainPosition::GENESIS`] position for a genuinely fresh replica. The
+/// recovered application comes with the tick watermark of its position,
+/// which the pipeline built over it starts from. Also seeds the fencing
+/// epoch from the recovered journal.
 ///
 /// Called at receiver startup, and again after a mid-stream chain
 /// divergence tears the pipeline down: the on-disk journal is
@@ -938,7 +962,6 @@ pub(super) const MAX_INPROCESS_DIVERGENCE_RESYNCS: u32 = 1;
 /// recovery re-derives a truthful handshake [`ChainPosition`] and the
 /// next connection takes the primary's
 /// HashMismatch → archive → reseed path in-process.
-#[allow(clippy::type_complexity)]
 pub(super) fn recover_replica_state<A, W>(
     store: &NodeStore,
     fence_state: &melin_transport_core::fence::FenceState,
@@ -949,7 +972,7 @@ pub(super) fn recover_replica_state<A, W>(
     // What the recovered journal is reopened with: the node's reservation
     // (`ServerConfig::journal_prealloc`).
     prealloc: melin_journal::Prealloc,
-) -> Result<(Option<IdleEngine<A, W>>, ChainPosition), Box<dyn std::error::Error>>
+) -> Result<RecoveredReplica<A, W>, Box<dyn std::error::Error>>
 where
     A: Application,
     W: melin_journal::JournalWrite<A::Event>,
@@ -963,7 +986,7 @@ where
         // Nothing held, so no policy either (the epoch stays: fencing
         // never moves it back).
         lineage_policy.store(None);
-        return Ok((None, ChainPosition::GENESIS));
+        return Ok(RecoveredReplica::FRESH);
     }
     let engine = if snapshot_path.try_exists()? {
         tracing::info!("recovering replica from snapshot + journal");
@@ -993,7 +1016,10 @@ where
         app,
         tick_watermark,
     };
-    Ok((Some(IdleEngine { warm, writer }), position))
+    Ok(RecoveredReplica {
+        engine: Some(IdleEngine { warm, writer }),
+        position,
+    })
 }
 
 /// Adopt a lineage recovered from disk (a journal replay, or a snapshot
@@ -1029,10 +1055,7 @@ pub(in crate::replication) enum AfterSession<A, W> {
     /// on-disk state is the new handshake position. The caller adopts it
     /// and reconnects; the primary's `HashMismatch` verdict then routes
     /// the replica through archive + re-seed.
-    Resync {
-        engine: Option<IdleEngine<A, W>>,
-        position: ChainPosition,
-    },
+    Resync(RecoveredReplica<A, W>),
     /// A plain disconnect or a stream contiguity break — backoff has
     /// already been applied (and the flags checked); the caller
     /// reconnects, reusing the still-live pipeline.
@@ -1051,10 +1074,10 @@ impl<A, W> AfterSession<A, W> {
     ) -> Option<ReceiverResult<A, W>> {
         match self {
             AfterSession::Return(r) => Some(r),
-            AfterSession::Resync {
+            AfterSession::Resync(RecoveredReplica {
                 engine: recovered_engine,
                 position: recovered_position,
-            } => {
+            }) => {
                 *engine = recovered_engine;
                 *position = recovered_position;
                 None
@@ -1187,7 +1210,7 @@ where
                 sizing,
                 prealloc,
             ) {
-                Ok((engine, position)) => AfterSession::Resync { engine, position },
+                Ok(recovered) => AfterSession::Resync(recovered),
                 Err(e) => AfterSession::Return(Err(e)),
             }
         }
@@ -2112,14 +2135,15 @@ mod tests {
 
         // No lineage at all.
         std::fs::write(&staging, b"debris").expect("write staging");
-        let (engine, position) = recover_replica_state::<counter_server::Counter, Writer>(
-            &store,
-            &fence,
-            &SharedLineagePolicy::new(None),
-            &(),
-            PREALLOC,
-        )
-        .expect("recover");
+        let RecoveredReplica { engine, position } =
+            recover_replica_state::<counter_server::Counter, Writer>(
+                &store,
+                &fence,
+                &SharedLineagePolicy::new(None),
+                &(),
+                PREALLOC,
+            )
+            .expect("recover");
         assert!(engine.is_none());
         assert_eq!(position, ChainPosition::GENESIS, "a fresh replica");
         assert!(!staging.exists(), "swept without a journal");
@@ -2138,14 +2162,15 @@ mod tests {
         // creator's or fall back to the default.
         let node = melin_journal::Prealloc::for_rotation(2 * 1024 * 1024);
         assert_ne!(node, PREALLOC);
-        let (engine, position) = recover_replica_state::<counter_server::Counter, Writer>(
-            &store,
-            &fence,
-            &SharedLineagePolicy::new(None),
-            &(),
-            node,
-        )
-        .expect("recover");
+        let RecoveredReplica { engine, position } =
+            recover_replica_state::<counter_server::Counter, Writer>(
+                &store,
+                &fence,
+                &SharedLineagePolicy::new(None),
+                &(),
+                node,
+            )
+            .expect("recover");
         let engine = engine.expect("recovered");
         assert_eq!(engine.writer.prealloc(), node);
         // The pair is the recovered journal's, read together.
@@ -2204,14 +2229,15 @@ mod tests {
             .tick_watermark();
         assert_ne!(replayed, TickWatermark::GENESIS);
 
-        let (engine, position) = recover_replica_state::<counter_server::Counter, CounterWriter>(
-            &store,
-            &melin_transport_core::fence::FenceState::new(0),
-            &SharedLineagePolicy::new(None),
-            &(),
-            PREALLOC,
-        )
-        .expect("recover");
+        let RecoveredReplica { engine, position } =
+            recover_replica_state::<counter_server::Counter, CounterWriter>(
+                &store,
+                &melin_transport_core::fence::FenceState::new(0),
+                &SharedLineagePolicy::new(None),
+                &(),
+                PREALLOC,
+            )
+            .expect("recover");
         assert_eq!(position.last_sequence, 2);
         (replayed, engine)
     }
@@ -2245,6 +2271,54 @@ mod tests {
             panic!("the locals must be promoted");
         };
         assert_eq!(warm.tick_watermark, replayed);
+    }
+
+    /// A resync's recovered state replaces the receiver's locals whole,
+    /// engine and position together, and sends the loop round again; a
+    /// plain reconnect leaves both as they were.
+    #[test]
+    fn a_resync_adopts_the_recovered_engine_and_position_together() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (replayed, recovered_engine) = recover_a_ticked_replica(dir.path());
+        let recovered_position = ChainPosition {
+            last_sequence: 2,
+            chain_hash: [7; 32],
+        };
+        let mut engine: Option<IdleEngine<counter_server::Counter, CounterWriter>> = None;
+        let mut position = ChainPosition::GENESIS;
+
+        let after = AfterSession::Resync(RecoveredReplica {
+            engine: recovered_engine,
+            position: recovered_position,
+        });
+        assert!(after.adopt(&mut engine, &mut position).is_none());
+        assert_eq!(position, recovered_position);
+        assert_eq!(
+            engine.as_ref().expect("adopted").warm.tick_watermark,
+            replayed
+        );
+
+        // A plain reconnect, with an engine held, leaves both alone.
+        let after = AfterSession::<counter_server::Counter, CounterWriter>::Reconnect;
+        assert!(after.adopt(&mut engine, &mut position).is_none());
+        assert_eq!(
+            position, recovered_position,
+            "a reconnect keeps the position"
+        );
+        assert_eq!(
+            engine
+                .as_ref()
+                .expect("a reconnect keeps the engine")
+                .warm
+                .tick_watermark,
+            replayed
+        );
+
+        // A fresh recovery (nothing on disk) replaces them too.
+        let after = AfterSession::Resync(RecoveredReplica::FRESH);
+        assert!(after.adopt(&mut engine, &mut position).is_none());
+        assert!(engine.is_none());
+        assert_eq!(position, ChainPosition::GENESIS);
     }
 
     /// [`recover_a_ticked_replica`]'s state, running in a replica

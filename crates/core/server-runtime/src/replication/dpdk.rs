@@ -30,8 +30,8 @@ use super::receiver_transport::{
 };
 use super::validation_worker::ValidationWorker;
 use super::{
-    IdleEngine, ReceiverResult, ReplicaCursors, ReplicaPipelineHandles, ReplicationMetrics,
-    ResumePoint, ResyncDecision, SentHighWater, StreamStartVerdict,
+    IdleEngine, ReceiverResult, RecoveredReplica, ReplicaCursors, ReplicaPipelineHandles,
+    ReplicationMetrics, ResumePoint, ResyncDecision, SentHighWater, StreamStartVerdict,
     build_replica_pipeline_with_threads, handle_resync_verdict, handle_session_exit,
     journal_failed_while_disconnected, recover_replica_state, sleep_then_double_backoff,
     take_pipeline_for_promotion, teardown_replica_pipeline,
@@ -1589,11 +1589,14 @@ where
     A::QueryResponse: Send + 'static,
 {
     // Recover local state from journal whenever any segment survives —
-    // live OR archived; fresh replicas get `(None, ChainPosition::GENESIS)`.
-    // See `recover_replica_state` for the lineage rules, and the
+    // live OR archived; fresh replicas get no engine and the genesis
+    // position. See `recover_replica_state` for the lineage rules, and the
     // kernel-TCP receiver for why `engine` is one `Option` and
     // `position` one value.
-    let (mut engine, mut position) = recover_replica_state::<A, BufferedWriter<A::Event>>(
+    let RecoveredReplica {
+        mut engine,
+        mut position,
+    } = recover_replica_state::<A, BufferedWriter<A::Event>>(
         store,
         &fence_state,
         &control.lineage_ack_policy,

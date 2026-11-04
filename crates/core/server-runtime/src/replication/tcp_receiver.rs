@@ -24,10 +24,10 @@ use super::receiver_transport::{
     ControlFrameSource, ReceiverTransport, SessionExit, streaming_loop,
 };
 use super::{
-    IdleEngine, ReplicaPipelineHandles, ResumePoint, ResyncDecision, StreamStartVerdict,
-    build_replica_pipeline_with_threads, handle_resync_verdict, handle_session_exit,
-    journal_failed_while_disconnected, recover_replica_state, sleep_then_double_backoff,
-    take_pipeline_for_promotion, teardown_replica_pipeline,
+    IdleEngine, RecoveredReplica, ReplicaPipelineHandles, ResumePoint, ResyncDecision,
+    StreamStartVerdict, build_replica_pipeline_with_threads, handle_resync_verdict,
+    handle_session_exit, journal_failed_while_disconnected, recover_replica_state,
+    sleep_then_double_backoff, take_pipeline_for_promotion, teardown_replica_pipeline,
 };
 use crate::uring_teardown::{DrainBackoff, wake_pending_ops};
 use melin_transport_core::replication::protocol::{
@@ -594,13 +594,17 @@ where
         pipeline_healthy,
     } = control;
     // Recover whenever any journal segment survives — live OR archived;
-    // fresh replicas get `(None, ChainPosition::GENESIS)`. See
+    // fresh replicas get no engine and the genesis position. See
     // `recover_replica_state` for the lineage rules. `engine` holds the
     // application, with the tick watermark of its position, and its
     // journal writer, in one `Option`, so nothing that replaces the state
     // can keep the old state's watermark or writer. `position` is the
     // next handshake's sequence and chain hash, likewise replaced whole.
-    let (mut engine, mut position) = recover_replica_state::<A, BufferedWriter<A::Event>>(
+    // A resync's recovery replaces both, through `AfterSession::adopt`.
+    let RecoveredReplica {
+        mut engine,
+        mut position,
+    } = recover_replica_state::<A, BufferedWriter<A::Event>>(
         store,
         &fence_state,
         lineage_ack_policy,
