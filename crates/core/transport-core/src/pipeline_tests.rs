@@ -99,10 +99,14 @@ fn drain_backoff(spins: &mut u32, start: std::time::Instant, what: &str) {
 /// on the deadline. The caller asserts, so its message can carry the
 /// state it was waiting on.
 ///
-/// For the end-to-end primary → replica tests, which observe durable
-/// progress rather than sleeping a fixed time and hoping: a fixed sleep
-/// loses the race once the rest of the suite oversubscribes the CPU.
-#[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
+/// For tests that wait on a journal stage's progress (a durable
+/// sequence, an archive on disk) rather than sleeping a fixed time and
+/// hoping: a fixed sleep, or a tight deadline, loses the race once the
+/// rest of the suite oversubscribes the CPU. Always followed by an
+/// assertion, on the result or on the state waited for (an `assert_eq!`
+/// also catches an overshoot): a wait that times out and carries on lets
+/// the test go on to act on a state it never reached.
+#[cfg(not(feature = "no-persist"))]
 fn wait_until(mut done: impl FnMut() -> bool) -> bool {
     let deadline = std::time::Instant::now() + DRAIN_TIMEOUT;
     while !done() {
@@ -969,21 +973,21 @@ fn allocator_wire_seq_and_gate_cursor_agree_across_rotation() {
     // segment (last_seq is published post-fsync) so the rotation
     // boundary genuinely splits the stream. Polled — fixed sleeps
     // flake on slow CI machines.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while last_seq.load().get() < 4 && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    assert!(
+        wait_until(|| last_seq.load().get() >= 4),
+        "pre-rotation events never durable: through {}",
+        last_seq.load().get()
+    );
     rotate_flag.store(true, Ordering::Release);
 
     // Post-rotation phase. The rotation itself must consume no
     // sequence: 5 and 6.
     publish(JournalEvent::App(TestEvent::Add(50)));
     let archive_path = std::path::PathBuf::from(format!("{}.000001", path.display()));
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !archive_path.exists() && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert!(archive_path.exists(), "rotation did not produce an archive");
+    assert!(
+        wait_until(|| archive_path.exists()),
+        "rotation did not produce an archive"
+    );
     publish(JournalEvent::App(TestEvent::Add(1000)));
 
     // Drain one output slot per input event and pin the stamped wire
@@ -1012,10 +1016,7 @@ fn allocator_wire_seq_and_gate_cursor_agree_across_rotation() {
     // publish runs on the journal thread), then assert equality — an
     // allocator running ahead of wire space overshoots and fails
     // immediately rather than timing out.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while last_seq.load().get() < MAX_WIRE_SEQ && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    wait_until(|| last_seq.load().get() >= MAX_WIRE_SEQ);
     assert_eq!(
         last_seq.load().get(),
         MAX_WIRE_SEQ,
@@ -1126,20 +1127,18 @@ fn recovery_resumes_allocator_wire_and_gate_agreement() {
         for n in 1..=3u64 {
             input_producer.publish(make_slot(JournalEvent::App(TestEvent::Add(n))));
         }
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while last_seq.load().get() < 3 && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        assert!(
+            wait_until(|| last_seq.load().get() >= 3),
+            "pre-rotation events never durable: through {}",
+            last_seq.load().get()
+        );
         rotate_flag.store(true, Ordering::Release);
         // An ack-policy change in the segment recovery replays: it must
         // take its sequence on both sides of the restart.
         input_producer.publish(make_slot(ack_policy_change(1, false)));
         input_producer.publish(make_slot(JournalEvent::App(TestEvent::Add(4))));
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while last_seq.load().get() < 5 && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        wait_until(|| last_seq.load().get() >= 5);
         assert_eq!(last_seq.load().get(), 5, "phase 1 fsync");
 
         shutdown.store(true, Ordering::Relaxed);
@@ -1217,10 +1216,7 @@ fn recovery_resumes_allocator_wire_and_gate_agreement() {
          with no gap or overlap"
     );
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while last_seq.load().get() < 8 && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    wait_until(|| last_seq.load().get() >= 8);
     assert_eq!(
         last_seq.load().get(),
         8,
@@ -1510,19 +1506,19 @@ fn replica_ack_cursor_tracks_primary_sequences_across_local_rotation() {
     for seq in 1..=3u64 {
         input_producer.publish(add_slot_with_seq(seq * 10, seq, 1_000_000_000 + seq));
     }
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while last_seq.load().get() < 3 && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    assert!(
+        wait_until(|| last_seq.load().get() >= 3),
+        "pre-rotation events never durable: through {}",
+        last_seq.load().get()
+    );
     rotate_flag.store(true, Ordering::Release);
 
     input_producer.publish(add_slot_with_seq(40, 4, 1_000_000_004));
     let archive_path = std::path::PathBuf::from(format!("{}.000001", path.display()));
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !archive_path.exists() && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert!(archive_path.exists(), "rotation did not produce an archive");
+    assert!(
+        wait_until(|| archive_path.exists()),
+        "rotation did not produce an archive"
+    );
     // A primary-stamped ack-policy change, then one more event: the
     // replica journals the change under the primary's sequence too.
     input_producer.publish(InputSlot {
@@ -1535,10 +1531,7 @@ fn replica_ack_cursor_tracks_primary_sequences_across_local_rotation() {
     // primary-stamped sequence. Overshoot means a replica-local entry
     // consumed a sequence — the replica would ack events the primary
     // never sent.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while last_seq.load().get() < 6 && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    wait_until(|| last_seq.load().get() >= 6);
     assert_eq!(
         last_seq.load().get(),
         6,
@@ -2429,17 +2422,14 @@ fn journal_stage_rotates_on_manual_request() {
     // the archive captures them. Polled rather than fixed-sleep so a
     // slow CI machine doesn't intermittently rotate early.
     let archive_path = std::path::PathBuf::from(format!("{}.000001", path.display()));
-    let pre_size_path = path.clone();
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while std::time::Instant::now() < deadline
-        && (!pre_size_path.exists()
-            || std::fs::metadata(&pre_size_path)
-                .map(|m| m.len())
-                .unwrap_or(0)
-                < 4096)
-    {
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    // A live segment that does not exist yet, or whose size cannot be
+    // read, is simply not there yet: keep waiting.
+    let live_len = || std::fs::metadata(&path).map_or(0, |m| m.len());
+    assert!(
+        wait_until(|| live_len() >= 4096),
+        "phase-1 events never reached the live segment: {} bytes",
+        live_len()
+    );
 
     rotate_flag.store(true, Ordering::Release);
 
@@ -2447,12 +2437,8 @@ fn journal_stage_rotates_on_manual_request() {
     // stage past a `maybe_rotate` boundary.
     publish_add(50);
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !archive_path.exists() && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
-    }
     assert!(
-        archive_path.exists(),
+        wait_until(|| archive_path.exists()),
         "archive {} should exist after manual rotation",
         archive_path.display()
     );
@@ -2785,11 +2771,10 @@ fn barrier_fsync_state_pair_is_self_consistent_for_the_shadow() {
             );
         })
         .unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while !snap_path.exists() && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    assert!(snap_path.exists(), "the aligned shadow must snapshot");
+    assert!(
+        wait_until(|| snap_path.exists()),
+        "the aligned shadow must snapshot"
+    );
     let (restored, header) = snapshot::load::<TestApp>(&snap_path).unwrap();
     assert_eq!(
         restored.total, 3,
@@ -3417,14 +3402,10 @@ fn primary_emits_chain_check_every_interval() {
     let total = u64::from(interval) + 6;
     for seq in 1..=total {
         producer.publish(add_slot(seq, 1_000_000_000 + seq));
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while fsync_state.load().journal_seq.get() < seq {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "fsync of seq {seq} never landed"
-            );
-            std::hint::spin_loop();
-        }
+        assert!(
+            wait_until(|| fsync_state.load().journal_seq.get() >= seq),
+            "fsync of seq {seq} never landed"
+        );
     }
     let chain_at_check = {
         // The check is emitted at the `interval`th batch boundary, which
@@ -3966,16 +3947,13 @@ fn journal_stage_rotates_on_size_threshold() {
     });
 
     let archive_path = std::path::PathBuf::from(format!("{}.000001", path.display()));
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !archive_path.exists() && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let rotated = wait_until(|| archive_path.exists());
 
     shutdown.store(true, Ordering::Relaxed);
     let _ = handle.join().unwrap();
 
     assert!(
-        archive_path.exists(),
+        rotated,
         "size-threshold rotation should have produced {}",
         archive_path.display()
     );
@@ -4425,6 +4403,10 @@ fn rotate_storm_collapses_to_single_rotation() {
         /* max_journal_bytes */ 0,
         Some(Arc::clone(&rotate_flag)),
     );
+    let (fsync_writer, fsync) =
+        melin_pipeline::seqlock::split(crate::pipeline::FsyncState::default());
+    stage.set_chain_hash_lock(fsync_writer);
+    let durable_through = |seq: u64| wait_until(|| fsync.load().journal_seq.get() >= seq);
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let s = Arc::clone(&shutdown);
@@ -4446,7 +4428,9 @@ fn rotate_storm_collapses_to_single_rotation() {
     };
 
     publish(1);
-    std::thread::sleep(Duration::from_millis(100));
+    // Synced, so the live segment the storm rotates is not empty (an
+    // empty-live rotation is skipped, and the flag with it).
+    assert!(durable_through(1), "event 1 never durable");
 
     // Storm of 100 rapid sets while the stage is idle — only the next
     // fsync gets to observe-and-clear the flag.
@@ -4459,17 +4443,19 @@ fn rotate_storm_collapses_to_single_rotation() {
     publish(2);
 
     let archive_001 = std::path::PathBuf::from(format!("{}.000001", path.display()));
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !archive_001.exists() && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let rotated = wait_until(|| archive_001.exists());
+    // Synced by the running stage, which checks the flag at that fsync,
+    // so a second rotation would show here. (Slept for before, and a
+    // stage too slow to reach it left event 3 to the shutdown drain,
+    // which never checks the flag, so the test passed without testing.)
     publish(3);
-    std::thread::sleep(Duration::from_millis(200));
+    let synced = durable_through(3);
 
     shutdown.store(true, Ordering::Relaxed);
     let _ = handle.join().unwrap();
 
-    assert!(archive_001.exists(), ".000001 must exist");
+    assert!(rotated, ".000001 must exist");
+    assert!(synced, "event 3 never durable");
     let archive_002 = std::path::PathBuf::from(format!("{}.000002", path.display()));
     assert!(
         !archive_002.exists(),
@@ -4536,11 +4522,10 @@ fn post_rotation_events_land_in_live_not_archive() {
     rotate_flag.store(true, Ordering::Release);
     let archive_001 = std::path::PathBuf::from(format!("{}.000001", path.display()));
     publish(&mut producer, 9_999);
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !archive_001.exists() && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert!(archive_001.exists(), "archive must be created by rotation");
+    assert!(
+        wait_until(|| archive_001.exists()),
+        "archive must be created by rotation"
+    );
 
     // Phase 2 — fresh burst after rotation. Must land in the new live
     // segment, not the archived one.
@@ -4731,10 +4716,7 @@ fn stats_query_reports_durable_wire_seq_across_recovery() {
         // Wait for the fsync to land before querying: the durable cursor
         // then sits at exactly 5 and cannot move (queries are never
         // journaled), so the assertion below is race-free.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while last_seq.load().get() < 5 && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        wait_until(|| last_seq.load().get() >= 5);
         assert_eq!(last_seq.load().get(), 5, "phase 1 fsync");
 
         input_producer.publish(slot(JournalEvent::App(TestEvent::Query)));
@@ -5173,10 +5155,7 @@ fn a_repeated_request_reaches_apply_on_live_replay_and_shadow() {
             drain_backoff(&mut spins, drain_start, "draining outputs");
         }
     }
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while durable.load().get() < slots.len() as u64 && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    wait_until(|| durable.load().get() >= slots.len() as u64);
     assert_eq!(
         durable.load().get(),
         slots.len() as u64,
