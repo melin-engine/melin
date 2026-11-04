@@ -1252,6 +1252,25 @@ mod tests {
             decode_replica_message(&payload).expect("decodable replica frame")
         }
 
+        /// Raise `shutdown` and wait, bounded, for the receiver thread to
+        /// exit, which it must do cleanly.
+        pub(super) fn stop_receiver(
+            replica: std::thread::JoinHandle<Result<bool, String>>,
+            shutdown: &std::sync::atomic::AtomicBool,
+        ) {
+            shutdown.store(true, Ordering::Relaxed);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !replica.is_finished() {
+                assert!(
+                    Instant::now() < deadline,
+                    "receiver did not exit after shutdown"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let result = replica.join().expect("replica thread panicked");
+            assert_eq!(result, Ok(true), "receiver must exit cleanly via shutdown");
+        }
+
         /// Skip frames until an `Ack` at or past `seq` arrives.
         pub(super) fn wait_for_ack(stream: &mut TcpStream, seq: u64) {
             loop {
@@ -2217,17 +2236,7 @@ mod tests {
             // timing just targets the arm that historically leaked.)
             std::thread::sleep(Duration::from_millis(1500));
 
-            shutdown.store(true, Ordering::Relaxed);
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while !replica.is_finished() {
-                assert!(
-                    Instant::now() < deadline,
-                    "receiver did not exit after shutdown"
-                );
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            let result = replica.join().expect("replica thread panicked");
-            assert_eq!(result, Ok(true), "receiver must exit cleanly via shutdown");
+            stop_receiver(replica, &shutdown);
 
             // The stage threads are named at spawn, and a leaked stage
             // spins forever — absence within the deadline proves the
@@ -2371,20 +2380,6 @@ mod tests {
             stream.write_all(&buf).expect("InputBatch");
         }
 
-        fn stop(replica: std::thread::JoinHandle<Result<bool, String>>, shutdown: &AtomicBool) {
-            shutdown.store(true, Ordering::Relaxed);
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while !replica.is_finished() {
-                assert!(
-                    Instant::now() < deadline,
-                    "receiver did not exit after shutdown"
-                );
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            let result = replica.join().expect("replica thread panicked");
-            assert_eq!(result, Ok(true), "receiver must exit cleanly via shutdown");
-        }
-
         /// A session ends on a stream gap with two received entries still
         /// unwritten: the group-commit delay holds them past the reconnect
         /// backoff. The next handshake claims them, once written, rather
@@ -2427,7 +2422,7 @@ mod tests {
             // Streaming again, so shutdown finds the receiver in a session
             // rather than waiting on the primary's answer.
             stream_start(&mut s2, h2.last_sequence, lineage);
-            stop(replica, &shutdown);
+            stop_receiver(replica, &shutdown);
         }
 
         /// A failed snapshot transfer backs off before redialing, and the
@@ -2472,7 +2467,7 @@ mod tests {
             let (mut s2, _s2r, h2) = next_handshake(&listener);
             assert_eq!(h2.last_sequence, 0, "retry handshakes as fresh");
             stream_start(&mut s2, 0, lineage);
-            stop(replica, &shutdown);
+            stop_receiver(replica, &shutdown);
         }
 
         /// The journal stage dies after a session has ended, while the
@@ -2535,7 +2530,7 @@ mod tests {
             stream_start(&mut s2, h2.last_sequence, lineage);
             send_entries(&mut s2, &[2]);
             wait_for_ack(&mut s2, 2);
-            stop(replica, &shutdown);
+            stop_receiver(replica, &shutdown);
         }
 
         /// A replica built over a journal that already holds an entry
@@ -2573,7 +2568,7 @@ mod tests {
             );
             // Streaming again, so shutdown finds the receiver in a session.
             stream_start(&mut s2, h2.last_sequence, lineage);
-            stop(replica, &shutdown);
+            stop_receiver(replica, &shutdown);
         }
 
         /// The audit's scenario end to end: an entry damaged on the way
@@ -2638,7 +2633,7 @@ mod tests {
             stream_start(&mut s2, 1, lineage);
             send_entries(&mut s2, &[2]);
             wait_for_ack(&mut s2, 2);
-            stop(replica, &shutdown);
+            stop_receiver(replica, &shutdown);
 
             let mut reader =
                 melin_journal::JournalReader::<EvtAdd>::open(&dir.path().join("replica.journal"))
@@ -2691,7 +2686,7 @@ mod tests {
             send_entries(&mut s1, &[1, 2]);
             wait_for_ack(&mut s1, 2);
             assert_eq!(replica_genesis(dir.path()), Some(3), "learned at creation");
-            stop(replica, &shutdown);
+            stop_receiver(replica, &shutdown);
 
             let shutdown = Arc::new(AtomicBool::new(false));
             let replica = spawn_replica(dir.path(), addr, Duration::ZERO, &shutdown);
@@ -2700,7 +2695,7 @@ mod tests {
             stream_start(&mut s2, 2, lineage);
             send_entries(&mut s2, &[3]);
             wait_for_ack(&mut s2, 3);
-            stop(replica, &shutdown);
+            stop_receiver(replica, &shutdown);
             assert_eq!(
                 replica_genesis(dir.path()),
                 Some(3),
@@ -2746,7 +2741,7 @@ mod tests {
             stream_start(&mut s1, 0, lineage);
             send_entries(&mut s1, &[1, 2]);
             wait_for_ack(&mut s1, 2);
-            stop(replica, &shutdown);
+            stop_receiver(replica, &shutdown);
             assert_eq!(replica_genesis(dir.path()), Some(3));
         }
 
