@@ -95,6 +95,27 @@ fn drain_backoff(spins: &mut u32, start: std::time::Instant, what: &str) {
     }
 }
 
+/// Poll `done` for up to [`DRAIN_TIMEOUT`]: `true` once it held, `false`
+/// on the deadline. The caller asserts, so its message can carry the
+/// state it was waiting on.
+///
+/// For the end-to-end primary → replica tests, which observe durable
+/// progress rather than sleeping a fixed time and hoping: a fixed sleep
+/// loses the race once the rest of the suite oversubscribes the CPU.
+#[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
+fn wait_until(mut done: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + DRAIN_TIMEOUT;
+    while !done() {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        // Sleep rather than spin: the stage and relay threads are
+        // already spinning, and this one has nothing to add.
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    true
+}
+
 /// A standalone durable-wire-seq handle for matching-stage-only tests
 /// (nothing publishes into it; the stage reads it once per batch).
 fn dummy_durable_cursor() -> DurableWireSeqCursor {
@@ -2154,6 +2175,11 @@ fn primary_and_replica_journals_contiguous_and_chain_identical() {
         false,
         Arc::new(crate::fence::FenceState::new(0)),
     );
+    // Durable-progress readers on both nodes: the test waits on what
+    // each journal stage has actually synced, never on a fixed sleep.
+    let (p_fsync_writer, p_fsync) =
+        melin_pipeline::seqlock::split(crate::pipeline::FsyncState::default());
+    primary.journal_stage.set_chain_hash_lock(p_fsync_writer);
 
     // -------- replica --------
     let replica_writer =
@@ -2173,6 +2199,9 @@ fn primary_and_replica_journals_contiguous_and_chain_identical() {
     replica
         .journal_stage
         .set_stream_marks(Arc::clone(&stream_marks));
+    let (r_fsync_writer, r_fsync) =
+        melin_pipeline::seqlock::split(crate::pipeline::FsyncState::default());
+    replica.journal_stage.set_chain_hash_lock(r_fsync_writer);
 
     // Mark a replica as connected so the primary's journal stage
     // actually publishes to the replication ring.
@@ -2250,18 +2279,32 @@ fn primary_and_replica_journals_contiguous_and_chain_identical() {
             .publish(add_slot(i + 1, 1_000_000_000 + i));
     }
 
-    std::thread::sleep(Duration::from_millis(3000));
+    // Each user event takes one journal sequence, so a journal has
+    // synced every event once its durable sequence reaches `total`. A
+    // fixed sleep here lost the race under the full suite's load: the
+    // replica was stopped with events still in flight.
+    assert!(
+        wait_until(|| p_fsync.load().journal_seq.get() >= total),
+        "timed out waiting for the primary to sync all {total} events: synced through seq {}",
+        p_fsync.load().journal_seq.get(),
+    );
 
     primary_shutdown.store(true, Ordering::Relaxed);
     let primary_journal_result = t_p_journal.join().unwrap();
     let _ = t_p_matching.join().unwrap();
+    // The relay exits only once the primary's ring is empty, so after
+    // the join every frame is on the replica's side.
     relay_shutdown.store(true, Ordering::Relaxed);
     let chain_checks_relayed = t_relay.join().unwrap();
     assert!(
         chain_checks_relayed > 0,
         "the run must carry at least one chain check to the replica"
     );
-    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        wait_until(|| r_fsync.load().journal_seq.get() >= total),
+        "timed out waiting for the replica to sync all {total} events: synced through seq {}",
+        r_fsync.load().journal_seq.get(),
+    );
     replica_shutdown.store(true, Ordering::Relaxed);
     let replica_journal_result = t_r_journal.join().unwrap();
     let _ = t_r_matching.join().unwrap();
@@ -3559,21 +3602,6 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
     // queued writes the tail into the wrong segment. A fixed sleep is
     // exactly that race: with the rest of the suite alongside on four
     // CPUs the replica lost it often enough to fail CI.
-    /// Poll `done` for up to 30 s: `true` once it held, `false` on the
-    /// deadline. The caller asserts, so its message can carry the state
-    /// it was waiting on.
-    fn wait_until(mut done: impl FnMut() -> bool) -> bool {
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while !done() {
-            if std::time::Instant::now() >= deadline {
-                return false;
-            }
-            // Yield rather than spin: seven stage/relay threads are
-            // already spinning, and this one has nothing to add.
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        true
-    }
     let primary_durable = |seq: u64| p_fsync.load().journal_seq.get() >= seq;
     let primary_rotations = || p_util.rotations_sync_fallback.load(Ordering::Relaxed);
 
