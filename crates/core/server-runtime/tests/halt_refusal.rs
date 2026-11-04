@@ -27,7 +27,7 @@ mod halt_cluster;
 mod raw_replica;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use counter_server::{
@@ -37,7 +37,7 @@ use counter_server::{
 use melin_client::{Ack, Connection, Error, Frame};
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::server::ServerConfig;
-use melin_test_node::probe::{gauge, wait_for_gauge, wait_for_gauge_where};
+use melin_test_node::probe::{PROBE_LIMIT, gauge, wait_for_gauge, wait_for_gauge_where};
 
 use halt_cluster::{Fixture, addrs, spawn_node};
 use raw_replica::RawReplica;
@@ -237,10 +237,13 @@ fn a_refusal_overtakes_a_held_write() {
 /// every reply to it. Returns how many requests were answered, and the
 /// error that ended the stream, if one did. A node that leaves a request
 /// unanswered past the client's read timeout ends it with `NoReply`.
+/// `bursts` counts the bursts answered in full as they are, so the test
+/// can wait on the writer's progress rather than sleep and assume it.
 fn pipelined_writer(
     fx: &Fixture,
     node: &melin_test_node::Node,
     stop: Arc<AtomicBool>,
+    bursts: Arc<AtomicU64>,
 ) -> std::thread::JoinHandle<(u64, Option<String>)> {
     const BURST: usize = 32;
     let mut conn = fx.client(node);
@@ -273,6 +276,7 @@ fn pipelined_writer(
                 }
             }
             answered += BURST as u64;
+            bursts.fetch_add(1, Ordering::Release);
         }
         (answered, None)
     })
@@ -301,14 +305,28 @@ fn a_disk_primary_keeps_answering_once_its_replica_is_gone() {
     wait_for_gauge(health, "melin_replicas_connected", 1);
 
     let stop = Arc::new(AtomicBool::new(false));
+    let bursts = Arc::new(AtomicU64::new(0));
     let writers: Vec<_> = (0..2)
-        .map(|_| pipelined_writer(&fx, &primary, Arc::clone(&stop)))
+        .map(|_| pipelined_writer(&fx, &primary, Arc::clone(&stop), Arc::clone(&bursts)))
         .collect();
+    // Bursts answered in full, waited for past `beyond`. These were
+    // fixed sleeps, which on a loaded host left the premises unmet:
+    // the replica gone before any write, or the writers stopped before
+    // the halted primary had answered any.
+    let wait_for_bursts = |beyond: u64, what: &str| {
+        let deadline = Instant::now() + PROBE_LIMIT;
+        while bursts.load(Ordering::Acquire) <= beyond {
+            assert!(Instant::now() < deadline, "{what} within {PROBE_LIMIT:?}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
     // At load when the replica goes.
-    std::thread::sleep(Duration::from_millis(300));
+    wait_for_bursts(0, "no burst was answered before the replica went");
     replica.stop();
     wait_for_gauge(health, "melin_replicas_connected", 0);
-    std::thread::sleep(Duration::from_millis(200));
+    // And still answered with the replica gone.
+    let before_halt = bursts.load(Ordering::Acquire);
+    wait_for_bursts(before_halt, "no burst was answered after the replica went");
     stop.store(true, Ordering::Relaxed);
     for writer in writers {
         let (answered, error) = writer.join().expect("writer thread");
