@@ -44,10 +44,10 @@ weaknesses are elsewhere: one cost it does not see (replication ring slots),
 two statements about what happens after a divergence that do not hold
 (the halt under `disk`, which the code contradicts, and who is left
 running when the primary is the faulty node, which the plan's own
-decision 10 contradicts), and a gap (the tick trap) that will make the
-first rollout stop healthy applications for reasons other than a broken
-`apply`. A second such gap, the encode buffer's stale bytes, is now
-closed on `main` (item 1.4).
+decision 10 contradicts), and a gap (the tick trap) that would have made
+the first rollout stop healthy applications for reasons other than a
+broken `apply`. Both that gap and a second one, the encode buffer's stale
+bytes, are now closed on `main` (items 1.5 and 1.4).
 
 ## Summary, ranked by harm to an operator
 
@@ -57,12 +57,12 @@ closed on `main` (item 1.4).
 | 2 | "Under `disk` the primary keeps serving alone" is wrong: the halt applies under every policy | Correctness of the guarantee text | High | Done: plan text corrected, halt cause added to step 5 |
 | 3 | When the primary is at fault, the plan stops the healthy copies, archives their good snapshots and tells the operator to reseed them from the faulty primary | Correctness / operations | High | **Yes** |
 | 4 | Stale bytes in the shared encode buffer: resolved on `main`. What remains is keeping the zeroing and the purity check on the drain's and the shadow's encodes | Correctness | Low (residual) | Done: now in the plan's decision 4 |
-| 5 | First rollout: the only fallback from enforcement is `--no-output-digests`, which gives up detection entirely | Operations | Medium-High | Decide now |
-| 6 | The tick trap is wider than finding 7 says: replica restarts and promotions trigger it too, with no clock step back needed | Correctness caveat | Medium-High | Confirms open question 8 (b); adds a test |
+| 5 | First rollout: the only fallback from enforcement is `--no-output-digests`, which gives up detection entirely | Operations | Medium-High | Decided: no observe mode; the offline tool is the debugging path |
+| 6 | The tick trap is wider than finding 7 says: replica restarts and promotions trigger it too, with no clock step back needed | Correctness caveat | Medium-High | Done on `main`: the watermark is carried (merge 87e36302), so no release gate |
 | 7 | The snapshot/restore check is narrower than claimed: one round trip per pipeline start, none at all if `clone_via_snapshot` is overridden | Coverage | Medium | Text and runbook |
 | 8 | Replica-side stop plumbing: the replica's shadow holds only the pipeline's shutdown flag | Implementation risk | Medium | Done: decision 11, step 3 |
 | 9 | Replication protocol 9 is another full-cluster-stop upgrade | Operations | Medium | Decide now |
-| 10 | Build-id gating silently stops comparing on mixed-arch and per-host builds, and nothing alertable shows it | Coverage / operations | Medium | Decide now |
+| 10 | Build-id gating silently stops comparing on mixed-arch and per-host builds, and nothing alertable shows it | Coverage / operations | Medium | Decided: every build is compared; the build id only names them |
 | 11 | Applications that already break the hash-map-order rule (report order following capacity) will now be stopped: the shadow is restored and never prefaulted, and `Sizing` varies by node | Coverage caveat (rollout) | Medium | Document; shadow prefault and test in step 3 |
 | 12 | Latent state divergence can be promoted at failover | Coverage | Medium | Defer (step 7) |
 | 13 | Uncovered windows around restarts and promotions; the failover tail | Coverage | Medium | Defer (step 7) |
@@ -81,7 +81,8 @@ closed on `main` (item 1.4).
 Items 1 to 3, 8 and 16, and the parts of 21, 22 and 23 marked above, should
 change the plan before step 1 starts. Items 5, 9 and 10 are decisions to
 take now, because they shape the flag, the protocol and the metrics of
-steps 2 to 5. The rest can be documented or deferred.
+steps 2 to 5; 5 and 10 are taken, 9 is open. The rest can be documented
+or deferred.
 
 ## 1. Correctness and guarantee gaps
 
@@ -369,6 +370,25 @@ expected to diverge while monotonic time is open and to stop diverging
 once it lands, so the dependency is pinned by a test rather than by prose.
 Consider (c) only if monotonic time slips by more than a release.
 
+**Decided (2026-11-04): the narrow fix, landed on `main`** (merge
+87e36302), wider than (c) as sketched. Rather than seeding the live
+stage from the last journaled timestamp, the watermark now goes with the
+state it belongs to: replay hands its watermark to the matching and
+shadow stages it seeds, a snapshot records the watermark of its position
+(framing version 5), a resynced replica takes the one in its primary's
+snapshot, and a promotion carries the replica stage's into the primary
+pipeline. Every copy applying the same journal now makes the same `tick`
+calls, pinned end to end by `server-runtime/tests/tick_watermark.rs`, and
+the test this item asked for exists as `TickCountingApp`, which counts
+every call into its reports. So there is no release gate: open question
+8 is settled and finding 7 rewritten, and the plan's step 5
+no-false-positive cases run `TickCountingApp` across restarts, recovery
+and promotion, expected never to diverge. What remains of monotonic time
+(time going backwards, the double call per journaled `Tick`, the producer
+race) reaches every copy alike and is independent of the plan. One
+residue: a snapshot written before framing version 5 restores with a
+fallback watermark (logged), which the plan's runbook names.
+
 ### 1.6 The snapshot/restore check is narrower than claimed (item 7)
 
 **Shortfall.** Decision 10 says the shadow catches "a `snapshot`/`restore`
@@ -473,6 +493,42 @@ log instead of stopping. That is an observe mode scoped to mixed builds
 `/healthz`, so "not comparing" can be alerted on directly. A mixed-arch
 cluster that diverges is a real failover hazard, and comparing it is
 desirable: the override lets the operator ask for exactly that.
+
+**Superseded (2026-11-04): every build is compared.** The user decided
+against gating on the build at all, which goes further than this
+section's recommendation. A replica on another build whose output
+differs for the same input has diverged: its state no longer matches the
+primary's, and a failover would show clients another history. Skipping
+the comparison hides exactly that, and the first two bullets above are
+cases where gating hid it silently. So the plan's open question 2 now
+compares whatever the builds, and:
+- the build id stays, for diagnosis only: a primary sends it in
+  `StreamStart`, a replica in its `Handshake`, and the stop's `error!`
+  line, its marker and the refusal message name both builds when they
+  differ, so a mixed-build cluster is plain as the cause;
+- the override (`--output-build-id`) is not needed: nothing is skipped,
+  and two builds an operator knows to be equivalent compare equal by
+  their output;
+- the all-zero id of a node that cannot read its executable is just an
+  unknown build, printed as such, no longer a match for any build;
+- the `build` reason of `melin_output_unverified_windows_total` is gone,
+  and the once-per-session "another build" `warn!` becomes an `info!`
+  naming both builds, since nothing is degraded;
+- the comparing gauge would now only cover a primary with digests off,
+  or no replica connected, both visible already; it is left as an
+  optional follow-up, not part of the plan's steps.
+
+The cost is an upgrade constraint the plan now states with its guarantee
+and in the operator docs: an application upgrade that changes output for
+the same input cannot run mixed in a live cluster with digests on. It
+goes through a full stop (every node replays the same journal on one
+build) or a journaled activation point, a pattern in
+`docs/building-an-application.md`. An upgrade that keeps output
+identical still rolls node by node. The last bullet above, a real
+difference between hosts, is now one case of that rule, and its stop
+names both builds only when the binaries differ; a shared-library
+difference under one binary shows one build, and the runbook names
+hosts as a suspect.
 
 ### 2.3 Queries (item 17)
 
@@ -609,7 +665,27 @@ stops) while making the fallback strictly better than off. Add a rule
 that observe mode is refused at startup on a node that already has a
 marker, so it cannot be used to skip the refusal. (c) is the
 operator-facing answer to "will my application survive the upgrade".
-(d) happens anyway under open question 8 (b).
+(d) happens anyway under open question 8 (b). (Since settled the other
+way: the tick watermark fix landed on main, so open question 8 no longer
+orders the releases, and (d) happens only if chosen.)
+
+**Decided (2026-11-03): (b) rejected; (c) kept and raised.** Observe mode
+is a footgun. It means serving on a contract known to be broken, and an
+operator who turns it on to get past one stop can leave it on for months
+on a build known to diverge. That contradicts the decision that a
+divergence must stop the cluster. Its debugging value is real, but a
+production switch is the wrong place for it:
+- qualifying a build is done in the stopping mode on staging, where a
+  stop costs nothing;
+- the marker already names the window and both digests;
+- reproducing an incident, and listing every divergent window rather than
+  the first, is the offline tool's job (c), working from the input-only,
+  chain-verified journal with no client answered.
+
+The switch stays `--no-output-digests`. The offline tool moves up the
+roadmap: it is the debugging path. The tick trap, the runtime-caused stop
+that weighed for (b), is gone: the tick watermark fix on `main` makes
+every copy's tick calls the same (1.5).
 
 ### 3.3 The refusal and the off switch
 
@@ -925,9 +1001,12 @@ In order of value for the cost:
 2. **Alertable staleness.** Add `melin_output_comparing{against}` and a
    lag gauge (`applied position − verified_through`, in entries), so "not
    comparing" and "falling behind" are alerts rather than "worth a look"
-   (plan:1228). Step 5.
-3. **Observe mode and offline qualification** (item 3.2). Before step 5
-   is released.
+   (plan:1228). Step 5. Since every build is compared (2.2), the comparing
+   gauge would only cover a primary with digests off or no replica
+   connected: an optional follow-up, not in the plan's steps.
+3. **Offline qualification** (item 3.2 (c)): replay a journal on two
+   copies and report every window whose outputs differ. Next after this
+   plan; it is the debugging path. Observe mode is rejected (3.2).
 4. **Protocol negotiation in protocol 9** (item 3.1 (b)). Step 4.
 5. **A generic refusal file** (item 3.4 (b)). Step 3.
 6. **An in-process query digest kind, opt-in** (item 2.3 (b)). Roadmap.
@@ -961,8 +1040,9 @@ In order of value for the cost:
   window" definition in 5.4 is still open; it goes with 1.2.
 - 3.5: done: `ArchiveReason::OutputDiverged`, tag `output-diverged`.
 
-**Decide now, because they shape steps 2 to 5:** observe mode (3.2), the
-build-id override and the comparing gauge (2.2), protocol negotiation
+**Decide now, because they shape steps 2 to 5:** observe mode (3.2,
+decided: rejected), the build-id override and the comparing gauge (2.2,
+decided: superseded, every build is compared), protocol negotiation
 (3.1), the generic refusal file (3.4).
 
 **Fold into the steps:** the hash-map-order rollout caveat (1.3), named in
@@ -974,9 +1054,10 @@ failover tail (1.7, 2.1), queries (2.3), the idle delay (2.4), chain breaks
 (2.6), downgrades (3.4 (a)), the dedicated fold consumer (4.2 (c)), the
 state digest and stored chain (step 7).
 
-**Release gating, unchanged:** step 5 waits for monotonic time (open
-question 8 (b)), with finding 7 widened (1.5) and the replica-restart tick
-test added.
+**Release gating: none left.** Step 5 no longer waits for monotonic time:
+the tick watermark fix landed on `main` (1.5), open question 8 is
+settled, and step 5's no-false-positive cases run `TickCountingApp`
+across restarts and promotion.
 
 ## Decisions for the user
 
@@ -985,13 +1066,18 @@ test added.
    verdicts) to add the partial two-against-one verdict from notices in
    step 5, and should a primary found at fault by it trip its own latch?
    Plan a deferred-exit failover separately, or rule it out?
-3. **First rollout (3.2):** add an `observe` mode beside `enforce` and
-   `off`, and an offline qualification tool? Or keep enforce-or-off as the
-   stance?
+3. **First rollout (3.2):** decided: no observe mode, which would mean
+   serving on a broken contract. The switch stays on/off, and the offline
+   qualification tool is the debugging path, next on the roadmap.
 4. **Upgrade (3.1):** pay for N/N−1 negotiation in protocol 9, or accept
    another cluster stop and leave negotiation for later?
-5. **Build id (2.2):** add the operator override and the comparing gauge?
-6. **Monotonic time (1.5):** keep the release gate, or ship the narrow
-   watermark-seeding fix if monotonic time slips?
+5. **Build id (2.2):** decided (2026-11-04): always compare output
+   digests, whatever the builds. The build id stays for diagnosis only,
+   named in the stop's log, marker and refusal when the builds differ; no
+   override and no comparing gauge in the plan. An upgrade that changes
+   output goes through a full stop or a journaled activation point.
+6. **Monotonic time (1.5):** decided: the narrow fix, landed on `main`
+   (the tick watermark carried across restart, promotion, snapshot
+   restore and resync, snapshot format v5). No release gate remains.
 7. **Refusal convention (3.4):** introduce `<journal>.refuse` now as the
    general mechanism?

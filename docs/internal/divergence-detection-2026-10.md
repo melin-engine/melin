@@ -24,15 +24,18 @@ serves the drifted copy.
 What is digested is the **output**: the bytes of every report the
 application's encoder produces for a journaled event. It is computed once,
 in the runtime, for every application. There is no trait to implement and
-no opt-in, and it is on unless the operator turns it off. A divergence means
-the application broke its determinism contract. Every copy runs the same
-build, so which copy produced the odd output does not matter, and nothing
+no opt-in, and it is on unless the operator turns it off. Copies are
+compared whatever build each runs (open question 2). A divergence means
+either the application broke its determinism contract, or two builds the
+cluster runs side by side answer the same input differently; for the
+cluster the two are one fault, since a failover would show clients another
+history. Which copy produced the odd output does not matter, and nothing
 is repaired. The node that sees it stops and tells the rest of the cluster,
 which stops too (decision 11), and every stopped node refuses to start
 again. Operations resume only on a new cluster, started from the journal
-with a fixed application or with output digests off (step 6). One clause of
-that contract is a trap the runtime still sets, the tick rule, and finding
-7 takes a position on it.
+with a fixed application or with output digests off (step 6). The tick
+rule, once a trap the runtime set for the cross-node check, no longer is:
+finding 7 says why.
 
 The journal stays input-only and the snapshot format is untouched. Nothing
 new is journaled and nothing is stored: each copy's chain starts when its
@@ -57,6 +60,32 @@ Stated here as the operator docs will state it (step 6):
   for byte, as the copy clients were answered from, for every position of
   its verified run** `[from, through]` (`/healthz`, `/metrics`). A run is
   contiguous by construction: no window inside it went uncompared.
+- **Copies on different builds are compared like any others.** Another
+  release of the application, another architecture (a floating-point
+  transcendental function can round differently on x86 and on ARM), or a
+  binary built per host: if the output differs for the same input, the
+  copies have diverged, and the cluster stops. The marker, the `error!`
+  line and the startup refusal name both builds when they differ, so a
+  mixed-build cluster is plain as the cause (open question 2).
+- **What this means for upgrades.** An application upgrade that changes
+  its output for the same input cannot run mixed with the old build in a
+  live cluster with output digests on: the first window whose reports
+  differ stops the cluster, and rightly, since a failover across the two
+  builds would show clients another history. Two paths are supported:
+  - **Stop everything, upgrade, start together.** Every node then replays
+    the same journal on one build.
+  - **A journaled activation point.** The new build keeps the old
+    behaviour until an entry every node applies at the same position (an
+    operator command the application journals, say) switches it, so old
+    and new builds produce identical output until every node runs the
+    new one, and the switch happens at one position everywhere. A
+    pattern for the application, described in
+    `docs/building-an-application.md` (step 6).
+
+  An upgrade that keeps output identical for the same input (a fix
+  elsewhere, a faster path) can still roll node by node. A Melin runtime
+  upgrade is already a stop-everything flag day for replication protocol
+  9 (decision 8).
 - **The limits.**
   - **A detector nobody can reach stops alone.** The stop travels on the
     replication links. A stopped node keeps its replication endpoint up for
@@ -383,46 +412,61 @@ answers, so the promotion is abandoned and the node exits (decision 14).
 Second, a cluster with more than three voters keeps a majority after two
 stop, which decision 14's voter cap refuses.
 
-**7. The runtime still hands applications repeated and backwards ticks.**
-Determinism audit finding 17 and the roadmap item "Monotonic sequencer time"
-([monotonic-sequencer-time-2026-09.md](monotonic-sequencer-time-2026-09.md),
-not started) are open: the dispatch watermark is per-process state, starting
-at 0 in the live matching stage at boot (after replay), in replay and on
-restore, and every journaled `Tick` calls `Application::tick` twice
-(`dispatch.rs`). So a primary restarted after a clock step back calls `tick`
-for event timestamps a replica that kept running skips. An application whose
-`tick` is not idempotent against a time already passed (the roadmap names
-the Exchange Core's, which stamps its rate limiter's clock) then holds
-different state on the two copies, and once a report shows it, every
-replica stops. The plan's position:
+**7. Every copy applying the same journal makes the same tick calls.**
+Until recently it did not: the dispatch watermark was per-process state,
+restarting at 0 whenever a stage was built (at boot after replay, on
+snapshot restore, on a resync, on promotion), so a copy restarted,
+restored or promoted inside a run of repeated or regressed timestamps
+called `Application::tick` where an uninterrupted copy did not. An
+application whose `tick` is not idempotent against a time already passed
+(the roadmap names the Exchange Core's, which stamps its rate limiter's
+clock) then held different state on the two copies, and with this plan
+the first report to show it would have stopped the cluster for a cause
+the runtime set. `main` closed that half of determinism audit finding 17
+(merge 87e36302): replay hands its watermark to the stages it seeds, a
+snapshot records the watermark of its position (snapshot framing version
+5), a resynced replica takes the one its primary's snapshot records, and
+a promotion carries the replica stage's into the primary pipeline, in the
+matching and the shadow stages alike, pinned end to end by
+`server-runtime/tests/tick_watermark.rs`. The plan's position:
 
-- **The stop is right when it fires.** The copies really do differ, which is
-  exactly what the product promises cannot happen silently; suppressing the
-  check around restarts would hide a real divergence. The rule is already in
-  the contract: `Application::tick`'s rustdoc says "a call for a time
-  already passed must change nothing", and "The determinism rules" in
-  `docs/building-an-application.md` covers `tick`. Step 1 makes the
-  guide name the routine causes (the double call, a restart or restore
-  across a clock step back) beside the encoder clause, and step 6's runbook
-  names this as the first suspect when a divergence follows a restart, a
-  failover or a clock step.
-- **Monotonic time is not a build prerequisite, but it is a release one for
-  step 5.** Steps 1 to 4 cannot trip on it: the shadow and the live stage of
-  one pipeline start their watermarks together and see the same events
-  (`shadow.rs`, `pipeline.rs`), so the in-process check of step 3 compares
-  like with like. Step 5 is the first to compare a restarted primary with a
-  replica that kept running. It can be committed and tested before
-  monotonic time lands, but should not reach a release ahead of it: until
-  then, the first divergence an operator sees is likelier to be this trap
-  than their own bug (open question 8).
-- **The test applications follow the rule.** `TestApp::tick` counts every
-  call (`test_support.rs`), breaking it, but `TestReport` does not carry
-  `ticks`, so no report shows the difference today. Step 5's no-false-
-  positive tests across a restart and a recovery must exercise the rule, not
-  dodge it: they run a test application whose `tick` is idempotent against
-  a clock it keeps in its snapshot (the audit's fix direction for finding
-  17) and whose reports carry that clock, so time-driven state reaches the
-  digest. It sits beside the fault-injecting apps, in the test crate.
+- **What remains of the tick contract cannot split copies.** The rest of
+  the roadmap item "Monotonic sequencer time"
+  ([monotonic-sequencer-time-2026-09.md](monotonic-sequencer-time-2026-09.md))
+  is open: time going backwards (a clock step on the primary, a failover
+  to a node whose clock is behind), the producer race that journals
+  timestamps out of order, and the double call per journaled `Tick`
+  (`dispatch.rs`), whose repeat is at the watermark, a time already
+  passed. Each is a
+  function of the journal, so every copy sees it alike: it can make an
+  application's own clock odd, never make two copies differ. That item is
+  independent of this plan, neither a build prerequisite nor a release
+  one (open question 8).
+- **One residue, once.** A snapshot written before framing version 5
+  records no watermark. Restoring one starts from the timestamp of the
+  journal entry at its sequence (exact unless timestamps went backwards
+  before it), or from zero when the journal no longer holds that entry,
+  and logs a warning naming the snapshot; the node's next snapshot records
+  the watermark. Such a snapshot exists only on a node that has not yet
+  written one since upgrading to the release with format 5. Step 6's
+  runbook names that warning, beside a divergence that follows it, as
+  the one tick-related suspect left.
+- **The stop is right whenever it fires.** If copies do differ around a
+  restart, they differ, which is exactly what the product promises cannot
+  happen silently; suppressing the check around restarts would hide a real
+  divergence. The rule stays in the contract (`Application::tick`'s
+  rustdoc: "a call for a time already passed must change nothing", and
+  "The determinism rules" in `docs/building-an-application.md`), for the
+  application's own correctness rather than for agreement between copies.
+- **The tests break the rule on purpose.** `main` now has `TickCountingApp`
+  (`transport-core`'s `test_support`, behind `test-utils`, with
+  `TickCountingCodec` to serve it through a node): its `tick` counts every
+  call, an equal or earlier time included, and every report carries the
+  count. Step 5's no-false-positive tests across a restart, a recovery
+  and a promotion run it, rather than a rule-following application, so a
+  copy that made one tick call more or fewer reaches the digest and would
+  stop the cluster: they pin that the runtime keeps the copies' tick calls
+  equal, not that a well-behaved application hides a difference.
   `TestApp` stays as it is: the dispatch tests count its calls on purpose.
 
 ## Design decisions
@@ -946,11 +990,16 @@ The rules, for both modes:
   skipped sample. A dropped or skipped entry costs delay, not coverage: the
   next comparison covers its windows.
 - **Session start** (decision 9): `begin_session(SessionKind)`, where
-  `SessionKind` is `Compared(PrimaryPipelineId)` or `Uncompared` (a
-  `StreamStart` with no output bit or another build), an enum so a caller
-  cannot forget to say which, and so an uncompared session carries no id
-  to compare. The comparator holds the id of the last compared session,
-  `Option<PrimaryPipelineId>`, `None` at construction.
+  `SessionKind` is `Compared(PrimaryPipelineId)` or `Uncompared`
+  (a `StreamStart` with no output bit: the primary sends no digests), an
+  enum so a caller cannot forget to say which, and so an uncompared
+  session carries no id to compare. A primary on another build is
+  `Compared` like any other (open question 2), and the comparator is
+  never told the build: with no build in its input, no rule here can
+  read one, so nothing can come to skip on it. The session's build goes
+  to the latch instead, which names it in the stop (decision 11). The comparator
+  holds the id of the last compared session, `Option<PrimaryPipelineId>`,
+  `None` at construction.
   - `Compared(id)` with the held id: nothing changes. The run, its anchor,
     a pending anchor and the expected array are kept, and the session's
     first entry is compared as any later one (at or below
@@ -966,7 +1015,7 @@ The rules, for both modes:
     the next usable entry anchors. A stretch begun here is caused
     `new_primary` when an id was held, and continues whatever stretch was
     open when none was (a replica's first session continues its `start`
-    stretch, a session after an uncompared one its `build` stretch).
+    stretch, a session after an uncompared one its `uncompared` stretch).
     Returns `SessionStart::Reanchor { cause }`: `NewPrimary` when an id
     was held; with none held, `AfterUncompared` when the open stretch
     contains an `Uncompared` session (the comparator already records this
@@ -983,7 +1032,7 @@ The rules, for both modes:
   first frame.
 - **Accounting has one owner: the comparator, at `Anchored`.** Each
   unverified window is counted once, by the `Anchored` that ends the
-  stretch it lies in, under the stretch's cause: `build` if any
+  stretch it lies in, under the stretch's cause: `uncompared` if any
   `Uncompared` session fell inside the stretch, else `gap` if the stretch
   began at a local break, else `new_primary` if it began at a session with
   a new pipeline id, else `start`. A session with the held id begins no
@@ -1000,7 +1049,8 @@ Every call returns the verdicts it produced:
 - `Mismatch { divergence, halted }`: the divergence verdict, returned
   only after the comparator has already called `T::trip(divergence)`.
   `divergence` is `{ end, run_from, verified_through, expected, actual }`,
-  where each side is a `(WindowDigest, ChainValue)` pair. The divergence
+  where each side is a `(WindowDigest, ChainValue)` pair. The
+  divergence
   lies in `(verified_through or run_from - 1, end]`, and when the two
   `d_e` differ, window `end` itself is one that differs. When the anchor's
   own `d_e` differs, no run exists yet: `run_from` is the window's first
@@ -1015,7 +1065,7 @@ Every call returns the verdicts it produced:
 - `Anchored { end, unverified, reason }`: a run starts, and the windows
   between the previous run's end (or `F`) and the new run's start are
   counted unverified under `reason` (`start`, `new_primary`, `gap` or
-  `build`, by the rule above);
+  `uncompared`, by the rule above);
 - `Break { after, lapped }`: the run ended at a local gap of `lapped`
   windows.
 
@@ -1139,9 +1189,9 @@ own batch cadence. Nothing in the digest path is behind
 | --- | --- |
 | New frame `MSG_DIGEST = 0x19`, primary to replica | `DigestFrame { tag, kind: u8, window_end: U64, window: [u8; 16], chain: [u8; 16] }`, 42 bytes |
 | `Ack` gains the stop flag, replica to primary | `AckFrame { tag, acked_sequence: U64, in_memory_sequence: U64, flags: u8, window_end: U64 }`, 26 bytes, from 17. `flags` bit 0 is `STOPPED`: this replica has stopped (decision 11), and its positions are frozen at the last ones it sent. `window_end` is the position its stop names (the diverged window, or the one it was told of), 0 when `STOPPED` is clear |
-| `Handshake` gains the same two fields, replica to primary | `HandshakeFrame { tag, last_sequence: U64, chain_hash: [u8; 32], epoch: U64, protocol_version: U16, flags: u8, window_end: U64 }`, 60 bytes, from 51: a stopped replica redialling tells the primary before anything else is exchanged (decision 11). Appended after `protocol_version`, so an older primary still parses the version and refuses it |
+| `Handshake` gains the same two fields and the replica's build, replica to primary | `HandshakeFrame { tag, last_sequence: U64, chain_hash: [u8; 32], epoch: U64, protocol_version: U16, flags: u8, window_end: U64, build_id: [u8; 32] }`, 92 bytes, from 51: a stopped replica redialling tells the primary before anything else is exchanged (decision 11), and the primary learns each replica's build, so a primary told to stop by a replica on another build can name both (open question 2). Appended after `protocol_version`, so an older primary still parses the version and refuses it |
 | New frame `MSG_HALT = 0x1A`, primary to replica | `HaltFrame { tag, cause: u8, window_end: U64 }`, 10 bytes: the cluster is stopping. `cause` 1 is "this primary detected", 2 "a replica told this primary"; `window_end` as on the ack |
-| `StreamStart` gains the digest kinds, the build and the pipeline id | `digest_kinds: u8` (bit `k - 1` set: this primary sends digests of kind `k`; 0: none), then `build_id: [u8; 32]` (open question 2), then `pipeline_id: [u8; 16]` (decision 3), appended after `genesis_entries`: 115 bytes, from 66 |
+| `StreamStart` gains the digest kinds, the build and the pipeline id | `digest_kinds: u8` (bit `k - 1` set: this primary sends digests of kind `k`; 0: none), then `build_id: [u8; 32]` (for diagnosis only, open question 2), then `pipeline_id: [u8; 16]` (decision 3), appended after `genesis_entries`: 115 bytes, from 66 |
 
 - **Unknown flag bits and causes are refused**, as `genesis_known` is: a
   bit this build does not define is a peer's protocol bug, never read as
@@ -1210,6 +1260,20 @@ own batch cadence. Nothing in the digest path is behind
   can compare what it was sent, and nothing can turn a received id into
   one a pipeline builder takes. Any 16 bytes are valid, zero included (a
   draw can produce it).
+- **The build id is for diagnosis, sent both ways.** Each node reads its
+  own once at startup (open question 2) and sends it in `StreamStart` (a
+  primary) and in its `Handshake` (a replica), so both ends of a session
+  know both builds. The decoder hands it up as a `BuildId`, a `[u8; 32]`
+  newtype, so it cannot be mistaken for the chain hash beside it in the
+  handshake. Nothing compares, skips or refuses on it: it is printed in
+  the session's `info!` line when the two differ (decision 16), and in
+  the stop's `error!` line, marker and refusal message (decisions 11 and
+  12). All zeros means the sender could not read its executable and is
+  printed as an unknown build. Two builds **differ**, everywhere this
+  plan says so, only when both ids are known (neither all zeros) and
+  unequal: an unknown build is printed as `unknown` beside this node's,
+  never with the mixed-build sentence, since the runtime does not know
+  the cluster ran mixed.
 - **A window end that is not a positive multiple of its kind's `K`** is the
   primary's protocol bug and ends the session as a `FrameError`, never as a
   divergence.
@@ -1260,16 +1324,19 @@ own batch cadence. Nothing in the digest path is behind
   space, copying every new window in order only when it moved (decision
   5). At every session start, once `StreamStart` is accepted,
   `streaming_loop` calls `begin_session` with the session's kind and
-  pipeline id (decision 6) and logs the verdict at `debug!`: the run kept
-  (same primary pipeline) or re-anchoring (a new primary pipeline, the
-  pipeline's first session, the first compared session after an
-  uncompared one, an uncompared session).
-- A session whose `StreamStart` has no output bit, or names another build
-  (open question 2), begins as `SessionKind::Uncompared` and feeds the
-  comparator no expected entries; the session logs why once. The receiver
-  counts nothing: the comparator attributes the session's windows to
-  `build` at the next `Anchored` (decision 6), so they are counted once.
-  A replica with digests off decodes and drops frames.
+  pipeline id (decision 6), records the primary's build in the latch
+  (`follow`, decision 11), and logs the verdict at `debug!`:
+  the run kept (same primary pipeline) or re-anchoring (a new primary
+  pipeline, the pipeline's first session, the first compared session
+  after an uncompared one, an uncompared session).
+- A session whose `StreamStart` has no output bit begins as
+  `SessionKind::Uncompared` and feeds the comparator no expected entries;
+  the session logs why once. The receiver counts nothing: the comparator
+  attributes the session's windows to `uncompared` at the next `Anchored`
+  (decision 6), so they are counted once. A primary that names another
+  build is compared as any other (open question 2); the session logs both
+  builds once at `info!` (decision 16). A replica with digests off decodes
+  and drops frames.
 - A `Mismatch` (the comparator has already tripped the latch, decision
   6), a `Halt` frame from the primary, or the latch found tripped by the
   replica's own shadow, ends streaming. The receiver publishes nothing
@@ -1314,10 +1381,38 @@ all; both are logged at startup and documented as limits.
 ### 11. On divergence: the cluster stops, in one order
 
 A node stops for one of two causes, `HaltCause` (exhaustive):
-`Detected(Divergence)`, when one of its own comparisons finds it (a
-replica's receiver, or any node's shadow), and `ClusterHalted { by, via,
-window_end }`, when another node tells it (`by` the primary or a replica's
-slot and key fingerprint, `via` the ack, the handshake or the halt frame).
+`Detected { divergence, peer_build }`, when one of its own comparisons
+finds it (a replica's receiver, or any node's shadow), and `ClusterHalted
+{ by, via, window_end, peer_build }`, when another node tells it (`by`
+the primary or a replica's slot and key fingerprint, `via` the ack, the
+handshake or the halt frame, `peer_build` the teller's `Option<BuildId>`,
+from the session's `StreamStart` or the replica's handshake, `None` when
+no session told it, as for a `Halt` answering a handshake). That `None`
+is deliberate: the `Halt` comes before any `StreamStart`, so the teller
+has not named its build, and the build the latch followed last may be
+another node's (a primary since replaced). Taking it would name a build
+the teller may not run, and a wrong mixed-build claim misleads more than
+a missing one. The marker of such a stop names this node's build alone.
+
+A `Detected` stop's `peer_build` is the build of the primary the node
+follows, whichever of its checks detected. On a replica, the receiver
+and the shadow can both catch one fault, and which trips first is a race
+(the shadow trails live by its lag only; the receiver waits for the
+primary's frame for that window or a later one). If the build came from
+the detecting check, a mixed-build replica would name the primary's build
+or not depending on that race. So the build is not the check's: each
+receiver records its session's primary build in the latch at
+`StreamStart` (`DivergenceLatch::follow(BuildId)`, compared and
+uncompared sessions alike), and the latch stamps it on every `Detected`
+stop it builds. `Trip::trip` takes only the `Divergence`, so no trip site
+supplies the build or can forget it. The record is a `Mutex<Option<BuildId>>`
+in the latch: 32 bytes are no single atomic, and it is touched once per
+session and once at the trip, both cold. It is `None` on a primary, on a
+replica before its first session, and after a promotion: the promotion
+teardown that reads the latch (item 1 below) clears it before handing the
+application over, so a promoted node's own shadow names no stale build.
+Between two sessions it keeps the last one's, the primary whose entries
+the shadow is still applying.
 The stop is honoured whatever the node's own `--no-output-digests`: that
 flag governs what a node computes, not whether it obeys a stop. Either
 way, the node:
@@ -1389,7 +1484,8 @@ way, the node:
    whose shadow may still be applying the last session's entries
    (`replication/mod.rs:1141-1142`). So the post-join reading is one
    function, a promotion teardown that joins the pipeline, reads the latch
-   and returns the application only when it is clear, and both the
+   and returns the application only when it is clear (clearing the
+   followed build as it does, above), and both the
    `Promote` arm and `take_pipeline_for_promotion` go through it, so
    neither can hand over a stopped node's application.
    The session's link is already closed (`close()`, `:975`, runs before the
@@ -1420,8 +1516,11 @@ way, the node:
    prefixes (`hex_prefix`, the journal crate's formatter, widened from
    `&[u8; 32]` to `&[u8]` so 16-byte values and the 32-byte chain hash
    print alike), and the run. For `ClusterHalted`: who told it, by which
-   path, and the position named. Both end "the cluster is stopping: see
-   docs/replication.md, Output verification".
+   path, and the position named. Both name this node's build and, when the
+   other node's (`peer_build`) is known and differs (decision 8, the
+   build id), that one too, with "the cluster runs mixed builds"; an
+   unknown one is printed as `unknown`, without that sentence. Both end "the
+   cluster is stopping: see docs/replication.md, Output verification".
 3. **Writes the divergence marker** beside the journal
    (`NodeStore::divergence_marker()`, `<journal>.diverged`), written to a
    temporary file, fsynced, renamed and the directory fsynced, so it
@@ -1431,7 +1530,8 @@ way, the node:
    divergence, whether that window differs itself, both window digests and
    both chain values in full hex, and the run (`verified_from`,
    `verified_through`); then `notice` (`pending`, `delivered` or `none`,
-   rewritten as the notice of item 4 progresses), the node's build id, and
+   rewritten as the notice of item 4 progresses), the node's build id and
+   the other node's when known (`unknown` for an all-zero id), and
    the wall-clock time (for people; nothing reads it).
 4. **Tells the rest of the cluster, then lingers.** What it does depends
    on its role (below, "The notice and the linger"). In short: a replica
@@ -1801,20 +1901,24 @@ that window have gone out by the time anyone knows; what the stop
 guarantees is that nothing further does.
 
 No automatic repair, no retry and no fault attribution: a divergence means
-the application's determinism contract is broken, every copy runs the same
-broken build, a restart from the same journal and the same build has no
-reason to behave differently, and an outage of the whole cluster is the
-intended outcome.
+the application's determinism contract is broken, or that the builds the
+cluster runs side by side do not agree; either way the build or builds in
+place produced it, a restart from the same journal on them has no reason
+to behave differently, and an outage of the whole cluster is the intended
+outcome. On mixed builds, which copy is "right" is not a question the
+runtime can answer: the markers name both builds, and the operator
+decides which build the new cluster runs (step 6).
 
 ### 12. Startup refuses while the marker exists
 
 A new `NodeStore::refuse_if_diverged(&self) -> Result<(), NodeStoreError>`,
 which every node entry calls right after `resolve` and before it opens its
 journal, starts raft or serves anything, returns
-`NodeStoreError::Diverged { marker, cause, window_end, stopped_at }`
+`NodeStoreError::Diverged { marker, cause, window_end, builds, stopped_at }`
 if the marker exists, every field parsed from the marker (`cause` the
 marker's cause, `detected` with its check and range or `cluster-halted`
-with who told it, `stopped_at` its wall-clock time), so the message below
+with who told it, `builds` this node's build and the other node's when
+the marker names it, `stopped_at` its wall-clock time), so the message below
 quotes the marker and nothing else. `resolve` stays as it
 is, writing nothing, so a test or tool that resolves a diverged node's
 paths is neither refused nor moves files.
@@ -1828,13 +1932,18 @@ happened and what to do:
 > this node stopped on `<time>` because the cluster's output diverged
 > (`<detected here: its output differs from the primary's | its shadow's,
 > between positions <a> and <b>>` or `<told by <who> via <path>, at
-> position <n>>`; details in `<marker>`). The application broke its
-> determinism contract, so this cluster cannot be restarted: do not delete
-> this marker to bring this node back. Start a new cluster from the
-> journal, with a fixed application or with output digests off. See
-> docs/replication.md, "Output verification".
+> position <n>>`; details in `<marker>`). [This node ran build `<a>`,
+> the other node build `<b>`: the cluster ran mixed builds, whose output
+> differs for the same input.] The application broke its determinism contract,
+> or its builds do not agree, so this cluster cannot be restarted: do not
+> delete this marker to bring this node back. Start a new cluster from the
+> journal, on one build, with a fixed application or with output digests
+> off. See docs/replication.md, "Output verification".
 
-A marker that cannot be parsed still refuses, naming the file.
+The bracketed sentence appears only when the marker names two builds
+that differ, both known (decision 8): a marker naming an `unknown` other
+build carries it as such, without the sentence. A marker that cannot be parsed still refuses, naming the
+file.
 
 So a stopped node cannot come back on its own (systemd's `Restart=always`
 just logs the refusal at each attempt), never rejoins raft, and cannot be
@@ -1968,22 +2077,33 @@ Logs (levels per the project convention):
 
 | Event | Level | Where |
 | --- | --- | --- |
-| Output diverged: the node stops (check, range, digests, run) | `error!` | the detecting node |
-| Told to stop (who, which path, the position) | `error!` | every node told, by an ack, a handshake or a halt frame |
+| Output diverged: the node stops (check, range, digests, run, this node's build and, when they differ, the primary's) | `error!` | the detecting node |
+| Told to stop (who, which path, the position, this node's build and, when known and different, the teller's) | `error!` | every node told, by an ack, a handshake or a halt frame |
 | Marker written (with its path) | `error!` (part of the stop) | every stopped node |
 | Still telling: the notice not yet answered (who it is waiting for) | `warn!`, at intervals during the linger | a stopped node |
 | Notice answered, or the linger ended unanswered | `info!` / `warn!` | a stopped node, before it exits |
 | Startup refused: the marker exists | `error!` (the run's returned error) | a stopped node, at each start |
 | Output digests off on this node (`--no-output-digests`), or no in-process check (no shadow) | `warn!` at startup | every node |
-| The primary sends no output digests, or runs another build (open question 2), for this session | `warn!`, once per session | replica |
+| The primary sends no output digests for this session | `warn!`, once per session | replica |
+| The other end of a replication session runs another build (both builds' prefixes; compared all the same, open question 2) | `info!`, once per session | replica, and the primary per replica |
+| This node cannot read its own executable, so it sends an unknown build | `warn!` at startup | every node |
 | A digest kind unknown to this build (a frame or a `digest_kinds` bit) | `warn!`, once per session | replica |
 | A chain broke: a local window lapped before the comparator copied it (with the number of windows lapped) | `warn!`, first then at each doubling of the count | the comparing thread |
 | A report the encoder refused, folded as a failure (with the encoder's reason and the count) | `warn!`, first then at each doubling of the count, per copy | every folding thread |
 | A reply due to a live client the encoder refused (unchanged) | `error!` | the egress |
 | A session started: the run kept (same primary pipeline id) or re-anchoring (a new primary pipeline, this replica pipeline's first session, the first compared session after an uncompared one, an uncompared session), with both ids' prefixes | `debug!` | replica receiver |
 | A run anchored (with the windows left unverified before it, and their reason) | `debug!` | the comparing thread |
-| Output digests on, window `K` entries | `info!` at pipeline start | every node |
+| Output digests on, window `K` entries, this node's build | `info!` at pipeline start | every node |
 | A match | none (metrics only) | |
+
+The mixed-build line is `info!`, not `warn!`: nothing is degraded, since
+the pair is compared as any other, and running two builds is a state an
+operator chooses (an upgrade that keeps output identical, a cluster
+across architectures). It is there so that, should the stop fire later,
+the log already shows the cluster ran mixed, beside the `error!` line
+that names both builds. An unreadable executable is `warn!`: nothing is
+lost to detection, but every stop and every peer's log would then name
+an unknown build, a diagnosis the operator should restore.
 
 Metrics (`/metrics`, rendered in `health.rs`, on replicas through the
 replica health endpoint; `/healthz` carries whether digests are on, each
@@ -1997,7 +2117,7 @@ cause and the notice's state):
 | `melin_output_verified_from{against="primary"\|"shadow"}` | gauge | first position of the current run |
 | `melin_output_verified_through{against}` | gauge | last window end of the current run found equal. Every position from `verified_from` to it was compared. A gauge that stops moving under traffic is worth a look |
 | `melin_output_checks_total{against}` | counter | comparisons found equal |
-| `melin_output_unverified_windows_total{reason="start"\|"new_primary"\|"gap"\|"build"}` | counter | replica against primary only, so it carries no `against` label: the shadow's run starts at `F` and cannot break, so it never has an unverified window. Windows left out of every run, each counted once, when the next run anchors, under the stretch's cause (`build` over `gap` over `new_primary` over `start`). `start` grows at a replica's start and at a resync of its state, `new_primary` at a primary restart or a promotion; neither is an alert, and a reconnect to the same primary adds to neither. Alert on `gap`. Nothing is counted while a stretch is still open: during a rolling upgrade `build` stays flat while the builds differ and grows only when the pair converges and a run anchors; meanwhile the stall shows as `verified_through` standing still and the once-per-session "another build" `warn!` |
+| `melin_output_unverified_windows_total{reason="start"\|"new_primary"\|"gap"\|"uncompared"}` | counter | replica against primary only, so it carries no `against` label: the shadow's run starts at `F` and cannot break, so it never has an unverified window. Windows left out of every run, each counted once, when the next run anchors, under the stretch's cause (`uncompared` over `gap` over `new_primary` over `start`). `start` grows at a replica's start and at a resync of its state, `new_primary` at a primary restart or a promotion; neither is an alert, and a reconnect to the same primary adds to neither. Alert on `gap`. Nothing is counted while a stretch is still open: while the primary sends no digests, `uncompared` stays flat and grows only once a primary sends them again and a run anchors; meanwhile the stall shows as `verified_through` standing still and the once-per-session "sends no output digests" `warn!`. A primary on another build is compared, so it adds nothing here |
 | `melin_output_chain_breaks_total` | counter | replica against primary only, as above. Runs ended by a lapped local window, live or during a catch-up; a session start never counts here, whatever its id. Alert on any growth |
 | `melin_output_frames_skipped_total{reason="kind"}` | counter | digest frames of a kind this build does not know |
 | `melin_output_encode_errors_total{copy="live"\|"shadow"}` | counter | reports the encoder refused, folded as failures (decision 4). Every copy counts the same failures when they agree, so growth alone is the application's choice or bug, not a divergence |
@@ -2033,9 +2153,11 @@ cross-node check. Each stays its own commit, and the tree passes at each.
   `DIGEST_BOARD_SLOTS` derived from both ring capacities and `K`),
   `DigestComparator` (decision 6, both modes, with `begin_session`,
   `SessionKind` and `SessionStart`), the `Trip` trait and `Divergence`
-  (decision 6), and `PrimaryPipelineId` (decision 8,
+  (decision 6), `PrimaryPipelineId` (decision 8,
   with a crate-private constructor for step 4's decoder and these
-  tests). Each type and constant
+  tests), and `BuildId` (decision 8, the newtype step 2's build-id
+  function returns and step 3's latch records; the comparator takes
+  none). Each type and constant
   carries the comment justifying its choice (decision 1's reasons for the
   hash and for `RawHasher` rather than an allocating `Hasher`; decision 2's
   for `K`; decision 5's for the seqlock board and `R`).
@@ -2068,9 +2190,12 @@ cross-node check. Each stays its own commit, and the tree passes at each.
   The rustdoc's "every response a node encodes" and the guide's "each
   response a node sends" become "every report a node encodes, sent or
   folded", since replicas and the shadow now encode reports that nobody
-  is sent. The guide also names the routine causes of a repeated or
-  backwards tick (the double call, a restart or restore across a clock
-  step back) under the existing tick rule (finding 7).
+  is sent. The guide also names, under the existing tick rule, the causes
+  of a repeated or backwards tick that remain (the double call per
+  journaled tick, a clock step back on the primary, a failover to a node
+  whose clock is behind), and says they reach every copy alike, so they
+  matter to the application's own clock, not to the agreement between
+  copies (finding 7).
 - Tests, all ungated:
   - folder: the digest of a known window and the chain value after two
     known windows pinned to byte patterns (so the definition cannot drift
@@ -2120,7 +2245,7 @@ cross-node check. Each stays its own commit, and the tree passes at each.
       local window up to the newest run's end, each exactly once, with the
       session starts in the generated sequence a random mix of held-id,
       new-id and `Uncompared` ones and breaks among them: a stretch holding
-      an `Uncompared` session is counted under `build` alone, never also
+      an `Uncompared` session is counted under `uncompared` alone, never also
       under `new_primary` or `gap`, a held-id session start adds nothing,
       and a `Break` adds nothing to the count;
     - the anchor's own window checked by `d` when held, and, when still to
@@ -2157,7 +2282,9 @@ cross-node check. Each stays its own commit, and the tree passes at each.
       nothing either: an expected entry held from before it, at or above
       the gap, is kept and anchors once its local window lands; in every case
       a local window closed before the session start extends the run the
-      session keeps, or the one anchored after it;
+      session keeps, or the one anchored after it (no build enters the
+      comparator, so "no build is ever skipped" needs no test here: its
+      input has none to skip on);
     - `shared_start` mode: verified from `F` with no anchor, chain values
       compared directly;
     - with capacity `DIGEST_BOARD_SLOTS` and the local side closing up to
@@ -2182,6 +2309,13 @@ cross-node check. Each stays its own commit, and the tree passes at each.
   encoder and folds. Each pipeline builder creates the boards.
 - `ServerConfig::no_output_digests` and `--no-output-digests`, on every
   node: no folder and no board when set (decision 2).
+- The node's build id (open question 2): one function hashes the running
+  executable once at startup, and a `ServerConfig::build_id` field
+  defaults to its result. A field rather than a direct read so that a
+  test can give two nodes of one process different builds (step 5's
+  mixed-build case): the one seam that stands in for a second binary.
+  The startup `info!` line names it; step 3's marker and step 4's frames
+  carry it.
 - Encode failures handled as decision 4 says:
   - the folder counts them and rate-limits a `warn!`;
   - both egresses keep `error!`, but only for a reply they were due to
@@ -2228,12 +2362,16 @@ cross-node check. Each stays its own commit, and the tree passes at each.
     features, so the whole pipeline is chain-less) to the pre-merge job's
     chain-off loop;
   - the DPDK egress's adaptation runs under the netns runner through the
-    existing response-stage tests in `dpdk_response.rs`.
+    existing response-stage tests in `dpdk_response.rs`;
+  - the build id: the hashing function, run on the test binary, equals a
+    BLAKE3 of that file read independently; given a path it cannot
+    read, it returns the all-zero id and logs the startup `warn!`
+    (`logs::capture`).
 - Docs: `docs/pipeline-architecture.md` (the response stage folds every
   report; the replica's drain and the shadow encode), the new flag in
   `docs/replication.md`'s CLI table. `CHANGELOG.md` **Changed**:
   `encode_report` must be deterministic; `ServerConfig` gains the public
-  field `no_output_digests` (breaking for a struct literal); a report the
+  fields `no_output_digests` and `build_id` (breaking for a struct literal); a report the
   encoder refuses that no client was due is now logged at `warn!` and
   counted, rather than never encoded. **Added**: the
   `--no-output-digests` flag, `melin_output_encode_errors_total`.
@@ -2246,6 +2384,8 @@ cross-node check. Each stays its own commit, and the tree passes at each.
   cause wins; `is_fenced` unchanged for its readers; the cause in
   `/healthz` and in the raft stand-down's log line.
 - `DivergenceLatch` (in `transport-core`, beside `FenceState`), `trip`,
+  `follow` and the followed build it stamps on a `Detected` stop (decision
+  11; step 4's receivers call it),
   `HaltCause` (`Detected` only; step 4 adds `ClusterHalted`), the `Halted`
   token with its `Drop` recording `Abandoned`, the latch's marker state
   and its claim, the `divergence-marker` writer thread, `MarkerOutcome`
@@ -2292,7 +2432,9 @@ cross-node check. Each stays its own commit, and the tree passes at each.
     first is sent, the second is not. This pins "no reply after the latch
     is observed";
   - `DivergenceLatch`: the first trip wins; it fences and sets shutdown
-    before returning the token; the exit helper's claim, for each of its
+    before returning the token; a `Detected` stop carries the build last
+    passed to `follow` (`None` with no `follow`, or after it was cleared),
+    whatever the trip site; the exit helper's claim, for each of its
     cases (nothing, marker written, marker failed, a stop left
     `Abandoned` by a dropped token: the helper hands the write to a
     writer), and `Pending` or `Claimed` left by a `mem::forget` token or
@@ -2310,7 +2452,14 @@ cross-node check. Each stays its own commit, and the tree passes at each.
     aside);
   - marker: written durably (temporary file, rename), parsed back, every
     field present, each value in full canonical hex, the range and the
-    "window differs itself" flag; `notice` reads `none` in this step; an
+    "window differs itself" flag; `notice` reads `none` in this step; the
+    node's build always, and a `Detected` stop whose latch followed
+    another build (`follow` called directly, since only step 4's receivers
+    call it) writes both, parsed back into `builds`, while one following
+    the same build or none writes one, and an all-zero id reads back as
+    unknown (a latch that followed an all-zero build writes both, the
+    other as `unknown`, and its refusal carries no mixed-build
+    sentence); an
     unparseable marker still refuses;
   - `hex_prefix`: the same prefix for a 16-byte value as for a 32-byte
     hash sharing its first bytes, so the chain's log lines are unchanged;
@@ -2319,7 +2468,9 @@ cross-node check. Each stays its own commit, and the tree passes at each.
   - `node_store.rs`: `refuse_if_diverged` refuses with the marker present,
     and the message names the marker, the cause, the position and the doc
     section, each as the marker holds it, and says a new cluster is the way
-    back; `resolve` on the same store succeeds and moves nothing;
+    back; it carries the mixed-build sentence, naming both builds, exactly
+    when the marker names two that differ; `resolve` on the same store
+    succeeds and moves nothing;
     `server.rs`: `startup_store()` refuses where `store()` does not, and
     a node refused at startup never spawns its raft driver;
   - shadow: a fault-injecting test app whose `restore` leaves a
@@ -2369,7 +2520,8 @@ cross-node check. Each stays its own commit, and the tree passes at each.
     application, and the exit helper returns `NodeDiverged`; the same stub
     through `take_pipeline_for_promotion` (the reconnect-loop top's
     promotion) returns no application either; and with the stub exiting
-    without a trip, both hand the application over as today;
+    without a trip, both hand the application over as today, with the
+    latch's followed build cleared, so a trip after it names none;
   - `DivergenceLatch`: a trip sets the flag the latch was built with,
     and the replica builder passes the node's flag, not
     `pipeline_shutdown`. The builder test asserts that the shadow's latch
@@ -2396,7 +2548,8 @@ cross-node check. Each stays its own commit, and the tree passes at each.
 - `replication/protocol.rs`: `MSG_DIGEST` and `MSG_HALT` with
   encoders returning fixed-size arrays (decision 8), decoders and size
   assertions; `AckFrame` and `HandshakeFrame` gain `flags` and
-  `window_end`, with unknown bits refused; `encode_chain_check` and
+  `window_end`, with unknown bits refused, and `HandshakeFrame` the
+  replica's `build_id`; `encode_chain_check` and
   `encode_rotate` move to the same
   shape. The journal stage then publishes them from the stack. The
   catch-up's `send_buf` (`catchup.rs`), which batches a rotate with data,
@@ -2415,15 +2568,18 @@ cross-node check. Each stays its own commit, and the tree passes at each.
 - Every sender fills `StreamStart` (kernel `tcp_sender.rs` and
   `catchup.rs`'s snapshot path, the DPDK sender and its `join_worker.rs`):
   the output bit unless the node runs with `--no-output-digests`; the
-  build id per open question 2, held in a `ServerConfig` field that
-  defaults to the executable's hash (so step 5's mixed-build test can set
-  it; listed with step 2's field under `CHANGELOG.md` **Changed**); the
-  pipeline's id, the same on every session of that pipeline.
+  node's build id (step 2's `ServerConfig::build_id`); the pipeline's id, the
+  same on every session of that pipeline. Every receiver fills its
+  handshake's `build_id` from the same field.
 - Every receiver records the session's kinds, build and pipeline id from
-  `StreamStart` for its comparator, and warns once when the primary sends
-  no output digests, names an unknown kind or runs another build. Digest
-  frames are decoded and, for now, dropped: no primary sends one until
-  step 5.
+  `StreamStart` (kinds and pipeline id for its comparator, the build
+  through the latch's `follow`, decision 11), and warns once when the
+  primary sends no output digests or names an unknown kind. Every sender records each
+  replica's build from its handshake, for the `peer_build` of a stop that
+  replica tells it of. Both ends log the other's build once at `info!`
+  when it differs from their own (decision 16), and nothing else reads it.
+  Digest frames are decoded and, for now, dropped: no primary sends one
+  until step 5.
 - The cluster-wide stop (decision 11, "The notice and the linger"):
   - `HaltCause::ClusterHalted` and `SessionExit::Stopped(HaltCause)`, with
     its arm in the shared `handle_session_exit`'s exhaustive `match exit`
@@ -2522,7 +2678,8 @@ cross-node check. Each stays its own commit, and the tree passes at each.
   checks the post-snapshot `StreamStart`'s fields gains it).
 - Tests of the stop, unit and ungated:
   - `protocol.rs`: the ack, the handshake and `Halt` round-trip with
-    every flag and cause; unknown bits and causes, and a `window_end`
+    every flag and cause, the handshake with its `build_id`, all-zero
+    included; unknown bits and causes, and a `window_end`
     without `STOPPED`, are refused; a v8 handshake gets the too-short
     error, and a v9-sized one carrying version 8 the version error;
   - `cursors.rs`: a flagged ack trips the latch, returns
@@ -2589,7 +2746,15 @@ cross-node check. Each stays its own commit, and the tree passes at each.
     replicas stop on `Halt`, nothing promotes, and every restart is
     refused;
   - a replica's shadow detects: the primary stops on the flag, and the
-    other replica on the primary's `Halt`;
+    other replica on the primary's `Halt`. The detecting replica runs
+    under another build id (step 2's `ServerConfig::build_id`), so the
+    session's `info!` line names both builds on both ends, and the
+    primary's marker, its `error!` line and its refusal name the
+    replica's build beside its own (`peer_build`, learnt from the
+    handshake), the detecting replica's name the primary's beside its own
+    (the build its latch followed, though its shadow, not its receiver,
+    detected), while the other replica's, on the primary's build, name
+    one;
   - the unaware raft leader. A replica is made raft leader first. Only its
     replication link is then cut by the test proxy, held past
     `HALT_LINGER`, timed so its grace runs out just after the primary's
@@ -2750,12 +2915,16 @@ cross-node check. Each stays its own commit, and the tree passes at each.
     board) breaks the run, counts the gap and re-anchors on the next
     frame, and `verified_through` never moves past the gap; the board read
     in a push waiting for ring space keeps the run unbroken with the input
-    ring full; a session whose `StreamStart` carries another build id
-    compares nothing and a mismatching digest in it does not stop the
-    replica, and when a same-build session follows and anchors, the
-    windows since the last run are counted once, all under
-    `unverified{reason="build"}`, none under `new_primary`; an all-zero
-    build id compares as any build;
+    ring full; a session whose `StreamStart` carries another build id is
+    compared as any other: matching digests advance `verified_through`,
+    and a mismatching one is a `Mismatch` that trips the latch and ends in
+    `SessionExit::Stopped`, its `Detected` stop carrying the primary's
+    build as `peer_build` (the receiver passed it to `follow` at
+    `StreamStart`); the same with an all-zero build id; a session
+    whose `StreamStart` has no output bit compares nothing, and when a
+    digest-sending session follows and anchors, the windows since the
+    last run are counted once, all under `unverified{reason="uncompared"}`,
+    none under `new_primary`;
   - `receiver_transport.rs`, sessions, each case successive sessions of
     `streaming_loop` over the same `ReplicaPipelineHandles` comparator,
     the scripted primary's `StreamStart` naming the pipeline id the case
@@ -2792,7 +2961,7 @@ cross-node check. Each stays its own commit, and the tree passes at each.
       the next frame anchoring anew and the gap counted `gap`, never
       `new_primary`;
     - an uncompared session between two of the same id: the third session
-      re-anchors (`build`);
+      re-anchors (`uncompared`);
     - a catch-up many times longer than the board, through `streaming_loop`
       over the scripted transport like the cases above, so the board is
       read only at the receiver's own read points rather than at a cadence
@@ -2844,17 +3013,20 @@ cross-node check. Each stays its own commit, and the tree passes at each.
     replica, `cluster-halted` by that replica on the primary, by the
     primary on the other replica), nothing promotes, and every restart is
     refused. The same with both replicas faulted, the second stop arriving
-    while the primary is already stopping. And the mixed-build case: the
-    same fault on a replica whose primary is started with another build id (a
-    `ServerConfig` field that defaults to the executable's hash and that
-    `melin-test-node` can set, the one seam that stands in for a second
-    binary) leaves the replica serving, with `verified_through` standing
-    still, `unverified{reason="build"}` still at zero (no run has ended
-    the stretch) and the "another build" `warn!` logged once for the
-    session; the primary is then restarted with the replica's build id,
-    the replica anchors on its first frame, and the windows of the
-    mixed-build stretch are counted under `unverified{reason="build"}`,
-    none under `new_primary`;
+    while the primary is already stopping. And the mixed-build case, the
+    primary started with another build id than its replicas (step 2's
+    `ServerConfig::build_id`, which `melin-test-node` can set, the one seam
+    that stands in for a second binary): healthy under load, both
+    replicas compare it as any other, their checks grow, nothing is
+    counted unverified beyond the replicas' start, and each end logs the
+    other's build once at `info!` per session; then the same fault on a
+    replica stops the whole cluster as above, and every node's marker,
+    `error!` line and refusal name both builds (the detecting replica the
+    primary's, followed from its `StreamStart`, whether its receiver or
+    its shadow tripped first, the primary the replica's as `peer_build`
+    from its handshake, the other replica the primary's from its
+    `StreamStart`), so a mixed-build cluster reads as the likely cause
+    from any one node;
   - integration, reconnect (`output_divergence.rs`, both transports, so
     the DPDK case runs under the runner): a replica behind the test proxy
     (`tests/common/proxy.rs`, bound at `melin_test_node::local_ip` so it
@@ -2870,8 +3042,10 @@ cross-node check. Each stays its own commit, and the tree passes at each.
     a replica that joins mid-run (journal catch-up, then live), one
     restarted from its own snapshot, a primary restarted (recovery replay)
     under traffic, and a promotion, each followed by a sustained run of
-    checks with nothing diverging, ticks on, driven by finding 7's
-    rule-following test app, whose reports carry its tick-driven clock;
+    checks with nothing diverging, ticks on at a short interval, driven
+    by `TickCountingApp` (finding 7), whose reports carry its count of
+    every tick call, so a copy that made one call more or fewer across the
+    transition would stop the cluster;
     each re-anchors once and counts the windows before its anchor as
     unverified, under the reason the transition implies (`start` for the
     replica's join and its own restart, `new_primary` for the primary's
@@ -2888,9 +3062,11 @@ cross-node check. Each stays its own commit, and the tree passes at each.
 - Docs: `docs/replication.md`, "Output verification" extended to the
   replica check. `CHANGELOG.md` **Changed**: a replica whose output
   disagrees with its primary's now stops the whole cluster, as step 4's
-  shadow check does; applications whose `tick` is not idempotent against a
-  time already passed are named as at risk until monotonic sequencer time
-  lands (finding 7).
+  shadow check does, whatever build each runs; so an application upgrade
+  that changes its output for the same input can no longer roll node by
+  node with output digests on (stop every node and start them together on
+  the new build, or switch behaviour at a journaled activation point:
+  docs/building-an-application.md).
 - **Leaves untested:** a chain break end to end (it needs a drain thread
   stalled under report-less traffic past decision 5's headroom, which a
   test cannot arrange without a seam in the drain; the receiver tests with
@@ -2901,12 +3077,13 @@ cross-node check. Each stays its own commit, and the tree passes at each.
   against a restarted chain, is a `Mismatch` on the first frame, the path
   the same-id fault case exercises: a needless stop of the cluster, never
   a missed divergence, and at 128 random bits not a case to plan for); a
-  primary restarted across a clock step back with an
-  application whose `tick` breaks the rule (finding 7): the tick generator
-  reads the wall clock and has no seam a test can step back, and the
-  monotonic-time plan's acceptance tests add exactly that case, which with
-  this plan in place also shows as a divergence until monotonic time
-  lands.
+  primary restarted across a clock step back: the tick generator reads
+  the wall clock and has no seam a test can step back, and that copies
+  make the same tick calls there is `tick_watermark.rs`'s to pin on
+  `main` (finding 7), which the no-false-positive cases above extend to
+  the digest under repeated timestamps; a genuine output difference
+  between two binaries (the mixed-build case injects the fault through
+  `Sizing` under two build ids: the detection path is the same).
 
 ### Step 6. Measurement and the operator runbook
 
@@ -2929,19 +3106,34 @@ cross-node check. Each stays its own commit, and the tree passes at each.
     idle; the unverified tail at failover; queries; nodes without
     snapshots;
   - **what an operator sees**: the `error!` lines on every node, naming
-    who detected and who told whom; the gauges to alert on
-    (`melin_output_diverged`, `melin_cluster_halt_notice`, chain breaks,
-    digests off), the run gauges, each node's marker, the refused
-    restarts;
+    who detected and who told whom, and both builds when they differ;
+    the gauges to alert on (`melin_output_diverged`,
+    `melin_cluster_halt_notice`, chain breaks, digests off), the run
+    gauges, each node's marker, the refused restarts;
   - **consequences**: any divergence, on any node, stops the whole
     cluster: no node answers clients, no node is promoted, and no node
-    restarts. Which copy produced the odd output does not matter: every
-    copy runs the same build, and the build broke its determinism
-    contract. A divergence soon after a restart, a failover or a clock
-    step points first at how the application handles a tick for a time
-    already passed, a rule its contract states and the runtime does not
-    yet make impossible (finding 7); a hardware fault is possible, and
-    the new cluster shows it if the fixed build diverges again;
+    restarts. Which copy produced the odd output does not matter. When
+    the markers name one build, that build broke its determinism
+    contract, or the hosts differ beneath it (a system math library
+    behind a floating-point function the application calls). When they
+    name two, the cluster ran mixed builds that
+    answer the same input differently (an output-changing upgrade rolled
+    node by node, two architectures, per-host builds), and the operator
+    picks the one build the new cluster runs. A divergence that follows
+    a node's restore of a snapshot written before snapshot framing
+    version 5, with its watermark warning in the log, points first at
+    how the application handles a tick for a time already passed
+    (finding 7); a hardware fault is possible, and the new cluster shows
+    it if the fixed build diverges again;
+  - **upgrades** (also in the "Upgrade and rollback notes"): an
+    application upgrade that changes its output for the same input cannot
+    run mixed with the old build while output digests are on, since the
+    first differing report stops the cluster, rightly. Upgrade such a
+    build by stopping every node and starting them together on it (they
+    replay the same journal on one build), or ship it with a journaled
+    activation point (below). An upgrade that keeps the output identical
+    can still roll node by node. A Melin runtime upgrade is a
+    stop-everything upgrade for replication protocol 9 already;
   - **what overrides the stop**, in one place: a manual `PROMOTE` of a
     node that never heard the halt; observational raft steering an
     operator to `PROMOTE` its leader, which may be the unaware node;
@@ -2964,7 +3156,8 @@ cross-node check. Each stays its own commit, and the tree passes at each.
        the segment chain check verifies the splice. Only if no copy
        survives anywhere is a snapshot the broken build wrote the starting
        point, knowingly.
-    4. Replay it once with the fixed build (or, on the same build, with
+    4. Replay it once with the fixed build (after a mixed-build stop, the
+       one build every node will now run; or, on the same build, with
        `--no-output-digests`, which is not a recovery: the replay is one
        more draw of the nondeterminism, and the docs say so), standalone,
        so its shadow writes a snapshot from the fixed build.
@@ -2982,6 +3175,26 @@ cross-node check. Each stays its own commit, and the tree passes at each.
   - the `--no-output-digests` switch, what turning it off gives up, and
     why the window is not configurable (it is part of the digest's
     definition, the same on every node).
+- `docs/building-an-application.md`, "Snapshots and upgrades", gains the
+  upgrade rule above for application authors, and the **journaled
+  activation point** as a pattern: the new build ships both behaviours,
+  keeps the old one until it applies an entry that switches it (an
+  operator command the application journals, either switching at once
+  or naming a later position at which to switch, that position then
+  being part of the journaled state), and keeps the switch in its state
+  and its snapshot. Old and new builds then produce identical output until
+  every node runs the new one, the switch lands at one position on every
+  copy, and replay from any point takes the same branch. The pattern's
+  rules: the activation must be an applied entry, never the wall clock or
+  a node's configuration (both differ by node); old builds must never
+  see it (activate only once every node runs the new build, since an old
+  build would not switch, and diverge, or fail to decode the entry); once
+  activated, there is no rolling back to the old build, which would
+  replay the activating entry without switching and diverge (going back
+  means a new release that keeps the new behaviour, or a new cluster);
+  and the old path stays
+  until a later release, once no journal still replayed predates the
+  activation. The production checklist gains a line for it.
 - `docs/internal/application-api-review-2026-09.md` S8 points here; the
   pipeline architecture doc's responsibilities table names the folders.
 - Tests: the new-cluster procedure as an integration test
@@ -3001,9 +3214,29 @@ cross-node check. Each stays its own commit, and the tree passes at each.
   are copied in.
 - **Leaves untested:** the runbook's prose itself; a hardware fault.
 
-### Step 7. Roadmap: four follow-ups
+### Step 7. Roadmap: five follow-ups
 
-Add four rows to `docs/internal/roadmap.md` ("Next"), roughly:
+Add five rows to `docs/internal/roadmap.md` ("Next"), roughly, the first
+listed first:
+
+> **Offline output qualification** (Medium, next after output digests).
+> A stopped cluster's marker names the first window whose outputs
+> differed. Investigating means reproducing it, and qualifying a build
+> means knowing whether it will diverge before it reaches production. A
+> tool replays a journal, which is input-only and checked by its chain, on
+> two copies of the application. Each copy is folded as a node folds, one
+> copy can be taken through `snapshot`/`restore` as the shadow is, and the
+> tool reports *every* window whose outputs differ, not just the first.
+> No client is answered, so it can run past a divergence. This is the
+> debugging path an observe mode would otherwise have been, without
+> serving on a broken contract. It reuses the folder and the comparator
+> as they are. It also replays from genesis with the fixed build for the
+> new-cluster procedure, so it can provision that step too. Run once per
+> build over the same journal, with their window digests compared, it
+> tells an operator whether an application upgrade keeps output identical,
+> and so may roll node by node, or must go through a full stop or a
+> journaled activation point. Plan:
+> [divergence-detection-2026-10.md](divergence-detection-2026-10.md).
 
 > **Application state digest** (Medium). Output digests catch a divergence
 > only once a report shows it. Two copies whose state differs where no
@@ -3056,7 +3289,7 @@ Add four rows to `docs/internal/roadmap.md` ("Next"), roughly:
 > until enough elections have passed. Raise a fresh raft cluster's terms
 > above the highest journal epoch its peers advertise.
 
-- **Leaves untested:** four roadmap rows.
+- **Leaves untested:** five roadmap rows.
 
 ## What this leaves untested, and why
 
@@ -3067,10 +3300,14 @@ Beyond each step's own list:
 - **The partition limit** is tested only as the documented outcome (step
   4): the cut-off detector stops alone and says so. Nothing asserts what
   the others do, since the design does not promise it.
-- **Mixed builds during a rolling upgrade** are covered by step 5's
-  receiver tests and its mixed-build integration case, which sets the build
-  id through configuration, not by running two binaries: the hash of the
-  executable itself is read by one function, tested on the test binary.
+- **Mixed builds** are covered by step 5's receiver tests and its
+  mixed-build integration case (compared like any pair, and named on
+  every node when the stop fires), which set the build id through
+  configuration, not by running two binaries: the hash of the executable
+  itself is read by one function, tested on the test binary (step 2). A
+  real output difference between two binaries, or between two
+  architectures, is not produced; the injected fault stands in for it,
+  and nothing on the path from the mismatch on depends on its cause.
 - **The fold's cost** is measured, not tested: a wall-clock threshold in a
   test flakes.
 - **The idle delay in seconds** is not asserted: step 5's idle test counts
@@ -3098,26 +3335,42 @@ Beyond each step's own list:
    A digest that must be tamper-evident to a third party is a different
    job: it needs a wider field, so a new frame and a protocol bump, and is
    not what these frames are for.
-2. **Comparing across builds.** A rolling upgrade that changes a report's
+2. **Comparing across builds. Decided (2026-11-04): always compare,
+   whatever the builds.** A rolling upgrade that changes a report's
    layout, or the encoder, makes a mixed pair disagree by design, and under
-   this plan the cluster stops. Options: (a) document that such upgrades run
-   with digests off on the primary; (b) `StreamStart` carries a build id (a
-   BLAKE3 hash of the running executable, read once at startup, in
-   `server-runtime`, which already depends on `blake3` unconditionally; it
-   stays BLAKE3 and 32 bytes, since it is computed once, off every hot
-   path, so decision 1's cost argument does not reach it), and a replica
-   compares only against the same build, and otherwise compares nothing;
-   while the builds differ that shows as `verified_through` standing still
-   and a once-per-session `warn!`, and the stretch's windows are counted
-   `unverified{reason="build"}` only once the pair runs one build again and
-   a run anchors; (c) an application-declared
-   output version, rejected because it is the trait surface this plan
-   avoids. Recommendation: (b). It needs nothing from the application, it
-   only loses coverage while a pair runs two builds, and an operator cannot
-   forget it. A node that cannot read its own executable sends an all-zero
-   id, which a replica treats as matching any build, and logs `warn!` at
-   startup: skipping the check on such hosts would lose it silently, while
-   comparing at worst stops the cluster loudly.
+   this plan the cluster stops. The options were: (a) document that such
+   upgrades run with digests off on the primary; (b) compare only when
+   both ends run the same build, identified by a build id in
+   `StreamStart`, and otherwise compare nothing; (c) an
+   application-declared output version, rejected because it is the trait
+   surface this plan avoids; (d) compare always. (d) is the decision. A
+   replica on another build whose output differs for the same input has
+   diverged: its state no longer matches the primary's, and a failover
+   would show clients another history. Skipping the comparison hides
+   exactly that, and (b) would have hidden it silently in two cases an
+   operator does not think of as an upgrade: a cluster across
+   architectures (a floating-point transcendental function can round
+   differently on x86 and on ARM), and binaries built per host without
+   reproducible-build flags, whose hashes differ although the source is
+   the same, so such a cluster would never have compared at all. The
+   consequence is an upgrade constraint, stated with the guarantee and in
+   the operator docs (step 6): an upgrade that changes output cannot run
+   mixed, and is done by stopping every node, or behind a journaled
+   activation point.
+
+   The build id stays, for diagnosis only: a BLAKE3 hash of the running
+   executable, read once at startup, in `server-runtime`, which already
+   depends on `blake3` unconditionally (it stays BLAKE3 and 32 bytes,
+   since it is computed once, off every hot path, so decision 1's cost
+   argument does not reach it). A primary sends it in `StreamStart` and a
+   replica in its `Handshake` (decision 8), and the stop's `error!` line,
+   its marker and the refusal message name both builds when they differ
+   (decisions 11 and 12), so a mixed-build cluster is plain as the cause.
+   Nothing compares, skips or refuses on it, so it needs no override for
+   builds an operator knows to be equivalent: equivalent builds compare
+   equal by their output. A node that cannot read its own executable
+   sends an all-zero id, printed as an unknown build, and logs `warn!` at
+   startup (decision 16); it is compared like any other.
 3. **Does the promotion gate need tightening for the stop?** Settled by
    `main`, no change needed. The concern was a raft-leading replica whose
    primary link had been down about 2.5 s when the primary stopped: its
@@ -3170,21 +3423,23 @@ Beyond each step's own list:
    broken build's state, and an operator's forced `ACK-POLICY disk` would
    let it take writes. Its two replicas' refusals and the `error!` lines
    are the operator's signal (step 6).
-8. **Ordering against monotonic sequencer time.** (a) Make the
-   monotonic-time plan a build prerequisite of step 3; (b) land steps 1 to
-   5 in any order against it, but release step 5 only with or after it;
-   (c) release independently and rely on the contract and the runbook.
-   Recommendation: (b). Step 3's in-process check compares two copies of
-   one pipeline, which share their watermark's start, so the trap cannot
-   trip it, and holding it back would delay the snapshot/restore check for
-   nothing (finding 7). Step 5 is the first comparison across a restart,
-   and shipping it ahead of monotonic time would make an application's
-   repeated-tick handling, today a silent and rare divergence, the likeliest
-   cause of a cluster-wide stop. The stop would still be correct, which is
-   why (c) is defensible, but an operator's first encounter with the
-   feature should be their own bug, not the runtime's known one. If
-   monotonic time slips, (c) with the Exchange Core's `tick` made
-   idempotent first is the fallback.
+8. **Ordering against monotonic sequencer time. Settled by `main`
+   (merge 87e36302): no ordering.** The options were (a) make the
+   monotonic-time plan a build prerequisite of step 3; (b) land steps 1
+   to 5 in any order against it, but release step 5 only with or after
+   it; (c) release independently and rely on the contract and the
+   runbook. (b) was recommended because step 5 is the first comparison
+   across a restart, and with the tick watermark restarting at 0 at every
+   stage build, an application's repeated-tick handling would have been
+   the likeliest cause of a cluster-wide stop. The watermark is now
+   carried across restart, promotion, snapshot restore and resync
+   (finding 7), so copies applying the same journal make the same tick
+   calls, and the trap step 5 would have sprung is gone. What remains of
+   monotonic time (time going backwards, the double call per journaled
+   `Tick`, the producer race) reaches every copy alike and cannot split
+   them, so it is independent of this plan: neither gates the other's
+   build or release. The one residue, a snapshot written before framing
+   version 5, is named in the runbook (step 6).
 9. **The window, `K`.** 64 (recommended, decision 2), 16, or 256 and up.
    Below 64 the per-window work becomes a visible share of the event
    budget on the response thread, the drain and the receiver, and the
@@ -3247,12 +3502,27 @@ Beyond each step's own list:
   could check, and would be the time to revisit this.
 - Replica-to-replica comparison, majority verdicts, and any attribution
   of a divergence to one copy.
+- An observe mode that detects and logs without stopping. It would mean
+  serving on a contract known to be broken, and once turned on to get
+  past one stop it is easily left on. The switch is on or off
+  (`--no-output-digests`), and debugging goes through the offline tool
+  (step 7).
 - Raft carrying the stop (a log entry, a forwarding RPC, a persisted
   halted state). It would reach a node that missed the data-plane notice,
   which only the documented partition case needs, at the cost of the first
   application data in raft and a raft storage version. Rejected for this
   plan; revisit only if that limit is seen in practice.
 - Making `apply` deterministic: this plan detects nondeterminism; the
-  determinism work removes sources of it. "Monotonic sequencer time" is the
-  one this plan depends on for its release (finding 7, open question 8),
-  not for its build.
+  determinism work removes sources of it. "Monotonic sequencer time" no
+  longer gates this plan: the part that split copies, the tick watermark,
+  is fixed on `main`, and the rest is independent (finding 7, open
+  question 8).
+- Skipping the comparison for a peer on another build, or an override
+  declaring two builds equivalent: copies are compared whatever their
+  builds, and the build id only names them (open question 2).
+- A `melin_output_comparing` gauge (1 while a compared session is live).
+  With every build compared, "not comparing" now means only a primary
+  with digests off or no replica connected, both already visible
+  (`melin_output_digests_enabled`, the replica gauges, the "sends no
+  output digests" `warn!`, `verified_through` standing still). An
+  optional follow-up, not part of these steps.
