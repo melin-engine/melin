@@ -28,7 +28,7 @@ mod raw_replica;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use counter_server::{
     Counter, GET_VALUE_REQUEST, KIND_RESP_ACK, KIND_RESP_REJECTED, KIND_RESP_VALUE,
@@ -38,7 +38,7 @@ use melin_client::{Ack, Connection, Error, Frame};
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::server::ServerConfig;
 use melin_test_node::probe::{
-    PROBE_LIMIT, gauge, journal_head, wait_for_gauge, wait_for_gauge_where,
+    PROBE_LIMIT, gauge, journal_head, wait_for_gauge, wait_for_gauge_where, wait_until,
 };
 
 use halt_cluster::{Fixture, addrs, spawn_node};
@@ -316,11 +316,13 @@ fn a_disk_primary_keeps_answering_once_its_replica_is_gone() {
     // the replica gone before any write, or the writers stopped before
     // the halted primary had answered any.
     let wait_for_bursts = |beyond: u64, what: &str| {
-        let deadline = Instant::now() + PROBE_LIMIT;
-        while bursts.load(Ordering::Acquire) <= beyond {
-            assert!(Instant::now() < deadline, "{what} within {PROBE_LIMIT:?}");
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        wait_until(PROBE_LIMIT, || {
+            if bursts.load(Ordering::Acquire) > beyond {
+                Ok(())
+            } else {
+                Err(what.to_owned())
+            }
+        });
     };
     // At load when the replica goes.
     wait_for_bursts(0, "no burst was answered before the replica went");

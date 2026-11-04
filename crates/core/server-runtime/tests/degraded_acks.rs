@@ -45,7 +45,7 @@ use melin_server_runtime::ack_policy::AckPolicy;
 use melin_test_node::Node;
 use melin_test_node::probe::{
     PROBE_LIMIT, gauge, journal_head, replica_acked_sequences, wait_for_gauge,
-    wait_for_replica_acks,
+    wait_for_replica_acks, wait_until,
 };
 
 use halt_cluster::{Fixture, addrs, spawn_node};
@@ -221,20 +221,18 @@ fn run(policy: AckPolicy, scenario: Scenario) {
     // are in flight at the cut. (Fixed sleeps stood in for this and for
     // the wait above; a host too loaded to run the writers in time left
     // nothing in flight.)
-    let deadline = Instant::now() + PROBE_LIMIT;
-    loop {
+    wait_until(PROBE_LIMIT, || {
         let acked = replica_acked_sequences(health).into_iter().flatten().max();
         let head = journal_head(health);
         if acked.is_some_and(|acked| head > acked) {
-            break;
+            Ok(())
+        } else {
+            Err(format!(
+                "no write was left unacked under the frozen link \
+                 (journaled through {head}, acked through {acked:?})"
+            ))
         }
-        assert!(
-            Instant::now() < deadline,
-            "no write was left unacked under the frozen link within {PROBE_LIMIT:?} \
-             (journaled through {head}, acked through {acked:?})"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    });
 
     // --- Then it breaks: the primary halts. ---
     proxy.cut();

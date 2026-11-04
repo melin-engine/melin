@@ -42,7 +42,9 @@ use melin_journal::{BufferedWriter, JournalEvent, JournalWrite};
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::server::ServerConfig;
-use melin_test_node::probe::{gauge, wait_for_gauge_where_within, wait_for_gauge_within};
+use melin_test_node::probe::{
+    gauge, wait_for_gauge_where_within, wait_for_gauge_within, wait_for_replica_acks_within,
+};
 use melin_wire_protocol::control_codec::{TAG_AUTH_FAILED, TAG_CHALLENGE};
 
 #[path = "../common/raw_replica.rs"]
@@ -542,14 +544,7 @@ fn large_joins_complete_a_tick_at_a_time() {
     assert_acked(&mut conn, "with both replicas attached");
     let head = gauge(primary_health, "melin_journal_sequence").expect("the primary's sequence");
     assert!(head > HISTORY, "the primary's history ends at {head}");
-    for slot in ["0", "1"] {
-        wait_for_gauge_within(
-            primary_health,
-            &format!("melin_replica_acked_sequence{{slot=\"{slot}\"}}"),
-            head,
-            STARTUP_LIMIT,
-        );
-    }
+    wait_for_replica_acks_within(primary_health, head, 2, STARTUP_LIMIT);
 
     // The divergent replica's old lineage: its snapshot archived beside the
     // snapshot, its journal beside the journal, under one index.
