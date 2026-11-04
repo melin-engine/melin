@@ -451,7 +451,7 @@ What was built (`server.rs`):
   primary's, sizing, the latched `ROTATE` cleared; the fence state, the
   advertised tip, the raft driver and the admin endpoint (with its
   `PROMOTE` flag) carry over. The receiver's pipeline is torn down before
-  the primary's is built, by the shared `take_pipeline_for_promotion`, so
+  the primary's is built, by the shared `ReplicaEngine::into_promotion`, so
   the history continues in the same journal from the writer's next
   sequence: nothing lost, repeated or reordered. One DPDK-only step: the
   main thread ran the receiver, pinned to the reader's core once it

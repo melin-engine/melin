@@ -24,10 +24,9 @@ use super::receiver_transport::{
     ControlFrameSource, ReceiverTransport, SessionExit, streaming_loop,
 };
 use super::{
-    IdleEngine, RecoveredReplica, ReplicaPipelineHandles, ResumePoint, ResyncDecision,
-    StreamStartVerdict, build_replica_pipeline_with_threads, handle_resync_verdict,
-    handle_session_exit, journal_failed_while_disconnected, recover_replica_state,
-    sleep_then_double_backoff, take_pipeline_for_promotion, teardown_replica_pipeline,
+    ReplicaEngine, ReplicaState, ResumePoint, ResyncDecision, StreamStartVerdict,
+    build_replica_pipeline_with_threads, handle_resync_verdict, handle_session_exit,
+    journal_failed_while_disconnected, recover_replica_state, sleep_then_double_backoff,
 };
 use crate::uring_teardown::{DrainBackoff, wake_pending_ops};
 use melin_transport_core::replication::protocol::{
@@ -595,28 +594,29 @@ where
     } = control;
     // Recover whenever any journal segment survives — live OR archived;
     // fresh replicas get no engine and the genesis position. See
-    // `recover_replica_state` for the lineage rules. `engine` holds the
-    // application, with the tick watermark of its position, and its
-    // journal writer, in one `Option`, so nothing that replaces the state
-    // can keep the old state's watermark or writer. `position` is the
-    // next handshake's sequence and chain hash, likewise replaced whole.
-    // A resync's recovery replaces both, through `AfterSession::adopt`.
-    let RecoveredReplica {
-        mut engine,
-        mut position,
-    } = recover_replica_state::<A, BufferedWriter<A::Event>>(
+    // `recover_replica_state` for the lineage rules. `state` holds where
+    // the engine is — none, idle (the application, with the tick
+    // watermark of its position, and its journal writer), or owned by a
+    // running pipeline — and the next handshake's sequence and chain hash,
+    // in one value: a resync's recovery (through `AfterSession::adopt`)
+    // and a snapshot transfer replace the whole of it, so nothing that
+    // replaces the state can keep the old state's watermark, writer or
+    // position.
+    let mut state = ReplicaState::from(recover_replica_state::<A, BufferedWriter<A::Event>>(
         store,
         &fence_state,
         lineage_ack_policy,
         sizing,
         prealloc,
-    )?;
+    )?);
     // The fence epoch now reflects the recovered journal (a fresh replica
     // legitimately recovers epoch 0). Seed the advertised sequence from
     // the same recovery before releasing the flag, so the first tip the
     // raft driver trusts is already the recovered high-water mark.
     // Release-store so the driver's Acquire-load sees both.
-    journal_tip.advance(melin_transport_core::WireSeq::new(position.last_sequence));
+    journal_tip.advance(melin_transport_core::WireSeq::new(
+        state.position.last_sequence,
+    ));
     tip_ready.store(true, Ordering::Release);
 
     let mut backoff = std::time::Duration::from_secs(1);
@@ -626,7 +626,6 @@ where
     let mut divergence_resyncs: u32 = 0;
 
     let mut send_buf = Vec::with_capacity(64);
-    let mut pipeline: Option<ReplicaPipelineHandles<A, BufferedWriter<A::Event>>> = None;
 
     // --- Outer reconnect loop ---
     loop {
@@ -634,7 +633,7 @@ where
         // driver may auto-promote from here on if it wins an election.
         primary_link_up.store(false, Ordering::Release);
 
-        if let Some(p) = pipeline.as_ref() {
+        if let ReplicaEngine::Running(p) = &state.engine {
             // The handshake position (sequence and chain hash) must come
             // from ONE FsyncState snapshot — the journal stage keeps
             // flushing while we reconnect, and the primary's handshake
@@ -647,7 +646,7 @@ where
             match p
                 .settled_resume_point(|| shutdown.load(Ordering::Relaxed) || promote.is_requested())
             {
-                ResumePoint::Settled(settled) => position = settled,
+                ResumePoint::Settled(settled) => state.position = settled,
                 // Handled just below, before any handshake.
                 ResumePoint::Interrupted => {}
                 // Torn down here rather than dialing the primary with a
@@ -655,10 +654,9 @@ where
                 ResumePoint::JournalFailed => {
                     let after = handle_session_exit(
                         journal_failed_while_disconnected(),
-                        &mut pipeline,
+                        &mut state,
                         &mut divergence_resyncs,
                         &mut backoff,
-                        position.last_sequence,
                         store,
                         &fence_state,
                         lineage_ack_policy,
@@ -671,7 +669,7 @@ where
                     );
                     // A fatal exit never keeps the pipeline, so going
                     // round again dials only after a resync or not at all.
-                    if let Some(r) = after.adopt(&mut engine, &mut position) {
+                    if let Some(r) = after.adopt(&mut state) {
                         return r;
                     }
                     continue;
@@ -684,14 +682,12 @@ where
         // continues back here, so teardown/promotion handling exists
         // exactly once.
         if shutdown.load(Ordering::Relaxed) {
-            if let Some(p) = pipeline.take() {
-                let _ = teardown_replica_pipeline::<A, BufferedWriter<A::Event>>(p);
-            }
+            state.engine.stop();
             return Ok(None);
         }
         if promote.is_requested() {
             info!("promotion triggered while disconnected");
-            return take_pipeline_for_promotion(&mut pipeline, &mut engine);
+            return state.engine.into_promotion();
         }
 
         // --- Connect and authenticate ---
@@ -771,7 +767,7 @@ where
         // Advertise our fencing epoch. If we are ahead of the primary it
         // sees this and self-demotes (it's a stale ex-primary); see
         // `crate::fence` and the sender's handshake handling.
-        let handshake = position.handshake(fence_state.epoch());
+        let handshake = state.position.handshake(fence_state.epoch());
         send_buf.clear();
         encode_handshake(&handshake, &mut send_buf);
         tcp_writer.write_all(&send_buf)?;
@@ -779,14 +775,9 @@ where
         send_buf.clear();
 
         // --- Protocol negotiation ---
-        // `session_start` is the resume point this streaming session
-        // continues from — the value that anchors the receiver's
-        // sequence-contiguity gate. Derived from local knowledge (our
-        // own handshake, or the verified snapshot), never from the
-        // wire.
         let response_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
         let response = decode_primary_message(&response_frame)?;
-        let (stream_lineage, session_start) = match response {
+        let stream_lineage = match response {
             PrimaryMessage::StreamStart {
                 start_sequence,
                 segment_start_sequence,
@@ -800,12 +791,11 @@ where
                     epoch,
                 },
                 "tcp",
-                &pipeline,
-                &mut engine,
+                &mut state.engine,
                 &fence_state,
                 control,
             )? {
-                StreamStartVerdict::Follow(lineage) => (lineage, position.last_sequence),
+                StreamStartVerdict::Follow(lineage) => lineage,
                 // Disconnect and retry with backoff; the operator's logs
                 // flag the misdirected `--replica-of`.
                 StreamStartVerdict::StalePrimary => {
@@ -827,12 +817,10 @@ where
                     &mut TcpFrameSource {
                         reader: &mut reader,
                     },
-                    &mut pipeline,
-                    &mut engine,
+                    &mut state,
                     store,
                     &fence_state,
                     control,
-                    &mut position,
                     prealloc,
                 )
                 .map_err(|e| -> Box<dyn std::error::Error> { e })?;
@@ -841,11 +829,7 @@ where
                         segment_start_sequence,
                         anchor_hash,
                         genesis_entries,
-                        resume,
-                    } => (
-                        (segment_start_sequence, anchor_hash, genesis_entries),
-                        resume.last_sequence,
-                    ),
+                    } => (segment_start_sequence, anchor_hash, genesis_entries),
                     ResyncDecision::Retry => {
                         // Drop the socket before sleeping — see the auth
                         // failure arm above.
@@ -861,30 +845,38 @@ where
             }
         };
 
-        // --- Build pipeline if absent ---
-        // Over the engine held, or for a fresh replica over a journal
-        // created from the StreamStart lineage (see `take_or_create`).
-        if pipeline.is_none() {
-            let held =
-                IdleEngine::take_or_create(&mut engine, store.journal(), stream_lineage, prealloc)?;
-            pipeline = Some(build_replica_pipeline_with_threads::<A>(
-                held,
-                cores,
-                ring_capacity,
-                staging_mode,
-                snapshot_interval_ms,
-                store,
-                group_commit_delay,
-                Arc::clone(&fence_state),
-                lineage_ack_policy,
-                Arc::clone(pipeline_healthy),
-                sizing,
-            )?);
-        }
+        // The resume point this streaming session continues from — the
+        // value that anchors the receiver's sequence-contiguity gate: our
+        // own handshake's, or the verified snapshot's, which a resync
+        // installed with its engine. Derived from local knowledge, never
+        // from the wire.
+        let session_start = state.position.last_sequence;
 
         // --- Streaming session ---
         let result = {
-            let p = pipeline.as_mut().expect("pipeline must exist by here");
+            // Built if absent, over the engine held, or for a fresh replica
+            // over a journal created from the StreamStart lineage (see
+            // `ensure_running`); a pipeline that survived a disconnect is
+            // reused.
+            let build = |held| {
+                build_replica_pipeline_with_threads::<A>(
+                    held,
+                    cores,
+                    ring_capacity,
+                    staging_mode,
+                    snapshot_interval_ms,
+                    store,
+                    group_commit_delay,
+                    Arc::clone(&fence_state),
+                    lineage_ack_policy,
+                    Arc::clone(pipeline_healthy),
+                    sizing,
+                )
+            };
+            let p =
+                state
+                    .engine
+                    .ensure_running(store.journal(), stream_lineage, prealloc, build)?;
             let input_producer = &mut p.input_producer;
             let journal_cursor = p.journal_cursor.as_ref();
             let stream_marks = &p.stream_marks;
@@ -941,10 +933,9 @@ where
         primary_link_up.store(false, Ordering::Release);
         let after = handle_session_exit(
             result,
-            &mut pipeline,
+            &mut state,
             &mut divergence_resyncs,
             &mut backoff,
-            position.last_sequence,
             store,
             &fence_state,
             lineage_ack_policy,
@@ -957,7 +948,7 @@ where
             sizing,
             prealloc,
         );
-        if let Some(r) = after.adopt(&mut engine, &mut position) {
+        if let Some(r) = after.adopt(&mut state) {
             return r;
         }
     }
@@ -1998,29 +1989,27 @@ mod tests {
         }
 
         // -------------------------------------------------------------
-        // Promotion teardown helper (`take_pipeline_for_promotion`) — the
-        // no-live-pipeline decision branches. With no pipeline to tear
-        // down it hands back the warm state held in the receiver's locals
-        // (a clean promotion) or errors when none is present. Colocated
-        // here for the `App` + `BufferedWriter` fixtures above; the
-        // tick watermark both branches carry, over a live pipeline and
-        // over recovered locals, is tested beside the helper.
+        // Promotion while disconnected (`ReplicaEngine::into_promotion`)
+        // — the no-live-pipeline decision branches. With no pipeline to
+        // tear down it hands back the idle engine (a clean promotion) or
+        // errors when the replica is fresh. Colocated here for the `App` +
+        // `BufferedWriter` fixtures above; the tick watermark both
+        // branches carry, over a live pipeline and over an idle engine, is
+        // tested beside the method.
         // -------------------------------------------------------------
-        type PromoteHandles =
-            crate::replication::ReplicaPipelineHandles<App, BufferedWriter<EvtAdd>>;
+        type PromoteEngine = crate::replication::ReplicaEngine<App, BufferedWriter<EvtAdd>>;
 
         #[test]
-        fn promotion_hands_back_local_state_when_present() {
+        fn promotion_hands_back_an_idle_engine() {
             let dir = tempfile::tempdir().unwrap();
-            let mut pipeline: Option<PromoteHandles> = None;
-            let mut engine = Some(crate::replication::IdleEngine {
+            let engine = PromoteEngine::Idle(crate::replication::IdleEngine {
                 warm: WarmApp::genesis(App),
                 writer: BufferedWriter::<EvtAdd>::create(&dir.path().join("p.journal"), PREALLOC)
                     .unwrap(),
             });
 
-            let result =
-                crate::replication::take_pipeline_for_promotion(&mut pipeline, &mut engine);
+            // By value: the engine is moved into the result.
+            let result = engine.into_promotion();
 
             assert!(
                 matches!(
@@ -2035,17 +2024,11 @@ mod tests {
                 ),
                 "warm state must be promoted, with the watermark it was held with"
             );
-            assert!(engine.is_none(), "state must be moved into the result");
         }
 
         #[test]
         fn promotion_errs_when_no_local_state() {
-            let mut pipeline: Option<PromoteHandles> = None;
-            let mut engine: Option<crate::replication::IdleEngine<App, BufferedWriter<EvtAdd>>> =
-                None;
-
-            let result =
-                crate::replication::take_pipeline_for_promotion(&mut pipeline, &mut engine);
+            let result = PromoteEngine::Fresh.into_promotion();
 
             // Not `expect_err` — the Ok payload (App) isn't `Debug`.
             let err = match result {
