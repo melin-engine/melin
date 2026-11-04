@@ -42,7 +42,7 @@ use melin_journal::{BufferedWriter, JournalEvent, JournalWrite};
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::server::ServerConfig;
-use melin_test_node::probe::{gauge, wait_for_gauge_within};
+use melin_test_node::probe::{gauge, wait_for_gauge_where_within, wait_for_gauge_within};
 use melin_wire_protocol::control_codec::{TAG_AUTH_FAILED, TAG_CHALLENGE};
 
 #[path = "../common/raw_replica.rs"]
@@ -912,17 +912,13 @@ fn an_ack_sent_during_the_catch_up_counts_once_the_joiner_is_live() {
 
     write_history_outlasting_the_queue(&cluster.dir.path().join("primary.journal"));
     let primary = cluster.start_primary();
-    let deadline = Instant::now() + STARTUP_LIMIT;
-    let history_end = loop {
-        if let Some(sequence) = gauge(primary_health, "melin_journal_sequence") {
-            break sequence;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the primary's health endpoint never came up"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    };
+    let history_end = wait_for_gauge_where_within(
+        primary_health,
+        "melin_journal_sequence",
+        "came up",
+        |_| true,
+        STARTUP_LIMIT,
+    );
 
     // The joiner, the primary's only replica (slot 0), reads the catch-up's
     // first entries and acks them as a replica that has journaled them

@@ -919,45 +919,18 @@ fn free_loopback_addr() -> SocketAddr {
         .expect("a free loopback port")
 }
 
-/// The node's count of authenticated connections, from the line its health
-/// endpoint answers a plain connection with:
-/// `OK <active_connections> <journal_seq> <replication_lag> trading|halted`.
-#[cfg(feature = "dpdk")]
-fn active_connections(health: SocketAddr) -> u64 {
-    let mut stream = std::net::TcpStream::connect_timeout(&health, Duration::from_secs(2))
-        .unwrap_or_else(|e| panic!("connect to the health endpoint at {health}: {e}"));
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .expect("set timeout");
-    let mut line = String::new();
-    stream
-        .read_to_string(&mut line)
-        .unwrap_or_else(|e| panic!("read the health line from {health}: {e}"));
-    let mut fields = line.split_whitespace();
-    assert_eq!(fields.next(), Some("OK"), "the health line: {line:?}");
-    fields
-        .next()
-        .and_then(|count| count.parse().ok())
-        .unwrap_or_else(|| panic!("no connection count in the health line: {line:?}"))
-}
-
 /// Wait, at most `within`, for the node's count of authenticated
-/// connections to be `expected`, reading it again every few milliseconds.
-/// Panics with the last count read, and `when`.
+/// connections (`melin_active_connections`) to be `expected`. Panics with
+/// the last count read, and `when`.
 #[cfg(feature = "dpdk")]
 fn wait_for_active(health: SocketAddr, expected: u64, within: Duration, when: &str) {
-    let started = Instant::now();
-    loop {
-        let count = active_connections(health);
-        if count == expected {
-            return;
-        }
-        assert!(
-            started.elapsed() < within,
-            "{when}: the node counts {count} connections, not {expected}, after {within:?}"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    melin_test_node::probe::wait_for_gauge_where_within(
+        health,
+        "melin_active_connections",
+        &format!("reached {expected} ({when})"),
+        |count| count == expected,
+        within,
+    );
 }
 
 // ---------------------------------------------------------------------------

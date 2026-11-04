@@ -46,7 +46,7 @@ pub fn wait_for_gauge(health: SocketAddr, name: &str, value: u64) {
 
 /// Wait, at most `limit`, until `name` reads `value`.
 pub fn wait_for_gauge_within(health: SocketAddr, name: &str, value: u64, limit: Duration) {
-    wait_for_gauge_matching(
+    wait_for_gauge_where_within(
         health,
         name,
         &format!("reached {value}"),
@@ -63,10 +63,12 @@ pub fn wait_for_gauge_where(
     what: &str,
     accept: impl Fn(u64) -> bool,
 ) -> u64 {
-    wait_for_gauge_matching(health, name, what, accept, PROBE_LIMIT)
+    wait_for_gauge_where_within(health, name, what, accept, PROBE_LIMIT)
 }
 
-fn wait_for_gauge_matching(
+/// Wait, at most `limit`, until `name` reads a value `accept` takes, and
+/// return it; the failure says the gauge never `what`.
+pub fn wait_for_gauge_where_within(
     health: SocketAddr,
     name: &str,
     what: &str,

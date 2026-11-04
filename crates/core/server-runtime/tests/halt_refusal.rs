@@ -37,7 +37,9 @@ use counter_server::{
 use melin_client::{Ack, Connection, Error, Frame};
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::server::ServerConfig;
-use melin_test_node::probe::{PROBE_LIMIT, gauge, wait_for_gauge, wait_for_gauge_where};
+use melin_test_node::probe::{
+    PROBE_LIMIT, gauge, journal_head, wait_for_gauge, wait_for_gauge_where,
+};
 
 use halt_cluster::{Fixture, addrs, spawn_node};
 use raw_replica::RawReplica;
@@ -338,15 +340,13 @@ fn a_disk_primary_keeps_answering_once_its_replica_is_gone() {
 
     // The primary's own persisted cursor passes the ticks it journals
     // alone.
-    let alone = gauge(health, "melin_journal_sequence").expect("health is up");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while gauge(health, "melin_journal_sequence").is_none_or(|seq| seq <= alone) {
-        assert!(
-            Instant::now() < deadline,
-            "the primary's persisted cursor stopped at {alone} with no replica attached"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let alone = journal_head(health);
+    wait_for_gauge_where(
+        health,
+        "melin_journal_sequence",
+        &format!("passed {alone} with no replica attached"),
+        |seq| seq > alone,
+    );
 
     let mut conn = fx.client(&primary);
     conn.set_read_timeout(Duration::from_secs(5))

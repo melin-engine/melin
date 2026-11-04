@@ -55,7 +55,7 @@ use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::server::ServerConfig;
 use melin_test_node::probe::{
     admin_command, admin_reply_when_up, admin_until_ok, gauge, wait_for_gauge,
-    wait_for_replica_acks, wait_for_snapshot_where, wait_released,
+    wait_for_gauge_where, wait_for_replica_acks, wait_for_snapshot_where, wait_released,
 };
 use melin_test_node::{Addrs, Node};
 use serial_test::serial;
@@ -350,15 +350,9 @@ impl Pending {
 
 /// Wait until the primary's journal is durable through `sequence`.
 fn wait_durable(health: SocketAddr, sequence: u64) {
-    let deadline = Instant::now() + LIMIT;
-    while gauge(health, DURABLE).is_none_or(|durable| durable < sequence) {
-        assert!(
-            Instant::now() < deadline,
-            "the journal never reached {sequence} (last: {:?})",
-            gauge(health, DURABLE)
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_for_gauge_where(health, DURABLE, &format!("reached {sequence}"), |durable| {
+        durable >= sequence
+    });
 }
 
 /// Wait until the primary has recorded a replica's ack of `sequence`, on
