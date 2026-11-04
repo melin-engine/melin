@@ -41,28 +41,30 @@
 //! 127.0.0.0/8 to `lo`; the crate builds on Linux only (io_uring), so
 //! there is no fallback.
 
+#[path = "common/failover_nodes.rs"]
+mod failover_nodes;
 #[path = "common/port_pool.rs"]
 mod port_pool;
 #[path = "common/proxy.rs"]
 mod proxy;
 
-use std::io::Read;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
 use counter_server::{Counter, KIND_RESP_ACK, RequestDecoder, ResponseEncoder, increment_request};
+use failover_nodes::{NodeSetup, cluster_summary};
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::server::ServerConfig;
 use melin_test_node::probe::{
-    admin_command, gauge, http_metrics, journal_head, wait_for_gauge, wait_for_replica_acks,
+    admin_command, gauge, http_metrics, journal_head, serves_clients, wait_for_gauge,
+    wait_for_replica_acks,
 };
 use melin_test_node::{Addrs, Node};
 use melin_transport_core::replication::archive::lineage_archives_beside;
-use melin_wire_protocol::control_codec::TAG_CHALLENGE;
 use proxy::Proxy;
 use serial_test::serial;
 
@@ -109,25 +111,6 @@ const RE_ELECTION_DEADLINE: Duration = Duration::from_secs(45);
 /// How long a healed cluster is watched for the fallout of a partition:
 /// several election timeouts, and a replica's reconnect and catch-up.
 const HEAL_WATCH: Duration = Duration::from_secs(15);
-
-/// Whether a client connect to `addr` is answered with the auth
-/// Challenge — the definitive "this node serves as primary" signal (a
-/// replica's client listener never accepts).
-fn serves_clients(addr: SocketAddr, patience: Duration) -> bool {
-    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(300)) else {
-        return false;
-    };
-    if stream.set_read_timeout(Some(patience)).is_err() {
-        return false;
-    }
-    let mut len_buf = [0u8; 4];
-    if stream.read_exact(&mut len_buf).is_err() {
-        return false;
-    }
-    let len = u32::from_le_bytes(len_buf) as usize;
-    let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload).is_ok() && payload.first() == Some(&TAG_CHALLENGE)
-}
 
 /// One increment on `conn`, which the node must ack.
 fn acked_write(conn: &mut melin_client::Connection) {
@@ -223,42 +206,6 @@ impl ReplicaLed {
         }
         self.primary.stop();
     }
-}
-
-struct NodeSetup {
-    key: ed25519_dalek::SigningKey,
-    /// Client and replication addresses.
-    addrs: Addrs,
-    /// Where the node's raft listener binds.
-    raft_addr: SocketAddr,
-    health_addr: SocketAddr,
-    admin_addr: SocketAddr,
-}
-
-/// Per-node control-plane state for deadline diagnostics: the raft and
-/// replication gauges of every node, so a timed-out wait reports *which*
-/// formation condition was stuck (replication attach vs. election) and
-/// what each node believed at the time — the servers install no tracing
-/// subscriber under test, so the panic message is the only record.
-fn cluster_summary(nodes: &[NodeSetup]) -> String {
-    nodes
-        .iter()
-        .enumerate()
-        .map(|(i, n)| {
-            let gauges = match http_metrics(n.health_addr) {
-                None => "health endpoint unreachable".to_owned(),
-                Some(body) => body
-                    .lines()
-                    .filter(|l| {
-                        l.starts_with("melin_raft_") || l.starts_with("melin_replicas_connected")
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            };
-            format!("node {}: {gauges}", i + 1)
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// Three nodes' identities and addresses, the shared `authorized_keys`

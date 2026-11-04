@@ -14,6 +14,7 @@ use melin_app::Application;
 use melin_client::{Connection, SigningKey};
 use melin_transport_core::cursors::ReplicaSlotCursors;
 use melin_transport_core::snapshot::{self, SnapshotHeader};
+use melin_wire_protocol::control_codec::TAG_CHALLENGE;
 
 /// How long a gauge may take to reach the value a test waits for, or an
 /// admin endpoint to answer as a test needs: generous, for a slow and
@@ -89,6 +90,22 @@ pub fn wait_for_gauge_where_within(
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Whether a client connect to `addr` is answered, within `patience`, with
+/// the auth challenge: the definitive "this node serves as primary"
+/// signal, since a replica's client listener never accepts. Only the
+/// frame's tag is read: any challenge counts, whatever protocol it speaks.
+pub fn serves_clients(addr: SocketAddr, patience: Duration) -> bool {
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(300)) else {
+        return false;
+    };
+    if stream.set_read_timeout(Some(patience)).is_err() {
+        return false;
+    }
+    // The frame's length prefix, then its tag.
+    let mut head = [0u8; 5];
+    stream.read_exact(&mut head).is_ok() && head[4] == TAG_CHALLENGE
 }
 
 /// The last sequence a running node has journaled durably
