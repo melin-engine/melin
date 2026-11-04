@@ -1880,7 +1880,7 @@ mod tests {
 
     #[test]
     fn loop_final_ack_on_shutdown_includes_durable_sequence() {
-        let (mut producer, _consumer) = ring(16);
+        let (mut producer, mut consumer) = ring(16);
         let cursor = journal_cursor(u64::MAX);
         let shutdown = AtomicBool::new(false);
         let control = control();
@@ -1898,12 +1898,22 @@ mod tests {
         append_input_batch_frame(&mut data2, &[slot(43, 0xFE)]);
         transport.push_data(data2);
 
-        // We need the loop to process at least one batch before
-        // shutdown. Use a thread to set shutdown after a short delay.
+        // The loop must have published both batches before shutdown, so
+        // a helper raises shutdown once it has seen them on the ring. A
+        // fixed delay instead failed whenever the loop's thread was
+        // descheduled for that long: shutdown came first, nothing was
+        // received, and no ack was due.
         let shutdown_ref = &shutdown;
         std::thread::scope(|s| {
-            s.spawn(|| {
-                std::thread::sleep(std::time::Duration::from_millis(10));
+            s.spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                let mut published = 0;
+                while published < 2 && std::time::Instant::now() < deadline {
+                    published += drain(&mut consumer).len();
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                // On the deadline too, so the loop returns and the
+                // assertions below report what it did.
                 shutdown_ref.store(true, Ordering::Release);
             });
 

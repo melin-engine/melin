@@ -43,8 +43,10 @@
 //! going, so failover completes only if they notice the silence
 //! themselves (the replica end of a DPDK link's liveness deadline).
 
-use std::io::Read;
-use std::net::{SocketAddr, TcpStream};
+#[path = "common/failover_nodes.rs"]
+mod failover_nodes;
+
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -52,14 +54,13 @@ use counter_server::{
     Counter, CounterEvent, GET_VALUE_REQUEST, KIND_RESP_ACK, KIND_RESP_VALUE, RequestDecoder,
     ResponseEncoder, increment_request,
 };
+use failover_nodes::{NodeSetup, cluster_summary};
 use melin_client::{Connection, SigningKey};
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::server::ServerConfig;
-use melin_test_node::Addrs;
-use melin_test_node::probe::{admin_until_ok, http_metrics, wait_for_gauge};
+use melin_test_node::probe::{admin_until_ok, http_metrics, serves_clients, wait_for_gauge};
 use melin_transport_core::test_ports::free_addr;
-use melin_wire_protocol::control_codec::TAG_CHALLENGE;
 use serial_test::serial;
 
 /// Port range this file owns for `free_addr` (10000..15000);
@@ -105,58 +106,6 @@ fn connect_authenticated(addr: SocketAddr, key: &SigningKey) -> Connection {
     conn.set_read_timeout(Duration::from_secs(30))
         .expect("set timeout");
     conn
-}
-
-/// Whether a client connect to `addr` is answered with the auth
-/// Challenge — the definitive "this node serves as primary" signal (a
-/// replica's client listener never accepts). Only the tag is looked at:
-/// any challenge counts, whatever protocol it speaks.
-fn serves_clients(addr: SocketAddr, patience: Duration) -> bool {
-    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(300)) else {
-        return false;
-    };
-    if stream.set_read_timeout(Some(patience)).is_err() {
-        return false;
-    }
-    let mut head = [0u8; 5];
-    stream.read_exact(&mut head).is_ok() && head[4] == TAG_CHALLENGE
-}
-
-// ---------------------------------------------------------------------------
-// Cluster scaffolding
-// ---------------------------------------------------------------------------
-
-struct NodeSetup {
-    key: SigningKey,
-    /// Client and replication addresses.
-    addrs: Addrs,
-    raft_addr: SocketAddr,
-    health_addr: SocketAddr,
-    admin_addr: SocketAddr,
-}
-
-/// Deadline diagnostics: the servers install no tracing subscriber
-/// under test, so the panic message is the only record of what each
-/// node believed when a wait timed out.
-fn cluster_summary(nodes: &[NodeSetup]) -> String {
-    nodes
-        .iter()
-        .enumerate()
-        .map(|(i, n)| {
-            let gauges = match http_metrics(n.health_addr) {
-                None => "health endpoint unreachable".to_owned(),
-                Some(body) => body
-                    .lines()
-                    .filter(|l| {
-                        l.starts_with("melin_raft_") || l.starts_with("melin_replicas_connected")
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            };
-            format!("node {}: {gauges}", i + 1)
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 #[test]

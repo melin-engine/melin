@@ -407,10 +407,9 @@ fn every_pipelined_request_is_answered_and_paired_by_id() {
 fn a_full_input_ring_answers_busy_and_keeps_the_connection() {
     /// Requests sent past the ring's capacity, all of which find it full.
     const PAST_THE_RING: usize = 20_000;
-    /// How long the busy answers must stay still before the test takes
-    /// the node to have read every request: the reader takes millions a
-    /// second, so a pause this long means it has caught up.
-    const SETTLED: Duration = Duration::from_secs(2);
+    /// How long the node is given to read every request once sent: far
+    /// more than it needs, bounded so a stall fails with a message.
+    const READ_ALL: Duration = Duration::from_secs(60);
     /// Writes the node may apply ahead of the replies read: a few tens of
     /// kilobytes of replies, well inside what a node buffers for a client.
     const WINDOW: u64 = 1024;
@@ -463,13 +462,24 @@ fn a_full_input_ring_answers_busy_and_keeps_the_connection() {
             read_answers(&mut conn, &mut busy, &mut applied);
         }
     }
-    // Every request handed over, and read by the node: the busies stop.
-    let mut last_change = (busy.len(), Instant::now());
-    while conn.connection().unsent() > 0 || last_change.1.elapsed() < SETTLED {
+    // Every request handed over, and read by the node. The node answers
+    // in the order it reads, and the held stage keeps the ring full, so
+    // the last request is shed, and its busy answer is the node's word
+    // that it has read them all. (A quiet spell in the busy answers was
+    // taken for that before, and a node descheduled for the spell failed
+    // the test.)
+    let last = RequestId(total as u64);
+    let deadline = Instant::now() + READ_ALL;
+    while busy.last() != Some(&last) {
+        assert!(
+            Instant::now() < deadline,
+            "the node never answered the last request {last:?} within {READ_ALL:?}: \
+             {} busy, {} applied, {} bytes unsent",
+            busy.len(),
+            applied.len(),
+            conn.connection().unsent()
+        );
         read_answers(&mut conn, &mut busy, &mut applied);
-        if busy.len() != last_change.0 {
-            last_change = (busy.len(), Instant::now());
-        }
         std::thread::sleep(Duration::from_millis(1));
     }
     assert!(
