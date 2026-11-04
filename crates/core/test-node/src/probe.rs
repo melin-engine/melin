@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use melin_app::Application;
 use melin_client::{Connection, SigningKey};
+use melin_transport_core::cursors::ReplicaSlotCursors;
 use melin_transport_core::snapshot::{self, SnapshotHeader};
 
 /// How long a gauge may take to reach the value a test waits for, or an
@@ -85,6 +86,54 @@ fn wait_for_gauge_matching(
             "{name} never {what} within {limit:?} (last: {last:?})"
         );
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The last sequence a running node has journaled durably
+/// (`melin_journal_sequence`). Panics if its health endpoint does not
+/// report it: a test reads it from a node it knows is up.
+pub fn journal_head(health: SocketAddr) -> u64 {
+    gauge(health, "melin_journal_sequence")
+        .unwrap_or_else(|| panic!("{health} reports no melin_journal_sequence"))
+}
+
+/// The sequence the primary has recorded as acked by the replica in each
+/// slot, `None` for a slot whose gauge it does not report.
+pub fn replica_acked_sequences(health: SocketAddr) -> [Option<u64>; ReplicaSlotCursors::SLOTS] {
+    std::array::from_fn(|slot| {
+        gauge(
+            health,
+            &format!("melin_replica_acked_sequence{{slot=\"{slot}\"}}"),
+        )
+    })
+}
+
+/// Wait, at most [`PROBE_LIMIT`], until the primary at `health` has
+/// recorded the ack of `sequence` from at least `replicas` of its
+/// replicas, on whichever slots they took: 1 for "a replica holds it",
+/// 2 for "both do".
+pub fn wait_for_replica_acks(health: SocketAddr, sequence: u64, replicas: usize) {
+    assert!(
+        (1..=ReplicaSlotCursors::SLOTS).contains(&replicas),
+        "a primary has {} replica slots, not {replicas}",
+        ReplicaSlotCursors::SLOTS
+    );
+    let deadline = Instant::now() + PROBE_LIMIT;
+    loop {
+        let acked = replica_acked_sequences(health);
+        let holding = acked
+            .iter()
+            .filter(|slot| slot.is_some_and(|seq| seq >= sequence))
+            .count();
+        if holding >= replicas {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{replicas} replica(s) never acked {sequence} within {PROBE_LIMIT:?} \
+             (acked per slot: {acked:?})"
+        );
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 

@@ -55,7 +55,7 @@ use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::server::ServerConfig;
 use melin_test_node::probe::{
     admin_command, admin_reply_when_up, admin_until_ok, gauge, wait_for_gauge,
-    wait_for_snapshot_where, wait_released,
+    wait_for_replica_acks, wait_for_snapshot_where, wait_released,
 };
 use melin_test_node::{Addrs, Node};
 use serial_test::serial;
@@ -364,26 +364,7 @@ fn wait_durable(health: SocketAddr, sequence: u64) {
 /// Wait until the primary has recorded a replica's ack of `sequence`, on
 /// whichever slot it took.
 fn wait_for_replica_ack(health: SocketAddr, sequence: u64) {
-    let deadline = Instant::now() + LIMIT;
-    let acked = || {
-        ["0", "1"]
-            .iter()
-            .filter_map(|slot| {
-                gauge(
-                    health,
-                    &format!("melin_replica_acked_sequence{{slot=\"{slot}\"}}"),
-                )
-            })
-            .max()
-    };
-    while acked().is_none_or(|acked| acked < sequence) {
-        assert!(
-            Instant::now() < deadline,
-            "the primary never recorded the ack of {sequence} (last: {:?})",
-            acked()
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_for_replica_acks(health, sequence, 1);
 }
 
 /// Under `disk+ram`, `ACK-POLICY disk` takes effect only once the replica
