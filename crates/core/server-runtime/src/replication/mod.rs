@@ -478,11 +478,71 @@ pub(super) struct ReplicaPipelineHandles<A: Application, W: Send + 'static> {
     pub(super) shadow_handle: Option<std::thread::JoinHandle<()>>,
 }
 
+/// A replica's handshake position: the last sequence its journal holds
+/// and the journal chain hash through it, which the primary checks
+/// against its own chain at that sequence.
+///
+/// One value rather than two loose ones because the pair is only
+/// meaningful whole: a sequence from one point of the journal and a hash
+/// from another is indistinguishable from divergence to the primary, and
+/// would have it resync a healthy replica. Every place that replaces the
+/// position (recovery, the reconnect's settled fsync state, a resync's
+/// reset) replaces both halves at once.
+///
+/// In-process only: the wire [`Handshake`] keeps its own fields and is
+/// built from this at the encode site ([`Self::handshake`]).
+///
+/// [`Handshake`]: melin_transport_core::replication::protocol::Handshake
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ChainPosition {
+    /// The last journaled sequence, 0 when nothing is held. `u64`, not
+    /// `WireSeq`: it is the handshake's field and the streaming session's
+    /// resume point, both plain `u64`s in the journal's sequence space.
+    pub(super) last_sequence: u64,
+    /// The journal's BLAKE3 chain hash through `last_sequence`; all zeros
+    /// when nothing is held or the `hash-chain` feature is off. `[u8; 32]`:
+    /// a BLAKE3 digest, as the journal and the wire both carry it.
+    pub(super) chain_hash: [u8; 32],
+}
+
+impl ChainPosition {
+    /// A replica holding nothing: a fresh one, or one whose lineage a
+    /// resync has just archived. The primary answers it with a snapshot
+    /// or a stream from genesis.
+    pub(super) const GENESIS: Self = Self {
+        last_sequence: 0,
+        chain_hash: [0u8; 32],
+    };
+
+    /// The wire handshake advertising this position under fencing `epoch`.
+    pub(super) fn handshake(
+        self,
+        epoch: u64,
+    ) -> melin_transport_core::replication::protocol::Handshake {
+        melin_transport_core::replication::protocol::Handshake {
+            last_sequence: self.last_sequence,
+            chain_hash: self.chain_hash,
+            epoch,
+        }
+    }
+}
+
+/// The position one fsync state records: its sequence and hash, taken
+/// from the one seqlock read, so they cannot tear.
+impl From<melin_transport_core::pipeline::FsyncState> for ChainPosition {
+    fn from(state: melin_transport_core::pipeline::FsyncState) -> Self {
+        Self {
+            last_sequence: state.journal_seq.get(),
+            chain_hash: state.chain_hash,
+        }
+    }
+}
+
 /// What [`ReplicaPipelineHandles::settled_resume_point`] found.
 pub(super) enum ResumePoint {
-    /// The fsync state, covering every slot published into the input
-    /// ring: the next handshake's pair.
-    Settled(melin_transport_core::pipeline::FsyncState),
+    /// The position of the fsync state covering every slot published
+    /// into the input ring: the next handshake's.
+    Settled(ChainPosition),
     /// The journal stage has died. The pipeline cannot take another
     /// session; the caller tears it down as a fatal session exit would
     /// (see [`journal_failed_while_disconnected`]) instead of dialing.
@@ -527,7 +587,7 @@ impl<A: Application, W: Send + 'static> ReplicaPipelineHandles<A, W> {
             }
             let state = self.chain_hash_lock.load();
             if state.input_ring_seq.get() >= published {
-                outcome = ResumePoint::Settled(state);
+                outcome = ResumePoint::Settled(state.into());
                 return true;
             }
             interrupted()
@@ -867,16 +927,16 @@ pub(super) const MAX_INPROCESS_DIVERGENCE_RESYNCS: u32 = 1;
 /// leaves archives with no live segment, and recovery handles that
 /// layout; treating it as a fresh replica would discard local durable
 /// history and then fail `create_new` against the surviving lineage).
-/// Returns `(None, 0, zeros)` for a genuinely fresh replica. The
-/// recovered application comes with the tick watermark of its position,
-/// which the pipeline built over it starts from. Also seeds the fencing
-/// epoch from the recovered journal.
+/// Returns `(None, ChainPosition::GENESIS)` for a genuinely fresh
+/// replica. The recovered application comes with the tick watermark of
+/// its position, which the pipeline built over it starts from. Also
+/// seeds the fencing epoch from the recovered journal.
 ///
 /// Called at receiver startup, and again after a mid-stream chain
 /// divergence tears the pipeline down: the on-disk journal is
 /// self-consistent (merely forked from the primary's history), so
-/// recovery re-derives a truthful handshake pair `(last_sequence,
-/// chain_hash)` and the next connection takes the primary's
+/// recovery re-derives a truthful handshake [`ChainPosition`] and the
+/// next connection takes the primary's
 /// HashMismatch → archive → reseed path in-process.
 #[allow(clippy::type_complexity)]
 pub(super) fn recover_replica_state<A, W>(
@@ -889,7 +949,7 @@ pub(super) fn recover_replica_state<A, W>(
     // What the recovered journal is reopened with: the node's reservation
     // (`ServerConfig::journal_prealloc`).
     prealloc: melin_journal::Prealloc,
-) -> Result<(Option<IdleEngine<A, W>>, u64, [u8; 32]), Box<dyn std::error::Error>>
+) -> Result<(Option<IdleEngine<A, W>>, ChainPosition), Box<dyn std::error::Error>>
 where
     A: Application,
     W: melin_journal::JournalWrite<A::Event>,
@@ -903,7 +963,7 @@ where
         // Nothing held, so no policy either (the epoch stays: fencing
         // never moves it back).
         lineage_policy.store(None);
-        return Ok((None, 0u64, [0u8; 32]));
+        return Ok((None, ChainPosition::GENESIS));
     }
     let engine = if snapshot_path.try_exists()? {
         tracing::info!("recovering replica from snapshot + journal");
@@ -917,9 +977,12 @@ where
         <A as Application>::prefault(&mut app, sizing);
         melin_transport_core::JournaledApp::<A, W>::recover(app, journal_path, prealloc)?
     };
-    let next = engine.next_sequence();
-    let last = next.saturating_sub(1);
-    let hash = engine.chain_hash().unwrap_or([0u8; 32]);
+    let position = ChainPosition {
+        last_sequence: engine.next_sequence().saturating_sub(1),
+        // `None` only with `hash-chain` off, which the handshake
+        // advertises as all zeros.
+        chain_hash: engine.chain_hash().unwrap_or([0u8; 32]),
+    };
     // Seed the lineage from the replica's own recovered journal.
     // Streaming `EpochBump`s and the snapshot-resync path raise the epoch
     // later.
@@ -930,7 +993,7 @@ where
         app,
         tick_watermark,
     };
-    Ok((Some(IdleEngine { warm, writer }), last, hash))
+    Ok((Some(IdleEngine { warm, writer }), position))
 }
 
 /// Adopt a lineage recovered from disk (a journal replay, or a snapshot
@@ -968,8 +1031,7 @@ pub(in crate::replication) enum AfterSession<A, W> {
     /// the replica through archive + re-seed.
     Resync {
         engine: Option<IdleEngine<A, W>>,
-        last_sequence: u64,
-        chain_hash: [u8; 32],
+        position: ChainPosition,
     },
     /// A plain disconnect or a stream contiguity break — backoff has
     /// already been applied (and the flags checked); the caller
@@ -985,19 +1047,16 @@ impl<A, W> AfterSession<A, W> {
     pub(in crate::replication) fn adopt(
         self,
         engine: &mut Option<IdleEngine<A, W>>,
-        last_sequence: &mut u64,
-        chain_hash: &mut [u8; 32],
+        position: &mut ChainPosition,
     ) -> Option<ReceiverResult<A, W>> {
         match self {
             AfterSession::Return(r) => Some(r),
             AfterSession::Resync {
                 engine: recovered_engine,
-                last_sequence: recovered_sequence,
-                chain_hash: recovered_hash,
+                position: recovered_position,
             } => {
                 *engine = recovered_engine;
-                *last_sequence = recovered_sequence;
-                *chain_hash = recovered_hash;
+                *position = recovered_position;
                 None
             }
             AfterSession::Reconnect => None,
@@ -1128,11 +1187,7 @@ where
                 sizing,
                 prealloc,
             ) {
-                Ok((engine, seq, hash)) => AfterSession::Resync {
-                    engine,
-                    last_sequence: seq,
-                    chain_hash: hash,
-                },
+                Ok((engine, position)) => AfterSession::Resync { engine, position },
                 Err(e) => AfterSession::Return(Err(e)),
             }
         }
@@ -1264,7 +1319,7 @@ struct ResyncTransfer<A> {
 /// What [`handle_resync_verdict`] resolved a `NeedSnapshot` /
 /// `HashMismatch` verdict to.
 pub(in crate::replication) enum ResyncDecision {
-    /// Resync complete — resume streaming from `resume_sequence` on the
+    /// Resync complete — resume streaming from `resume` on the
     /// re-seeded lineage `(segment_start_sequence, anchor_hash)`. The
     /// recovered engine is left in the receiver's `engine` local.
     Ready {
@@ -1273,7 +1328,10 @@ pub(in crate::replication) enum ResyncDecision {
         /// The lineage's genesis length, as the seeded segment's header
         /// (and the `StreamStart` that matched it) records it.
         genesis_entries: Option<u64>,
-        resume_sequence: u64,
+        /// The snapshot's position — its sequence, and the chain hash the
+        /// primary announced and the loaded snapshot confirmed: what the
+        /// replica now holds.
+        resume: ChainPosition,
     },
     /// The transfer failed network-shaped (drop / restart mid-body); the
     /// caller backs off and reconnects. The pre-resync lineage is already
@@ -1399,8 +1457,7 @@ pub(in crate::replication) fn handle_resync_verdict<A, W, S>(
     store: &NodeStore,
     fence_state: &melin_transport_core::fence::FenceState,
     control: &ReplicaControlPlane,
-    last_sequence: &mut u64,
-    chain_hash: &mut [u8; 32],
+    position: &mut ChainPosition,
     // What the seeded journal is opened with: the node's reservation
     // (`ServerConfig::journal_prealloc`). A parameter rather than the old
     // writer's, which a fresh replica does not have.
@@ -1420,7 +1477,7 @@ where
     // suffix).
     if divergent {
         tracing::warn!(
-            last_sequence = *last_sequence,
+            last_sequence = position.last_sequence,
             "primary reports chain divergence — archiving local journal, resyncing from snapshot"
         );
     } else {
@@ -1468,8 +1525,7 @@ where
     })?;
     // Archived — a retried handshake must present as a fresh replica,
     // holding no lineage, so no policy either.
-    *last_sequence = 0;
-    *chain_hash = [0u8; 32];
+    *position = ChainPosition::GENESIS;
     control.lineage_ack_policy.store(None);
     // The advertised control-plane tip must shrink with the holdings:
     // the archived suffix is either divergent (never acked) or being
@@ -1577,7 +1633,10 @@ where
                 segment_start_sequence,
                 anchor_hash,
                 genesis_entries,
-                resume_sequence: snap_sequence,
+                resume: ChainPosition {
+                    last_sequence: snap_sequence,
+                    chain_hash: snap_chain_hash,
+                },
             })
         }
         other => Err(format!("expected StreamStart after snapshot, got {other:?}").into()),
@@ -1874,14 +1933,16 @@ mod tests {
         encode_input_batch(&[slot], buf).expect("encode InputBatch");
     }
 
+    /// Built from a position as the receivers build it: each half lands
+    /// in its own wire field, and the epoch beside them.
     #[test]
     fn handshake_encode_decode_round_trip() {
-        let handshake = Handshake {
+        let handshake = ChainPosition {
             last_sequence: 42,
             chain_hash: [0xAB; 32],
-            // Non-zero so a dropped/zeroed epoch field is caught.
-            epoch: 9,
-        };
+        }
+        // Non-zero so a dropped/zeroed epoch field is caught.
+        .handshake(9);
         let mut buf = Vec::new();
         encode_handshake(&handshake, &mut buf);
 
@@ -2051,7 +2112,7 @@ mod tests {
 
         // No lineage at all.
         std::fs::write(&staging, b"debris").expect("write staging");
-        let (engine, _, _) = recover_replica_state::<counter_server::Counter, Writer>(
+        let (engine, position) = recover_replica_state::<counter_server::Counter, Writer>(
             &store,
             &fence,
             &SharedLineagePolicy::new(None),
@@ -2060,6 +2121,7 @@ mod tests {
         )
         .expect("recover");
         assert!(engine.is_none());
+        assert_eq!(position, ChainPosition::GENESIS, "a fresh replica");
         assert!(!staging.exists(), "swept without a journal");
 
         // A journal that holds history, which the adopt guard never touches.
@@ -2076,7 +2138,7 @@ mod tests {
         // creator's or fall back to the default.
         let node = melin_journal::Prealloc::for_rotation(2 * 1024 * 1024);
         assert_ne!(node, PREALLOC);
-        let (engine, last, _) = recover_replica_state::<counter_server::Counter, Writer>(
+        let (engine, position) = recover_replica_state::<counter_server::Counter, Writer>(
             &store,
             &fence,
             &SharedLineagePolicy::new(None),
@@ -2084,8 +2146,16 @@ mod tests {
             node,
         )
         .expect("recover");
-        assert_eq!(engine.expect("recovered").writer.prealloc(), node);
-        assert_eq!(last, 1);
+        let engine = engine.expect("recovered");
+        assert_eq!(engine.writer.prealloc(), node);
+        // The pair is the recovered journal's, read together.
+        assert_eq!(
+            position,
+            ChainPosition {
+                last_sequence: 1,
+                chain_hash: engine.writer.chain_hash().unwrap_or([0u8; 32]),
+            }
+        );
         assert!(!staging.exists(), "swept beside a journal with history");
     }
 
@@ -2134,7 +2204,7 @@ mod tests {
             .tick_watermark();
         assert_ne!(replayed, TickWatermark::GENESIS);
 
-        let (engine, last, _) = recover_replica_state::<counter_server::Counter, CounterWriter>(
+        let (engine, position) = recover_replica_state::<counter_server::Counter, CounterWriter>(
             &store,
             &melin_transport_core::fence::FenceState::new(0),
             &SharedLineagePolicy::new(None),
@@ -2142,7 +2212,7 @@ mod tests {
             PREALLOC,
         )
         .expect("recover");
-        assert_eq!(last, 2);
+        assert_eq!(position.last_sequence, 2);
         (replayed, engine)
     }
 
@@ -2304,7 +2374,11 @@ mod tests {
         std::fs::create_dir(&replica_dir).expect("replica dir");
         let store = NodeStore::resolve(replica_dir.join("r.journal"), None).expect("store");
         let (mut pipeline, mut engine) = (None, None);
-        let (mut last_sequence, mut chain_hash) = (0, [0u8; 32]);
+        // A position the resync must replace whole: the archived lineage's.
+        let mut position = ChainPosition {
+            last_sequence: 7,
+            chain_hash: [0x5A; 32],
+        };
         let decision = handle_resync_verdict::<TickCountingApp, TickWriter, _>(
             false,
             &mut receiver_transport::ScriptedFrames::from_published(&frames),
@@ -2313,12 +2387,23 @@ mod tests {
             &store,
             &melin_transport_core::fence::FenceState::new(0),
             &ReplicaControlPlane::new(),
-            &mut last_sequence,
-            &mut chain_hash,
+            &mut position,
             PREALLOC,
         )
         .expect("resync");
-        assert!(matches!(decision, ResyncDecision::Ready { .. }));
+        // The archive leaves the handshake at genesis; the decision
+        // carries the snapshot's position, sequence and hash together.
+        assert_eq!(position, ChainPosition::GENESIS);
+        let ResyncDecision::Ready { resume, .. } = decision else {
+            panic!("the transfer completes");
+        };
+        assert_eq!(
+            resume,
+            ChainPosition {
+                last_sequence: 3,
+                chain_hash: primary.chain_hash().unwrap_or([0u8; 32]),
+            }
+        );
         let IdleEngine {
             warm: WarmApp {
                 app,
@@ -4373,14 +4458,19 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
             fsync.store(melin_transport_core::pipeline::FsyncState {
                 journal_seq: melin_transport_core::WireSeq::new(13),
-                chain_hash: [0u8; 32],
+                chain_hash: [0xC3; 32],
                 input_ring_seq: melin_transport_core::cursors::RingPos::new(3),
             });
         });
         let outcome = handles.settled_resume_point(|| false);
         journal.join().unwrap();
+        // The sequence and the hash of the one fsync state, together.
+        let covering = ChainPosition {
+            last_sequence: 13,
+            chain_hash: [0xC3; 32],
+        };
         assert!(
-            matches!(outcome, ResumePoint::Settled(s) if s.journal_seq.get() == 13),
+            matches!(outcome, ResumePoint::Settled(s) if s == covering),
             "resumes past the ring's slots"
         );
     }
@@ -4393,7 +4483,7 @@ mod tests {
         let (handles, _consumer) = handles_fixture(8, reader);
         assert!(matches!(
             handles.settled_resume_point(|| false),
-            ResumePoint::Settled(s) if s.journal_seq.get() == 10
+            ResumePoint::Settled(s) if s.last_sequence == 10
         ));
     }
 

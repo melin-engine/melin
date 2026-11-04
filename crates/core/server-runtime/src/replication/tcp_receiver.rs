@@ -31,8 +31,8 @@ use super::{
 };
 use crate::uring_teardown::{DrainBackoff, wake_pending_ops};
 use melin_transport_core::replication::protocol::{
-    Ack, Handshake, MAX_CONTROL_FRAME, MAX_DATA_FRAME, PrimaryMessage, decode_primary_message,
-    encode_ack, encode_handshake, read_frame,
+    Ack, MAX_CONTROL_FRAME, MAX_DATA_FRAME, PrimaryMessage, decode_primary_message, encode_ack,
+    encode_handshake, read_frame,
 };
 
 /// Force the kernel to send a TCP ACK immediately rather than holding
@@ -594,25 +594,25 @@ where
         pipeline_healthy,
     } = control;
     // Recover whenever any journal segment survives — live OR archived;
-    // fresh replicas get `(None, 0, zeros)`. See `recover_replica_state`
-    // for the lineage rules. `engine` holds the application, with the
-    // tick watermark of its position, and its journal writer, in one
-    // `Option`, so nothing that replaces the state can keep the old
-    // state's watermark or writer.
-    let (mut engine, mut last_sequence, mut chain_hash) =
-        recover_replica_state::<A, BufferedWriter<A::Event>>(
-            store,
-            &fence_state,
-            lineage_ack_policy,
-            sizing,
-            prealloc,
-        )?;
+    // fresh replicas get `(None, ChainPosition::GENESIS)`. See
+    // `recover_replica_state` for the lineage rules. `engine` holds the
+    // application, with the tick watermark of its position, and its
+    // journal writer, in one `Option`, so nothing that replaces the state
+    // can keep the old state's watermark or writer. `position` is the
+    // next handshake's sequence and chain hash, likewise replaced whole.
+    let (mut engine, mut position) = recover_replica_state::<A, BufferedWriter<A::Event>>(
+        store,
+        &fence_state,
+        lineage_ack_policy,
+        sizing,
+        prealloc,
+    )?;
     // The fence epoch now reflects the recovered journal (a fresh replica
     // legitimately recovers epoch 0). Seed the advertised sequence from
     // the same recovery before releasing the flag, so the first tip the
     // raft driver trusts is already the recovered high-water mark.
     // Release-store so the driver's Acquire-load sees both.
-    journal_tip.advance(melin_transport_core::WireSeq::new(last_sequence));
+    journal_tip.advance(melin_transport_core::WireSeq::new(position.last_sequence));
     tip_ready.store(true, Ordering::Release);
 
     let mut backoff = std::time::Duration::from_secs(1);
@@ -631,7 +631,7 @@ where
         primary_link_up.store(false, Ordering::Release);
 
         if let Some(p) = pipeline.as_ref() {
-            // The handshake pair (last_sequence, chain_hash) must come
+            // The handshake position (sequence and chain hash) must come
             // from ONE FsyncState snapshot — the journal stage keeps
             // flushing while we reconnect, and the primary's handshake
             // validation recomputes its chain at exactly the sequence
@@ -643,10 +643,7 @@ where
             match p
                 .settled_resume_point(|| shutdown.load(Ordering::Relaxed) || promote.is_requested())
             {
-                ResumePoint::Settled(fsync_state) => {
-                    last_sequence = fsync_state.journal_seq.get();
-                    chain_hash = fsync_state.chain_hash;
-                }
+                ResumePoint::Settled(settled) => position = settled,
                 // Handled just below, before any handshake.
                 ResumePoint::Interrupted => {}
                 // Torn down here rather than dialing the primary with a
@@ -657,7 +654,7 @@ where
                         &mut pipeline,
                         &mut divergence_resyncs,
                         &mut backoff,
-                        last_sequence,
+                        position.last_sequence,
                         store,
                         &fence_state,
                         lineage_ack_policy,
@@ -670,7 +667,7 @@ where
                     );
                     // A fatal exit never keeps the pipeline, so going
                     // round again dials only after a resync or not at all.
-                    if let Some(r) = after.adopt(&mut engine, &mut last_sequence, &mut chain_hash) {
+                    if let Some(r) = after.adopt(&mut engine, &mut position) {
                         return r;
                     }
                     continue;
@@ -770,11 +767,7 @@ where
         // Advertise our fencing epoch. If we are ahead of the primary it
         // sees this and self-demotes (it's a stale ex-primary); see
         // `crate::fence` and the sender's handshake handling.
-        let handshake = Handshake {
-            last_sequence,
-            chain_hash,
-            epoch: fence_state.epoch(),
-        };
+        let handshake = position.handshake(fence_state.epoch());
         send_buf.clear();
         encode_handshake(&handshake, &mut send_buf);
         tcp_writer.write_all(&send_buf)?;
@@ -808,7 +801,7 @@ where
                 &fence_state,
                 control,
             )? {
-                StreamStartVerdict::Follow(lineage) => (lineage, last_sequence),
+                StreamStartVerdict::Follow(lineage) => (lineage, position.last_sequence),
                 // Disconnect and retry with backoff; the operator's logs
                 // flag the misdirected `--replica-of`.
                 StreamStartVerdict::StalePrimary => {
@@ -835,8 +828,7 @@ where
                     store,
                     &fence_state,
                     control,
-                    &mut last_sequence,
-                    &mut chain_hash,
+                    &mut position,
                     prealloc,
                 )
                 .map_err(|e| -> Box<dyn std::error::Error> { e })?;
@@ -845,10 +837,10 @@ where
                         segment_start_sequence,
                         anchor_hash,
                         genesis_entries,
-                        resume_sequence,
+                        resume,
                     } => (
                         (segment_start_sequence, anchor_hash, genesis_entries),
-                        resume_sequence,
+                        resume.last_sequence,
                     ),
                     ResyncDecision::Retry => {
                         // Drop the socket before sleeping — see the auth
@@ -948,7 +940,7 @@ where
             &mut pipeline,
             &mut divergence_resyncs,
             &mut backoff,
-            last_sequence,
+            position.last_sequence,
             store,
             &fence_state,
             lineage_ack_policy,
@@ -961,7 +953,7 @@ where
             sizing,
             prealloc,
         );
-        if let Some(r) = after.adopt(&mut engine, &mut last_sequence, &mut chain_hash) {
+        if let Some(r) = after.adopt(&mut engine, &mut position) {
             return r;
         }
     }

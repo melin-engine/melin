@@ -1589,17 +1589,17 @@ where
     A::QueryResponse: Send + 'static,
 {
     // Recover local state from journal whenever any segment survives —
-    // live OR archived; fresh replicas get `(None, 0, zeros)`.
+    // live OR archived; fresh replicas get `(None, ChainPosition::GENESIS)`.
     // See `recover_replica_state` for the lineage rules, and the
-    // kernel-TCP receiver for why `engine` is one `Option`.
-    let (mut engine, mut last_sequence, mut chain_hash) =
-        recover_replica_state::<A, BufferedWriter<A::Event>>(
-            store,
-            &fence_state,
-            &control.lineage_ack_policy,
-            sizing,
-            prealloc,
-        )?;
+    // kernel-TCP receiver for why `engine` is one `Option` and
+    // `position` one value.
+    let (mut engine, mut position) = recover_replica_state::<A, BufferedWriter<A::Event>>(
+        store,
+        &fence_state,
+        &control.lineage_ack_policy,
+        sizing,
+        prealloc,
+    )?;
     // Fence epoch now reflects the recovered journal; seed the advertised
     // sequence from the same recovery, then let the raft driver trust
     // this node's tip. See the kernel-TCP `run_receiver`.
@@ -1613,7 +1613,7 @@ where
         lineage_ack_policy,
         pipeline_healthy,
     } = control;
-    journal_tip.advance(melin_transport_core::WireSeq::new(last_sequence));
+    journal_tip.advance(melin_transport_core::WireSeq::new(position.last_sequence));
     tip_ready.store(true, Ordering::Release);
 
     // Exponential backoff for reconnection: 1s → 2s → 4s → … → 30s max.
@@ -1653,7 +1653,7 @@ where
         primary_link_up.store(false, Ordering::Release);
 
         // Refresh handshake state from the running pipeline, if any.
-        // The (last_sequence, chain_hash) pair must come from ONE
+        // The position (sequence and chain hash) must come from ONE
         // FsyncState snapshot — a torn pair read from two sources while
         // the journal stage keeps flushing trips the primary's
         // handshake chain validation (false divergence; see the
@@ -1663,10 +1663,7 @@ where
             match p
                 .settled_resume_point(|| shutdown.load(Ordering::Relaxed) || promote.is_requested())
             {
-                ResumePoint::Settled(fsync_state) => {
-                    last_sequence = fsync_state.journal_seq.get();
-                    chain_hash = fsync_state.chain_hash;
-                }
+                ResumePoint::Settled(settled) => position = settled,
                 // Handled just below, before any handshake.
                 ResumePoint::Interrupted => {}
                 // Torn down here rather than dialing the primary with a
@@ -1678,7 +1675,7 @@ where
                         &mut pipeline,
                         &mut divergence_resyncs,
                         &mut backoff,
-                        last_sequence,
+                        position.last_sequence,
                         store,
                         &fence_state,
                         lineage_ack_policy,
@@ -1692,7 +1689,7 @@ where
                     );
                     // A fatal exit never keeps the pipeline, so going
                     // round again dials only after a resync or not at all.
-                    if let Some(r) = after.adopt(&mut engine, &mut last_sequence, &mut chain_hash) {
+                    if let Some(r) = after.adopt(&mut engine, &mut position) {
                         return r;
                     }
                     continue;
@@ -1879,11 +1876,7 @@ where
         // Send handshake. Advertise our fencing epoch so a stale primary
         // self-demotes when it sees we are ahead (see `crate::fence`).
         send_buf.clear();
-        let handshake = Handshake {
-            last_sequence,
-            chain_hash,
-            epoch: fence_state.epoch(),
-        };
+        let handshake = position.handshake(fence_state.epoch());
         encode_handshake(&handshake, &mut send_buf);
         transport.queue_send(handle, &send_buf);
         send_buf.clear();
@@ -1981,8 +1974,7 @@ where
                                 store,
                                 &fence_state,
                                 control,
-                                &mut last_sequence,
-                                &mut chain_hash,
+                                &mut position,
                                 prealloc,
                             );
                             match decision {
@@ -1990,11 +1982,17 @@ where
                                     segment_start_sequence,
                                     anchor_hash,
                                     genesis_entries,
-                                    resume_sequence,
+                                    resume,
                                 }) => {
-                                    // DPDK resumes streaming from `last_sequence`
-                                    // (the TCP path uses a separate `session_start`).
-                                    last_sequence = resume_sequence;
+                                    // DPDK resumes streaming from `position`
+                                    // (the TCP path uses a separate `session_start`
+                                    // and leaves its `position` as it was). The
+                                    // whole position is taken, chain hash included,
+                                    // so it never holds the snapshot sequence beside
+                                    // the archive step's zeroed hash; either way it is
+                                    // replaced (settled resume point or `adopt`)
+                                    // before the next handshake reads it.
+                                    position = resume;
                                     break 'handshake Some((
                                         segment_start_sequence,
                                         anchor_hash,
@@ -2109,9 +2107,9 @@ where
                 handle,
                 send_buf: std::mem::take(&mut send_buf),
             };
-            // `last_sequence` is the session's resume point — updated to
-            // the snapshot sequence after a transfer, so it anchors the
-            // contiguity gate on both negotiation paths.
+            // `position` is the session's resume point — updated to the
+            // snapshot's after a transfer, so it anchors the contiguity
+            // gate on both negotiation paths.
             let r = streaming_loop::<DpdkReceiverTransport<'_>, A::Event>(
                 &mut dpdk_transport,
                 input_producer,
@@ -2120,7 +2118,7 @@ where
                 control,
                 pipeline_depth,
                 cores.reader.wait,
-                last_sequence,
+                position.last_sequence,
                 std::mem::take(&mut recv_buf),
                 None,
                 stream_marks,
@@ -2136,7 +2134,7 @@ where
             &mut pipeline,
             &mut divergence_resyncs,
             &mut backoff,
-            last_sequence,
+            position.last_sequence,
             store,
             &fence_state,
             lineage_ack_policy,
@@ -2155,7 +2153,7 @@ where
             sizing,
             prealloc,
         );
-        if let Some(r) = after.adopt(&mut engine, &mut last_sequence, &mut chain_hash) {
+        if let Some(r) = after.adopt(&mut engine, &mut position) {
             return r;
         }
     }
