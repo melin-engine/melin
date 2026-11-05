@@ -41,9 +41,15 @@ impl Logs {
     /// A subscriber writing every event at `max_level` or more severe into
     /// this sink, one line each, without colour codes: `<LEVEL> <target>:
     /// <message> <field>=<value> ...` after a timestamp.
+    ///
+    /// The timestamp is the time since the subscriber was made, read from
+    /// the monotonic clock, not the wall clock the default timer reads: Miri
+    /// runs this crate's tests isolated from the host, which refuses a
+    /// wall-clock read, and an elapsed time orders a test's lines as well.
     pub fn subscriber(&self, max_level: Level) -> impl Subscriber + Send + Sync + 'static {
         let writer = self.clone();
         tracing_subscriber::fmt()
+            .with_timer(tracing_subscriber::fmt::time::Uptime::default())
             .with_ansi(false)
             .with_max_level(max_level)
             .with_writer(move || writer.clone())
