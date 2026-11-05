@@ -256,6 +256,16 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Fixed
 
+- **`melin_transport_core::test_ports::free_addr` (behind `test-utils`)
+  no longer hands a test process a port another test process still
+  uses.** Each port it hands out is now claimed, with a lock file in
+  `$XDG_RUNTIME_DIR/melin-test-ports` (or, where that is not set,
+  `melin-test-ports-<uid>` in the system temp directory), until the
+  process exits, and no other process is given a claimed port. The bind probe alone let a port whose
+  server had stopped go to a concurrent test, while the first test's
+  clients still dialled it: under nextest, a stopped primary's
+  replication port went to another cluster test's raft listener, and the
+  replica redialling its primary reached that listener instead.
 - **A kernel-TCP replica whose primary stops answering no longer delays
   its own promotion by up to two minutes.** The replica dialled its
   primary with a blocking connect, so against a host that answers
