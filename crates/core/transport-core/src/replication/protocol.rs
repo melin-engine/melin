@@ -21,6 +21,9 @@ pub const MSG_CHALLENGE: u8 = 0x03;
 pub const MSG_CHALLENGE_RESPONSE: u8 = 0x04;
 pub const MSG_AUTH_OK: u8 = 0x05;
 pub const MSG_AUTH_FAILED: u8 = 0x06;
+/// In place of `AuthOk`: the replica's key verified, but it speaks an
+/// older protocol than this primary. Carries the primary's version.
+pub const MSG_VERSION_REFUSED: u8 = 0x07;
 pub const MSG_STREAM_START: u8 = 0x10;
 pub const MSG_NEED_SNAPSHOT: u8 = 0x11;
 pub const MSG_HASH_MISMATCH: u8 = 0x12;
@@ -56,8 +59,15 @@ pub const MSG_HEARTBEAT: u8 = 0x30;
 /// 0x05), which a v7 replica refuses as an unknown entry mid-stream, and
 /// `StreamStart` and `Heartbeat` no longer carry the policy byte (a
 /// replica judges by the changes its lineage holds), so both frames
-/// changed layout.
-pub const REPL_PROTOCOL_VERSION: u16 = 8;
+/// changed layout;
+/// 9 = the version moves into authentication: the replica states its own
+/// in `ChallengeResponse`, and the primary admits one at or above its own
+/// with an `AuthOk` naming the session's version, or answers
+/// `VersionRefused`. Each side states one version and the newer one
+/// decides whether it can speak the other's, so a later release can talk
+/// down to this one without another refused session (the handshake's
+/// check stays, against the session's version).
+pub const REPL_PROTOCOL_VERSION: u16 = 9;
 
 /// Maximum frame size for control messages (handshake, ack, etc.).
 /// `InputBatch` frames can be much larger (up to a full 512 KiB ring chunk).
@@ -192,6 +202,40 @@ pub enum PrimaryMessage {
     },
 }
 
+/// A decoded `ChallengeResponse`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChallengeResponse {
+    pub signature: [u8; 64],
+    pub pubkey: [u8; 32],
+    /// The replication protocol version the sender speaks; `None` when it
+    /// states none: a replica on v8 or earlier, or a control-plane link,
+    /// whose version is exchanged after authentication.
+    pub protocol_version: Option<u16>,
+}
+
+/// The answer to a `ChallengeResponse`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthResult {
+    /// The key is accepted. `protocol_version` is the version the session
+    /// runs at, which a replication primary states and a v8 primary or a
+    /// control-plane peer does not (`None`).
+    Ok { protocol_version: Option<u16> },
+    /// The key is refused.
+    Failed,
+    /// The key is accepted, but the replica speaks an older protocol than
+    /// the primary, whose version this is.
+    VersionRefused { protocol_version: u16 },
+}
+
+/// Whether a primary admits a replica stating `stated` (`None`: a replica
+/// on v8 or earlier, which states none): one at or above this primary's
+/// version, which is trusted to speak this one. A newer replica that gets
+/// that wrong sends a frame this primary cannot decode, which ends the
+/// session.
+pub fn admits_replica_version(stated: Option<u16>) -> bool {
+    stated.is_some_and(|version| version >= REPL_PROTOCOL_VERSION)
+}
+
 /// Messages from replica to primary.
 #[derive(Debug)]
 pub enum ReplicaMessage {
@@ -239,12 +283,34 @@ struct ChallengeFrame {
     nonce: [u8; 32],
 }
 
+/// The response as a control-plane (raft) link sends it: its version is
+/// exchanged separately, after authentication. Also the prefix of the
+/// replication form below, and the whole of a v8 replica's.
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 #[repr(C)]
 struct ChallengeResponseFrame {
     tag: u8,
     signature: [u8; 64],
     pubkey: [u8; 32],
+}
+
+/// The response as a replica sends it: the unversioned frame plus the
+/// replica's [`REPL_PROTOCOL_VERSION`], appended last so a v8 primary,
+/// which reads the frame by prefix, still verifies the signature.
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct VersionedChallengeResponseFrame {
+    response: ChallengeResponseFrame,
+    protocol_version: U16,
+}
+
+/// `AuthOk` and `VersionRefused` as a replication primary sends them: the
+/// tag and the primary's version. Frozen, so any later replica reads it.
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct VersionFrame {
+    tag: u8,
+    protocol_version: U16,
 }
 
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
@@ -310,6 +376,8 @@ const _: () = assert!(core::mem::size_of::<HandshakeFrame>() == 51);
 const _: () = assert!(core::mem::size_of::<AckFrame>() == 17);
 const _: () = assert!(core::mem::size_of::<ChallengeFrame>() == 33);
 const _: () = assert!(core::mem::size_of::<ChallengeResponseFrame>() == 97);
+const _: () = assert!(core::mem::size_of::<VersionedChallengeResponseFrame>() == 99);
+const _: () = assert!(core::mem::size_of::<VersionFrame>() == 3);
 const _: () = assert!(core::mem::size_of::<SnapshotBeginFrame>() == 49);
 const _: () = assert!(core::mem::size_of::<SnapshotEndFrame>() == 5);
 const _: () = assert!(core::mem::size_of::<HeartbeatFrame>() == 9);
@@ -363,23 +431,70 @@ pub fn encode_challenge(nonce: &[u8; 32], buf: &mut Vec<u8>) {
     buf.extend_from_slice(payload);
 }
 
-/// Encode a ChallengeResponse message (replica → primary).
-pub fn encode_challenge_response(signature: &[u8; 64], pubkey: &[u8; 32], buf: &mut Vec<u8>) {
-    let frame = ChallengeResponseFrame {
+fn challenge_response_frame(signature: &[u8; 64], pubkey: &[u8; 32]) -> ChallengeResponseFrame {
+    ChallengeResponseFrame {
         tag: MSG_CHALLENGE_RESPONSE,
         signature: *signature,
         pubkey: *pubkey,
+    }
+}
+
+/// Encode a ChallengeResponse message (replica → primary), stating this
+/// node's [`REPL_PROTOCOL_VERSION`].
+pub fn encode_challenge_response(signature: &[u8; 64], pubkey: &[u8; 32], buf: &mut Vec<u8>) {
+    let frame = VersionedChallengeResponseFrame {
+        response: challenge_response_frame(signature, pubkey),
+        protocol_version: U16::new(REPL_PROTOCOL_VERSION),
     };
     let payload = frame.as_bytes();
     write_length_prefix(buf, payload.len() as u32);
     buf.extend_from_slice(payload);
 }
 
-/// Encode an AuthOk message (primary → replica).
+/// Encode a ChallengeResponse stating no version, for a control-plane
+/// (raft) link: it exchanges its own protocol version after
+/// authentication, which the replication protocol's version has no
+/// bearing on.
+pub fn encode_unversioned_challenge_response(
+    signature: &[u8; 64],
+    pubkey: &[u8; 32],
+    buf: &mut Vec<u8>,
+) {
+    let frame = challenge_response_frame(signature, pubkey);
+    let payload = frame.as_bytes();
+    write_length_prefix(buf, payload.len() as u32);
+    buf.extend_from_slice(payload);
+}
+
+fn encode_version_frame(tag: u8, buf: &mut Vec<u8>) {
+    let frame = VersionFrame {
+        tag,
+        protocol_version: U16::new(REPL_PROTOCOL_VERSION),
+    };
+    let payload = frame.as_bytes();
+    write_length_prefix(buf, payload.len() as u32);
+    buf.extend_from_slice(payload);
+}
+
+/// Encode an AuthOk message (primary → replica), naming the session's
+/// version, which is this primary's own.
 pub fn encode_auth_ok(buf: &mut Vec<u8>) {
+    encode_version_frame(MSG_AUTH_OK, buf);
+}
+
+/// Encode an AuthOk naming no version, for a control-plane (raft) link
+/// (see [`encode_unversioned_challenge_response`]).
+pub fn encode_unversioned_auth_ok(buf: &mut Vec<u8>) {
     let payload_len: u32 = 1;
     buf.extend_from_slice(&payload_len.to_le_bytes());
     buf.push(MSG_AUTH_OK);
+}
+
+/// Encode a VersionRefused message (primary → replica), in place of
+/// AuthOk to a replica older than this primary, naming this primary's
+/// version.
+pub fn encode_version_refused(buf: &mut Vec<u8>) {
+    encode_version_frame(MSG_VERSION_REFUSED, buf);
 }
 
 /// Encode an AuthFailed message (primary → replica).
@@ -557,9 +672,12 @@ pub fn decode_challenge(payload: &[u8]) -> io::Result<[u8; 32]> {
     Ok(frame.nonce)
 }
 
-/// Decode a ChallengeResponse payload → (signature, pubkey).
-pub fn decode_challenge_response(payload: &[u8]) -> io::Result<([u8; 64], [u8; 32])> {
-    let (frame, _) = ChallengeResponseFrame::ref_from_prefix(payload)
+/// Decode a ChallengeResponse payload, in either form: the unversioned one
+/// (a v8 replica, or a control-plane link) or the replication one, which
+/// states a version. A length between the two is refused, never read as
+/// either.
+pub fn decode_challenge_response(payload: &[u8]) -> io::Result<ChallengeResponse> {
+    let (frame, rest) = ChallengeResponseFrame::ref_from_prefix(payload)
         .map_err(|_| io::Error::other("challenge response too short"))?;
     if frame.tag != MSG_CHALLENGE_RESPONSE {
         return Err(io::Error::other(format!(
@@ -567,19 +685,45 @@ pub fn decode_challenge_response(payload: &[u8]) -> io::Result<([u8; 64], [u8; 3
             MSG_CHALLENGE_RESPONSE, frame.tag
         )));
     }
-    Ok((frame.signature, frame.pubkey))
+    let protocol_version = if rest.is_empty() {
+        None
+    } else {
+        let (version, _) = U16::ref_from_prefix(rest)
+            .map_err(|_| io::Error::other("challenge response's version truncated"))?;
+        Some(version.get())
+    };
+    Ok(ChallengeResponse {
+        signature: frame.signature,
+        pubkey: frame.pubkey,
+        protocol_version,
+    })
 }
 
-/// Decode an auth result payload → true if AuthOk, false if AuthFailed.
-pub fn decode_auth_result(payload: &[u8]) -> io::Result<bool> {
-    if payload.is_empty() {
+/// Decode an auth result payload: AuthOk (naming the session's version,
+/// or, from a v8 primary or a control-plane peer, none), AuthFailed, or
+/// VersionRefused.
+pub fn decode_auth_result(payload: &[u8]) -> io::Result<AuthResult> {
+    let Some(&tag) = payload.first() else {
         return Err(io::Error::other("empty auth result"));
-    }
-    match payload[0] {
-        MSG_AUTH_OK => Ok(true),
-        MSG_AUTH_FAILED => Ok(false),
+    };
+    let stated_version = || {
+        VersionFrame::ref_from_prefix(payload)
+            .map(|(frame, _)| frame.protocol_version.get())
+            .map_err(|_| io::Error::other("auth result's version truncated"))
+    };
+    match tag {
+        MSG_AUTH_OK if payload.len() == 1 => Ok(AuthResult::Ok {
+            protocol_version: None,
+        }),
+        MSG_AUTH_OK => Ok(AuthResult::Ok {
+            protocol_version: Some(stated_version()?),
+        }),
+        MSG_AUTH_FAILED => Ok(AuthResult::Failed),
+        MSG_VERSION_REFUSED => Ok(AuthResult::VersionRefused {
+            protocol_version: stated_version()?,
+        }),
         other => Err(io::Error::other(format!(
-            "expected AuthOk/AuthFailed, got 0x{other:02x}"
+            "expected AuthOk/AuthFailed/VersionRefused, got 0x{other:02x}"
         ))),
     }
 }
@@ -777,9 +921,8 @@ mod tests {
         );
     }
 
-    /// The primary refuses a replica speaking another protocol version,
-    /// naming both — v7 in particular, which would refuse an ack-policy
-    /// change mid-stream as an unknown entry.
+    /// The primary refuses a handshake at another protocol version than
+    /// the session's, naming both.
     #[test]
     fn a_handshake_from_another_protocol_version_is_refused() {
         let mut buf = Vec::new();
@@ -795,12 +938,118 @@ mod tests {
             decode_replica_message(&buf[4..]).unwrap(),
             ReplicaMessage::Handshake(_)
         ));
-        assert_eq!(REPL_PROTOCOL_VERSION, 8);
+        assert_eq!(REPL_PROTOCOL_VERSION, 9);
 
         let version_at = buf.len() - 2;
-        buf[version_at..].copy_from_slice(&7u16.to_le_bytes());
-        let err = decode_replica_message(&buf[4..]).expect_err("v7 replica");
+        buf[version_at..].copy_from_slice(&8u16.to_le_bytes());
+        let err = decode_replica_message(&buf[4..]).expect_err("v8 replica");
         let msg = err.to_string();
-        assert!(msg.contains("v7") && msg.contains("v8"), "{msg}");
+        assert!(msg.contains("v8") && msg.contains("v9"), "{msg}");
+    }
+
+    fn payload(encode: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+        let mut buf = Vec::new();
+        encode(&mut buf);
+        let len = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
+        assert_eq!(len, buf.len() - 4, "the length prefix covers the payload");
+        buf.split_off(4)
+    }
+
+    /// A replica's response states its version, after the 97 bytes a v8
+    /// primary reads by prefix.
+    #[test]
+    fn a_replica_challenge_response_states_its_version() {
+        let sent = payload(|buf| encode_challenge_response(&[0xAA; 64], &[0xBB; 32], buf));
+        assert_eq!(sent.len(), 99);
+        assert_eq!(&sent[97..], &REPL_PROTOCOL_VERSION.to_le_bytes());
+        assert_eq!(
+            decode_challenge_response(&sent).unwrap(),
+            ChallengeResponse {
+                signature: [0xAA; 64],
+                pubkey: [0xBB; 32],
+                protocol_version: Some(REPL_PROTOCOL_VERSION),
+            }
+        );
+    }
+
+    /// The unversioned form, a raft link's and a v8 replica's, is the
+    /// versioned one's prefix, and decodes as stating none.
+    #[test]
+    fn an_unversioned_challenge_response_states_none() {
+        let sent =
+            payload(|buf| encode_unversioned_challenge_response(&[0xAA; 64], &[0xBB; 32], buf));
+        let versioned = payload(|buf| encode_challenge_response(&[0xAA; 64], &[0xBB; 32], buf));
+        assert_eq!(sent, versioned[..97]);
+        let decoded = decode_challenge_response(&sent).unwrap();
+        assert_eq!(decoded.protocol_version, None);
+        assert_eq!(
+            (decoded.signature, decoded.pubkey),
+            ([0xAA; 64], [0xBB; 32])
+        );
+    }
+
+    /// A response too short for its signature and key, or with a single
+    /// byte where a version would be, is refused rather than guessed at.
+    #[test]
+    fn a_truncated_challenge_response_is_refused() {
+        let sent = payload(|buf| encode_challenge_response(&[0xAA; 64], &[0xBB; 32], buf));
+        for len in [10, 96, 98] {
+            assert!(
+                decode_challenge_response(&sent[..len]).is_err(),
+                "{len} bytes"
+            );
+        }
+    }
+
+    /// Every auth answer decodes to what was sent, the replication ones
+    /// with this primary's version.
+    #[test]
+    fn auth_results_round_trip() {
+        let ours = Some(REPL_PROTOCOL_VERSION);
+        for (sent, expected) in [
+            (
+                payload(encode_auth_ok),
+                AuthResult::Ok {
+                    protocol_version: ours,
+                },
+            ),
+            (
+                payload(encode_unversioned_auth_ok),
+                AuthResult::Ok {
+                    protocol_version: None,
+                },
+            ),
+            (payload(encode_auth_failed), AuthResult::Failed),
+            (
+                payload(encode_version_refused),
+                AuthResult::VersionRefused {
+                    protocol_version: REPL_PROTOCOL_VERSION,
+                },
+            ),
+        ] {
+            assert_eq!(decode_auth_result(&sent).unwrap(), expected);
+        }
+    }
+
+    /// A version cut short is a malformed answer, not a v8 primary's.
+    #[test]
+    fn a_truncated_auth_result_is_refused() {
+        for sent in [payload(encode_auth_ok), payload(encode_version_refused)] {
+            assert!(decode_auth_result(&sent[..2]).is_err());
+        }
+        assert!(decode_auth_result(&[]).is_err());
+        assert!(decode_auth_result(&[0x42]).is_err());
+    }
+
+    /// A primary admits a replica at or above its own version, and refuses
+    /// an older one, including one that states none.
+    #[test]
+    fn a_primary_admits_replicas_at_or_above_its_version() {
+        assert!(admits_replica_version(Some(REPL_PROTOCOL_VERSION)));
+        assert!(admits_replica_version(Some(REPL_PROTOCOL_VERSION + 1)));
+        assert!(admits_replica_version(Some(u16::MAX)));
+        assert!(!admits_replica_version(Some(REPL_PROTOCOL_VERSION - 1)));
+        assert!(!admits_replica_version(Some(0)));
+        assert!(!admits_replica_version(None));
     }
 }

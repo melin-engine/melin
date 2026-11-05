@@ -44,7 +44,8 @@ impl RawReplica {
     ) -> Authenticated {
         use ed25519_dalek::Signer;
         use melin_transport_core::replication::protocol::{
-            decode_auth_result, decode_challenge, encode_challenge_response,
+            AuthResult, REPL_PROTOCOL_VERSION, decode_auth_result, decode_challenge,
+            encode_challenge_response,
         };
 
         let mut stream = connect_with_receive_buffer(primary, Self::RECEIVE_BUFFER);
@@ -61,9 +62,12 @@ impl RawReplica {
         );
         stream.write_all(&out).expect("send the challenge response");
         let verdict = read_any_frame(&mut stream).expect("the primary's verdict");
-        assert!(
+        assert_eq!(
             decode_auth_result(&verdict).expect("an auth result"),
-            "the primary refused the replication key"
+            AuthResult::Ok {
+                protocol_version: Some(REPL_PROTOCOL_VERSION)
+            },
+            "the primary refused this replica"
         );
         Authenticated { stream }
     }

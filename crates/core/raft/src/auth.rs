@@ -28,14 +28,19 @@ use std::io;
 use ed25519_dalek::Signer;
 use ed25519_dalek::Verifier;
 use melin_app::auth::AuthorizedKeys;
+// The unversioned challenge response and AuthOk: a control-plane link
+// states its own protocol version after authentication
+// (`wire::exchange_version`), and the replication protocol's version,
+// which the versioned forms carry, says nothing about it.
+use melin_transport_core::replication::protocol::AuthResult;
 use melin_transport_core::replication::protocol::MAX_CONTROL_FRAME;
 use melin_transport_core::replication::protocol::decode_auth_result;
 use melin_transport_core::replication::protocol::decode_challenge;
 use melin_transport_core::replication::protocol::decode_challenge_response;
 use melin_transport_core::replication::protocol::encode_auth_failed;
-use melin_transport_core::replication::protocol::encode_auth_ok;
 use melin_transport_core::replication::protocol::encode_challenge;
-use melin_transport_core::replication::protocol::encode_challenge_response;
+use melin_transport_core::replication::protocol::encode_unversioned_auth_ok;
+use melin_transport_core::replication::protocol::encode_unversioned_challenge_response;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
@@ -210,8 +215,10 @@ fn verify_challenge_response_identified(
     response_payload: &[u8],
     authorized_keys: &AuthorizedKeys,
 ) -> Result<[u8; 32], KeyRefusal> {
-    let (signature_bytes, pubkey_bytes) = decode_challenge_response(response_payload)
+    // A stated replication version is ignored: see the imports.
+    let response = decode_challenge_response(response_payload)
         .map_err(|e| KeyRefusal::Malformed(e.to_string()))?;
+    let (signature_bytes, pubkey_bytes) = (response.signature, response.pubkey);
 
     let role = authorized_keys
         .lookup(&pubkey_bytes)
@@ -258,7 +265,7 @@ where
     {
         Ok(accepted) => {
             buf.clear();
-            encode_auth_ok(&mut buf);
+            encode_unversioned_auth_ok(&mut buf);
             stream.write_all(&buf).await?;
             stream.flush().await?;
             Ok(accepted)
@@ -360,7 +367,7 @@ pub(crate) async fn answer_challenge<S: AsyncRead + AsyncWrite + Unpin>(
 
     let signature = signing_key.sign(&nonce);
     let mut buf = Vec::with_capacity(128);
-    encode_challenge_response(
+    encode_unversioned_challenge_response(
         &signature.to_bytes(),
         signing_key.verifying_key().as_bytes(),
         &mut buf,
@@ -369,10 +376,13 @@ pub(crate) async fn answer_challenge<S: AsyncRead + AsyncWrite + Unpin>(
     stream.flush().await?;
 
     let result = read_control_frame(stream).await?;
-    if decode_auth_result(&result)? {
-        Ok(())
-    } else {
-        Err(io::Error::other("peer rejected control-plane key"))
+    match decode_auth_result(&result)? {
+        AuthResult::Ok { .. } => Ok(()),
+        AuthResult::Failed => Err(io::Error::other("peer rejected control-plane key")),
+        AuthResult::VersionRefused { protocol_version } => Err(io::Error::other(format!(
+            "peer answered with a replication version refusal (v{protocol_version}), which \
+             no control-plane peer sends"
+        ))),
     }
 }
 
@@ -526,7 +536,7 @@ mod tests {
             async {
                 read_control_frame(&mut responder_end).await.unwrap();
                 let mut buf = Vec::new();
-                encode_challenge_response(
+                encode_unversioned_challenge_response(
                     &key.sign(&[0u8; 32]).to_bytes(),
                     key.verifying_key().as_bytes(),
                     &mut buf,
@@ -548,7 +558,7 @@ mod tests {
             async {
                 read_control_frame(&mut responder_end).await.unwrap();
                 let mut buf = Vec::new();
-                encode_auth_ok(&mut buf);
+                encode_unversioned_auth_ok(&mut buf);
                 responder_end.write_all(&buf).await.unwrap();
             },
         );
