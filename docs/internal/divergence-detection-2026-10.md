@@ -85,7 +85,10 @@ Stated here as the operator docs will state it (step 6):
   An upgrade that keeps output identical for the same input (a fix
   elsewhere, a faster path) can still roll node by node. A Melin runtime
   upgrade is already a stop-everything flag day for replication protocol
-  9 (decision 8).
+  9 (decision 8); protocol 9 moves the version check into
+  authentication, where a primary accepts a newer replica, so that a
+  later release can roll without one (raft protocol 1 needs the same,
+  not yet scheduled).
 - **The limits.**
   - **A detector nobody can reach stops alone.** The stop travels on the
     replication links. A stopped node keeps its replication endpoint up for
@@ -1191,6 +1194,9 @@ own batch cadence. Nothing in the digest path is behind
 | `Ack` gains the stop flag, replica to primary | `AckFrame { tag, acked_sequence: U64, in_memory_sequence: U64, flags: u8, window_end: U64 }`, 26 bytes, from 17. `flags` bit 0 is `STOPPED`: this replica has stopped (decision 11), and its positions are frozen at the last ones it sent. `window_end` is the position its stop names (the diverged window, or the one it was told of), 0 when `STOPPED` is clear |
 | `Handshake` gains the same two fields and the replica's build, replica to primary | `HandshakeFrame { tag, last_sequence: U64, chain_hash: [u8; 32], epoch: U64, protocol_version: U16, flags: u8, window_end: U64, build_id: [u8; 32] }`, 92 bytes, from 51: a stopped replica redialling tells the primary before anything else is exchanged (decision 11), and the primary learns each replica's build, so a primary told to stop by a replica on another build can name both (open question 2). Appended after `protocol_version`, so an older primary still parses the version and refuses it |
 | New frame `MSG_HALT = 0x1A`, primary to replica | `HaltFrame { tag, cause: u8, window_end: U64 }`, 10 bytes: the cluster is stopping. `cause` 1 is "this primary detected", 2 "a replica told this primary"; `window_end` as on the ack |
+| `ChallengeResponse` gains the replica's version, replica to primary | `ChallengeResponseFrame { tag, signature: [u8; 64], pubkey: [u8; 32], protocol_version: U16 }`, 99 bytes, from 97. Appended last: a v8 primary reads the frame by prefix (`decode_challenge_response`) and ignores it. The primary compares it with its own once the signature verifies, so an unauthenticated peer learns nothing |
+| `AuthOk` gains the session's version, primary to replica | `AuthOkFrame { tag, protocol_version: U16 }`, 3 bytes, from 1: the version this session runs at, which is the primary's own. A v8 replica reads only the tag (`decode_auth_result`). The layout is frozen, so any later replica can read it |
+| New frame `MSG_VERSION_REFUSED = 0x07`, primary to replica | `VersionRefusedFrame { tag, protocol_version: U16 }`, 3 bytes, in place of `AuthOk`: the replica is older than this primary, and this is the primary's version. The layout is frozen, so any later replica can read it |
 | `StreamStart` gains the digest kinds, the build and the pipeline id | `digest_kinds: u8` (bit `k - 1` set: this primary sends digests of kind `k`; 0: none), then `build_id: [u8; 32]` (for diagnosis only, open question 2), then `pipeline_id: [u8; 16]` (decision 3), appended after `genesis_entries`: 115 bytes, from 66 |
 
 - **Unknown flag bits and causes are refused**, as `genesis_known` is: a
@@ -1277,18 +1283,65 @@ own batch cadence. Nothing in the digest path is behind
 - **A window end that is not a positive multiple of its kind's `K`** is the
   primary's protocol bug and ends the session as a `FrameError`, never as a
   divergence.
-- **A mixed pair is still refused in both directions.** The handshake's
-  new fields come after `protocol_version`, so a v8 primary parses the
-  longer v9 handshake's prefix and fails the version check, and a v9
-  primary refuses the shorter v8 handshake with the existing "too short
-  ... older, incompatible replication protocol version" error.
+- **A mixed pair is still refused in both directions.** A v9 primary
+  reads a v8 replica's 97-byte `ChallengeResponse`, verifies its
+  signature, and answers `VersionRefused` for a replica that names no
+  version; the v8 replica fails on the unknown tag ("expected
+  AuthOk/AuthFailed, got 0x07"), and the primary's log names both
+  versions. A v8 primary ignores the appended version and answers its
+  one-byte `AuthOk`, which a v9 replica reads as an older primary's (it
+  names no version) and refuses with an error naming its own, sending no
+  handshake. Should it get that far, the handshake's
+  `protocol_version` keeps its offset, so a v8 primary still refuses a v9
+  handshake (the handshake's new fields come after it).
   `REPL_PROTOCOL_VERSION` becomes 9, with the history comment extended.
-  Size assertions for the two new frames and the grown `Ack`, `Handshake`
-  and `StreamStart` (`StreamStartFrame`, 66 to 115 bytes);
-  `docs/replication.md`'s frame tables gain them, and its `StreamStart`,
+  Size assertions for the three new frames and the grown
+  `ChallengeResponse`, `AuthOk`, `Ack`, `Handshake` and `StreamStart`
+  (`StreamStartFrame`, 66 to 115 bytes); `docs/replication.md`'s frame
+  tables gain them, and its `ChallengeResponse`, `AuthOk`, `StreamStart`,
   `Ack` and `Handshake` rows and the frame list in
   `server-runtime/src/replication/mod.rs`'s module docs gain the new
   fields.
+- **Protocol 9 is a flag day, and the version check moves into
+  authentication so that it is the last one the replication protocol
+  forces** (assessment 3.1, decided 2026-11-04). The release this lands
+  in already stops every node for raft protocol 1, so protocol 9 adds no
+  stop if it ships with it. Talking to an older peer would not help this
+  upgrade: a v8 node accepts only v8, and raft links refuse a peer on
+  another release anyway. The rule, with no ranges, each side stating
+  one version:
+  - **The primary accepts a replica at or above its own version** and
+    refuses an older one. The replica sends its version in its
+    `ChallengeResponse`; the primary, once the signature verifies,
+    answers `AuthOk` carrying the session's version, which is its own,
+    or `VersionRefused` carrying the same for an older replica. A newer
+    replica is trusted to speak down; if it gets that wrong, the worst
+    case is a frame the primary cannot decode, which ends the session.
+  - **The replica decides whether it can speak the primary's version.**
+    Its authentication (`authenticate_with_primary`, and its DPDK
+    counterpart) reads the version in `AuthOk`: its own, and nothing
+    changes; an older one, and it either speaks it (a later release's
+    code) or ends the session with an error naming both versions,
+    without sending a handshake. A v9 replica requires 9. On
+    `VersionRefused` it errors the same way and retries as after any
+    refused session.
+
+  The primary's check on the handshake's `protocol_version` stays,
+  against the session's version. A later release can then roll replicas
+  first without a refused session: a v9 primary accepts a v10 replica,
+  which speaks 9 to it, and after a switchover a v10 primary may accept
+  its v9 replicas. Both are that release's code; the v9 side needs none.
+  Serving N−1 is on the roadmap with a planned switchover.
+- **A rolling upgrade also needs raft links across versions; not done
+  in this plan.** Raft protocol 1, unreleased on `main`, refuses a peer
+  on any other version (`exchange_version_as`, `raft/src/wire.rs`), so
+  a mixed cluster would have no failover and no switchover onto an
+  upgraded node. The same rule fits there, both ends exchanging
+  versions: accept a peer at or above one's own, refuse an older one,
+  the newer side deciding whether it can speak down. Changing it before
+  raft protocol 1 ships is a small edit and a test; after, it costs
+  another stop of every node. It is a separate change on `main`, not a
+  step of this plan, and is not scheduled yet.
 
 ### 9. The replica compares in its receiver
 
@@ -2549,7 +2602,16 @@ cross-node check. Each stays its own commit, and the tree passes at each.
   encoders returning fixed-size arrays (decision 8), decoders and size
   assertions; `AckFrame` and `HandshakeFrame` gain `flags` and
   `window_end`, with unknown bits refused, and `HandshakeFrame` the
-  replica's `build_id`; `encode_chain_check` and
+  replica's `build_id`; `ChallengeResponseFrame` gains the replica's
+  `protocol_version` (`decode_challenge_response` returns it, `None` for
+  a v8 frame), `AuthOk` gains the session's version, `MSG_VERSION_REFUSED`
+  is new, and `decode_auth_result` returns `AuthOk(Option<version>)`
+  (`None` from a v8 primary), `AuthFailed` or `VersionRefused(version)`;
+  the primary's authentication on both transports (`authenticate_replica`
+  and the DPDK sender's polled one) accepts, after the signature, a
+  version at or above its own, and the replica's requires 9 in `AuthOk`
+  and errors otherwise, or on `VersionRefused`, before the handshake
+  (decision 8); `encode_chain_check` and
   `encode_rotate` move to the same
   shape. The journal stage then publishes them from the stack. The
   catch-up's `send_buf` (`catchup.rs`), which batches a rotate with data,
@@ -2662,7 +2724,18 @@ cross-node check. Each stays its own commit, and the tree passes at each.
   in both directions (the existing
   `a_handshake_from_another_protocol_version_is_refused` covers it once the
   constant moves; one case added for a v9 replica at a scripted v8
-  primary); kind 0 refused, an unknown kind skipped and counted, not
+  primary, whose one-byte `AuthOk` the replica refuses without sending a
+  handshake); the version at authentication: `ChallengeResponse`,
+  `AuthOk` and `VersionRefused` round-trip and their byte patterns are
+  pinned (`AuthOk`'s and `VersionRefused`'s layouts are frozen); the
+  primary's authentication, blocking and polled (the existing `auth.rs`
+  unit tests), answers `AuthOk(9)` to version 9 and to 10 (a later
+  replica, which speaks down), `VersionRefused(9)` to 8 and to a
+  v8-sized frame naming none, and `AuthFailed`, not either, to a bad
+  signature whatever the version; the replica's, on both transports,
+  proceeds on `AuthOk(9)`, and turns `AuthOk(8)`, `AuthOk(10)`, a
+  versionless `AuthOk` and `VersionRefused(10)` into an error naming
+  both versions, sending no handshake; kind 0 refused, an unknown kind skipped and counted, not
   fatal, and an unknown `digest_kinds` bit warned about and ignored; a
   window end of 0 or off the kind's grid refused as malformed;
   `RingChunk::classify` sorts a `Digest` chunk exactly as a `ChainCheck`
@@ -2823,11 +2896,16 @@ cross-node check. Each stays its own commit, and the tree passes at each.
     may fail over. The test asserts the counted, logged outcome
     (`notice` left `pending`, the linger's `warn!`), not a stop the design
     does not promise.
-- Docs: `docs/replication.md` frame tables, the `StreamStart`, `Ack` and
-  `Handshake` rows' descriptions (the id names the running primary, so a
-  replica knows a reconnect from a restart), and "Output verification"
-  gaining the cluster-wide stop, the linger and its limit. `CHANGELOG.md`
-  **Changed**: replication protocol 9, mixed pairs refused;
+- Docs: `docs/replication.md` frame tables, the `ChallengeResponse`,
+  `StreamStart`, `Ack` and `Handshake` rows' descriptions (the id names the running
+  primary, so a replica knows a reconnect from a restart), "Output
+  verification" gaining the cluster-wide stop, the linger and its limit,
+  and "Upgrade and rollback notes" naming protocol 9 among the
+  stop-everything upgrades, to be done with the raft protocol 1 one if
+  both are in the release. `CHANGELOG.md` **Changed**: replication
+  protocol 9, mixed pairs refused at authentication, a primary accepting
+  a newer replica that speaks its version (`decode_challenge_response` and
+  `decode_auth_result` change signature);
   `build_pipeline_with_replication` takes a `PipelineId`;
   `decode_primary_message` returns a `PrimaryFrame`, and
   `ReplicaCursors::new` and `record_ack` change signature (all public in
@@ -3488,6 +3566,20 @@ Beyond each step's own list:
     show first. Step 6 reports the break count under report-less load and
     across a reconnect with a long catch-up; any break seen outside a
     forced stall makes (c) the follow-up.
+12. **Upgrading to protocol 9. Decided (2026-11-04): a flag day, with
+    the version check moved into authentication.** (a) Stop every node,
+    as for protocols 6 to 8; (b) negotiate N/N−1 in protocol 9; (c) the
+    whole zero-downtime path. (a) costs no extra stop when it ships with
+    raft protocol 1, and (b) would not spare this upgrade one: a v8 node
+    accepts only v8, and raft links refuse a peer on another release.
+    The one part only this release can add is a v9 primary accepting a
+    newer replica: the replica's version in `ChallengeResponse`, the
+    session's (the primary's) in `AuthOk`, one version each way, no
+    ranges; the primary accepts a replica at or above its own version,
+    and the replica decides whether it can speak the primary's (decision
+    8). Raft protocol 1 needs the same rule before it ships, noted in
+    decision 8 and not scheduled. Serving N−1 and a planned switchover
+    go on the roadmap as (c).
 
 ## Not part of this plan
 

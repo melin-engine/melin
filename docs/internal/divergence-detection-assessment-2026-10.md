@@ -61,7 +61,7 @@ bytes, are now closed on `main` (items 1.5 and 1.4).
 | 6 | The tick trap is wider than finding 7 says: replica restarts and promotions trigger it too, with no clock step back needed | Correctness caveat | Medium-High | Done on `main`: the watermark is carried (merge 87e36302), so no release gate |
 | 7 | The snapshot/restore check is narrower than claimed: one round trip per pipeline start, none at all if `clone_via_snapshot` is overridden | Coverage | Medium | Text and runbook |
 | 8 | Replica-side stop plumbing: the replica's shadow holds only the pipeline's shutdown flag | Implementation risk | Medium | Done: decision 11, step 3 |
-| 9 | Replication protocol 9 is another full-cluster-stop upgrade | Operations | Medium | Decide now |
+| 9 | Replication protocol 9 is another full-cluster-stop upgrade | Operations | Medium | Decided: a flag day, with the version check moved into authentication |
 | 10 | Build-id gating silently stops comparing on mixed-arch and per-host builds, and nothing alertable shows it | Coverage / operations | Medium | Decided: every build is compared; the build id only names them |
 | 11 | Applications that already break the hash-map-order rule (report order following capacity) will now be stopped: the shadow is restored and never prefaulted, and `Sizing` varies by node | Coverage caveat (rollout) | Medium | Document; shadow prefault and test in step 3 |
 | 12 | Latent state divergence can be promoted at failover | Coverage | Medium | Defer (step 7) |
@@ -623,10 +623,24 @@ planned-switchover command, and cluster-version activation for journaled
 features such as monotonic time and the encoding version. That is a
 roadmap item of its own.
 
-**Recommendation.** (b), because this bump already rewrites the
-`StreamStart` layout and adds a capability byte (`digest_kinds`). Paying
-for negotiation once here costs less than the next bump. (c) belongs on
-the roadmap, not in this plan.
+**Decided (2026-11-04): (a), with the version check moved into
+authentication.** (b) would not spare this upgrade its stop: a v8 node
+accepts only v8, and the release this lands in already stops every node
+for raft protocol 1, whose links refuse a peer on another release. (b)'s
+second way of sending the stream would buy only the next upgrade, and
+that needs raft link versions too, which is (c). The one part only this
+release can add: the replica sends its version in `ChallengeResponse`
+(appended, so a v8 primary ignores it), and the primary, once the
+signature verifies, accepts a replica at or above its own version with
+an `AuthOk` carrying the session's version (its own), and refuses an
+older one with a `VersionRefused` naming it. The replica decides whether
+it can speak the primary's version. No ranges: each side states one
+version. A later release can then roll replicas first with no code on
+the v9 side and no refused session: a v9 primary accepts a v10 replica,
+which speaks 9 to it (plan, decision 8 and open question 12). Raft
+protocol 1, unreleased, refuses any other version and needs the same
+rule before it ships, or a mixed cluster has no failover; noted in the
+plan, not scheduled. (c) stays on the roadmap.
 
 ### 3.2 First rollout: enforcement with only an off switch (item 5)
 
@@ -1007,7 +1021,9 @@ In order of value for the cost:
 3. **Offline qualification** (item 3.2 (c)): replay a journal on two
    copies and report every window whose outputs differ. Next after this
    plan; it is the debugging path. Observe mode is rejected (3.2).
-4. **Protocol negotiation in protocol 9** (item 3.1 (b)). Step 4.
+4. **Protocol 9's version check at authentication** (item 3.1,
+   decided). Step 4. Serving N−1 goes on the roadmap with raft link
+   versions and a planned switchover (3.1 (c)).
 5. **A generic refusal file** (item 3.4 (b)). Step 3.
 6. **An in-process query digest kind, opt-in** (item 2.3 (b)). Roadmap.
 7. **State digest; chain stored in snapshots.** Already step 7. The state
@@ -1043,7 +1059,8 @@ In order of value for the cost:
 **Decide now, because they shape steps 2 to 5:** observe mode (3.2,
 decided: rejected), the build-id override and the comparing gauge (2.2,
 decided: superseded, every build is compared), protocol negotiation
-(3.1), the generic refusal file (3.4).
+(3.1, decided: a flag day, the version checked at authentication), the
+generic refusal file (3.4).
 
 **Fold into the steps:** the hash-map-order rollout caveat (1.3), named in
 the rollout notes, with the shadow prefault and the capacity-order fault
@@ -1069,8 +1086,12 @@ across restarts and promotion.
 3. **First rollout (3.2):** decided: no observe mode, which would mean
    serving on a broken contract. The switch stays on/off, and the offline
    qualification tool is the debugging path, next on the roadmap.
-4. **Upgrade (3.1):** pay for N/N−1 negotiation in protocol 9, or accept
-   another cluster stop and leave negotiation for later?
+4. **Upgrade (3.1):** decided (2026-11-04): protocol 9 is a flag day,
+   shipped with raft protocol 1's if the timing allows. The replica
+   sends its version in `ChallengeResponse`, and the primary accepts one
+   at or above its own, naming the session's version in `AuthOk`, so
+   that a later release can roll replicas first. No ranges. Raft
+   protocol 1 needs the same rule before it ships (noted, not scheduled). Serving N−1 is roadmap work with raft link versions.
 5. **Build id (2.2):** decided (2026-11-04): always compare output
    digests, whatever the builds. The build id stays for diagnosis only,
    named in the stop's log, marker and refusal when the builds differ; no
