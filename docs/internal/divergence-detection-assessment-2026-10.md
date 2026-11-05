@@ -1,6 +1,7 @@
 # Divergence detection: a critical assessment of the plan
 
-Status: **review**. Assesses [divergence-detection-2026-10.md](divergence-detection-2026-10.md)
+Status: **closed**: every decision below is taken (2026-11-04), and the
+plan carries the outcome. Assesses [divergence-detection-2026-10.md](divergence-detection-2026-10.md)
 as it stands on branch `plan/state-divergence-detection` at 25f75166.
 Every claim below was
 checked against the plan's text and the code at that commit, and is cited
@@ -59,11 +60,11 @@ bytes, are now closed on `main` (items 1.5 and 1.4).
 | 4 | Stale bytes in the shared encode buffer: resolved on `main`. What remains is keeping the zeroing and the purity check on the drain's and the shadow's encodes | Correctness | Low (residual) | Done: now in the plan's decision 4 |
 | 5 | First rollout: the only fallback from enforcement is `--no-output-digests`, which gives up detection entirely | Operations | Medium-High | Decided: no observe mode; the offline tool is the debugging path |
 | 6 | The tick trap is wider than finding 7 says: replica restarts and promotions trigger it too, with no clock step back needed | Correctness caveat | Medium-High | Done on `main`: the watermark is carried (merge 87e36302), so no release gate |
-| 7 | The snapshot/restore check is narrower than claimed: one round trip per pipeline start, none at all if `clone_via_snapshot` is overridden | Coverage | Medium | Text and runbook |
+| 7 | The snapshot/restore check is narrower than claimed: one round trip per pipeline start, none at all if `clone_via_snapshot` is overridden | Coverage | Medium | Done: a limit in the plan's guarantee, decision 10 and the runbook |
 | 8 | Replica-side stop plumbing: the replica's shadow holds only the pipeline's shutdown flag | Implementation risk | Medium | Done: decision 11, step 3 |
 | 9 | Replication protocol 9 is another full-cluster-stop upgrade | Operations | Medium | Decided: a flag day, with the version check moved into authentication |
 | 10 | Build-id gating silently stops comparing on mixed-arch and per-host builds, and nothing alertable shows it | Coverage / operations | Medium | Decided: every build is compared; the build id only names them |
-| 11 | Applications that already break the hash-map-order rule (report order following capacity) will now be stopped: the shadow is restored and never prefaulted, and `Sizing` varies by node | Coverage caveat (rollout) | Medium | Document; shadow prefault and test in step 3 |
+| 11 | Applications that already break the hash-map-order rule (report order following capacity) will now be stopped: the shadow is restored and never prefaulted, and `Sizing` varies by node | Coverage caveat (rollout) | Medium | Done: shadow prefault and its tests in step 3, the cross-node case in step 5, the rollout suspect in step 6 |
 | 12 | Latent state divergence can be promoted at failover | Coverage | Medium | Defer (step 7) |
 | 13 | Uncovered windows around restarts and promotions; the failover tail | Coverage | Medium | Defer (step 7) |
 | 14 | Fold placement: after the send it still delays the next reply in the batch | Performance | Medium | Measure (step 6) |
@@ -81,7 +82,7 @@ bytes, are now closed on `main` (items 1.5 and 1.4).
 Items 1 to 3, 8 and 16, and the parts of 21, 22 and 23 marked above, should
 change the plan before step 1 starts. Items 5, 9 and 10 are decisions to
 take now, because they shape the flag, the protocol and the metrics of
-steps 2 to 5; 5 and 10 are taken, 9 is open. The rest can be documented
+steps 2 to 5; all three are taken. The rest can be documented
 or deferred.
 
 ## 1. Correctness and guarantee gaps
@@ -591,7 +592,10 @@ position.
 
 **Confirmed.** A lap needs a drain stall of about `R·K` entries of
 report-less traffic, which with both rings at `1 << 20`
-(`pipeline.rs:247, 252`) is about two million entries. It is counted, never
+(`pipeline.rs:247, 252`) is about two million entries. (The rings have
+since become configurable, `--ring-capacity`, with `1 << 20` the default;
+the plan now sizes `R` from the configured capacity, so the bound scales
+with it.) It is counted, never
 a false claim. One refinement: the drain's wait strategy can be
 `SpinThenYield` on a shared core (`wait.rs:41-48`), so a small replica host
 that places the drain beside a busy thread makes the stall likelier than
@@ -901,7 +905,8 @@ stage's ring waits".
   assumes. The board will want its own array type over the seqlock
   protocol, which is new `unsafe` code. The plan's Miri test (plan:1298-1301)
   should then cover that type, not the existing one.
-- **Memory.** `R = 32770` with both rings at `1 << 20` and `K = 64`. That
+- **Memory.** `R = 32770` with both rings at `1 << 20` (now the default
+  `--ring-capacity`) and `K = 64`. That
   is 2 MiB per board, plus two 40-byte arrays of `R` per comparator. A
   replica with a shadow holds two comparators, so with its board or boards
   it is in the high single-digit MiB. Small against the rings. This is not
@@ -1076,9 +1081,9 @@ decided: superseded, every build is compared), protocol negotiation
 (3.1, decided: a flag day, the version checked at authentication), the
 generic refusal file (3.4, decided: not planned).
 
-**Fold into the steps:** the hash-map-order rollout caveat (1.3), named in
-the rollout notes, with the shadow prefault and the capacity-order fault
-test in step 3.
+**Fold into the steps (done):** the hash-map-order rollout caveat (1.3):
+the shadow prefault and its tests in step 3, the capacity-order fault
+across nodes in step 5, the second suspect in step 6's runbook.
 
 **Can be deferred, documented as limits:** latent divergence and the
 failover tail (1.7, 2.1), queries (2.3), the idle delay (2.4), chain breaks

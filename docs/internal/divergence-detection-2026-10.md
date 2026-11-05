@@ -4,11 +4,11 @@ Status: **proposal**. Implements item S8 of the
 [application API review](application-api-review-2026-09.md), "No divergence
 detection for a nondeterministic `apply`".
 
-Code is cited as `file:line` against branch `plan/state-divergence-detection`
-at 1164fce7 (its code is unchanged since 3d0ec3d4, the commit the
+Code is cited as `file:line` against main at 5301f789, the commit this
+branch is based on (the
 [cluster-halt evaluation](divergence-cluster-halt-evaluation-2026-10.md)
-cites); a later edit to a cited file moves its lines, so the function or
-type named beside each citation is the anchor to search for.
+cites an older tree); a later edit to a cited file moves its lines, so the
+function or type named beside each citation is the anchor to search for.
 
 The one-line goal: **every copy of the application digests the reports it
 produced, in windows of a fixed number of entries, chains the window digests,
@@ -139,6 +139,17 @@ Stated here as the operator docs will state it (step 6):
     afresh from its live state.
   - **Queries are not covered**: they are not journaled, so no other copy
     answers them.
+  - **Snapshot handling is checked in-process only narrowly.** The shadow
+    is made by one snapshot-and-restore of the live copy at the
+    pipeline's start, so the in-process check catches a `snapshot` or
+    `restore` that loses state only for state present at that moment: a
+    field first filled later is never round-tripped in-process, since the
+    shadow writes later snapshots but never reads them back. An
+    application that overrides `clone_via_snapshot` with a direct clone
+    gets no round trip at all. Either way, a lossy snapshot shows once a
+    node restores one (a restart, a resync, a new replica), and then only
+    the check across nodes sees it. The way back sets every snapshot aside
+    (step 6), so a lossy one is not carried into the new cluster.
 
 ## What the code shows
 
@@ -270,8 +281,8 @@ Stated here as the operator docs will state it (step 6):
   the raft directory's first boot the stored membership is in force, and
   the driver compares it with the flags only inside its own thread, after
   `initialize`, where a failure can only `mark_stopped` and leave the node
-  running without raft (`driver.rs:367`, `:405`); the store itself is
-  opened synchronously in `melin_raft::spawn` (`driver.rs:192`), so the
+  running without raft (`driver.rs:688`, `:801`); the store itself is
+  opened synchronously in `melin_raft::spawn` (`driver.rs:524`), so the
   node's start can still fail there.
 - **Replicas never re-point.** After a failover, surviving replicas keep
   dialling their `--replica-of` until an operator re-points them
@@ -299,11 +310,12 @@ Stated here as the operator docs will state it (step 6):
   (`tcp_sender.rs:163`), dropping the listener. On DPDK the EAL and port
   (`DpdkShared`, `server.rs:2565`) live in the entry, but the transport,
   which holds the replication listener, is moved into
-  `run_as_primary_dpdk` (`server.rs:2938`), whose poll loop ends with
+  `run_as_primary_dpdk` (`server.rs:3006`), whose poll loop ends with
   `close_all_links`: a 100 ms drain, then a reset of every link
   (`linger_then_reset`, `dpdk.rs:202`, `1526`). The primary's health
-  endpoint runs on the node's shutdown flag (`server.rs:3980`) and is
-  joined with the pipeline (`stop_and_join`, `server.rs:1645`); only the
+  endpoint runs on the node's shutdown flag (`spawn_health_endpoint`,
+  `server.rs:4163`) and is joined with the pipeline (`stop_and_join`,
+  `server.rs:1658`); only the
   replica's has a stop flag of its own, held by the entry
   (`spawn_replica_health`, `raft.rs:318`).
 - **A replica reads primary messages in five places**, each ending in a
@@ -600,20 +612,22 @@ d(W) = XXH3-128 (seed 0, default secret) over
   the primary can send. It is bounded below by two costs only:
   - **The per-window work**: a fresh `RawHasher`, its finalize, one
     one-shot chain hash over 32 bytes, and one 40-byte seqlock store into
-    a board slot that is usually not in cache. Estimated on the order of a
-    hundred nanoseconds per window, so at `K = 64` under two nanoseconds
-    per entry, a small share of the ~100 ns per-event budget, on the
-    primary's response thread and the replica's drain (and on the
-    replica's receiver, a board read and one chain hash per window,
-    decision 9). The per-report encode and update dominate it. Step 6's
-    measurement confirms the estimate; if it does not hold, open
-    question 9's next value is the fallback.
-  - **The board and comparator sizing** `R = ceil((INPUT_RING_CAPACITY +
-    OUTPUT_RING_CAPACITY) / K) + 2` (decision 5): with both rings at
-    `1 << 20` slots and `K = 64`, 32770 slots, one cache line each, so a
-    board of 2 MiB, and comparator arrays of the same count at 40 bytes a
-    slot. Small beside the rings themselves, allocated once per pipeline;
-    a smaller `K` grows them in proportion. `R` is a headroom in entries
+    a board slot that is usually not in cache, all paid once per `K`
+    entries, on the primary's response thread and the replica's drain
+    (and on the replica's receiver, a board read and one chain hash per
+    window, decision 9). The per-report encode and update are paid per
+    report and should dominate it. The bound to hold is that the
+    per-window work, divided by `K`, is a small share of the ~100 ns
+    per-event budget; step 6's measurement checks it, and if it does not
+    hold, open question 9's next value is the fallback.
+  - **The board and comparator sizing** `R = ceil((input ring slots +
+    output ring slots) / K) + 2` (decision 5), from the pipeline's
+    configured `--ring-capacity` (both rings take the same `RingCapacity`).
+    At the default capacity (`1 << 20` slots per ring) and `K = 64` that is
+    32770 slots, one cache line each, so a board of 2 MiB, and comparator
+    arrays of the same count at 40 bytes a slot. Both scale with the ring
+    capacity, so they stay small beside the rings themselves, allocated
+    once per pipeline; a smaller `K` grows them in proportion. `R` is a headroom in entries
     (decision 5 says what it bounds and what it does not), not a
     guarantee that no window is ever lapped.
 - **What `K` costs in delay.** A divergence is seen once its window closes
@@ -664,7 +678,7 @@ d(W) = XXH3-128 (seed 0, default secret) over
     and so on. Each later frame at `e` is compared against `C'_e`. A match
     at `e` verifies every window from `e₀ + 1` to `e`, and a mismatch says
     some window in that range differs. The frame also carries `d_e`
-    (open question 10): comparing it with the local `d_e` checks the
+    (open question 10, decided): comparing it with the local `d_e` checks the
     anchor's own window too, and names window `e` as one that differs when
     it does.
 - **A local gap breaks the run, never the claim.** If the replica's own
@@ -847,9 +861,13 @@ readers (the journal stage's injector, the shadow's comparator, the
 replica's receiver, the health endpoint). The seqlock module already
 enforces single-writer and no-padding in the type system.
 
-**Sizing R.** `R = ceil((INPUT_RING_CAPACITY + OUTPUT_RING_CAPACITY) / K) +
-2`, a constant (`DIGEST_BOARD_SLOTS`), allocated once when the pipeline is
-built (decision 2 gives its size). It matters for one reader only: the
+**Sizing R.** `R = ceil((input ring slots + output ring slots) / K) + 2`,
+computed when the pipeline is built from the `RingCapacity` it builds both
+rings with (`ring_capacity.slots()`, `pipeline.rs:3665`, set by
+`--ring-capacity`), and allocated then (decision 2 gives its size at the
+default). It is not a constant: the rings are configurable, and a board
+sized for the default would lap inside the ring-bounded backlog below on a
+node run with larger rings. It matters for one reader only: the
 replica's comparator, which must copy *every* window of its local board
 (decision 3). The receiver reads its board at each loop iteration and on
 every pass of a push waiting for ring space (beside `keep_link_serviced`),
@@ -859,9 +877,9 @@ the drain can close at once is its own backlog: the entries the receiver
 has published that the drain has not yet closed a window over. That
 backlog is bounded by the rings only in part:
 
-- entries still in the input ring, at most `INPUT_RING_CAPACITY`;
-- applied entries whose reports wait in the output ring, at most
-  `OUTPUT_RING_CAPACITY`;
+- entries still in the input ring, at most its capacity;
+- applied entries whose reports wait in the output ring, at most its
+  capacity;
 - applied entries that published **no** output slot, bounded by no ring.
   The matching stage publishes nothing for an entry with no report and
   connection id 0 (`MatchingStage::run` pushes its `BatchEnd` slot only
@@ -910,8 +928,8 @@ length is not part of it:
   512 entries. It cannot publish more than the input ring's free space
   either: a push that waits for ring space reads the board on each pass.
   So between two reads it publishes at most the smaller of the cap plus
-  one frame and the input ring's capacity, both within the
-  `INPUT_RING_CAPACITY` term of `R`, however long the catch-up runs, and
+  one frame and the input ring's capacity, both within the input ring's
+  term of `R`, however long the catch-up runs, and
   the drain cannot close more than its own backlog plus that between two
   reads, as live.
 - **What can still lap** is what can lap live: a drain stalled while about
@@ -931,8 +949,9 @@ Lookups are `get(end) -> Option<BoardEntry>` (present, not yet written, or
 lapped) and `latest() -> Option<BoardEntry>`. Positions are `WireSeq`, the
 existing cursor-space newtype. The board and the comparator are built
 through one constructor taking the capacity: production builds them only
-with `DIGEST_BOARD_SLOTS` (`DigestBoard::for_pipeline`), and tests build
-small ones to force laps. They share one indexing helper, so the two cannot
+through `DigestBoard::for_pipeline(ring_capacity)` (and the comparator's
+counterpart), which computes `R` from the pipeline's `RingCapacity` with
+one shared function, and tests build small ones to force laps. They share one indexing helper, so the two cannot
 index differently.
 
 ### 6. The comparator: one pure type for both checks
@@ -1399,7 +1418,7 @@ own batch cadence. Nothing in the digest path is behind
   primary's `Halt` or its close, within the notice bound. The session then
   ends with a new `SessionExit::Stopped(HaltCause)`. Both receivers hand
   every exit to the one shared `handle_session_exit`
-  (`replication/mod.rs:950`), whose `match exit` is exhaustive, so the
+  (`replication/mod.rs:958`), whose `match exit` is exhaustive, so the
   new variant cannot compile without its arm there. That arm tears the
   pipeline down and returns `AfterSession::Return` with the stop's error,
   which `AfterSession::adopt` passes through to `run_receiver*`'s caller
@@ -1428,7 +1447,12 @@ This is the only check on a node without replicas, and it catches what the
 replica check cannot see on a primary: a shadow built by
 `clone_via_snapshot` that answers differently, that is, a `snapshot`/`restore`
 pair that drops a field, which is exactly the copy a restart or a resync
-would come back from. A node without a shadow (`--snapshot-interval-ms 0`)
+would come back from. It does so only for state present when the shadow
+was cloned, once per pipeline start, and only through the default
+`clone_via_snapshot`: an application that overrides it with a direct clone
+(its rustdoc allows "a cheaper same-process clone") gives the shadow no
+round trip, and the check then sees no snapshot fault at all. Both are
+stated as a limit ("The guarantee, and its limits"; assessment 1.6). A node without a shadow (`--snapshot-interval-ms 0`)
 has no in-process check, and a standalone node without one has no check at
 all; both are logged at startup and documented as limits.
 
@@ -1507,7 +1531,7 @@ way, the node:
    branch runs `drain_pending_acks` after the drain
    (`receiver_transport.rs:1025`) and then `break SessionExit::Promote`
    (`:1034`), whose arm in `handle_session_exit`
-   (`replication/mod.rs:985`) hands the application to the entry to run
+   (`replication/mod.rs:994`) hands the application to the entry to run
    as primary. A drain that ended with the latch set, whether its abort
    read the latch or the shadow tripped while it ran, does neither: it
    skips `drain_pending_acks`, as the stopped loop top does, so no
@@ -1522,18 +1546,18 @@ way, the node:
    reading: while `drain_pending_acks` waits on the journal cursor
    (`pop_all_blocking`, `receiver_transport.rs:1170`), or during the
    teardown, which publishes the sentinel and joins the shadow only after
-   the session has broken with `Promote` (`replication/mod.rs:757-773`,
-   reached from the `Promote` arm at `:985`). A divergent window closing
+   the session has broken with `Promote` (`teardown_replica_pipeline`,
+   `replication/mod.rs:742-772`, reached from the `Promote` arm at `:994`). A divergent window closing
    on one of the drained frames is the common case, not a corner. So the
    guarantee is a second reading, in `handle_session_exit`'s `Promote` arm,
    after `teardown_replica_pipeline` has returned: every thread of the
    replica pipeline is joined then (`shutdown_pipeline`,
    `replication/mod.rs:351` on), so no thread that could trip for the old
    pipeline is left, and the receiver is the caller. Set, the arm does not
-   hand the application over (`Ok(Some(..))`, `:987`): it returns as the
+   hand the application over (`Ok(Some(..))`, `:996`): it returns as the
    `Stopped` arm does, and the exit helper finds the stop in the latch.
    The other promotion, at each receiver's reconnect-loop top
-   (`tcp_receiver.rs:684`, `dpdk.rs:1713`), has the same gap: it checks the
+   (`tcp_receiver.rs:691`, `dpdk.rs:1713`), has the same gap: it checks the
    shutdown flag, then `take_pipeline_for_promotion` tears down a pipeline
    whose shadow may still be applying the last session's entries
    (`replication/mod.rs:1141-1142`). So the post-join reading is one
@@ -1720,7 +1744,7 @@ it stopped, with a full backoff's margin. A constant, not a flag: the value
 follows from the backoff, and an operator has nothing to tune it against.
 
 The notice bound, `HALT_NOTICE_BOUND`, is a second constant, 5 s, and
-not derived from `replication_heartbeat_secs` (`server.rs:305`, a flag,
+not derived from `replication_heartbeat_secs` (`server.rs:318`, a flag,
 default 5). It bounds a wait on a peer that is connected and was just
 sent a frame (the replica waiting for `Halt` after its flagged ack, a
 sender's write and drain after its `Halt`), which a live peer answers
@@ -1765,7 +1789,7 @@ By role:
   kernel socket, or on DPDK the transport `run_receiver_dpdk` borrows
   (`dpdk.rs:1553`). The factored dial takes the linger's absolute
   deadline. Today's kernel dial is a bare `TcpStream::connect`
-  (`tcp_receiver.rs:690`), which against a primary whose SYNs are dropped
+  (`tcp_receiver.rs:698`), which against a primary whose SYNs are dropped
   rather than reset (a host down behind a switch, a firewall) blocks for
   the kernel's SYN retries, longer than `HALT_LINGER` itself; the factored
   one uses `TcpStream::connect_timeout` with the time left before the
@@ -1775,9 +1799,11 @@ By role:
   mis-pointed address, a stale host: the replica authenticates to it, not
   the reverse) would hold the redial past the linger. So the exchange runs
   through the same deadline `Read` adapter as the primary's kernel linger
-  (below), one type in `server-runtime` used by both sides, not two, and
-  writes take the smaller of their own timeout (`tcp_receiver.rs:722`) and
-  the time left, so no redial outlasts the linger. The dial checks
+  (below), one type in `server-runtime` used by both sides, not two. Writes
+  need a bound added: today's kernel receiver sets a 5 s read timeout on
+  the stream (`tcp_receiver.rs:730`) and no write timeout at all, so the
+  factored dial sets the write timeout to the time left, and no redial
+  outlasts the linger. The dial checks
   the deadline before each of those calls and returns its timeout
   outcome when nothing is left: `connect_timeout` returns `InvalidInput`
   for a zero `Duration`, and `set_read_timeout` and `set_write_timeout`
@@ -1836,7 +1862,7 @@ By role:
   each transport's existing authentication and handshake decode, hoisted
   rather than copied. On kernel TCP the exit helper accepts on the
   returned listener. The listener is non-blocking by construction
-  (`ReplicationListener::new`, `server.rs:1370`), so the loop waits for a
+  (`ReplicationListener::new`, `server.rs:1428`), so the loop waits for a
   connection with `poll(2)` on its descriptor, with the linger's remaining
   time as the timeout, rather than spinning on `WouldBlock` or switching
   the listener to blocking, and leaves when the poll times out at the
@@ -1899,7 +1925,7 @@ By role:
   replica's has, raised by the exit helper after the linger rather than
   by the pipeline's shutdown, so `/healthz` and `/metrics` stay readable
   throughout. Its handle therefore leaves `PipelineHandles`: today
-  `stop_and_join` joins it with the pipeline threads (`server.rs:1645`),
+  `stop_and_join` joins it with the pipeline threads (`server.rs:1658`),
   and with a flag only the exit helper raises, which runs after that
   join, the join would never return. The entry holds it instead, in the
   replica's `ReplicaHealthGuard` (`raft.rs:285`), reused rather than
@@ -2028,9 +2054,9 @@ one is a prerequisite:
 - **The voter cap.** A cluster refuses more raft voters than one plus the
   primary's replica slots, three today, derived from
   `ReplicaSlotCursors::SLOTS` so the bound moves with it. `melin-raft`
-  already depends on `melin-transport-core` (`crates/core/raft/Cargo.toml:48`,
+  already depends on `melin-transport-core` (`crates/core/raft/Cargo.toml:63`,
   used at `driver.rs:23` and `recency.rs:43`), where the constant is public
-  (`cursors.rs:143`, `lib.rs:26`), so both checks read
+  (`cursors.rs:143`, re-exported at `lib.rs:83`), so both checks read
   `ReplicaSlotCursors::SLOTS + 1` directly, through one `pub const
   MAX_VOTERS` in `melin-raft` that `build_raft_config` uses too, and
   `RaftConfig` is unchanged. It is checked twice: on the
@@ -2203,8 +2229,9 @@ cross-node check. Each stays its own commit, and the tree passes at each.
 - `transport-core::output_digest`: `DigestKind` (exhaustive, `Output = 1`),
   `WindowDigest` and `ChainValue`, `OUTPUT_DIGEST_WINDOW`, `CHAIN_SEED`,
   `WindowFolder` (decision 1's definition, decision 2's first-full-window
-  rule, decision 3's chain), `DigestBoard` (decision 5,
-  `DIGEST_BOARD_SLOTS` derived from both ring capacities and `K`),
+  rule, decision 3's chain), `DigestBoard` (decision 5, with
+  `for_pipeline(RingCapacity)` deriving `R` from both rings' capacity and
+  `K` through one function the comparator shares),
   `DigestComparator` (decision 6, both modes, with `begin_session`,
   `SessionKind` and `SessionStart`), the `Trip` trait and `Divergence`
   (decision 6), `PrimaryPipelineId` (decision 8,
@@ -2341,11 +2368,13 @@ cross-node check. Each stays its own commit, and the tree passes at each.
       input has none to skip on);
     - `shared_start` mode: verified from `F` with no anchor, chain values
       compared directly;
-    - with capacity `DIGEST_BOARD_SLOTS` and the local side closing up to
-      both rings' worth of entries between two reads, no break and no
-      evicted sample; closing more than `R` windows between two reads is a
-      `Break`, never a `Match` across it; one indexing helper for board and
-      comparator.
+    - built through `for_pipeline` at `RingCapacity::DEFAULT`, at
+      `RingCapacity::MIN` and at a capacity above the default, with the
+      local side closing up to both rings' worth of entries (at that
+      capacity) between two reads: no break and no evicted sample; closing
+      more than `R` windows between two reads is a `Break`, never a
+      `Match` across it; one indexing helper for board and comparator, and
+      one sizing function for both.
 - `framing` tests in `response_frame.rs` keep passing unchanged: the
   framing is the same bytes, the zeroing and the purity check included.
 - **Leaves untested:** nothing calls these types yet, so whether each copy
@@ -2473,12 +2502,35 @@ cross-node check. Each stays its own commit, and the tree passes at each.
   helper finds the stop and returns `NodeDiverged`.
 - The shadow's comparator (`shared_start`) against the live board on every
   node with a shadow (decision 10).
+- The shadow prefaulted (assessment 1.3 (d)): today the live instance is
+  prefaulted with the node's `Sizing` and the shadow, a
+  `clone_via_snapshot` of it, never is, so it runs at whatever capacity
+  `restore` chose. One `server-runtime` helper, `shadow_clone(&app,
+  sizing)`, clones and then prefaults, and replaces the bare
+  `clone_via_snapshot` at all three sites: the kernel primary
+  (`server.rs:1838`), the DPDK primary (`:3047`) and the replica
+  (`replication/mod.rs:593`). `run_impl` and `run_dpdk_impl` prefault the
+  live instance before calling `run_as_primary` and `run_as_primary_dpdk`,
+  at boot and after a promotion (`server.rs:1353` and `:1268`, `:2910`
+  and `:2796`); those two take no `Sizing` today, so both gain the
+  parameter. This
+  is hygiene, not correctness: a compliant application's decisions do not
+  depend on capacity (`prefault`'s contract), but one that breaks the rule
+  by emitting reports in a hash map's iteration order would otherwise trip
+  its own shadow on upgrade day for a capacity difference the node itself
+  made.
 - `NodeStore::refuse_if_diverged` and `NodeStoreError::Diverged`, called
   from `ServerConfig::startup_store()` by both entries; `resolve` and
   `store()` unchanged (decision 12).
 - Metrics `verified_from{against="shadow"}`,
   `verified_through{against="shadow"}`, `checks_total{against="shadow"}`,
-  `melin_output_diverged`.
+  `melin_output_diverged`. On a replica they must reach the endpoint
+  `spawn_replica_health` builds through `HealthState::for_replica`
+  (`raft.rs:338`), which takes only the fence state, the raft status and
+  `pipeline_healthy` today and outlives every pipeline a resync rebuilds:
+  so the output metrics live in one node-lifetime handle the entry
+  creates, passes to `HealthState::for_replica` (and to the primary's
+  `HealthState`), and hands to each pipeline it builds.
 - Tests:
   - `response_loop.rs`: a latch set while a slot waits at the gate: the
     slot is never offered to the egress after its release, nor any later
@@ -2519,6 +2571,11 @@ cross-node check. Each stays its own commit, and the tree passes at each.
     hash sharing its first bytes, so the chain's log lines are unchanged;
   - no file moves: after a stop, every snapshot and the journal are where
     they were;
+  - the shutdown drain (decision 13): a primary and a replica, each with a
+    shadow, shut down cleanly under load with a window open on every
+    folder (the load stopped off the grid, at a position not a multiple of
+    `K`): neither trips, no marker is written, the run returns `Ok`, and
+    both restart unrefused;
   - `node_store.rs`: `refuse_if_diverged` refuses with the marker present,
     and the message names the marker, the cause, the position and the doc
     section, each as the marker holds it, and says a new cluster is the way
@@ -2576,6 +2633,18 @@ cross-node check. Each stays its own commit, and the tree passes at each.
     promotion) returns no application either; and with the stub exiting
     without a trip, both hand the application over as today, with the
     latch's followed build cleared, so a trip after it names none;
+  - shadow prefault: a test app that records each `prefault` call and its
+    `Sizing`; on the kernel primary, the DPDK primary (under the runner)
+    and the replica, the shadow instance has been prefaulted once with
+    the node's `Sizing`, after the clone. And a capacity-order app (its
+    reports for an event follow a fixed-hasher map's iteration order, its
+    `restore` rebuilds the map at the entry count, its `prefault` reserves
+    `Sizing`'s count): a unit test on `shadow_clone` applies the same
+    events to a prefaulted live instance, to its bare `clone_via_snapshot`
+    and to its `shadow_clone`, and the reports of the bare clone differ in
+    order while the `shadow_clone`'s match, which pins that the prefault
+    is what aligns the two; and one node under load with that app and a
+    shadow does not stop;
   - `DivergenceLatch`: a trip sets the flag the latch was built with,
     and the replica builder passes the node's flag, not
     `pipeline_shutdown`. The builder test asserts that the shadow's latch
@@ -2949,8 +3018,22 @@ cross-node check. Each stays its own commit, and the tree passes at each.
 - Metrics `verified_from{against="primary"}`,
   `verified_through{against="primary"}`, `checks_total{against="primary"}`,
   `unverified_windows_total`, `chain_breaks_total`,
-  `frames_skipped_total`.
+  `frames_skipped_total`. A replica's endpoint is not the primary's: it is
+  built by `spawn_replica_health` through `HealthState::for_replica`
+  (`raft.rs:338`), which today takes only the fence state, the raft status
+  and `pipeline_healthy`, and it outlives every replica pipeline a resync
+  rebuilds. So these metrics go into the node-lifetime handle step 3
+  creates for the shadow's series, never into the pipeline's own state,
+  which a rebuild would replace behind the endpoint's back.
 - Tests:
+  - the replica's endpoint (`/metrics` on a replica under load) shows the
+    `against="primary"` series growing, and after a snapshot resync
+    rebuilds its pipeline the same series keep counting rather than
+    vanishing or resetting the counters;
+  - `receiver_transport.rs`, with the scripted transport: a replica
+    started with `--no-output-digests` behind a primary that advertises
+    the output kind and sends `Digest` frames decodes and drops every
+    frame, feeds no comparator, never trips, and acks as without them;
   - `pipeline_tests.rs`: `primary_emits_output_digest_after_its_position`,
     modelled on `primary_emits_chain_check_every_interval`, reading each
     slot through `chunk_frames`:
@@ -3092,7 +3175,11 @@ cross-node check. Each stays its own commit, and the tree passes at each.
     replica, `cluster-halted` by that replica on the primary, by the
     primary on the other replica), nothing promotes, and every restart is
     refused. The same with both replicas faulted, the second stop arriving
-    while the primary is already stopping. And the mixed-build case, the
+    while the primary is already stopping. The same with step 3's
+    capacity-order app and one replica given a larger `Sizing` than the
+    primary, an application that breaks the determinism rule without
+    violating `prefault`'s contract: the first event whose reports come
+    out in another order stops the cluster. And the mixed-build case, the
     primary started with another build id than its replicas (step 2's
     `ServerConfig::build_id`, which `melin-test-node` can set, the one seam
     that stands in for a second binary): healthy under load, both
@@ -3169,7 +3256,7 @@ cross-node check. Each stays its own commit, and the tree passes at each.
 - The measurement of decision 15, the hash micro-benchmark and the
   per-window cost included, in a dated document naming its hardware. If
   the response stage's tail moves, open questions 1 and 5 decide; if the
-  per-window cost is above decision 2's estimate, open question 9 does.
+  per-window cost breaks decision 2's bound, open question 9 does.
   The run also reports replication ring slots per published batch (one,
   digests on or off, decision 7) and replica evictions, both with digests
   on and off.
@@ -3183,7 +3270,9 @@ cross-node check. Each stays its own commit, and the tree passes at each.
     primary keeps coverage, catch-up included, unless a chain break is
     counted; the detection delay bounded in entries and so in ticks when
     idle; the unverified tail at failover; queries; nodes without
-    snapshots;
+    snapshots; snapshot handling checked in-process only for the state
+    present at the pipeline's start, and not at all under an overridden
+    `clone_via_snapshot`;
   - **what an operator sees**: the `error!` lines on every node, naming
     who detected and who told whom, and both builds when they differ;
     the gauges to alert on (`melin_output_diverged`,
@@ -3202,8 +3291,13 @@ cross-node check. Each stays its own commit, and the tree passes at each.
     a node's restore of a snapshot written before snapshot framing
     version 5, with its watermark warning in the log, points first at
     how the application handles a tick for a time already passed
-    (finding 7); a hardware fault is possible, and the new cluster shows
-    it if the fixed build diverges again;
+    (finding 7). The second suspect, especially on the first rollout of
+    this release, is report order that follows a hash map's capacity (the
+    determinism rule in `docs/building-an-application.md` already forbids
+    it): nodes sized differently iterate differently, and an application
+    that broke the rule unseen until now is stopped from upgrade day
+    (assessment 1.3). A hardware fault is possible, and the new cluster
+    shows it if the fixed build diverges again;
   - **upgrades** (also in the "Upgrade and rollback notes"): an
     application upgrade that changes its output for the same input cannot
     run mixed with the old build while output digests are on, since the
@@ -3402,6 +3496,12 @@ Beyond each step's own list:
   and nothing on the path from the mismatch on depends on its cause.
 - **The fold's cost** is measured, not tested: a wall-clock threshold in a
   test flakes.
+- **A non-default `--ring-capacity` end to end.** The board's and the
+  comparator's sizing is one function of the `RingCapacity`, unit-tested
+  at the minimum, the default and above it (step 1), and the builders
+  call only that function. No cluster runs at a capacity above the
+  default: its rings alone would take several times the default's memory
+  per node, and the sizing is what such a run would test.
 - **The idle delay in seconds** is not asserted: step 5's idle test counts
   checks per ticks, since a wall-clock bound flakes; the bound in ticks is
   what the docs state.
@@ -3474,9 +3574,9 @@ Beyond each step's own list:
    peers never answer it, so the promotion is abandoned. The case that
    remains, both replicas between sessions when the primary stops, is
    the documented limit, as before.
-4. **Clearing the marker.** Moving it aside, as one step of starting a
-   new cluster (step 6), or an admin command. Recommendation: the file,
-   moved and kept as the incident's record. It is an explicit act, it
+4. **Clearing the marker. Decided: the file is moved aside** (decision
+   12, and step 2 of the new-cluster procedure in step 6), not an admin
+   command, and kept as the incident's record. It is an explicit act, it
    works when the node will not start (which is exactly when an admin
    socket is not there), and the refusal says not to do it to bring the
    node back.
@@ -3486,11 +3586,12 @@ Beyond each step's own list:
    which takes the fold off the response thread entirely at the cost of a
    core and a second encode. Recommendation: the response stage, and the
    dedicated consumer only if step 6 shows the response thread's tail move.
-6. **Closing windows downstream of the output ring.** The applied cursor
-   (recommended: one store per matching batch, no new payload) or a marker
-   slot the matching stage publishes at each window end (a per-event compare
-   on the matching thread, and a new `OutputPayload` variant, breaking for
-   publishers, which the gate must also pass without waiting).
+6. **Closing windows downstream of the output ring. Decided: the applied
+   cursor** (decision 4): one store per matching batch, no new payload.
+   The alternative, a marker slot the matching stage publishes at each
+   window end, costs a per-event compare on the matching thread and a new
+   `OutputPayload` variant, breaking for publishers, which the gate must
+   also pass without waiting.
 7. **A stop that does not finish.** The stop exits through the node's
    ordinary shutdown, which fenced nodes already take. If a thread never
    joined, the exit helper never runs the linger, so a stopped primary
@@ -3545,14 +3646,14 @@ Beyond each step's own list:
    definition, changing it after release is a new kind value, which mixed
    builds handle as an unknown kind, not as a divergence; before release
    it is a constant to edit.
-10. **Does the digest frame carry `d_e` beside `C_e`?** (a) Yes, 16 bytes
-    more per frame (recommended); (b) the chain value alone. With (a), the
+10. **Does the digest frame carry `d_e` beside `C_e`? Decided: yes**, as
+    decision 8's frame layout does: (a) 16 bytes more per frame, rather
+    than (b) the chain value alone. With (a), the
     anchor's own window is checked rather than taken on trust, and a
     mismatch can say whether the window it was found at differs itself,
     which narrows the marker's range for the operator; the cost is 16
     bytes on a frame sent at most once per fsync batch. With (b), a
     mismatch only says the divergence lies somewhere since the last match.
-    Recommendation: (a).
 11. **Chain breaks on a replica's board.** Decision 5 leaves one lap a
     replica's comparator cannot absorb: a drain stalled while about `R·K`
     entries of report-less traffic were applied, which the rings do not
