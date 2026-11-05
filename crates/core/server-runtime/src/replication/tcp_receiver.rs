@@ -835,12 +835,35 @@ where
         let handshake = state.position.handshake(fence_state.epoch());
         send_buf.clear();
         encode_handshake(&handshake, &mut send_buf);
-        tcp_writer.write_all(&send_buf)?;
-        tcp_writer.flush()?;
+        let exchanged = tcp_writer
+            .write_all(&send_buf)
+            .and_then(|()| tcp_writer.flush())
+            // --- Protocol negotiation ---
+            .and_then(|()| read_frame(&mut reader, MAX_CONTROL_FRAME));
         send_buf.clear();
-
-        // --- Protocol negotiation ---
-        let response_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
+        let response_frame = match exchanged {
+            Ok(frame) => frame,
+            // The session was lost before the primary answered: it went
+            // away, reset the link, or sent no answer within the read
+            // timeout. Network-shaped, so reconnect, as the DPDK receiver
+            // does on a disconnect here, rather than end the node's run.
+            // A frame too large or empty lands here too: a fresh session
+            // restarts the framing, and a primary that keeps sending one
+            // shows as this warning on every attempt.
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    backoff_secs = backoff.as_secs(),
+                    "lost the primary during the handshake — retrying"
+                );
+                // Drop the socket before sleeping — see the auth failure
+                // arm above.
+                drop(reader);
+                drop(tcp_writer);
+                sleep_then_double_backoff(&mut backoff, shutdown, promote);
+                continue;
+            }
+        };
         let response = decode_primary_message(&response_frame)?;
         let stream_lineage = match response {
             PrimaryMessage::StreamStart {
@@ -3182,6 +3205,131 @@ mod tests {
                 logs.lines("failed to connect to primary").is_empty(),
                 "the dial failed rather than being abandoned"
             );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // A session lost between authentication and the primary's answer to
+    // the handshake — end to end against a scripted primary. Needs real
+    // persistence for the replica's store; no chain verdicts involved.
+    // -----------------------------------------------------------------
+    #[cfg(not(feature = "no-persist"))]
+    mod handshake_loss {
+        use super::super::super::auth::authenticate_replica;
+        use super::scripted::*;
+        use super::*;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        /// How the scripted primary loses the session once it holds the
+        /// replica's handshake.
+        enum Loss {
+            /// It closes the connection: the replica reads end of file.
+            Closed,
+            /// It holds the connection and never answers: the replica's
+            /// read times out.
+            Silent,
+        }
+
+        /// A scripted primary authenticates a fresh replica, takes its
+        /// handshake, and loses the session as `loss` says. The replica
+        /// must not end its run over it: it comes back, authenticates
+        /// again with the same handshake, and still stops cleanly on
+        /// shutdown.
+        fn reconnects_after(loss: Loss) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let authorized_keys = replica_auth();
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let addr = listener.local_addr().expect("addr");
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let control = crate::replication::ReplicaControlPlane::new();
+            let replica = {
+                let journal = dir.path().join("replica.journal");
+                let shutdown = Arc::clone(&shutdown);
+                let control = control.clone();
+                std::thread::spawn(move || -> Result<bool, String> {
+                    run_receiver::<App>(
+                        addr,
+                        &store(&journal),
+                        &ed25519_dalek::SigningKey::from_bytes(&REPLICA_KEY),
+                        &shutdown,
+                        &control,
+                        3_600_000,
+                        crate::layout::PipelineCores::unpinned(),
+                        RingCapacity::MIN,
+                        melin_journal::StagingMode::ZeroFill,
+                        PREALLOC,
+                        Duration::ZERO,
+                        64,
+                        Arc::new(melin_transport_core::fence::FenceState::new(0)),
+                        &(),
+                    )
+                    // ReceiverResult's error is !Send — stringify for join().
+                    .map(|state| state.is_none())
+                    .map_err(|e| e.to_string())
+                })
+            };
+            // Authenticate the replica on `stream` and take its handshake.
+            let take_handshake = |mut stream: TcpStream| {
+                let mut reader = stream.try_clone().expect("clone");
+                authenticate_replica(&mut reader, &authorized_keys).expect("auth");
+                match read_replica_msg(&mut stream) {
+                    ReplicaMessage::Handshake(h) => {
+                        assert_eq!(h.last_sequence, 0, "fresh replica handshake")
+                    }
+                    other => panic!("expected Handshake, got {other:?}"),
+                }
+                (stream, reader)
+            };
+
+            let first = take_handshake(accept_within(&listener, 30));
+            let _held = match loss {
+                Loss::Closed => {
+                    drop(first);
+                    None
+                }
+                Loss::Silent => Some(first),
+            };
+
+            // The reconnect: the replica's backoff, after its read timeout
+            // when the primary is silent. A replica that ends its run
+            // instead fails the test with its error at once.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let second = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(10)))
+                            .expect("read timeout");
+                        break stream;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        if replica.is_finished() {
+                            panic!(
+                                "the replica ended its run instead of reconnecting: {:?}",
+                                replica.join()
+                            );
+                        }
+                        assert!(Instant::now() < deadline, "the replica never reconnected");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("accept failed: {e}"),
+                }
+            };
+            let _second = take_handshake(second);
+
+            stop_receiver(replica, &shutdown);
+        }
+
+        #[test]
+        fn a_primary_closing_after_the_handshake_is_reconnected_to() {
+            reconnects_after(Loss::Closed);
+        }
+
+        #[test]
+        fn a_primary_silent_after_the_handshake_is_reconnected_to() {
+            reconnects_after(Loss::Silent);
         }
     }
 

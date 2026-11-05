@@ -266,6 +266,12 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   as the DPDK replica's does, and within a second of a promotion or
   shutdown request, so a failover is no longer held up by the dead
   primary's silence.
+- **A kernel-TCP replica no longer stops when it loses its primary
+  mid-handshake.** If the primary closed or reset the connection, or
+  sent no answer within 5 seconds, after authenticating the replica but
+  before answering its handshake, the replica's node exited with the
+  I/O error instead of reconnecting. It now logs a warning and
+  reconnects with its usual backoff, as the DPDK replica does.
 - **A restarted node, a node restored from a snapshot, a replica
   seeded by a resync, or a replica promoted to primary, no longer makes
   tick calls an uninterrupted node does not.** The time last handed to
