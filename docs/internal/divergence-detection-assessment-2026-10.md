@@ -55,7 +55,7 @@ bytes, are now closed on `main` (items 1.5 and 1.4).
 | --- | --- | --- | --- | --- |
 | 1 | Digest frames take a replication-ring slot each, up to one per fsync batch. That can halve the headroom before a replica is evicted | Performance | High | Done: the digest shares the batch's slot (decision 7) |
 | 2 | "Under `disk` the primary keeps serving alone" is wrong: the halt applies under every policy | Correctness of the guarantee text | High | Done: plan text corrected, halt cause added to step 5 |
-| 3 | When the primary is at fault, the plan stops the healthy copies, archives their good snapshots and tells the operator to reseed them from the faulty primary | Correctness / operations | High | **Yes** |
+| 3 | When the primary is at fault, the plan stops the healthy copies, archives their good snapshots and tells the operator to reseed them from the faulty primary | Correctness / operations | High | Superseded (2026-10-28): the whole cluster stops |
 | 4 | Stale bytes in the shared encode buffer: resolved on `main`. What remains is keeping the zeroing and the purity check on the drain's and the shadow's encodes | Correctness | Low (residual) | Done: now in the plan's decision 4 |
 | 5 | First rollout: the only fallback from enforcement is `--no-output-digests`, which gives up detection entirely | Operations | Medium-High | Decided: no observe mode; the offline tool is the debugging path |
 | 6 | The tick trap is wider than finding 7 says: replica restarts and promotions trigger it too, with no clock step back needed | Correctness caveat | Medium-High | Done on `main`: the watermark is carried (merge 87e36302), so no release gate |
@@ -72,8 +72,8 @@ bytes, are now closed on `main` (items 1.5 and 1.4).
 | 17 | Queries are not covered, and `QueryCtx` makes a query check hard | Coverage | Low-Medium | Document |
 | 18 | Idle detection delay is bounded in ticks; unbounded with ticks off | Coverage | Low-Medium | Document |
 | 19 | Chain break under report-less traffic with a stalled drain (open question 11) | Coverage | Low | Defer |
-| 20 | Downgrade ignores the marker | Operations | Low-Medium | Document, plus a convention |
-| 21 | API breaks, the API review's "additive" label, and a name clash in `ArchiveReason` | Operations | Low | Rename done (`OutputDiverged`); the rest is text |
+| 20 | Downgrade ignores the marker | Operations | Low-Medium | Decided: document only |
+| 21 | API breaks, the API review's "additive" label, and a name clash in `ArchiveReason` | Operations | Low | Archive reason superseded (2026-10-28: nothing is archived); the rest is text |
 | 22 | Comparator complexity, and "cannot compile" claims that are only lints | Complexity | Medium | `trip` done (decisions 6, 11); the rest in design review |
 | 23 | Smaller implementation traps (allocating sibling, encode-error logs at `error!`, notice aggregation, the board's shape) | Complexity | Low-Medium | Stack buffer and encode-error logging done (decisions 4, 8); the rest in the steps |
 | 24 | Room for improvement: majority verdict from notices, staleness metrics, offline qualification | Improvement | — | Some now, some later |
@@ -640,7 +640,8 @@ the v9 side and no refused session: a v9 primary accepts a v10 replica,
 which speaks 9 to it (plan, decision 8 and open question 12). Raft
 protocol 1, unreleased, refuses any other version and needs the same
 rule before it ships, or a mixed cluster has no failover; noted in the
-plan, not scheduled. (c) stays on the roadmap.
+plan, not scheduled. Rolling upgrades are not supported; (c) is not
+planned.
 
 ### 3.2 First rollout: enforcement with only an off switch (item 5)
 
@@ -732,8 +733,21 @@ refusal file name that every future release checks
 first user, so later stop-causes need no new startup check and stay
 visible to releases from this one on.
 
-**Recommendation.** Both. (b) is cheap and only pays off if done in the
-first release that has a marker.
+**Decided (2026-11-04): (a) only.** A
+rollback across releases is already a manual procedure, not a reinstall:
+this release writes snapshot format v5, which 0.22.0 refuses
+(`UnsupportedTransportVersion`), the shadow writes snapshots routinely,
+and journals carrying entries an older release cannot read (a promotion,
+an ack-policy change) stop it too. `docs/replication.md`'s rollback
+notes already send the operator to restore an older release's snapshot
+or re-sync the node. What is left is a node that stopped before its
+first v5 snapshot with a journal the older release reads, and the
+rollback procedure itself, which sets the v5 snapshot aside: both pass
+through an operator following those notes, so a line there covers them
+(plan, step 6). The argument that (b) only pays off in the first release
+with a marker does not hold while every cross-release rollback needs
+manual steps: no binary starts unattended on a marker it does not know.
+Rolling upgrades and rollbacks are not supported, so (b) is not planned.
 
 ### 3.5 API breaks (item 21)
 
@@ -1007,11 +1021,9 @@ right.
 
 In order of value for the cost:
 
-1. **Majority verdict from the notices** (item 1.2 (b)). It needs no new
-   wire field and, with two or more replicas, turns a guess into a verdict
-   for persistent divergences and replicas that anchored together. It
-   widens the plan's scope, which excludes majority verdicts (plan:2031).
-   Step 5.
+1. ~~**Majority verdict from the notices**~~ (item 1.2 (b)). Superseded
+   (2026-10-28): every node stops, and who is at fault does not change
+   the recovery, so the plan attributes nothing.
 2. **Alertable staleness.** Add `melin_output_comparing{against}` and a
    lag gauge (`applied position − verified_through`, in entries), so "not
    comparing" and "falling behind" are alerts rather than "worth a look"
@@ -1022,14 +1034,15 @@ In order of value for the cost:
    copies and report every window whose outputs differ. Next after this
    plan; it is the debugging path. Observe mode is rejected (3.2).
 4. **Protocol 9's version check at authentication** (item 3.1,
-   decided). Step 4. Serving N−1 goes on the roadmap with raft link
-   versions and a planned switchover (3.1 (c)).
-5. **A generic refusal file** (item 3.4 (b)). Step 3.
+   decided). Step 4. Serving N−1 is not planned: rolling upgrades are
+   not supported.
+5. **A generic refusal file** (item 3.4 (b), decided: not planned).
 6. **An in-process query digest kind, opt-in** (item 2.3 (b)). Roadmap.
 7. **State digest; chain stored in snapshots.** Already step 7. The state
    digest also closes items 1.6 and 1.7.
-8. **Deferred replica exit with automatic failover on a primary-fault
-   verdict** (item 1.2 (c)). Its own plan.
+8. ~~**Deferred replica exit with automatic failover on a primary-fault
+   verdict**~~ (item 1.2 (c)). Superseded (2026-10-28): it would serve
+   after a divergence.
 
 ## What should change before implementation, and what can wait
 
@@ -1039,9 +1052,9 @@ In order of value for the cost:
   and step 6 measures ring occupancy.
 - 1.1: done. The plan's text now says the halt applies under every
   policy, and step 5 adds the halt's cause to `/healthz`.
-- 1.2: refusal message and runbook branch on who is at fault; restore
-  archived snapshots on a primary-fault verdict; say whether replay is
-  possible; add the majority verdict to step 5.
+- 1.2: superseded (2026-10-28). The refusal message points every node
+  at a new cluster, nothing is archived, and the new-cluster procedure
+  says which journal can be replayed (plan, step 6).
 - 1.4: done. The zeroing and the purity check are on `main`, and the plan
   now moves both into `encode_report_body` so the drain and the shadow
   share them.
@@ -1053,14 +1066,15 @@ In order of value for the cost:
   (decisions 6, 11). Fixed-size frames, the chain check and rotate
   included, encode into arrays (decision 8). Encode failures nobody
   receives are counted and logged at `warn!` (decision 4). The "same
-  window" definition in 5.4 is still open; it goes with 1.2.
-- 3.5: done: `ArchiveReason::OutputDiverged`, tag `output-diverged`.
+  window" definition in 5.4 is superseded with 1.2.
+- 3.5: superseded (2026-10-28): nothing is archived, so there is no
+  archive reason to add.
 
 **Decide now, because they shape steps 2 to 5:** observe mode (3.2,
 decided: rejected), the build-id override and the comparing gauge (2.2,
 decided: superseded, every build is compared), protocol negotiation
 (3.1, decided: a flag day, the version checked at authentication), the
-generic refusal file (3.4).
+generic refusal file (3.4, decided: not planned).
 
 **Fold into the steps:** the hash-map-order rollout caveat (1.3), named in
 the rollout notes, with the shadow prefault and the capacity-order fault
@@ -1079,10 +1093,11 @@ across restarts and promotion.
 ## Decisions for the user
 
 1. **Ring slots (4.1):** decided: the digest shares the batch's slot.
-2. **Faulty primary (1.2):** widen the plan's scope (it excludes majority
-   verdicts) to add the partial two-against-one verdict from notices in
-   step 5, and should a primary found at fault by it trip its own latch?
-   Plan a deferred-exit failover separately, or rule it out?
+2. **Faulty primary (1.2):** superseded (2026-10-28) by the whole-cluster
+   stop: every node stops, the primary included, and the only way back
+   is a new cluster from the input-only journal, so who is at fault does
+   not change the recovery. No majority verdict, no attribution, no
+   deferred exit or failover after a divergence.
 3. **First rollout (3.2):** decided: no observe mode, which would mean
    serving on a broken contract. The switch stays on/off, and the offline
    qualification tool is the debugging path, next on the roadmap.
@@ -1091,7 +1106,9 @@ across restarts and promotion.
    sends its version in `ChallengeResponse`, and the primary accepts one
    at or above its own, naming the session's version in `AuthOk`, so
    that a later release can roll replicas first. No ranges. Raft
-   protocol 1 needs the same rule before it ships (noted, not scheduled). Serving N−1 is roadmap work with raft link versions.
+   protocol 1 needs the same rule before it ships (noted, not
+   scheduled). Serving N−1 is not planned: rolling upgrades are not
+   supported.
 5. **Build id (2.2):** decided (2026-11-04): always compare output
    digests, whatever the builds. The build id stays for diagnosis only,
    named in the stop's log, marker and refusal when the builds differ; no
@@ -1100,5 +1117,8 @@ across restarts and promotion.
 6. **Monotonic time (1.5):** decided: the narrow fix, landed on `main`
    (the tick watermark carried across restart, promotion, snapshot
    restore and resync, snapshot format v5). No release gate remains.
-7. **Refusal convention (3.4):** introduce `<journal>.refuse` now as the
-   general mechanism?
+7. **Refusal convention (3.4):** decided (2026-11-04): no. A rollback
+   across releases already needs manual steps (snapshot format v5,
+   journal entries an older release cannot read), so the rollback notes
+   and the new-cluster procedure say to check for the marker first.
+   Rolling upgrades and rollbacks are not supported.

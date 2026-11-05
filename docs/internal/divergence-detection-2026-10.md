@@ -1331,7 +1331,8 @@ own batch cadence. Nothing in the digest path is behind
   first without a refused session: a v9 primary accepts a v10 replica,
   which speaks 9 to it, and after a switchover a v10 primary may accept
   its v9 replicas. Both are that release's code; the v9 side needs none.
-  Serving N−1 is on the roadmap with a planned switchover.
+  Rolling upgrades are not supported today; this only keeps protocol 9
+  from ruling them out.
 - **A rolling upgrade also needs raft links across versions; not done
   in this plan.** Raft protocol 1, unreleased on `main`, refuses a peer
   on any other version (`exchange_version_as`, `raft/src/wire.rs`), so
@@ -3212,6 +3213,15 @@ cross-node check. Each stays its own commit, and the tree passes at each.
     activation point (below). An upgrade that keeps the output identical
     can still roll node by node. A Melin runtime upgrade is a
     stop-everything upgrade for replication protocol 9 already;
+  - **rolling back past this release** (in the "Upgrade and rollback
+    notes", beside "Rolling back across a promotion…"): a release before
+    this one does not know the marker, and would start a stopped node
+    whose snapshot and journal it can read, or one whose v5 snapshot the
+    rollback procedure set aside. Before rolling a node back, check for
+    `<journal>.diverged`: a node with one must not be started on any
+    release, and the cluster comes back only as a new one (below). No
+    refusal file older releases would honour is possible (assessment
+    3.4);
   - **what overrides the stop**, in one place: a manual `PROMOTE` of a
     node that never heard the halt; observational raft steering an
     operator to `PROMOTE` its leader, which may be the unaware node;
@@ -3224,6 +3234,9 @@ cross-node check. Each stays its own commit, and the tree passes at each.
     1. Stop every node, lingering ones included.
     2. Move each node's marker aside, kept as the incident's record, and
        set every node's snapshots aside: the broken build wrote them all.
+       Rolling the stopped nodes back to an older release is not a way
+       around this procedure: it ignores the marker (rolling back,
+       above).
     3. Pick the node whose journal reaches the highest position *and*
        goes back to sequence 1. With snapshots set aside, recovery needs
        the whole history and refuses with `MissingHistoryPrefix`
@@ -3290,7 +3303,8 @@ cross-node check. Each stays its own commit, and the tree passes at each.
   A second case starts from a node whose journal does not reach sequence
   1: recovery refuses with `MissingHistoryPrefix` until the early segments
   are copied in.
-- **Leaves untested:** the runbook's prose itself; a hardware fault.
+- **Leaves untested:** the runbook's prose itself; a hardware fault; a
+  rollback to an older release, whose binary the suite does not build.
 
 ### Step 7. Roadmap: five follow-ups
 
@@ -3578,8 +3592,8 @@ Beyond each step's own list:
     ranges; the primary accepts a replica at or above its own version,
     and the replica decides whether it can speak the primary's (decision
     8). Raft protocol 1 needs the same rule before it ships, noted in
-    decision 8 and not scheduled. Serving N−1 and a planned switchover
-    go on the roadmap as (c).
+    decision 8 and not scheduled. Rolling upgrades are not supported, so
+    (c) is not planned.
 
 ## Not part of this plan
 
