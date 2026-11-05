@@ -261,9 +261,23 @@ pub(super) fn log_tcp_info(fd: std::os::unix::io::RawFd, tag: &str, slot: usize)
     );
 }
 
-/// Sleep for the given duration in 100ms increments, checking the shutdown
-/// flag and the promotion request between increments. Returns early if
-/// either is set.
+/// How often a receiver sleeping out a reconnect backoff looks at the
+/// shutdown flag and the promotion request: the most a requested
+/// promotion or shutdown waits for it to notice.
+pub(super) const FLAG_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How long either receiver waits for the TCP handshake with the primary
+/// before giving up on the dial and backing off. A primary that is down
+/// but whose host still answers refuses at once; this bounds the case
+/// where nothing answers (a partition, a powered-off host, a firewall
+/// dropping SYNs, a stopped DPDK node, which has no stack to refuse).
+/// A shutdown or promotion request also ends either dial: the DPDK one at
+/// once, the kernel one within its one-second attempt.
+pub(super) const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Sleep for the given duration in [`FLAG_POLL_INTERVAL`] increments,
+/// checking the shutdown flag and the promotion request between
+/// increments. Returns early if either is set.
 pub(super) fn sleep_checking_flags(
     duration: std::time::Duration,
     shutdown: &AtomicBool,
@@ -274,7 +288,7 @@ pub(super) fn sleep_checking_flags(
         if shutdown.load(Ordering::Relaxed) || promote.is_requested() {
             return;
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::thread::sleep(FLAG_POLL_INTERVAL);
     }
 }
 

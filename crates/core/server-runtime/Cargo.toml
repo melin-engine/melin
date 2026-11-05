@@ -107,6 +107,10 @@ melin-dpdk = { workspace = true, features = ["clap"] }
 # feature is a pure forward with no code of its own, so nothing is lost.
 melin-example-counter = { path = "../../examples/counter", default-features = false }
 tempfile = "3"
+# The kernel dial tests' unanswering primary (a listener with a backlog of
+# 1) and refusing one (bound, never listening): `std::net` can do neither.
+# Already in the lock through `melin-client`.
+socket2 = "0.6"
 serial_test = "3"
 proptest = "1"
 melin-journal = { workspace = true, features = ["test-utils"] }
