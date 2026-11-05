@@ -1158,6 +1158,7 @@ dependencies = [
  "rand 0.10.3",
  "rustc-hash",
  "serial_test",
+ "socket2",
  "tempfile",
  "tracing",
  "tracing-subscriber",

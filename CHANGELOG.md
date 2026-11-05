@@ -256,6 +256,16 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Fixed
 
+- **A kernel-TCP replica whose primary stops answering no longer delays
+  its own promotion by up to two minutes.** The replica dialled its
+  primary with a blocking connect, so against a host that answers
+  nothing (a partition, a powered-off host, a firewall dropping SYNs)
+  each dial waited out the kernel's SYN retries, about two minutes at
+  Linux's default, and a promotion or a shutdown requested meanwhile
+  was not seen until it gave up. The dial now gives up after 10 seconds,
+  as the DPDK replica's does, and within a second of a promotion or
+  shutdown request, so a failover is no longer held up by the dead
+  primary's silence.
 - **A restarted node, a node restored from a snapshot, a replica
   seeded by a resync, or a replica promoted to primary, no longer makes
   tick calls an uninterrupted node does not.** The time last handed to

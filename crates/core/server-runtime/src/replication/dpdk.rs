@@ -30,10 +30,10 @@ use super::receiver_transport::{
 };
 use super::validation_worker::ValidationWorker;
 use super::{
-    ReceiverResult, ReplicaCursors, ReplicaEngine, ReplicaState, ReplicationMetrics, ResumePoint,
-    ResyncDecision, SentHighWater, StreamStartVerdict, build_replica_pipeline_with_threads,
-    handle_resync_verdict, handle_session_exit, journal_failed_while_disconnected,
-    recover_replica_state, sleep_then_double_backoff,
+    CONNECT_TIMEOUT, ReceiverResult, ReplicaCursors, ReplicaEngine, ReplicaState,
+    ReplicationMetrics, ResumePoint, ResyncDecision, SentHighWater, StreamStartVerdict,
+    build_replica_pipeline_with_threads, handle_resync_verdict, handle_session_exit,
+    journal_failed_while_disconnected, recover_replica_state, sleep_then_double_backoff,
 };
 use melin_app::auth::AuthorizedKeys;
 use melin_transport_core::node_store::NodeStore;
@@ -1779,7 +1779,6 @@ where
 
         // Poll until TCP handshake completes (with timeout).
         let connect_start = std::time::Instant::now();
-        const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
         let connected = loop {
             // Route shutdown and promotion through the `!connected` arm
             // and the loop top — returning from here would leak the

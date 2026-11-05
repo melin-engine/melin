@@ -24,7 +24,7 @@ use super::receiver_transport::{
     ControlFrameSource, ReceiverTransport, SessionExit, streaming_loop,
 };
 use super::{
-    ReplicaEngine, ReplicaState, ResumePoint, ResyncDecision, StreamStartVerdict,
+    CONNECT_TIMEOUT, ReplicaEngine, ReplicaState, ResumePoint, ResyncDecision, StreamStartVerdict,
     build_replica_pipeline_with_threads, handle_resync_verdict, handle_session_exit,
     journal_failed_while_disconnected, recover_replica_state, sleep_then_double_backoff,
 };
@@ -33,6 +33,69 @@ use melin_transport_core::replication::protocol::{
     Ack, MAX_CONTROL_FRAME, MAX_DATA_FRAME, PrimaryMessage, decode_primary_message, encode_ack,
     encode_handshake, read_frame,
 };
+
+/// How a [`dial_checking_flags`] ended. Exhaustive, so the reconnect loop
+/// decides for each outcome.
+enum Dial {
+    /// The TCP handshake completed; the stream is in blocking mode.
+    Connected(TcpStream),
+    /// Refused, unreachable, or no answer within the timeout.
+    Failed(io::Error),
+    /// Shutdown or promotion was requested while the dial waited; the
+    /// socket is closed.
+    Interrupted,
+}
+
+/// The longest one attempt of [`dial_checking_flags`] waits for the
+/// primary to answer, and so the longest a promotion or shutdown requested
+/// mid-dial waits to be seen. Linux's initial SYN retransmission timeout:
+/// against a primary that drops SYNs, a fresh attempt goes out when the
+/// kernel would first have resent the SYN (it then backs off; these do
+/// not, a handful of extra SYNs over a dial). A link whose handshake round
+/// trip exceeds it never connects, but could not carry a replication
+/// stream either.
+const DIAL_ATTEMPT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Dial the primary, giving up after `timeout`, or at the end of the
+/// attempt under way once shutdown or promotion is requested.
+///
+/// A plain `TcpStream::connect` to a primary whose host does not answer
+/// (a partition, a powered-off host, a firewall dropping SYNs) blocks for
+/// the kernel's SYN retries, about two minutes at Linux's default, and a
+/// promotion raft requests meanwhile is not seen until it fails: the
+/// failover stalls for as long. So the dial is a series of
+/// `connect_timeout` attempts of at most [`DIAL_ATTEMPT`], the flags read
+/// between them. Only an unanswered attempt is retried: any other error
+/// (a refusal, an unreachable network) fails the dial at once, so the
+/// reconnect loop's backoff paces it.
+fn dial_checking_flags(
+    addr: SocketAddr,
+    timeout: std::time::Duration,
+    shutdown: &AtomicBool,
+    promote: &crate::promotion::PromotionRequest,
+) -> Dial {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        // Before the deadline check, so a flag raised during the last
+        // attempt abandons the dial rather than failing it.
+        if shutdown.load(Ordering::Relaxed) || promote.is_requested() {
+            return Dial::Interrupted;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        // Never zero: `connect_timeout` rejects a zero timeout.
+        if remaining.is_zero() {
+            return Dial::Failed(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("no answer from the primary within {timeout:?}"),
+            ));
+        }
+        match TcpStream::connect_timeout(&addr, remaining.min(DIAL_ATTEMPT)) {
+            Ok(stream) => return Dial::Connected(stream),
+            Err(e) if e.kind() == io::ErrorKind::TimedOut => {}
+            Err(e) => return Dial::Failed(e),
+        }
+    }
+}
 
 /// Force the kernel to send a TCP ACK immediately rather than holding
 /// it in the delayed-ACK timer (~40 ms on Linux). Linux clears
@@ -693,9 +756,11 @@ where
         // --- Connect and authenticate ---
         info!(primary = %primary_addr, "connecting to primary as replica");
 
-        let stream = match TcpStream::connect(primary_addr) {
-            Ok(s) => s,
-            Err(e) => {
+        let stream = match dial_checking_flags(primary_addr, CONNECT_TIMEOUT, shutdown, promote) {
+            Dial::Connected(s) => s,
+            // The loop top handles both, once, and logs the promotion.
+            Dial::Interrupted => continue,
+            Dial::Failed(e) => {
                 warn!(
                     error = %e,
                     backoff_secs = backoff.as_secs(),
@@ -2848,6 +2913,275 @@ mod tests {
                 .expect("promoted, not shut down");
             assert!(verdict.contains("refusing promotion"), "{verdict}");
             assert!(verdict.contains("holds 2 entries"), "{verdict}");
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // The kernel dial (`dial_checking_flags`): bounded, and abandoned on
+    // shutdown or promotion, against a primary that never answers.
+    // -----------------------------------------------------------------
+    mod dial {
+        use super::*;
+        use socket2::{Domain, Protocol, Socket, Type};
+        use std::sync::atomic::AtomicBool;
+
+        /// A listener whose accept queue is full, so the kernel drops
+        /// every further SYN unanswered: from the dialler's side, a
+        /// primary whose host is partitioned away. Linux holds one more
+        /// connection than the backlog in the accept queue, so `listen(1)`
+        /// takes the two fillers returned, and nothing ever accepts. All
+        /// must outlive the dial. Not `listen(0)` with one filler: with a
+        /// backlog of 0 some kernels count the SYN queue as full from the
+        /// start, so the filler itself would go through SYN cookies, and
+        /// hang where they are off.
+        fn silent_primary() -> (Socket, [TcpStream; 2], SocketAddr) {
+            let listener =
+                Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).expect("socket");
+            listener
+                .bind(&"127.0.0.1:0".parse::<SocketAddr>().expect("addr").into())
+                .expect("bind");
+            listener.listen(1).expect("listen");
+            let addr = listener
+                .local_addr()
+                .expect("local addr")
+                .as_socket()
+                .expect("inet addr");
+            let fillers =
+                [(); 2].map(|()| TcpStream::connect(addr).expect("fill the accept queue"));
+            (listener, fillers, addr)
+        }
+
+        #[test]
+        fn a_listening_primary_connects_in_blocking_mode() {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let promote = crate::promotion::PromotionRequest::new();
+            let mut stream = match dial_checking_flags(
+                addr,
+                Duration::from_secs(10),
+                &AtomicBool::new(false),
+                &promote,
+            ) {
+                Dial::Connected(s) => s,
+                Dial::Failed(e) => panic!("dial failed: {e}"),
+                Dial::Interrupted => panic!("dial interrupted with no flag set"),
+            };
+            let (mut peer, _) = listener.accept().expect("accept");
+            peer.write_all(b"x").expect("write");
+            // Blocking mode: a read with nothing yet to read waits for
+            // the timeout rather than returning `WouldBlock` at once.
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("read timeout");
+            let mut byte = [0u8; 1];
+            stream.read_exact(&mut byte).expect("read");
+            assert_eq!(&byte, b"x");
+            let start = Instant::now();
+            stream
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .expect("read timeout");
+            let err = stream.read(&mut byte).expect_err("nothing more to read");
+            assert!(
+                matches!(
+                    err.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ),
+                "{err}"
+            );
+            assert!(
+                start.elapsed() >= Duration::from_millis(150),
+                "the read returned at once: the stream was left non-blocking"
+            );
+        }
+
+        #[test]
+        fn a_refusing_primary_fails_at_once() {
+            // Bound but never listening: the port refuses for as long as
+            // the socket lives, and no other test can take it meanwhile.
+            let closed =
+                Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).expect("socket");
+            closed
+                .bind(&"127.0.0.1:0".parse::<SocketAddr>().expect("addr").into())
+                .expect("bind");
+            let addr = closed
+                .local_addr()
+                .expect("local addr")
+                .as_socket()
+                .expect("inet addr");
+            let start = Instant::now();
+            match dial_checking_flags(
+                addr,
+                Duration::from_secs(30),
+                &AtomicBool::new(false),
+                &crate::promotion::PromotionRequest::new(),
+            ) {
+                Dial::Failed(e) => {
+                    assert_eq!(e.kind(), io::ErrorKind::ConnectionRefused, "{e}")
+                }
+                Dial::Connected(_) => panic!("connected to a closed port"),
+                Dial::Interrupted => panic!("dial interrupted with no flag set"),
+            }
+            // Inside one attempt: a refusal is not retried, it goes back
+            // to the reconnect loop's backoff.
+            assert!(start.elapsed() < DIAL_ATTEMPT, "{:?}", start.elapsed());
+        }
+
+        #[test]
+        fn a_silent_primary_times_out_at_the_bound() {
+            let (_listener, _filler, addr) = silent_primary();
+            let timeout = Duration::from_millis(300);
+            let start = Instant::now();
+            match dial_checking_flags(
+                addr,
+                timeout,
+                &AtomicBool::new(false),
+                &crate::promotion::PromotionRequest::new(),
+            ) {
+                Dial::Failed(e) => assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e}"),
+                Dial::Connected(_) => panic!("connected through a full accept queue"),
+                Dial::Interrupted => panic!("dial interrupted with no flag set"),
+            }
+            let elapsed = start.elapsed();
+            assert!(elapsed >= timeout, "gave up early: {elapsed:?}");
+            // Far below the kernel's own SYN retries (about two minutes).
+            assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+        }
+
+        /// The dial against a silent primary, with `raise` setting a flag
+        /// from another thread once the dial is under way: it must give
+        /// up at the end of the attempt under way, far inside its own
+        /// timeout.
+        fn abandoned_on(raise: impl FnOnce(&AtomicBool, &crate::promotion::PromotionRequest)) {
+            let (_listener, _filler, addr) = silent_primary();
+            let shutdown = AtomicBool::new(false);
+            let promote = crate::promotion::PromotionRequest::new();
+            let start = Instant::now();
+            let dial = std::thread::scope(|s| {
+                let dialler = s.spawn(|| {
+                    dial_checking_flags(addr, Duration::from_secs(60), &shutdown, &promote)
+                });
+                std::thread::sleep(Duration::from_millis(300));
+                raise(&shutdown, &promote);
+                dialler.join().expect("dialler panicked")
+            });
+            assert!(
+                matches!(dial, Dial::Interrupted),
+                "expected an abandoned dial"
+            );
+            // Raised inside the first attempt, seen when it ends.
+            assert!(start.elapsed() < 2 * DIAL_ATTEMPT, "{:?}", start.elapsed());
+        }
+
+        #[test]
+        fn a_promotion_abandons_the_dial() {
+            abandoned_on(|_, promote| {
+                assert!(promote.request(crate::promotion::PromotionOrigin::Manual));
+            });
+        }
+
+        #[test]
+        fn a_shutdown_abandons_the_dial() {
+            abandoned_on(|shutdown, _| shutdown.store(true, Ordering::Relaxed));
+        }
+
+        /// A promotion raised during the last attempt abandons the dial
+        /// rather than failing it: when that attempt ends, the flag is set
+        /// and the deadline passed together, and the flag must win, or the
+        /// reconnect loop warns of a failed dial and sleeps a backoff
+        /// before it sees the promotion. A single attempt, the promotion
+        /// raised early in it, so a late-scheduled thread has most of the
+        /// attempt to spare.
+        #[test]
+        fn a_promotion_during_the_last_attempt_abandons_the_dial() {
+            let (_listener, _fillers, addr) = silent_primary();
+            let shutdown = AtomicBool::new(false);
+            let promote = crate::promotion::PromotionRequest::new();
+            let dial = std::thread::scope(|s| {
+                let dialler =
+                    s.spawn(|| dial_checking_flags(addr, DIAL_ATTEMPT, &shutdown, &promote));
+                std::thread::sleep(Duration::from_millis(100));
+                assert!(promote.request(crate::promotion::PromotionOrigin::Manual));
+                dialler.join().expect("dialler panicked")
+            });
+            match dial {
+                Dial::Interrupted => {}
+                Dial::Failed(e) => panic!("the dial failed rather than being abandoned: {e}"),
+                Dial::Connected(_) => panic!("connected through a full accept queue"),
+            }
+        }
+
+        /// End to end: a replica whose primary has gone silent sees a
+        /// promotion while it dials, not after the kernel gives up. A
+        /// fresh replica has nothing to promote, so the receiver returns
+        /// that error; what the test pins is that it returns at all
+        /// within the bound, which a blocking connect did not.
+        #[cfg(not(feature = "no-persist"))]
+        #[test]
+        fn a_replica_dialling_a_silent_primary_sees_a_promotion() {
+            use super::scripted::{App, REPLICA_KEY};
+            use std::sync::Arc;
+
+            let (_listener, _fillers, addr) = silent_primary();
+            let dir = tempfile::tempdir().expect("tempdir");
+            let journal = dir.path().join("replica.journal");
+            let shutdown = AtomicBool::new(false);
+            let control = crate::replication::ReplicaControlPlane::new();
+            // The receiver's own log, captured on its thread, tells the
+            // test when it has reached the dial.
+            let logs = melin_transport_core::test_logs::Logs::default();
+            let (result, filed) = std::thread::scope(|s| {
+                let replica = s.spawn(|| {
+                    tracing::subscriber::with_default(logs.subscriber(tracing::Level::INFO), || {
+                        run_receiver::<App>(
+                            addr,
+                            &store(&journal),
+                            &ed25519_dalek::SigningKey::from_bytes(&REPLICA_KEY),
+                            &shutdown,
+                            &control,
+                            3_600_000,
+                            crate::layout::PipelineCores::unpinned(),
+                            RingCapacity::MIN,
+                            melin_journal::StagingMode::ZeroFill,
+                            PREALLOC,
+                            Duration::ZERO,
+                            64,
+                            Arc::new(melin_transport_core::fence::FenceState::new(0)),
+                            &(),
+                        )
+                        // The error is !Send: stringify for join().
+                        .map(|promoted| promoted.is_some())
+                        .map_err(|e| e.to_string())
+                    })
+                });
+                // Logged just before the dial. A bound, so a receiver that
+                // never gets there fails the test rather than hanging it.
+                let reached = Instant::now() + Duration::from_secs(30);
+                while logs.lines("connecting to primary as replica").is_empty() {
+                    assert!(Instant::now() < reached, "the receiver never dialled");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                // A moment more, so the dial is under way, its SYN
+                // dropped, when the promotion lands.
+                std::thread::sleep(Duration::from_millis(300));
+                let filed = Instant::now();
+                assert!(
+                    control
+                        .promote
+                        .request(crate::promotion::PromotionOrigin::Manual),
+                    "promotion filed"
+                );
+                (replica.join().expect("replica thread panicked"), filed)
+            });
+            let err = result.expect_err("a fresh replica has nothing to promote");
+            assert!(err.contains("no local state available"), "{err}");
+            // The promotion ended the dial at the end of the attempt under
+            // way, well inside the dial's own timeout, and with no failed
+            // dial before it.
+            assert!(filed.elapsed() < 2 * DIAL_ATTEMPT, "{:?}", filed.elapsed());
+            assert!(
+                logs.lines("failed to connect to primary").is_empty(),
+                "the dial failed rather than being abandoned"
+            );
         }
     }
 
