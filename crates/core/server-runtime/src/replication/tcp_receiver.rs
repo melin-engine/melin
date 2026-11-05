@@ -3209,36 +3209,31 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // A session lost between authentication and the primary's answer to
-    // the handshake — end to end against a scripted primary. Needs real
-    // persistence for the replica's store; no chain verdicts involved.
+    // Sessions that end before streaming begins and must be redialled: one
+    // lost between authentication and the primary's answer to the
+    // handshake, and one with a primary on an older protocol — end to end
+    // against a scripted primary. Needs real persistence for the replica's
+    // store; no chain verdicts involved.
     // -----------------------------------------------------------------
     #[cfg(not(feature = "no-persist"))]
-    mod handshake_loss {
+    mod redial {
         use super::super::super::auth::authenticate_replica;
         use super::scripted::*;
         use super::*;
+        use melin_transport_core::replication::protocol::{
+            MAX_CONTROL_FRAME, REPL_PROTOCOL_VERSION, decode_challenge_response, encode_challenge,
+            encode_unversioned_auth_ok, read_frame,
+        };
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
 
-        /// How the scripted primary loses the session once it holds the
-        /// replica's handshake.
-        enum Loss {
-            /// It closes the connection: the replica reads end of file.
-            Closed,
-            /// It holds the connection and never answers: the replica's
-            /// read times out.
-            Silent,
-        }
+        type Replica = std::thread::JoinHandle<Result<bool, String>>;
 
-        /// A scripted primary authenticates a fresh replica, takes its
-        /// handshake, and loses the session as `loss` says. The replica
-        /// must not end its run over it: it comes back, authenticates
-        /// again with the same handshake, and still stops cleanly on
-        /// shutdown.
-        fn reconnects_after(loss: Loss) {
+        /// A fresh replica dialling a scripted primary's listener: the
+        /// listener (non-blocking), the replica's thread, its shutdown flag,
+        /// and the directory its store lives in.
+        fn start_replica() -> (TcpListener, Replica, Arc<AtomicBool>, tempfile::TempDir) {
             let dir = tempfile::tempdir().expect("tempdir");
-            let authorized_keys = replica_auth();
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
             listener.set_nonblocking(true).expect("nonblocking");
             let addr = listener.local_addr().expect("addr");
@@ -3247,7 +3242,6 @@ mod tests {
             let replica = {
                 let journal = dir.path().join("replica.journal");
                 let shutdown = Arc::clone(&shutdown);
-                let control = control.clone();
                 std::thread::spawn(move || -> Result<bool, String> {
                     run_receiver::<App>(
                         addr,
@@ -3270,6 +3264,56 @@ mod tests {
                     .map_err(|e| e.to_string())
                 })
             };
+            (listener, replica, shutdown, dir)
+        }
+
+        /// Accept the replica's next connection, within its backoff. A
+        /// replica that ends its run instead fails the test with its error
+        /// at once. Takes the replica's thread and hands it back, to join
+        /// it for that error.
+        fn accept_while_running(listener: &TcpListener, replica: Replica) -> (TcpStream, Replica) {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(10)))
+                            .expect("read timeout");
+                        return (stream, replica);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        if replica.is_finished() {
+                            panic!(
+                                "the replica ended its run instead of redialling: {:?}",
+                                replica.join()
+                            );
+                        }
+                        assert!(Instant::now() < deadline, "the replica never redialled");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("accept failed: {e}"),
+                }
+            }
+        }
+
+        /// How the scripted primary loses the session once it holds the
+        /// replica's handshake.
+        enum Loss {
+            /// It closes the connection: the replica reads end of file.
+            Closed,
+            /// It holds the connection and never answers: the replica's
+            /// read times out.
+            Silent,
+        }
+
+        /// A scripted primary authenticates a fresh replica, takes its
+        /// handshake, and loses the session as `loss` says. The replica
+        /// must not end its run over it: it comes back, authenticates
+        /// again with the same handshake, and still stops cleanly on
+        /// shutdown.
+        fn reconnects_after(loss: Loss) {
+            let (listener, replica, shutdown, _dir) = start_replica();
+            let authorized_keys = replica_auth();
             // Authenticate the replica on `stream` and take its handshake.
             let take_handshake = |mut stream: TcpStream| {
                 let mut reader = stream.try_clone().expect("clone");
@@ -3293,30 +3337,8 @@ mod tests {
             };
 
             // The reconnect: the replica's backoff, after its read timeout
-            // when the primary is silent. A replica that ends its run
-            // instead fails the test with its error at once.
-            let deadline = Instant::now() + Duration::from_secs(30);
-            let second = loop {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        stream
-                            .set_read_timeout(Some(Duration::from_secs(10)))
-                            .expect("read timeout");
-                        break stream;
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        if replica.is_finished() {
-                            panic!(
-                                "the replica ended its run instead of reconnecting: {:?}",
-                                replica.join()
-                            );
-                        }
-                        assert!(Instant::now() < deadline, "the replica never reconnected");
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(e) => panic!("accept failed: {e}"),
-                }
-            };
+            // when the primary is silent.
+            let (second, replica) = accept_while_running(&listener, replica);
             let _second = take_handshake(second);
 
             stop_receiver(replica, &shutdown);
@@ -3330,6 +3352,44 @@ mod tests {
         #[test]
         fn a_primary_silent_after_the_handshake_is_reconnected_to() {
             reconnects_after(Loss::Silent);
+        }
+
+        /// A primary on replication protocol 8 answers the replica's
+        /// response, which states its version, with the one-byte AuthOk of
+        /// a release that states none. The replica must not run a session
+        /// at a version it does not speak: it sends no handshake, closes,
+        /// and redials after its backoff, as after any refused session.
+        #[test]
+        fn a_primary_on_an_older_protocol_gets_no_handshake_and_is_redialled() {
+            let (listener, mut replica, shutdown, _dir) = start_replica();
+            for session in 0..2 {
+                let mut stream;
+                (stream, replica) = accept_while_running(&listener, replica);
+                let mut challenge = Vec::new();
+                encode_challenge(&[0x42; 32], &mut challenge);
+                stream.write_all(&challenge).expect("send the challenge");
+                let response = read_frame(&mut stream, MAX_CONTROL_FRAME).expect("response");
+                assert_eq!(
+                    decode_challenge_response(&response)
+                        .expect("a challenge response")
+                        .protocol_version,
+                    Some(REPL_PROTOCOL_VERSION),
+                    "the replica states its version"
+                );
+                let mut auth_ok = Vec::new();
+                encode_unversioned_auth_ok(&mut auth_ok);
+                stream.write_all(&auth_ok).expect("send a v8 AuthOk");
+
+                let mut rest = Vec::new();
+                stream
+                    .read_to_end(&mut rest)
+                    .expect("the replica closes the session");
+                assert!(
+                    rest.is_empty(),
+                    "session {session}: the replica sent {rest:?}"
+                );
+            }
+            stop_receiver(replica, &shutdown);
         }
     }
 

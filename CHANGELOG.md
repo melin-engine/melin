@@ -89,6 +89,25 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Changed
 
+- **Replication protocol 9: the version is checked at authentication**
+  (breaking for the wire). A replica states the version it speaks in its
+  challenge response; a primary admits one at or above its own, answering
+  with the version the session runs at, or refuses an older one with a
+  new `VersionRefused` answer, and both nodes log both versions. A replica
+  that cannot speak the session's version ends it before its handshake.
+  A node running this release and one running an earlier release refuse
+  each other in either direction, so upgrade every node together, in the
+  same stop raft protocol 1 already requires (see "Upgrade and rollback
+  notes" in `docs/replication.md`). This is meant as the last such stop
+  the replication protocol forces: a later release can speak this
+  protocol to a node running it. In `melin_transport_core::replication::protocol`
+  (breaking): `decode_challenge_response` returns a `ChallengeResponse`
+  carrying the stated version, `decode_auth_result` an `AuthResult`, and
+  `encode_challenge_response` and `encode_auth_ok` write the versioned
+  frames; `encode_unversioned_challenge_response`,
+  `encode_unversioned_auth_ok`, `encode_version_refused`,
+  `admits_replica_version` and `MSG_VERSION_REFUSED` are new. Control-plane
+  links keep the unversioned frames, and their wire is unchanged.
 - **Every pipeline stage is built with the tick watermark of the state
   it starts from** (breaking): `MatchingStage::new`,
   `build_pipeline_with_replication` and `build_replica_pipeline` take a

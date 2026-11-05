@@ -22,8 +22,10 @@ use tracing::{info, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use melin_transport_core::replication::protocol::{
-    MAX_CONTROL_FRAME, decode_auth_result, decode_challenge, decode_challenge_response,
-    encode_auth_failed, encode_auth_ok, encode_challenge, encode_challenge_response, read_frame,
+    AuthResult, MAX_CONTROL_FRAME, REPL_PROTOCOL_VERSION, admits_replica_version,
+    decode_auth_result, decode_challenge, decode_challenge_response, encode_auth_failed,
+    encode_auth_ok, encode_challenge, encode_challenge_response, encode_version_refused,
+    read_frame,
 };
 
 #[cfg(any(feature = "dpdk", test))]
@@ -39,24 +41,63 @@ pub(super) fn generate_challenge_nonce() -> io::Result<[u8; 32]> {
     Ok(nonce)
 }
 
+/// Judge a replica's `ChallengeResponse` and encode the answer into
+/// `answer`: `AuthOk` when its key verifies ([`verify_challenge_response`])
+/// and it speaks this primary's version or a later one, `VersionRefused`
+/// when the key verifies but the replica is older, `AuthFailed` otherwise.
+/// The version is looked at only once the signature verifies, so a peer
+/// without a key learns nothing from the answer.
+///
+/// Pure (no I/O) on purpose — the blocking kernel-TCP path and the
+/// non-blocking DPDK poll loop both call this, so neither the
+/// security-critical verification nor the answer can diverge between
+/// transports. `Err` is the refusal, for the caller's log, once the answer
+/// is sent.
+pub(super) fn judge_challenge_response(
+    nonce: &[u8; 32],
+    response_frame: &[u8],
+    authorized_keys: &melin_app::auth::AuthorizedKeys,
+    answer: &mut Vec<u8>,
+) -> io::Result<()> {
+    let stated = match verify_challenge_response(nonce, response_frame, authorized_keys) {
+        Ok(stated) => stated,
+        Err(e) => {
+            encode_auth_failed(answer);
+            return Err(e);
+        }
+    };
+    if !admits_replica_version(stated) {
+        encode_version_refused(answer);
+        let replica = match stated {
+            Some(version) => format!("v{version}"),
+            None => "v8 or earlier".to_owned(),
+        };
+        return Err(io::Error::other(format!(
+            "replica speaks replication protocol {replica}, this primary speaks \
+             v{REPL_PROTOCOL_VERSION} and admits only v{REPL_PROTOCOL_VERSION} or later \
+             — upgrade the replica to this primary's release"
+        )));
+    }
+    encode_auth_ok(answer);
+    Ok(())
+}
+
 /// Verify a replica's `ChallengeResponse` against the `nonce` we issued and
 /// the operator's `AuthorizedKeys`: the key must be listed under the
 /// `replication` role, and produce a valid Ed25519 signature over the
 /// nonce. `response_frame` is the decoded frame payload (length prefix
-/// stripped).
-///
-/// Pure (no I/O) on purpose — the blocking kernel-TCP path and the
-/// non-blocking DPDK poll loop both call this, so the security-critical
-/// verification can never diverge between transports.
-pub(super) fn verify_challenge_response(
+/// stripped). Returns the version the replica states, `None` for one on v8
+/// or earlier, unread until the signature verifies.
+fn verify_challenge_response(
     nonce: &[u8; 32],
     response_frame: &[u8],
     authorized_keys: &melin_app::auth::AuthorizedKeys,
-) -> io::Result<()> {
+) -> io::Result<Option<u16>> {
     use ed25519_dalek::{Verifier, VerifyingKey};
 
-    let (signature_bytes, pubkey_bytes) = decode_challenge_response(response_frame)
+    let response = decode_challenge_response(response_frame)
         .map_err(|e| io::Error::other(format!("bad challenge response: {e}")))?;
+    let (signature_bytes, pubkey_bytes) = (response.signature, response.pubkey);
 
     let role = authorized_keys
         .lookup(&pubkey_bytes)
@@ -75,17 +116,17 @@ pub(super) fn verify_challenge_response(
         .verify(nonce, &signature)
         .map_err(|e| io::Error::other(format!("signature verification failed: {e}")))?;
 
-    Ok(())
+    Ok(response.protocol_version)
 }
 
 /// Authenticate a replica connection (primary side, blocking — used by the
 /// kernel-TCP sender and tests).
 ///
-/// Sends a 32-byte nonce challenge, verifies the replica's Ed25519
-/// signature, and checks that the key is listed under the `replication`
-/// role. Must complete within the stream's existing read timeout. The DPDK
-/// sender runs the same exchange non-blocking on its poll loop, reusing
-/// [`generate_challenge_nonce`] and [`verify_challenge_response`].
+/// Sends a 32-byte nonce challenge and answers the replica's response as
+/// [`judge_challenge_response`] decides. Must complete within the stream's
+/// existing read timeout. The DPDK sender runs the same exchange
+/// non-blocking on its poll loop, reusing [`generate_challenge_nonce`] and
+/// [`judge_challenge_response`].
 pub(super) fn authenticate_replica<S: Read + Write>(
     stream: &mut S,
     authorized_keys: &melin_app::auth::AuthorizedKeys,
@@ -98,30 +139,24 @@ pub(super) fn authenticate_replica<S: Read + Write>(
     stream.write_all(&buf)?;
     stream.flush()?;
 
-    // Read and verify the ChallengeResponse.
+    // Read the ChallengeResponse and answer it.
     let frame = read_frame(stream, MAX_CONTROL_FRAME)?;
-    if let Err(e) = verify_challenge_response(&nonce, &frame, authorized_keys) {
-        // Best-effort AuthFailed notice before we bail — the connection is
-        // about to drop, so a failed write here is not actionable.
-        buf.clear();
-        encode_auth_failed(&mut buf);
-        let _ = stream.write_all(&buf);
-        return Err(e);
-    }
-
-    // Auth succeeded.
     buf.clear();
-    encode_auth_ok(&mut buf);
-    stream.write_all(&buf)?;
-    stream.flush()?;
-
-    Ok(())
+    let verdict = judge_challenge_response(&nonce, &frame, authorized_keys, &mut buf);
+    let sent = stream.write_all(&buf).and_then(|()| stream.flush());
+    // A refusal is reported over a failure to send its notice: the
+    // connection is about to drop either way, and the refusal is what the
+    // operator acts on.
+    verdict.and(sent)
 }
 
 /// Authenticate with the primary (replica side).
 ///
 /// Reads the nonce challenge, signs it with the replica's private key,
-/// sends the response, and waits for AuthOk/AuthFailed.
+/// sends the response stating this node's version, and waits for the
+/// answer. The session runs at the version the primary's `AuthOk` names,
+/// which this release requires to be its own: a later release decides
+/// here whether it can speak an older primary's.
 pub(super) fn authenticate_with_primary<S: Read + Write>(
     stream: &mut S,
     signing_key: &ed25519_dalek::SigningKey,
@@ -144,9 +179,37 @@ pub(super) fn authenticate_with_primary<S: Read + Write>(
 
     // Read auth result.
     let result_frame = read_frame(stream, MAX_CONTROL_FRAME)?;
-    match decode_auth_result(&result_frame)? {
-        true => Ok(()),
-        false => Err(io::Error::other("primary rejected replication key")),
+    session_version_check(decode_auth_result(&result_frame)?)
+}
+
+/// Whether this replica can run a session after the primary's `answer`.
+/// Every error names both versions where the primary stated one, and the
+/// node to upgrade.
+fn session_version_check(answer: AuthResult) -> io::Result<()> {
+    let ours = REPL_PROTOCOL_VERSION;
+    match answer {
+        AuthResult::Ok {
+            protocol_version: Some(session),
+        } if session == ours => Ok(()),
+        AuthResult::Ok {
+            protocol_version: Some(session),
+        } => Err(io::Error::other(format!(
+            "the primary runs this session at replication protocol v{session}, this replica \
+             speaks only v{ours} — run every node on the same release"
+        ))),
+        AuthResult::Ok {
+            protocol_version: None,
+        } => Err(io::Error::other(format!(
+            "the primary speaks replication protocol v8 or earlier, this replica speaks \
+             v{ours} — upgrade the primary to this replica's release"
+        ))),
+        AuthResult::VersionRefused {
+            protocol_version: primary,
+        } => Err(io::Error::other(format!(
+            "the primary speaks replication protocol v{primary} and refuses this replica's \
+             v{ours} — upgrade this node to the primary's release"
+        ))),
+        AuthResult::Failed => Err(io::Error::other("primary rejected replication key")),
     }
 }
 
@@ -208,7 +271,7 @@ pub(super) enum AuthOutcome {
 /// the transport, the receive/send buffers, and the key table (no slot/cursor/
 /// metric state), so the security-critical failure paths — timeout, oversized
 /// frame, mid-auth disconnect, bad signature — are unit-testable with a mock
-/// [`AuthTransport`]. Shares [`verify_challenge_response`] with the blocking
+/// [`AuthTransport`]. Shares [`judge_challenge_response`] with the blocking
 /// path so the two transports cannot diverge.
 #[cfg(any(feature = "dpdk", test))]
 pub(super) fn step_authentication<T: AuthTransport>(
@@ -244,31 +307,30 @@ pub(super) fn step_authentication<T: AuthTransport>(
     transport.recv_into_vec(handle, recv_buf);
     match try_extract_frame(recv_buf, MAX_CONTROL_FRAME) {
         FrameResult::Complete(payload_start, frame_end) => {
-            // Shared verification with the kernel-TCP path — the
-            // security-critical step (decode, authorized-keys lookup,
-            // replication-role check, Ed25519 verify over the nonce).
-            let verdict = verify_challenge_response(
+            // Shared with the kernel-TCP path — the security-critical
+            // step (decode, authorized-keys lookup, replication-role
+            // check, Ed25519 verify over the nonce), then the version.
+            send_buf.clear();
+            let verdict = judge_challenge_response(
                 &challenge.nonce,
                 &recv_buf[payload_start..frame_end],
                 authorized_keys,
+                send_buf,
             );
             compact_recv_buf(recv_buf, frame_end);
-            send_buf.clear();
+            // Best-effort answer: on success the tiny frame flushes on the
+            // next poll, and a full TX queue surfaces as a disconnect next
+            // tick; on a refusal the connection is closed next anyway.
+            let _ = transport.queue_send(handle, send_buf);
             match verdict {
                 Ok(()) => {
-                    // Best-effort AuthOk; the tiny frame flushes on the next
-                    // poll. A full TX queue surfaces as a disconnect next tick.
-                    encode_auth_ok(send_buf);
-                    let _ = transport.queue_send(handle, send_buf);
                     info!(slot = slot_idx, "replica authenticated (DPDK)");
                     AuthOutcome::Authenticated
                 }
                 Err(e) => {
                     warn!(slot = slot_idx, error = %e, "replica auth failed (DPDK) — disconnecting");
-                    // Best-effort AuthFailed notice, flushed (poll) before the
-                    // caller's teardown closes the connection.
-                    encode_auth_failed(send_buf);
-                    let _ = transport.queue_send(handle, send_buf);
+                    // Flush the notice before the caller's teardown closes
+                    // the connection.
                     transport.poll();
                     AuthOutcome::Rejected
                 }
@@ -379,18 +441,31 @@ mod tests {
         crate::test_roles::desk_keys(role, &pub_b64)
     }
 
-    /// Encode a `ChallengeResponse` and return just the payload (4-byte LE
-    /// length prefix stripped — see `protocol::read_frame`), matching what
-    /// the runtime feeds to `verify_challenge_response`.
-    fn response_payload(key: &SigningKey, nonce: &[u8; 32]) -> Vec<u8> {
+    /// The full wire frame of a `ChallengeResponse` signing `nonce` with
+    /// `key` and stating `stated`, as a replica on that version sends it
+    /// (`None`: a v8 replica's, which states none).
+    fn response_stating(key: &SigningKey, nonce: &[u8; 32], stated: Option<u16>) -> Vec<u8> {
+        use melin_transport_core::replication::protocol::encode_unversioned_challenge_response;
         let sig = key.sign(nonce);
         let mut frame = Vec::new();
-        melin_transport_core::replication::protocol::encode_challenge_response(
+        encode_unversioned_challenge_response(
             &sig.to_bytes(),
             key.verifying_key().as_bytes(),
             &mut frame,
         );
-        frame[4..].to_vec()
+        if let Some(version) = stated {
+            frame.extend_from_slice(&version.to_le_bytes());
+            let len = (frame.len() - 4) as u32;
+            frame[..4].copy_from_slice(&len.to_le_bytes());
+        }
+        frame
+    }
+
+    /// Encode a `ChallengeResponse` and return just the payload (4-byte LE
+    /// length prefix stripped — see `protocol::read_frame`), matching what
+    /// the runtime feeds to `verify_challenge_response`.
+    fn response_payload(key: &SigningKey, nonce: &[u8; 32]) -> Vec<u8> {
+        response_frame(key, nonce)[4..].to_vec()
     }
 
     #[test]
@@ -398,7 +473,130 @@ mod tests {
         let key = SigningKey::from_bytes(&[0x11; 32]);
         let keys = keys_for(&key, "replication");
         let nonce = [0x42; 32];
-        assert!(verify_challenge_response(&nonce, &response_payload(&key, &nonce), &keys).is_ok());
+        assert_eq!(
+            verify_challenge_response(&nonce, &response_payload(&key, &nonce), &keys).unwrap(),
+            Some(REPL_PROTOCOL_VERSION),
+            "the replica's stated version is handed up"
+        );
+    }
+
+    /// The answer `judge_challenge_response` encodes for a response from
+    /// `key`, listed under `role`, stating `stated`, and its verdict.
+    fn judge(role: &str, stated: Option<u16>, signed: [u8; 32]) -> (io::Result<()>, AuthResult) {
+        let key = SigningKey::from_bytes(&[0x11; 32]);
+        let keys = keys_for(&key, role);
+        let response = response_stating(&key, &signed, stated);
+        let mut answer = Vec::new();
+        let verdict = judge_challenge_response(&[0x42; 32], &response[4..], &keys, &mut answer);
+        let decoded = decode_auth_result(&answer[4..]).expect("an answer is encoded");
+        (verdict, decoded)
+    }
+
+    /// A replica at this primary's version or a later one is admitted, and
+    /// told the session runs at this primary's.
+    #[test]
+    fn judge_admits_a_replica_at_or_above_its_version() {
+        for stated in [REPL_PROTOCOL_VERSION, REPL_PROTOCOL_VERSION + 1] {
+            let (verdict, answer) = judge("replication", Some(stated), [0x42; 32]);
+            verdict.expect("admitted");
+            assert_eq!(
+                answer,
+                AuthResult::Ok {
+                    protocol_version: Some(REPL_PROTOCOL_VERSION)
+                },
+                "v{stated}"
+            );
+        }
+    }
+
+    /// An older replica, one stating its version or a v8 one stating none,
+    /// is told VersionRefused with this primary's version, and the refusal
+    /// names both versions and the node to upgrade.
+    #[test]
+    fn judge_refuses_an_older_replica_naming_both_versions() {
+        for (stated, named) in [
+            (
+                Some(REPL_PROTOCOL_VERSION - 1),
+                format!("v{}", REPL_PROTOCOL_VERSION - 1),
+            ),
+            // v9 onwards always states a version, so a silent one is v8 or
+            // earlier whatever this primary's version is.
+            (None, "v8 or earlier".to_owned()),
+        ] {
+            let (verdict, answer) = judge("replication", stated, [0x42; 32]);
+            assert_eq!(
+                answer,
+                AuthResult::VersionRefused {
+                    protocol_version: REPL_PROTOCOL_VERSION
+                }
+            );
+            let msg = verdict.unwrap_err().to_string();
+            assert!(
+                msg.contains(&format!("protocol {named},"))
+                    && msg.contains(&format!("v{REPL_PROTOCOL_VERSION}"))
+                    && msg.contains("upgrade the replica"),
+                "{msg}"
+            );
+        }
+    }
+
+    /// The version is not looked at before the key verifies: a peer that
+    /// fails it is told AuthFailed whatever version it states, so it learns
+    /// nothing about this primary's.
+    #[test]
+    fn judge_answers_a_failed_key_with_auth_failed_whatever_its_version() {
+        for stated in [
+            None,
+            Some(REPL_PROTOCOL_VERSION - 1),
+            Some(REPL_PROTOCOL_VERSION),
+        ] {
+            for (role, signed) in [("replication", [0x01; 32]), ("trader", [0x42; 32])] {
+                let (verdict, answer) = judge(role, stated, signed);
+                assert!(verdict.is_err());
+                assert_eq!(answer, AuthResult::Failed, "{role}, {stated:?}");
+            }
+        }
+    }
+
+    /// The replica runs a session only at its own version, and every
+    /// refusal names the node to upgrade.
+    #[test]
+    fn a_replica_runs_a_session_only_at_its_own_version() {
+        let ours = REPL_PROTOCOL_VERSION;
+        session_version_check(AuthResult::Ok {
+            protocol_version: Some(ours),
+        })
+        .expect("its own version");
+        for (answer, expected) in [
+            (
+                AuthResult::Ok {
+                    protocol_version: Some(ours - 1),
+                },
+                format!("session at replication protocol v{}", ours - 1),
+            ),
+            (
+                AuthResult::Ok {
+                    protocol_version: Some(ours + 1),
+                },
+                format!("session at replication protocol v{}", ours + 1),
+            ),
+            (
+                AuthResult::Ok {
+                    protocol_version: None,
+                },
+                "v8 or earlier".to_owned(),
+            ),
+            (
+                AuthResult::VersionRefused {
+                    protocol_version: ours + 1,
+                },
+                format!("v{} and refuses this replica's v{ours}", ours + 1),
+            ),
+            (AuthResult::Failed, "rejected replication key".to_owned()),
+        ] {
+            let msg = session_version_check(answer).unwrap_err().to_string();
+            assert!(msg.contains(&expected), "{answer:?}: {msg}");
+        }
     }
 
     #[test]
@@ -550,9 +748,28 @@ mod tests {
         let challenge = challenge_at(nonce, far_future());
         let (outcome, tx) = run_step(response_frame(&key, &nonce), &challenge, &keys);
         assert!(matches!(outcome, AuthOutcome::Authenticated));
-        assert!(
+        assert_eq!(
             decode_auth_result(&tx.sent[4..]).expect("AuthOk frame"),
+            AuthResult::Ok {
+                protocol_version: Some(REPL_PROTOCOL_VERSION)
+            },
             "AuthOk should be queued on success"
+        );
+    }
+
+    #[test]
+    fn step_refuses_an_older_replica_with_version_refused() {
+        let key = SigningKey::from_bytes(&[0x11; 32]);
+        let keys = keys_for(&key, "replication");
+        let nonce = [0x42; 32];
+        let challenge = challenge_at(nonce, far_future());
+        let (outcome, tx) = run_step(response_stating(&key, &nonce, None), &challenge, &keys);
+        assert!(matches!(outcome, AuthOutcome::Rejected));
+        assert_eq!(
+            decode_auth_result(&tx.sent[4..]).expect("VersionRefused frame"),
+            AuthResult::VersionRefused {
+                protocol_version: REPL_PROTOCOL_VERSION
+            }
         );
     }
 
@@ -565,8 +782,9 @@ mod tests {
         let (outcome, tx) = run_step(response_frame(&key, &[0x01; 32]), &challenge, &keys);
         assert!(matches!(outcome, AuthOutcome::Rejected));
         // AuthFailed queued + flushed; the caller's teardown then closes.
-        assert!(
-            !decode_auth_result(&tx.sent[4..]).expect("AuthFailed frame"),
+        assert_eq!(
+            decode_auth_result(&tx.sent[4..]).expect("AuthFailed frame"),
+            AuthResult::Failed,
             "AuthFailed should be queued for a verification failure"
         );
     }
@@ -580,8 +798,9 @@ mod tests {
         let challenge = challenge_at(nonce, far_future());
         let (outcome, tx) = run_step(response_frame(&signer, &nonce), &challenge, &keys);
         assert!(matches!(outcome, AuthOutcome::Rejected));
-        assert!(
-            !decode_auth_result(&tx.sent[4..]).expect("AuthFailed frame"),
+        assert_eq!(
+            decode_auth_result(&tx.sent[4..]).expect("AuthFailed frame"),
+            AuthResult::Failed,
             "an unknown key is told AuthFailed"
         );
     }
@@ -594,8 +813,9 @@ mod tests {
         let challenge = challenge_at(nonce, far_future());
         let (outcome, tx) = run_step(response_frame(&key, &nonce), &challenge, &keys);
         assert!(matches!(outcome, AuthOutcome::Rejected));
-        assert!(
-            !decode_auth_result(&tx.sent[4..]).expect("AuthFailed frame"),
+        assert_eq!(
+            decode_auth_result(&tx.sent[4..]).expect("AuthFailed frame"),
+            AuthResult::Failed,
             "a wrong-permission key is told AuthFailed"
         );
     }
@@ -790,5 +1010,23 @@ mod tests {
             authenticate_with_primary(s, &key).unwrap_err()
         });
         assert!(err.to_string().contains("rejected"));
+    }
+
+    /// Over the DPDK replica's adapter too, a primary's VersionRefused ends
+    /// the authentication with the upgrade advice.
+    #[test]
+    fn polled_stream_surfaces_version_refused() {
+        let key = SigningKey::from_bytes(&[0x11; 32]);
+        let mut challenge = Vec::new();
+        encode_challenge(&[0x42; 32], &mut challenge);
+        let mut refused = Vec::new();
+        encode_version_refused(&mut refused);
+        let mut tx = MockAuthTransport::scripted(vec![challenge, refused]);
+        let shutdown = AtomicBool::new(false);
+
+        let err = with_stream(&mut tx, &shutdown, far_future(), |s| {
+            authenticate_with_primary(s, &key).unwrap_err()
+        });
+        assert!(err.to_string().contains("upgrade this node"), "{err}");
     }
 }

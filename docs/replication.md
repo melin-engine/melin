@@ -1128,6 +1128,18 @@ these flags are specified, the server runs in standalone mode.
 Length-prefixed frames, little-endian. Runs over a dedicated TCP
 connection separate from the client protocol.
 
+### Authentication
+
+Exchanged first on every connection, before the handshake.
+
+| Message | Direction | Layout | Purpose |
+|---|---|---|---|
+| Challenge | Primary → Replica | `[len:u32][type=0x03][nonce:[u8;32]]` | A fresh nonce for the replica to sign. |
+| ChallengeResponse | Replica → Primary | `[len:u32][type=0x04][signature:[u8;64]][pubkey:[u8;32]][protocol_version:u16]` | The replica's Ed25519 signature over the nonce, its public key, and the replication protocol version it speaks. The primary reads the version only once the signature verifies against a key listed under the `replication` role. |
+| AuthOk | Primary → Replica | `[len:u32][type=0x05][protocol_version:u16]` | The key is accepted and the replica's version admitted: the primary admits a replica at or above its own version. Carries the version the session runs at, the primary's own; a replica that cannot speak it ends the session, logging both versions. |
+| AuthFailed | Primary → Replica | `[len:u32][type=0x06]` | The key is refused. |
+| VersionRefused | Primary → Replica | `[len:u32][type=0x07][protocol_version:u16]` | The key is accepted, but the replica speaks an older protocol than the primary, whose version this is. Both nodes log both versions; the replica retries with backoff. |
+
 ### Replica → Primary
 
 | Message | Layout | Purpose |
@@ -1253,6 +1265,13 @@ normal-case post-recovery state.
   every node on its existing files. An existing history records no
   policy yet, so the first primary to serve it under protocol 8 (by boot
   or promotion) serves under the policy it requests and journals it.
+  The release that moves the version check into authentication
+  (replication protocol 9) is the same kind of change: a node running it
+  and a node running an earlier release refuse each other at
+  authentication, in either direction, before any handshake. From
+  protocol 9 on, a primary admits a replica at or above its own
+  version, and the replica decides whether it can speak the primary's.
+  Upgrading every node together remains the supported path.
 - **The control plane is versioned too, and needs the same.** Control-plane
   links (`--raft-peer`) exchange a protocol version as part of the
   handshake (after the connecting node proves its key, before the node

@@ -19,9 +19,17 @@
 //!
 //! ### Auth (before handshake)
 //! - **Challenge** (Primary → Replica): `[len:u32][0x03][nonce:[u8;32]]`
-//! - **ChallengeResponse** (Replica → Primary): `[len:u32][0x04][signature:[u8;64]][pubkey:[u8;32]]`
-//! - **AuthOk** (Primary → Replica): `[len:u32][0x05]`
+//! - **ChallengeResponse** (Replica → Primary): `[len:u32][0x04][signature:[u8;64]][pubkey:[u8;32]][protocol_version:u16]`
+//!   — the version the replica speaks; a primary admits one at or above
+//!   its own (see `auth::judge_challenge_response`)
+//! - **AuthOk** (Primary → Replica): `[len:u32][0x05][protocol_version:u16]`
+//!   — the version the session runs at, which is the primary's own
 //! - **AuthFailed** (Primary → Replica): `[len:u32][0x06]`
+//! - **VersionRefused** (Primary → Replica): `[len:u32][0x07][protocol_version:u16]`
+//!   — in place of AuthOk, to a replica older than the primary
+//!
+//! Control-plane (raft) links borrow these frames without the versions
+//! (`encode_unversioned_*`): they exchange their own after authentication.
 //!
 //! ### Replica → Primary
 //! - **Handshake**: `[len:u32][0x01][last_sequence:u64][chain_hash:[u8;32]]`
@@ -2069,10 +2077,9 @@ mod tests {
     type InputSlot = melin_transport_core::pipeline::InputSlot<CounterEvent>;
     use melin_transport_core::replication::protocol::{
         Ack, Handshake, MAX_CONTROL_FRAME, MAX_DATA_FRAME, MSG_AUTH_OK, MSG_CHALLENGE_RESPONSE,
-        MSG_SNAPSHOT_BEGIN, MSG_SNAPSHOT_CHUNK, MSG_SNAPSHOT_END, ReplicaMessage,
-        decode_auth_result, decode_challenge, decode_challenge_response, decode_primary_message,
-        decode_replica_message, encode_ack, encode_auth_failed, encode_auth_ok, encode_chain_check,
-        encode_challenge, encode_challenge_response, encode_handshake, encode_hash_mismatch,
+        MSG_SNAPSHOT_BEGIN, MSG_SNAPSHOT_CHUNK, MSG_SNAPSHOT_END, ReplicaMessage, decode_challenge,
+        decode_challenge_response, decode_primary_message, decode_replica_message, encode_ack,
+        encode_chain_check, encode_challenge, encode_handshake, encode_hash_mismatch,
         encode_heartbeat, encode_need_snapshot, encode_rotate, encode_segment_seed_begin,
         encode_snapshot_begin, encode_snapshot_chunk, encode_snapshot_end, encode_stream_start,
         read_frame,
@@ -3336,37 +3343,6 @@ mod tests {
     }
 
     #[test]
-    fn challenge_response_encode_decode_round_trip() {
-        let sig = [0xAA; 64];
-        let pubkey = [0xBB; 32];
-        let mut buf = Vec::new();
-        encode_challenge_response(&sig, &pubkey, &mut buf);
-
-        let payload = &buf[4..];
-        let (decoded_sig, decoded_pubkey) = decode_challenge_response(payload).unwrap();
-        assert_eq!(decoded_sig, sig);
-        assert_eq!(decoded_pubkey, pubkey);
-    }
-
-    #[test]
-    fn auth_ok_encode_decode_round_trip() {
-        let mut buf = Vec::new();
-        encode_auth_ok(&mut buf);
-
-        let payload = &buf[4..];
-        assert!(decode_auth_result(payload).unwrap());
-    }
-
-    #[test]
-    fn auth_failed_encode_decode_round_trip() {
-        let mut buf = Vec::new();
-        encode_auth_failed(&mut buf);
-
-        let payload = &buf[4..];
-        assert!(!decode_auth_result(payload).unwrap());
-    }
-
-    #[test]
     fn decode_challenge_rejects_wrong_tag() {
         let mut payload = [0u8; 33];
         payload[0] = MSG_AUTH_OK;
@@ -3546,8 +3522,11 @@ mod tests {
 
             // Should receive AuthFailed.
             let result_frame = read_frame(&mut reader, MAX_CONTROL_FRAME).unwrap();
-            let ok = decode_auth_result(&result_frame).unwrap();
-            assert!(!ok, "should receive auth failure");
+            assert_eq!(
+                decode_auth_result(&result_frame).unwrap(),
+                AuthResult::Failed,
+                "should receive auth failure"
+            );
         });
 
         let mut conn = primary_stream;
