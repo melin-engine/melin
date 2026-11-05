@@ -826,8 +826,8 @@ fn the_auditor_reports_an_empty_log_and_a_missing_one() {
 /// Port range this file owns for `free_addr` (5000..10000). The
 /// runtime's cluster tests own 10000..30000 in 5000-port ranges, which
 /// is all the room below the ephemeral floor; `test_ports`' own unit
-/// tests probe a couple of ports in this range too, and bind nothing
-/// for longer than the probe.
+/// tests take a few ports in this range too, binding nothing past the
+/// probe but holding their claims while their process runs.
 const PORT_BASE: u16 = 5_000;
 
 /// The replica's identity on the replication link.
