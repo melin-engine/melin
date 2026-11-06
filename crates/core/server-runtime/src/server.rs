@@ -1290,6 +1290,7 @@ where
                 // channel for the whole primary tenure.
                 return run_as_primary::<A, L>(
                     app,
+                    &sizing,
                     tick_watermark,
                     writer,
                     listener,
@@ -1401,6 +1402,7 @@ where
     // The raft guard drops — stopping the driver — after this returns.
     run_as_primary::<A, L>(
         app,
+        &sizing,
         tick_watermark,
         writer,
         listener,
@@ -1768,6 +1770,9 @@ fn shutdown_pipeline_stages<A: Send + 'static, W: Send + 'static>(
 #[allow(clippy::too_many_arguments)]
 fn run_as_primary<A, L>(
     app: A,
+    // The node's sizing, which `app` was prefaulted with before the call;
+    // the shadow copy is sized with it too (`shadow_clone`).
+    sizing: &A::Sizing,
     // The tick watermark of the position `app` is at, which the matching
     // and shadow stages start from: the recovered one at boot, the
     // replica's on a promotion.
@@ -1844,13 +1849,10 @@ where
     // Clone the application for the shadow snapshot stage before the pipeline
     // consumes it. `Application` does not require `Clone`, so this goes
     // through `clone_via_snapshot` (a snapshot round-trip unless the
-    // application overrides it with something cheaper).
+    // application overrides it with something cheaper), then is sized as
+    // the live instance was.
     let enable_shadow = config.snapshot_interval_ms > 0;
-    let shadow_app = if enable_shadow {
-        Some(<A as Application>::clone_via_snapshot(&app)?)
-    } else {
-        None
-    };
+    let shadow_app = crate::shadow_clone::shadow_clone(&app, sizing, enable_shadow)?;
 
     // Build the disruptor pipeline with optional replication consumer.
     // An application without an event publisher silently ignores
@@ -2849,6 +2851,7 @@ where
                 // returns; see the kernel-TCP promotion path.
                 return run_as_primary_dpdk::<A>(
                     app,
+                    &sizing,
                     tick_watermark,
                     writer,
                     transport,
@@ -2985,6 +2988,7 @@ where
     // The raft guard and the admin endpoint drop after this returns.
     run_as_primary_dpdk::<A>(
         app,
+        &sizing,
         tick_watermark,
         writer,
         transport,
@@ -3028,6 +3032,8 @@ where
 fn run_as_primary_dpdk<A>(
     app: A,
     // As `run_as_primary`'s.
+    sizing: &A::Sizing,
+    // As `run_as_primary`'s.
     tick_watermark: TickWatermark,
     writer: BufferedWriter<A::Event>,
     mut transport: melin_dpdk::DpdkTransport,
@@ -3066,11 +3072,7 @@ where
     // Clone the application's state for the shadow snapshot stage before
     // moving it into the pipeline (same as the kernel TCP path).
     let enable_shadow = config.snapshot_interval_ms > 0;
-    let shadow_app = if enable_shadow {
-        Some(<A as Application>::clone_via_snapshot(&app)?)
-    } else {
-        None
-    };
+    let shadow_app = crate::shadow_clone::shadow_clone(&app, sizing, enable_shadow)?;
 
     let active_connections = Arc::new(AtomicU64::new(0));
 
@@ -3087,7 +3089,6 @@ where
     // never drained — see "DPDK never runs the event publisher" in
     // docs/internal/transport-divergences-2026-10.md.
     let enable_event_publisher = event_publisher.is_some() && config.event_bind.is_some();
-    let enable_shadow = config.snapshot_interval_ms > 0;
     let Pipeline {
         input_producer,
         journal_stage,
@@ -4163,7 +4164,7 @@ where
     let interval = std::time::Duration::from_millis(config.snapshot_interval_ms);
     let chain_hash =
         chain_hash_lock.ok_or("chain hash lock must be Some when shadow is enabled")?;
-    let shadow_ex = shadow_app.ok_or("shadow application must be Some when shadow is enabled")?;
+    let shadow_ex = shadow_app.ok_or(crate::shadow_clone::NO_SHADOW_CLONE)?;
     let s_shadow = Arc::clone(shutdown);
     let shadow = cores.shadow;
     let handle = melin_app::affinity::spawn_placed("shadow", shadow.core, move || {

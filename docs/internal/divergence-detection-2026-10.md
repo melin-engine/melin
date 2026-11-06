@@ -2519,23 +2519,15 @@ cross-node check. Each stays its own commit, and the tree passes at each.
   helper finds the stop and returns `NodeDiverged`.
 - The shadow's comparator (`shared_start`) against the live board on every
   node with a shadow (decision 10).
-- The shadow prefaulted (assessment 1.3 (d)): today the live instance is
-  prefaulted with the node's `Sizing` and the shadow, a
-  `clone_via_snapshot` of it, never is, so it runs at whatever capacity
-  `restore` chose. One `server-runtime` helper, `shadow_clone(&app,
-  sizing)`, clones and then prefaults, and replaces the bare
-  `clone_via_snapshot` at all three sites: the kernel primary
-  (`server.rs:1838`), the DPDK primary (`:3047`) and the replica
-  (`replication/mod.rs:593`). `run_impl` and `run_dpdk_impl` prefault the
-  live instance before calling `run_as_primary` and `run_as_primary_dpdk`,
-  at boot and after a promotion (`server.rs:1353` and `:1268`, `:2910`
-  and `:2796`); those two take no `Sizing` today, so both gain the
-  parameter. This
-  is hygiene, not correctness: a compliant application's decisions do not
-  depend on capacity (`prefault`'s contract), but one that breaks the rule
-  by emitting reports in a hash map's iteration order would otherwise trip
-  its own shadow on upgrade day for a capacity difference the node itself
-  made.
+- The shadow prefaulted (assessment 1.3 (d), on `main`): one
+  `server-runtime` helper, `shadow_clone(&app, sizing)`, clones and then
+  prefaults, at all three sites (the kernel and DPDK primaries, which
+  take the node's `Sizing`, and the replica, which takes the copy only
+  when its shadow stage is enabled). This is hygiene, not correctness: a
+  compliant application's decisions do not depend on capacity
+  (`prefault`'s contract), but one that breaks the rule by emitting
+  reports in a hash map's iteration order would otherwise trip its own
+  shadow on upgrade day for a capacity difference the node itself made.
 - `NodeStore::refuse_if_diverged` and `NodeStoreError::Diverged`, called
   from `ServerConfig::startup_store()` by both entries; `resolve` and
   `store()` unchanged (decision 12).
@@ -2650,18 +2642,9 @@ cross-node check. Each stays its own commit, and the tree passes at each.
     promotion) returns no application either; and with the stub exiting
     without a trip, both hand the application over as today, with the
     latch's followed build cleared, so a trip after it names none;
-  - shadow prefault: a test app that records each `prefault` call and its
-    `Sizing`; on the kernel primary, the DPDK primary (under the runner)
-    and the replica, the shadow instance has been prefaulted once with
-    the node's `Sizing`, after the clone. And a capacity-order app (its
-    reports for an event follow a fixed-hasher map's iteration order, its
-    `restore` rebuilds the map at the entry count, its `prefault` reserves
-    `Sizing`'s count): a unit test on `shadow_clone` applies the same
-    events to a prefaulted live instance, to its bare `clone_via_snapshot`
-    and to its `shadow_clone`, and the reports of the bare clone differ in
-    order while the `shadow_clone`'s match, which pins that the prefault
-    is what aligns the two; and one node under load with that app and a
-    shadow does not stop;
+  - shadow prefault (the sizing and `shadow_clone` tests are on `main`):
+    one node under load with the capacity-order app of `shadow_clone`'s
+    unit test and a shadow does not stop;
   - `DivergenceLatch`: a trip sets the flag the latch was built with,
     and the replica builder passes the node's flag, not
     `pipeline_shutdown`. The builder test asserts that the shadow's latch

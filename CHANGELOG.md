@@ -96,6 +96,11 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   holds more voters, before its control plane starts; re-provision such
   a directory with at most three entries. `melin_raft::check_voter_count`
   is new.
+- **The shadow copy is sized as the live instance**: a node with
+  snapshots enabled calls `Application::prefault`, with its own sizing,
+  on the copy it takes for its snapshot stage, right after taking it,
+  where the copy used to keep the capacity its restore gave it. A
+  replica with snapshots disabled no longer takes the copy at all.
 - **Replication protocol 9: the version is checked at authentication**
   (breaking for the wire). A replica states the version it speaks in its
   challenge response; a primary admits one at or above its own, answering
