@@ -1,10 +1,10 @@
 //! The divergence stop, end to end, through a running node.
 //!
-//! Nothing in this build detects a divergence yet; the tests trip a running
-//! node's stop through the test seam (`divergence::test_seam`), as a
-//! detection will. A stopped node stops answering, returns `NodeDiverged`
-//! once its threads are down, leaves its marker, and refuses every later
-//! start.
+//! A healthy cluster's replicas compare their output with their primary's
+//! and never stop. The stop itself is tripped on a running node through the
+//! test seam (`divergence::test_seam`), as a detection does: a stopped node
+//! stops answering, returns `NodeDiverged` once its threads are down, leaves
+//! its marker, and refuses every later start.
 //!
 //! Nodes are started through `melin-test-node`: on kernel TCP by default,
 //! on DPDK with this crate's `dpdk` feature, under
@@ -17,7 +17,7 @@ use melin_client::SigningKey;
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::server::ServerConfig;
-use melin_test_node::probe::wait_for_gauge;
+use melin_test_node::probe::{wait_for_gauge, wait_for_gauge_where};
 use melin_transport_core::WireSeq;
 use melin_transport_core::divergence::{HaltCause, test_seam};
 use melin_transport_core::output_digest::{ChainValue, Divergence};
@@ -186,6 +186,72 @@ fn a_stopped_primary_halts_its_replicas() {
             "{name}: {restarted}"
         );
     }
+}
+
+/// Under traffic, a healthy cluster's replicas check their output against
+/// their primary's, and nothing stops: each replica's checks keep growing,
+/// and no node leaves a marker.
+#[test]
+fn a_healthy_cluster_checks_its_output() {
+    let fx = Fixture::new(0xD7);
+    let primary_addrs = addrs(0);
+    let primary_config = fx.primary_config(&primary_addrs, AckPolicy::DiskAndRam);
+    let health = primary_config.health_bind.expect("set by the fixture");
+    let primary_marker = primary_config.store().expect("store").divergence_marker();
+    let primary = spawn_node::<Counter>(&primary_addrs, primary_config);
+    wait_for_gauge(health, "melin_replicas_connected", 0);
+
+    let replicas: Vec<_> = [(1, "replica-a"), (2, "replica-b")]
+        .into_iter()
+        .map(|(slot, name)| {
+            let mut config =
+                fx.replica_config(name, primary_addrs.replication(), AckPolicy::DiskAndRam);
+            let replica_health = halt_cluster::endpoint();
+            config.health_bind = Some(replica_health);
+            let marker = config.store().expect("store").divergence_marker();
+            let node = spawn_node::<Counter>(&addrs(slot), config);
+            (replica_health, marker, node)
+        })
+        .collect();
+    wait_for_gauge(health, "melin_replicas_connected", 2);
+
+    let mut client = fx.client(&primary);
+    let mut write = |count: u64| {
+        for _ in 0..count {
+            client
+                .request_one(&increment_request(1))
+                .expect("served by the whole cluster");
+        }
+    };
+    // Several windows of output, then several more: the checks grow
+    // across both.
+    let window = melin_transport_core::output_digest::OUTPUT_DIGEST_WINDOW;
+    write(4 * window);
+    let mut seen = Vec::new();
+    for (replica_health, _, _) in &replicas {
+        seen.push(wait_for_gauge_where(
+            *replica_health,
+            "melin_output_checks_total",
+            "checked a window",
+            |checks| checks >= 2,
+        ));
+    }
+    write(4 * window);
+    for ((replica_health, _, _), before) in replicas.iter().zip(seen) {
+        wait_for_gauge_where(
+            *replica_health,
+            "melin_output_checks_total",
+            "kept checking",
+            |checks| checks >= before + 2,
+        );
+    }
+
+    assert!(!primary_marker.exists());
+    for (_, marker, node) in &replicas {
+        assert!(!node.is_finished(), "a healthy replica keeps running");
+        assert!(!marker.exists(), "{}", marker.display());
+    }
+    assert!(!primary.is_finished(), "a healthy primary keeps running");
 }
 
 /// A replica that detects the divergence stops the whole cluster: its

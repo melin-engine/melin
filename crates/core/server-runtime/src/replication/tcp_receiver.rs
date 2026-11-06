@@ -755,8 +755,9 @@ where
         lineage_ack_policy,
         pipeline_healthy,
         // Read and tripped by the streaming loop, which takes `control`
-        // whole.
-        latch: _,
+        // whole, and by each pipeline's output check, built with it.
+        latch,
+        output_checks,
     } = control;
     // Recover whenever any journal segment survives — live OR archived;
     // fresh replicas get no engine and the genesis position. See
@@ -1073,6 +1074,8 @@ where
                     Arc::clone(pipeline_healthy),
                     sizing,
                     digest_encoder.clone(),
+                    latch,
+                    output_checks,
                 )
             };
             let p =
@@ -1083,6 +1086,7 @@ where
             let journal_cursor = p.journal_cursor.as_ref();
             let stream_marks = &p.stream_marks;
             let journal_failed = &p.journal_failed;
+            let output_check = p.output_check.as_deref_mut();
             std::thread::scope(|s| {
                 let receiver = || {
                     melin_app::affinity::pin_thread("replica-receiver", cores.reader.core);
@@ -1114,6 +1118,7 @@ where
                         None,
                         stream_marks,
                         journal_failed,
+                        output_check,
                     )
                 };
                 // Created in its own placement, not this thread's — see

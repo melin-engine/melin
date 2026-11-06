@@ -88,6 +88,7 @@ mod dpdk;
 /// test, which runs it beside a primary's stage.
 pub(crate) mod drain;
 mod halt_notice;
+mod output_check;
 mod receiver_transport;
 mod tcp_receiver;
 mod tcp_sender;
@@ -197,6 +198,12 @@ pub struct ReplicaControlPlane {
     /// read by the streaming loop before its shutdown arm, so a stopped
     /// replica sends no ordinary ack after the stop.
     pub(crate) latch: DivergenceLatch,
+    /// `melin_output_checks_total`: windows of this replica's output its
+    /// comparison found equal to the primary's. Process-lifetime for the
+    /// same reason as `pipeline_healthy`: every pipeline a resync builds
+    /// counts into it, and the health endpoint outlives them all. One
+    /// writer, the receive thread.
+    pub(crate) output_checks: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ReplicaControlPlane {
@@ -217,6 +224,7 @@ impl ReplicaControlPlane {
             primary_observed: std::sync::Arc::new(AtomicBool::new(false)),
             lineage_ack_policy: std::sync::Arc::new(SharedLineagePolicy::new(None)),
             pipeline_healthy: std::sync::Arc::new(AtomicBool::new(true)),
+            output_checks: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 }
@@ -502,6 +510,12 @@ pub(super) struct ReplicaPipelineHandles<A: Application, W: Send + 'static> {
     pub(super) matching_handle: std::thread::JoinHandle<WarmApp<A>>,
     pub(super) drain_handle: std::thread::JoinHandle<()>,
     pub(super) shadow_handle: Option<std::thread::JoinHandle<()>>,
+    /// The check of this pipeline's output against the primary's, read
+    /// from the drain's board; `None` with output digests off. Lent to
+    /// every streaming session over this pipeline, so its windows outlive
+    /// a reconnect. Boxed: inline, the comparator's state would make
+    /// every `ReplicaEngine` the running pipeline's size, idle or not.
+    pub(super) output_check: Option<Box<output_check::OutputCheck>>,
 }
 
 /// A replica's handshake position: the last sequence its journal holds
@@ -734,6 +748,12 @@ pub(super) fn build_replica_pipeline_with_threads<A>(
     // The encoder the drain digests reports with, the node's own; `None`
     // with output digests off (`--no-output-digests`).
     digest_encoder: Option<crate::response::ResponseEncoderArc<A>>,
+    // The node's divergence stop, which the pipeline's output check trips
+    // on a mismatch (`ReplicaControlPlane::latch`).
+    latch: &DivergenceLatch,
+    // Where the check counts the windows it found equal
+    // (`ReplicaControlPlane::output_checks`).
+    output_checks: &Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<ReplicaHandles<A>, Box<dyn std::error::Error>>
 where
     A: Application + Send + 'static,
@@ -839,12 +859,23 @@ where
     let ps = Arc::clone(&pipeline_shutdown);
     let drain = cores.response;
     let drain_consumer = pipeline.drain_consumer;
-    let drain_digest = digest_encoder.and_then(|encoder| {
-        // The board's reader is dropped until the receiver compares
-        // against it.
+    // The drain's digester publishes to the board the receiver's check
+    // reads.
+    let (drain_digest, output_check) = match digest_encoder.and_then(|encoder| {
         crate::server::output_digester(true, pipeline.first_live, &pipeline.cursors, ring_capacity)
-            .map(|(digester, _board)| drain::DrainDigest { digester, encoder })
-    });
+            .map(|digester| (digester, encoder))
+    }) {
+        Some(((digester, board), encoder)) => (
+            Some(drain::DrainDigest { digester, encoder }),
+            Some(Box::new(output_check::OutputCheck::new(
+                latch.clone(),
+                board,
+                pipeline.first_live,
+                Arc::clone(output_checks),
+            ))),
+        ),
+        None => (None, None),
+    };
     let drain_handle = melin_app::affinity::spawn_placed("drain", drain.core, move || {
         drain::run(drain_consumer, drain_digest, drain.wait, &ps);
     })
@@ -892,6 +923,7 @@ where
         matching_handle,
         drain_handle,
         shadow_handle,
+        output_check,
     })
 }
 
@@ -2555,6 +2587,8 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             &(),
             Some(Arc::new(counter_server::ResponseEncoder)),
+            &crate::tests::idle_latch(),
+            &Arc::new(std::sync::atomic::AtomicU64::new(0)),
         )
     }
 
@@ -3205,6 +3239,7 @@ mod tests {
             matching_handle: std::thread::spawn(move || warm),
             drain_handle: std::thread::spawn(|| {}),
             shadow_handle: None,
+            output_check: None,
         });
         std::fs::remove_file(&path).expect("simulate the rotation gap");
         assert_eq!(
@@ -4676,6 +4711,7 @@ mod tests {
             }),
             drain_handle: std::thread::spawn(|| {}),
             shadow_handle: None,
+            output_check: None,
         };
         (handles, consumer)
     }
@@ -4782,6 +4818,8 @@ mod tests {
                 Arc::new(AtomicBool::new(true)),
                 &(),
                 Some(Arc::new(counter_server::ResponseEncoder)),
+                &crate::tests::idle_latch(),
+                &Arc::new(std::sync::atomic::AtomicU64::new(0)),
             )
             .expect("build the replica pipeline");
 
@@ -5044,6 +5082,7 @@ mod tests {
             }),
             drain_handle: std::thread::spawn(|| {}),
             shadow_handle: None,
+            output_check: None,
         }
     }
 
@@ -5262,6 +5301,7 @@ mod tests {
             }),
             drain_handle: std::thread::spawn(|| {}),
             shadow_handle: None,
+            output_check: None,
         };
         let mut state = ReplicaState::<counter_server::Counter, Writer> {
             engine: ReplicaEngine::Running(handles),

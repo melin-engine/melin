@@ -1405,6 +1405,7 @@ where
             &fence_state,
             raft_status.as_ref(),
             Arc::clone(&control.pipeline_healthy),
+            Arc::clone(&control.output_checks),
         )?;
 
         // No local rotation triggers on the replica side: segment
@@ -2957,6 +2958,7 @@ where
             &fence_state,
             raft_status.as_ref(),
             Arc::clone(&control.pipeline_healthy),
+            Arc::clone(&control.output_checks),
         )?;
 
         // No local rotation triggers on the replica side — rotation is
@@ -4475,6 +4477,8 @@ fn spawn_health_endpoint(
             matching_utilization: Arc::clone(matching_utilization),
             response_utilization: Arc::clone(response_utilization),
             raft: raft_status.clone(),
+            // A primary compares nothing: its replicas check against it.
+            output_checks: None,
         },
         Arc::clone(shutdown),
     )?))
