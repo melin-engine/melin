@@ -696,14 +696,27 @@ pub fn bridge_catchup_to_live<E: AppEvent>(
     let mut refill = |from: u64, fwd: &mut dyn FnMut(&[u8]) -> io::Result<()>| -> io::Result<u64> {
         handoff_pass_from_journal::<E>(journal_path, from, fwd, shutdown)
     };
-    let mut expired = || Instant::now() >= deadline;
-    drain_into_contiguity(
+    // A node stopping ends the wait at once: its passes, which watch the
+    // same flag, read nothing more, so an ahead chunk could only wait out
+    // the deadline.
+    let mut expired = || shutdown.load(Ordering::Relaxed) || Instant::now() >= deadline;
+    match drain_into_contiguity(
         &mut sent,
         consumer,
         &mut *publisher,
         &mut refill,
         &mut expired,
-    )?;
+    ) {
+        Ok(()) => {}
+        // Stopping: go live with the ahead chunk held, unsent. The live
+        // loop answers the stop (a primary stopped for divergence sends
+        // its replica `Halt` there) before it forwards anything, so a
+        // joining replica learns of the stop rather than losing its
+        // session to the stall. The stall's error says only that the
+        // back-fill did not reach the chunk, which the stop explains.
+        Err(_stalled) if shutdown.load(Ordering::Relaxed) => {}
+        Err(e) => return Err(e),
+    }
     Ok(sent)
 }
 
@@ -1537,6 +1550,54 @@ mod tests {
         let err = handoff_pass_from_journal::<TestEvent>(&live, 0, &mut publish, &never)
             .expect_err("the start point was pruned");
         assert!(err.to_string().contains("pruned"), "{err}");
+    }
+
+    /// A node stopping while a joining replica's bridge waits on a chunk
+    /// ahead of the disk goes live at once, the chunk held and unsent, so
+    /// the live loop can answer the stop; running, the same wait is a
+    /// stall that ends the session.
+    #[test]
+    fn the_bridge_goes_live_at_once_when_the_node_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = journal_of_five(dir.path());
+        let bridge = |stopping: bool| {
+            let (mut producer, mut consumers) = melin_journal::replication::build_replication_ring(
+                1,
+                8,
+                melin_pipeline::wait::WaitStrategy::SpinThenYield,
+            );
+            let mut consumer = consumers.pop().expect("one consumer");
+            let mut ahead = Vec::new();
+            let slots = [8u64, 9].map(crate::test_support::sequenced_slot);
+            crate::replication_wire::encode_input_batch(&slots, &mut ahead).expect("encode");
+            producer.publish(&ahead, 9);
+            let active = AtomicBool::new(false);
+            let shutdown = AtomicBool::new(stopping);
+            let mut sent_frames = 0usize;
+            let mut publish = |_: &[u8]| -> io::Result<()> {
+                sent_frames += 1;
+                Ok(())
+            };
+            let result = bridge_catchup_to_live::<TestEvent>(
+                &live,
+                5,
+                5,
+                &active,
+                &mut consumer,
+                &mut publish,
+                &shutdown,
+            );
+            let held = consumer.peek().map(|b| b.meta().end_sequence);
+            (result, sent_frames, held)
+        };
+
+        let (result, sent_frames, held) = bridge(true);
+        assert_eq!(result.expect("goes live").get(), 5);
+        assert_eq!(sent_frames, 0, "the ahead chunk is not forwarded");
+        assert_eq!(held, Some(9), "the chunk stays on the ring");
+
+        let (result, _, _) = bridge(false);
+        assert!(result.is_err(), "running, the stall ends the session");
     }
 }
 

@@ -2071,10 +2071,14 @@ fn spawn_replication_relay(
             let mut got_something = false;
             if let Some(batch) = repl_c0.peek() {
                 let data = batch.data();
-                let payload_len =
-                    u32::from_le_bytes(data[..4].try_into().expect("4-byte length prefix"))
-                        as usize;
-                let payload = &data[4..4 + payload_len];
+                // One frame per slot: this relay's primary forwards no
+                // output digests.
+                assert_eq!(
+                    crate::replication_wire::chunk_frames(data).count(),
+                    1,
+                    "one frame per slot"
+                );
+                let payload = &data[4..];
                 if peek_frame_tag(data).expect("relay frame tag") == MSG_INPUT_BATCH {
                     let slots: Vec<TestInput> =
                         try_decode_input_batch(payload).expect("relay InputBatch decode");
@@ -3484,7 +3488,7 @@ fn primary_emits_output_digest_after_its_position() {
         BoardLookup, BoardSize, OUTPUT_DIGEST_WINDOW as K, ReportBody, WindowFolder, digest_board,
     };
     use crate::replication::protocol::{PrimaryMessage, decode_primary_message};
-    use crate::replication_wire::{MSG_INPUT_BATCH, peek_frame_tag};
+    use crate::replication_wire::{MSG_INPUT_BATCH, chunk_frames, peek_frame_tag};
     use melin_pipeline::seqlock;
 
     let dir = tempfile::tempdir().unwrap();
@@ -3569,12 +3573,14 @@ fn primary_emits_output_digest_after_its_position() {
     let mut digests = Vec::new();
     while let Some(slot) = repl_consumers[0].peek() {
         let end_seq = slot.meta().end_sequence;
-        let data = slot.data();
+        let frames: Vec<&[u8]> = chunk_frames(slot.data())
+            .map(|f| f.expect("whole frames"))
+            .collect();
+        let data = frames[0];
         if peek_frame_tag(data).unwrap() == MSG_INPUT_BATCH {
             batches += 1;
-            let batch_len = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
-            let rest = &data[4 + batch_len..];
-            if !rest.is_empty() {
+            assert!(frames.len() <= 2, "a batch and at most one digest");
+            if let Some(rest) = frames.get(1) {
                 assert_eq!(rest.len(), crate::replication::protocol::DIGEST_FRAME_LEN);
                 match decode_primary_message(&rest[4..]).unwrap() {
                     PrimaryMessage::Digest {
@@ -3590,6 +3596,7 @@ fn primary_emits_output_digest_after_its_position() {
         } else {
             // A live-stream `ChainCheck`, with the hash chain on: its own
             // slot, never a digest.
+            assert_eq!(frames.len(), 1);
             assert!(matches!(
                 decode_primary_message(&data[4..]).unwrap(),
                 PrimaryMessage::ChainCheck { .. }

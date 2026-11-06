@@ -612,6 +612,34 @@ pub(crate) fn peek_frame_tag(frame: &[u8]) -> io::Result<u8> {
         .ok_or_else(|| io::Error::other("frame too short for a message tag"))
 }
 
+/// The frames of one replication ring slot, each with its length prefix,
+/// in order. A batch's slot holds its `InputBatch` and, after it, the
+/// primary's output digest, and the decoders read one frame and ignore
+/// what follows it: a test reading a slot goes through this, so a frame
+/// it does not expect fails it rather than passing unseen. A slot that
+/// does not split into whole frames yields an error and ends.
+#[cfg(test)]
+pub(crate) fn chunk_frames(chunk: &[u8]) -> impl Iterator<Item = io::Result<&[u8]>> {
+    let mut rest = chunk;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let Some(prefix) = rest.first_chunk::<4>() else {
+            rest = &[];
+            return Some(Err(io::Error::other("slot ends inside a length prefix")));
+        };
+        let len = 4 + u32::from_le_bytes(*prefix) as usize;
+        if len > rest.len() {
+            rest = &[];
+            return Some(Err(io::Error::other("slot ends inside a frame")));
+        }
+        let (frame, after) = rest.split_at(len);
+        rest = after;
+        Some(Ok(frame))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -848,6 +876,33 @@ mod tests {
             sample_slot(6_932_803, JournalEvent::App(TestEvent(3))),
         ]);
         assert_eq!(peek_first_sequence(&buf).unwrap(), 6_932_801);
+    }
+
+    /// A slot splits into its batch and the digest after it, each whole;
+    /// a slot cut inside a frame or a prefix is an error, after the whole
+    /// frames before the cut.
+    #[test]
+    fn chunk_frames_splits_a_slot_into_whole_frames() {
+        let batch = frame(&[sample_slot(7, JournalEvent::App(TestEvent(1)))]);
+        let digest = crate::replication::protocol::encode_digest(
+            crate::output_digest::DigestKind::Output,
+            crate::WireSeq::new(64),
+            crate::output_digest::CHAIN_SEED,
+        );
+        let mut slot = batch.clone();
+        slot.extend_from_slice(&digest);
+        let frames: Vec<&[u8]> = chunk_frames(&slot).map(|f| f.unwrap()).collect();
+        assert_eq!(frames, [&batch[..], &digest[..]]);
+        assert_eq!(chunk_frames(&[]).count(), 0);
+
+        let cut = &slot[..slot.len() - 1];
+        let mut split = chunk_frames(cut);
+        assert_eq!(split.next().unwrap().unwrap(), &batch[..]);
+        assert!(split.next().unwrap().is_err());
+        assert!(split.next().is_none());
+        let mut prefix_cut = chunk_frames(&slot[..batch.len() + 2]);
+        assert!(prefix_cut.next().unwrap().is_ok());
+        assert!(prefix_cut.next().unwrap().is_err());
     }
 
     #[test]
