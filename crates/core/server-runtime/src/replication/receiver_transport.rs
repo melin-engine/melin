@@ -17,7 +17,11 @@ use tracing::{debug, info};
 
 use melin_app::AppEvent;
 use melin_pipeline::wait::WaitStrategy;
-use melin_transport_core::divergence::{HaltCause, HaltedBy, NoticePath};
+use melin_transport_core::divergence::{
+    DivergenceLatch, HALT_NOTICE_BOUND, HaltCause, HaltedBy, NoticePath,
+};
+
+use super::halt_notice::{HaltNotice, HaltStep, take_halt};
 use melin_transport_core::lineage::SharedLineagePolicy;
 use melin_transport_core::pipeline::{AdoptedRotation, InputSlot, StreamMark, StreamMarkQueue};
 use melin_transport_core::replication::protocol::{
@@ -58,6 +62,12 @@ pub(super) trait ReceiverTransport {
     /// `false` if the ack was not accepted (caller retries next
     /// iteration). Returns `Err` on fatal send error.
     fn send_ack(&mut self, ack: &Ack) -> io::Result<bool>;
+
+    /// Send a stopped replica's ack: `ack`'s positions flagged
+    /// `FLAG_STOPPED`. Taken only when no ack is in flight or queued
+    /// (`false` otherwise: the caller retries), so it is never coalesced
+    /// with an ordinary ack, and nothing the replica sends follows it.
+    fn send_stopped_ack(&mut self, ack: &Ack) -> io::Result<bool>;
 
     /// Whether any accepted ack has not yet fully reached the wire.
     /// The flush path skips composing new acks while true; the drain
@@ -1062,10 +1072,11 @@ pub(super) fn process_drain_frames<E: AppEvent>(
 pub(super) enum SessionExit {
     Shutdown,
     /// The node stopped because the cluster's output diverged. The
-    /// session sent nothing after it saw the stop; the pipeline is torn
-    /// down and the receiver returns, never reaching a reconnect where a
-    /// promotion could be honoured.
-    Stopped,
+    /// session sent nothing after it saw the stop but the stopped ack it
+    /// owed, if it owed one; the pipeline is torn down and the receiver
+    /// returns, after redialling if the notice went unanswered, never
+    /// reaching a reconnect where a promotion could be honoured.
+    Stopped(StopNotice),
     Promote,
     /// The transport dropped. Reconnect with backoff.
     Disconnected,
@@ -1087,6 +1098,70 @@ pub(super) enum SessionExit {
     /// death); mid-stream chain divergence is the one fatal the exit
     /// handler repairs by in-process resync.
     Fatal(Box<dyn std::error::Error + Send + Sync>),
+}
+
+/// What became of the notice a stopped replica owes its primary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StopNotice {
+    /// None owed: the replica was told by its primary's `Halt`.
+    NotOwed,
+    /// The replica detected the divergence, sent its stopped ack, and the
+    /// primary answered with `Halt`.
+    Answered,
+    /// The replica detected the divergence and no `Halt` answered within
+    /// the bound: the receiver redials with a stopped handshake.
+    Unanswered,
+}
+
+/// Tell the primary this replica has stopped on its own detection: once
+/// its marker is durable, or the notice bound has passed (`HaltNotice`),
+/// send one stopped ack carrying `frozen`, the last positions it sent,
+/// then wait up to the bound for the primary's `Halt`, reading and
+/// dropping everything else: a stopped replica publishes nothing more.
+/// `bound` is [`HALT_NOTICE_BOUND`] in production, shorter in tests.
+fn tell_primary<T: ReceiverTransport>(
+    transport: &mut T,
+    latch: &DivergenceLatch,
+    recv_buf: &mut Vec<u8>,
+    frozen: Ack,
+    bound: std::time::Duration,
+) -> StopNotice {
+    let mut notice = HaltNotice::with_bound(bound);
+    loop {
+        // A `Halt` already on its way (the primary was told by another
+        // replica, or this one's ack crossed it) answers the notice.
+        let read = transport.poll_recv(recv_buf);
+        if take_halt(recv_buf) {
+            info!("the primary answered this replica's stop with its halt");
+            return StopNotice::Answered;
+        }
+        if read.is_err() {
+            return StopNotice::Unanswered;
+        }
+        match notice.step(!transport.ack_in_flight(), latch) {
+            HaltStep::Wait => std::thread::yield_now(),
+            HaltStep::Send => match transport.send_stopped_ack(&frozen) {
+                Ok(true) => break,
+                // Not taken although nothing was in flight, or the link
+                // failed: the redial tells the primary instead.
+                Ok(false) | Err(_) => return StopNotice::Unanswered,
+            },
+            HaltStep::Close => return StopNotice::Unanswered,
+        }
+    }
+    let deadline = std::time::Instant::now() + bound;
+    while std::time::Instant::now() < deadline {
+        let read = transport.poll_recv(recv_buf);
+        if take_halt(recv_buf) {
+            info!("the primary answered this replica's stop with its halt");
+            return StopNotice::Answered;
+        }
+        if read.is_err() {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    StopNotice::Unanswered
 }
 
 /// What the streaming loop returns to the caller.
@@ -1208,8 +1283,26 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
         // --- Check flags ---
         // The stop first: it also sets the shutdown flag, and a stopped
         // replica must not send the ordinary acks the shutdown arm drains.
+        // A stop this replica detected is owed to its primary; one it was
+        // told of is not.
         if latch.is_tripped() {
-            break SessionExit::Stopped;
+            let notice = match latch.cause() {
+                Some(HaltCause::Detected(_)) => {
+                    compact_recv_buf(&mut recv_buf, std::mem::take(&mut recv_offset));
+                    tell_primary(
+                        transport,
+                        latch,
+                        &mut recv_buf,
+                        Ack {
+                            acked_sequence: last_sent_acked_seq,
+                            in_memory_sequence: last_sent_in_memory_seq,
+                        },
+                        HALT_NOTICE_BOUND,
+                    )
+                }
+                Some(HaltCause::ClusterHalted { .. }) | None => StopNotice::NotOwed,
+            };
+            break SessionExit::Stopped(notice);
         }
         if shutdown.load(Ordering::Relaxed) {
             info!("replica shutting down");
@@ -1365,7 +1458,7 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
                     by: HaltedBy::Primary,
                     via: NoticePath::HaltFrame,
                 });
-                break SessionExit::Stopped;
+                break SessionExit::Stopped(StopNotice::NotOwed);
             }
             None => {}
         }
@@ -1908,11 +2001,31 @@ mod tests {
         recv_queue: VecDeque<Vec<u8>>,
         // Acks sent via send_ack (sequence pairs).
         sent_acks: Vec<Ack>,
+        // Acks sent via send_stopped_ack.
+        stopped_acks: Vec<Ack>,
         connected: bool,
         // Simulate async ack: when true, send_ack sets in_flight and
         // the next poll_recv clears it.
         simulate_in_flight: bool,
         in_flight: bool,
+        // Further reads an ack in flight survives before it completes:
+        // zero, the next read completes it.
+        in_flight_reads: usize,
+        // Reads so far.
+        reads: usize,
+        // The reads before the stopped ack was taken, once it was.
+        reads_before_stopped_ack: Option<usize>,
+        // Stopped acks offered while an ack was still in flight.
+        stopped_acks_offered_in_flight: usize,
+        // The primary answers a stopped ack with its `Halt`.
+        halt_on_stopped_ack: bool,
+        // Every read fails, as on a lost link.
+        reads_fail: bool,
+        // The link is lost as the stopped ack is taken: every read after
+        // it fails.
+        reads_fail_after_stopped_ack: bool,
+        // The stopped ack fails to send, as on a lost link.
+        stopped_ack_fails: bool,
     }
 
     impl MockTransport {
@@ -1920,9 +2033,18 @@ mod tests {
             Self {
                 recv_queue: VecDeque::new(),
                 sent_acks: Vec::new(),
+                stopped_acks: Vec::new(),
                 connected: true,
                 simulate_in_flight: false,
                 in_flight: false,
+                in_flight_reads: 0,
+                reads: 0,
+                reads_before_stopped_ack: None,
+                stopped_acks_offered_in_flight: 0,
+                halt_on_stopped_ack: false,
+                reads_fail: false,
+                reads_fail_after_stopped_ack: false,
+                stopped_ack_fails: false,
             }
         }
 
@@ -1937,8 +2059,16 @@ mod tests {
 
     impl ReceiverTransport for MockTransport {
         fn poll_recv(&mut self, recv_buf: &mut Vec<u8>) -> io::Result<bool> {
+            self.reads += 1;
+            if self.reads_fail {
+                return Err(io::Error::from(io::ErrorKind::ConnectionReset));
+            }
             if self.in_flight {
-                self.in_flight = false;
+                if self.in_flight_reads == 0 {
+                    self.in_flight = false;
+                } else {
+                    self.in_flight_reads -= 1;
+                }
             }
             if let Some(chunk) = self.recv_queue.pop_front() {
                 recv_buf.extend_from_slice(&chunk);
@@ -1946,6 +2076,24 @@ mod tests {
             } else {
                 Ok(false)
             }
+        }
+
+        fn send_stopped_ack(&mut self, ack: &Ack) -> io::Result<bool> {
+            if self.in_flight {
+                self.stopped_acks_offered_in_flight += 1;
+                return Ok(false);
+            }
+            if self.stopped_ack_fails {
+                return Err(io::Error::from(io::ErrorKind::BrokenPipe));
+            }
+            self.stopped_acks.push(*ack);
+            self.reads_before_stopped_ack.get_or_insert(self.reads);
+            self.reads_fail |= self.reads_fail_after_stopped_ack;
+            if self.halt_on_stopped_ack {
+                self.recv_queue
+                    .push_back(melin_transport_core::replication::protocol::encode_halt().to_vec());
+            }
+            Ok(true)
         }
 
         fn send_ack(&mut self, ack: &Ack) -> io::Result<bool> {
@@ -2105,7 +2253,10 @@ mod tests {
             &AtomicBool::new(false),
         );
 
-        assert!(matches!(result.exit, SessionExit::Stopped));
+        assert!(matches!(
+            result.exit,
+            SessionExit::Stopped(StopNotice::NotOwed)
+        ));
         assert_eq!(
             control.latch.cause(),
             Some(&HaltCause::ClusterHalted {
@@ -2147,7 +2298,278 @@ mod tests {
             &AtomicBool::new(false),
         );
 
-        assert!(matches!(result.exit, SessionExit::Stopped));
+        assert!(matches!(
+            result.exit,
+            SessionExit::Stopped(StopNotice::NotOwed)
+        ));
+        assert!(transport.sent_acks.is_empty());
+    }
+
+    /// A replica stopped on its own detection, with `pending` the bytes
+    /// its primary sends meanwhile, one chunk per read; how its session
+    /// ended, and the transport, to read what it sent.
+    fn detected_stop(pending: Vec<Vec<u8>>) -> (SessionExit, MockTransport) {
+        let (mut producer, _consumer) = ring(16);
+        let cursor = journal_cursor(u64::MAX);
+        let shutdown = AtomicBool::new(true);
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Durable before the loop's turn, so the ack goes at once.
+        let control = crate::replication::ReplicaControlPlane::new(detected_latch(
+            dir.path(),
+            std::sync::Arc::new(melin_transport_core::divergence::FsSync),
+            true,
+        ));
+        let mut transport = MockTransport::new();
+        for chunk in pending {
+            transport.push_data(chunk);
+        }
+        let result = streaming_loop::<MockTransport, TestEvent>(
+            &mut transport,
+            &mut producer,
+            &cursor,
+            &shutdown,
+            &control,
+            4,
+            WaitStrategy::SpinThenYield,
+            5,
+            Vec::new(),
+            None,
+            &no_marks(),
+            &AtomicBool::new(false),
+        );
+        (result.exit, transport)
+    }
+
+    /// A replica that detected the divergence tells its primary: one
+    /// stopped ack with its last positions, no ordinary ack, and the
+    /// primary's `Halt` answers it; an entry the primary sent before the
+    /// `Halt` is dropped, not published.
+    #[test]
+    fn a_detecting_replica_sends_one_stopped_ack_and_takes_the_halt() {
+        let mut ahead = Vec::new();
+        append_input_batch_frame(&mut ahead, &[slot(6, 0x01)]);
+        ahead.extend_from_slice(&melin_transport_core::replication::protocol::encode_halt());
+        let (exit, transport) = detected_stop(vec![Vec::new(), ahead]);
+        assert!(matches!(exit, SessionExit::Stopped(StopNotice::Answered)));
+        assert_eq!(transport.stopped_acks.len(), 1);
+        let stopped = transport.stopped_acks[0];
+        assert_eq!(
+            (stopped.acked_sequence, stopped.in_memory_sequence),
+            (5, 5),
+            "the positions last sent, the session's start here"
+        );
+        assert!(transport.sent_acks.is_empty(), "no ordinary ack");
+    }
+
+    /// A latch tripped by this replica's own detection, its marker synced
+    /// by `sync`, and whether that sync is durable before the notice.
+    fn detected_latch(
+        dir: &std::path::Path,
+        sync: std::sync::Arc<dyn melin_transport_core::divergence::MarkerSync>,
+        durable: bool,
+    ) -> DivergenceLatch {
+        let latch = DivergenceLatch::new(
+            std::sync::Arc::new(melin_transport_core::fence::FenceState::new(0)),
+            std::sync::Arc::new(AtomicBool::new(false)),
+            dir.join("replica.journal.diverged"),
+            sync,
+        );
+        let _halted = latch.trip_with(HaltCause::Detected(
+            melin_transport_core::output_digest::Divergence {
+                end: melin_transport_core::WireSeq::new(64),
+                run_from: melin_transport_core::WireSeq::new(1),
+                last_match: None,
+                expected: melin_transport_core::output_digest::ChainValue::from_bytes([1; 16]),
+                actual: melin_transport_core::output_digest::ChainValue::from_bytes([2; 16]),
+            },
+        ));
+        if durable {
+            assert!(matches!(
+                latch.wait_marker(HALT_NOTICE_BOUND),
+                melin_transport_core::divergence::MarkerOutcome::Written
+            ));
+        }
+        latch
+    }
+
+    use melin_transport_core::divergence::FsSync;
+
+    /// The positions a test's stopped ack carries.
+    const FROZEN: Ack = Ack {
+        acked_sequence: 5,
+        in_memory_sequence: 7,
+    };
+
+    /// The positions each stopped ack `transport` took carried.
+    fn stopped_positions(transport: &MockTransport) -> Vec<(u64, u64)> {
+        transport
+            .stopped_acks
+            .iter()
+            .map(|a| (a.acked_sequence, a.in_memory_sequence))
+            .collect()
+    }
+
+    /// A short notice bound, so the tests that run it out stay quick.
+    const TEST_BOUND: std::time::Duration = std::time::Duration::from_millis(50);
+
+    /// An ordinary ack still going out holds the stopped ack: it is
+    /// offered only once that ack has completed, and taken then, once.
+    #[test]
+    fn the_stopped_ack_waits_for_the_ack_in_flight() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let latch = detected_latch(dir.path(), std::sync::Arc::new(FsSync), true);
+        let mut transport = MockTransport::new();
+        transport.in_flight = true;
+        transport.in_flight_reads = 3;
+        transport.halt_on_stopped_ack = true;
+        let notice = tell_primary(
+            &mut transport,
+            &latch,
+            &mut Vec::new(),
+            FROZEN,
+            HALT_NOTICE_BOUND,
+        );
+        assert_eq!(notice, StopNotice::Answered);
+        assert_eq!(stopped_positions(&transport), vec![(5, 7)]);
+        assert_eq!(
+            transport.stopped_acks_offered_in_flight, 0,
+            "offered while an ack was in flight"
+        );
+        assert!(
+            transport.reads_before_stopped_ack >= Some(4),
+            "{:?}",
+            transport.reads_before_stopped_ack
+        );
+        assert!(transport.sent_acks.is_empty());
+    }
+
+    /// A marker not yet durable holds the stopped ack until it is, or
+    /// here, with a disk that never answers, for the bound and no longer.
+    #[test]
+    fn a_hung_marker_holds_the_stopped_ack_for_the_bound_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let latch = detected_latch(
+            dir.path(),
+            std::sync::Arc::new(super::super::halt_notice::HungMarkerSync),
+            false,
+        );
+        let mut transport = MockTransport::new();
+        transport.halt_on_stopped_ack = true;
+        let started = std::time::Instant::now();
+        let notice = tell_primary(&mut transport, &latch, &mut Vec::new(), FROZEN, TEST_BOUND);
+        assert_eq!(notice, StopNotice::Answered);
+        assert_eq!(stopped_positions(&transport), vec![(5, 7)]);
+        assert!(started.elapsed() >= TEST_BOUND, "waited for the marker");
+        assert!(
+            transport.reads_before_stopped_ack > Some(1),
+            "{:?}",
+            transport.reads_before_stopped_ack
+        );
+    }
+
+    /// A `Halt` already on its way answers the notice: no stopped ack.
+    #[test]
+    fn a_halt_on_its_way_answers_without_a_stopped_ack() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let latch = detected_latch(dir.path(), std::sync::Arc::new(FsSync), true);
+        let mut transport = MockTransport::new();
+        transport.push_data(melin_transport_core::replication::protocol::encode_halt().to_vec());
+        let notice = tell_primary(&mut transport, &latch, &mut Vec::new(), FROZEN, TEST_BOUND);
+        assert_eq!(notice, StopNotice::Answered);
+        assert!(transport.stopped_acks.is_empty());
+    }
+
+    /// No `Halt` within the bound after the stopped ack: the notice went
+    /// unanswered, and the receiver will redial.
+    #[test]
+    fn a_detecting_replica_unanswered_is_left_to_redial() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let latch = detected_latch(dir.path(), std::sync::Arc::new(FsSync), true);
+        let mut transport = MockTransport::new();
+        let started = std::time::Instant::now();
+        let notice = tell_primary(&mut transport, &latch, &mut Vec::new(), FROZEN, TEST_BOUND);
+        assert_eq!(notice, StopNotice::Unanswered);
+        assert_eq!(stopped_positions(&transport), vec![(5, 7)]);
+        assert!(started.elapsed() >= TEST_BOUND, "waited the bound");
+        assert!(transport.sent_acks.is_empty());
+    }
+
+    /// An ack in flight that never completes: the stopped ack is never
+    /// offered, and the notice gives up at twice the bound.
+    #[test]
+    fn a_link_that_never_frees_gives_up_at_twice_the_bound() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let latch = detected_latch(dir.path(), std::sync::Arc::new(FsSync), true);
+        let mut transport = MockTransport::new();
+        transport.in_flight = true;
+        transport.in_flight_reads = usize::MAX;
+        let started = std::time::Instant::now();
+        let notice = tell_primary(&mut transport, &latch, &mut Vec::new(), FROZEN, TEST_BOUND);
+        assert_eq!(notice, StopNotice::Unanswered);
+        assert!(started.elapsed() >= 2 * TEST_BOUND);
+        assert!(transport.stopped_acks.is_empty());
+        assert_eq!(transport.stopped_acks_offered_in_flight, 0);
+    }
+
+    /// A lost link leaves the notice unanswered at once, to the redial.
+    #[test]
+    fn a_lost_link_leaves_the_notice_to_the_redial() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let latch = detected_latch(dir.path(), std::sync::Arc::new(FsSync), true);
+        let mut transport = MockTransport::new();
+        transport.reads_fail = true;
+        let notice = tell_primary(
+            &mut transport,
+            &latch,
+            &mut Vec::new(),
+            FROZEN,
+            HALT_NOTICE_BOUND,
+        );
+        assert_eq!(notice, StopNotice::Unanswered);
+        assert!(transport.stopped_acks.is_empty());
+    }
+
+    /// A stopped ack the link fails to send leaves the notice unanswered
+    /// at once, to the redial, without waiting out the bound.
+    #[test]
+    fn a_failed_stopped_ack_leaves_the_notice_to_the_redial() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let latch = detected_latch(dir.path(), std::sync::Arc::new(FsSync), true);
+        let mut transport = MockTransport::new();
+        transport.stopped_ack_fails = true;
+        let started = std::time::Instant::now();
+        let notice = tell_primary(
+            &mut transport,
+            &latch,
+            &mut Vec::new(),
+            FROZEN,
+            HALT_NOTICE_BOUND,
+        );
+        assert_eq!(notice, StopNotice::Unanswered);
+        assert!(started.elapsed() < HALT_NOTICE_BOUND, "did not wait");
+        assert!(transport.stopped_acks.is_empty());
+        assert!(transport.sent_acks.is_empty());
+    }
+
+    /// A link lost after the stopped ack went out ends the wait for the
+    /// `Halt` at once: the notice is unanswered, to the redial.
+    #[test]
+    fn a_link_lost_after_the_stopped_ack_ends_the_wait_for_the_halt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let latch = detected_latch(dir.path(), std::sync::Arc::new(FsSync), true);
+        let mut transport = MockTransport::new();
+        transport.reads_fail_after_stopped_ack = true;
+        let started = std::time::Instant::now();
+        let notice = tell_primary(
+            &mut transport,
+            &latch,
+            &mut Vec::new(),
+            FROZEN,
+            HALT_NOTICE_BOUND,
+        );
+        assert_eq!(notice, StopNotice::Unanswered);
+        assert!(started.elapsed() < HALT_NOTICE_BOUND, "did not wait");
+        assert_eq!(stopped_positions(&transport), vec![(5, 7)]);
         assert!(transport.sent_acks.is_empty());
     }
 

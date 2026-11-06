@@ -31,6 +31,11 @@ use standalone::standalone_config;
 mod halt_cluster;
 use halt_cluster::{Fixture, addrs, spawn_node};
 
+#[path = "common/proxy.rs"]
+mod proxy;
+use melin_transport_core::divergence::HALT_NOTICE_BOUND;
+use proxy::Proxy;
+
 const CLIENT_KEY: [u8; 32] = [0xD1; 32];
 
 /// How long a stopped node has to return.
@@ -181,6 +186,96 @@ fn a_stopped_primary_halts_its_replicas() {
             "{name}: {restarted}"
         );
     }
+}
+
+/// A replica that detects the divergence stops the whole cluster: its
+/// stopped ack stops the primary, whose `Halt` answers it and stops the
+/// other replica. Every node says why, leaves its marker, and nothing
+/// serves after.
+#[test]
+fn a_detecting_replica_stops_the_whole_cluster() {
+    let fx = Fixture::new(0xDB);
+    let primary_addrs = addrs(0);
+    let primary_config = fx.primary_config(&primary_addrs, AckPolicy::DiskAndRam);
+    let health = primary_config.health_bind.expect("set by the fixture");
+    let primary_marker = primary_config.store().expect("store").divergence_marker();
+    let primary = spawn_node::<Counter>(&primary_addrs, primary_config);
+    wait_for_gauge(health, "melin_replicas_connected", 0);
+
+    let replica = |slot: usize, name: &str| {
+        let config = fx.replica_config(name, primary_addrs.replication(), AckPolicy::DiskAndRam);
+        let marker = config.store().expect("store").divergence_marker();
+        (marker, spawn_node::<Counter>(&addrs(slot), config))
+    };
+    let (detector_marker, detector) = replica(1, "detector");
+    let (other_marker, other) = replica(2, "other");
+    wait_for_gauge(health, "melin_replicas_connected", 2);
+    let mut client = fx.client(&primary);
+    client
+        .request_one(&increment_request(1))
+        .expect("served by the whole cluster");
+
+    let _halted = test_seam::trip(&detector_marker, detected()).expect("the replica runs");
+
+    let error = stopped(detector);
+    assert!(
+        error.contains("its output diverged from its primary's between positions 65 and 128"),
+        "detector: {error}"
+    );
+    let error = stopped(primary);
+    assert!(
+        error.contains("told by the replica on slot") && error.contains("via its acknowledgement"),
+        "primary: {error}"
+    );
+    let error = stopped(other);
+    assert!(
+        error.contains("told by the primary via the halt frame"),
+        "other: {error}"
+    );
+    for marker in [&detector_marker, &primary_marker, &other_marker] {
+        assert!(marker.exists(), "{}", marker.display());
+    }
+}
+
+/// A detector whose stopped ack never reaches its primary (its link frozen
+/// at the trip) redials it once the in-session wait runs out, and its
+/// stopped handshake, once the link is back, stops the primary.
+#[test]
+fn a_lost_stopped_ack_is_made_good_by_the_redial() {
+    let fx = Fixture::new(0xDF);
+    let primary_addrs = addrs(0);
+    let primary_config = fx.primary_config(&primary_addrs, AckPolicy::DiskAndRam);
+    let health = primary_config.health_bind.expect("set by the fixture");
+    let primary = spawn_node::<Counter>(&primary_addrs, primary_config);
+    wait_for_gauge(health, "melin_replicas_connected", 0);
+
+    let proxy = Proxy::start(primary_addrs.replication());
+    let config = fx.replica_config("detector", proxy.addr(), AckPolicy::DiskAndRam);
+    let marker = config.store().expect("store").divergence_marker();
+    let detector = spawn_node::<Counter>(&addrs(1), config);
+    wait_for_gauge(health, "melin_replicas_connected", 1);
+
+    proxy.freeze();
+    let _halted = test_seam::trip(&marker, detected()).expect("the replica runs");
+    // Past the replica's in-session wait for the `Halt`: the primary has
+    // heard nothing.
+    std::thread::sleep(HALT_NOTICE_BOUND + Duration::from_secs(1));
+    assert!(!primary.is_finished(), "the frozen link carried the stop");
+    // The held redial fails; the next one, through the restored link,
+    // reaches the primary.
+    proxy.cut();
+    proxy.restore();
+
+    let error = stopped(primary);
+    assert!(
+        error.contains("told by the replica on slot") && error.contains("via its handshake"),
+        "primary: {error}"
+    );
+    let error = stopped(detector);
+    assert!(
+        error.contains("its output diverged from its primary's"),
+        "detector: {error}"
+    );
 }
 
 /// A replica that redials its primary as stopped, with a flagged

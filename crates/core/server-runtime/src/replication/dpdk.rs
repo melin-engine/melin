@@ -49,7 +49,7 @@ use melin_transport_core::replication::handoff::{
 use melin_transport_core::replication::protocol::{
     Ack, Handshake, MAX_CONTROL_FRAME, PrimaryMessage, ReplicaMessage, decode_primary_message,
     decode_replica_message, encode_ack, encode_challenge, encode_halt, encode_handshake,
-    encode_heartbeat,
+    encode_heartbeat, encode_stopped_ack, encode_stopped_handshake,
 };
 use melin_transport_core::replication::validate::{
     HandshakeValidation, validate_replica_handshake_settled,
@@ -101,26 +101,14 @@ impl ReceiverTransport for DpdkReceiverTransport<'_> {
     }
 
     fn send_ack(&mut self, ack: &Ack) -> io::Result<bool> {
-        self.send_buf.clear();
-        encode_ack(ack, &mut self.send_buf);
-        let mut attempts: u32 = 0;
-        loop {
-            if self.transport.queue_send(self.handle, &self.send_buf) {
-                // Flush immediately so the ACK reaches the primary
-                // without waiting for the next poll_recv iteration.
-                self.transport.poll();
-                return Ok(true);
-            }
-            attempts += 1;
-            if attempts >= ACK_RETRY_CAP {
-                tracing::warn!("DPDK ack send failed after {ACK_RETRY_CAP} retries");
-                return Ok(false);
-            }
-            self.transport.poll();
-            if !self.transport.is_connected(self.handle) {
-                return Err(io::Error::other("replica disconnected during ack send"));
-            }
-        }
+        self.send_ack_frame(ack, encode_ack)
+    }
+
+    /// Nothing is ever in flight here (the frame is queued whole on the
+    /// socket, or not at all), so the stopped ack follows whatever was
+    /// queued before it and nothing after it.
+    fn send_stopped_ack(&mut self, ack: &Ack) -> io::Result<bool> {
+        self.send_ack_frame(ack, encode_stopped_ack)
     }
 
     fn ack_in_flight(&self) -> bool {
@@ -141,6 +129,243 @@ impl ReceiverTransport for DpdkReceiverTransport<'_> {
     fn keep_link_serviced(&mut self) {
         self.transport.poll();
     }
+}
+
+impl DpdkReceiverTransport<'_> {
+    /// Queue `ack`, written by `encode`, on the socket, retrying a full
+    /// queue a bounded number of times.
+    fn send_ack_frame(&mut self, ack: &Ack, encode: fn(&Ack, &mut Vec<u8>)) -> io::Result<bool> {
+        self.send_buf.clear();
+        encode(ack, &mut self.send_buf);
+        let mut attempts: u32 = 0;
+        loop {
+            if self.transport.queue_send(self.handle, &self.send_buf) {
+                // Flush immediately so the ACK reaches the primary
+                // without waiting for the next poll_recv iteration.
+                self.transport.poll();
+                return Ok(true);
+            }
+            attempts += 1;
+            if attempts >= ACK_RETRY_CAP {
+                tracing::warn!("DPDK ack send failed after {ACK_RETRY_CAP} retries");
+                return Ok(false);
+            }
+            self.transport.poll();
+            if !self.transport.is_connected(self.handle) {
+                return Err(io::Error::other("replica disconnected during ack send"));
+            }
+        }
+    }
+}
+
+/// How a DPDK dial to the primary ended. Exhaustive, so each caller
+/// decides for every outcome.
+enum DpdkDial {
+    /// Connected, the link's liveness deadline armed.
+    Connected(melin_dpdk::SocketHandle),
+    /// The stack would not open the socket (an endpoint it cannot
+    /// address): no SYN went out, and no socket was added.
+    Refused { local_port: u16, error: String },
+    /// No answer within the timeout, the socket went away, or
+    /// `interrupted` said so: the socket is reset.
+    Failed,
+}
+
+/// Dial the primary at `primary_ip:primary_port` from the next local port
+/// (`local_port` moves on), waiting at most `timeout` for the handshake,
+/// or until `interrupted` says so. One dial for the reconnect loop and the
+/// stopped redial.
+fn dial_primary_dpdk(
+    transport: &mut melin_dpdk::DpdkTransport,
+    primary_ip: std::net::Ipv4Addr,
+    primary_port: u16,
+    local_port: &mut u16,
+    timeout: std::time::Duration,
+    interrupted: impl Fn() -> bool,
+) -> DpdkDial {
+    // Seed the primary's MAC into smoltcp's neighbor cache. Without this
+    // the replica has no way to address its first frame: an acceptor
+    // learns the peer MAC from the inbound packet, but an initiator has to
+    // know it before anything goes out. ARP cannot supply it — an SR-IOV
+    // VF does not receive broadcast, and in bifurcated mode the `rte_flow`
+    // rule matches on IPv4 source address so ARP is never steered into
+    // DPDK at all. Either way the SYN never ships and the replica spins on
+    // "failed to connect (DPDK)" with no error to show for it.
+    //
+    // `--dpdk-peer-mac` wins when supplied; otherwise this falls back to
+    // the SR-IOV `02:00:<ip>` convention, which holds only on ports whose
+    // MAC dpdk-setup.sh assigned. Re-seeded on every dial so an expired
+    // neighbour entry cannot strand a reconnecting replica.
+    let mac_source = transport.seed_peer_neighbor(primary_ip);
+    info!(
+        primary_ip = %primary_ip,
+        mac_source = mac_source.as_str(),
+        "seeded primary MAC into the neighbour cache"
+    );
+    // Drain the injected ARP reply through smoltcp so the neighbor cache
+    // is populated BEFORE connect_to() runs. Without this poll smoltcp's
+    // connect tries to resolve ARP from an empty cache, queues a broadcast
+    // request that the PF drops, and the SYN never ships.
+    transport.poll();
+
+    // Replication streams large journal batches; use bigger RX buffer so
+    // smoltcp can advertise a window large enough to sustain throughput.
+    const REPL_RX_BUF: usize = 512 * 1024;
+    const REPL_TX_BUF: usize = 64 * 1024;
+    const REPL_TX_QUEUE: usize = 64 * 1024;
+    let dial_port = *local_port;
+    *local_port = local_port.wrapping_add(1).max(40000);
+    let handle = match transport.connect_to_with_buffers(
+        primary_ip,
+        primary_port,
+        dial_port,
+        REPL_RX_BUF,
+        REPL_TX_BUF,
+        REPL_TX_QUEUE,
+        REPL_DISPATCH_BURST,
+    ) {
+        Ok(handle) => handle,
+        Err(e) => {
+            return DpdkDial::Refused {
+                local_port: dial_port,
+                error: format!("{e:?}"),
+            };
+        }
+    };
+    let connect_start = std::time::Instant::now();
+    loop {
+        if interrupted() {
+            break;
+        }
+        transport.poll();
+        if transport.is_connected(handle) {
+            // From here the link watches the primary: one that stops
+            // answering is reset by the stack, which every wait after the
+            // dial reads as the session's end. Armed now rather than at
+            // connect, so the connect keeps its own timeout.
+            transport.set_peer_liveness(handle, &REPLICATION_LIVENESS);
+            return DpdkDial::Connected(handle);
+        }
+        if !transport.is_active(handle) || connect_start.elapsed() >= timeout {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    // Reset rather than drop: a primary that accepted after our timeout
+    // frees the connection at once.
+    transport.reset(handle);
+    DpdkDial::Failed
+}
+
+/// The redial a replica that stopped on its own detection owes a primary
+/// that did not answer its stopped ack, as the kernel-TCP receiver's: dial,
+/// authenticate, and handshake as stopped, with the reconnect backoff,
+/// until a `Halt` answers or `HALT_REDIAL` runs out, servicing the stack
+/// throughout. Every wait is bounded by the time left.
+fn redial_stopped_dpdk(
+    transport: &mut melin_dpdk::DpdkTransport,
+    primary_ip: std::net::Ipv4Addr,
+    primary_port: u16,
+    local_port: &mut u16,
+    key: &ed25519_dalek::SigningKey,
+    handshake: &Handshake,
+) {
+    let deadline = std::time::Instant::now() + super::halt_notice::HALT_REDIAL;
+    let mut backoff = std::time::Duration::from_secs(1);
+    // Never set: the redial runs with the node's shutdown flag already up.
+    let never = AtomicBool::new(false);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            warn!(
+                primary_ip = %primary_ip,
+                "the primary did not answer this stopped replica's redial: it may not have been \
+                 told that the cluster's output diverged"
+            );
+            return;
+        }
+        // Logged per attempt as the kernel-TCP redial's are.
+        match dial_primary_dpdk(
+            transport,
+            primary_ip,
+            primary_port,
+            local_port,
+            remaining,
+            || false,
+        ) {
+            DpdkDial::Connected(handle) => {
+                let attempt =
+                    stopped_session_dpdk(transport, handle, key, handshake, deadline, &never);
+                transport.reset(handle);
+                match attempt {
+                    Ok(true) => {
+                        info!("the primary answered this replica's stop with its halt");
+                        return;
+                    }
+                    Ok(false) => {
+                        debug!("the primary's answer to the stopped handshake was not a halt")
+                    }
+                    Err(e) => debug!(error = %e, "stopped redial attempt failed"),
+                }
+            }
+            DpdkDial::Refused { local_port, error } => debug!(
+                local_port,
+                error = %error,
+                "stopped redial attempt failed: the stack refused to open a connection"
+            ),
+            DpdkDial::Failed => debug!("stopped redial attempt failed: no connection"),
+        }
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let pause_until = std::time::Instant::now() + backoff.min(left);
+        while std::time::Instant::now() < pause_until {
+            transport.poll();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        backoff = (backoff * 2).min(super::MAX_BACKOFF);
+    }
+}
+
+/// One stopped redial attempt on the connected `handle`, before
+/// `deadline`: authenticate, handshake as stopped, and wait up to the
+/// notice bound for the primary's `Halt`. `true` once it answers, `false`
+/// when it did not in time; an error when the session failed before.
+fn stopped_session_dpdk(
+    transport: &mut melin_dpdk::DpdkTransport,
+    handle: melin_dpdk::SocketHandle,
+    key: &ed25519_dalek::SigningKey,
+    handshake: &Handshake,
+    deadline: std::time::Instant,
+    never: &AtomicBool,
+) -> std::io::Result<bool> {
+    let left = || deadline.saturating_duration_since(std::time::Instant::now());
+    let mut recv_buf = Vec::new();
+    {
+        let mut stream = PolledAuthStream {
+            transport: &mut *transport,
+            handle,
+            recv_buf: &mut recv_buf,
+            shutdown: never,
+            deadline: std::time::Instant::now() + AUTH_TIMEOUT.min(left()),
+        };
+        authenticate_with_primary(&mut stream, key)?;
+    }
+    let mut out = Vec::new();
+    encode_stopped_handshake(handshake, &mut out);
+    if !transport.queue_send(handle, &out) {
+        return Err(std::io::Error::other(
+            "the stopped handshake could not be queued",
+        ));
+    }
+    let wait_until = std::time::Instant::now() + HALT_NOTICE_BOUND.min(left());
+    while std::time::Instant::now() < wait_until && transport.is_connected(handle) {
+        transport.poll();
+        transport.recv_into_vec(handle, &mut recv_buf);
+        if super::halt_notice::take_halt(&mut recv_buf) {
+            return Ok(true);
+        }
+        std::thread::yield_now();
+    }
+    Ok(false)
 }
 
 /// When a replication peer counts as gone, at both ends of a DPDK link.
@@ -1739,7 +1964,16 @@ where
                     );
                     // A fatal exit never keeps the pipeline, so going
                     // round again dials only after a resync or not at all.
-                    if let Some(r) = after.adopt(&mut state) {
+                    if let Some(r) = after.adopt(&mut state, |state| {
+                        redial_stopped_dpdk(
+                            transport,
+                            primary_ip,
+                            primary_port,
+                            &mut local_port,
+                            signing_key,
+                            &state.position.handshake(fence_state.epoch()),
+                        )
+                    }) {
                         return r;
                     }
                     continue;
@@ -1766,119 +2000,52 @@ where
             "connecting to primary as replica (DPDK)"
         );
 
-        // Seed the primary's MAC into smoltcp's neighbor cache. Without
-        // this the replica has no way to address its first frame: an
-        // acceptor learns the peer MAC from the inbound packet, but an
-        // initiator has to know it before anything goes out. ARP cannot
-        // supply it — an SR-IOV VF does not receive broadcast, and in
-        // bifurcated mode the `rte_flow` rule matches on IPv4 source
-        // address so ARP is never steered into DPDK at all. Either way
-        // the SYN never ships and the replica spins on "failed to
-        // connect (DPDK)" with no error to show for it.
-        //
-        // `--dpdk-peer-mac` wins when supplied; otherwise this falls back
-        // to the SR-IOV `02:00:<ip>` convention, which holds only on
-        // ports whose MAC dpdk-setup.sh assigned. Re-seeded on every
-        // reconnect so an expired neighbour entry cannot strand a
-        // reconnecting replica.
-        let mac_source = transport.seed_peer_neighbor(primary_ip);
-        info!(
-            primary_ip = %primary_ip,
-            mac_source = mac_source.as_str(),
-            "seeded primary MAC into the neighbour cache"
-        );
-        // Drain the injected ARP reply through smoltcp so the neighbor
-        // cache is populated BEFORE connect_to() runs. Without this poll
-        // smoltcp's connect tries to resolve ARP from an empty cache,
-        // queues a broadcast request that the PF drops, and the SYN
-        // never ships.
-        transport.poll();
-
-        // Connect to primary via smoltcp.
-        // Replication streams large journal batches; use bigger RX buffer
-        // so smoltcp can advertise a window large enough to sustain throughput.
-        const REPL_RX_BUF: usize = 512 * 1024;
-        const REPL_TX_BUF: usize = 64 * 1024;
-        const REPL_TX_QUEUE: usize = 64 * 1024;
-        let dial_port = local_port;
-        local_port = local_port.wrapping_add(1).max(40000);
-        let handle = match transport.connect_to_with_buffers(
+        // Route shutdown and promotion through the failure arm and the
+        // loop top — returning from here would leak the pipeline threads
+        // and the smoltcp socket. Promotion is checked during the dial
+        // because a dial to a primary that has gone is answered by nothing
+        // (a stopped DPDK node has no stack to refuse it), so waiting out
+        // the connect timeout would delay the failover by as much.
+        let dialed = dial_primary_dpdk(
+            transport,
             primary_ip,
             primary_port,
-            dial_port,
-            REPL_RX_BUF,
-            REPL_TX_BUF,
-            REPL_TX_QUEUE,
-            REPL_DISPATCH_BURST,
-        ) {
-            Ok(handle) => handle,
-            // The stack would not open the socket (an endpoint it cannot
-            // address): a dial that failed before its SYN, on the same
-            // retry path as one that got no answer. No socket was added,
-            // so there is nothing to reset.
-            Err(e) => {
+            &mut local_port,
+            CONNECT_TIMEOUT,
+            || shutdown.load(Ordering::Relaxed) || promote.is_requested(),
+        );
+        let handle = match dialed {
+            DpdkDial::Connected(handle) => handle,
+            DpdkDial::Refused { local_port, error } => {
                 warn!(
                     primary_ip = %primary_ip,
                     primary_port,
-                    local_port = dial_port,
-                    error = ?e,
+                    local_port,
+                    error = %error,
                     backoff_secs = backoff.as_secs(),
                     "the stack refused to open a connection to the primary (DPDK) — retrying"
                 );
                 sleep_then_double_backoff(&mut backoff, shutdown, promote);
                 continue;
             }
+            DpdkDial::Failed => {
+                // A shutdown racing the connect window is a clean exit,
+                // not degraded operation — don't warn.
+                if shutdown.load(Ordering::Relaxed) {
+                    debug!("connect aborted — shutting down (DPDK)");
+                } else if promote.is_requested() {
+                    debug!("connect aborted — promoting (DPDK)");
+                } else {
+                    warn!(
+                        backoff_secs = backoff.as_secs(),
+                        "failed to connect to primary (DPDK) — retrying"
+                    );
+                }
+                sleep_then_double_backoff(&mut backoff, shutdown, promote);
+                continue;
+            }
         };
-
-        // Poll until TCP handshake completes (with timeout).
-        let connect_start = std::time::Instant::now();
-        let connected = loop {
-            // Route shutdown and promotion through the `!connected` arm
-            // and the loop top — returning from here would leak the
-            // pipeline threads and the smoltcp socket. Promotion is
-            // checked here because a dial to a primary that has gone is
-            // answered by nothing (a stopped DPDK node has no stack to
-            // refuse it), so waiting out the connect timeout would delay
-            // the failover by as much.
-            if shutdown.load(Ordering::Relaxed) || promote.is_requested() {
-                break false;
-            }
-            transport.poll();
-            if transport.is_connected(handle) {
-                break true;
-            }
-            if !transport.is_active(handle) || connect_start.elapsed() >= CONNECT_TIMEOUT {
-                break false;
-            }
-            std::thread::yield_now();
-        };
-
-        if !connected {
-            // A shutdown racing the connect window is a clean exit, not
-            // degraded operation — don't warn.
-            if shutdown.load(Ordering::Relaxed) {
-                debug!("connect aborted — shutting down (DPDK)");
-            } else if promote.is_requested() {
-                debug!("connect aborted — promoting (DPDK)");
-            } else {
-                warn!(
-                    backoff_secs = backoff.as_secs(),
-                    "failed to connect to primary (DPDK) — retrying"
-                );
-            }
-            // Reset rather than drop: a primary that accepted after our
-            // timeout frees the connection at once.
-            transport.reset(handle);
-            sleep_then_double_backoff(&mut backoff, shutdown, promote);
-            continue;
-        }
         info!("connected to primary (DPDK)");
-        // From here the link watches the primary: one that stops
-        // answering is reset by the stack, which every wait below (auth,
-        // handshake, transfer, streaming) reads as the session's end.
-        // Armed now rather than at connect, so the connect keeps its own
-        // timeout.
-        transport.set_peer_liveness(handle, &REPLICATION_LIVENESS);
 
         // Authenticate BEFORE the handshake — mirrors the kernel-TCP receiver.
         // The primary issues a Challenge first and will not accept our
@@ -2176,7 +2343,16 @@ where
             sizing,
             prealloc,
         );
-        if let Some(r) = after.adopt(&mut state) {
+        if let Some(r) = after.adopt(&mut state, |state| {
+            redial_stopped_dpdk(
+                transport,
+                primary_ip,
+                primary_port,
+                &mut local_port,
+                signing_key,
+                &state.position.handshake(fence_state.epoch()),
+            )
+        }) {
             return r;
         }
     }

@@ -899,6 +899,31 @@ departs from the text below in these places:
 - The replica's latch reaches its receivers through `ReplicaControlPlane`,
   whose constructor now requires it.
 
+The third part, the replica's own notice, departs from the text below in
+these places:
+
+- The streaming loop owes the notice by the latch's cause, not by holding
+  the `Halted` token: a `Detected` cause can only be the replica's own
+  (its comparator in step 3, the seam until then), so the receiver that
+  sees it at its loop top sends the stopped ack. The seam trips the latch
+  directly, from the test's thread.
+- The stopped ack carries the last positions the session sent, waits for
+  the marker as every notice does (`HaltNotice`), and is never coalesced
+  with an ordinary ack (`ReceiverTransport::send_stopped_ack` is taken
+  only with nothing in flight).
+- `SessionExit::Stopped` says whether a notice was owed and answered; an
+  unanswered one makes `handle_session_exit` return
+  `AfterSession::RedialStopped`, and `AfterSession::adopt` takes each
+  receiver's redial as a parameter, so neither can fold it without one.
+- Each receiver's dial is factored for the redial: kernel TCP's
+  `dial_until` (`dial_checking_flags` over the node's flags), DPDK's
+  `dial_primary_dpdk`. The redial runs with the node's shutdown flag
+  already set, so its dial is never interrupted, and every wait is bounded
+  by the time left of `HALT_REDIAL`.
+- The test proxy now holds a chunk read across a freeze, as it holds one
+  read while frozen: a read already waiting when the link froze forwarded
+  its bytes, which let the lost-ack test's stopped ack through.
+
 - `output_digest::Trip` and `Divergence` (decision 6); `DivergenceLatch`,
   `HaltCause`, `Halted`, the marker writer and its state, the marker
   (`NodeStore::divergence_marker`), the exit helper and `NodeDiverged`
