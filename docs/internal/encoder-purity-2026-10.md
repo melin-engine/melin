@@ -8,8 +8,12 @@ the text below:
   response stage alone. CI runs no test with `--release`, so step 3
   replaced it there with the debug test that the check fires through a
   running node, on kernel TCP and on DPDK.
-- The check-free inner function (`frame_zeroed`) is private, not
-  `pub(crate)`: only `frame_app_response` and its own tests call it.
+- The check-free inner function is private, not `pub(crate)`: only the
+  encode and its own tests call it. It was `frame_zeroed` in
+  `response_frame.rs`; since the divergence plan's first step it is
+  `encode_zeroed`, beside `encode_app_body` in
+  `transport-core/src/output_digest.rs`, where the zeroing and purity
+  tests moved with it.
 - Step 2's measurement, 2026-10-27, on an Apple M-series laptop (8 cores,
   Asahi Linux), kernel TCP over loopback, echo with 64-byte requests, one
   client, window 1, `disk` acks, five interleaved 15-second runs of each
@@ -21,7 +25,7 @@ the text below:
 It was to be implemented on its own branch off `main`. It is independent
 of the [divergence-detection plan](divergence-detection-2026-10.md), which
 builds on it: that plan's decision 4 moves the body encode, zeroing and
-purity check included, into `encode_report_body`, which
+purity check included, into `encode_app_body`, which
 `frame_app_response` then calls, so a replica's digest fold gets both
 changes with no second copy.
 

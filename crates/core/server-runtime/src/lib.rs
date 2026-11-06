@@ -58,7 +58,7 @@ mod dpdk_transport;
 // time, next to the bounds it declares (`AppEvent::MAX_ENCODED_SIZE` is
 // the journal's; these are the wire's).
 pub use client_frames::MAX_REQUEST_BODY;
-pub use response_frame::MAX_RESPONSE_BODY;
+pub use melin_transport_core::output_digest::MAX_RESPONSE_BODY;
 
 /// Control-plane event the accept loop, reader, and response stage
 /// exchange. Transport-agnostic — the payload is a socket fd + writer,

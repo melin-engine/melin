@@ -14,6 +14,14 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Added
 
+- **`melin_transport_core::output_digest`**: the building blocks of output
+  divergence detection, not yet wired into a node. `WindowFolder` digests
+  one copy's reports in fixed windows of `OUTPUT_DIGEST_WINDOW` positions
+  (XXH3-128) and chains the window digests; the digest board publishes
+  each closed window to readers on other threads; `encode_app_body` is the
+  one application body encode, which the response stages' framing now goes
+  through. `MAX_RESPONSE_BODY` moves here and is still re-exported at the
+  root of `melin-server-runtime`.
 - **`melin_pipeline::spsc::Producer::push_with_unless`**: the blocking
   push, given up with `Stopped`, having written nothing, if a stop flag is
   set while it waits for room. A push with room never reads the flag.

@@ -305,16 +305,17 @@ d(W) = XXH3-128 (seed 0, default secret) over
   choice. The journal chain keeps BLAKE3: it is the audit trail, where
   adversarial resistance is the point.
 - **`twox-hash` 2.x** (MIT, already allowed by `deny.toml`), with
-  `default-features = false, features = ["xxhash3_128"]`, which drops
-  `rand`. The window digest streams through
+  `default-features = false, features = ["xxhash3_128", "std"]`, which
+  drops `rand`. `std` turns on the SIMD stripe loop for inputs past 240
+  bytes (without it the loop is scalar), and costs nothing in a crate that
+  links `std`. The window digest streams through
   `xxhash3_128::RawHasher::new(SecretBuffer::default())`, a plain value with
   no heap, made fresh per window since it has no reset (the crate's
   `Hasher` instance boxes the secret, and the response thread must not
   allocate). The chain step uses `Hasher::oneshot`. Bytes are
-  `finish_128().to_be_bytes()`, the reference's canonical form, so pinned
-  vectors are cross-checked against `xxh128sum`. Without `std` the stripe
-  loop is scalar; the micro-benchmark decides whether `std` is worth
-  turning on.
+  `finish_128().to_be_bytes()`, the reference's canonical form. The crate
+  is checked against xxHash's own published test vectors, and the digest's
+  definition by hashing bytes built by hand in one shot.
 - **Two newtypes**, `WindowDigest` and `ChainValue`, each `[u8; 16]`, so
   the type system rules out comparing or chaining one as the other. Byte
   arrays rather than `u128`: no byte-order question, and alignment 1 keeps
@@ -376,19 +377,20 @@ d(W) = XXH3-128 (seed 0, default secret) over
 ### 4. Where each copy folds
 
 `transport-core`'s new `output_digest` module holds `WindowFolder`: it
-encodes a report's body into the caller's buffer, folds
-`(wire_seq, body)` into the open window, closes windows as positions pass,
-extends its chain, and publishes each closed window to a `DigestBoard`
-(decision 5).
+folds `(wire_seq, body)` into the open window, closes windows as positions
+pass, extends its chain, and publishes each closed window to the digest
+board (decision 5). The caller encodes the body and hands the folder the
+bytes, or `ReportBody::Failed`.
 
 The body encode moves out of `response_frame.rs` into one free function in
-that module, `encode_report_body`: the zeroing, the debug-build purity
-check, the encoder's call and the `MAX_RESPONSE_BODY` check, everything
-`frame_app_response` and `frame_zeroed` do except the header.
-`frame_app_response` keeps the header and calls it; early replies call it
-without a folder. So the replica's drain gets the same zeroing and purity
-check as a client's frame, with no second copy. `server-runtime` keeps
-re-exporting `MAX_RESPONSE_BODY` from where it is today.
+that module, `encode_app_body`: the zeroing, the debug-build purity check,
+the encoder's call and the `MAX_RESPONSE_BODY` check, everything
+`frame_app_response` did except the header (named for every application
+body, since query responses go through it too). `frame_app_response` keeps
+the header and calls it; early replies call it without a folder. So the
+replica's drain gets the same zeroing and purity check as a client's
+frame, with no second copy. `MAX_RESPONSE_BODY` moves with it, and
+`server-runtime` keeps re-exporting it at its root.
 
 | Copy | Thread | Closes a window when |
 | --- | --- | --- |
@@ -421,7 +423,9 @@ re-exporting `MAX_RESPONSE_BODY` from where it is today.
 
 ### 5. The digest board
 
-Each folder publishes to a `DigestBoard`: `R` slots of `(window_end, d, C)`,
+Each folder publishes to a digest board (`digest_board`, a
+`DigestBoardWriter` for the folder and a cloneable `DigestBoardReader`):
+`R` slots of `(window_end, d, C)`,
 window end `E` at slot `(E / K) % R`, each a `melin_pipeline::seqlock` over
 a 40-byte `repr(C)` payload (`u64`, then two `[u8; 16]`, no padding, so it
 satisfies `NoPadding`), plus an `AtomicU64` holding the latest window end.
@@ -433,8 +437,9 @@ Lookups are `get(end)` (present, not yet written, or overwritten) and
 
 `R = ceil((input ring slots + output ring slots) / K) + 2`, computed from
 the pipeline's `RingCapacity` (both rings use it) by one function that the
-comparator's constructor shares, through `DigestBoard::for_pipeline`, so
-the two cannot size or index differently; tests build small ones to force
+comparator's constructor shares: `BoardSize::for_pipeline`, a newtype
+that also owns the slot index, so the two cannot size or index
+differently; tests build small ones (`BoardSize::new`) to force
 overwrites. Only the replica's comparator needs every window. The drain can
 close at most its backlog between two receiver reads: the entries in the
 input ring, those whose reports wait in the output ring, both covered by
@@ -766,8 +771,8 @@ leave its primary serving.
 
 - `transport-core::output_digest`: `DigestKind` (exhaustive, `Output = 1`),
   `WindowDigest`, `ChainValue`, `OUTPUT_DIGEST_WINDOW`, `CHAIN_SEED`,
-  `WindowFolder` (decisions 1 to 3), `DigestBoard` with `for_pipeline`
-  (decision 5), and `encode_report_body` (decision 4), moved with its
+  `WindowFolder` (decisions 1 to 3), the digest board with `BoardSize`
+  (decision 5), and `encode_app_body` (decision 4), moved with its
   comments and unit tests from `response_frame.rs`; `frame_app_response`
   and `encode_early_reply` call it. Each type and constant carries the
   comment justifying its choice. `twox-hash` becomes a workspace
@@ -775,9 +780,8 @@ leave its primary serving.
 - A micro-benchmark, an example in `transport-core/examples/` (as
   `melin-journal`'s `scan_bench`), folding windows of `K` representative
   bodies (the examples' and a few hundred bytes) with the chain step,
-  through XXH3-128 with and without `twox-hash`'s `std` feature, and
-  through BLAKE3, for `K` of 16, 64 and 256. It fixes the hash, the
-  feature set and `K` (open question 1); its results go in a dated
+  through XXH3-128 and through BLAKE3, for `K` of 16, 64 and 256. It
+  fixes the hash and `K` (open question 1); its results go in a dated
   document naming its hardware.
 - The matching stage's applied cursor; `response_loop::run` encoding,
   sending and folding (decision 4); `Egress::send_slot` taking
@@ -792,9 +796,11 @@ leave its primary serving.
   encodes, sent or folded". `encode_report`'s rustdoc says an error is
   logged only for a reply due to a held connection.
 - Tests, ungated:
-  - folder: a known window's digest and the chain value after two known
-    windows pinned to bytes taken from `xxh128sum`, not from the code
-    under test; the streaming hasher, fed report by report, equal to the
+  - folder: `twox-hash` against xxHash's published XXH3-128 test
+    vectors either side of each internal cutoff; a known window's digest
+    and the chain value after two known windows equal to one-shot hashes
+    of bytes the test builds by hand from the definition, not from the
+    code under test; the streaming hasher, fed report by report, equal to the
     one-shot hash of the same bytes on both sides of XXH3's 240-byte
     cutoff and past its internal buffer; a report moved, a byte changed,
     two reports swapped or an encode error each change `d` and every later
@@ -806,7 +812,7 @@ leave its primary serving.
     back whole; a two-thread stress test with no torn read, run under Miri
     by the existing Miri job; `for_pipeline` at `RingCapacity::MIN`, the
     default and above it;
-  - `encode_report_body` called directly zeroes and, in debug builds,
+  - `encode_app_body` called directly zeroes and, in debug builds,
     checks purity; `response_frame.rs`'s framing tests and
     `server-runtime/tests/encoder_purity.rs` pass unchanged;
   - `server-runtime/src/tests/output_digest_agreement.rs`: one input
@@ -1121,11 +1127,11 @@ Beyond each step's list:
 
 ## Open questions
 
-1. **The hash and `K`.** XXH3-128 at `K = 64` is the recommendation
-   (decisions 1, 2). Step 1's micro-benchmark decides, with BLAKE3 and `K`
-   of 16 and 256 as the alternatives: below 64 the per-window work becomes
-   a visible share of the per-event budget and the board grows in
-   proportion; above it the idle delay grows (256 is about a minute at the
+1. **The hash and `K`. Decided by step 1's micro-benchmark
+   ([results](output-digest-fold-bench-2026-11.md)): XXH3-128 at
+   `K = 64`.** BLAKE3 costs several times more per report; `K` of 16 costs
+   more per report and grows the board, and 256 saves under half a
+   nanosecond while the idle delay grows fourfold (about a minute at the
    default tick interval), and idle is when an operator restarts or fails
    over. `K` is part of kind 1: changing it after release is a new kind.
 2. **Where the primary folds.** In the response stage after the send
