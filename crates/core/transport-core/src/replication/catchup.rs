@@ -836,6 +836,12 @@ impl RingChunk {
     /// first sequence was skipped from the ring and reaches the wire only
     /// from disk.
     ///
+    /// A slot is classified by its leading frame alone. A batch's slot may
+    /// carry a trailing `Digest` frame after its `InputBatch` (see the
+    /// journal stage's `publish_input_batch_to_rings`): it is dropped with
+    /// a covered batch and forwarded with one that is not, so a decoder of
+    /// a slot must not reject bytes after the batch.
+    ///
     /// Control frames (`Rotate`, `ChainCheck`) ride the rings between
     /// `InputBatch` chunks. One strictly BEHIND the stream position is
     /// stale re-delivery (the disk walk already streamed past it) — drop
@@ -1767,6 +1773,60 @@ mod drain_into_contiguity_tests {
         .expect("empty ring goes live");
         assert!(forwarded.borrow().is_empty());
         assert_eq!(sent.get(), 100);
+    }
+
+    /// A batch's slot that also carries the primary's output digest after
+    /// the batch is classified by the batch alone, at every fate, and is
+    /// forwarded whole, the digest with it.
+    #[test]
+    fn a_digest_after_the_batch_changes_nothing_about_its_slot() {
+        use crate::cursors::WireSeq;
+        use crate::output_digest::{CHAIN_SEED, DigestKind};
+        let with_digest = |seqs: &[u64]| {
+            let mut chunk = frame(seqs);
+            chunk.extend_from_slice(&super::super::protocol::encode_digest(
+                DigestKind::Output,
+                WireSeq::new(64),
+                CHAIN_SEED,
+            ));
+            chunk
+        };
+        for (seqs, sent) in [
+            (&[98u64, 99][..], 100),
+            (&[101, 102], 100),
+            (&[105, 106], 100),
+        ] {
+            let end = *seqs.last().expect("a slot");
+            assert_eq!(
+                RingChunk::classify(end, &with_digest(seqs), sent).expect("classify"),
+                RingChunk::classify(end, &frame(seqs), sent).expect("classify"),
+                "{seqs:?} against {sent}"
+            );
+        }
+
+        let (mut producer, mut consumer) = ring();
+        let chunk = with_digest(&[101, 102]);
+        producer.publish(&chunk, 102);
+        let mut sent = super::super::sent::SentHighWater::seed(100, 100);
+        let forwarded = RefCell::new(Vec::<Vec<u8>>::new());
+        let mut forward = |data: &[u8]| -> io::Result<()> {
+            forwarded.borrow_mut().push(data.to_vec());
+            Ok(())
+        };
+        let mut refill = |from: u64,
+                          _fwd: &mut dyn FnMut(&[u8]) -> io::Result<()>|
+         -> io::Result<u64> { Ok(from) };
+        let mut expired = || false;
+        drain_into_contiguity(
+            &mut sent,
+            &mut consumer,
+            &mut forward,
+            &mut refill,
+            &mut expired,
+        )
+        .expect("drains");
+        assert_eq!(*forwarded.borrow(), vec![chunk]);
+        assert_eq!(sent.get(), 102);
     }
 
     /// Encode a `Rotate` control frame the way the journal stage

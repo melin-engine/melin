@@ -324,6 +324,16 @@ pub enum ReportBody<'a> {
     Failed,
 }
 
+/// `F`, the end of the first window a copy whose pipeline applies its
+/// first live entry at `first_live` digests whole: the one value its
+/// [`WindowFolder`] and its [`DigestComparator`] must agree on.
+pub fn first_window_end(first_live: WireSeq) -> WireSeq {
+    // Position 0 is never allocated; a pipeline starting there starts at
+    // 1, whose window is whole.
+    let s = first_live.get().max(1);
+    WireSeq::new(window_end_of(s - 1) + OUTPUT_DIGEST_WINDOW)
+}
+
 /// Digests the reports one copy of the application produces, a window at
 /// a time, chains the window digests, and publishes each closed window to
 /// the digest board.
@@ -366,10 +376,7 @@ impl WindowFolder {
     /// A folder whose pipeline applies its first live entry at
     /// `first_live`, publishing to `board`.
     pub fn new(first_live: WireSeq, board: DigestBoardWriter) -> Self {
-        // Position 0 is never allocated; a pipeline starting there starts
-        // at 1, whose window is whole.
-        let s = first_live.get().max(1);
-        let first_end = window_end_of(s - 1) + OUTPUT_DIGEST_WINDOW;
+        let first_end = first_window_end(first_live).get();
         Self {
             first_end,
             open_end: first_end,
@@ -639,6 +646,356 @@ pub trait Trip {
     /// Stop the node for `divergence`. `None` when it was already stopped,
     /// by this cause or another.
     fn trip(&self, divergence: Divergence) -> Option<Self::Token>;
+}
+
+// ---------------------------------------------------------------------------
+// The comparator
+// ---------------------------------------------------------------------------
+
+/// What one step of a [`DigestComparator`] found.
+#[derive(Debug)]
+pub struct Comparison<Token> {
+    /// Comparisons that found the two chains equal.
+    pub matched: u32,
+    /// A run was anchored at this window end.
+    pub anchored: Option<WireSeq>,
+    /// The run broke: a local window between this end and the next one
+    /// was lost before it was read.
+    pub broke_after: Option<WireSeq>,
+    /// The chains differed. The comparator has tripped its stop, and is
+    /// spent; `halted` is what the trip returned (`None` when the node had
+    /// already stopped).
+    pub mismatch: Option<(Divergence, Option<Token>)>,
+}
+
+/// Nothing found: by hand, so the token needs no `Default` (a trip's
+/// token, `Halted`, has none on purpose).
+impl<Token> Default for Comparison<Token> {
+    fn default() -> Self {
+        Self {
+            matched: 0,
+            anchored: None,
+            broke_after: None,
+            mismatch: None,
+        }
+    }
+}
+
+/// One of this copy's closed windows, as the comparator holds it.
+#[derive(Clone, Copy)]
+struct LocalWindow {
+    /// 0 for a slot never filled.
+    end: u64,
+    digest: WindowDigest,
+    /// This copy's window digests chained from the run's anchor: `Some`
+    /// for a window the run has reached.
+    chain: Option<ChainValue>,
+}
+
+/// One of the primary's chain values, waiting for this copy to reach its
+/// window.
+#[derive(Clone, Copy)]
+struct ExpectedWindow {
+    /// 0 for a slot never filled.
+    end: u64,
+    chain: ChainValue,
+}
+
+/// The run being verified: this copy's windows chained from the primary's
+/// chain value at the anchor.
+#[derive(Clone, Copy)]
+struct Run {
+    /// The first position the run covers: one past the anchor.
+    from: u64,
+    /// The newest window end the run has chained to.
+    extended_to: u64,
+    /// This copy's chain at `extended_to`.
+    chain: ChainValue,
+    last_match: Option<u64>,
+}
+
+/// Compares this copy's output digests with the primary's, run by run.
+///
+/// Two copies' chains start wherever each copy's pipeline started, so they
+/// cannot be compared directly. A run anchors on the primary's chain value
+/// at some window end `e` (taken on trust) and extends it with this copy's
+/// own window digests: a later primary value at `e'` is compared with this
+/// copy's chain there, and a match verifies every window in between. Each
+/// replication session starts a new run (`begin_session`): the replica
+/// cannot tell a reconnect from a primary that restarted.
+///
+/// Fed this copy's closed windows in order ([`push_local`](Self::push_local),
+/// or from its board with [`absorb`](Self::absorb)) and the primary's
+/// values as they arrive ([`push_expected`](Self::push_expected)). Either
+/// side may arrive first: values ahead of this copy wait. Both sides are
+/// fixed arrays of the board's size, so nothing allocates after
+/// construction; an entry evicted before its use costs delay, never a
+/// wrong verdict.
+///
+/// It holds the node's stop and trips it before it reports a mismatch
+/// (see [`Trip`]); after one, it is spent.
+pub struct DigestComparator<T: Trip> {
+    trip: T,
+    size: BoardSize,
+    /// `F`: this copy's first window end.
+    first_end: u64,
+    /// Where an anchor's next window must be at or after, so the run
+    /// never spans a lost local window: `F - K` until a gap, then the
+    /// window before the first one after the gap.
+    floor: u64,
+    local: Box<[LocalWindow]>,
+    expected: Box<[ExpectedWindow]>,
+    last_local: Option<u64>,
+    run: Option<Run>,
+    spent: bool,
+}
+
+impl<T: Trip> DigestComparator<T> {
+    /// A comparator for a copy whose first window ends at `first_end`
+    /// ([`WindowFolder::first_window_end`] of the folder whose board it
+    /// absorbs), holding windows as its board of `size` does, tripping
+    /// `trip` on a mismatch. A `first_end` below the folder's would find
+    /// that window never closing, and absorb nothing.
+    pub fn new(trip: T, size: BoardSize, first_end: WireSeq) -> Self {
+        let empty_local = LocalWindow {
+            end: 0,
+            digest: WindowDigest([0; DIGEST_LEN]),
+            chain: None,
+        };
+        let empty_expected = ExpectedWindow {
+            end: 0,
+            chain: CHAIN_SEED,
+        };
+        Self {
+            trip,
+            size,
+            first_end: first_end.get(),
+            floor: first_end.get() - OUTPUT_DIGEST_WINDOW,
+            local: vec![empty_local; size.slots()].into_boxed_slice(),
+            expected: vec![empty_expected; size.slots()].into_boxed_slice(),
+            last_local: None,
+            run: None,
+            spent: false,
+        }
+    }
+
+    /// Whether a mismatch has spent the comparator.
+    pub fn is_spent(&self) -> bool {
+        self.spent
+    }
+
+    /// A new replication session: the run ends and the primary's waiting
+    /// values are dropped. This copy's windows are kept, for the next
+    /// anchor to extend over.
+    pub fn begin_session(&mut self) {
+        self.run = None;
+        for slot in self.expected.iter_mut() {
+            slot.end = 0;
+        }
+    }
+
+    fn slot(&self, end: u64) -> usize {
+        self.size.index(WireSeq::new(end))
+    }
+
+    /// This copy's window ending at `end`, if still held.
+    fn held(&self, end: u64) -> Option<LocalWindow> {
+        let window = self.local[self.slot(end)];
+        (window.end == end).then_some(window)
+    }
+
+    /// Copy every window this copy's board has closed since the last call,
+    /// in order. A window overwritten before it was read is a gap.
+    pub fn absorb(&mut self, board: &DigestBoardReader) -> Comparison<T::Token> {
+        match board.latest() {
+            Some(latest) => self.absorb_through(board, latest),
+            None => Comparison::default(),
+        }
+    }
+
+    /// [`absorb`](Self::absorb) up to `latest`, the board's newest end as
+    /// loaded before the reads: the board may have moved on, even lapped
+    /// `latest`, by the time a window is read.
+    fn absorb_through(
+        &mut self,
+        board: &DigestBoardReader,
+        latest: WireSeq,
+    ) -> Comparison<T::Token> {
+        let mut found = Comparison::default();
+        let mut next = match self.last_local {
+            Some(last) => last + OUTPUT_DIGEST_WINDOW,
+            None => self.first_end,
+        };
+        while next <= latest.get() && !self.spent {
+            match board.get(WireSeq::new(next)) {
+                BoardLookup::Closed(window) => {
+                    let step = self.push_local(window);
+                    Self::merge(&mut found, step);
+                    next += OUTPUT_DIGEST_WINDOW;
+                }
+                // The newest loaded was itself overwritten since: the board
+                // lapped this read. Stop here, so the loop is bounded; the
+                // next call starts from the board's new latest, and the
+                // windows lost in between surface there as a gap.
+                BoardLookup::Overwritten if next >= latest.get() => break,
+                // Lost before it was read: resume at the newest, which is
+                // a gap from what was last held.
+                BoardLookup::Overwritten => next = latest.get(),
+                // Not yet visible, though the latest is: try next time.
+                BoardLookup::NotYet => break,
+            }
+        }
+        found
+    }
+
+    fn merge(into: &mut Comparison<T::Token>, from: Comparison<T::Token>) {
+        into.matched += from.matched;
+        into.anchored = from.anchored.or(into.anchored);
+        into.broke_after = from.broke_after.or(into.broke_after);
+        if from.mismatch.is_some() {
+            into.mismatch = from.mismatch;
+        }
+    }
+
+    /// This copy closed `window`; windows come in order.
+    pub fn push_local(&mut self, window: ClosedWindow) -> Comparison<T::Token> {
+        let mut found = Comparison::default();
+        if self.spent {
+            return found;
+        }
+        let end = window.end.get();
+        if let Some(last) = self.last_local {
+            if end <= last {
+                return found;
+            }
+            if end != last + OUTPUT_DIGEST_WINDOW {
+                // A gap: no run spans it, and no anchor may reach back
+                // across it.
+                if self.run.take().is_some() {
+                    found.broke_after = Some(WireSeq::new(last));
+                }
+                self.clear_expected();
+                self.floor = end - OUTPUT_DIGEST_WINDOW;
+            }
+        }
+        self.last_local = Some(end);
+        let slot = self.slot(end);
+        self.local[slot] = LocalWindow {
+            end,
+            digest: window.digest,
+            chain: None,
+        };
+        if let Some(run) = self.run.as_mut()
+            && end == run.extended_to + OUTPUT_DIGEST_WINDOW
+        {
+            run.chain = run.chain.extend(window.digest);
+            run.extended_to = end;
+            self.local[slot].chain = Some(run.chain);
+            self.compare_waiting(end, &mut found);
+        }
+        found
+    }
+
+    fn clear_expected(&mut self) {
+        for slot in self.expected.iter_mut() {
+            slot.end = 0;
+        }
+    }
+
+    /// Compare the primary's value waiting at `end`, if any, now that the
+    /// run has reached it.
+    fn compare_waiting(&mut self, end: u64, found: &mut Comparison<T::Token>) {
+        let slot = self.slot(end);
+        let waiting = self.expected[slot];
+        if waiting.end == end {
+            self.expected[slot].end = 0;
+            self.compare(end, waiting.chain, found);
+        }
+    }
+
+    /// The primary's chain value at `end` arrived.
+    pub fn push_expected(&mut self, end: WireSeq, chain: ChainValue) -> Comparison<T::Token> {
+        let mut found = Comparison::default();
+        if self.spent {
+            return found;
+        }
+        let end = end.get();
+        let Some(run) = self.run else {
+            self.try_anchor(end, chain, &mut found);
+            return found;
+        };
+        if end < run.from || run.last_match.is_some_and(|matched| end <= matched) {
+            // Re-delivered, or the anchor itself.
+            return found;
+        }
+        if end <= run.extended_to {
+            self.compare(end, chain, &mut found);
+            return found;
+        }
+        // Ahead of this copy: wait. The oldest waiting value in the slot
+        // gives way.
+        let slot = self.slot(end);
+        self.expected[slot] = ExpectedWindow { end, chain };
+        found
+    }
+
+    /// Anchor a run at the primary's value `chain` at `end`, if every
+    /// window of this copy after it is held or still to come, unbroken.
+    fn try_anchor(&mut self, end: u64, chain: ChainValue, found: &mut Comparison<T::Token>) {
+        if end < self.floor {
+            return;
+        }
+        let next = end + OUTPUT_DIGEST_WINDOW;
+        if let Some(last) = self.last_local
+            && last >= next
+            && self.held(next).is_none()
+        {
+            // Its next window is gone: a later value may still anchor.
+            return;
+        }
+        let mut run = Run {
+            from: end + 1,
+            extended_to: end,
+            chain,
+            last_match: None,
+        };
+        // Extend over every window this copy already holds after it.
+        while let Some(window) = self.held(run.extended_to + OUTPUT_DIGEST_WINDOW) {
+            run.chain = run.chain.extend(window.digest);
+            run.extended_to = window.end;
+            let slot = self.slot(window.end);
+            self.local[slot].chain = Some(run.chain);
+        }
+        self.run = Some(run);
+        found.anchored = Some(WireSeq::new(end));
+    }
+
+    /// Compare the primary's `expected` value at `end` with this copy's
+    /// chain there.
+    fn compare(&mut self, end: u64, expected: ChainValue, found: &mut Comparison<T::Token>) {
+        let Some(actual) = self.held(end).and_then(|window| window.chain) else {
+            // This copy's chain there was evicted: a skipped sample.
+            return;
+        };
+        let Some(run) = self.run.as_mut() else {
+            return;
+        };
+        if actual == expected {
+            run.last_match = Some(end);
+            found.matched += 1;
+            return;
+        }
+        let divergence = Divergence {
+            end: WireSeq::new(end),
+            run_from: WireSeq::new(run.from),
+            last_match: run.last_match.map(WireSeq::new),
+            expected,
+            actual,
+        };
+        self.spent = true;
+        let halted = self.trip.trip(divergence);
+        found.mismatch = Some((divergence, halted));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1154,6 +1511,455 @@ mod folder_tests {
         assert_eq!(second.digest, digest_of(2 * K, &[]));
         assert_eq!(second.chain, first.chain.extend(second.digest));
         assert_eq!(reader.latest(), Some(WireSeq::new(2 * K)));
+    }
+
+    // ---- the comparator ---------------------------------------------------
+
+    /// A stop that records every trip; its token is a number, `None` once
+    /// `answer` is off (a node already stopped).
+    #[derive(Default)]
+    struct Recorder {
+        trips: std::cell::RefCell<Vec<Divergence>>,
+        already_stopped: bool,
+    }
+
+    impl Trip for &Recorder {
+        type Token = u32;
+        fn trip(&self, divergence: Divergence) -> Option<u32> {
+            self.trips.borrow_mut().push(divergence);
+            (!self.already_stopped).then_some(7)
+        }
+    }
+
+    /// The body every copy encodes for the report at `position`, or a
+    /// different one at `fault`.
+    fn body_at(position: u64, fault: Option<u64>) -> Vec<u8> {
+        let mut body = position.to_le_bytes()[..(position % 7) as usize + 1].to_vec();
+        if fault == Some(position) {
+            body.push(0xEE);
+        }
+        body
+    }
+
+    /// The windows a copy started at `first_live` closes through
+    /// `through`, one report per position, the one at `fault` changed.
+    fn windows(first_live: u64, through: u64, fault: Option<u64>) -> Vec<ClosedWindow> {
+        let slots = (through / K) as usize + 2;
+        let (writer, reader) = digest_board(BoardSize::new(slots).unwrap());
+        let mut folder = WindowFolder::new(WireSeq::new(first_live), writer);
+        for position in first_live.max(1)..=through {
+            let body = body_at(position, fault);
+            folder.fold(WireSeq::new(position), ReportBody::Encoded(&body));
+        }
+        folder.close_through(WireSeq::new(through));
+        let first = folder.first_window_end().get();
+        (first..=through)
+            .step_by(K as usize)
+            .map(|end| closed(&reader, end))
+            .collect()
+    }
+
+    fn comparator(recorder: &Recorder, first_live: u64) -> DigestComparator<&Recorder> {
+        let first = first_window_end(WireSeq::new(first_live));
+        DigestComparator::new(recorder, BoardSize::new(16).unwrap(), first)
+    }
+
+    /// A run anchored on the primary's first value verifies every later
+    /// value it reaches, whichever side arrives first.
+    #[test]
+    fn agreeing_copies_match_whichever_side_arrives_first() {
+        let primary = windows(1, 8 * K, None);
+        let replica = windows(1, 8 * K, None);
+        let recorder = Recorder::default();
+        let mut c = comparator(&recorder, 1);
+        let anchored = c.push_expected(primary[0].end, primary[0].chain);
+        assert_eq!(anchored.anchored, Some(primary[0].end));
+        let mut matched = 0;
+        // Windows 2 to 4 local first, then the primary's.
+        for w in &replica[..4] {
+            matched += c.push_local(*w).matched;
+        }
+        for w in &primary[1..4] {
+            matched += c.push_expected(w.end, w.chain).matched;
+        }
+        // Windows 5 to 8: the primary's first, waiting.
+        for w in &primary[4..] {
+            matched += c.push_expected(w.end, w.chain).matched;
+        }
+        for w in &replica[4..] {
+            matched += c.push_local(*w).matched;
+        }
+        assert_eq!(matched, 7);
+        assert!(recorder.trips.borrow().is_empty());
+    }
+
+    /// A report that differs in window 5 is a mismatch at the first
+    /// value compared at or after it, never later, and its range holds
+    /// the report's position. The stop is tripped before the verdict, and
+    /// the comparator is spent.
+    #[test]
+    fn a_differing_report_trips_at_the_first_value_reaching_it() {
+        let fault = 4 * K + 9;
+        let primary = windows(1, 8 * K, None);
+        let replica = windows(1, 8 * K, Some(fault));
+        let recorder = Recorder::default();
+        let mut c = comparator(&recorder, 1);
+        let _ = c.push_expected(primary[0].end, primary[0].chain);
+        for w in &replica {
+            let _ = c.push_local(*w);
+        }
+        // Window 3's value matches; window 7's is the first past the fault
+        // (5 and 6 are never sent).
+        assert_eq!(c.push_expected(primary[2].end, primary[2].chain).matched, 1);
+        let found = c.push_expected(primary[6].end, primary[6].chain);
+        let (divergence, halted) = found.mismatch.expect("a mismatch");
+        assert_eq!(halted, Some(7));
+        assert_eq!(divergence.end, primary[6].end);
+        let (from, through) = divergence.positions();
+        assert!(from.get() <= fault && fault <= through.get());
+        assert_eq!(divergence.last_match, Some(primary[2].end));
+        assert_eq!(*recorder.trips.borrow(), [divergence]);
+        assert!(c.is_spent());
+        assert!(
+            c.push_expected(primary[7].end, primary[7].chain)
+                .mismatch
+                .is_none()
+        );
+        assert_eq!(recorder.trips.borrow().len(), 1);
+    }
+
+    /// A stop that had already tripped answers `None`: the mismatch says so.
+    #[test]
+    fn a_mismatch_on_a_stopped_node_carries_no_token() {
+        let primary = windows(1, 3 * K, None);
+        let replica = windows(1, 3 * K, Some(K + 1));
+        let recorder = Recorder {
+            already_stopped: true,
+            ..Recorder::default()
+        };
+        let mut c = comparator(&recorder, 1);
+        let _ = c.push_expected(primary[0].end, primary[0].chain);
+        for w in &replica {
+            let _ = c.push_local(*w);
+        }
+        let found = c.push_expected(primary[2].end, primary[2].chain);
+        assert!(matches!(found.mismatch, Some((_, None))));
+    }
+
+    /// A replica that joined mid-window anchors on nothing before its own
+    /// first whole window, and verifies from there.
+    #[test]
+    fn a_late_replica_anchors_at_its_first_whole_window() {
+        let primary = windows(1, 6 * K, None);
+        let replica = windows(2 * K + 10, 6 * K, None);
+        let recorder = Recorder::default();
+        let mut c = comparator(&recorder, 2 * K + 10);
+        // F = 4K: values at K and 2K are below F - K, and anchor nothing.
+        assert!(
+            c.push_expected(primary[0].end, primary[0].chain)
+                .anchored
+                .is_none()
+        );
+        assert!(
+            c.push_expected(primary[1].end, primary[1].chain)
+                .anchored
+                .is_none()
+        );
+        assert!(
+            c.push_expected(primary[2].end, primary[2].chain)
+                .anchored
+                .is_some()
+        );
+        let mut matched = 0;
+        for w in &replica {
+            matched += c.push_local(*w).matched;
+        }
+        for w in &primary[3..] {
+            matched += c.push_expected(w.end, w.chain).matched;
+        }
+        assert_eq!(matched, 3);
+        assert!(recorder.trips.borrow().is_empty());
+    }
+
+    /// A local window lost before it was read breaks the run: no match
+    /// spans it, and the next usable value anchors anew.
+    #[test]
+    fn a_lost_local_window_breaks_the_run() {
+        let primary = windows(1, 8 * K, None);
+        let replica = windows(1, 8 * K, None);
+        let recorder = Recorder::default();
+        let mut c = comparator(&recorder, 1);
+        let _ = c.push_expected(primary[0].end, primary[0].chain);
+        for w in &replica[..3] {
+            let _ = c.push_local(*w);
+        }
+        // Window 4 is lost.
+        let broke = c.push_local(replica[4]);
+        assert_eq!(broke.broke_after, Some(replica[2].end));
+        // Window 5's value cannot be checked across the gap.
+        let found = c.push_expected(primary[4].end, primary[4].chain);
+        assert_eq!(found.matched, 0);
+        assert_eq!(found.anchored, Some(primary[4].end));
+        for w in &replica[5..] {
+            let _ = c.push_local(*w);
+        }
+        assert_eq!(c.push_expected(primary[7].end, primary[7].chain).matched, 1);
+        assert!(recorder.trips.borrow().is_empty());
+    }
+
+    /// A new session ends the run and drops the waiting values: a primary
+    /// that restarted, its chain started afresh, anchors anew and never
+    /// mismatches.
+    #[test]
+    fn a_session_against_a_restarted_primary_anchors_anew() {
+        let first = windows(1, 4 * K, None);
+        let restarted = windows(3 * K + 1, 8 * K, None);
+        let replica = windows(1, 8 * K, None);
+        let recorder = Recorder::default();
+        let mut c = comparator(&recorder, 1);
+        let _ = c.push_expected(first[0].end, first[0].chain);
+        // A value waiting when the session ends is dropped with it.
+        let _ = c.push_expected(first[3].end, first[3].chain);
+        c.begin_session();
+        let mut matched = 0;
+        for w in &restarted {
+            matched += c.push_expected(w.end, w.chain).matched;
+        }
+        for w in &replica {
+            matched += c.push_local(*w).matched;
+        }
+        assert_eq!(matched, restarted.len() as u32 - 1);
+        assert!(recorder.trips.borrow().is_empty());
+    }
+
+    /// A comparator built for a pipeline, fed from a board of the same
+    /// size, absorbs a whole board's worth of windows between two reads
+    /// without a gap; more than that is a gap.
+    #[test]
+    fn absorbing_up_to_the_board_loses_nothing_and_past_it_breaks() {
+        let size = BoardSize::new(8).unwrap();
+        let (writer, board) = digest_board(size);
+        let mut folder = WindowFolder::new(WireSeq::new(1), writer);
+        let recorder = Recorder::default();
+        let mut c = DigestComparator::new(&recorder, size, folder.first_window_end());
+        fold_through(&mut folder, 1, 8 * K);
+        assert!(c.absorb(&board).broke_after.is_none());
+        // A run anchored on window 1 reaches every window absorbed so far.
+        let primary = windows(1, 17 * K, None);
+        let anchored = c.push_expected(primary[0].end, primary[0].chain);
+        assert_eq!(anchored.anchored, Some(primary[0].end));
+        assert_eq!(c.push_expected(primary[7].end, primary[7].chain).matched, 1);
+        // Nine more windows close before the next read: window 9 is lost.
+        fold_through(&mut folder, 8 * K + 1, 17 * K);
+        let found = c.absorb(&board);
+        assert_eq!(found.broke_after, Some(WireSeq::new(8 * K)));
+        // Nothing spans the gap; the newest window anchors anew.
+        let after = c.push_expected(primary[16].end, primary[16].chain);
+        assert_eq!(after.matched, 0);
+        assert!(recorder.trips.borrow().is_empty());
+    }
+
+    /// Fold one agreeing report per position from `from` through
+    /// `through`, closing every window through `through`.
+    fn fold_through(folder: &mut WindowFolder, from: u64, through: u64) {
+        for position in from..=through {
+            let body = body_at(position, None);
+            folder.fold(WireSeq::new(position), ReportBody::Encoded(&body));
+        }
+        folder.close_through(WireSeq::new(through));
+    }
+
+    /// A board that laps the newest end a read loaded, before that end's
+    /// slot is read, ends the read rather than spinning on it; the next
+    /// read resumes at the board's new latest, past a gap.
+    #[test]
+    fn a_board_lapping_the_loaded_latest_ends_the_read() {
+        let size = BoardSize::new(8).unwrap();
+        let (writer, board) = digest_board(size);
+        let mut folder = WindowFolder::new(WireSeq::new(1), writer);
+        let recorder = Recorder::default();
+        let mut c = DigestComparator::new(&recorder, size, folder.first_window_end());
+        fold_through(&mut folder, 1, 8 * K);
+        assert!(c.absorb(&board).broke_after.is_none());
+        let primary = windows(1, K, None);
+        assert!(
+            c.push_expected(primary[0].end, primary[0].chain)
+                .anchored
+                .is_some()
+        );
+        // The read loads 16K as the latest; before it reads a slot, the
+        // board closes through 24K, overwriting windows 9 to 16, 16K's
+        // slot included.
+        fold_through(&mut folder, 8 * K + 1, 24 * K);
+        let stale = c.absorb_through(&board, WireSeq::new(16 * K));
+        assert!(stale.broke_after.is_none());
+        assert_eq!(c.last_local, Some(8 * K));
+        let found = c.absorb(&board);
+        assert_eq!(found.broke_after, Some(WireSeq::new(8 * K)));
+        assert_eq!(c.last_local, Some(24 * K));
+        assert!(recorder.trips.borrow().is_empty());
+    }
+
+    mod comparator_properties {
+        use proptest::prelude::*;
+
+        use super::*;
+
+        /// What happens, in what order, in a generated scenario.
+        #[derive(Clone, Debug)]
+        enum Event {
+            /// This copy's next window arrives, or is lost (`lost`).
+            Local { lost: bool },
+            /// The primary's next window's value is sent (`sent`) or not.
+            Expected { sent: bool },
+            /// A new session, the primary restarted (`restarted`) or not.
+            Session { restarted: bool },
+        }
+
+        fn event() -> impl Strategy<Value = Event> {
+            prop_oneof![
+                6 => Just(Event::Local { lost: false }),
+                1 => Just(Event::Local { lost: true }),
+                6 => any::<bool>().prop_map(|sent| Event::Expected { sent }),
+                1 => any::<bool>().prop_map(|restarted| Event::Session { restarted }),
+            ]
+        }
+
+        /// Run `events` with this copy started at `first_live` and its
+        /// report at `fault` changed; return every trip.
+        fn run(first_live: u64, fault: Option<u64>, events: &[Event]) -> Vec<Divergence> {
+            const THROUGH: u64 = 24 * K;
+            let replica = windows(first_live, THROUGH, fault);
+            let mut primary = windows(1, THROUGH, None);
+            let recorder = Recorder::default();
+            let mut c = comparator(&recorder, first_live);
+            let (mut local, mut expected) = (0usize, 0usize);
+            for event in events {
+                match *event {
+                    Event::Local { lost } => {
+                        if local < replica.len() {
+                            if !lost {
+                                let _ = c.push_local(replica[local]);
+                            }
+                            local += 1;
+                        }
+                    }
+                    Event::Expected { sent } => {
+                        if expected < primary.len() {
+                            if sent {
+                                let w = primary[expected];
+                                let _ = c.push_expected(w.end, w.chain);
+                            }
+                            expected += 1;
+                        }
+                    }
+                    Event::Session { restarted } => {
+                        c.begin_session();
+                        if restarted && expected < primary.len() {
+                            // Restarted at the next position: its chain
+                            // starts afresh from there.
+                            let from = primary[expected].end.get() - K + 1;
+                            let fresh = windows(from, THROUGH, None);
+                            primary.truncate(expected);
+                            primary.extend(fresh);
+                        }
+                    }
+                }
+            }
+            recorder.trips.take()
+        }
+
+        proptest! {
+            /// Copies whose reports agree never mismatch, across any
+            /// interleaving, session, primary restart or lost window.
+            #[test]
+            fn agreeing_copies_never_mismatch(
+                first_live in 1u64..(4 * K),
+                events in proptest::collection::vec(event(), 0..120),
+            ) {
+                prop_assert!(run(first_live, None, &events).is_empty());
+            }
+
+            /// A mismatch's range always holds the differing report, and
+            /// at most one trip is made.
+            #[test]
+            fn a_mismatch_points_at_the_differing_report(
+                first_live in 1u64..(4 * K),
+                fault_offset in 0u64..(16 * K),
+                events in proptest::collection::vec(event(), 0..120),
+            ) {
+                let fault = first_live + fault_offset;
+                let trips = run(first_live, Some(fault), &events);
+                prop_assert!(trips.len() <= 1);
+                for trip in trips {
+                    let (from, through) = trip.positions();
+                    prop_assert!(from.get() <= fault && fault <= through.get(), "{trip:?}");
+                }
+            }
+
+            /// Within one session, nothing lost and nothing evicted, a
+            /// differing report is caught: by the first value the primary
+            /// sends at or past its window, once this copy reaches that
+            /// value, provided the run anchored before the window. Pins
+            /// that detection happens, which the property above cannot.
+            #[test]
+            fn an_unbroken_run_trips_at_the_first_value_past_the_fault(
+                first_live in 1u64..(4 * K),
+                fault_offset in 0u64..(8 * K),
+                events in proptest::collection::vec(
+                    prop_oneof![
+                        Just(Event::Local { lost: false }),
+                        any::<bool>().prop_map(|sent| Event::Expected { sent }),
+                    ],
+                    0..60,
+                ),
+            ) {
+                // Fewer windows than the comparator holds: nothing evicted.
+                const THROUGH: u64 = 12 * K;
+                let fault = first_live + fault_offset;
+                let replica = windows(first_live, THROUGH, Some(fault));
+                let primary = windows(1, THROUGH, None);
+                let first_end = replica[0].end.get();
+                let window = fault.div_ceil(K) * K;
+                let recorder = Recorder::default();
+                let mut c = comparator(&recorder, first_live);
+                let (mut local, mut expected) = (0usize, 0usize);
+                let mut sent = Vec::new();
+                for event in &events {
+                    match *event {
+                        Event::Local { .. } if local < replica.len() => {
+                            let _ = c.push_local(replica[local]);
+                            local += 1;
+                        }
+                        Event::Expected { sent: send } if expected < primary.len() => {
+                            let w = primary[expected];
+                            if send {
+                                let _ = c.push_expected(w.end, w.chain);
+                                sent.push(w.end.get());
+                            }
+                            expected += 1;
+                        }
+                        _ => {}
+                    }
+                }
+                let reached = local.checked_sub(1).map_or(0, |i| replica[i].end.get());
+                // The anchor: the first value at or after the window before
+                // this copy's first.
+                let anchor = sent.iter().copied().find(|&end| end >= first_end - K);
+                let caught = sent.iter().copied().find(|&end| end >= window);
+                let want = match (anchor, caught) {
+                    (Some(anchor), Some(end))
+                        if window >= first_end && anchor < window && end <= reached =>
+                    {
+                        Some(end)
+                    }
+                    _ => None,
+                };
+                let trips = recorder.trips.take();
+                prop_assert_eq!(trips.iter().map(|t| t.end.get()).collect::<Vec<_>>(),
+                    want.into_iter().collect::<Vec<_>>());
+            }
+        }
     }
 
     // ---- the digester's slot rules ---------------------------------------

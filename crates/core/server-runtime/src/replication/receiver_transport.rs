@@ -866,6 +866,9 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
                                 Some(FrameError::Fatal("chain hash mismatch from primary".into()));
                             break;
                         }
+                        // The primary's output digest: nothing compares it
+                        // yet, so it is dropped.
+                        Ok(PrimaryMessage::Digest { .. }) => {}
                         // The primary stopped for divergence: so does this
                         // replica, at once, publishing nothing more.
                         Ok(PrimaryMessage::Halt) => {

@@ -79,8 +79,10 @@ SKIPS=(
     --skip divergence::
     # Not I/O: `twox-hash` hashes in SIMD (NEON with inline assembly on
     # aarch64), which Miri cannot execute. No `unsafe` of ours is in it;
-    # the digest board's tests (`output_digest::tests`) still run.
+    # the digest board's tests (`output_digest::tests`) still run. The
+    # journal stage's digest forwarding closes its windows by hashing.
     --skip output_digest::folder_tests
+    --skip pipeline::digest_trailer_tests
 )
 
 echo "==> miri: melin-transport-core (no-persist)"
