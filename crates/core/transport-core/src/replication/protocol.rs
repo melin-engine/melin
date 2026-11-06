@@ -33,6 +33,9 @@ pub const MSG_SNAPSHOT_END: u8 = 0x15;
 pub const MSG_ROTATE: u8 = 0x16;
 pub const MSG_CHAIN_CHECK: u8 = 0x17;
 pub const MSG_SEGMENT_SEED_BEGIN: u8 = 0x18;
+/// The primary has stopped because the cluster's output diverged: a
+/// replica that reads it stops too.
+pub const MSG_HALT: u8 = 0x1A;
 // `MSG_INPUT_BATCH` (0x21) — in `crate::replication_wire`; carries `InputSlot`
 // records on the wire. Replaces the old `MSG_DATA_BATCH = 0x20` (removed
 // in phase 3 of feat/unified-pipeline).
@@ -66,8 +69,15 @@ pub const MSG_HEARTBEAT: u8 = 0x30;
 /// `VersionRefused`. Each side states one version and the newer one
 /// decides whether it can speak the other's, so a later release can talk
 /// down to this one without another refused session (the handshake's
-/// check stays, against the session's version).
+/// check stays, against the session's version). Also in 9, unreleased:
+/// `Ack` and `Handshake` gain a flag byte, whose one bit says the replica
+/// stopped for divergence, and the primary's `Halt` frame says it has.
 pub const REPL_PROTOCOL_VERSION: u16 = 9;
+
+/// The flag bit, on a replica's `Ack` and `Handshake`, saying the replica
+/// has stopped because the cluster's output diverged. Any other bit is
+/// refused, never read as a stop or as no stop.
+pub const FLAG_STOPPED: u8 = 0b1;
 
 /// Maximum frame size for control messages (handshake, ack, etc.).
 /// `InputBatch` frames can be much larger (up to a full 512 KiB ring chunk).
@@ -200,6 +210,8 @@ pub enum PrimaryMessage {
         /// Total seed length in bytes (file header included).
         seed_len: u64,
     },
+    /// The primary has stopped because the cluster's output diverged.
+    Halt,
 }
 
 /// A decoded `ChallengeResponse`.
@@ -236,11 +248,26 @@ pub fn admits_replica_version(stated: Option<u16>) -> bool {
     stated.is_some_and(|version| version >= REPL_PROTOCOL_VERSION)
 }
 
-/// Messages from replica to primary.
+/// Messages from replica to primary. A stopped replica's frames are
+/// variants of their own, so no reader can take one for the ordinary
+/// frame without the `match` saying so.
 #[derive(Debug)]
 pub enum ReplicaMessage {
     Handshake(Handshake),
     Ack(Ack),
+    /// A handshake flagged [`FLAG_STOPPED`]: the replica has stopped and
+    /// redials to say so.
+    StoppedHandshake(Handshake),
+    /// An ack flagged [`FLAG_STOPPED`]: the replica has stopped. Its
+    /// positions are the last ones it sent, frozen.
+    StoppedAck(Ack),
+    /// An `Ack` or `Handshake` carrying a flag bit this build does not
+    /// know: refused, neither read as a stop nor as an ordinary frame. A
+    /// reader treats it as the protocol violation it is.
+    UnknownFlags {
+        tag: u8,
+        flags: u8,
+    },
 }
 
 // --- Wire structs ---
@@ -266,6 +293,9 @@ struct HandshakeFrame {
     /// parsing on an older peer still reads the fields it knows, and the
     /// new decoder rejects a mismatch with an explicit version error.
     protocol_version: U16,
+    /// [`FLAG_STOPPED`] or 0. After the version, so an older primary still
+    /// reads the version and refuses it.
+    flags: u8,
 }
 
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
@@ -274,7 +304,21 @@ struct AckFrame {
     tag: u8,
     acked_sequence: U64,
     in_memory_sequence: U64,
+    /// [`FLAG_STOPPED`] or 0.
+    flags: u8,
 }
+
+/// The `Halt` frame behind its length prefix: the tag alone.
+#[derive(IntoBytes, Immutable, Unaligned)]
+#[repr(C)]
+struct PrefixedHaltFrame {
+    len: U32,
+    tag: u8,
+}
+
+/// Wire length, length prefix included, of the `Halt` frame
+/// [`encode_halt`] returns.
+pub const HALT_FRAME_LEN: usize = core::mem::size_of::<PrefixedHaltFrame>();
 
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 #[repr(C)]
@@ -389,8 +433,9 @@ struct PrefixedSeqHashFrame {
 /// publishes one from the stack.
 pub const SEQ_HASH_FRAME_LEN: usize = core::mem::size_of::<PrefixedSeqHashFrame>();
 
-const _: () = assert!(core::mem::size_of::<HandshakeFrame>() == 51);
-const _: () = assert!(core::mem::size_of::<AckFrame>() == 17);
+const _: () = assert!(core::mem::size_of::<HandshakeFrame>() == 52);
+const _: () = assert!(core::mem::size_of::<AckFrame>() == 18);
+const _: () = assert!(HALT_FRAME_LEN == 5);
 const _: () = assert!(core::mem::size_of::<ChallengeFrame>() == 33);
 const _: () = assert!(core::mem::size_of::<ChallengeResponseFrame>() == 97);
 const _: () = assert!(core::mem::size_of::<VersionedChallengeResponseFrame>() == 99);
@@ -414,12 +459,23 @@ fn write_length_prefix(buf: &mut Vec<u8>, payload_len: u32) {
 
 /// Encode a handshake message into a frame (length-prefixed).
 pub fn encode_handshake(h: &Handshake, buf: &mut Vec<u8>) {
+    encode_handshake_flagged(h, 0, buf);
+}
+
+/// Encode a stopped replica's handshake: [`encode_handshake`]'s frame
+/// flagged [`FLAG_STOPPED`].
+pub fn encode_stopped_handshake(h: &Handshake, buf: &mut Vec<u8>) {
+    encode_handshake_flagged(h, FLAG_STOPPED, buf);
+}
+
+fn encode_handshake_flagged(h: &Handshake, flags: u8, buf: &mut Vec<u8>) {
     let frame = HandshakeFrame {
         tag: MSG_HANDSHAKE,
         last_sequence: U64::new(h.last_sequence),
         chain_hash: h.chain_hash,
         epoch: U64::new(h.epoch),
         protocol_version: U16::new(REPL_PROTOCOL_VERSION),
+        flags,
     };
     let payload = frame.as_bytes();
     write_length_prefix(buf, payload.len() as u32);
@@ -428,14 +484,34 @@ pub fn encode_handshake(h: &Handshake, buf: &mut Vec<u8>) {
 
 /// Encode an ack message into a frame.
 pub fn encode_ack(ack: &Ack, buf: &mut Vec<u8>) {
+    encode_ack_flagged(ack, 0, buf);
+}
+
+/// Encode a stopped replica's ack: [`encode_ack`]'s frame flagged
+/// [`FLAG_STOPPED`], its positions the last ones the replica sent.
+pub fn encode_stopped_ack(ack: &Ack, buf: &mut Vec<u8>) {
+    encode_ack_flagged(ack, FLAG_STOPPED, buf);
+}
+
+fn encode_ack_flagged(ack: &Ack, flags: u8, buf: &mut Vec<u8>) {
     let frame = AckFrame {
         tag: MSG_ACK,
         acked_sequence: U64::new(ack.acked_sequence),
         in_memory_sequence: U64::new(ack.in_memory_sequence),
+        flags,
     };
     let payload = frame.as_bytes();
     write_length_prefix(buf, payload.len() as u32);
     buf.extend_from_slice(payload);
+}
+
+/// Encode the `Halt` frame, length prefix included: this primary has
+/// stopped because the cluster's output diverged.
+pub fn encode_halt() -> [u8; HALT_FRAME_LEN] {
+    zerocopy::transmute!(PrefixedHaltFrame {
+        len: U32::new(1),
+        tag: MSG_HALT,
+    })
 }
 
 /// Encode a Challenge message (primary → replica).
@@ -771,19 +847,35 @@ pub fn decode_replica_message(payload: &[u8]) -> io::Result<ReplicaMessage> {
                      speaks v{REPL_PROTOCOL_VERSION} — upgrade both nodes to the same version"
                 )));
             }
-            Ok(ReplicaMessage::Handshake(Handshake {
+            let handshake = Handshake {
                 last_sequence: frame.last_sequence.get(),
                 chain_hash: frame.chain_hash,
                 epoch: frame.epoch.get(),
-            }))
+            };
+            Ok(match frame.flags {
+                0 => ReplicaMessage::Handshake(handshake),
+                FLAG_STOPPED => ReplicaMessage::StoppedHandshake(handshake),
+                flags => ReplicaMessage::UnknownFlags {
+                    tag: MSG_HANDSHAKE,
+                    flags,
+                },
+            })
         }
         MSG_ACK => {
             let (frame, _) = AckFrame::ref_from_prefix(payload)
                 .map_err(|_| io::Error::other("ack too short"))?;
-            Ok(ReplicaMessage::Ack(Ack {
+            let ack = Ack {
                 acked_sequence: frame.acked_sequence.get(),
                 in_memory_sequence: frame.in_memory_sequence.get(),
-            }))
+            };
+            Ok(match frame.flags {
+                0 => ReplicaMessage::Ack(ack),
+                FLAG_STOPPED => ReplicaMessage::StoppedAck(ack),
+                flags => ReplicaMessage::UnknownFlags {
+                    tag: MSG_ACK,
+                    flags,
+                },
+            })
         }
         other => Err(io::Error::other(format!(
             "unknown replica message type: 0x{other:02x}"
@@ -873,6 +965,7 @@ pub fn decode_primary_message(payload: &[u8]) -> io::Result<PrimaryMessage> {
                 seed_len: frame.seed_len.get(),
             })
         }
+        MSG_HALT => Ok(PrimaryMessage::Halt),
         other => Err(io::Error::other(format!(
             "unknown primary message type: 0x{other:02x}"
         ))),
@@ -960,8 +1053,9 @@ mod tests {
         ));
         assert_eq!(REPL_PROTOCOL_VERSION, 9);
 
-        let version_at = buf.len() - 2;
-        buf[version_at..].copy_from_slice(&8u16.to_le_bytes());
+        // The version is the last field but the flag byte.
+        let version_at = buf.len() - 3;
+        buf[version_at..version_at + 2].copy_from_slice(&8u16.to_le_bytes());
         let err = decode_replica_message(&buf[4..]).expect_err("v8 replica");
         let msg = err.to_string();
         assert!(msg.contains("v8") && msg.contains("v9"), "{msg}");
@@ -1071,5 +1165,95 @@ mod tests {
         assert!(!admits_replica_version(Some(REPL_PROTOCOL_VERSION - 1)));
         assert!(!admits_replica_version(Some(0)));
         assert!(!admits_replica_version(None));
+    }
+
+    const ACK: Ack = Ack {
+        acked_sequence: 7,
+        in_memory_sequence: 9,
+    };
+
+    fn handshake() -> Handshake {
+        Handshake {
+            last_sequence: 3,
+            chain_hash: [1; 32],
+            epoch: 2,
+        }
+    }
+
+    /// An ack and a handshake round-trip as ordinary or stopped, the flag
+    /// the frame's last byte.
+    #[test]
+    fn acks_and_handshakes_carry_the_stopped_flag() {
+        let ack = payload(|buf| encode_ack(&ACK, buf));
+        assert_eq!(ack.len(), 18);
+        assert_eq!(ack[17], 0);
+        assert!(matches!(
+            decode_replica_message(&ack).unwrap(),
+            ReplicaMessage::Ack(Ack {
+                acked_sequence: 7,
+                in_memory_sequence: 9
+            })
+        ));
+        let stopped = payload(|buf| encode_stopped_ack(&ACK, buf));
+        assert_eq!(stopped[17], FLAG_STOPPED);
+        assert!(matches!(
+            decode_replica_message(&stopped).unwrap(),
+            ReplicaMessage::StoppedAck(Ack {
+                acked_sequence: 7,
+                in_memory_sequence: 9
+            })
+        ));
+
+        let hs = payload(|buf| encode_handshake(&handshake(), buf));
+        assert_eq!(hs.len(), 52);
+        assert!(matches!(
+            decode_replica_message(&hs).unwrap(),
+            ReplicaMessage::Handshake(h) if h.last_sequence == 3 && h.epoch == 2
+        ));
+        let stopped = payload(|buf| encode_stopped_handshake(&handshake(), buf));
+        assert_eq!(stopped[51], FLAG_STOPPED);
+        assert!(matches!(
+            decode_replica_message(&stopped).unwrap(),
+            ReplicaMessage::StoppedHandshake(h) if h.last_sequence == 3
+        ));
+    }
+
+    /// A flag bit this build does not know is refused as such, never read
+    /// as a stop or as an ordinary frame.
+    #[test]
+    fn unknown_flag_bits_are_refused() {
+        for flags in [0b10, 0b11, 0x80] {
+            let mut ack = payload(|buf| encode_ack(&ACK, buf));
+            ack[17] = flags;
+            assert!(matches!(
+                decode_replica_message(&ack).unwrap(),
+                ReplicaMessage::UnknownFlags { tag: MSG_ACK, flags: f } if f == flags
+            ));
+            let mut hs = payload(|buf| encode_handshake(&handshake(), buf));
+            hs[51] = flags;
+            assert!(matches!(
+                decode_replica_message(&hs).unwrap(),
+                ReplicaMessage::UnknownFlags { tag: MSG_HANDSHAKE, flags: f } if f == flags
+            ));
+        }
+    }
+
+    /// A v8 replica's handshake, without the flag byte, is too short.
+    #[test]
+    fn a_handshake_without_its_flag_byte_is_refused() {
+        let hs = payload(|buf| encode_handshake(&handshake(), buf));
+        let err = decode_replica_message(&hs[..51]).expect_err("too short");
+        assert!(err.to_string().contains("too short"), "{err}");
+    }
+
+    /// The `Halt` frame: its length prefix and tag, nothing else.
+    #[test]
+    fn halt_wire_byte_pattern() {
+        assert_eq!(encode_halt(), [1, 0, 0, 0, MSG_HALT]);
+        assert_eq!(MSG_HALT, 0x1A);
+        assert!(matches!(
+            decode_primary_message(&encode_halt()[4..]).unwrap(),
+            PrimaryMessage::Halt
+        ));
     }
 }

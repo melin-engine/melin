@@ -17,6 +17,7 @@ use tracing::{debug, info};
 
 use melin_app::AppEvent;
 use melin_pipeline::wait::WaitStrategy;
+use melin_transport_core::divergence::{HaltCause, HaltedBy, NoticePath};
 use melin_transport_core::lineage::SharedLineagePolicy;
 use melin_transport_core::pipeline::{AdoptedRotation, InputSlot, StreamMark, StreamMarkQueue};
 use melin_transport_core::replication::protocol::{
@@ -127,14 +128,17 @@ pub(super) fn compact_recv_buf(buf: &mut Vec<u8>, consumed: usize) {
 /// A length prefix above [`MAX_CONTROL_FRAME`], or of zero (every replica
 /// message carries a tag), is an `Err` as soon as its 4 bytes are in, as
 /// is an `Err` from `on_ack`; either ends the connection, so nothing is
-/// compacted on that path. A frame that is not a decodable `Ack` is
-/// skipped.
+/// compacted on that path. So is an ack with a flag bit this build does
+/// not know, logged at `error!` as the violation it is: skipped, it could
+/// be a stop the primary never sees. A frame that is not a decodable ack
+/// is skipped. A stopped ack ends the drain: handed over, then everything
+/// after it in `parse_buf` is dropped.
 ///
 /// Not [`try_extract_frame`], which applies the same rule: the error
 /// names the length the replica declared.
 pub(super) fn drain_ack_frames(
     parse_buf: &mut Vec<u8>,
-    mut on_ack: impl FnMut(Ack) -> io::Result<()>,
+    mut on_ack: impl FnMut(ReceivedAck) -> io::Result<()>,
 ) -> io::Result<()> {
     let mut cursor = 0;
     loop {
@@ -149,13 +153,139 @@ pub(super) fn drain_ack_frames(
                 )));
             }
         };
-        if let Ok(ReplicaMessage::Ack(ack)) = decode_replica_message(frame.payload) {
-            on_ack(ack)?;
+        match decode_replica_message(frame.payload) {
+            Ok(ReplicaMessage::Ack(ack)) => on_ack(ReceivedAck::Ack(ack))?,
+            // The last frame read from this replica: its positions froze
+            // when it stopped, so nothing after it is handed over, even
+            // from a replica that (against the protocol) acks on.
+            Ok(ReplicaMessage::StoppedAck(_)) => {
+                on_ack(ReceivedAck::Stopped)?;
+                parse_buf.clear();
+                return Ok(());
+            }
+            Ok(ReplicaMessage::UnknownFlags { tag, flags }) => {
+                return Err(unknown_flags(tag, flags));
+            }
+            // Not an ack: skipped, as an undecodable frame is.
+            Ok(ReplicaMessage::Handshake(_) | ReplicaMessage::StoppedHandshake(_)) | Err(_) => {}
         }
         cursor += frame.consumed();
     }
     compact_recv_buf(parse_buf, cursor);
     Ok(())
+}
+
+/// What reading a joining replica's control frames found.
+#[cfg(any(feature = "dpdk", test))]
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum JoinFrames {
+    /// A frame's length prefix is zero or over [`MAX_CONTROL_FRAME`], or an
+    /// ack carries unknown flag bits: a replica the caller disconnects, as
+    /// the streaming arm does.
+    Malformed,
+    /// Well formed. `acked`: an ack is kept: the replica is in its
+    /// streaming loop, which arms the join's stall watch.
+    Read { acked: bool },
+    /// The replica sent an ack flagged as stopped: the caller stops the
+    /// node at once. A stopped replica stops acking, so a flag held for
+    /// after the join might never be recorded.
+    Stopped,
+}
+
+/// Keep only the newest complete ack at the front of `buf`, and a trailing
+/// partial frame for the next read. `acked` whenever an ack is kept,
+/// which, as one is kept across reads, is true again on every read after
+/// the first (arming the stall watch is idempotent).
+///
+/// Serves the DPDK sender's `Joining` slot, in both phases. The replica
+/// acks what it journals of the join, and its acks must be read off the
+/// socket (left unread they fill the listener's receive buffer, and the
+/// replica's acks then back up in its own TX queue), but not recorded yet:
+/// the slot's cursors are seeded only once the catch-up ends, and the sent
+/// high-water an ack is checked against only once the handoff is over (a
+/// journal pass's entries are counted when the pass ends, and the replica
+/// may ack them before). The streaming arm records what is kept here, on
+/// its first tick. Acks are cumulative, so the newest carries everything
+/// the older ones did, and the rest are dropped.
+///
+/// Kept, not dropped, through the catch-up too: a replica acks only when
+/// it holds something new, so its last ack of the join is never repeated.
+/// On a quiet primary nothing more is journaled, and an ack dropped here
+/// would leave the slot at its handshake position, with a write held for
+/// the replica's ack never answered.
+///
+/// Walks the frames itself rather than through [`drain_ack_frames`]: that
+/// helper hands out each decoded ack and compacts everything it consumed,
+/// where this one keeps the newest ack's own bytes in the buffer, for the
+/// streaming arm's drain to decode on its first tick. Here, beside it,
+/// rather than with the DPDK sender, so its tests run on every host:
+/// compiled where the sender or the tests are.
+#[cfg(any(feature = "dpdk", test))]
+pub(super) fn keep_last_ack(buf: &mut Vec<u8>) -> JoinFrames {
+    let mut consumed = 0;
+    // The newest ack's byte range in `buf`.
+    let mut newest: Option<(usize, usize)> = None;
+    loop {
+        match try_extract_frame(&buf[consumed..], MAX_CONTROL_FRAME) {
+            FrameResult::Complete(payload_start, frame_end) => {
+                let payload = &buf[consumed + payload_start..consumed + frame_end];
+                match decode_replica_message(payload) {
+                    Ok(ReplicaMessage::Ack(_)) => newest = Some((consumed, consumed + frame_end)),
+                    Ok(ReplicaMessage::StoppedAck(_)) => return JoinFrames::Stopped,
+                    // A violation, as on the streaming arm: logged, and the
+                    // caller disconnects; never skipped, since it could be a
+                    // stop.
+                    Ok(ReplicaMessage::UnknownFlags { tag, flags }) => {
+                        let _logged = unknown_flags(tag, flags);
+                        return JoinFrames::Malformed;
+                    }
+                    Ok(ReplicaMessage::Handshake(_) | ReplicaMessage::StoppedHandshake(_))
+                    | Err(_) => {}
+                }
+                consumed += frame_end;
+            }
+            FrameResult::Incomplete => break,
+            FrameResult::Oversized => return JoinFrames::Malformed,
+        }
+    }
+    let acked = newest.is_some();
+    match newest {
+        Some((start, end)) => {
+            let len = buf.len();
+            let ack_len = end - start;
+            buf.copy_within(start..end, 0);
+            // `ack_len <= end <= consumed`: the partial frame moves down.
+            buf.copy_within(consumed..len, ack_len);
+            buf.truncate(ack_len + (len - consumed));
+        }
+        None => compact_recv_buf(buf, consumed),
+    }
+    JoinFrames::Read { acked }
+}
+
+/// One ack as a streaming replica sent it.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum ReceivedAck {
+    /// An ordinary ack: record it.
+    Ack(Ack),
+    /// The replica has stopped for divergence: stop this node too. Its
+    /// positions, the last it sent, are not recorded, so not carried.
+    Stopped,
+}
+
+/// A replica's frame carrying a flag bit this build does not know: logged
+/// at `error!` (an authenticated cluster member sent an impossible frame,
+/// a software bug on one side) and turned into the error that evicts it,
+/// as an ack violation does.
+pub(super) fn unknown_flags(tag: u8, flags: u8) -> io::Error {
+    tracing::error!(
+        tag,
+        flags,
+        "replica frame with unknown flag bits — evicting replica"
+    );
+    io::Error::other(format!(
+        "replica frame 0x{tag:02x} carries unknown flag bits 0x{flags:02x}"
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -421,6 +551,9 @@ pub(super) enum FrameError {
     /// Anything else — malformed/oversized frames, an unexpected
     /// primary message, or the journal stage dying mid-publish.
     Fatal(Box<dyn std::error::Error + Send + Sync>),
+    /// The primary's `Halt`: it stopped because the cluster's output
+    /// diverged, and this replica stops with it.
+    Halted,
 }
 
 /// Slots published under one `Producer::batch` before it is committed
@@ -723,7 +856,21 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
                                 Some(FrameError::Fatal("chain hash mismatch from primary".into()));
                             break;
                         }
-                        Ok(_) => {
+                        // The primary stopped for divergence: so does this
+                        // replica, at once, publishing nothing more.
+                        Ok(PrimaryMessage::Halt) => {
+                            frame_err = Some(FrameError::Halted);
+                            break;
+                        }
+                        // Listed, not a wildcard: a new message must be
+                        // decided on here, not skipped by default.
+                        Ok(
+                            PrimaryMessage::StreamStart { .. }
+                            | PrimaryMessage::SnapshotBegin { .. }
+                            | PrimaryMessage::SnapshotChunk(_)
+                            | PrimaryMessage::SnapshotEnd { .. }
+                            | PrimaryMessage::SegmentSeedBegin { .. },
+                        ) => {
                             debug!("unexpected message during streaming");
                         }
                         Err(e) => {
@@ -914,6 +1061,11 @@ pub(super) fn process_drain_frames<E: AppEvent>(
 /// Outcome of the inner streaming receive loop.
 pub(super) enum SessionExit {
     Shutdown,
+    /// The node stopped because the cluster's output diverged. The
+    /// session sent nothing after it saw the stop; the pipeline is torn
+    /// down and the receiver returns, never reaching a reconnect where a
+    /// promotion could be honoured.
+    Stopped,
     Promote,
     /// The transport dropped. Reconnect with backoff.
     Disconnected,
@@ -1013,6 +1165,9 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
         primary_observed: _,
         // Latched by the journal thread's failure wrapper, not here.
         pipeline_healthy: _,
+        // Tripped here by the primary's `Halt`, and read before the
+        // shutdown arm.
+        latch,
     } = control;
     let mut slot_buf: Vec<InputSlot<E>> = Vec::new();
     let mut pending_acks = PendingAckQueue::new(pipeline_depth);
@@ -1051,6 +1206,11 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
 
     let exit = loop {
         // --- Check flags ---
+        // The stop first: it also sets the shutdown flag, and a stopped
+        // replica must not send the ordinary acks the shutdown arm drains.
+        if latch.is_tripped() {
+            break SessionExit::Stopped;
+        }
         if shutdown.load(Ordering::Relaxed) {
             info!("replica shutting down");
             drain_pending_acks(
@@ -1197,6 +1357,16 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
             Some(FrameError::SequenceGap(e)) => break SessionExit::StreamGap(e),
             Some(FrameError::Corrupted(e)) => break SessionExit::Corrupted(e),
             Some(FrameError::Fatal(e)) => break SessionExit::Fatal(e),
+            Some(FrameError::Halted) => {
+                // A first trip, or one after another cause: either way the
+                // replica has stopped. It owes nobody a notice: the primary
+                // that halted it knows.
+                let _halted = latch.trip_with(HaltCause::ClusterHalted {
+                    by: HaltedBy::Primary,
+                    via: NoticePath::HaltFrame,
+                });
+                break SessionExit::Stopped;
+            }
             None => {}
         }
 
@@ -1450,6 +1620,134 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
+    // keep_last_ack
+    // ---------------------------------------------------------------
+
+    /// A length-prefixed frame with a `len`-byte payload.
+    fn opaque_frame(len: usize) -> Vec<u8> {
+        let mut f = (len as u32).to_le_bytes().to_vec();
+        f.resize(4 + len, 0xAB);
+        f
+    }
+
+    fn ack(acked_sequence: u64, in_memory_sequence: u64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        melin_transport_core::replication::protocol::encode_ack(
+            &Ack {
+                acked_sequence,
+                in_memory_sequence,
+            },
+            &mut buf,
+        );
+        buf
+    }
+
+    /// The newest ack survives, ahead of a partial frame; older acks and
+    /// frames that are not acks go. Kept across reads, so the newest of
+    /// all of them is what the streaming arm records.
+    #[test]
+    fn keep_last_ack_keeps_the_newest_ack_and_a_partial_frame() {
+        let mut buf = ack(1, 2);
+        buf.extend(opaque_frame(8));
+        buf.extend(ack(3, 4));
+        buf.extend(opaque_frame(8));
+        let partial = ack(5, 6);
+        buf.extend_from_slice(&partial[..5]);
+
+        let acked = JoinFrames::Read { acked: true };
+        assert_eq!(keep_last_ack(&mut buf), acked);
+        let mut expected = ack(3, 4);
+        expected.extend_from_slice(&partial[..5]);
+        assert_eq!(buf, expected);
+
+        // The partial ack completes, and is the newest from then on.
+        buf.extend_from_slice(&partial[5..]);
+        assert_eq!(keep_last_ack(&mut buf), acked);
+        assert_eq!(buf, ack(5, 6));
+        assert_eq!(keep_last_ack(&mut buf), acked, "idempotent");
+        assert_eq!(buf, ack(5, 6));
+    }
+
+    #[test]
+    fn keep_last_ack_with_no_ack_keeps_only_a_partial_frame() {
+        let none = JoinFrames::Read { acked: false };
+        let mut buf = opaque_frame(8);
+        buf.extend_from_slice(&opaque_frame(8)[..3]);
+        assert_eq!(keep_last_ack(&mut buf), none);
+        assert_eq!(buf, opaque_frame(8)[..3]);
+
+        let mut buf = Vec::new();
+        assert_eq!(keep_last_ack(&mut buf), none);
+        assert!(buf.is_empty());
+
+        // Too short for a length prefix: left as it is.
+        let mut buf = vec![5, 0];
+        assert_eq!(keep_last_ack(&mut buf), none);
+        assert_eq!(buf, [5, 0]);
+
+        // A partial frame that completes as something other than an ack
+        // goes on the next read.
+        let partial = opaque_frame(12);
+        let mut buf = partial[..7].to_vec();
+        assert_eq!(keep_last_ack(&mut buf), none);
+        buf.extend_from_slice(&partial[7..]);
+        assert_eq!(keep_last_ack(&mut buf), none);
+        assert!(buf.is_empty());
+    }
+
+    /// The replica's only ack of a join, arriving in pieces, is reported
+    /// once complete and then kept, read after read, with nothing newer
+    /// behind it: a replica on a quiet primary acks the end of its catch-up
+    /// once, and the streaming arm must still find that ack when the join
+    /// is over, however many reads the rest of the join took.
+    #[test]
+    fn keep_last_ack_keeps_the_only_ack_until_the_join_is_over() {
+        let only = ack(1_560, 1_560);
+        let mut buf = only[..5].to_vec();
+        assert_eq!(keep_last_ack(&mut buf), JoinFrames::Read { acked: false });
+        buf.extend_from_slice(&only[5..]);
+        for read in 0..3 {
+            assert_eq!(
+                keep_last_ack(&mut buf),
+                JoinFrames::Read { acked: true },
+                "read {read}"
+            );
+            assert_eq!(buf, only, "read {read}");
+        }
+    }
+
+    #[test]
+    fn keep_last_ack_rejects_an_oversized_or_empty_frame() {
+        let mut buf = ack(1, 1);
+        buf.extend(((MAX_CONTROL_FRAME + 1) as u32).to_le_bytes());
+        assert_eq!(keep_last_ack(&mut buf), JoinFrames::Malformed);
+
+        let mut buf = 0u32.to_le_bytes().to_vec();
+        assert_eq!(keep_last_ack(&mut buf), JoinFrames::Malformed);
+    }
+
+    /// A stopped ack among a join's acks is reported at once, whatever
+    /// came before it; one with unknown flag bits disconnects, never
+    /// skipped.
+    #[test]
+    fn keep_last_ack_reports_a_stop_and_refuses_unknown_flags() {
+        let mut buf = ack(1, 1);
+        melin_transport_core::replication::protocol::encode_stopped_ack(
+            &Ack {
+                acked_sequence: 1,
+                in_memory_sequence: 1,
+            },
+            &mut buf,
+        );
+        assert_eq!(keep_last_ack(&mut buf), JoinFrames::Stopped);
+
+        let mut buf = ack(1, 1);
+        let last = buf.len() - 1;
+        buf[last] = 0b100;
+        assert_eq!(keep_last_ack(&mut buf), JoinFrames::Malformed);
+    }
+
+    // ---------------------------------------------------------------
     // drain_ack_frames
     // ---------------------------------------------------------------
 
@@ -1465,15 +1763,58 @@ mod tests {
         buf
     }
 
+    /// What `drain_acks` saw a stopped ack as.
+    const STOPPED: u64 = u64::MAX;
+
     /// `drain_ack_frames` over `buf`, returning the acked sequences it
-    /// handed over alongside its result.
+    /// handed over ([`STOPPED`] for a stopped ack) alongside its result.
     fn drain_acks(buf: &mut Vec<u8>) -> (io::Result<()>, Vec<u64>) {
         let mut seen = Vec::new();
-        let result = drain_ack_frames(buf, |ack| {
-            seen.push(ack.acked_sequence);
+        let result = drain_ack_frames(buf, |frame| {
+            seen.push(match frame {
+                ReceivedAck::Ack(ack) => ack.acked_sequence,
+                ReceivedAck::Stopped => STOPPED,
+            });
             Ok(())
         });
         (result, seen)
+    }
+
+    /// A stopped ack is handed over as such, after the acks before it, and
+    /// is the last thing handed over: an ack after it, whole or partial, is
+    /// dropped, never recorded.
+    #[test]
+    fn a_stopped_ack_is_handed_over_as_a_stop_and_ends_the_drain() {
+        let mut buf = ack_frame(1);
+        melin_transport_core::replication::protocol::encode_stopped_ack(
+            &Ack {
+                acked_sequence: 1,
+                in_memory_sequence: 1,
+            },
+            &mut buf,
+        );
+        buf.extend_from_slice(&ack_frame(2));
+        let third = ack_frame(3);
+        buf.extend_from_slice(&third[..third.len() - 1]);
+        let (result, seen) = drain_acks(&mut buf);
+        result.unwrap();
+        assert_eq!(seen, [1, STOPPED]);
+        assert!(buf.is_empty(), "nothing after the stop kept: {buf:?}");
+    }
+
+    /// An ack with a flag bit this build does not know ends the session,
+    /// as a violation does: skipped, it could be a stop never seen.
+    #[test]
+    fn an_ack_with_unknown_flags_is_an_error_not_skipped() {
+        let mut buf = ack_frame(1);
+        let mut unknown = ack_frame(2);
+        let last = unknown.len() - 1;
+        unknown[last] = 0b10;
+        buf.extend_from_slice(&unknown);
+        let (result, seen) = drain_acks(&mut buf);
+        let err = result.expect_err("refused");
+        assert!(err.to_string().contains("unknown flag bits"), "{err}");
+        assert_eq!(seen, [1]);
     }
 
     #[test]
@@ -1644,7 +1985,7 @@ mod tests {
     /// Throwaway control-plane bundle — these tests don't exercise
     /// raft; `streaming_loop` just needs somewhere to write.
     fn control() -> crate::replication::ReplicaControlPlane {
-        crate::replication::ReplicaControlPlane::new()
+        crate::replication::ReplicaControlPlane::new(crate::tests::idle_latch())
     }
 
     /// A bundle whose promotion request is already filed (manually) —
@@ -1718,6 +2059,96 @@ mod tests {
         let slots = drain(&mut consumer);
         assert_eq!(slots.len(), 1, "promote drain should publish pending data");
         assert_eq!(slots[0].key_hash, 0x01);
+    }
+
+    /// A control plane whose divergence stop is a real latch, its marker
+    /// in `dir`.
+    fn control_tripping_in(dir: &std::path::Path) -> crate::replication::ReplicaControlPlane {
+        crate::replication::ReplicaControlPlane::new(
+            melin_transport_core::divergence::DivergenceLatch::new(
+                std::sync::Arc::new(melin_transport_core::fence::FenceState::new(0)),
+                std::sync::Arc::new(AtomicBool::new(false)),
+                dir.join("replica.journal.diverged"),
+                std::sync::Arc::new(melin_transport_core::divergence::FsSync),
+            ),
+        )
+    }
+
+    /// The primary's `Halt` stops the replica at once: the session ends
+    /// as stopped, the stop names the primary and the halt frame, and no
+    /// ack goes out, not even for the entry ahead of it.
+    #[test]
+    fn a_halt_from_the_primary_stops_the_replica() {
+        let (mut producer, _consumer) = ring(16);
+        let cursor = journal_cursor(u64::MAX);
+        let shutdown = AtomicBool::new(false);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let control = control_tripping_in(dir.path());
+        let mut transport = MockTransport::new();
+        let mut data = Vec::new();
+        append_input_batch_frame(&mut data, &[slot(1, 0x01)]);
+        data.extend_from_slice(&melin_transport_core::replication::protocol::encode_halt());
+        transport.push_data(data);
+
+        let result = streaming_loop::<MockTransport, TestEvent>(
+            &mut transport,
+            &mut producer,
+            &cursor,
+            &shutdown,
+            &control,
+            4,
+            WaitStrategy::SpinThenYield,
+            0,
+            Vec::new(),
+            None,
+            &no_marks(),
+            &AtomicBool::new(false),
+        );
+
+        assert!(matches!(result.exit, SessionExit::Stopped));
+        assert_eq!(
+            control.latch.cause(),
+            Some(&HaltCause::ClusterHalted {
+                by: HaltedBy::Primary,
+                via: NoticePath::HaltFrame
+            })
+        );
+        assert!(transport.sent_acks.is_empty(), "{:?}", transport.sent_acks);
+    }
+
+    /// A replica stopped before the loop's turn, its shutdown flag set
+    /// with the stop, leaves as stopped, without the shutdown arm's drain
+    /// of ordinary acks.
+    #[test]
+    fn a_stopped_replica_leaves_without_draining_its_acks() {
+        let (mut producer, _consumer) = ring(16);
+        let cursor = journal_cursor(u64::MAX);
+        let shutdown = AtomicBool::new(true);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let control = control_tripping_in(dir.path());
+        let _halted = control.latch.trip_with(HaltCause::ClusterHalted {
+            by: HaltedBy::Primary,
+            via: NoticePath::HaltFrame,
+        });
+        let mut transport = MockTransport::new();
+
+        let result = streaming_loop::<MockTransport, TestEvent>(
+            &mut transport,
+            &mut producer,
+            &cursor,
+            &shutdown,
+            &control,
+            4,
+            WaitStrategy::SpinThenYield,
+            5,
+            Vec::new(),
+            None,
+            &no_marks(),
+            &AtomicBool::new(false),
+        );
+
+        assert!(matches!(result.exit, SessionExit::Stopped));
+        assert!(transport.sent_acks.is_empty());
     }
 
     #[test]

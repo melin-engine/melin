@@ -1300,7 +1300,7 @@ mod tests {
         // first and swallow the second, leaving the stalled failover
         // explained by a condition that stopped holding at the crash.
         let status = leader_status(7, Some(0));
-        let control = crate::replication::ReplicaControlPlane::new();
+        let control = crate::replication::ReplicaControlPlane::new(crate::tests::idle_latch());
         control.tip_ready.store(true, Ordering::Release);
         control
             .journal_tip
@@ -1358,7 +1358,7 @@ mod tests {
     #[test]
     fn auto_promotion_judges_by_the_lineage_policy_not_the_nodes_own() {
         let status = leader_status(7, Some(0));
-        let control = crate::replication::ReplicaControlPlane::new();
+        let control = crate::replication::ReplicaControlPlane::new(crate::tests::idle_latch());
         control.tip_ready.store(true, Ordering::Release);
         control.primary_observed.store(true, Ordering::Release);
         control
@@ -1417,7 +1417,7 @@ mod tests {
     #[test]
     fn consider_auto_promotion_files_nothing_without_a_lease() {
         let status = leader_status(7, None);
-        let control = crate::replication::ReplicaControlPlane::new();
+        let control = crate::replication::ReplicaControlPlane::new(crate::tests::idle_latch());
         control.tip_ready.store(true, Ordering::Release);
         control.primary_observed.store(true, Ordering::Release);
         control

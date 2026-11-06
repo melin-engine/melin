@@ -876,6 +876,29 @@ response loop's check), departs from the text below in three places:
   directly; `melin-test-node` gains a wrapper when the replica's half
   needs it.
 
+The second part, the wire and the receiving end of each notice (a
+primary told by a stopped ack or handshake, a replica told by `Halt`),
+departs from the text below in these places:
+
+- `ReplicaCursors` is unchanged: the senders hold the latch, and the
+  decoded `ReplicaMessage::StoppedAck` (a variant of its own, as are
+  `StoppedHandshake` and `UnknownFlags`) forces each read site to handle
+  a stop explicitly, so `record_ack` keeps its signature and only ever
+  sees ordinary acks.
+- `HaltedBy::Replica` carries the slot only: naming the replica's key is
+  diagnostics, deferred with the build ids.
+- A primary that has sent its `Halt` keeps the connection open, reading
+  and dropping what arrives, until the replica closes it (bounded by
+  `HALT_NOTICE_BOUND`), on both transports: closing first had the kernel
+  answer the replica's unread acks with a reset that discarded the `Halt`
+  every time. So the limit "a `Halt` lost to the close" holds only for a
+  replica that does not close within the bound.
+- On DPDK every live session's `Halt` is sent by the poll loop's close
+  (`close_all_links`); a slot answered for a stopped handshake waits there
+  in a `Halting` state.
+- The replica's latch reaches its receivers through `ReplicaControlPlane`,
+  whose constructor now requires it.
+
 - `output_digest::Trip` and `Divergence` (decision 6); `DivergenceLatch`,
   `HaltCause`, `Halted`, the marker writer and its state, the marker
   (`NodeStore::divergence_marker`), the exit helper and `NodeDiverged`

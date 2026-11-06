@@ -657,6 +657,9 @@ where
         primary_observed: _,
         lineage_ack_policy,
         pipeline_healthy,
+        // Read and tripped by the streaming loop, which takes `control`
+        // whole.
+        latch: _,
     } = control;
     // Recover whenever any journal segment survives — live OR archived;
     // fresh replicas get no engine and the genesis position. See
@@ -1504,7 +1507,7 @@ mod tests {
             let replica_journal = dir.path().join("replica.journal");
             let replica_snapshot_check = store(&replica_journal).snapshot().to_path_buf();
             let shutdown = Arc::new(AtomicBool::new(false));
-            let control = crate::replication::ReplicaControlPlane::new();
+            let control = crate::replication::ReplicaControlPlane::new(crate::tests::idle_latch());
             let cores = crate::layout::PipelineCores::unpinned();
             let replica = {
                 let journal = replica_journal.clone();
@@ -1765,7 +1768,7 @@ mod tests {
 
             let replica_journal = dir.path().join("replica.journal");
             let shutdown = Arc::new(AtomicBool::new(false));
-            let control = crate::replication::ReplicaControlPlane::new();
+            let control = crate::replication::ReplicaControlPlane::new(crate::tests::idle_latch());
             let cores = crate::layout::PipelineCores::unpinned();
             let replica = {
                 let journal = replica_journal.clone();
@@ -1975,7 +1978,7 @@ mod tests {
 
             let replica_journal = dir.path().join("replica.journal");
             let shutdown = Arc::new(AtomicBool::new(false));
-            let control = crate::replication::ReplicaControlPlane::new();
+            let control = crate::replication::ReplicaControlPlane::new(crate::tests::idle_latch());
             let cores = crate::layout::PipelineCores::unpinned();
             let replica = {
                 let journal = replica_journal.clone();
@@ -2247,7 +2250,7 @@ mod tests {
             let addr = listener.local_addr().expect("addr");
 
             let shutdown = Arc::new(AtomicBool::new(false));
-            let control = crate::replication::ReplicaControlPlane::new();
+            let control = crate::replication::ReplicaControlPlane::new(crate::tests::idle_latch());
             let replica = {
                 let journal = dir.path().join("replica.journal");
                 let shutdown = Arc::clone(&shutdown);
@@ -2397,7 +2400,7 @@ mod tests {
                     &store(&journal),
                     &ed25519_dalek::SigningKey::from_bytes(&REPLICA_KEY),
                     &shutdown,
-                    &crate::replication::ReplicaControlPlane::new(),
+                    &crate::replication::ReplicaControlPlane::new(crate::tests::idle_latch()),
                     3_600_000,
                     crate::layout::PipelineCores::unpinned(),
                     RingCapacity::MIN,
@@ -2882,7 +2885,7 @@ mod tests {
             listener.set_nonblocking(true).expect("nonblocking");
             let addr = listener.local_addr().expect("addr");
             let shutdown = Arc::new(AtomicBool::new(false));
-            let control = crate::replication::ReplicaControlPlane::new();
+            let control = crate::replication::ReplicaControlPlane::new(crate::tests::idle_latch());
             let replica = {
                 let journal = dir.path().join("replica.journal");
                 let shutdown = Arc::clone(&shutdown);
@@ -3153,7 +3156,7 @@ mod tests {
             let dir = tempfile::tempdir().expect("tempdir");
             let journal = dir.path().join("replica.journal");
             let shutdown = AtomicBool::new(false);
-            let control = crate::replication::ReplicaControlPlane::new();
+            let control = crate::replication::ReplicaControlPlane::new(crate::tests::idle_latch());
             // The receiver's own log, captured on its thread, tells the
             // test when it has reached the dial.
             let logs = melin_transport_core::test_logs::Logs::default();
@@ -3244,7 +3247,7 @@ mod tests {
             listener.set_nonblocking(true).expect("nonblocking");
             let addr = listener.local_addr().expect("addr");
             let shutdown = Arc::new(AtomicBool::new(false));
-            let control = crate::replication::ReplicaControlPlane::new();
+            let control = crate::replication::ReplicaControlPlane::new(crate::tests::idle_latch());
             let replica = {
                 let journal = dir.path().join("replica.journal");
                 let shutdown = Arc::clone(&shutdown);
@@ -3474,7 +3477,7 @@ mod tests {
 
             let replica_journal = dir.path().join("replica.journal");
             let shutdown = Arc::new(AtomicBool::new(false));
-            let control = crate::replication::ReplicaControlPlane::new();
+            let control = crate::replication::ReplicaControlPlane::new(crate::tests::idle_latch());
             let replica = {
                 let journal = replica_journal.clone();
                 let shutdown = Arc::clone(&shutdown);
