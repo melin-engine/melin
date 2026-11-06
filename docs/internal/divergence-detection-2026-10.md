@@ -3318,11 +3318,9 @@ one-byte `AuthOk` without a handshake and redialling. What remains:
 
     The history clients were served and the fixed build's replay may
     differ: the journal is the audit trail of what was asked, and the
-    replay is the state from now on. A cluster that ever failed over has
-    journaled epochs above the fresh raft terms, and auto-promotion
-    refuses while the term is at or below the epoch: the new cluster has
-    manual failover only until enough elections have passed (a roadmap
-    item, step 7, which also fixes voter replacement);
+    replay is the state from now on. The fresh raft directories start
+    their terms at the journal's epoch (the term floor, landed), so
+    the new cluster can fail over automatically at once;
   - the `--no-output-digests` switch, what turning it off gives up, and
     why the window is not configurable (it is part of the digest's
     definition, the same on every node).
@@ -3366,10 +3364,11 @@ one-byte `AuthOk` without a handshake and redialling. What remains:
 - **Leaves untested:** the runbook's prose itself; a hardware fault; a
   rollback to an older release, whose binary the suite does not build.
 
-### Step 7. Roadmap: five follow-ups
+### Step 7. Roadmap: four follow-ups
 
-Add five rows to `docs/internal/roadmap.md` ("Next"), roughly, the first
-listed first:
+Add four rows to `docs/internal/roadmap.md` ("Next"), roughly, the first
+listed first (a fifth, a raft term floor for a fresh raft cluster, has
+landed: each node raises its term to its journal's epoch as it starts):
 
 > **Offline output qualification** (Medium, next after output digests).
 > A stopped cluster's marker names the first window whose outputs
@@ -3433,15 +3432,7 @@ listed first:
 > but a host reboot. Worth it only if the linger's limit is seen in
 > practice. Plan: [divergence-detection-2026-10.md](divergence-detection-2026-10.md).
 
-> **A raft term floor for a fresh raft cluster** (Medium). Auto-promotion
-> refuses while the raft term is at or below the journal's fencing epoch.
-> A raft cluster started fresh on an existing journal (a new cluster after
-> a divergence, or a voter replaced with a wiped raft dir) restarts terms
-> from zero, so a history that ever failed over gets manual failover only
-> until enough elections have passed. Raise a fresh raft cluster's terms
-> above the highest journal epoch its peers advertise.
-
-- **Leaves untested:** five roadmap rows.
+- **Leaves untested:** four roadmap rows.
 
 ## What this leaves untested, and why
 

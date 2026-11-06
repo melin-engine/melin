@@ -793,8 +793,12 @@ Auto-promotion is deliberately conservative. The elected replica
   position was ahead (its journal is then the reconciliation source
   when it returns);
 - manual promotions have outrun election terms (the term must be
-  strictly above the epoch in force; the alignment heals as terms
-  advance — promote manually in the interim).
+  strictly above the epoch in force). A node raises its control-plane
+  term to its journal's epoch each time it starts, so restarting the
+  nodes clears this; promote manually in the interim. Each restarted
+  node whose term was raised returns as a follower and, on rejoining,
+  makes the current leader step down: expect up to one election per
+  such node during that rolling restart.
 
 Passing these checks starts the promotion; it does not finish it. Just
 before taking over, after its pipeline is ready and before it journals
@@ -891,6 +895,16 @@ nothing of its own.
   the same term, undermining the epoch guarantee. If the dir is lost,
   restart that node last, after a leader is established, or with the
   raft flags off.
+- **A new `--raft-dir` on an existing journal is ready for failover.** A
+  promotion's election term becomes its fencing epoch, so it must be
+  above the epoch the journal already holds. Each node raises its
+  control-plane term to its journal's epoch as it starts, so a raft
+  directory created for a history that has already failed over (a
+  cluster re-provisioned, or a voter replaced) elects above it at once,
+  instead of promoting only manually until enough elections have passed.
+  A node's control plane starts once its journal is recovered: until
+  then a recovering replica takes no part in elections, as it already
+  refused to vote.
 - **Membership is static on this release.** The `--raft-peer` list is
   fixed at first boot (later flag changes are ignored in favor of the
   stored membership, with a warning). The public keys are the exception:
