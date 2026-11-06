@@ -334,6 +334,9 @@ pub(crate) fn spawn_replica_health(
     // (`ReplicaControlPlane::pipeline_healthy`) — drives the endpoint's
     // OK/ERR status and the `melin_pipeline_healthy` gauge.
     pipeline_healthy: Arc<AtomicBool>,
+    // The replica's output checks (`ReplicaControlPlane::output_checks`),
+    // `melin_output_checks_total`.
+    output_checks: Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<ReplicaHealthGuard, Box<dyn std::error::Error>> {
     let Some(addr) = config.health_bind else {
         return Ok(ReplicaHealthGuard { inner: None });
@@ -345,6 +348,7 @@ pub(crate) fn spawn_replica_health(
             Arc::clone(fence_state),
             raft_status.map(Arc::clone),
             pipeline_healthy,
+            output_checks,
         ),
         Arc::clone(&stop),
     )?;

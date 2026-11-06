@@ -22,6 +22,7 @@ use melin_transport_core::divergence::{
 };
 
 use super::halt_notice::{HaltNotice, HaltStep, take_halt};
+use super::output_check::{Checked, DigestRefusal, OutputCheck, check_digest_frame};
 use melin_transport_core::lineage::SharedLineagePolicy;
 use melin_transport_core::pipeline::{AdoptedRotation, InputSlot, StreamMark, StreamMarkQueue};
 use melin_transport_core::replication::protocol::{
@@ -564,6 +565,9 @@ pub(super) enum FrameError {
     /// The primary's `Halt`: it stopped because the cluster's output
     /// diverged, and this replica stops with it.
     Halted,
+    /// This replica's output differs from its primary's: its output check
+    /// has stopped the node, and the loop's stop check tells the primary.
+    Diverged,
 }
 
 /// Slots published under one `Producer::batch` before it is committed
@@ -706,6 +710,10 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
     // Run on every pass of a push waiting for ring space — see
     // [`ReceiverTransport::keep_link_serviced`].
     keep_link_serviced: &mut impl FnMut(),
+    // The pipeline's output check, handed each `Digest` frame; `None`
+    // with output digests off, when the frames are checked against the
+    // protocol and dropped.
+    mut output_check: Option<&mut OutputCheck>,
 ) -> StreamingFrameOutcome {
     let mut consumed = 0;
     let mut last_target = 0u64;
@@ -866,9 +874,31 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
                                 Some(FrameError::Fatal("chain hash mismatch from primary".into()));
                             break;
                         }
-                        // The primary's output digest: nothing compares it
-                        // yet, so it is dropped.
-                        Ok(PrimaryMessage::Digest { .. }) => {}
+                        // The primary's output digest, after the entries it
+                        // covers: compared with this copy's output.
+                        Ok(PrimaryMessage::Digest {
+                            kind,
+                            window_end,
+                            chain,
+                        }) => match check_digest_frame(kind, window_end, pending_accum) {
+                            Err(DigestRefusal::Ahead(e)) => {
+                                frame_err = Some(FrameError::SequenceGap(e.into()));
+                                break;
+                            }
+                            Err(DigestRefusal::Malformed(e)) => {
+                                frame_err = Some(FrameError::Fatal(e.into()));
+                                break;
+                            }
+                            Ok(known) => {
+                                if let Some(check) = output_check.as_deref_mut()
+                                    && check.expected(known, kind, window_end, chain)
+                                        == Checked::Diverged
+                                {
+                                    frame_err = Some(FrameError::Diverged);
+                                    break;
+                                }
+                            }
+                        },
                         // The primary stopped for divergence: so does this
                         // replica, at once, publishing nothing more.
                         Ok(PrimaryMessage::Halt) => {
@@ -1227,6 +1257,10 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
     // cursor never advances, so waiting on it would wedge this thread
     // forever instead of tearing down for the reconnect/resync path.
     journal_failed: &AtomicBool,
+    // The pipeline's output check, lent for this session (see
+    // `ReplicaPipelineHandles::output_check`); `None` with output digests
+    // off.
+    mut output_check: Option<&mut OutputCheck>,
 ) -> StreamingResult {
     let super::ReplicaControlPlane {
         promote,
@@ -1243,10 +1277,16 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
         primary_observed: _,
         // Latched by the journal thread's failure wrapper, not here.
         pipeline_healthy: _,
-        // Tripped here by the primary's `Halt`, and read before the
-        // shutdown arm.
+        // Tripped here by the primary's `Halt` (and by the output check on
+        // a mismatch), and read before the shutdown arm.
         latch,
+        // Counted by the output check, which holds its own handle.
+        output_checks: _,
     } = control;
+    // The stream has started: a new session for the check.
+    if let Some(check) = output_check.as_deref_mut() {
+        check.begin_session();
+    }
     let mut slot_buf: Vec<InputSlot<E>> = Vec::new();
     let mut pending_acks = PendingAckQueue::new(pipeline_depth);
 
@@ -1283,6 +1323,15 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
     const RECV_COMPACT_THRESHOLD: usize = 64 * 1024;
 
     let exit = loop {
+        // --- This copy's output ---
+        // The windows the drain has closed since the last pass, compared
+        // with any value of the primary's waiting for them. Before the
+        // stop's check: a mismatch found here trips the latch, read next.
+        if let Some(check) = output_check.as_deref_mut() {
+            // Its verdict is the latch's state, read just below.
+            let _verdict = check.absorb();
+        }
+
         // --- Check flags ---
         // The stop first: it also sets the shutdown flag, and a stopped
         // replica must not send the ordinary acks the shutdown arm drains.
@@ -1432,6 +1481,7 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
             journal_failed,
             &mut pending_acks,
             &mut || transport.keep_link_serviced(),
+            output_check.as_deref_mut(),
         );
         accum_end_sequence = outcome.accum_end_sequence;
         last_committed_primary_seq = accum_end_sequence;
@@ -1463,6 +1513,9 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
                 });
                 break SessionExit::Stopped(StopNotice::NotOwed);
             }
+            // The check tripped the latch: the loop's top tells the
+            // primary, publishing nothing more first.
+            Some(FrameError::Diverged) => continue,
             None => {}
         }
 
@@ -1600,6 +1653,8 @@ mod tests {
         slot_buf: &mut Vec<InputSlot<TestEvent>>,
         marks: &StreamMarkQueue,
         journal_failed: &AtomicBool,
+        // The output check handed each `Digest` frame; `None`: digests off.
+        output_check: Option<&mut OutputCheck>,
     ) -> (StreamingFrameOutcome, PendingAckQueue) {
         stream_frames_following(
             buf,
@@ -1609,11 +1664,13 @@ mod tests {
             marks,
             &SharedLineagePolicy::new(None),
             journal_failed,
+            output_check,
         )
     }
 
     /// [`stream_frames`], with the lineage policy cell the accepted
     /// changes move.
+    #[allow(clippy::too_many_arguments)]
     fn stream_frames_following(
         buf: &[u8],
         producer: &mut melin_pipeline::ring::Producer<InputSlot<TestEvent>>,
@@ -1622,6 +1679,8 @@ mod tests {
         marks: &StreamMarkQueue,
         lineage_policy: &SharedLineagePolicy,
         journal_failed: &AtomicBool,
+        // The output check handed each `Digest` frame; `None`: digests off.
+        output_check: Option<&mut OutputCheck>,
     ) -> (StreamingFrameOutcome, PendingAckQueue) {
         let mut acks = PendingAckQueue::new(16);
         let outcome = process_streaming_frames::<TestEvent>(
@@ -1634,6 +1693,7 @@ mod tests {
             journal_failed,
             &mut acks,
             &mut || {},
+            output_check,
         );
         (outcome, acks)
     }
@@ -2029,6 +2089,9 @@ mod tests {
         reads_fail_after_stopped_ack: bool,
         // The stopped ack fails to send, as on a lost link.
         stopped_ack_fails: bool,
+        // Run on each read, with the reads so far: what happens elsewhere
+        // in the node while the receiver polls (the drain closing windows).
+        on_read: Option<Box<dyn FnMut(usize)>>,
     }
 
     impl MockTransport {
@@ -2048,6 +2111,7 @@ mod tests {
                 reads_fail: false,
                 reads_fail_after_stopped_ack: false,
                 stopped_ack_fails: false,
+                on_read: None,
             }
         }
 
@@ -2063,6 +2127,9 @@ mod tests {
     impl ReceiverTransport for MockTransport {
         fn poll_recv(&mut self, recv_buf: &mut Vec<u8>) -> io::Result<bool> {
             self.reads += 1;
+            if let Some(on_read) = self.on_read.as_mut() {
+                on_read(self.reads);
+            }
             if self.reads_fail {
                 return Err(io::Error::from(io::ErrorKind::ConnectionReset));
             }
@@ -2172,6 +2239,7 @@ mod tests {
             None,
             &no_marks(),
             &AtomicBool::new(false),
+            None,
         );
 
         assert!(matches!(result.exit, SessionExit::Shutdown));
@@ -2204,6 +2272,7 @@ mod tests {
             None,
             &no_marks(),
             &AtomicBool::new(false),
+            None,
         );
 
         assert!(matches!(result.exit, SessionExit::Promote));
@@ -2254,6 +2323,7 @@ mod tests {
             None,
             &no_marks(),
             &AtomicBool::new(false),
+            None,
         );
 
         assert!(matches!(
@@ -2299,6 +2369,7 @@ mod tests {
             None,
             &no_marks(),
             &AtomicBool::new(false),
+            None,
         );
 
         assert!(matches!(
@@ -2339,6 +2410,7 @@ mod tests {
             None,
             &no_marks(),
             &AtomicBool::new(false),
+            None,
         );
         (result.exit, transport)
     }
@@ -2598,6 +2670,7 @@ mod tests {
             None,
             &no_marks(),
             &AtomicBool::new(false),
+            None,
         );
 
         assert!(matches!(result.exit, SessionExit::Disconnected));
@@ -2630,6 +2703,7 @@ mod tests {
             None,
             &no_marks(),
             &AtomicBool::new(false),
+            None,
         );
 
         assert!(matches!(result.exit, SessionExit::Disconnected));
@@ -2674,6 +2748,7 @@ mod tests {
             None,
             &no_marks(),
             &AtomicBool::new(false),
+            None,
         );
 
         assert!(result.heard_from_primary);
@@ -2717,6 +2792,7 @@ mod tests {
             None,
             &no_marks(),
             &AtomicBool::new(false),
+            None,
         );
 
         assert!(matches!(result.exit, SessionExit::Disconnected));
@@ -2765,6 +2841,7 @@ mod tests {
             None,
             &no_marks(),
             &AtomicBool::new(false),
+            None,
         );
 
         assert!(matches!(result.exit, SessionExit::Disconnected));
@@ -2830,6 +2907,7 @@ mod tests {
                 None,
                 &no_marks(),
                 &AtomicBool::new(false),
+                None,
             );
 
             assert!(matches!(result.exit, SessionExit::Disconnected));
@@ -2876,6 +2954,7 @@ mod tests {
             None,
             &no_marks(),
             &AtomicBool::new(false),
+            None,
         );
 
         assert!(matches!(result.exit, SessionExit::Fatal(_)));
@@ -2933,6 +3012,7 @@ mod tests {
                 None,
                 &no_marks(),
                 &AtomicBool::new(false),
+                None,
             );
 
             assert!(matches!(result.exit, SessionExit::Shutdown));
@@ -2973,6 +3053,7 @@ mod tests {
             Some(&utilization),
             &no_marks(),
             &AtomicBool::new(false),
+            None,
         );
 
         let busy = utilization.busy.load(Ordering::Relaxed);
@@ -3002,6 +3083,7 @@ mod tests {
             &mut slot_buf,
             &no_marks(),
             &AtomicBool::new(false),
+            None,
         );
 
         assert!(outcome.frame_err.is_none(), "no fatal exit");
@@ -3040,6 +3122,7 @@ mod tests {
             &mut slot_buf,
             &no_marks(),
             &AtomicBool::new(false),
+            None,
         );
         assert!(outcome.frame_err.is_none());
         assert_eq!(outcome.accum_end_sequence, 6);
@@ -3071,6 +3154,7 @@ mod tests {
             &mut slot_buf,
             &no_marks(),
             &AtomicBool::new(false),
+            None,
         );
         assert!(first.frame_err.is_none());
         assert_eq!(
@@ -3088,6 +3172,7 @@ mod tests {
             &mut slot_buf,
             &no_marks(),
             &AtomicBool::new(false),
+            None,
         );
         assert!(second.frame_err.is_none());
         assert_eq!(second.accum_end_sequence, total as u64);
@@ -3118,6 +3203,7 @@ mod tests {
             &mut slot_buf,
             &no_marks(),
             &AtomicBool::new(false),
+            None,
         );
         assert!(outcome.frame_err.is_none());
         assert_eq!(outcome.accum_end_sequence, 11);
@@ -3230,6 +3316,7 @@ mod tests {
             &no_marks(),
             &cell,
             &AtomicBool::new(false),
+            None,
         );
         assert!(outcome.frame_err.is_none());
         assert_eq!(outcome.accum_end_sequence, 4);
@@ -3263,6 +3350,7 @@ mod tests {
             &no_marks(),
             &cell,
             &AtomicBool::new(false),
+            None,
         );
         assert!(outcome.frame_err.is_none());
         assert_eq!(outcome.accum_end_sequence, 6);
@@ -3279,6 +3367,7 @@ mod tests {
             &no_marks(),
             &cell,
             &AtomicBool::new(false),
+            None,
         );
         assert!(matches!(
             outcome.frame_err,
@@ -3341,6 +3430,7 @@ mod tests {
             &mut slot_buf,
             &rotations,
             &AtomicBool::new(false),
+            None,
         );
 
         assert!(outcome.frame_err.is_none(), "rotate at boundary is valid");
@@ -3379,6 +3469,7 @@ mod tests {
             &mut slot_buf,
             &marks,
             &AtomicBool::new(false),
+            None,
         );
 
         assert!(outcome.frame_err.is_none());
@@ -3419,6 +3510,7 @@ mod tests {
             &mut slot_buf,
             &rotations,
             &AtomicBool::new(false),
+            None,
         );
 
         assert!(outcome.frame_err.is_none(), "stale rotate is not fatal");
@@ -3450,6 +3542,7 @@ mod tests {
             &mut slot_buf,
             &rotations,
             &AtomicBool::new(false),
+            None,
         );
 
         assert!(
@@ -3479,6 +3572,7 @@ mod tests {
             &mut slot_buf,
             &no_marks(),
             &AtomicBool::new(false),
+            None,
         );
 
         assert!(outcome.frame_err.is_some(), "oversize => fatal");
@@ -3505,6 +3599,7 @@ mod tests {
             &mut slot_buf,
             &no_marks(),
             &AtomicBool::new(false),
+            None,
         );
 
         assert!(outcome.frame_err.is_some(), "unknown primary msg => fatal");
@@ -3530,6 +3625,7 @@ mod tests {
             &mut slot_buf,
             &no_marks(),
             &AtomicBool::new(false),
+            None,
         );
 
         assert!(outcome.frame_err.is_none());
@@ -3554,6 +3650,7 @@ mod tests {
             &mut slot_buf,
             &no_marks(),
             &AtomicBool::new(false),
+            None,
         );
 
         assert!(outcome.frame_err.is_none());
@@ -3578,6 +3675,7 @@ mod tests {
             &mut slot_buf,
             &no_marks(),
             &AtomicBool::new(false),
+            None,
         );
 
         assert!(outcome.frame_err.is_none());
@@ -3618,6 +3716,7 @@ mod tests {
                 serviced += 1;
                 journaled.extend(drain(&mut consumer).into_iter().map(|s| s.sequence));
             },
+            None,
         );
 
         assert!(outcome.frame_err.is_none(), "{:?}", outcome.frame_err);
@@ -3648,6 +3747,7 @@ mod tests {
             &AtomicBool::new(false),
             &mut acks,
             &mut || serviced += 1,
+            None,
         );
 
         assert!(outcome.frame_err.is_none());
@@ -3759,6 +3859,7 @@ mod tests {
             &mut slot_buf,
             &no_marks(),
             &AtomicBool::new(false),
+            None,
         );
 
         assert!(
@@ -3794,6 +3895,7 @@ mod tests {
             &mut slot_buf,
             &no_marks(),
             &AtomicBool::new(false),
+            None,
         );
 
         assert!(
@@ -3829,6 +3931,7 @@ mod tests {
             &mut slot_buf,
             &no_marks(),
             &AtomicBool::new(false),
+            None,
         );
 
         assert!(
@@ -3917,6 +4020,7 @@ mod tests {
             None,
             &no_marks(),
             &AtomicBool::new(false),
+            None,
         );
 
         assert!(
@@ -3975,6 +4079,7 @@ mod tests {
             &mut slot_buf,
             &no_marks(),
             &AtomicBool::new(false),
+            None,
         );
 
         assert!(
@@ -4023,6 +4128,7 @@ mod tests {
             &mut slot_buf,
             &no_marks(),
             &AtomicBool::new(false),
+            None,
         );
 
         assert!(
@@ -4068,6 +4174,7 @@ mod tests {
             None,
             &no_marks(),
             &AtomicBool::new(false),
+            None,
         );
 
         assert!(
@@ -4171,6 +4278,7 @@ mod tests {
             &AtomicBool::new(false),
             &mut acks,
             &mut || {},
+            None,
         );
 
         match &outcome.frame_err {
@@ -4230,6 +4338,7 @@ mod tests {
             None,
             &no_marks(),
             &AtomicBool::new(false),
+            None,
         );
 
         assert!(
@@ -4283,6 +4392,7 @@ mod tests {
             None,
             &no_marks(),
             &AtomicBool::new(false),
+            None,
         );
 
         assert!(
@@ -4469,6 +4579,415 @@ mod tests {
             let err = receive_chunked_body(&mut src, &tmp, 4, "snapshot").unwrap_err();
             assert!(err.to_string().contains("SnapshotChunk/End"), "{err}");
             assert!(!tmp.exists());
+        }
+    }
+
+    /// The receiver's output check: the primary's `Digest` frames read
+    /// from the stream, against a board this test closes windows on as
+    /// the replica's drain would.
+    mod output_checks {
+        use super::*;
+        use crate::replication::output_check::OutputCheck;
+        use melin_transport_core::WireSeq;
+        use melin_transport_core::output_digest::{
+            BoardSize, DigestKind, OUTPUT_DIGEST_WINDOW as K, ReportBody, WindowFolder,
+            digest_board,
+        };
+        use melin_transport_core::replication::protocol::encode_digest;
+        use std::sync::Arc;
+
+        /// The report at `position`; changed at `fault`.
+        fn body(position: u64, fault: Option<u64>) -> Vec<u8> {
+            let mut body = position.to_le_bytes().to_vec();
+            if fault == Some(position) {
+                body.push(0xEE);
+            }
+            body
+        }
+
+        /// Fold one report per position `from..=through` into `folder`,
+        /// and close its windows through `through`.
+        fn fold(folder: &mut WindowFolder, from: u64, through: u64, fault: Option<u64>) {
+            for position in from..=through {
+                let body = body(position, fault);
+                folder.fold(WireSeq::new(position), ReportBody::Encoded(&body));
+            }
+            folder.close_through(WireSeq::new(through));
+        }
+
+        /// A primary started at `first_live`, through `through`: the
+        /// `Digest` frame for each of its windows, by window end.
+        fn primary(first_live: u64, through: u64) -> Vec<(u64, Vec<u8>)> {
+            let slots = (through / K) as usize + 2;
+            let (writer, board) = digest_board(BoardSize::new(slots).expect("size"));
+            let mut folder = WindowFolder::new(WireSeq::new(first_live), writer);
+            fold(&mut folder, first_live, through, None);
+            let first = folder.first_window_end().get();
+            (first..=through)
+                .step_by(K as usize)
+                .map(|end| {
+                    let melin_transport_core::output_digest::BoardLookup::Closed(window) =
+                        board.get(WireSeq::new(end))
+                    else {
+                        panic!("window {end} closed");
+                    };
+                    let frame = encode_digest(DigestKind::Output, window.end, window.chain);
+                    (end, frame.to_vec())
+                })
+                .collect()
+        }
+
+        /// A replica's check over a board of `slots` windows, stopping
+        /// through `control`'s latch, and the folder its drain would
+        /// close windows with.
+        fn replica(
+            control: &crate::replication::ReplicaControlPlane,
+            slots: usize,
+        ) -> (OutputCheck, WindowFolder) {
+            let (writer, board) = digest_board(BoardSize::new(slots).expect("size"));
+            let check = OutputCheck::new(
+                control.latch.clone(),
+                board,
+                WireSeq::new(1),
+                Arc::clone(&control.output_checks),
+            );
+            (check, WindowFolder::new(WireSeq::new(1), writer))
+        }
+
+        fn checks(control: &crate::replication::ReplicaControlPlane) -> u64 {
+            control.output_checks.load(Ordering::Relaxed)
+        }
+
+        /// Hand `frames` to the receiver's frame processing with the
+        /// stream at `position`.
+        fn receive(
+            check: Option<&mut OutputCheck>,
+            frames: &[&[u8]],
+            position: u64,
+        ) -> StreamingFrameOutcome {
+            let (mut producer, _consumer) = ring(16);
+            let mut slot_buf = Vec::new();
+            let buf: Vec<u8> = frames.concat();
+            stream_frames(
+                &buf,
+                &mut producer,
+                position,
+                &mut slot_buf,
+                &no_marks(),
+                &AtomicBool::new(false),
+                check,
+            )
+            .0
+        }
+
+        /// A digest for a window past what the stream has delivered is a
+        /// gap, as a skipped slot is; one at the stream position is not.
+        #[test]
+        fn a_digest_ahead_of_the_stream_is_a_gap() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let control = control_tripping_in(dir.path());
+            let (mut check, _folder) = replica(&control, 8);
+            let frames = primary(1, 3 * K);
+            let outcome = receive(Some(&mut check), &[&frames[2].1], 3 * K - 1);
+            assert!(matches!(
+                outcome.frame_err,
+                Some(FrameError::SequenceGap(_))
+            ));
+            let outcome = receive(Some(&mut check), &[&frames[2].1], 3 * K);
+            assert!(outcome.frame_err.is_none());
+            assert!(!control.latch.is_tripped());
+        }
+
+        /// The first usable value anchors; each later one, once this copy
+        /// has closed its window, is a check, counted once.
+        #[test]
+        fn later_values_are_compared_and_counted() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let control = control_tripping_in(dir.path());
+            let (mut check, mut folder) = replica(&control, 8);
+            let frames = primary(1, 6 * K);
+            // The primary's values arrive first and wait.
+            let all: Vec<&[u8]> = frames.iter().map(|(_, f)| &f[..]).collect();
+            let outcome = receive(Some(&mut check), &all, 6 * K);
+            assert!(outcome.frame_err.is_none());
+            assert_eq!(checks(&control), 0, "nothing of this copy's closed yet");
+            fold(&mut folder, 1, 6 * K, None);
+            assert_eq!(check.absorb(), Checked::Continue);
+            assert_eq!(checks(&control), 5, "every value after the anchor");
+            // Re-delivered after a reconnect's overlap: not counted again.
+            let outcome = receive(Some(&mut check), &all, 6 * K);
+            assert!(outcome.frame_err.is_none());
+            assert_eq!(checks(&control), 5);
+            assert!(!control.latch.is_tripped());
+        }
+
+        /// A report that differs in a window the primary never sends a
+        /// value for is caught at the next value it does send: the
+        /// replica stops, publishes nothing more, sends its stopped ack and
+        /// takes the primary's `Halt`; the marker records the stop.
+        #[test]
+        fn a_differing_report_stops_the_replica_and_tells_its_primary() {
+            let (mut producer, consumer) = ring(16);
+            let cursor = journal_cursor(u64::MAX);
+            let shutdown = AtomicBool::new(false);
+            let dir = tempfile::tempdir().expect("tempdir");
+            let control = control_tripping_in(dir.path());
+            let (mut check, mut folder) = replica(&control, 8);
+            fold(&mut folder, 1, 4 * K, Some(2 * K + 9));
+            let frames = primary(1, 4 * K);
+            let mut transport = MockTransport::new();
+            transport.halt_on_stopped_ack = true;
+            // Window 1 anchors, window 4 is compared; 2 and 3 never sent.
+            // An entry after the mismatch is never published.
+            let mut data = frames[0].1.clone();
+            data.extend_from_slice(&frames[3].1);
+            append_input_batch_frame(&mut data, &[slot(4 * K + 1, 0x01)]);
+            transport.push_data(data);
+
+            let result = streaming_loop::<MockTransport, TestEvent>(
+                &mut transport,
+                &mut producer,
+                &cursor,
+                &shutdown,
+                &control,
+                4,
+                WaitStrategy::SpinThenYield,
+                4 * K,
+                Vec::new(),
+                None,
+                &no_marks(),
+                &AtomicBool::new(false),
+                Some(&mut check),
+            );
+
+            assert!(matches!(
+                result.exit,
+                SessionExit::Stopped(StopNotice::Answered)
+            ));
+            let Some(HaltCause::Detected(divergence)) = control.latch.cause() else {
+                panic!("stopped on its own detection: {:?}", control.latch.cause());
+            };
+            assert_eq!(divergence.end.get(), 4 * K);
+            let (from, through) = divergence.positions();
+            assert!(from.get() <= 2 * K + 9 && 2 * K + 9 <= through.get());
+            assert_eq!(transport.stopped_acks.len(), 1);
+            assert_eq!(
+                (
+                    transport.stopped_acks[0].acked_sequence,
+                    transport.stopped_acks[0].in_memory_sequence
+                ),
+                (4 * K, 4 * K),
+                "the positions it held, frozen"
+            );
+            assert!(transport.sent_acks.is_empty(), "{:?}", transport.sent_acks);
+            let mut consumer = consumer;
+            assert!(drain(&mut consumer).is_empty(), "nothing published after");
+            assert!(dir.path().join("replica.journal.diverged").exists());
+            assert_eq!(checks(&control), 0);
+        }
+
+        /// The primary's value arrives first and waits; the mismatch is
+        /// found when this copy's drain closes the window, by the loop's
+        /// own pass over its output with no frame to hand: the replica
+        /// stops all the same, sends its stopped ack and publishes nothing
+        /// that arrives after.
+        #[test]
+        fn a_mismatch_found_as_this_copy_closes_its_window_stops_the_replica() {
+            let (mut producer, consumer) = ring(16);
+            let cursor = journal_cursor(u64::MAX);
+            let shutdown = AtomicBool::new(false);
+            let dir = tempfile::tempdir().expect("tempdir");
+            let control = control_tripping_in(dir.path());
+            let (mut check, mut folder) = replica(&control, 8);
+            let frames = primary(1, 4 * K);
+            let mut transport = MockTransport::new();
+            transport.halt_on_stopped_ack = true;
+            // Read 1: window 1's value and window 4's, before this copy
+            // has closed either, so both wait.
+            let mut data = frames[0].1.clone();
+            data.extend_from_slice(&frames[3].1);
+            transport.push_data(data);
+            // Read 2: nothing arrives, and the drain closes this copy's
+            // windows through 4, one report in window 3 differing.
+            // Read 3: an entry the stopped replica must not publish.
+            let mut entry = Vec::new();
+            append_input_batch_frame(&mut entry, &[slot(4 * K + 1, 0x01)]);
+            transport.push_data(Vec::new());
+            transport.push_data(entry);
+            // The first read that finds the node stopped.
+            let seen_stopped_at = std::rc::Rc::new(std::cell::Cell::new(None));
+            let seen = std::rc::Rc::clone(&seen_stopped_at);
+            let latch = control.latch.clone();
+            transport.on_read = Some(Box::new(move |reads| {
+                if latch.is_tripped() && seen.get().is_none() {
+                    seen.set(Some(reads));
+                }
+                if reads == 2 {
+                    fold(&mut folder, 1, 4 * K, Some(2 * K + 9));
+                }
+            }));
+
+            let result = streaming_loop::<MockTransport, TestEvent>(
+                &mut transport,
+                &mut producer,
+                &cursor,
+                &shutdown,
+                &control,
+                4,
+                WaitStrategy::SpinThenYield,
+                4 * K,
+                Vec::new(),
+                None,
+                &no_marks(),
+                &AtomicBool::new(false),
+                Some(&mut check),
+            );
+
+            assert!(matches!(
+                result.exit,
+                SessionExit::Stopped(StopNotice::Answered)
+            ));
+            assert_eq!(
+                seen_stopped_at.get(),
+                Some(3),
+                "stopped on the pass after the windows closed, with no frame"
+            );
+            let Some(HaltCause::Detected(divergence)) = control.latch.cause() else {
+                panic!("stopped on its own detection: {:?}", control.latch.cause());
+            };
+            assert_eq!(divergence.end.get(), 4 * K);
+            assert_eq!(transport.stopped_acks.len(), 1);
+            assert_eq!(
+                (
+                    transport.stopped_acks[0].acked_sequence,
+                    transport.stopped_acks[0].in_memory_sequence
+                ),
+                (4 * K, 4 * K),
+                "the positions it held, frozen"
+            );
+            assert!(transport.sent_acks.is_empty(), "{:?}", transport.sent_acks);
+            let mut consumer = consumer;
+            assert!(drain(&mut consumer).is_empty(), "nothing published after");
+            assert!(dir.path().join("replica.journal.diverged").exists());
+        }
+
+        /// A window of this copy overwritten before it was read breaks the
+        /// run: the value past the gap anchors anew and is not a check,
+        /// and the one after it is.
+        #[test]
+        fn a_lost_local_window_breaks_the_run_and_anchors_anew() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let control = control_tripping_in(dir.path());
+            let (mut check, mut folder) = replica(&control, 2);
+            let frames = primary(1, 8 * K);
+            fold(&mut folder, 1, 2 * K, None);
+            check.absorb();
+            let outcome = receive(Some(&mut check), &[&frames[0].1, &frames[1].1], 2 * K);
+            assert!(outcome.frame_err.is_none());
+            assert_eq!(checks(&control), 1);
+            // Windows 3 to 6 close before the next read: 3 and 4 are lost.
+            fold(&mut folder, 2 * K + 1, 6 * K, None);
+            check.absorb();
+            let outcome = receive(Some(&mut check), &[&frames[5].1], 6 * K);
+            assert!(outcome.frame_err.is_none());
+            assert_eq!(checks(&control), 1, "no check spans the gap");
+            fold(&mut folder, 6 * K + 1, 7 * K, None);
+            check.absorb();
+            let outcome = receive(Some(&mut check), &[&frames[6].1], 7 * K);
+            assert!(outcome.frame_err.is_none());
+            assert_eq!(checks(&control), 2);
+            assert!(!control.latch.is_tripped());
+        }
+
+        /// A second session, against a primary restarted with its chain
+        /// started afresh: the check anchors on the new chain and never
+        /// mismatches.
+        #[test]
+        fn a_session_against_a_restarted_primary_anchors_anew() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let control = control_tripping_in(dir.path());
+            let (mut check, mut folder) = replica(&control, 16);
+            let first = primary(1, 4 * K);
+            let restarted = primary(4 * K + 1, 10 * K);
+            fold(&mut folder, 1, 10 * K, None);
+            check.begin_session();
+            let outcome = receive(Some(&mut check), &[&first[0].1, &first[3].1], 4 * K);
+            assert!(outcome.frame_err.is_none());
+            check.absorb();
+            assert_eq!(checks(&control), 1);
+            check.begin_session();
+            let all: Vec<&[u8]> = restarted.iter().map(|(_, f)| &f[..]).collect();
+            let outcome = receive(Some(&mut check), &all, 10 * K);
+            assert!(outcome.frame_err.is_none());
+            check.absorb();
+            assert_eq!(checks(&control), 1 + restarted.len() as u64 - 1);
+            assert!(!control.latch.is_tripped());
+        }
+
+        /// With output digests off, every frame is read and dropped, and
+        /// the stream goes on: no stop, the entries after published.
+        #[test]
+        fn with_digests_off_the_frames_are_dropped() {
+            let frames = primary(1, 2 * K);
+            let mut data = frames[0].1.clone();
+            data.extend_from_slice(&frames[1].1);
+            append_input_batch_frame(&mut data, &[slot(2 * K + 1, 0x01)]);
+            let outcome = receive(None, &[&data], 2 * K);
+            assert!(outcome.frame_err.is_none());
+            assert_eq!(outcome.accum_end_sequence, 2 * K + 1);
+            // Still checked against the protocol.
+            let outcome = receive(None, &[&frames[1].1], 2 * K - 1);
+            assert!(matches!(
+                outcome.frame_err,
+                Some(FrameError::SequenceGap(_))
+            ));
+        }
+
+        /// A frame of a kind this build does not know is skipped and the
+        /// stream goes on; kind 0, or a window end off the grid, is the
+        /// primary's protocol bug, a fatal error rather than a divergence.
+        #[test]
+        fn unknown_kinds_are_skipped_and_malformed_frames_are_fatal() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let control = control_tripping_in(dir.path());
+            let (mut check, _folder) = replica(&control, 8);
+            let frames = primary(1, K);
+            let with_kind = |kind: u8| {
+                let mut frame = frames[0].1.clone();
+                // The kind byte follows the length prefix and the tag.
+                frame[5] = kind;
+                frame
+            };
+            let outcome = receive(Some(&mut check), &[&with_kind(9), &with_kind(9)], K);
+            assert!(outcome.frame_err.is_none());
+            let outcome = receive(Some(&mut check), &[&with_kind(0)], K);
+            assert!(matches!(outcome.frame_err, Some(FrameError::Fatal(_))));
+            let off_grid = encode_digest(
+                DigestKind::Output,
+                WireSeq::new(K + 1),
+                melin_transport_core::output_digest::CHAIN_SEED,
+            );
+            let outcome = receive(Some(&mut check), &[&off_grid], 2 * K);
+            assert!(matches!(outcome.frame_err, Some(FrameError::Fatal(_))));
+            assert!(!control.latch.is_tripped());
+        }
+
+        /// The count is the node's, not the pipeline's: a check built for
+        /// a rebuilt pipeline keeps adding to it.
+        #[test]
+        fn a_rebuilt_pipelines_check_counts_into_the_same_total() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let control = control_tripping_in(dir.path());
+            let frames = primary(1, 2 * K);
+            let all: Vec<&[u8]> = frames.iter().map(|(_, f)| &f[..]).collect();
+            for _pipeline in 0..2 {
+                let (mut check, mut folder) = replica(&control, 8);
+                fold(&mut folder, 1, 2 * K, None);
+                check.absorb();
+                let outcome = receive(Some(&mut check), &all, 2 * K);
+                assert!(outcome.frame_err.is_none());
+            }
+            assert_eq!(checks(&control), 2);
         }
     }
 }

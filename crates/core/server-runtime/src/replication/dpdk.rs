@@ -1886,8 +1886,9 @@ where
         lineage_ack_policy,
         pipeline_healthy,
         // Read and tripped by the streaming loop, which takes `control`
-        // whole.
-        latch: _,
+        // whole, and by each pipeline's output check, built with it.
+        latch,
+        output_checks,
     } = control;
     journal_tip.advance(melin_transport_core::WireSeq::new(
         state.position.last_sequence,
@@ -2271,6 +2272,8 @@ where
                         Arc::clone(pipeline_healthy),
                         sizing,
                         digest_encoder.clone(),
+                        latch,
+                        output_checks,
                     )?;
                     // Pipeline children are spawned and self-pinned. Now safe
                     // to pin the receive thread — mirrors the primary's reader
@@ -2293,6 +2296,7 @@ where
             let journal_cursor = p.journal_cursor.as_ref();
             let stream_marks = &p.stream_marks;
             let journal_failed = &p.journal_failed;
+            let output_check = p.output_check.as_deref_mut();
             let mut dpdk_transport = DpdkReceiverTransport {
                 transport: &mut *transport,
                 handle,
@@ -2314,6 +2318,7 @@ where
                 None,
                 stream_marks,
                 journal_failed,
+                output_check,
             );
             send_buf = dpdk_transport.send_buf;
             r

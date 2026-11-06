@@ -99,6 +99,12 @@ pub struct HealthState {
     /// thread. `None` when the node runs without control-plane raft
     /// (no `--raft-bind`).
     pub raft: Option<Arc<RaftStatus>>,
+    /// The replica's output checks: windows of its output found equal to
+    /// its primary's, `melin_output_checks_total`. Node-lifetime, so it
+    /// keeps counting across every pipeline a resync rebuilds; one writer
+    /// (the receiver), a count that cannot wrap. `None` on a primary,
+    /// which checks nothing, and the series is omitted.
+    pub output_checks: Option<Arc<AtomicU64>>,
 }
 
 /// A [`QueueCursor`] that always reads 0 — used for the pipeline-cursor
@@ -135,6 +141,7 @@ impl HealthState {
         fence_state: Arc<crate::fence::FenceState>,
         raft: Option<Arc<RaftStatus>>,
         pipeline_healthy: Arc<AtomicBool>,
+        output_checks: Arc<AtomicU64>,
     ) -> Self {
         Self {
             active_connections: Arc::new(AtomicU64::new(0)),
@@ -160,6 +167,7 @@ impl HealthState {
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
             raft,
+            output_checks: Some(output_checks),
         }
     }
 }
@@ -597,6 +605,8 @@ struct HealthSnapshot {
     /// Control-plane raft election state; `None` when raft isn't
     /// configured on this node.
     raft: Option<RaftSnapshot>,
+    /// [`HealthState::output_checks`]; `None` omits the series.
+    output_checks: Option<u64>,
 }
 
 /// Point-in-time copy of [`RaftStatus`] for the formatters.
@@ -862,6 +872,10 @@ impl HealthSnapshot {
                 running: r.running.load(Ordering::Relaxed),
                 quorum_ack_age_ms: r.millis_since_quorum_ack(),
             }),
+            output_checks: state
+                .output_checks
+                .as_ref()
+                .map(|checks| checks.load(Ordering::Relaxed)),
         }
     }
 
@@ -1073,6 +1087,15 @@ impl HealthSnapshot {
                 "# HELP melin_ack_policy_journaled Ack policy the newest journaled policy change puts in force, as its wire byte.\n\
                  # TYPE melin_ack_policy_journaled gauge\n\
                  melin_ack_policy_journaled {byte}\n",
+            );
+        }
+        if let Some(checks) = self.output_checks {
+            // Best-effort like the main block above.
+            let _ = write!(
+                c,
+                "# HELP melin_output_checks_total Windows of this replica's output found equal to its primary's. Under traffic it should keep growing; flat under traffic means the comparison has stopped.\n\
+                 # TYPE melin_output_checks_total counter\n\
+                 melin_output_checks_total {checks}\n",
             );
         }
         // Raft gauges only exist on raft-enabled nodes — omitting the
@@ -1450,7 +1473,12 @@ mod tests {
 
         let handle = spawn(
             addr,
-            HealthState::for_replica(fence, Some(raft), Arc::new(AtomicBool::new(true))),
+            HealthState::for_replica(
+                fence,
+                Some(raft),
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicU64::new(0)),
+            ),
             Arc::clone(&shutdown),
         )
         .unwrap();
@@ -1491,7 +1519,12 @@ mod tests {
 
         let handle = spawn(
             addr,
-            HealthState::for_replica(fence, Some(raft), Arc::new(AtomicBool::new(true))),
+            HealthState::for_replica(
+                fence,
+                Some(raft),
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicU64::new(0)),
+            ),
             Arc::clone(&shutdown),
         )
         .unwrap();
@@ -1509,14 +1542,43 @@ mod tests {
     /// The Prometheus body for a replica whose control plane is `raft`,
     /// formatted straight from a snapshot (no listener).
     fn replica_prometheus_body(raft: &Arc<RaftStatus>) -> String {
+        replica_body_with_checks(raft, Arc::new(AtomicU64::new(0)))
+    }
+
+    /// The same, with the replica's output checks at `checks`.
+    fn replica_body_with_checks(raft: &Arc<RaftStatus>, checks: Arc<AtomicU64>) -> String {
         let state = HealthState::for_replica(
             Arc::new(crate::fence::FenceState::new(0)),
             Some(Arc::clone(raft)),
             Arc::new(AtomicBool::new(true)),
+            checks,
         );
         let mut buf = [0u8; 16384];
         let len = HealthSnapshot::collect(&state).write_prometheus(&mut buf);
         String::from_utf8(buf[..len].to_vec()).unwrap()
+    }
+
+    /// A replica exports its output checks as a counter, read live; a
+    /// primary, which checks nothing, omits the series.
+    #[test]
+    fn output_checks_are_a_replica_counter() {
+        let checks = Arc::new(AtomicU64::new(0));
+        let raft = Arc::new(RaftStatus::new(1));
+        let body = replica_body_with_checks(&raft, Arc::clone(&checks));
+        assert!(
+            body.contains("# TYPE melin_output_checks_total counter\n"),
+            "{body}"
+        );
+        assert!(body.contains("melin_output_checks_total 0\n"), "{body}");
+        checks.store(17, Ordering::Relaxed);
+        let body = replica_body_with_checks(&raft, checks);
+        assert!(body.contains("melin_output_checks_total 17\n"), "{body}");
+
+        let (addr, _events, _healthy, shutdown, handle) = start_health(0, 0, u64::MAX);
+        let body = http_request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(!body.contains("melin_output_checks_total"), "{body}");
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
     }
 
     #[test]
@@ -1577,7 +1639,12 @@ mod tests {
 
         let handle = spawn(
             addr,
-            HealthState::for_replica(fence, Some(raft), Arc::clone(&pipeline_healthy)),
+            HealthState::for_replica(
+                fence,
+                Some(raft),
+                Arc::clone(&pipeline_healthy),
+                Arc::new(AtomicU64::new(0)),
+            ),
             Arc::clone(&shutdown),
         )
         .unwrap();
@@ -1719,6 +1786,7 @@ mod tests {
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
             raft: None,
+            output_checks: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -1847,6 +1915,7 @@ mod tests {
                 matching_utilization: Arc::new(StageUtilization::new()),
                 response_utilization: Arc::new(StageUtilization::new()),
                 raft: None,
+                output_checks: None,
             },
             Arc::clone(&shutdown),
         );
@@ -1884,6 +1953,7 @@ mod tests {
                 matching_utilization: Arc::new(StageUtilization::new()),
                 response_utilization: Arc::new(StageUtilization::new()),
                 raft: None,
+                output_checks: None,
             },
             Arc::new(AtomicBool::new(false)),
         );
@@ -2047,6 +2117,7 @@ mod tests {
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
             raft: None,
+            output_checks: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -2118,6 +2189,7 @@ mod tests {
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
             raft: None,
+            output_checks: None,
         };
         let handle = std::thread::spawn(move || {
             health_loop(&listener, &state, &s);
@@ -2310,6 +2382,7 @@ mod tests {
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
             raft: None,
+            output_checks: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -2379,6 +2452,7 @@ mod tests {
             matching_utilization: matching_util,
             response_utilization: response_util,
             raft: None,
+            output_checks: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -2459,6 +2533,7 @@ mod tests {
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
             raft: None,
+            output_checks: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -2513,6 +2588,7 @@ mod tests {
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
             raft: None,
+            output_checks: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -2771,6 +2847,7 @@ mod tests {
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
             raft: Some(full_raft_status()),
+            output_checks: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -2869,6 +2946,7 @@ mod tests {
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
             raft: None,
+            output_checks: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -2947,6 +3025,7 @@ mod tests {
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
             raft: None,
+            output_checks: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -3122,6 +3201,7 @@ mod tests {
             matching_utilization: matching_util,
             response_utilization: response_util,
             raft: None,
+            output_checks: None,
         };
 
         let handle = std::thread::spawn(move || {
