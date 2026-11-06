@@ -28,6 +28,13 @@ to change [divergence-detection-2026-10.md](divergence-detection-2026-10.md)
   The confirmation starts after the grace ran out, so it covers Part 2's
   tightened-gate concern without the formula proposed there. The plan's
   open question 3 is closed on that basis.
+- **The plan trimmed (2026-11-06).** The plan was cut to the essentials
+  of detection, and renumbered. Every `plan:N`, step and decision number
+  cited here refers to the full plan, in git history (the plan file at
+  b403d38b). The trimmed plan keeps the data-plane stop but defers the
+  stopped primary's linger: only replicas detect there, so a primary
+  stops only once a replica has, and with voters capped at three
+  (`MAX_VOTERS`), two stopped voters already leave no quorum.
 
 Code is cited as `file:line` against branch `plan/state-divergence-detection`
 at 3d0ec3d4. Bare names are in `crates/core/raft/src` (`driver.rs`,

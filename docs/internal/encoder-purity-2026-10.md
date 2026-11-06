@@ -19,9 +19,11 @@ the text below:
   measured over DPDK: no bench host with a NIC was available.
 
 It was to be implemented on its own branch off `main`. It is independent
-of the divergence-detection plan (not yet written), which is to build on
-it: that plan's `encode_report_body` is to wrap `frame_app_response` and
-so inherit both changes.
+of the [divergence-detection plan](divergence-detection-2026-10.md), which
+builds on it: that plan's decision 4 moves the body encode, zeroing and
+purity check included, into `encode_report_body`, which
+`frame_app_response` then calls, so a replica's digest fold gets both
+changes with no second copy.
 
 ## The problem
 
