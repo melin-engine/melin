@@ -44,6 +44,7 @@ pub mod lineage;
 /// both paths, shared by every role that reads, writes, serves or
 /// archives the snapshot.
 pub mod node_store;
+pub mod output_digest;
 pub mod pipeline;
 pub mod replica_presence;
 /// Replication wire protocol, journal-file catch-up, ack queueing,

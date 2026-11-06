@@ -1201,6 +1201,7 @@ dependencies = [
 name = "melin-transport-core"
 version = "0.22.0"
 dependencies = [
+ "blake3",
  "crc32c",
  "hdrhistogram",
  "io-uring",
@@ -1213,6 +1214,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "tracing-subscriber",
+ "twox-hash",
  "zerocopy",
 ]
 
@@ -2116,6 +2118,12 @@ dependencies = [
  "tracing-core",
  "tracing-log",
 ]
+
+[[package]]
+name = "twox-hash"
+version = "2.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
 
 [[package]]
 name = "typenum"

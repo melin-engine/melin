@@ -76,6 +76,10 @@ SKIPS=(
     --skip replication::validate
     --skip replication::archive
     --skip replication::catchup
+    # Not I/O: `twox-hash` hashes in SIMD (NEON with inline assembly on
+    # aarch64), which Miri cannot execute. No `unsafe` of ours is in it;
+    # the digest board's tests (`output_digest::tests`) still run.
+    --skip output_digest::folder_tests
 )
 
 echo "==> miri: melin-transport-core (no-persist)"

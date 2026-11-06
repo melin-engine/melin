@@ -52,6 +52,9 @@ libc = { workspace = true }
 tracing = { workspace = true }
 # Only under `test-utils`, for `test_logs`.
 tracing-subscriber = { workspace = true, optional = true }
+# XXH3-128 for the output digest (`output_digest`); features chosen in the
+# workspace manifest.
+twox-hash = { workspace = true }
 # Typed views over raw byte buffers for the replication wire format —
 # replaces field-by-field extend_from_slice / try_into chains with a
 # single struct write/read. derive feature for `FromBytes` / `IntoBytes`.
@@ -65,6 +68,9 @@ melin-journal = { workspace = true }
 melin-wire-protocol = { workspace = true }
 
 [dev-dependencies]
+# The fold micro-benchmark (`examples/fold_bench.rs`) compares XXH3-128
+# with it, the hash the journal chain uses.
+blake3 = { workspace = true }
 tempfile = "3"
 proptest = "1"
 # The pipeline tests capture the stages' tracing output so a timed-out
