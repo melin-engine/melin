@@ -39,6 +39,7 @@ use crate::response_frame::{EarlyReplyBuf, MAX_APP_FRAME, MAX_EARLY_REPLY, encod
 use crate::response_loop::{
     self, Egress, EgressRecorders, LoopInputs, SlotFrames, SlotOutcome, StageNames,
 };
+use melin_transport_core::divergence::DivergenceLatch;
 use melin_transport_core::output_digest::OutputDigester;
 
 #[cfg(feature = "latency-trace")]
@@ -166,6 +167,9 @@ pub fn run<A: Application>(
     // Digests every report the stage reads, as on the kernel stage
     // (`response::Response::digester`); `None` with output digests off.
     digester: Option<OutputDigester>,
+    // The node's divergence stop, as on the kernel stage
+    // (`response::Response::latch`).
+    latch: DivergenceLatch,
     // Test seam, the kernel stage's `Response::pause_after_control_drain`:
     // called once per iteration right after the control channel has been
     // drained, so a test can hold the stage there, and with it every early
@@ -194,6 +198,7 @@ pub fn run<A: Application>(
             encoder,
             early_replies,
             digester,
+            latch,
             #[cfg(test)]
             pause_after_control_drain,
         },
@@ -1337,6 +1342,7 @@ mod tests {
                             grace: Duration::ZERO,
                         }),
                         None,
+                        crate::tests::idle_latch(),
                         None,
                     )
                 });
@@ -1512,6 +1518,7 @@ mod tests {
                     early_replies,
                     None,
                     None,
+                    crate::tests::idle_latch(),
                     pause_after_control_drain,
                 )
             });
@@ -1754,6 +1761,7 @@ mod tests {
                 encoder: &ResponseEncoder,
                 early_buf: &mut early_buf,
                 shutdown: &AtomicBool::new(false),
+                latch: &crate::tests::idle_latch(),
             }
             .while_waiting();
 

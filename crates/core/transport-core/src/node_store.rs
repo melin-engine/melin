@@ -19,6 +19,9 @@ use crate::snapshot::{PREV_SUFFIX, TMP_SUFFIX, with_suffix};
 /// explicit one is given: `melin.journal` → `melin.snapshot`.
 const DERIVED_SNAPSHOT_EXTENSION: &str = "snapshot";
 
+/// Appended to the journal's path to name the divergence marker.
+const DIVERGED_SUFFIX: &str = ".diverged";
+
 /// A node's journal and snapshot locations, paired.
 ///
 /// Paired rather than a snapshot newtype on its own, because catch-up and
@@ -62,6 +65,13 @@ pub enum NodeStoreError {
     DerivedSnapshotLeftBehind { snapshot: PathBuf, derived: PathBuf },
     /// The layout could not be inspected.
     Io { path: PathBuf, error: io::Error },
+    /// The node stopped because the cluster's output diverged, and its
+    /// marker is still there: it must not be started again. `record` is
+    /// what the marker says, `None` when it cannot be read as one.
+    Diverged {
+        marker: PathBuf,
+        record: Option<crate::divergence::MarkerRecord>,
+    },
 }
 
 impl fmt::Display for NodeStoreError {
@@ -113,6 +123,40 @@ impl fmt::Display for NodeStoreError {
             Self::Io { path, error } => {
                 write!(f, "cannot inspect {}: {error}", path.display())
             }
+            Self::Diverged { marker, record } => {
+                use crate::divergence::MarkerCause;
+                match record {
+                    Some(record) => {
+                        write!(
+                            f,
+                            "this node stopped at Unix time {} because the cluster's output \
+                             diverged (",
+                            record.stopped_at_unix
+                        )?;
+                        match &record.cause {
+                            MarkerCause::Detected { from, through } => {
+                                write!(f, "detected here, between positions {from} and {through}")?
+                            }
+                            MarkerCause::Told { by, via } => write!(f, "told by {by} via {via}")?,
+                        }
+                        write!(f, "; details in {}). ", marker.display())?;
+                    }
+                    None => write!(
+                        f,
+                        "this node stopped because the cluster's output diverged (its marker {} \
+                         cannot be read as one). ",
+                        marker.display()
+                    )?,
+                }
+                write!(
+                    f,
+                    "The application broke its determinism contract, or the builds the cluster \
+                     ran do not agree, so this cluster cannot be restarted: do not delete this \
+                     marker to bring this node back. Start a new cluster from the journal, on \
+                     one build, with a fixed application or with output digests off. See \
+                     docs/replication.md, \"Output verification\""
+                )
+            }
         }
     }
 }
@@ -121,7 +165,8 @@ impl std::error::Error for NodeStoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io { error, .. } => Some(error),
-            Self::SnapshotNamesNoFile { .. }
+            Self::Diverged { .. }
+            | Self::SnapshotNamesNoFile { .. }
             | Self::SnapshotDirMissing { .. }
             | Self::SnapshotDirNotADirectory { .. }
             | Self::SnapshotIsADirectory { .. }
@@ -226,6 +271,32 @@ impl NodeStore {
         with_suffix(&self.snapshot, PREV_SUFFIX)
     }
 
+    /// `<journal>.diverged`: the marker a node stopped for divergence
+    /// leaves, which refuses every later start
+    /// ([`refuse_if_diverged`](Self::refuse_if_diverged)). Beside the
+    /// journal, so it travels with the history it stopped.
+    pub fn divergence_marker(&self) -> PathBuf {
+        with_suffix(&self.journal, DIVERGED_SUFFIX)
+    }
+
+    /// Refuse to start a node whose divergence marker exists: the cluster
+    /// it belonged to stopped, and it must not rejoin it. A marker that
+    /// cannot be read still refuses, naming the file. Reads, writes
+    /// nothing; separate from [`resolve`](Self::resolve) so a tool can
+    /// still resolve a stopped node's paths.
+    pub fn refuse_if_diverged(&self) -> Result<(), NodeStoreError> {
+        let marker = self.divergence_marker();
+        if !try_exists(&marker)? {
+            return Ok(());
+        }
+        // A read error is dropped on purpose: the marker exists, which is
+        // what refuses; its contents only enrich the message.
+        let record = std::fs::read_to_string(&marker)
+            .ok()
+            .and_then(|text| crate::divergence::parse_marker(&text));
+        Err(NodeStoreError::Diverged { marker, record })
+    }
+
     /// Whether any journal segment, live or archived, is on disk.
     pub fn journal_lineage_exists(&self) -> io::Result<bool> {
         journal_lineage_exists(&self.journal)
@@ -293,6 +364,56 @@ mod tests {
         assert_eq!(store.snapshot(), dir.path().join("x.snapshot"));
         assert_eq!(store.snapshot_tmp(), dir.path().join("x.snapshot.tmp"));
         assert_eq!(store.snapshot_prev(), dir.path().join("x.snapshot.prev"));
+    }
+
+    /// A node whose divergence marker exists is refused, with a message
+    /// quoting the marker and naming a new cluster as the way back; one
+    /// whose marker cannot be read is refused all the same. Resolving the
+    /// store still works and writes nothing.
+    #[test]
+    fn a_node_with_a_divergence_marker_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = NodeStore::resolve(dir.path().join("x.journal"), None).unwrap();
+        assert_eq!(
+            store.divergence_marker(),
+            dir.path().join("x.journal.diverged")
+        );
+        store.refuse_if_diverged().expect("no marker, no refusal");
+
+        let marker = "melin output divergence marker\nversion: 1\nstopped_at_unix: 1700000000\n\
+                      cause: detected\nfrom: 129\nthrough: 192\n";
+        std::fs::write(store.divergence_marker(), marker).unwrap();
+        let refused = store.refuse_if_diverged().expect_err("refused");
+        assert!(matches!(
+            &refused,
+            NodeStoreError::Diverged {
+                record: Some(_),
+                ..
+            }
+        ));
+        let message = refused.to_string();
+        for part in [
+            "1700000000",
+            "between positions 129 and 192",
+            "x.journal.diverged",
+            "do not delete this marker",
+            "Start a new cluster",
+        ] {
+            assert!(message.contains(part), "{part:?} missing from {message}");
+        }
+
+        std::fs::write(store.divergence_marker(), "garbage").unwrap();
+        let refused = store.refuse_if_diverged().expect_err("refused");
+        assert!(matches!(
+            &refused,
+            NodeStoreError::Diverged { record: None, .. }
+        ));
+        assert!(refused.to_string().contains("x.journal.diverged"));
+
+        let before: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        NodeStore::resolve(dir.path().join("x.journal"), None).expect("still resolves");
+        let after: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(before.len(), after.len(), "resolving wrote nothing");
     }
 
     #[test]

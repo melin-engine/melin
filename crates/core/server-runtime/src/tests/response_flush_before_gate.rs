@@ -102,6 +102,7 @@ fn config_for(journal_cursor: DurableWireSeqCursor) -> Response<Counter> {
         ready: None,
         degraded_release: None,
         digester: None,
+        latch: crate::tests::idle_latch(),
         pause_after_control_drain: None,
     }
 }

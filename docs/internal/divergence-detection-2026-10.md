@@ -861,6 +861,21 @@ leave its primary serving.
 
 ### Step 2. The stop
 
+Built in parts, each reviewed and committed on its own. The first, the
+stop on one node (the latch, the marker and the refusal, the exit, the
+response loop's check), departs from the text below in three places:
+
+- The chain values are logged and recorded in full hex (`ChainValue`'s
+  `Debug`), so `hex_prefix` is not widened.
+- The node's fence is made once, with the latch, as soon as the store is
+  resolved (`server::NodeStop`): a primary raises it to its recovered
+  epoch rather than creating its own, so the latch and every reader share
+  one fence.
+- The seam (`divergence::test_seam`) is a registry of running nodes'
+  latches by marker path, reached from the runtime's integration tests
+  directly; `melin-test-node` gains a wrapper when the replica's half
+  needs it.
+
 - `output_digest::Trip` and `Divergence` (decision 6); `DivergenceLatch`,
   `HaltCause`, `Halted`, the marker writer and its state, the marker
   (`NodeStore::divergence_marker`), the exit helper and `NodeDiverged`

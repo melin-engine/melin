@@ -592,6 +592,56 @@ impl OutputDigester {
 }
 
 // ---------------------------------------------------------------------------
+// A divergence, and what stops the node on one
+// ---------------------------------------------------------------------------
+
+/// Two copies' chains disagreed: what a comparison found, as the stop logs
+/// it and the marker records it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Divergence {
+    /// The window end the two chains were compared at.
+    pub end: WireSeq,
+    /// The first position of the comparison run the mismatch ended.
+    pub run_from: WireSeq,
+    /// The last window end the run found equal, if any.
+    pub last_match: Option<WireSeq>,
+    /// The other copy's chain value at `end`.
+    pub expected: ChainValue,
+    /// This copy's chain value at `end`.
+    pub actual: ChainValue,
+}
+
+impl Divergence {
+    /// The positions known to hold the first differing report, both ends
+    /// included: everything after the last window found equal (or from the
+    /// run's start), through `end`.
+    pub fn positions(&self) -> (WireSeq, WireSeq) {
+        let from = match self.last_match {
+            Some(matched) => WireSeq::new(matched.get() + 1),
+            None => self.run_from,
+        };
+        (from, self.end)
+    }
+}
+
+/// What a comparator stops the node with, before it reports a mismatch.
+///
+/// A comparator holds its node's stop and trips it itself before it
+/// returns a mismatch, so no caller can forget to: Rust has no linear
+/// types, and a `#[must_use]` verdict is only a lint. Generic rather than
+/// `dyn`: one implementation per build, monomorphized; tests use a
+/// recording one.
+pub trait Trip {
+    /// What the first trip returns: proof that this caller stopped the
+    /// node, for whatever it must then do once (the notice to the others).
+    type Token;
+
+    /// Stop the node for `divergence`. `None` when it was already stopped,
+    /// by this cause or another.
+    fn trip(&self, divergence: Divergence) -> Option<Self::Token>;
+}
+
+// ---------------------------------------------------------------------------
 // The board
 // ---------------------------------------------------------------------------
 

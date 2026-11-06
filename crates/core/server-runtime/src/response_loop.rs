@@ -44,6 +44,7 @@ use tracing::debug;
 
 use melin_app::encoder::ResponseEncoder;
 use melin_pipeline::ring;
+use melin_transport_core::divergence::DivergenceLatch;
 use melin_transport_core::output_digest::OutputDigester;
 use melin_transport_core::pipeline::{OutputSlot, RequestId};
 #[cfg(feature = "latency-trace")]
@@ -285,6 +286,9 @@ pub(crate) struct GateWaitHook<'a, 'q, E: Egress, R: Copy, Q: Copy> {
     /// wait for room (see [`Egress::release_early_replies`]). The gate's
     /// own wait reads it on its next turn.
     pub(crate) shutdown: &'a AtomicBool,
+    /// The node's divergence stop: once tripped, no early reply goes out.
+    /// The gate's wait then leaves on the shutdown flag the trip set.
+    pub(crate) latch: &'a DivergenceLatch,
 }
 
 impl<E: Egress, R: Copy, Q: Copy> GateWait for GateWaitHook<'_, '_, E, R, Q> {
@@ -301,6 +305,9 @@ impl<E: Egress, R: Copy, Q: Copy> GateWait for GateWaitHook<'_, '_, E, R, Q> {
         let Some(at) = &self.at_boundary else {
             return;
         };
+        if self.latch.is_tripped() {
+            return;
+        }
         let egress = &mut *self.egress;
         let control_rx = self.control_rx;
         self.registered
@@ -413,6 +420,9 @@ pub(crate) struct LoopInputs<R: Copy, Q: Copy, C> {
     /// Digests every report the stage reads, sent or not; `None` with
     /// output digests off.
     pub(crate) digester: Option<OutputDigester>,
+    /// The node's divergence stop. Once tripped, the stage hands the
+    /// egress nothing more: no slot, no early reply.
+    pub(crate) latch: DivergenceLatch,
     /// Test seam: see `response::Response::pause_after_control_drain`.
     #[cfg(test)]
     pub(crate) pause_after_control_drain: Option<Box<dyn FnMut() + Send>>,
@@ -439,6 +449,7 @@ pub(crate) fn run<E: Egress, R: Copy, Q: Copy>(
         encoder,
         mut early_replies,
         mut digester,
+        latch,
         #[cfg(test)]
         mut pause_after_control_drain,
     } = inputs;
@@ -560,6 +571,13 @@ pub(crate) fn run<E: Egress, R: Copy, Q: Copy>(
                 && let Some(applied) = applied
             {
                 digester.ring_empty(applied);
+            }
+
+            // A stopped node hands the egress nothing more. The trip set
+            // the shutdown flag too; this leaves before an early reply
+            // could go, rather than at the top's check.
+            if latch.is_tripped() {
+                break 'run;
             }
 
             // Between two events, the snapshot's early replies go now. An
@@ -685,6 +703,15 @@ pub(crate) fn run<E: Egress, R: Copy, Q: Copy>(
             #[cfg(feature = "latency-trace")]
             spsc_rec.record_elapsed(slot.match_complete_ts, consume_ts);
 
+            // A stopped node hands the egress nothing more, from the slot
+            // the stop is seen at: neither this slot's early replies nor
+            // its reply. One relaxed load per slot, since the top of the
+            // loop checks the shutdown flag only per batch. Out to the
+            // epilogue, uncommitted, as on shutdown.
+            if latch.is_tripped() {
+                break 'run;
+            }
+
             // The first slot of an event: the last one handled ended its
             // event, so the snapshot's early replies go here, ahead of the
             // gate, which holds this event, not them. The iteration's
@@ -748,6 +775,7 @@ pub(crate) fn run<E: Egress, R: Copy, Q: Copy>(
                     encoder: &*encoder,
                     early_buf: &mut early_buf,
                     shutdown,
+                    latch: &latch,
                 },
             );
             let reply = match admission {
@@ -788,6 +816,11 @@ pub(crate) fn run<E: Egress, R: Copy, Q: Copy>(
             // copy digests every report, whoever receives it.
             let mut encoded = None;
             if let Some((connection_id, backing)) = reply {
+                // Checked again here: the stop may have come while the
+                // gate held this slot.
+                if latch.is_tripped() {
+                    break 'run;
+                }
                 let frames =
                     SlotFrames::encode(slot, backing, &*encoder, &mut encode_buf, &mut batch_ends);
                 encoded = frames.payload;
@@ -970,7 +1003,13 @@ mod tests {
         /// The degraded-time counter as `after_commit` saw it, to tell
         /// whether `gate.after_batch` ran before or after it.
         degraded_nanos_at_commit: Arc<AtomicU64>,
+        /// The stage's divergence stop, tripped by a send to [`TRIP`].
+        latch: DivergenceLatch,
     }
+
+    /// The connection whose send trips the stage's divergence stop, as if
+    /// it came between this slot and the next.
+    const TRIP: u64 = 98;
 
     impl Recording {
         fn log(&self, call: Call) {
@@ -1025,6 +1064,9 @@ mod tests {
                     thread::sleep(Duration::from_millis(1));
                 }
                 return SlotOutcome::Stopped;
+            }
+            if connection_id == TRIP {
+                let _halted = self.latch.trip_with(test_cause());
             }
             if known {
                 SlotOutcome::Known
@@ -1127,6 +1169,10 @@ mod tests {
         utilization: Arc<StageUtilization>,
         degraded_nanos_at_commit: Arc<AtomicU64>,
         shutdown: Arc<AtomicBool>,
+        /// The stage's divergence stop, over `shutdown`, for a test to trip.
+        latch: DivergenceLatch,
+        /// Where the latch writes its marker if tripped.
+        _marker_dir: tempfile::TempDir,
         handle: Option<JoinHandle<()>>,
     }
 
@@ -1173,6 +1219,14 @@ mod tests {
                 }),
             ),
         };
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let marker_dir = tempfile::tempdir().expect("tempdir");
+        let latch = DivergenceLatch::new(
+            Arc::new(melin_transport_core::fence::FenceState::new(0)),
+            Arc::clone(&shutdown),
+            marker_dir.path().join("stage.journal.diverged"),
+            Arc::new(melin_transport_core::divergence::FsSync),
+        );
         let inputs = LoopInputs {
             consumer,
             control_rx,
@@ -1192,6 +1246,7 @@ mod tests {
             encoder,
             early_replies,
             digester,
+            latch: latch.clone(),
             pause_after_control_drain: Some(pause),
         };
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -1202,9 +1257,9 @@ mod tests {
             committed: Arc::clone(&committed),
             utilization: Arc::clone(&utilization),
             degraded_nanos_at_commit: Arc::clone(&degraded_nanos_at_commit),
+            latch: latch.clone(),
         };
         let (recorders, _) = register_recorders(&Recording::NAMES);
-        let shutdown = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&shutdown);
         let handle = thread::spawn(move || run(egress, inputs, recorders, &flag));
         seam.parked();
@@ -1219,6 +1274,8 @@ mod tests {
             utilization,
             degraded_nanos_at_commit,
             shutdown,
+            latch,
+            _marker_dir: marker_dir,
             handle: Some(handle),
         }
     }
@@ -1652,6 +1709,113 @@ mod tests {
         drain_stop.store(true, Ordering::Relaxed);
         drain.join().expect("the drain");
         stage.stop();
+    }
+
+    /// A cause to trip a test's latch with.
+    fn test_cause() -> melin_transport_core::divergence::HaltCause {
+        melin_transport_core::divergence::HaltCause::ClusterHalted {
+            by: melin_transport_core::divergence::HaltedBy::Primary,
+            via: melin_transport_core::divergence::NoticePath::HaltFrame,
+        }
+    }
+
+    /// The stop arrives while the gate holds a slot: that slot, and the
+    /// early reply queued behind it, are never offered to the egress, and
+    /// the stage leaves to its epilogue without committing.
+    #[test]
+    fn a_stop_while_a_slot_waits_at_the_gate_sends_nothing_more() {
+        let mut stage = start(GateKind::Disk, 0);
+        let base = stage.committed();
+        stage.connect(1);
+        assert_eq!(stage.step(), idle_then_drained(&[1]));
+        stage.publish(1, 1, 1, true);
+        // The parked iteration finishes idle; the next reads the slot.
+        stage.step();
+        stage.seam().resume();
+        stage.wait_for(&Call::BeforeWait);
+
+        let _halted = stage.latch.trip_with(test_cause());
+        stage.answer_early(1, 0);
+        // The journal reaches the slot: the gate would release it now.
+        stage.journal.store(WireSeq::new(1));
+        let calls = stage.stop();
+        assert!(
+            !calls
+                .iter()
+                .any(|call| matches!(call, Call::SendSlot { .. } | Call::Released(_))),
+            "{calls:?}"
+        );
+        assert!(calls.contains(&Call::OnShutdown), "{calls:?}");
+        assert_eq!(stage.committed(), base, "nothing committed");
+    }
+
+    /// The stop comes between two slots of one batch: the first is sent,
+    /// the second never offered.
+    #[test]
+    fn a_stop_between_two_slots_of_a_batch_sends_only_the_first() {
+        let mut stage = start(GateKind::Disk, 10);
+        stage.connect(TRIP);
+        stage.connect(1);
+        assert_eq!(stage.step(), idle_then_drained(&[TRIP, 1]));
+        stage.publish(TRIP, 1, 1, true);
+        stage.publish(1, 2, 2, true);
+        // The parked iteration finishes idle; the next reads both slots
+        // and, once resumed, never parks again: the stop ends it.
+        stage.step();
+        stage.seam().resume();
+        stage.wait_for(&Call::OnShutdown);
+        let calls = stage.stop();
+        let sent: Vec<u64> = calls
+            .iter()
+            .filter_map(|call| match call {
+                Call::SendSlot { connection_id, .. } => Some(*connection_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sent, [TRIP], "{calls:?}");
+    }
+
+    /// The stop comes with the slot that ends an event, and an early reply
+    /// is still unreleased in the iteration's snapshot, held since the
+    /// event began in an earlier read: the next slot's boundary, where it
+    /// would go, releases nothing. The gate is open, so only the per-slot
+    /// check stands between the stop and that release.
+    #[test]
+    fn a_stop_at_an_events_last_slot_releases_no_early_reply_after_it() {
+        let mut stage = start(GateKind::Disk, 10);
+        stage.connect(TRIP);
+        stage.connect(1);
+        assert_eq!(stage.step(), idle_then_drained(&[TRIP, 1]));
+
+        // The event's first slot, alone in its read.
+        stage.publish(1, 1, 1, false);
+        assert_eq!(stage.step(), IDLE);
+        stage.step();
+
+        // Mid-event: the early reply stays queued.
+        stage.answer_early(1, 0);
+        assert_eq!(stage.step(), [Call::OnIdle]);
+
+        // One read: the event's last slot, whose send trips, then the
+        // next event's first, at whose boundary the reply would go.
+        stage.publish(TRIP, 1, 2, true);
+        stage.publish(1, 2, 3, true);
+        assert_eq!(stage.step(), [Call::OnIdle]);
+        stage.seam().resume();
+        stage.wait_for(&Call::OnShutdown);
+        let calls = stage.stop();
+        assert!(
+            !calls.iter().any(|call| matches!(call, Call::Released(_))),
+            "{calls:?}"
+        );
+        let sent: Vec<u64> = calls
+            .iter()
+            .filter_map(|call| match call {
+                Call::SendSlot { connection_id, .. } => Some(*connection_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sent, [TRIP], "{calls:?}");
     }
 
     /// The idle path at a boundary, with nothing to release.

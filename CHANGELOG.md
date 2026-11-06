@@ -28,6 +28,15 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   `encode_app_body` is the one application body encode, which the response
   stages' framing goes through. `MAX_RESPONSE_BODY` moves here and is still
   re-exported at the root of `melin-server-runtime`.
+- **The divergence stop, on one node**: `melin_transport_core::divergence`
+  holds `DivergenceLatch`, tripped once by its first `HaltCause`. It
+  fences the node, stops its threads, sends nothing more to clients,
+  logs the cause at `error!`, and writes a marker beside the journal
+  (`NodeStore::divergence_marker`, `<journal>.diverged`). A node whose
+  marker exists refuses to start (`NodeStore::refuse_if_diverged`,
+  through the new `ServerConfig::startup_store`), and a stopped node's run
+  returns `server::NodeDiverged`. Nothing trips it yet but a test seam
+  (`divergence::test_seam`, behind `test-utils`).
 - **`melin_transport_core::AppliedWireSeqCursor`**, reached through
   `PipelineCursors::applied_wire_seq`: how far the matching stage has
   applied, published once per batch after its output slots.
@@ -113,8 +122,10 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   a body. An encode error is logged only for a reply to a connection the
   node holds. Applications whose encoder already follows its purity
   contract need no change.
+- **`NodeStoreError::Diverged`** is a new variant of an exhaustive enum
+  (breaking for a `match` on it).
 - **Breaking for code that builds these by hand**: `ServerConfig` gains
-  `no_output_digests`; `response::Response` gains `digester`;
+  `no_output_digests`; `response::Response` gains `digester` and `latch`;
   `pipeline::Pipeline` and `pipeline::ReplicaPipeline` gain `first_live`;
   `MatchingStage::new` takes an `AppliedWireSeqCursor` after the durable
   cursor.

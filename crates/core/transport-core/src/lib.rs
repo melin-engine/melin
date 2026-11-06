@@ -29,6 +29,7 @@ pub mod cursors;
 /// three cannot rebuild different state from one stream, and the clock's
 /// watermark ([`TickWatermark`]) each of them carries.
 mod dispatch;
+pub mod divergence;
 /// Replication fencing: the node's observed epoch and the one-way fenced
 /// latch that closes the split-brain window after a promotion.
 pub mod fence;
