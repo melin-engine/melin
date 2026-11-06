@@ -1029,6 +1029,54 @@ runs do not agree. Either way a failover could show clients another
 history, so **the whole cluster stops, for good: the way back is a new
 cluster.**
 
+### How output is checked
+
+- **Every replica checks its primary.** The primary sends its digest of
+  each window of 64 journal positions down the replication stream, after
+  the entries the window covers; a replica compares it with its own
+  digest of the same window. The digests are chained, so one value found
+  equal vouches for every window since the session's first value,
+  including windows whose value the primary never sent.
+- **What is caught.** Any difference in the bytes of any report, in its
+  order among the others, or in how many there are, for a journaled
+  entry (client request or tick) in a window the session compares (see
+  below). Queries are not journaled, and are not checked. A difference is
+  found at the first value the primary sends after it: under traffic,
+  within a window or two.
+- **When it starts.** Each session with a primary starts the comparison
+  afresh: a replica that joins, reconnects, restarts (from its journal or
+  its own snapshot), or follows a restarted or newly promoted primary
+  takes the primary's first digest of the session as its starting point,
+  and compares every window that closes after it. What the replica
+  applied before that value reached it, its catch-up from the primary's
+  journal included, and the window that value covers are not compared. A
+  replica that restarts counts from zero again.
+- **When idle.** Windows close as positions are journaled, so a cluster
+  with ticks on keeps checking while no client writes; with ticks off
+  (`--tick-interval-ms 0`) an idle cluster checks nothing until writes
+  resume.
+- **What you see.** `melin_output_checks_total` on a replica's health
+  endpoint counts the windows found equal. Under traffic it keeps
+  growing; one flat under traffic means the replica is not checking (it
+  or its primary runs with `--no-output-digests`, or it is not
+  streaming), and is worth a look. The check logs nothing while it agrees
+  (its `debug` lines say where each session's comparison started, and
+  where one restarted after a window was missed).
+- **Likely causes of a divergence.** The application's determinism:
+  something in `apply` or `tick` that is not a function of its inputs and
+  state (an unseeded hash map's iteration order, a report order that
+  follows a collection's capacity, which a node's sizing can change, the
+  wall clock, a thread). Builds that differ between nodes (another
+  release of the application, another compiler, another target). A
+  snapshot taken before format 5 recovered with the warning about its
+  tick watermark. Rarely, a hardware fault.
+- **Upgrading the application.** An upgrade that changes the output for
+  the same input (a new report field, a reworded rejection) now means
+  stopping every node and starting them all on the new build: rolled node
+  by node, the first replica on the new build sees its output differ from
+  its primary's and stops the cluster. An upgrade that leaves the output
+  alone rolls as before.
+
 ### What a stop does
 
 - **The node that sees the divergence stops at once.** It closes every
@@ -1091,8 +1139,14 @@ has it.
   operator promotes. Never promote a node of a cluster in which any node
   holds a marker.
 - **Output digests off.** A node started with `--no-output-digests`
-  digests nothing, so its output is never checked; it still honours a
-  stop it is told of.
+  digests nothing, so its output is never checked: as a primary it sends
+  no digests and its replicas check nothing, as a replica it drops the
+  ones it is sent. It still honours a stop it is told of.
+- **Each session's start is not compared.** Every session, a reconnect to
+  the same primary included, starts from the primary's first digest of
+  that session: the windows the replica applied before it, a long
+  catch-up included, and the window that digest covers are taken on
+  trust. A divergence confined to them is not found by that session.
 
 ## Entry integrity in transit
 
@@ -1260,6 +1314,7 @@ Exchanged first on every connection, before the handshake.
 | ChainCheck | `[len:u32][type=0x17][sequence:u64][chain_hash:[u8;32]]` | Periodic live-stream validation: the primary's chain value at `sequence`; the replica compares its own and treats a mismatch as divergence. |
 | SegmentSeedBegin | `[len:u32][type=0x18][seed_len:u64]` | Start of the post-snapshot segment seed (see "Snapshot transfer"); the body rides SnapshotChunk frames and ends with a SnapshotEnd. |
 | InputBatch | `[len:u32][type=0x21][count:u16][slot...]` | Batch of input events. Each slot is the primary's journal entry without its leading magic: sequence, timestamp, key hash, the event itself, and the entry's CRC32C, which the replica verifies before accepting the entry (see "Entry integrity in transit"). The entries include the runtime's own (ticks, fencing epochs, ack-policy swaps): the ack policy reaches a replica only this way, in order with the events it governs. |
+| Digest | `[len:u32][type=0x19][kind:u8][window_end:u64][chain:[u8;16]]` | The primary's output digest chain at `window_end`, a multiple of 64 (see "Output verification"). It follows the batch that reaches its window, in the same send, so it never names a position the stream has not delivered. `kind` 1 is the output digest; 0 is refused, and a kind the replica does not know is skipped. |
 | Halt | `[len:u32][type=0x1A]` | The primary has stopped because the cluster's output diverged: the replica stops too (see "Output verification"). Sent at a frame boundary on every live session, and as the answer to a stopped replica's handshake. |
 | Heartbeat | `[len:u32][type=0x30][sequence:u64]` | Periodic idle keepalive (5 s interval) advertising the primary's last published sequence. |
 
@@ -1429,6 +1484,10 @@ normal-case post-recovery state.
 
 ## Observability
 
+- `melin_output_checks_total` (Prometheus counter, replicas only) —
+  windows of the replica's output found equal to its primary's (see
+  "Output verification"). Alert on it staying flat while the primary's
+  `melin_journal_sequence` grows: the replica is not checking.
 - The health endpoint's `trading`/`halted` flag (and the
   `melin_trading_active` gauge) reports `halted` on a fenced node even
   while replicas remain connected — point load-balancer probes and
