@@ -1580,9 +1580,8 @@ mod tests {
 
             // Wrong tail hash at the announced boundary — the replica's
             // local chain at sequence 1 cannot match this.
-            buf.clear();
-            encode_rotate(1, &[0xEE; 32], &mut buf);
-            s1.write_all(&buf).expect("Rotate");
+            s1.write_all(&encode_rotate(1, &[0xEE; 32]))
+                .expect("Rotate");
 
             // --- Session 2: the SAME process reconnects with its
             // position re-derived from the forked on-disk journal.
@@ -1827,9 +1826,8 @@ mod tests {
             }
             stream_one(&mut s1, &mut buf);
             wait_for_ack(&mut s1, 1);
-            buf.clear();
-            encode_rotate(1, &[0xEE; 32], &mut buf);
-            s1.write_all(&buf).expect("Rotate");
+            s1.write_all(&encode_rotate(1, &[0xEE; 32]))
+                .expect("Rotate");
 
             // --- Session 2: reconnect at the recovered position (seq 1),
             // verdict HashMismatch (archives the live journal aside), send
@@ -2034,9 +2032,8 @@ mod tests {
             .expect("encode InputBatch");
             s1.write_all(&buf).expect("InputBatch");
             wait_for_ack(&mut s1, 1);
-            buf.clear();
-            encode_rotate(1, &[0xEE; 32], &mut buf);
-            s1.write_all(&buf).expect("Rotate 1");
+            s1.write_all(&encode_rotate(1, &[0xEE; 32]))
+                .expect("Rotate 1");
 
             // Session 2: in-process repair (the one allowed), then a
             // SECOND poisoned rotation after streaming resumes.
@@ -2081,9 +2078,8 @@ mod tests {
             s2.write_all(&buf).expect("InputBatch 6");
             let mut s2_acks = s2.try_clone().expect("clone");
             wait_for_ack(&mut s2_acks, 6);
-            buf.clear();
-            encode_rotate(6, &[0xEE; 32], &mut buf);
-            s2.write_all(&buf).expect("Rotate 2");
+            s2.write_all(&encode_rotate(6, &[0xEE; 32]))
+                .expect("Rotate 2");
 
             // No third connection: the receiver must give up and exit
             // with an error naming the recurrence.
@@ -2600,9 +2596,8 @@ mod tests {
             // entry 3, then 5: the gap ends the session at once, with 2
             // and 3 still unwritten.
             send_entries(&mut s1, &[2]);
-            let mut buf = Vec::new();
-            encode_chain_check(2, &[0xEE; 32], &mut buf);
-            s1.write_all(&buf).expect("ChainCheck");
+            s1.write_all(&encode_chain_check(2, &[0xEE; 32]))
+                .expect("ChainCheck");
             send_entries(&mut s1, &[3]);
             send_entries(&mut s1, &[5]);
 
@@ -3572,9 +3567,8 @@ mod tests {
 
             // The boundary, with the correct tail hash — verified
             // against the replica's own chain, then adopted.
-            buf.clear();
-            encode_rotate(2, &chain_at_2, &mut buf);
-            s1.write_all(&buf).expect("Rotate");
+            s1.write_all(&encode_rotate(2, &chain_at_2))
+                .expect("Rotate");
 
             // Streaming continues on the new segment. The journal stage
             // holds entries past a pending boundary until the rotation

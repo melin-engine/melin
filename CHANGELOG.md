@@ -108,6 +108,12 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   `encode_unversioned_auth_ok`, `encode_version_refused`,
   `admits_replica_version` and `MSG_VERSION_REFUSED` are new. Control-plane
   links keep the unversioned frames, and their wire is unchanged.
+- **`encode_rotate` and `encode_chain_check` return the frame**
+  (breaking, in `melin_transport_core::replication::protocol`): each
+  returns `[u8; SEQ_HASH_FRAME_LEN]`, length prefix included, instead of
+  appending to a `Vec` passed in; `SEQ_HASH_FRAME_LEN` is new. The wire
+  bytes are unchanged, and the journal stage no longer allocates for
+  either frame.
 - **Every pipeline stage is built with the tick watermark of the state
   it starts from** (breaking): `MatchingStage::new`,
   `build_pipeline_with_replication` and `build_replica_pipeline` take a

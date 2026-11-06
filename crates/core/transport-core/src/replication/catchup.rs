@@ -296,10 +296,8 @@ fn stream_journal<E: AppEvent>(
         if info.starting_sequence > 1 {
             let boundary = info.starting_sequence - 1;
             if end_sequence == boundary {
-                encode_rotate(boundary, &info.anchor_hash, &mut send_buf);
-                publisher(&send_buf)
+                publisher(&encode_rotate(boundary, &info.anchor_hash))
                     .map_err(|e| io::Error::other(format!("publish catch-up rotate: {e}")))?;
-                send_buf.clear();
             }
         }
 
@@ -1774,9 +1772,7 @@ mod drain_into_contiguity_tests {
     /// Encode a `Rotate` control frame the way the journal stage
     /// publishes it to the rings (boundary as the chunk's end_sequence).
     fn rotate_chunk(boundary: u64) -> Vec<u8> {
-        let mut buf = Vec::new();
-        super::encode_rotate(boundary, &[0x52u8; 32], &mut buf);
-        buf
+        super::encode_rotate(boundary, &[0x52u8; 32]).to_vec()
     }
 
     /// A Rotate chunk wholly covered by the bulk pass is discarded like

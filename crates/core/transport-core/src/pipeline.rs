@@ -1958,14 +1958,12 @@ impl<E: AppEvent> SequencerCore<E> {
             return;
         };
         let sequence = self.encoder.next_sequence() - 1;
-        // Local buffer: the frame is 45 bytes and checks are sparse.
-        let mut buf = Vec::with_capacity(64);
-        crate::replication::protocol::encode_chain_check(sequence, &hash, &mut buf);
+        let frame = crate::replication::protocol::encode_chain_check(sequence, &hash);
         Self::publish_to_replication_rings(
             &mut self.repl.producers,
             &self.repl.evict,
             &self.repl.active,
-            &buf,
+            &frame,
             sequence,
         );
     }
@@ -1984,15 +1982,12 @@ impl<E: AppEvent> SequencerCore<E> {
         }
         let boundary_seq = encoder.next_sequence() - 1;
         let tail_hash = encoder.chain_hash().unwrap_or([0u8; 32]);
-        // Local buffer: the frame is 45 bytes and rotations are cold —
-        // not worth a dedicated reusable buffer on ReplicationState.
-        let mut buf = Vec::with_capacity(64);
-        crate::replication::protocol::encode_rotate(boundary_seq, &tail_hash, &mut buf);
+        let frame = crate::replication::protocol::encode_rotate(boundary_seq, &tail_hash);
         Self::publish_to_replication_rings(
             &mut repl.producers,
             &repl.evict,
             &repl.active,
-            &buf,
+            &frame,
             boundary_seq,
         );
     }
