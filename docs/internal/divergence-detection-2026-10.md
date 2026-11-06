@@ -924,6 +924,59 @@ these places:
   read while frozen: a read already waiting when the link froze forwarded
   its bytes, which let the lost-ack test's stopped ack through.
 
+The last part is the operator section, "Output verification" in
+`docs/replication.md`: the stop, the marker and the refusal, the
+new-cluster procedure and the rollback warning (written here rather than
+with step 3, since they concern the stop), and the limits; and the frame
+tables. As built, step 2's integration cases are those of
+`tests/output_divergence.rs` (a tripped node; a primary halting both
+replicas; a stopped handshake and a stopped ack each stopping the primary;
+a detecting replica stopping the whole cluster; a lost stopped ack made
+good by the redial), on both transports. It leaves untested at the node
+level, each covered as noted:
+
+- **The primary's join-time reads** (a stopped ack read in the DPDK
+  `Joining` arm; kernel TCP reads nothing from a replica between its
+  handshake and the live loop, so a stopped ack sent mid-catch-up is
+  first read by the live loop's drain, the path the stopped-ack case
+  covers): `keep_last_ack`'s unit tests, and the handshake read site
+  through the stopped-handshake case. A replica trips only on streaming
+  frames, never mid-join, so no production path reaches them before
+  step 3.
+- **The `Halt` owed to a joining replica**: on DPDK `close_all_links`
+  halts `Joining` slots with `Streaming` ones; on kernel TCP the journal
+  catch-up returns at the stop and the live loop's first iteration sends
+  the `Halt`, which the replica's stream loop reads mid-catch-up. One
+  window misses it on kernel TCP: `bridge_catchup_to_live` sits between
+  the catch-up and the live loop, and a batch the journal stage was
+  already publishing when the latch tripped can land in the just-activated
+  ring ahead of the stalled catch-up position; the refill returns at the
+  shutdown flag without advancing, so `drain_into_contiguity` spins to
+  `HANDOFF_BRIDGE_TIMEOUT` and returns its stall error, and the handler
+  exits without the `Halt`. Step 3 makes the bridge go straight to the
+  live loop once shutdown is set (with a unit test of the drain under a
+  set flag); until then the operator limits hedge it. No case
+  stops a primary while a replica is joining; one needs a catch-up held
+  open across the stop (a large journal or a frozen link), left for
+  step 3's integration suite. A replica receiving a snapshot is not told
+  (the `Halt` arrives where a `SnapshotChunk` is expected, so the
+  transfer fails and it retries into a stopped primary), as the operator
+  limits say.
+- **The unaware raft leader** (a replica made raft leader, its
+  replication link cut before the stop): the promotion's leadership
+  confirmation is tested on `main`, and two stopped voters of three cannot
+  confirm it. A node-level case needs a raft cluster with a cut link,
+  left for step 3's integration suite.
+- **A failed or hung marker write in a running node**: the latch's and the
+  exit's unit tests (a failing and a blocked `MarkerSync`); a node is
+  built with the real disk, and no seam reaches its `MarkerSync`.
+- **A detector cut off past `HALT_REDIAL`**: the kernel redial's unit test
+  pins that an attempt ends at the time left; a node-level case would run
+  past a minute.
+- **A crash between the trip and the marker**: the exit's bound is
+  unit-tested, not a killed process.
+- **The new-cluster procedure**: step 3's integration suite runs it.
+
 - `output_digest::Trip` and `Divergence` (decision 6); `DivergenceLatch`,
   `HaltCause`, `Halted`, the marker writer and its state, the marker
   (`NodeStore::divergence_marker`), the exit helper and `NodeDiverged`
@@ -1061,6 +1114,12 @@ these places:
   `HealthState::for_replica` (via `spawn_replica_health`) and to each
   replica pipeline it builds, since that endpoint outlives every pipeline a
   resync rebuilds.
+- Kernel TCP's join bridge at the stop (step 2's untested list): once
+  shutdown is set, `bridge_catchup_to_live` goes straight to the live loop
+  rather than waiting out `HANDOFF_BRIDGE_TIMEOUT` on a ring chunk the
+  stopped catch-up can no longer reach, so a joining replica still gets
+  its `Halt`; a unit test drives `drain_into_contiguity` with an ahead
+  chunk and the flag set.
 - Tests, ungated:
   - comparator, property tests over random interleavings of local windows
     and expected entries from two folders fed the same reports, the

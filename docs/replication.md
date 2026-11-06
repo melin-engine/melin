@@ -1016,6 +1016,84 @@ with the same reason and index as the journal's archive (for example
 resync carry the same `<n>`, and the snapshot never leaves its own
 filesystem.
 
+## Output verification
+
+The journal checks prove that every node holds the same input. Output
+verification checks what each node's copy of the application *answered*
+for it. Every node digests the bytes of every report its copy produces,
+whether or not a client receives it, so that copies can be compared (see
+[Pipeline Architecture](pipeline-architecture.md#output-digests)). When
+two copies are seen to answer the same input differently, the
+application broke its determinism contract, or the builds the cluster
+runs do not agree. Either way a failover could show clients another
+history, so **the whole cluster stops, for good: the way back is a new
+cluster.**
+
+### What a stop does
+
+- **The node that sees the divergence stops at once.** It closes every
+  client and sends nothing more, its control plane leaves and will not
+  promote it, and its process returns an error naming the cause.
+- **It tells the others.** A replica tells its primary, on its live
+  session or, if that goes unanswered, by redialling it for up to a
+  minute. The primary stops the same way and tells every replica
+  streaming from it, each of which stops too.
+- **Every stopped node logs the cause at `error`** (the positions the
+  divergence lies between, on the node that saw it; who told it, and how,
+  on the others) and **writes a marker beside its journal**,
+  `<journal>.diverged`, recording the same.
+- **A node whose marker exists refuses to start**, with a message
+  summarising the marker and naming it. Do not delete the marker to bring a node back: it
+  belonged to a cluster that broke its guarantee.
+- **Nothing is promoted automatically.** With at most three control-plane
+  voters, two stopped nodes leave no majority, and a promotion needs a
+  majority to confirm it before it takes effect.
+
+### Starting a new cluster
+
+1. Stop every node.
+2. Move each node's marker aside, kept as the record of the incident, and
+   set every node's snapshots aside: the build that diverged wrote them.
+3. Pick the node whose journal reaches the highest position and goes back
+   to sequence 1 (recovery without snapshots needs the whole history); if
+   none does, copy the missing early segments from any node or archive
+   (the segment chain check verifies the splice). Only if no copy
+   survives is a suspect snapshot the starting point, knowingly.
+4. Start it once, standalone, on one fixed build, to replay the journal
+   (or with `--no-output-digests`, which is not a fix: the replay is
+   another draw of whatever made the copies differ).
+5. Give every node a fresh `--raft-dir` and the others clean data
+   directories, and start as on a first deployment; the replicas reseed
+   from the new primary. The fresh control-plane directories start at
+   the journal's fencing epoch, so the new cluster can fail over at once.
+
+**Rolling back past this release** is the one other way around the
+marker: an older release does not read it. Check for `<journal>.diverged`
+before starting any node on an older release, and never start one that
+has it.
+
+### Limits
+
+- **A replica not streaming when its primary stops is not told**: one
+  between sessions, one receiving a snapshot, or one that does not read
+  the primary's notice before its connection ends. (A replica catching up
+  from the primary's journal is normally told, as a streaming one is; one
+  just finishing its catch-up as the primary stops can miss the notice.)
+  It stays up, serves no
+  client (it is a replica), and cannot be promoted automatically, since
+  the two stopped nodes leave no majority. Stop it by hand.
+- **A detector cut off from its primary stops alone.** If a replica's
+  notice and a minute of redials all go unanswered, the replica stops by
+  itself and logs at `warn` that the primary may not have been told; the
+  primary and the other replica may go on serving.
+- **A manual promotion overrides the stop**, as does a cluster without
+  the control plane, or with it in observational mode, where only the
+  operator promotes. Never promote a node of a cluster in which any node
+  holds a marker.
+- **Output digests off.** A node started with `--no-output-digests`
+  digests nothing, so its output is never checked; it still honours a
+  stop it is told of.
+
 ## Entry integrity in transit
 
 Every replicated entry carries the CRC32C its primary journaled it
@@ -1165,8 +1243,8 @@ Exchanged first on every connection, before the handshake.
 
 | Message | Layout | Purpose |
 |---|---|---|
-| Handshake | `[len:u32][type=0x01][last_sequence:u64][chain_hash:[u8;32]][epoch:u64][protocol_version:u16]` | Initial connection — replica reports its last durable sequence, the chain hash at that point, its fencing epoch, and the replication protocol version it speaks. A version mismatch is rejected with an explicit log line naming both versions. |
-| Ack | `[len:u32][type=0x02][acked_sequence:u64][in_memory_sequence:u64]` | Replica confirms persisted writes up to `acked_sequence` and pre-journal receipt up to `in_memory_sequence`. Both fields are populated on every ack so the primary's gate can evaluate any policy without separate ack streams. |
+| Handshake | `[len:u32][type=0x01][last_sequence:u64][chain_hash:[u8;32]][epoch:u64][protocol_version:u16][flags:u8]` | Initial connection — replica reports its last durable sequence, the chain hash at that point, its fencing epoch, and the replication protocol version it speaks. A version mismatch is rejected with an explicit log line naming both versions. `flags` bit 0 set: the replica has stopped for divergence and redials to say so (see "Output verification"); the primary stops and answers with `Halt`. Any other bit is refused. |
+| Ack | `[len:u32][type=0x02][acked_sequence:u64][in_memory_sequence:u64][flags:u8]` | Replica confirms persisted writes up to `acked_sequence` and pre-journal receipt up to `in_memory_sequence`. Both fields are populated on every ack so the primary's gate can evaluate any policy without separate ack streams. `flags` bit 0 set: the replica has stopped for divergence, its positions the last it sent; the primary stops. Any other bit is refused, and the replica evicted. |
 
 ### Primary → Replica
 
@@ -1182,6 +1260,7 @@ Exchanged first on every connection, before the handshake.
 | ChainCheck | `[len:u32][type=0x17][sequence:u64][chain_hash:[u8;32]]` | Periodic live-stream validation: the primary's chain value at `sequence`; the replica compares its own and treats a mismatch as divergence. |
 | SegmentSeedBegin | `[len:u32][type=0x18][seed_len:u64]` | Start of the post-snapshot segment seed (see "Snapshot transfer"); the body rides SnapshotChunk frames and ends with a SnapshotEnd. |
 | InputBatch | `[len:u32][type=0x21][count:u16][slot...]` | Batch of input events. Each slot is the primary's journal entry without its leading magic: sequence, timestamp, key hash, the event itself, and the entry's CRC32C, which the replica verifies before accepting the entry (see "Entry integrity in transit"). The entries include the runtime's own (ticks, fencing epochs, ack-policy swaps): the ack policy reaches a replica only this way, in order with the events it governs. |
+| Halt | `[len:u32][type=0x1A]` | The primary has stopped because the cluster's output diverged: the replica stops too (see "Output verification"). Sent at a frame boundary on every live session, and as the answer to a stopped replica's handshake. |
 | Heartbeat | `[len:u32][type=0x30][sequence:u64]` | Periodic idle keepalive (5 s interval) advertising the primary's last published sequence. |
 
 ## Cluster recovery
