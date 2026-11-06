@@ -190,6 +190,7 @@ fn large_frame_batch_is_delivered_not_disconnected() {
         ready: None,
         degraded_release: None,
         digester: None,
+        latch: crate::tests::idle_latch(),
         pause_after_control_drain: None,
     };
 

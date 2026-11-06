@@ -41,6 +41,7 @@ use crate::response_loop::MAX_BATCH;
 use crate::response_loop::{
     self, Egress, EgressRecorders, LoopInputs, SlotFrames, SlotOutcome, StageNames,
 };
+use melin_transport_core::divergence::DivergenceLatch;
 use melin_transport_core::output_digest::OutputDigester;
 
 /// Maximum accumulated send buffer per connection (64 KiB). If a client
@@ -219,6 +220,9 @@ pub struct Response<A: Application> {
     /// Digests every report the stage reads, sent or not, for the output
     /// digest; `None` with output digests off.
     pub digester: Option<OutputDigester>,
+    /// The node's divergence stop: once tripped, the stage sends nothing
+    /// more.
+    pub latch: DivergenceLatch,
     /// Test seam: called once per iteration right after the control
     /// channel has been drained, so a test can hold the stage there and
     /// choose what lands while it waits. The drain runs after the
@@ -840,6 +844,7 @@ pub fn run<A: Application>(
         ready,
         degraded_release,
         digester,
+        latch,
         #[cfg(test)]
         pause_after_control_drain,
     } = config;
@@ -906,6 +911,7 @@ pub fn run<A: Application>(
             encoder,
             early_replies,
             digester,
+            latch,
             #[cfg(test)]
             pause_after_control_drain,
         },
@@ -3802,6 +3808,7 @@ pub(crate) mod tests {
                 encoder: &ResponseEncoder,
                 early_buf: &mut early_buf,
                 shutdown: &AtomicBool::new(false),
+                latch: &crate::tests::idle_latch(),
             }
             .while_waiting();
             (egress, client)
@@ -3995,6 +4002,7 @@ pub(crate) mod tests {
                 ready: None,
                 degraded_release: None,
                 digester: None,
+                latch: crate::tests::idle_latch(),
                 pause_after_control_drain,
             }
         }
