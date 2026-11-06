@@ -37,6 +37,19 @@ pub(crate) fn authorized_keys_table(entries: &[(&SigningKey, &str, &str)]) -> Au
     AuthorizedKeys::parse::<NoRoles>(&table).unwrap()
 }
 
+/// The vote and the log entries a store at `dir` holds once reopened:
+/// what the raft core will read.
+pub(crate) async fn reopened(
+    dir: &std::path::Path,
+) -> (Option<crate::types::Vote>, Vec<crate::types::Entry>) {
+    use openraft::RaftLogReader;
+    use openraft::storage::RaftLogStorage;
+    let (mut log, _sm) = crate::storage::open(dir).expect("reopen");
+    let vote = log.read_vote().await.expect("read vote");
+    let entries = log.try_get_log_entries(0..).await.expect("read log");
+    (vote, entries)
+}
+
 /// A ready advertised journal tip at (epoch, seq). Most tests want (0, 0)
 /// so recency filters nothing; the recency tests raise it.
 fn tip_at(epoch: u64, seq: u64) -> Arc<TipSource> {

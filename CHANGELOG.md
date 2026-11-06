@@ -300,6 +300,16 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Fixed
 
+- **A raft directory created on a journal that has failed over no longer
+  holds auto-promotion back.** A promotion's election term becomes its
+  fencing epoch, so it is refused unless the term is above the epoch in
+  force; a fresh raft directory started its terms at zero, and a cluster
+  re-provisioned (or a voter replaced) on such a journal could promote
+  only manually until enough elections had passed. A node now raises its
+  control-plane term to its journal's epoch as it starts, which also
+  clears terms left behind by manual promotions once the node restarts.
+  The control plane now starts once the node's journal is recovered, so
+  a recovering replica takes no part in elections until then.
 - **`melin_transport_core::test_ports::free_addr` (behind `test-utils`)
   no longer hands a test process a port another test process still
   uses.** Each port it hands out is now claimed, with a lock file in

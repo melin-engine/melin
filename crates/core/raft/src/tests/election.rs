@@ -11,8 +11,9 @@ use crate::driver::{
     ELECTION_TIMEOUT_MAX_MS, LEADER_CONFIRM_TIMEOUT, LeaderConfirmError, RaftConfig, RaftHandles,
     RaftPeer, spawn,
 };
+use crate::recency::TipSource;
 use crate::tests::authorized_keys_table;
-use crate::tests::tip_at;
+use crate::tests::{reopened, tip_at};
 use ed25519_dalek::SigningKey;
 use melin_app::auth::{AuthorizedKeys, NoRoles};
 use melin_transport_core::health::RaftStatus;
@@ -21,7 +22,10 @@ use tempfile::TempDir;
 
 struct Cluster {
     nodes: Vec<Node>,
-    _dirs: Vec<TempDir>,
+    /// What a restart keeps: the keys, the addresses the stored membership
+    /// names, and each node's raft directory.
+    layout: Layout,
+    dirs: Vec<TempDir>,
 }
 
 struct Node {
@@ -30,6 +34,73 @@ struct Node {
     addr: std::net::SocketAddr,
     handles: RaftHandles,
     shutdown: Arc<AtomicBool>,
+}
+
+/// A cluster's identities and addresses, fixed across restarts: node `i`
+/// (id `i + 1`) has `keys[i]` and listens on `addrs[i]`.
+struct Layout {
+    keys: Vec<SigningKey>,
+    addrs: Vec<std::net::SocketAddr>,
+    peers: Vec<RaftPeer>,
+    authorized_keys: Arc<AuthorizedKeys>,
+}
+
+impl Layout {
+    fn new(n: u64) -> Self {
+        let keys: Vec<SigningKey> = (0..n)
+            .map(|i| SigningKey::from_bytes(&[i as u8 + 1; 32]))
+            .collect();
+        // Reserve n distinct localhost ports — see `free_addr`.
+        let addrs: Vec<std::net::SocketAddr> = (0..n).map(|_| free_addr(PORT_BASE)).collect();
+        let names: Vec<String> = (1..=n).map(|id| format!("node-{id}")).collect();
+        let entries: Vec<(&SigningKey, &str, &str)> = keys
+            .iter()
+            .zip(&names)
+            .map(|(k, name)| (k, "replication", name.as_str()))
+            .collect();
+        let authorized_keys = Arc::new(authorized_keys_table(&entries));
+        // Identical peer list on every node, self included — the
+        // production configuration shape.
+        let peers: Vec<RaftPeer> = (0..n as usize)
+            .map(|i| RaftPeer {
+                id: i as u64 + 1,
+                addr: addrs[i].to_string(),
+                pubkey: keys[i].verifying_key().to_bytes(),
+            })
+            .collect();
+        Layout {
+            keys,
+            addrs,
+            peers,
+            authorized_keys,
+        }
+    }
+
+    /// Start node `i` on the raft state in `dir`, advertising `tip`.
+    fn start(&self, i: usize, dir: &TempDir, tip: Arc<TipSource>) -> Node {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let config = RaftConfig {
+            node_id: i as u64 + 1,
+            bind: self.addrs[i],
+            dir: dir.path().to_path_buf(),
+            peers: self.peers.clone(),
+        };
+        let handles = spawn(
+            config,
+            Arc::new(self.keys[i].clone()),
+            Arc::clone(&self.authorized_keys),
+            tip,
+            None, // no supersession policy — election-only test nodes
+            Arc::clone(&shutdown),
+        )
+        .expect("driver spawn");
+        Node {
+            id: i as u64 + 1,
+            addr: self.addrs[i],
+            handles,
+            shutdown,
+        }
+    }
 }
 
 /// Overall bound for a cluster to settle on a leader. Elections are tuned
@@ -48,62 +119,25 @@ fn start_cluster(n: u64) -> Cluster {
 /// Boot a cluster with a fixed advertised journal tip per node (index i =
 /// node id i+1), for recency-steering tests. Every tip is `ready`.
 fn start_cluster_with_tips(tips: &[u64]) -> Cluster {
-    let n = tips.len() as u64;
-    let keys: Vec<SigningKey> = (0..n)
-        .map(|i| SigningKey::from_bytes(&[i as u8 + 1; 32]))
+    let tips: Vec<Arc<TipSource>> = tips.iter().map(|&seq| tip_at(0, seq)).collect();
+    start_cluster_advertising(tips)
+}
+
+/// Boot a cluster on fresh raft directories, node `i` advertising
+/// `tips[i]`.
+fn start_cluster_advertising(tips: Vec<Arc<TipSource>>) -> Cluster {
+    let layout = Layout::new(tips.len() as u64);
+    let dirs: Vec<TempDir> = tips.iter().map(|_| TempDir::new().unwrap()).collect();
+    let nodes = tips
+        .into_iter()
+        .enumerate()
+        .map(|(i, tip)| layout.start(i, &dirs[i], tip))
         .collect();
-
-    // Reserve n distinct localhost ports — see `free_addr`.
-    let addrs: Vec<String> = (0..n).map(|_| free_addr(PORT_BASE).to_string()).collect();
-
-    let names: Vec<String> = (1..=n).map(|id| format!("node-{id}")).collect();
-    let entries: Vec<(&SigningKey, &str, &str)> = keys
-        .iter()
-        .zip(&names)
-        .map(|(k, name)| (k, "replication", name.as_str()))
-        .collect();
-    let authorized_keys = Arc::new(authorized_keys_table(&entries));
-
-    // Identical peer list on every node, self included — the production
-    // configuration shape.
-    let peers: Vec<RaftPeer> = (0..n as usize)
-        .map(|i| RaftPeer {
-            id: i as u64 + 1,
-            addr: addrs[i].clone(),
-            pubkey: keys[i].verifying_key().to_bytes(),
-        })
-        .collect();
-
-    let mut nodes = Vec::new();
-    let mut dirs = Vec::new();
-    for i in 0..n as usize {
-        let dir = TempDir::new().unwrap();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let addr = addrs[i].parse().unwrap();
-        let config = RaftConfig {
-            node_id: i as u64 + 1,
-            bind: addr,
-            dir: dir.path().to_path_buf(),
-            peers: peers.clone(),
-        };
-        let handles = spawn(
-            config,
-            Arc::new(keys[i].clone()),
-            Arc::clone(&authorized_keys),
-            tip_at(0, tips[i]),
-            None, // no supersession policy — election-only test nodes
-            Arc::clone(&shutdown),
-        )
-        .expect("driver spawn");
-        nodes.push(Node {
-            id: i as u64 + 1,
-            addr,
-            handles,
-            shutdown,
-        });
-        dirs.push(dir);
+    Cluster {
+        nodes,
+        layout,
+        dirs,
     }
-    Cluster { nodes, _dirs: dirs }
 }
 
 /// `spawn` for node 1, listening on `bind`, with node 2 at `peer_addr`
@@ -283,6 +317,26 @@ impl Cluster {
         let node = self.nodes.remove(at);
         node.handles.join.join().expect("driver thread panicked");
         node.addr
+    }
+
+    /// Stop every node, then start them again on their own raft
+    /// directories and addresses, each advertising a ready tip at `epoch`:
+    /// the cluster restarted on a journal whose fencing epoch is `epoch`.
+    fn restart_at_epoch(mut self, epoch: u64) -> Cluster {
+        self.stop_all();
+        let nodes = (0..self.dirs.len())
+            .map(|i| self.layout.start(i, &self.dirs[i], tip_at(epoch, 0)))
+            .collect();
+        Cluster { nodes, ..self }
+    }
+
+    /// The highest term any node reports.
+    fn highest_term(&self) -> u64 {
+        self.nodes
+            .iter()
+            .map(|n| n.handles.status.term.load(Ordering::Relaxed))
+            .max()
+            .unwrap_or(0)
     }
 
     fn stop_all(&mut self) {
@@ -634,4 +688,126 @@ fn behind_node_never_wins_an_election() {
     let first = await_single_leader(&refs);
     assert_ne!(first, 3, "the behind node must not win the election");
     cluster.stop_all();
+}
+
+// --- The term floor: a raft cluster's terms above the journal's epoch ---
+
+/// Poll until the nodes agree on a leader whose term is above `term`.
+/// Returns the leader's id and term.
+fn await_leader_above(cluster: &Cluster, nodes: &[&Node], term: u64) -> (u64, u64) {
+    let deadline = Instant::now() + ELECTION_DEADLINE;
+    loop {
+        let leader = await_single_leader(nodes);
+        let leader_term = cluster.status(leader).term.load(Ordering::Relaxed);
+        if leader_term > term {
+            return (leader, leader_term);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no leader above term {term} within {ELECTION_DEADLINE:?}; node {leader} leads at \
+             term {leader_term}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A raft cluster started fresh on a journal that has failed over (epoch
+/// 5) elects above that epoch at once, so the winner's term can become
+/// the next epoch, and auto-promotion is not refused for want of terms.
+#[test]
+fn a_fresh_cluster_elects_above_the_journal_epoch() {
+    let mut cluster = start_cluster_advertising((0..3).map(|_| tip_at(5, 0)).collect());
+    let refs: Vec<&Node> = cluster.nodes.iter().collect();
+    let leader = await_single_leader(&refs);
+    let term = cluster.status(leader).term.load(Ordering::Relaxed);
+    assert!(
+        term > 5,
+        "node {leader} leads at term {term}, not above epoch 5"
+    );
+    cluster.stop_all();
+}
+
+/// A cluster whose terms trail the epoch (manual promotions since its
+/// raft directories were made) raises them when it restarts.
+#[test]
+fn a_restarted_cluster_raises_its_terms_above_the_epoch() {
+    const EPOCH: u64 = 9;
+    let cluster = start_cluster(3);
+    let refs: Vec<&Node> = cluster.nodes.iter().collect();
+    let leader = await_single_leader(&refs);
+    let term = cluster.status(leader).term.load(Ordering::Relaxed);
+    assert!(term < EPOCH, "the first election ran to term {term}");
+
+    let mut cluster = cluster.restart_at_epoch(EPOCH);
+    let refs: Vec<&Node> = cluster.nodes.iter().collect();
+    await_leader_above(&cluster, &refs, EPOCH);
+    cluster.stop_all();
+}
+
+/// A replica starts its driver before its journal is recovered, so its
+/// epoch is not yet known: its raft core waits for it, and takes no part
+/// until then, rather than start below its floor.
+#[test]
+fn a_node_whose_tip_is_ready_late_starts_raft_at_its_epoch() {
+    const EPOCH: u64 = 7;
+    let late = tip_at(0, 0);
+    late.ready.store(false, Ordering::Release);
+    let mut cluster =
+        start_cluster_advertising(vec![tip_at(0, 0), tip_at(0, 0), Arc::clone(&late)]);
+
+    let early: Vec<&Node> = cluster.nodes.iter().filter(|n| n.id != 3).collect();
+    let leader = await_single_leader(&early);
+    assert!(
+        cluster.status(leader).term.load(Ordering::Relaxed) < EPOCH,
+        "the first election ran to the epoch"
+    );
+    assert_eq!(
+        cluster.status(3).term.load(Ordering::Relaxed),
+        0,
+        "a node whose tip is not ready has not started its raft core"
+    );
+
+    // Its journal recovered: the epoch it found, then the tip released.
+    late.fence.observe_epoch(EPOCH);
+    late.ready.store(true, Ordering::Release);
+    let all: Vec<&Node> = cluster.nodes.iter().collect();
+    await_leader_above(&cluster, &all, EPOCH);
+    assert!(cluster.highest_term() > EPOCH);
+    cluster.stop_all();
+}
+
+/// A replica shut down while its journal is still recovering: its driver
+/// exits, reports itself stopped, and has written nothing to its raft
+/// state, so no floor is taken from a journal not yet recovered.
+#[test]
+fn a_node_shut_down_before_its_tip_is_ready_stops_without_writing() {
+    let layout = Layout::new(3);
+    let dir = TempDir::new().unwrap();
+    // An epoch a floor would write, were it applied.
+    let tip = tip_at(5, 0);
+    tip.ready.store(false, Ordering::Release);
+    let node = layout.start(0, &dir, tip);
+
+    // Long enough for the driver to reach its wait (it polls every
+    // `SHUTDOWN_POLL`); the assertions below hold however far it got.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(node.handles.status.running.load(Ordering::Relaxed));
+    node.shutdown.store(true, Ordering::Relaxed);
+    let Node { handles, .. } = node;
+    handles.join.join().expect("driver thread panicked");
+    assert!(
+        !handles.status.running.load(Ordering::Relaxed),
+        "a driver stopped while waiting for its tip reports itself stopped"
+    );
+    assert_eq!(handles.status.term.load(Ordering::Relaxed), 0);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let (vote, entries) = rt.block_on(reopened(dir.path()));
+    assert_eq!(vote, None, "no vote written before the tip was ready");
+    assert!(
+        entries.is_empty(),
+        "no log written before the tip was ready"
+    );
 }
