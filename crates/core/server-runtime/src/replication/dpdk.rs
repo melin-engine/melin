@@ -25,8 +25,8 @@ use super::join_worker::{
     JoinContext, JoinRequest, JoinStallWatch, JoinStream, JoinWorker, Pump, stream_join,
 };
 use super::receiver_transport::{
-    ControlFrameSource, FrameResult, ReceiverTransport, compact_recv_buf, run_serviced,
-    streaming_loop, try_extract_frame,
+    ControlFrameSource, FrameResult, ReceiverTransport, compact_recv_buf, drain_ack_frames,
+    run_serviced, streaming_loop, try_extract_frame,
 };
 use super::validation_worker::ValidationWorker;
 use super::{
@@ -248,6 +248,11 @@ enum JoinFrames {
 /// On a quiet primary nothing more is journaled, and an ack dropped here
 /// would leave the slot at its handshake position, with a write held for
 /// the replica's ack never answered.
+///
+/// Walks the frames itself rather than through [`drain_ack_frames`]: that
+/// helper hands out each decoded ack and compacts everything it consumed,
+/// where this one keeps the newest ack's own bytes in the buffer, for the
+/// streaming arm's drain to decode on its first tick.
 fn keep_last_ack(buf: &mut Vec<u8>) -> JoinFrames {
     let mut consumed = 0;
     // The newest ack's byte range in `buf`.
@@ -1319,54 +1324,28 @@ impl<A: Application> DpdkReplicationDriver<A> {
 
                     // 1. Process acks (non-blocking).
                     transport.recv_into_vec(handle, &mut slot.recv_buf);
-                    let mut consumed = 0;
-                    let mut ack_error = false;
                     // Whether an ack was recorded this tick. The latency
-                    // gauge is stored once after the loop rather than per
+                    // gauge is stored once after the drain rather than per
                     // ack: `last_send` does not move inside it, so a later
                     // ack's store would only overwrite an earlier one, and
                     // this poll thread is also client ingress.
                     let mut acked = false;
                     // When this tick's acks arrived, read once, on the first.
                     let mut ack_received: Option<std::time::Instant> = None;
-                    loop {
-                        let remaining = &slot.recv_buf[consumed..];
-                        match try_extract_frame(remaining, MAX_CONTROL_FRAME) {
-                            FrameResult::Complete(payload_start, frame_end) => {
-                                let payload = &remaining[payload_start..frame_end];
-                                if let Ok(ReplicaMessage::Ack(ack)) =
-                                    decode_replica_message(payload)
-                                {
-                                    if cursors.record_ack(slot_idx, &ack, slot.sent.get()).is_err()
-                                    {
-                                        // Eviction on violation: reuse the ack-error
-                                        // teardown below (the store already logged
-                                        // the violation at error level).
-                                        ack_error = true;
-                                        break;
-                                    }
-                                    acked = true;
-                                    let received =
-                                        *ack_received.get_or_insert_with(std::time::Instant::now);
-                                    if let Some(event) = slot.persist_watch.observe(&ack, received)
-                                    {
-                                        event.log(slot_idx);
-                                    }
-                                }
-                                consumed += frame_end;
-                            }
-                            FrameResult::Oversized => {
-                                warn!(
-                                    slot = slot_idx,
-                                    "oversized ack frame from replica — disconnecting"
-                                );
-                                ack_error = true;
-                                break;
-                            }
-                            FrameResult::Incomplete => break,
+                    let drained = drain_ack_frames(&mut slot.recv_buf, |ack| {
+                        // Eviction on violation: the store has logged it
+                        // at error level, and the error tears the slot
+                        // down below.
+                        cursors
+                            .record_ack(slot_idx, &ack, slot.sent.get())
+                            .map_err(io::Error::other)?;
+                        acked = true;
+                        let received = *ack_received.get_or_insert_with(std::time::Instant::now);
+                        if let Some(event) = slot.persist_watch.observe(&ack, received) {
+                            event.log(slot_idx);
                         }
-                    }
-                    compact_recv_buf(&mut slot.recv_buf, consumed);
+                        Ok(())
+                    });
                     if acked {
                         // Same measure as the TCP sender: time since the
                         // last send (data or heartbeat) to the ack.
@@ -1382,7 +1361,12 @@ impl<A: Application> DpdkReplicationDriver<A> {
                             first_ack.acked(replicas_connected);
                         }
                     }
-                    if ack_error {
+                    // After the acks recorded ahead of the failure, as on
+                    // the kernel-TCP sender, whose drain records each one.
+                    if let Err(e) = drained {
+                        // The kernel-TCP sender's wording and level for
+                        // the same end (its handler's error).
+                        warn!(slot = slot_idx, error = %e, "replica connection error");
                         slot.go_idle(slot_idx, transport, cursors, metrics, replicas_connected);
                         continue;
                     }

@@ -20,7 +20,8 @@ use melin_pipeline::wait::WaitStrategy;
 use melin_transport_core::lineage::SharedLineagePolicy;
 use melin_transport_core::pipeline::{AdoptedRotation, InputSlot, StreamMark, StreamMarkQueue};
 use melin_transport_core::replication::protocol::{
-    Ack, MAX_DATA_FRAME, PrimaryMessage, decode_primary_message,
+    Ack, MAX_CONTROL_FRAME, MAX_DATA_FRAME, PrimaryMessage, ReplicaMessage, decode_primary_message,
+    decode_replica_message,
 };
 use melin_transport_core::replication_wire::{InputBatchError, try_decode_input_batch_into};
 use melin_wire_protocol::framing::{PREFIX_LEN, split_frame_limited};
@@ -115,6 +116,46 @@ pub(super) fn compact_recv_buf(buf: &mut Vec<u8>, consumed: usize) {
         buf.copy_within(consumed.., 0);
         buf.truncate(buf.len() - consumed);
     }
+}
+
+/// Split a streaming replica's complete frames off the front of
+/// `parse_buf`, hand every `Ack` among them to `on_ack`, and compact the
+/// consumed bytes away; a trailing partial frame stays for the next read.
+/// The primary's side of the stream, shared by the kernel-TCP and DPDK
+/// senders.
+///
+/// A length prefix above [`MAX_CONTROL_FRAME`], or of zero (every replica
+/// message carries a tag), is an `Err` as soon as its 4 bytes are in, as
+/// is an `Err` from `on_ack`; either ends the connection, so nothing is
+/// compacted on that path. A frame that is not a decodable `Ack` is
+/// skipped.
+///
+/// Not [`try_extract_frame`], which applies the same rule: the error
+/// names the length the replica declared.
+pub(super) fn drain_ack_frames(
+    parse_buf: &mut Vec<u8>,
+    mut on_ack: impl FnMut(Ack) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut cursor = 0;
+    loop {
+        let frame = match split_frame_limited(&parse_buf[cursor..], MAX_CONTROL_FRAME) {
+            Ok(Some(frame)) if !frame.payload.is_empty() => frame,
+            Ok(Some(_)) => return Err(io::Error::other("invalid ack frame length: 0")),
+            Ok(None) => break,
+            Err(too_large) => {
+                return Err(io::Error::other(format!(
+                    "invalid ack frame length: {}",
+                    too_large.declared
+                )));
+            }
+        };
+        if let Ok(ReplicaMessage::Ack(ack)) = decode_replica_message(frame.payload) {
+            on_ack(ack)?;
+        }
+        cursor += frame.consumed();
+    }
+    compact_recv_buf(parse_buf, cursor);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1406,6 +1447,112 @@ mod tests {
             try_extract_frame(&prefixed(0, &[1, 2, 3]), 16),
             FrameResult::Oversized
         );
+    }
+
+    // ---------------------------------------------------------------
+    // drain_ack_frames
+    // ---------------------------------------------------------------
+
+    fn ack_frame(seq: u64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        melin_transport_core::replication::protocol::encode_ack(
+            &Ack {
+                acked_sequence: seq,
+                in_memory_sequence: seq,
+            },
+            &mut buf,
+        );
+        buf
+    }
+
+    /// `drain_ack_frames` over `buf`, returning the acked sequences it
+    /// handed over alongside its result.
+    fn drain_acks(buf: &mut Vec<u8>) -> (io::Result<()>, Vec<u64>) {
+        let mut seen = Vec::new();
+        let result = drain_ack_frames(buf, |ack| {
+            seen.push(ack.acked_sequence);
+            Ok(())
+        });
+        (result, seen)
+    }
+
+    #[test]
+    fn ack_frames_are_handed_over_and_a_partial_one_is_kept() {
+        let mut buf = ack_frame(1);
+        buf.extend_from_slice(&ack_frame(2));
+        let third = ack_frame(3);
+        buf.extend_from_slice(&third[..third.len() - 1]);
+
+        let (result, seen) = drain_acks(&mut buf);
+        result.unwrap();
+        assert_eq!(seen, [1, 2]);
+        assert_eq!(
+            buf,
+            third[..third.len() - 1],
+            "partial frame compacted to the front"
+        );
+
+        buf.push(*third.last().unwrap());
+        let (result, seen) = drain_acks(&mut buf);
+        result.unwrap();
+        assert_eq!(seen, [3]);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn a_frame_that_is_not_an_ack_is_skipped() {
+        let mut buf = prefixed(1, &[0xEE]);
+        buf.extend_from_slice(&ack_frame(4));
+        let (result, seen) = drain_acks(&mut buf);
+        result.unwrap();
+        assert_eq!(seen, [4]);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn an_ack_frame_at_the_cap_waits_for_its_payload() {
+        let mut buf = prefixed(MAX_CONTROL_FRAME, &[]);
+        let (result, seen) = drain_acks(&mut buf);
+        result.unwrap();
+        assert!(seen.is_empty());
+        assert_eq!(buf.len(), 4, "prefix kept for the next read");
+    }
+
+    /// Refused on the prefix alone, after the acks in front of it.
+    #[test]
+    fn an_oversized_ack_prefix_fails_before_its_payload() {
+        let mut buf = ack_frame(5);
+        buf.extend_from_slice(&prefixed(MAX_CONTROL_FRAME + 1, &[]));
+        let (result, seen) = drain_acks(&mut buf);
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            format!("invalid ack frame length: {}", MAX_CONTROL_FRAME + 1)
+        );
+        assert_eq!(seen, [5]);
+    }
+
+    #[test]
+    fn a_zero_length_ack_frame_fails() {
+        let mut buf = prefixed(0, &[]);
+        let (result, seen) = drain_acks(&mut buf);
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "invalid ack frame length: 0"
+        );
+        assert!(seen.is_empty());
+    }
+
+    #[test]
+    fn an_on_ack_error_stops_the_drain() {
+        let mut buf = ack_frame(6);
+        buf.extend_from_slice(&ack_frame(7));
+        let mut calls = 0;
+        let result = drain_ack_frames(&mut buf, |_| {
+            calls += 1;
+            Err(io::Error::other("cursor violation"))
+        });
+        assert_eq!(result.unwrap_err().to_string(), "cursor violation");
+        assert_eq!(calls, 1);
     }
 
     // ---------------------------------------------------------------
