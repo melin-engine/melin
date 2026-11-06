@@ -1113,7 +1113,8 @@ across restarts and promotion.
    that a later release can roll replicas first. No ranges. Raft
    protocol 1 needs the same rule before it ships (noted, not
    scheduled). Serving N−1 is not planned: rolling upgrades are not
-   supported.
+   supported. Landed on `main` on 2026-11-05, ahead of the plan; raft
+   links keep the unversioned auth frames (plan, decision 8).
 5. **Build id (2.2):** decided (2026-11-04): always compare output
    digests, whatever the builds. The build id stays for diagnosis only,
    named in the stop's log, marker and refusal when the builds differ; no
