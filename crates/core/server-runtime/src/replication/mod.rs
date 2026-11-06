@@ -73,6 +73,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use melin_journal::{BufferedWriter, JournalWrite};
 
 use melin_app::Application;
+use melin_transport_core::divergence::DivergenceLatch;
 use melin_transport_core::lineage::SharedLineagePolicy;
 use melin_transport_core::node_store::NodeStore;
 use melin_transport_core::pipeline::InputSlot;
@@ -86,6 +87,7 @@ mod dpdk;
 /// The replica's drain: `pub(crate)` for the response loop's agreement
 /// test, which runs it beside a primary's stage.
 pub(crate) mod drain;
+mod halt_notice;
 mod receiver_transport;
 mod tcp_receiver;
 mod tcp_sender;
@@ -189,14 +191,21 @@ pub struct ReplicaControlPlane {
     /// `true` from boot, latched `false` by the journal stage's failure
     /// wrapper, reset `true` when a fresh pipeline is built.
     pub(crate) pipeline_healthy: std::sync::Arc<AtomicBool>,
+    /// The node's divergence stop: tripped by the primary's `Halt`, and
+    /// read by the streaming loop before its shutdown arm, so a stopped
+    /// replica sends no ordinary ack after the stop.
+    pub(crate) latch: DivergenceLatch,
 }
 
 impl ReplicaControlPlane {
     /// Fresh handles for a replica boot: nothing requested, tip not
     /// trustworthy yet, tip sequence 0, primary link down and never seen,
     /// no lineage policy held, pipeline healthy (nothing has failed yet).
-    pub fn new() -> Self {
+    /// `latch` is the node's divergence stop, required: a replica whose
+    /// stop is not the node's would stop nothing.
+    pub fn new(latch: DivergenceLatch) -> Self {
         Self {
+            latch,
             promote: crate::promotion::PromotionRequest::new(),
             tip_ready: std::sync::Arc::new(AtomicBool::new(false)),
             journal_tip: melin_transport_core::AdvertisedJournalTip::new(
@@ -207,12 +216,6 @@ impl ReplicaControlPlane {
             lineage_ack_policy: std::sync::Arc::new(SharedLineagePolicy::new(None)),
             pipeline_healthy: std::sync::Arc::new(AtomicBool::new(true)),
         }
-    }
-}
-
-impl Default for ReplicaControlPlane {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -1345,7 +1348,9 @@ where
     close();
 
     match exit {
-        SessionExit::Shutdown => {
+        // Stopped for divergence: as a shutdown, the pipeline stops and
+        // the receiver returns; the node's exit reports the stop.
+        SessionExit::Shutdown | SessionExit::Stopped => {
             state.engine.take().stop();
             AfterSession::Return(Ok(None))
         }
@@ -2168,15 +2173,22 @@ mod tests {
         };
         let mut buf = Vec::new();
         encode_ack(&ack, &mut buf);
-        // [length:u32 LE = 17][tag:u8 = MSG_ACK = 0x02]
-        // [acked_sequence:u64 LE][in_memory_sequence:u64 LE]
-        let expected: &[u8] = &[
-            0x11, 0x00, 0x00, 0x00, // length = 17 LE
+        // [length:u32 LE = 18][tag:u8 = MSG_ACK = 0x02]
+        // [acked_sequence:u64 LE][in_memory_sequence:u64 LE][flags:u8]
+        let mut expected: Vec<u8> = vec![
+            0x12, 0x00, 0x00, 0x00, // length = 18 LE
             0x02, // MSG_ACK
             0x0D, 0xF0, 0xFE, 0xCA, 0xEF, 0xBE, 0xAD, 0xDE, // acked_sequence LE
             0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // in_memory_sequence LE
+            0x00, // flags: none
         ];
-        assert_eq!(buf.as_slice(), expected, "Ack wire layout drifted");
+        assert_eq!(buf, expected, "Ack wire layout drifted");
+
+        // A stopped replica's ack: the same frame, the flag set.
+        buf.clear();
+        melin_transport_core::replication::protocol::encode_stopped_ack(&ack, &mut buf);
+        *expected.last_mut().expect("the flag byte") = 0x01;
+        assert_eq!(buf, expected, "stopped Ack wire layout drifted");
     }
 
     /// Two known genesis lengths must agree; an unknown one on either
@@ -2631,7 +2643,7 @@ mod tests {
             &mut state,
             &store,
             &melin_transport_core::fence::FenceState::new(0),
-            &ReplicaControlPlane::new(),
+            &ReplicaControlPlane::new(crate::tests::idle_latch()),
             PREALLOC,
         )
         .expect("resync");
@@ -2699,7 +2711,7 @@ mod tests {
             &mut state,
             &store,
             &melin_transport_core::fence::FenceState::new(0),
-            &ReplicaControlPlane::new(),
+            &ReplicaControlPlane::new(crate::tests::idle_latch()),
             PREALLOC,
         )
         .expect("a network-shaped failure is retried, not fatal");
@@ -2861,7 +2873,7 @@ mod tests {
             Writer::create_continuing(&path, 1, anchor, None, PREALLOC).expect("create"),
         );
         let fence = melin_transport_core::fence::FenceState::new(5);
-        let control = ReplicaControlPlane::new();
+        let control = ReplicaControlPlane::new(crate::tests::idle_latch());
 
         let verdict = accept_stream_start::<counter_server::Counter, Writer>(
             StreamStart {
@@ -2889,7 +2901,7 @@ mod tests {
     #[test]
     fn a_fresh_replica_follows_a_primary_without_an_engine() {
         let fence = melin_transport_core::fence::FenceState::new(0);
-        let control = ReplicaControlPlane::new();
+        let control = ReplicaControlPlane::new(crate::tests::idle_latch());
         let mut engine = ReplicaEngine::<counter_server::Counter, CounterWriter>::Fresh;
 
         let verdict = accept_stream_start(
@@ -3041,7 +3053,7 @@ mod tests {
             Writer::create_continuing(&path, 1, anchor, None, PREALLOC).expect("create"),
         );
         let fence = melin_transport_core::fence::FenceState::new(5);
-        let control = ReplicaControlPlane::new();
+        let control = ReplicaControlPlane::new(crate::tests::idle_latch());
         let held = Some(melin_transport_core::lineage::LineagePolicy::after(
             None,
             melin_transport_core::WireSeq::new(1),
@@ -3091,7 +3103,7 @@ mod tests {
             Writer::create_continuing(&path, 1, anchor, Some(2), PREALLOC).expect("create"),
         );
         let fence = melin_transport_core::fence::FenceState::new(5);
-        let control = ReplicaControlPlane::new();
+        let control = ReplicaControlPlane::new(crate::tests::idle_latch());
 
         let err = accept_stream_start::<counter_server::Counter, Writer>(
             StreamStart {

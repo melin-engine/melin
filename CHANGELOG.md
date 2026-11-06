@@ -128,7 +128,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   `no_output_digests`; `response::Response` gains `digester` and `latch`;
   `pipeline::Pipeline` and `pipeline::ReplicaPipeline` gain `first_live`;
   `MatchingStage::new` takes an `AppliedWireSeqCursor` after the durable
-  cursor.
+  cursor; `replication::Sender` gains `latch`; `ReplicaControlPlane::new`
+  takes the node's `DivergenceLatch`, and `ReplicaControlPlane` no longer
+  implements `Default`.
 - **A cluster has at most three raft voters** (breaking for deployments
   listing more): the primary and one per replica slot, as
   `melin_raft::MAX_VOTERS`. A node refuses to start with more
@@ -159,7 +161,16 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   frames; `encode_unversioned_challenge_response`,
   `encode_unversioned_auth_ok`, `encode_version_refused`,
   `admits_replica_version` and `MSG_VERSION_REFUSED` are new. Control-plane
-  links keep the unversioned frames, and their wire is unchanged.
+  links keep the unversioned frames, and their wire is unchanged. Also in
+  protocol 9: a replica's `Ack` and `Handshake` gain a flag byte, whose one
+  bit (`FLAG_STOPPED`) says the replica stopped for divergence, and the
+  primary's new `Halt` frame (`MSG_HALT`) says it has. A stopped replica
+  stops its primary, which stops every replica streaming from it.
+  `ReplicaMessage` gains `StoppedAck`, `StoppedHandshake` and
+  `UnknownFlags` (an unknown flag bit is refused, never read as a stop or
+  as no stop), `PrimaryMessage` gains `Halt`, each breaking for a `match`
+  on it; `encode_stopped_ack`, `encode_stopped_handshake` and
+  `encode_halt` are new.
 - **`encode_rotate` and `encode_chain_check` return the frame**
   (breaking, in `melin_transport_core::replication::protocol`): each
   returns `[u8; SEQ_HASH_FRAME_LEN]`, length prefix included, instead of

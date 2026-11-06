@@ -56,14 +56,12 @@ pub enum HaltCause {
 pub enum HaltedBy {
     /// This node's primary.
     Primary,
-    /// A replica streaming from this node: its slot, and its key as the
-    /// authorized keys file names it.
+    /// A replica streaming from this node, by the replication slot it
+    /// streamed on. Naming its key is diagnostics the plan defers with the
+    /// build ids.
     Replica {
         /// The replication slot it streamed on.
         slot: usize,
-        /// Its key's comment in the authorized keys file, or its
-        /// fingerprint when it has none.
-        key: String,
     },
 }
 
@@ -82,7 +80,7 @@ impl fmt::Display for HaltedBy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Primary => write!(f, "the primary"),
-            Self::Replica { slot, key } => write!(f, "the replica on slot {slot} ({key})"),
+            Self::Replica { slot } => write!(f, "the replica on slot {slot}"),
         }
     }
 }
@@ -645,10 +643,7 @@ mod tests {
     fn a_told_marker_parses_back() {
         let n = node(Arc::new(FsSync));
         let _halted = n.latch.trip_with(HaltCause::ClusterHalted {
-            by: HaltedBy::Replica {
-                slot: 1,
-                key: "node-2".into(),
-            },
+            by: HaltedBy::Replica { slot: 1 },
             via: NoticePath::Ack,
         });
         assert!(matches!(
@@ -660,7 +655,7 @@ mod tests {
         assert_eq!(
             record.cause,
             MarkerCause::Told {
-                by: "the replica on slot 1 (node-2)".into(),
+                by: "the replica on slot 1".into(),
                 via: "its acknowledgement".into()
             }
         );

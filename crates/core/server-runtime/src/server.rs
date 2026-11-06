@@ -1323,7 +1323,7 @@ where
         // mode-detection so it survives a replica → primary transition.
         // The rotate flag is re-wired into the new primary's journal
         // stage by `run_as_primary`.
-        let control = crate::replication::ReplicaControlPlane::new();
+        let control = crate::replication::ReplicaControlPlane::new(stop.latch.clone());
         let promotion_request = control.promote.clone();
         let rotate_flag = config.admin_bind.map(|_| Arc::new(AtomicBool::new(false)));
         let _admin_handle = config
@@ -2344,6 +2344,7 @@ where
             .ok_or("replication_metrics must be Some when replication is enabled")?;
         let handlers = [cores.repl_handler_0, cores.repl_handler_1];
         let sender_fence = Arc::clone(&fence_state);
+        let sender_latch = stop.latch.clone();
         // Bound in `run_impl` before any pipeline thread was spawned —
         // see the `repl_listener` parameter doc.
         let repl_listener = repl_listener
@@ -2378,6 +2379,7 @@ where
                         batch_size,
                         heartbeat_secs,
                         fence_state: sender_fence,
+                        latch: sender_latch,
                     },
                     &s_repl,
                     &ready_flag,
@@ -2875,7 +2877,7 @@ where
 
         // The replica's control-plane bundle, same shape as the kernel
         // TCP replica path — see `run` for the rationale on lifetime.
-        let control = crate::replication::ReplicaControlPlane::new();
+        let control = crate::replication::ReplicaControlPlane::new(stop.latch.clone());
         let promotion_request = control.promote.clone();
         let rotate_flag = config.admin_bind.map(|_| Arc::new(AtomicBool::new(false)));
         let _admin_handle = config
@@ -3585,6 +3587,7 @@ where
             heartbeat_secs,
             Arc::clone(&fence_state),
             Arc::clone(&authorized_keys),
+            stop.latch.clone(),
         )?;
         // Legacy text match — `lan-bench-suite.sh` `wait_for_log` keys
         // off "DPDK replication sender started" to know the primary

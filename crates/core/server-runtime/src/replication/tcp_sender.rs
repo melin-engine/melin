@@ -17,17 +17,21 @@ use melin_transport_core::node_store::NodeStore;
 use melin_transport_core::replica_presence::{FirstAck, ReplicaPresence};
 
 use super::auth::authenticate_replica;
-use super::receiver_transport::drain_ack_frames;
+use super::halt_notice::{HaltNotice, HaltStep};
+use super::receiver_transport::{ReceivedAck, drain_ack_frames};
 use super::{ReplicaCursors, ReplicationMetrics, SentHighWater};
 use crate::layout::Placement;
 use crate::uring_teardown::{DrainBackoff, wake_pending_ops};
 use melin_app::Application;
+use melin_transport_core::divergence::{
+    DivergenceLatch, HALT_NOTICE_BOUND, HaltCause, HaltedBy, NoticePath,
+};
 use melin_transport_core::replication::catchup::{
     CatchUpResult, bridge_catchup_to_live, can_catch_up_from_journal, catch_up_from_journal,
     preflight_snapshot_transfer, snapshot_transfer_with,
 };
 use melin_transport_core::replication::protocol::{
-    MAX_CONTROL_FRAME, ReplicaMessage, decode_replica_message, encode_hash_mismatch,
+    MAX_CONTROL_FRAME, ReplicaMessage, decode_replica_message, encode_halt, encode_hash_mismatch,
     encode_heartbeat, encode_need_snapshot, encode_stream_start, read_frame,
 };
 use melin_transport_core::replication::validate::{
@@ -80,6 +84,10 @@ pub struct Sender {
     /// `StreamStart`, and to self-demote when a replica handshakes with a
     /// higher epoch (this primary has been superseded). See `crate::fence`.
     pub fence_state: Arc<melin_transport_core::fence::FenceState>,
+    /// The node's divergence stop: tripped by a replica that reports it
+    /// stopped, and, once tripped, answered on every live session with a
+    /// `Halt` before it closes.
+    pub latch: DivergenceLatch,
 }
 
 /// Run the replication sender. Listens for replica connections,
@@ -107,6 +115,7 @@ pub fn run_sender<A: Application>(
         batch_size,
         heartbeat_secs,
         fence_state,
+        latch,
     } = config;
     // Unwrap the invariant-carrying newtype — from here `listener` is a
     // plain TcpListener, known non-blocking.
@@ -309,6 +318,7 @@ pub fn run_sender<A: Application>(
                     let slot_active = Arc::clone(&active_flags[slot_idx]);
                     let slot_evict = Arc::clone(&evict_flags[slot_idx]);
                     let slot_fence = Arc::clone(&fence_state);
+                    let slot_latch = latch.clone();
                     let slot_counted = Arc::clone(&counted_flags[slot_idx]);
                     let handler = handlers[slot_idx];
                     let shutdown_flag = shutdown as *const AtomicBool as usize;
@@ -344,6 +354,7 @@ pub fn run_sender<A: Application>(
                                 evict_flag: &slot_evict,
                                 metrics: &slot_metrics,
                                 fence_state: &slot_fence,
+                                latch: &slot_latch,
                                 slot_idx,
                                 batch_size,
                                 heartbeat_secs,
@@ -410,6 +421,8 @@ struct SlotContext<'a> {
     evict_flag: &'a AtomicBool,
     metrics: &'a ReplicationMetrics,
     fence_state: &'a melin_transport_core::fence::FenceState,
+    /// The node's divergence stop (see [`Sender::latch`]).
+    latch: &'a DivergenceLatch,
     slot_idx: usize,
     batch_size: usize,
     heartbeat_secs: u64,
@@ -421,6 +434,23 @@ struct SlotContext<'a> {
     /// Per-slot latch the handler sets true as it lifts the gate, so the
     /// main loop knows whether this slot lifted it.
     counted: &'a AtomicBool,
+}
+
+/// Answer a stopped replica's handshake with `Halt`, once this node's
+/// marker is durable or the notice bound has passed (see `HaltNotice`), on
+/// a connection that carries nothing else. A blocking write, bounded.
+fn answer_with_halt(writer: &mut TcpStream, latch: &DivergenceLatch) -> io::Result<()> {
+    let mut notice = HaltNotice::new();
+    loop {
+        match notice.step(true, latch) {
+            HaltStep::Wait => std::thread::sleep(std::time::Duration::from_millis(1)),
+            HaltStep::Send => {
+                writer.set_write_timeout(Some(HALT_NOTICE_BOUND))?;
+                writer.write_all(&encode_halt())?;
+            }
+            HaltStep::Close => return Ok(()),
+        }
+    }
 }
 
 /// Handle a single replica connection on a dedicated thread.
@@ -452,6 +482,7 @@ fn handle_replica_connection<A: Application>(
         evict_flag: _,
         metrics,
         fence_state,
+        latch,
         slot_idx,
         batch_size: _,
         heartbeat_secs,
@@ -480,7 +511,20 @@ fn handle_replica_connection<A: Application>(
     let handshake_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
     let handshake = match decode_replica_message(&handshake_frame)? {
         ReplicaMessage::Handshake(h) => h,
-        ReplicaMessage::Ack(_) => {
+        // Read before the fence and chain checks, so a stopped replica is
+        // never sent a stream or a snapshot: it has stopped the cluster,
+        // and this node stops with it, answering with `Halt`.
+        ReplicaMessage::StoppedHandshake(_) => {
+            let _halted = latch.trip_with(HaltCause::ClusterHalted {
+                by: HaltedBy::Replica { slot: slot_idx },
+                via: NoticePath::Handshake,
+            });
+            return answer_with_halt(&mut writer, latch);
+        }
+        ReplicaMessage::UnknownFlags { tag, flags } => {
+            return Err(super::receiver_transport::unknown_flags(tag, flags));
+        }
+        ReplicaMessage::Ack(_) | ReplicaMessage::StoppedAck(_) => {
             return Err(io::Error::other("expected Handshake, got Ack"));
         }
     };
@@ -814,6 +858,7 @@ fn live_stream_uring(
         active_flag: _,
         heartbeat_secs: _,
         fence_state: _,
+        latch,
         counted: _,
     } = ctx;
     let slot_idx = *slot_idx;
@@ -891,12 +936,58 @@ fn live_stream_uring(
     unsafe { ring.submission().push(&sqe).expect("SQ full") };
     uring.in_flight += 1;
 
+    // The `Halt` this session owes its replica once the node has stopped
+    // for divergence: `Some` from the iteration that sees the stop.
+    let mut halt: Option<HaltNotice> = None;
+    // Once the `Halt` is out: until when the session waits for the replica
+    // to close the connection. Closing first would have the kernel answer
+    // the replica's unread acks with a reset, which can discard the `Halt`
+    // before the replica reads it; the replica closes as soon as it has.
+    let mut halt_sent_until: Option<std::time::Instant> = None;
+
     loop {
         // --- Check flags ---
         if shutdown.load(Ordering::Relaxed) {
-            return Ok(());
+            // A node stopped for divergence tells its replica before the
+            // session closes, at a frame boundary: no stream data goes
+            // out after the stop is seen, the frame in flight finishes,
+            // then `Halt`, then the close. Any other shutdown just closes.
+            if !latch.is_tripped() {
+                return Ok(());
+            }
+            match halt
+                .get_or_insert_with(HaltNotice::new)
+                .step(!send_in_flight, latch)
+            {
+                HaltStep::Wait => {}
+                HaltStep::Send => {
+                    send_buf.clear();
+                    send_buf.extend_from_slice(&encode_halt());
+                    let sqe = opcode::Send::new(
+                        types::Fixed(0),
+                        send_buf.as_ptr(),
+                        send_buf.len() as u32,
+                    )
+                    .build()
+                    .user_data(TOKEN_SEND);
+                    // SAFETY: as the stream's sends below: `send_buf` is
+                    // pinned by `send_in_flight` until its CQE, which the
+                    // guard drains on every exit path.
+                    unsafe { ring.submission().push(&sqe).expect("SQ full") };
+                    uring.in_flight += 1;
+                    send_in_flight = true;
+                    send_offset = 0;
+                }
+                HaltStep::Close => {
+                    let until = *halt_sent_until
+                        .get_or_insert_with(|| std::time::Instant::now() + HALT_NOTICE_BOUND);
+                    if std::time::Instant::now() >= until {
+                        return Ok(());
+                    }
+                }
+            }
         }
-        if evict_flag.load(Ordering::Relaxed) {
+        if halt.is_none() && evict_flag.load(Ordering::Relaxed) {
             // Capture the TCP state at the moment of eviction — the
             // critical frame for comparing an evicted slot's teardown
             // against the still-live slot's socket state when
@@ -910,8 +1001,9 @@ fn live_stream_uring(
         //
         // Ring chunks are wire-ready `InputBatch` frames produced by the
         // journal stage (phase 3 of the unified-pipeline plan), so the
-        // sender is a passthrough — no decode + re-encode here.
-        if !send_in_flight {
+        // sender is a passthrough — no decode + re-encode here. Nothing
+        // more once the session owes its replica a `Halt`.
+        if !send_in_flight && halt.is_none() {
             let mut coalesced = 0;
             while coalesced < batch_size {
                 if let Some(batch) = repl_consumer.peek() {
@@ -1024,15 +1116,39 @@ fn live_stream_uring(
             match token {
                 TOKEN_RECV => {
                     if result <= 0 {
+                        // After the `Halt`, the replica closing is the end
+                        // the session waits for.
+                        if halt_sent_until.is_some() {
+                            return Ok(());
+                        }
                         return Err(io::Error::other(format!(
                             "replica disconnected (recv returned {result})"
                         )));
                     }
                     let n = result as usize;
-                    parse_buf.extend_from_slice(&recv_buf[..n]);
+                    // Once the session owes or has sent its `Halt`, what
+                    // the replica sends is read off the socket and dropped:
+                    // the node has stopped, and records nothing more.
+                    if halt.is_none() {
+                        parse_buf.extend_from_slice(&recv_buf[..n]);
+                    }
 
                     let received = std::time::Instant::now();
-                    drain_ack_frames(&mut parse_buf, |ack| {
+                    drain_ack_frames(&mut parse_buf, |frame| {
+                        let ack = match frame {
+                            ReceivedAck::Ack(ack) => ack,
+                            // The replica stopped: this node stops too,
+                            // and the loop's next turn sends the `Halt`
+                            // the replica waits for. Its positions are
+                            // not recorded.
+                            ReceivedAck::Stopped => {
+                                let _halted = latch.trip_with(HaltCause::ClusterHalted {
+                                    by: HaltedBy::Replica { slot: slot_idx },
+                                    via: NoticePath::Ack,
+                                });
+                                return Ok(());
+                            }
+                        };
                         // Eviction on violation: returning Err tears the
                         // connection down; the accept loop's cleanup
                         // disengages the cursors and frees the slot.
