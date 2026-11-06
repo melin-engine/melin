@@ -533,6 +533,8 @@ Events the node journals on its own behalf, such as startup events, carry a `key
 
 **Changing your event encoding needs care, because the journal does not record it.** Old entries are decoded by whichever version of your application replays them. Adding a new kind of event is safe for replay, since no existing entry carries it — but upgrade every node before one is written, or a node on the old version cannot decode it. Changing an existing event's layout changes what entries already in the journal mean: do it only across a snapshot boundary, so the new version never replays an entry the old one wrote. The procedures are in [Journal & Event Sourcing](journal.md#migration-procedure).
 
+**An upgrade that changes your output means stopping every node.** Every replica checks the bytes of its reports against its primary's, and a difference stops the whole cluster (see [Output verification](replication.md#output-verification)). A new version whose reports differ for the same input — a new field, a reworded rejection, another order — cannot roll node by node: the first replica on it stops the cluster. Stop every node and start them all on the new version. A version whose output is unchanged rolls as before. The check also holds your sizing to its contract: `prefault` may change how fast your application runs, never what it reports.
+
 **Clone cheaply if you can.** The runtime takes its background copy through a snapshot round trip. An application with a faster way to copy itself can override `Application::clone_via_snapshot`.
 
 ## The client side

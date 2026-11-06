@@ -1247,6 +1247,21 @@ level, each covered as noted:
   `tick_watermark.rs` stand for it); a genuine output difference between
   two binaries or architectures (the `Sizing` fault stands in, and nothing
   after the mismatch depends on its cause).
+  As built, the integration cases are split: the healthy cluster under
+  load is `output_divergence.rs`'s `a_healthy_cluster_checks_its_output`,
+  and the rest are in `output_checks.rs`.
+  As built, also: the application whose report order follows a hash
+  map's capacity (assessment 1.3) is not among the integration cases: the
+  `Sizing` fault exercises the same path from the receiver on, and the
+  receiver cannot tell the two apart. The new-cluster test rebuilds on
+  the primary's own journal, which reaches sequence 1; the
+  `MissingHistoryPrefix` refusal of one that does not is pinned by
+  `journaled_app`'s recovery tests
+  (`recover_rejects_trimmed_history_prefix_without_snapshot`), not here. That a reconnect keeps the
+  pipeline's check and a resync builds a new one has no transport-level
+  unit test: the check lives in the pipeline's handles, so it follows the
+  pipeline by construction, and the reconnect integration case (a long
+  catch-up behind the proxy) runs the kept check on both transports.
 
 ## What this leaves untested, and why
 

@@ -17,9 +17,16 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 - **Output digests**: every node digests the bytes of every report its
   copy of the application produces, in windows of 64 journal positions,
   chained (XXH3-128): the primary in its response stage, sent or not, a
-  replica in its drain. Nothing compares them yet. `--no-output-digests`
-  (`ServerConfig::no_output_digests`) turns it off on a node, with a
-  warning at startup.
+  replica in its drain. The primary streams its digests to its replicas,
+  and each replica compares them with its own: a replica whose output
+  differs from its primary's stops the whole cluster (see **Changed**).
+  `--no-output-digests` (`ServerConfig::no_output_digests`) turns it off
+  on a node, with a warning at startup.
+- **`melin_output_checks_total`**: on a replica's health endpoint, the
+  windows of its output found equal to its primary's. Flat under traffic
+  means the replica is not checking. `health::HealthState` gains
+  `output_checks`, and `HealthState::for_replica` takes the counter
+  (breaking for code that builds either).
 - **`melin_transport_core::output_digest`**: the building blocks.
   `WindowFolder` digests one copy's reports in fixed windows of
   `OUTPUT_DIGEST_WINDOW` positions and chains the window digests;
@@ -40,8 +47,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   (`NodeStore::divergence_marker`, `<journal>.diverged`). A node whose
   marker exists refuses to start (`NodeStore::refuse_if_diverged`,
   through the new `ServerConfig::startup_store`), and a stopped node's run
-  returns `server::NodeDiverged`. Nothing trips it yet but a test seam
-  (`divergence::test_seam`, behind `test-utils`).
+  returns `server::NodeDiverged`. A replica's output check trips it on a
+  mismatch, as does a stop the node is told of; tests can trip it through
+  a seam (`divergence::test_seam`, behind `test-utils`).
 - **`melin_transport_core::AppliedWireSeqCursor`**, reached through
   `PipelineCursors::applied_wire_seq`: how far the matching stage has
   applied, published once per batch after its output slots.
@@ -120,6 +128,14 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Changed
 
+- **A replica whose output differs from its primary's stops the whole
+  cluster**, whatever build each node runs: it stops, tells its primary,
+  which stops and tells its other replicas, and every node leaves a
+  marker that refuses its restart; the way back is a new cluster (see
+  "Output verification" in `docs/replication.md`). So an application
+  upgrade that changes the output for the same input can no longer roll
+  node by node with output digests on: stop every node and start them
+  all on the new build.
 - **`ResponseEncoder::encode_report` is called for every report**,
   including those no client receives (a tick's, a disconnected client's,
   every report on a replica), since every report is digested; and it must
@@ -180,8 +196,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   end as a `u64` LE and the 16-byte chain value) carries its output
   digest chain at a window end, in a batch's replication slot right after
   the batch, naming no window past the batch's end and each window at
-  most once; a replica skips a kind it does not know, and as yet compares
-  nothing. `PrimaryMessage` gains `Digest` (breaking for a `match` on
+  most once; a replica compares it with its own output, refuses kind 0 or
+  a window end off the 64-position grid as a protocol error, and skips a
+  kind it does not know. `PrimaryMessage` gains `Digest` (breaking for a `match` on
   it); `encode_digest` and `DIGEST_FRAME_LEN` (30, the frame with its
   length prefix, which the journal stage reserves out of each batch's
   slot) are new.
