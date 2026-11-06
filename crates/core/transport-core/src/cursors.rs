@@ -230,6 +230,48 @@ impl DurableWireSeqCursor {
     }
 }
 
+/// Shared handle to the applied-wire-seq cursor: the highest wire seq the
+/// matching stage has applied *and* whose output slots it has published.
+///
+/// The output digest's folders need it to close a window of entries that
+/// published no slot: a replica's ticks, or any entry whose application
+/// produced no report. A folder loads it (`Acquire`) before it reads the
+/// output ring; if the ring is then empty, every slot of every entry at or
+/// below the value loaded has been read, so every window ending there can
+/// close.
+///
+/// Single writer: the matching stage [`store`](Self::store)s once per batch,
+/// after the batch's output slots are committed (`Release`).
+#[derive(Clone)]
+pub struct AppliedWireSeqCursor(Arc<AtomicU64>);
+
+impl AppliedWireSeqCursor {
+    /// A cursor detached from any pipeline bundle, seeded at `start`. For
+    /// stage-level tests; production wiring obtains handles from
+    /// [`PipelineCursors::applied_wire_seq`] so the matching stage and the
+    /// folders share one atomic.
+    pub fn detached(start: WireSeq) -> Self {
+        Self(Arc::new(AtomicU64::new(start.get())))
+    }
+
+    /// Highest wire seq applied with its output published. `Acquire` to
+    /// pair with the matching stage's `Release`, so every slot it
+    /// published before the store is visible to a ring read after this
+    /// load.
+    #[inline]
+    pub fn load(&self) -> WireSeq {
+        WireSeq::new(self.0.load(Ordering::Acquire))
+    }
+
+    /// Publish the highest applied wire seq. Single-writer (matching
+    /// stage), after the output batch's commit; `Release` to pair with the
+    /// readers' `Acquire`.
+    #[inline]
+    pub fn store(&self, seq: WireSeq) {
+        self.0.store(seq.get(), Ordering::Release);
+    }
+}
+
 /// The journal tip a node advertises on the control plane: the highest
 /// contiguous wire seq this node is guaranteed to carry into a promotion.
 /// The raft driver pairs it with the fencing epoch to filter vote requests
@@ -305,6 +347,10 @@ pub struct PipelineCursors {
     /// the typed handle so the bundle's own reads go through the same single
     /// load path every other consumer uses.
     durable_wire_seq: DurableWireSeqCursor,
+    /// Highest wire seq the matching stage has applied with its output
+    /// published, for the output digest's folders. Starts with the durable
+    /// cursor: everything recovered is applied.
+    applied_wire_seq: AppliedWireSeqCursor,
     /// Journal consumer's ring progress (slots read), for queue-depth monitoring.
     journal_ring: Arc<Sequence>,
     /// Matching consumer's ring progress (slots read), for queue-depth monitoring.
@@ -339,6 +385,7 @@ impl PipelineCursors {
     ) -> Self {
         Self {
             durable_wire_seq: DurableWireSeqCursor::detached(starting_durable),
+            applied_wire_seq: AppliedWireSeqCursor::detached(starting_durable),
             journal_ring,
             matching_ring,
             replica_slots: Arc::new(ReplicaSlotCursors::new()),
@@ -386,6 +433,13 @@ impl PipelineCursors {
     #[inline]
     pub fn durable_wire_seq(&self) -> DurableWireSeqCursor {
         self.durable_wire_seq.clone()
+    }
+
+    /// Typed handle to the applied-wire-seq cursor: the matching stage's to
+    /// publish, the output digest's folders' to read.
+    #[inline]
+    pub fn applied_wire_seq(&self) -> AppliedWireSeqCursor {
+        self.applied_wire_seq.clone()
     }
 
     // The ring getters below hand the underlying `Arc` to wiring that still

@@ -25,6 +25,7 @@ use melin_journal::JournalWrite;
 use melin_transport_core::journaled_app::JournaledApp;
 use melin_transport_core::lineage::{Lineage, LineagePolicy};
 use melin_transport_core::node_store::{NodeStore, NodeStoreError};
+use melin_transport_core::output_digest::OutputDigester;
 /// The type of [`ServerConfig::ring_capacity`], re-exported beside it so
 /// a caller configuring a node needs no dependency of its own on the
 /// transport crate.
@@ -35,6 +36,7 @@ use melin_transport_core::pipeline::{
 };
 use melin_transport_core::replica_presence::ReplicaPresence;
 use melin_transport_core::shadow::ShadowFeed;
+use melin_transport_core::{PipelineCursors, WireSeq};
 use melin_transport_core::{TickWatermark, WarmApp};
 /// Internal alias for the disruptor-built pipeline, used only by
 /// destructuring `let Pipeline { … }` patterns inside the boot path.
@@ -517,6 +519,17 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = false)]
     pub no_mlock: bool,
 
+    /// Turn off output digests on this node.
+    ///
+    /// By default every node digests every report its copy of the
+    /// application produces, so that a replica can check its output
+    /// against its primary's. With this flag the node digests nothing. It
+    /// takes nothing a client sees and saves the digest's cost on the
+    /// response path; the node's output is then not checked. Logged as a
+    /// warning at startup.
+    #[arg(long, default_value_t = false)]
+    pub no_output_digests: bool,
+
     /// Bind address for the control-plane raft RPC listener. Setting this
     /// enables the control plane on this node: leader election runs and is
     /// observable via the `melin_raft_*` gauges. Requires `--raft-node-id`
@@ -625,6 +638,7 @@ impl Default for ServerConfig {
             snapshot_path: None,
             tick_interval_ms: 250,
             no_mlock: false,
+            no_output_digests: false,
             raft_bind: None,
             raft_node_id: None,
             raft_peer: Vec::new(),
@@ -1004,6 +1018,34 @@ fn warn_if_chain_disabled() {
     );
 }
 
+/// Warn at startup when output digests are off: the node's output is then
+/// never checked against another copy's, which an operator should know
+/// rather than discover. `warn!` rather than `error!`: a configuration the
+/// operator chose, not a malfunction.
+fn warn_if_output_digests_off(config: &ServerConfig) {
+    if config.no_output_digests {
+        warn!(
+            "output digests are off (--no-output-digests): this node digests none of its \
+             reports, so its output is not checked against any other copy's"
+        );
+    }
+}
+
+/// The output digester for a pipeline that applies its first live entry
+/// at `first_live`, `None` unless `enabled` (`--no-output-digests` unset).
+/// The one place a node builds one, for the primary's response stage on
+/// either transport and for a replica's drain.
+pub(crate) fn output_digester(
+    enabled: bool,
+    first_live: WireSeq,
+    cursors: &PipelineCursors,
+    ring_capacity: RingCapacity,
+) -> Option<OutputDigester> {
+    // The board's reader is dropped: nothing in this node compares
+    // digests yet.
+    enabled.then(|| OutputDigester::for_pipeline(first_live, cursors, ring_capacity).0)
+}
+
 /// Log the layout the node runs, and warn when it leaves a mandatory
 /// thread without a core. Every request passes through those threads, so
 /// a core shared with whatever else the scheduler puts there is paid for
@@ -1057,6 +1099,7 @@ where
     L: BlockingTransportListener,
 {
     warn_if_chain_disabled();
+    warn_if_output_digests_off(&config);
 
     // The layout every spawn site below reads, refused outright if two
     // threads would starve each other.
@@ -1252,6 +1295,7 @@ where
             config.replication_pipeline_depth,
             Arc::clone(&fence_state),
             &sizing,
+            (!config.no_output_digests).then(|| Arc::clone(&encoder)),
         )? {
             // Clean shutdown — the raft and health guards tear down on drop.
             None => return Ok(()),
@@ -1874,6 +1918,7 @@ where
         chain_hash_lock,
         replication_ring_progress,
         cursors,
+        first_live,
     } = build_pipeline_with_replication(
         app,
         tick_watermark,
@@ -2054,6 +2099,12 @@ where
     // the report never blocks the stage on this thread reaching `recv`.
     let (response_ready_tx, response_ready_rx) = std::sync::mpsc::sync_channel(1);
     let degraded_release = config.degraded_release(replicas_connected.as_ref());
+    let digester = output_digester(
+        !config.no_output_digests,
+        first_live,
+        &cursors,
+        config.ring_capacity,
+    );
     stages.response = Some(
         melin_app::affinity::spawn_placed("response", cores.response.core, move || {
             let started = crate::response::run::<A>(
@@ -2074,6 +2125,7 @@ where
                     ring_sizing,
                     ready: Some(response_ready_tx),
                     degraded_release,
+                    digester,
                     #[cfg(test)]
                     pause_after_control_drain: None,
                 },
@@ -2601,6 +2653,7 @@ where
     A::QueryResponse: Send + 'static,
 {
     warn_if_chain_disabled();
+    warn_if_output_digests_off(&config);
 
     // As on the kernel-TCP path: resolve the layout once, up front. The
     // reader entry pins the NIC poll thread here, which never yields.
@@ -2792,6 +2845,7 @@ where
             config.replication_pipeline_depth,
             Arc::clone(&fence_state),
             &sizing,
+            (!config.no_output_digests).then(|| Arc::clone(&encoder)),
         )? {
             // Clean shutdown — the raft and health guards tear down on drop.
             None => return Ok(()),
@@ -3102,6 +3156,7 @@ where
         chain_hash_lock,
         replication_ring_progress,
         cursors,
+        first_live,
     } = build_pipeline_with_replication(
         app,
         tick_watermark,
@@ -3248,6 +3303,12 @@ where
     let s3 = Arc::clone(&shutdown);
     let response_utilization_thread = Arc::clone(&response_utilization);
     let degraded_release = config.degraded_release(replicas_connected.as_ref());
+    let digester = output_digester(
+        !config.no_output_digests,
+        first_live,
+        &cursors,
+        config.ring_capacity,
+    );
     stages.response = Some(
         melin_app::affinity::spawn_placed("response", cores.response.core, move || {
             crate::dpdk_response::run::<A>(
@@ -3266,6 +3327,7 @@ where
                 encoder,
                 early_rx,
                 degraded_release,
+                digester,
                 #[cfg(test)]
                 None,
             );
@@ -4602,6 +4664,50 @@ mod tests {
             forgotten_value.is_err(),
             "a forgotten value must error, not swallow the next flag"
         );
+    }
+
+    /// Output digests are on by default and off with the flag: a node with
+    /// them off builds no digester and says so once at startup, at `warn`;
+    /// one with them on builds one and says nothing.
+    #[test]
+    fn output_digests_are_on_unless_turned_off_and_off_is_warned() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+
+        use clap::Parser;
+        use melin_transport_core::test_logs::{Logs, level};
+        use melin_transport_core::{PipelineCursors, WireSeq};
+
+        use super::{ServerConfig, output_digester, warn_if_output_digests_off};
+
+        let parsed = ServerConfig::try_parse_from(["melin"]).expect("defaults parse");
+        assert!(!parsed.no_output_digests, "on by default");
+        let off = ServerConfig::try_parse_from(["melin", "--no-output-digests"]).expect("parses");
+        assert!(off.no_output_digests);
+
+        let cursors = PipelineCursors::new(
+            WireSeq::new(0),
+            Arc::new(melin_pipeline::padding::Sequence::new(AtomicU64::new(0))),
+            Arc::new(melin_pipeline::padding::Sequence::new(AtomicU64::new(0))),
+        );
+        let build = |enabled| {
+            output_digester(enabled, WireSeq::new(1), &cursors, super::RingCapacity::MIN).is_some()
+        };
+        assert!(build(true));
+        assert!(!build(false));
+
+        const WARNING: &str = "output digests are off";
+        let warned = |config: &ServerConfig| {
+            let logs = Logs::default();
+            tracing::subscriber::with_default(logs.subscriber(tracing::Level::DEBUG), || {
+                warn_if_output_digests_off(config);
+            });
+            logs.lines(WARNING)
+        };
+        let lines = warned(&off);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(level(&lines[0]), tracing::Level::WARN);
+        assert!(warned(&parsed).is_empty());
     }
 
     /// `--ring-capacity` defaults to the pipeline's default, on a bare
@@ -5950,6 +6056,7 @@ mod primary_gate_policy_tests {
             output,
             Arc::new(AtomicU64::new(0)),
             DurableWireSeqCursor::detached(WireSeq::new(0)),
+            melin_transport_core::AppliedWireSeqCursor::detached(WireSeq::new(0)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(FenceState::new(0)),
             WaitStrategy::SpinThenYield,

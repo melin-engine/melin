@@ -143,10 +143,10 @@ The simplified diagram above shows the primary-side request path. The picture be
                     |
                     v
               +---------+
-              |  DRAIN  |  reports are discarded — replica
-              | (only   |  does not serve clients until
-              | consumer|  promotion. See docs/replication.md.
-              +---------+
+              |  DRAIN  |  reports are encoded and digested,
+              | (only   |  never sent — replica does not
+              | consumer|  serve clients until promotion.
+              +---------+  See docs/replication.md.
 ```
 
 (*) At the default `--ring-capacity`; both rings take its value. See [Input disruptor](#input-disruptor).
@@ -323,6 +323,10 @@ The node refuses to start with a layout in which threads would starve each other
 The loop is defined in `crates/core/server-runtime/src/response_loop.rs`; the kernel TCP send path (io_uring-based SEND) in `crates/core/server-runtime/src/response.rs`, and the DPDK one in `crates/core/server-runtime/src/dpdk_response.rs`. Both transports run the same loop, and so apply the same ack gating below.
 
 The response stage runs on a dedicated OS thread and is the final stage in the pipeline. It consumes from the output SPSC and writes encoded responses to client sockets.
+
+### Output digests
+
+The response stage encodes every report the application produces, whether or not a client is there to receive it (a tick's report, a disconnected client's), and digests the bytes: per window of 64 journal positions, chained from one window to the next. A replica's drain does the same with its own copy's reports, though it sends none. Two copies applying the same journal therefore digest the same windows to the same values, which is what lets a replica check its output against its primary's. The digest is taken after the reply is handed on, so it is off the reply's own latency. `--no-output-digests` turns it off on a node.
 
 ### Ack gating (persist-before-ack)
 

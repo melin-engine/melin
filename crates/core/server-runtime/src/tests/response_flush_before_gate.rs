@@ -101,6 +101,7 @@ fn config_for(journal_cursor: DurableWireSeqCursor) -> Response<Counter> {
         ring_sizing: RingSizing::for_max_connections(1).expect("a supported cap"),
         ready: None,
         degraded_release: None,
+        digester: None,
         pause_after_control_drain: None,
     }
 }

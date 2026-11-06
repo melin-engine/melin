@@ -86,8 +86,8 @@ pub mod test_support;
 mod pipeline_tests;
 
 pub use cursors::{
-    AdvertisedJournalTip, DurableWireSeqCursor, PipelineCursors, ReplicaSlotCursors, RingPos,
-    WireSeq,
+    AdvertisedJournalTip, AppliedWireSeqCursor, DurableWireSeqCursor, PipelineCursors,
+    ReplicaSlotCursors, RingPos, WireSeq,
 };
 // The items of the dispatch module other crates name: every stage they
 // build starts from a watermark, which only this crate mints (from

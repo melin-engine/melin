@@ -26,7 +26,7 @@ use melin_pipeline::wait::WaitStrategy;
 
 #[cfg(not(feature = "no-persist"))]
 use crate::cursors::SlotAcked;
-use crate::cursors::{DurableWireSeqCursor, WireSeq};
+use crate::cursors::{AppliedWireSeqCursor, DurableWireSeqCursor, WireSeq};
 use crate::dispatch::TickWatermark;
 // Only the tests that recover or promote over a journal name it, and
 // no-persist gates those off.
@@ -239,6 +239,7 @@ fn matching_stage_processes_events() {
         output_producer,
         events_counter,
         dummy_cursor,
+        AppliedWireSeqCursor::detached(WireSeq::new(0)),
         active_conns,
         Arc::new(crate::fence::FenceState::new(0)),
         WaitStrategy::SpinThenYield,
@@ -314,6 +315,8 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
     // observed epoch (it is sequenced like any non-query event but never
     // reaches the application).
     let fence = Arc::new(crate::fence::FenceState::new(0));
+    // Where the stage publishes how far it has applied, checked below.
+    let applied = AppliedWireSeqCursor::detached(WireSeq::new(STARTING_WIRE_SEQ - 1));
     let stage = MatchingStage::new(
         app,
         TickWatermark::GENESIS,
@@ -321,6 +324,7 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
         output_producer,
         events_counter,
         dummy_cursor,
+        applied.clone(),
         active_conns,
         Arc::clone(&fence),
         WaitStrategy::SpinThenYield,
@@ -396,6 +400,20 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
         vec![10, 10, 11, 12, 13, 14, 15],
         "wire_seq stamping diverged from the journal allocator's per-event rule"
     );
+
+    // The applied cursor reaches the last allocated position, the query's
+    // allocating none, once the batch's slots are published. Stored right
+    // after the commit that made them visible, so it may trail the drain
+    // above by a moment.
+    let applied_start = std::time::Instant::now();
+    while applied.load() != WireSeq::new(15) {
+        assert!(
+            applied.load() <= WireSeq::new(15),
+            "applied past the last allocated position: {:?}",
+            applied.load()
+        );
+        drain_backoff(&mut spins, applied_start, "waiting for the applied cursor");
+    }
 
     // The EpochBump must have advanced the observed epoch without ever
     // touching application state, and the policy change after it must
@@ -538,6 +556,7 @@ where
         output_producer,
         Arc::new(AtomicU64::new(0)),
         dummy_durable_cursor(),
+        AppliedWireSeqCursor::detached(WireSeq::new(0)),
         Arc::new(AtomicU64::new(0)),
         Arc::new(crate::fence::FenceState::new(0)),
         WaitStrategy::SpinThenYield,

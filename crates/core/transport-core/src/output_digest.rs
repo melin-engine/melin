@@ -30,7 +30,8 @@ use melin_app::WireSeq;
 use melin_pipeline::seqlock::{self, NoPadding, SeqLockReader, SeqLockWriter};
 use twox_hash::xxhash3_128::{self, DEFAULT_SECRET_LENGTH, RawHasher, SecretBuffer};
 
-use crate::pipeline::RingCapacity;
+use crate::cursors::AppliedWireSeqCursor;
+use crate::pipeline::{OutputPayload, OutputSlot, RingCapacity};
 
 /// `K`: the number of positions in one window. A constant of
 /// [`DigestKind::Output`]'s definition, so every copy of every build cuts
@@ -449,6 +450,144 @@ impl WindowFolder {
             chain: self.chain,
         });
         self.open_end = next_end;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The digester: the folder driven by the output ring
+// ---------------------------------------------------------------------------
+
+/// A [`WindowFolder`] driven by an output ring's consumer: the rules for
+/// what each slot, and an empty ring, tells the folder. The primary's
+/// response stage and a replica's drain both go through it, so the two
+/// copies cannot close windows by different rules.
+///
+/// Per iteration of its consumer's loop:
+///
+/// 1. [`load_applied`](Self::load_applied), *before* the ring is read;
+/// 2. read the ring; if it is empty, [`ring_empty`](Self::ring_empty) with
+///    what step 1 loaded;
+/// 3. otherwise, for each slot, [`slot`](Self::slot), and for a report,
+///    [`fold`](Self::fold) its body.
+pub struct OutputDigester {
+    folder: WindowFolder,
+    applied: AppliedWireSeqCursor,
+}
+
+/// How far the matching stage had applied, loaded before a ring read.
+/// Only [`OutputDigester::load_applied`] makes one and only
+/// [`OutputDigester::ring_empty`] takes one, so the load cannot be taken
+/// after the read it must precede without the type showing it.
+#[must_use]
+pub struct AppliedBeforeRead(WireSeq);
+
+/// A report the digester expects the body of: made by
+/// [`OutputDigester::slot`], consumed by [`OutputDigester::fold`]. Holds
+/// the report, for a caller that has not encoded it yet.
+#[must_use = "a report's body must be folded"]
+pub struct ReportAt<'s, R> {
+    position: WireSeq,
+    report: &'s R,
+}
+
+impl<R> ReportAt<'_, R> {
+    /// The report to encode.
+    pub fn report(&self) -> &R {
+        self.report
+    }
+}
+
+impl<'a> ReportBody<'a> {
+    /// A report's body from what an encode into `region` returned: the
+    /// bytes it wrote, or `Failed` for an error. The one mapping from an
+    /// encode's result to what the folder takes, for every copy.
+    #[inline]
+    pub fn of(region: &'a [u8], encoded: Result<usize, EncodeError>) -> Self {
+        match encoded {
+            Ok(len) => Self::Encoded(&region[..len]),
+            Err(_) => Self::Failed,
+        }
+    }
+}
+
+impl OutputDigester {
+    /// A digester for a pipeline whose first live entry is at
+    /// `first_live`, closing windows the matching stage reports applied
+    /// through `applied`, publishing to `board`.
+    pub fn new(
+        first_live: WireSeq,
+        applied: AppliedWireSeqCursor,
+        board: DigestBoardWriter,
+    ) -> Self {
+        Self {
+            folder: WindowFolder::new(first_live, board),
+            applied,
+        }
+    }
+
+    /// How far the matching stage has applied, with every slot of those
+    /// entries published. Load it before reading the ring.
+    #[inline]
+    pub fn load_applied(&self) -> AppliedBeforeRead {
+        AppliedBeforeRead(self.applied.load())
+    }
+
+    /// The ring read after `applied` was loaded came back empty: every
+    /// slot of every entry through it has been read, so every window
+    /// ending there closes, those whose entries published no slot
+    /// included.
+    #[inline]
+    pub fn ring_empty(&mut self, applied: AppliedBeforeRead) {
+        self.folder.close_through(applied.0);
+    }
+
+    /// A slot was read: close what lies behind it, and for a report,
+    /// return what [`fold`](Self::fold) needs. The ring is in position
+    /// order, so a slot at `w` means every entry before `w` has published
+    /// all its slots. A query response is stamped with the last position
+    /// allocated before it, already applied whole, so it closes through
+    /// its own position.
+    #[inline]
+    pub fn slot<'s, R: Copy, Q: Copy>(
+        &mut self,
+        slot: &'s OutputSlot<R, Q>,
+    ) -> Option<ReportAt<'s, R>> {
+        let position = WireSeq::new(slot.wire_seq);
+        match &slot.payload {
+            // `fold` closes the windows before the report's own.
+            OutputPayload::Report(report) => Some(ReportAt { position, report }),
+            OutputPayload::QueryResponse(_) => {
+                self.folder.close_through(position);
+                None
+            }
+            OutputPayload::BatchEnd | OutputPayload::AckPolicyChange(_) => {
+                self.folder
+                    .close_through(WireSeq::new(slot.wire_seq.saturating_sub(1)));
+                None
+            }
+        }
+    }
+
+    /// Fold the body of the report [`slot`](Self::slot) returned `at` for.
+    #[inline]
+    pub fn fold<R>(&mut self, at: ReportAt<'_, R>, body: ReportBody<'_>) {
+        self.folder.fold(at.position, body);
+    }
+
+    /// The digester for a pipeline that applies its first live entry at
+    /// `first_live`, its rings `capacity` slots each: over the pipeline's
+    /// applied cursor, publishing to a board sized for it, whose reader is
+    /// returned beside it.
+    pub fn for_pipeline(
+        first_live: WireSeq,
+        cursors: &crate::cursors::PipelineCursors,
+        capacity: RingCapacity,
+    ) -> (Self, DigestBoardReader) {
+        let (writer, reader) = digest_board(BoardSize::for_pipeline(capacity));
+        (
+            Self::new(first_live, cursors.applied_wire_seq(), writer),
+            reader,
+        )
     }
 }
 
@@ -965,6 +1104,74 @@ mod folder_tests {
         assert_eq!(second.digest, digest_of(2 * K, &[]));
         assert_eq!(second.chain, first.chain.extend(second.digest));
         assert_eq!(reader.latest(), Some(WireSeq::new(2 * K)));
+    }
+
+    // ---- the digester's slot rules ---------------------------------------
+
+    type Slot = OutputSlot<u8, u16>;
+
+    fn slot(wire_seq: u64, payload: OutputPayload<u8, u16>) -> Slot {
+        Slot {
+            wire_seq,
+            payload,
+            ..Default::default()
+        }
+    }
+
+    /// A digester from position 1 over a board of 8, its applied cursor
+    /// and its board's reader.
+    fn digester() -> (OutputDigester, AppliedWireSeqCursor, DigestBoardReader) {
+        let applied = AppliedWireSeqCursor::detached(WireSeq::new(0));
+        let (writer, reader) = digest_board(BoardSize::new(8).unwrap());
+        (
+            OutputDigester::new(WireSeq::new(1), applied.clone(), writer),
+            applied,
+            reader,
+        )
+    }
+
+    /// A report hands back itself and its position to fold; a batch end
+    /// or a policy change at `w` closes the windows before `w`, not the
+    /// one `w` is in; a query response at `w` closes through `w`, since
+    /// it is stamped with a position already applied whole.
+    #[test]
+    fn each_slot_closes_what_lies_behind_it() {
+        let (mut d, _applied, board) = digester();
+        let report = slot(3, OutputPayload::Report(7));
+        let at = d.slot(&report).expect("a report is folded");
+        assert_eq!(*at.report(), 7);
+        d.fold(at, ReportBody::Encoded(b"x"));
+
+        // At the first position of window 2: window 1 closes.
+        assert!(d.slot(&slot(K + 1, OutputPayload::BatchEnd)).is_none());
+        assert_eq!(closed(&board, K).digest, digest_of(K, &[(3, Some(b"x"))]));
+        // At window 2's end: a batch end leaves it open...
+        assert!(d.slot(&slot(2 * K, OutputPayload::BatchEnd)).is_none());
+        let change = OutputPayload::AckPolicyChange(melin_journal::AckPolicyChange {
+            policy: melin_journal::AckPolicyByte(0),
+            unwitnessed: false,
+        });
+        assert!(d.slot(&slot(2 * K, change)).is_none());
+        assert_eq!(board.get(WireSeq::new(2 * K)), BoardLookup::NotYet);
+        // ...a query response stamped there closes it.
+        assert!(
+            d.slot(&slot(2 * K, OutputPayload::QueryResponse(1)))
+                .is_none()
+        );
+        assert_eq!(closed(&board, 2 * K).digest, digest_of(2 * K, &[]));
+    }
+
+    /// An empty ring closes every window through what was loaded before
+    /// the read, and nothing past it.
+    #[test]
+    fn an_empty_ring_closes_through_the_applied_position_loaded() {
+        let (mut d, applied, board) = digester();
+        applied.store(WireSeq::new(2 * K + 5));
+        let loaded = d.load_applied();
+        // Moved on after the load: not what the read was taken against.
+        applied.store(WireSeq::new(3 * K));
+        d.ring_empty(loaded);
+        assert_eq!(board.latest(), Some(WireSeq::new(2 * K)));
     }
 }
 

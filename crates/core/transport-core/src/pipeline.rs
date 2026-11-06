@@ -60,7 +60,8 @@ use melin_pipeline::seqlock::{NoPadding, SeqLockReader, SeqLockWriter};
 use melin_pipeline::wait::WaitStrategy;
 
 use crate::cursors::{
-    AdvertisedJournalTip, DurableWireSeqCursor, PipelineCursors, RingPos, WireSeq,
+    AdvertisedJournalTip, AppliedWireSeqCursor, DurableWireSeqCursor, PipelineCursors, RingPos,
+    WireSeq,
 };
 
 use crate::replication_wire::{finalize_input_batch, init_input_batch};
@@ -2854,6 +2855,11 @@ pub struct MatchingStage<A: Application> {
     /// gauge so the two operator surfaces agree. One `Acquire` load per
     /// batch — no extra cross-thread synchronization on the hot path.
     durable_wire_seq: DurableWireSeqCursor,
+    /// Where the stage publishes how far it has applied, once per batch
+    /// after the batch's output slots are committed: the output digest's
+    /// folders close windows of entries that published no slot from it.
+    /// One `Release` store per batch.
+    applied_wire_seq: AppliedWireSeqCursor,
     /// Active connection count, shared with the server accept loop.
     /// Loaded once per batch into `QueryCtx::active_connections`, for
     /// stats queries to read.
@@ -2922,6 +2928,7 @@ impl<A: Application> MatchingStage<A> {
         output: ring::Producer<OutputSlot<A::Report, A::QueryResponse>>,
         events_processed: Arc<AtomicU64>,
         durable_wire_seq: DurableWireSeqCursor,
+        applied_wire_seq: AppliedWireSeqCursor,
         active_connections: Arc<AtomicU64>,
         fence_state: Arc<crate::fence::FenceState>,
         wait: WaitStrategy,
@@ -2934,6 +2941,7 @@ impl<A: Application> MatchingStage<A> {
             output,
             events_processed,
             durable_wire_seq,
+            applied_wire_seq,
             active_connections,
             fence_state,
             wait,
@@ -3264,6 +3272,12 @@ impl<A: Application> MatchingStage<A> {
             // pushed during this disruptor batch. The response stage
             // sees all the slots become visible at once.
             out_batch.commit();
+            // After the commit, so a folder that loads this value and
+            // then finds the ring empty has read every slot of every
+            // entry through it. `next_wire_seq` is one past the last
+            // allocated position (a query allocates none).
+            self.applied_wire_seq
+                .store(WireSeq::new(self.next_wire_seq.saturating_sub(1)));
 
             // Release the input slots back to the producer for
             // backpressure. The borrowed slices `slots_a` / `slots_b`
@@ -3394,6 +3408,9 @@ impl<A: Application> MatchingStage<A> {
                 }
             }
         }
+        // Every slot above is published, one at a time: as after a batch.
+        self.applied_wire_seq
+            .store(WireSeq::new(self.next_wire_seq.saturating_sub(1)));
     }
 }
 
@@ -3450,6 +3467,10 @@ pub struct Pipeline<A: Application> {
     /// replication-lag monitoring). See [`PipelineCursors`] for why the
     /// wire-seq vs ring-index split matters.
     pub cursors: PipelineCursors,
+    /// The position of the first entry the pipeline applies live: the
+    /// journal's next sequence when it was built. Where the output digest's
+    /// folder starts (replay is not folded).
+    pub first_live: WireSeq,
 }
 
 /// Assembled replica pipeline stages and handles returned by [`build_replica_pipeline`].
@@ -3469,6 +3490,9 @@ pub struct ReplicaPipeline<A: Application> {
     /// Fsync state, read half. Always present on a replica, shadow or
     /// not: it is the reconnect handshake's resume point.
     pub chain_hash_lock: SeqLockReader<FsyncState>,
+    /// The position of the first entry the pipeline applies live, as on
+    /// [`Pipeline::first_live`].
+    pub first_live: WireSeq,
 }
 
 /// Handles for monitoring replication ring drain progress.
@@ -3808,6 +3832,7 @@ where
         output_producer,
         Arc::clone(&events_processed),
         cursors.durable_wire_seq(),
+        cursors.applied_wire_seq(),
         active_connections,
         fence_state,
         waits.matching,
@@ -3827,6 +3852,7 @@ where
         chain_hash_lock,
         replication_ring_progress,
         cursors,
+        first_live: WireSeq::new(starting_wire_seq),
     }
 }
 
@@ -3934,6 +3960,7 @@ where
         output_producer,
         Arc::clone(&events_processed),
         cursors.durable_wire_seq(),
+        cursors.applied_wire_seq(),
         active_connections,
         fence_state,
         waits.matching,
@@ -3948,5 +3975,6 @@ where
         shadow_feed: ShadowFeed::at(shadow_consumer, starting_wire_seq, tick_watermark),
         cursors,
         chain_hash_lock,
+        first_live: WireSeq::new(starting_wire_seq),
     }
 }

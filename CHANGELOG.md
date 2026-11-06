@@ -14,14 +14,23 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Added
 
-- **`melin_transport_core::output_digest`**: the building blocks of output
-  divergence detection, not yet wired into a node. `WindowFolder` digests
-  one copy's reports in fixed windows of `OUTPUT_DIGEST_WINDOW` positions
-  (XXH3-128) and chains the window digests; the digest board publishes
-  each closed window to readers on other threads; `encode_app_body` is the
-  one application body encode, which the response stages' framing now goes
-  through. `MAX_RESPONSE_BODY` moves here and is still re-exported at the
-  root of `melin-server-runtime`.
+- **Output digests**: every node digests the bytes of every report its
+  copy of the application produces, in windows of 64 journal positions,
+  chained (XXH3-128): the primary in its response stage, sent or not, a
+  replica in its drain. Nothing compares them yet. `--no-output-digests`
+  (`ServerConfig::no_output_digests`) turns it off on a node, with a
+  warning at startup.
+- **`melin_transport_core::output_digest`**: the building blocks.
+  `WindowFolder` digests one copy's reports in fixed windows of
+  `OUTPUT_DIGEST_WINDOW` positions and chains the window digests;
+  `OutputDigester` drives one from an output ring's consumer; the digest
+  board publishes each closed window to readers on other threads;
+  `encode_app_body` is the one application body encode, which the response
+  stages' framing goes through. `MAX_RESPONSE_BODY` moves here and is still
+  re-exported at the root of `melin-server-runtime`.
+- **`melin_transport_core::AppliedWireSeqCursor`**, reached through
+  `PipelineCursors::applied_wire_seq`: how far the matching stage has
+  applied, published once per batch after its output slots.
 - **`melin_pipeline::spsc::Producer::push_with_unless`**: the blocking
   push, given up with `Stopped`, having written nothing, if a stop flag is
   set while it waits for room. A push with room never reads the flag.
@@ -97,6 +106,18 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Changed
 
+- **`ResponseEncoder::encode_report` is called for every report**,
+  including those no client receives (a tick's, a disconnected client's,
+  every report on a replica), since every report is digested; and it must
+  be deterministic across nodes, not only within one: no node identity in
+  a body. An encode error is logged only for a reply to a connection the
+  node holds. Applications whose encoder already follows its purity
+  contract need no change.
+- **Breaking for code that builds these by hand**: `ServerConfig` gains
+  `no_output_digests`; `response::Response` gains `digester`;
+  `pipeline::Pipeline` and `pipeline::ReplicaPipeline` gain `first_live`;
+  `MatchingStage::new` takes an `AppliedWireSeqCursor` after the durable
+  cursor.
 - **A cluster has at most three raft voters** (breaking for deployments
   listing more): the primary and one per replica slot, as
   `melin_raft::MAX_VOTERS`. A node refuses to start with more

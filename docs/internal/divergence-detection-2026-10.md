@@ -750,8 +750,8 @@ incident's record.
 | Where | Per report | Per batch | Per window |
 | --- | --- | --- | --- |
 | Matching stage | nothing | one `Release` store | nothing |
-| Primary response stage | encode (new only for node events' and gone clients' reports), one XXH3 update after the send | one `Relaxed` latch load per slot; one `Acquire` load on the idle path | finalize, chain hash, seqlock store |
-| Replica drain | encode and XXH3 update (both new) | one `Acquire` load when the ring is empty | finalize, chain hash, seqlock store |
+| Primary response stage | encode (new only for node events' and gone clients' reports), one XXH3 update after the send | one `Relaxed` latch load per slot; one `Acquire` load per iteration, before the ring read | finalize, chain hash, seqlock store |
+| Replica drain | encode and XXH3 update (both new) | one `Acquire` load per iteration, before the ring read | finalize, chain hash, seqlock store |
 | Journal stage (primary with replicas) | nothing | one latest-window load, at most one board read | at most one frame per batch, appended: 30 bytes copied, no extra publish |
 | Replica receiver | nothing | one `Acquire` load per iteration | board read, chain hash, comparator update |
 | Primary senders | nothing | one more byte per ack and one flag test | nothing |
@@ -786,8 +786,13 @@ leave its primary serving.
 - The matching stage's applied cursor; `response_loop::run` encoding,
   sending and folding (decision 4); `Egress::send_slot` taking
   `SlotFrames`, `SlotReply` gone, both egresses adapted. The replica's drain
-  hoisted into a function that folds; the replica builder takes the
-  encoder; each builder creates its board.
+  hoisted into `replication/drain.rs`, which folds; the replica builder
+  takes the encoder (`None` with digests off). The slot rules both
+  consumers follow (load the applied cursor before the read, what each
+  payload closes, a report's fold) live once, in `OutputDigester`, whose
+  `AppliedBeforeRead` and `ReportAt` tokens keep the order and the pairing
+  in the types; `server::output_digester` builds one for every pipeline,
+  and the pipeline builders expose `first_live`.
 - `ServerConfig::no_output_digests` and `--no-output-digests`, with its
   startup `warn!`.
 - `ResponseEncoder`'s "Purity" rustdoc and "The determinism rules" in
@@ -815,20 +820,26 @@ leave its primary serving.
   - `encode_app_body` called directly zeroes and, in debug builds,
     checks purity; `response_frame.rs`'s framing tests and
     `server-runtime/tests/encoder_purity.rs` pass unchanged;
-  - `server-runtime/src/tests/output_digest_agreement.rs`: one input
-    sequence through a primary pipeline (response stage over a recording
-    egress) and a replica pipeline (its drain) publishes identical window
-    digests for every window both saw whole. The sequence carries what
-    differs between copies on purpose: a request with no report, a query,
-    a tick's reports, a report to a connection the egress does not hold, a
-    reply released degraded, an ack-policy change, and a report the
-    encoder refuses;
-  - `response_loop.rs`: a reply to an unknown connection is folded and not
-    sent; a window of report-less entries closes on the idle path once the
-    applied cursor passes it, and not before; a window closes on a
-    `BatchEnd` past its end and on a query slot at its end with the ring
-    never empty; the applied cursor is loaded before the ring is read; with
-    digests off nothing is folded and the frames are the same bytes;
+  - the agreement test (`response_loop.rs`,
+    `a_primary_and_a_replica_publish_the_same_window_digests`): one input
+    sequence through two real matching stages, a primary's and a
+    replica's, whose output goes through the response stage over a
+    recording egress and through the drain; both publish identical window
+    digests and chains. The primary's stream carries what differs between
+    copies on purpose: queries, ticks that publish nothing, reports to a
+    connection the egress does not hold, an ack-policy change, and reports
+    the encoder refuses. (A degraded reply changes only its trailer, which
+    is not digested; the counter publishes no `BatchEnd`, which the
+    digester's own tests cover.)
+  - `response_loop.rs`: a reply to an unknown connection is digested; a
+    window of report-less entries closes on the idle path once the applied
+    cursor passes it, and not before; a window closes on a query slot at
+    its end with the ring never empty. `output_digest.rs`: what each slot
+    kind closes, and an empty ring closing through what was loaded before
+    the read (the load-before-read order itself is held by the
+    `AppliedBeforeRead` token); `pipeline_tests.rs`: the applied cursor
+    reaches the last allocated position; `drain.rs`: the drain's closing
+    rules;
   - the chain-less build: the agreement test with `hash-chain` off,
     added to the pre-merge job's chain-off loop (`cargo nextest run -p
     melin-server-runtime --no-default-features`, filtered to it), since
@@ -842,7 +853,11 @@ leave its primary serving.
   receives included; `ServerConfig` gains `no_output_digests` (breaking for
   a struct literal). **Added**: `--no-output-digests`.
 - **Leaves untested:** any comparison (step 3); the fold's cost end to end,
-  which the micro-benchmark does not measure (see "Deferred").
+  which the micro-benchmark does not measure (see "Deferred"); digests in
+  a running node, end to end: nothing reads a node's board until step 3
+  (the builder drops its reader), so a node-level test would observe
+  nothing. The agreement test runs both consumers over real matching
+  stages, and every node test in the suite now runs with digests on.
 
 ### Step 2. The stop
 
