@@ -293,14 +293,16 @@ Stated here as the operator docs will state it (step 6):
 - **Acks are read in a few places.** Kernel TCP reads acks in the live
   loop only, not during catch-up, snapshot transfer or the bridge
   (`tcp_sender.rs`). The DPDK sender keeps only the newest ack while a slot
-  joins (`keep_last_ack`, `dpdk.rs:252`), and the streaming arm records it
-  only once the join is over (`dpdk.rs:1165`, `1341`). Every ack that moves
+  joins (`keep_last_ack` in `dpdk.rs`), and the streaming arm records it
+  only once the join is over. Every ack that moves
   a cursor passes `ReplicaCursors::record_ack`
   (`transport-core/src/replication/cursors.rs:149`), which checks the ack
   against the sent high-water first, evicting on a violation, and then
   stores rather than takes a maximum. Its two callers are the kernel live
   loop (`tcp_sender.rs:1040`) and the DPDK streaming arm. Every read site
-  skips frames it does not decode (`tcp_sender.rs:1155`, `dpdk.rs:260`).
+  skips frames it does not decode (`drain_ack_frames` in
+  `receiver_transport.rs`, shared by both senders' streaming loops, and
+  `keep_last_ack`).
 - **The primary's handshake is read in one place per transport**, after
   authentication and before the epoch check: `handle_replica_connection`
   (`tcp_sender.rs:480`, the fence check at `:502`) and the DPDK
@@ -1244,8 +1246,8 @@ uncompared and without `Halt` (see the flag-day bullet below).
   bit this build does not define is a peer's protocol bug, never read as
   a stop or as no stop. A `window_end` that is not 0 with `STOPPED` clear
   is refused the same way. On the primary's ack read sites, which today
-  skip any frame that does not decode (`tcp_sender.rs:1155`,
-  `dpdk.rs:1338`, and the join's `keep_last_ack`, `dpdk.rs:260`), an ack
+  skip any frame that does not decode (`drain_ack_frames`, which both
+  senders' streaming loops call, and the DPDK join's `keep_last_ack`), an ack
   refused for its flags is not skipped: it takes the ack-violation path
   (evict, `error!`), since it is an authenticated member's bug exactly as
   an impossible cursor is, and a skipped one could be a stop the primary
@@ -1253,13 +1255,11 @@ uncompared and without `Halt` (see the flag-day bullet below).
   of its own, distinct from a frame of another kind, so a read site can
   tell the two apart; `keep_last_ack` returns it as a `JoinFrames`
   violation arm, which the `Joining` arm evicts on. The DPDK streaming
-  arm's frame loop (`dpdk.rs:1333`) today duplicates `drain_ack_frames`
-  (`tcp_sender.rs:1138`) inline in the gated poll loop; it is replaced by
-  a call to `drain_ack_frames`, hoisted, ungated, beside `keep_last_ack`
-  in `receiver_transport.rs`, with the record, latency and persist-watch
-  work in its closure and its framing error taken through the arm's
-  existing `ack_error` teardown. One helper then reads every streaming
-  ack on both transports, and its ungated tests cover both.
+  arm already calls `drain_ack_frames` (landed: hoisted, ungated, into
+  `receiver_transport.rs`, with the record, latency and persist-watch
+  work in its closure and its error ending the slot's session as kernel
+  TCP's does), so one helper reads every streaming ack on both
+  transports, and its ungated tests cover both.
 - **`Halt` cannot fall into a wildcard arm.** Every place a replica reads
   a primary message ends in a `_` arm that returns an error out of the
   receiver (what the code shows), so a `Halt` added as one more
@@ -2775,9 +2775,7 @@ one-byte `AuthOk` without a handshake and redialling. What remains:
     ordinary ack, the wait for `Halt`, and `Stopped`, never `Promote`);
   - `record_ack` (`AckRecorded`, the `STOPPED` check first), `keep_last_ack`
     (`JoinFrames::Stopped`, and a violation arm for an ack refused for its
-    flags) and the handshake tripping the latch; `drain_ack_frames` hoisted
-    beside `keep_last_ack` and called by the DPDK streaming arm in place of
-    its inline copy;
+    flags) and the handshake tripping the latch;
     `ReplicaCursors::new` takes the latch;
   - every sender's `Halt` on every exit path once the latch is set: the
     kernel live loop through its ring before its guard's teardown, every
@@ -2843,8 +2841,8 @@ one-byte `AuthOk` without a handshake and redialling. What remains:
     ack whose positions would fail the sent high-water check still trips
     rather than evicting; a second flagged ack returns `Stopped(None)`;
     an ack refused for its flags evicts as a violation, and is not
-    skipped, in `drain_ack_frames`, which after the hoist reads the
-    streaming acks of both transports, and in `keep_last_ack` below;
+    skipped, in `drain_ack_frames`, which reads the streaming acks of
+    both transports, and in `keep_last_ack` below;
   - `keep_last_ack` returns `JoinFrames::Stopped` when any ack it reads
     carries the flag, a newer unflagged one included, and its violation
     arm for an ack refused for its flags. Today its tests

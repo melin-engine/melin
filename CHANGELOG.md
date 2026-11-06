@@ -263,6 +263,13 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   that is not installed (a failed rotation, a shutdown with a segment
   still staged) is removed at once, and startup removes any a crash
   left behind, in either the new form or the old one.
+- **A primary on DPDK logs a replica's malformed ack as kernel TCP
+  does**: a zero-length or oversized ack frame now ends the replica's
+  session with the warning `replica connection error`, carrying
+  `invalid ack frame length: <n>`, where it logged `oversized ack frame
+  from replica — disconnecting`; a replica evicted for an impossible ack
+  is followed by the same warning, as on kernel TCP. Alerts matching the
+  old text should match the new one.
 
 ### Removed
 
