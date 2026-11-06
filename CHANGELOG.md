@@ -9,6 +9,8 @@ entry here covers all of them.
 
 While the project is at `0.x`, a minor release may contain breaking changes.
 Anything source-breaking is called out under **Removed** or **Changed**.
+What a release may change, and what it must state when it does, is set out
+in the [compatibility policy](docs/compatibility.md).
 
 ## [Unreleased]
 
