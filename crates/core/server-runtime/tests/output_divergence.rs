@@ -10,7 +10,7 @@
 //! on DPDK with this crate's `dpdk` feature, under
 //! `scripts/dpdk/netns-runner.sh` (see `docs/internal/dpdk-testing.md`).
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use counter_server::{Counter, RequestDecoder, ResponseEncoder, increment_request};
 use melin_client::SigningKey;
@@ -88,12 +88,7 @@ fn a_tripped_node_stops_and_refuses_to_restart() {
     let after = conn.request_one(&increment_request(1));
     assert!(after.is_err(), "answered after the stop: {after:?}");
 
-    let deadline = Instant::now() + STOP_WITHIN;
-    while !node.is_finished() {
-        assert!(Instant::now() < deadline, "the node did not stop");
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let error = node.join().expect_err("a stopped node returns an error");
+    let error = stopped(node);
     assert!(
         error.contains("its output diverged from its primary's between positions 65 and 128"),
         "{error}"
@@ -123,12 +118,8 @@ fn a_tripped_node_stops_and_refuses_to_restart() {
 
 /// Wait for `node` to return, and return its error.
 fn stopped(node: melin_test_node::Node) -> String {
-    let deadline = Instant::now() + STOP_WITHIN;
-    while !node.is_finished() {
-        assert!(Instant::now() < deadline, "the node did not stop");
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    node.join().expect_err("a stopped node returns an error")
+    node.join_within(STOP_WITHIN)
+        .expect_err("a stopped node returns an error")
 }
 
 /// A stopped primary tells every replica streaming from it, with its
