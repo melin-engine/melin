@@ -17,6 +17,50 @@ use std::time::{Duration, Instant};
 
 use melin_transport_core::divergence::{DivergenceLatch, HALT_NOTICE_BOUND};
 
+/// How long a replica that stopped on its own detection, and was not
+/// answered with `Halt` in its session, keeps redialling its primary with
+/// a stopped handshake: twice the reconnect backoff's cap, so a primary
+/// that was between sessions, or restarting, is reached.
+pub(crate) const HALT_REDIAL: Duration = Duration::from_secs(2 * super::MAX_BACKOFF.as_secs());
+
+// The redial outlasts several notices' worth of waiting: each attempt's
+// own waits are bounded by the notice bound.
+const _: () = assert!(5 * HALT_NOTICE_BOUND.as_secs() <= HALT_REDIAL.as_secs());
+
+/// Whether `recv_buf` holds the primary's `Halt` among its complete
+/// frames. Everything else in it is dropped: a stopped replica publishes
+/// nothing more. The partial frame at its end, if any, is kept for the
+/// next read.
+pub(crate) fn take_halt(recv_buf: &mut Vec<u8>) -> bool {
+    use melin_transport_core::replication::protocol::{MAX_DATA_FRAME, MSG_HALT};
+
+    use super::receiver_transport::{FrameResult, compact_recv_buf, try_extract_frame};
+
+    let mut consumed = 0;
+    loop {
+        // The data bound, the larger: a batch the primary sent before its
+        // `Halt` is skipped whole rather than refused.
+        match try_extract_frame(&recv_buf[consumed..], MAX_DATA_FRAME) {
+            FrameResult::Complete(payload_start, frame_end) => {
+                if recv_buf[consumed + payload_start..consumed + frame_end] == [MSG_HALT] {
+                    recv_buf.clear();
+                    return true;
+                }
+                consumed += frame_end;
+            }
+            FrameResult::Incomplete => break,
+            // Nothing a correct primary sends: drop it all; the wait for
+            // the `Halt` goes on until its bound.
+            FrameResult::Oversized => {
+                recv_buf.clear();
+                return false;
+            }
+        }
+    }
+    compact_recv_buf(recv_buf, consumed);
+    false
+}
+
 /// What a sender does next about its session's `Halt`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HaltStep {
@@ -83,6 +127,22 @@ impl HaltNotice {
     }
 }
 
+/// A disk that never answers the marker's sync, for the tests of every
+/// notice that must not wait on it past its bound.
+#[cfg(test)]
+pub(crate) struct HungMarkerSync;
+
+#[cfg(test)]
+impl melin_transport_core::divergence::MarkerSync for HungMarkerSync {
+    fn sync_file(&self, _: &std::fs::File) -> std::io::Result<()> {
+        std::thread::park();
+        Ok(())
+    }
+    fn sync_dir(&self, _: &std::path::Path) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -134,24 +194,12 @@ mod tests {
         assert_eq!(notice.step(true, &latch), HaltStep::Close);
     }
 
-    /// A disk that never answers.
-    struct Hung;
-    impl MarkerSync for Hung {
-        fn sync_file(&self, _: &std::fs::File) -> std::io::Result<()> {
-            std::thread::park();
-            Ok(())
-        }
-        fn sync_dir(&self, _: &std::path::Path) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
     /// A hung marker holds the frame for the bound, not longer; a session
     /// that cannot send it gives up at twice the bound.
     #[test]
     fn a_hung_marker_delays_the_halt_by_the_bound_only() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let latch = latch(dir.path(), Arc::new(Hung));
+        let latch = latch(dir.path(), Arc::new(HungMarkerSync));
         let _halted = latch.trip_with(cause());
         let bound = Duration::from_millis(30);
 

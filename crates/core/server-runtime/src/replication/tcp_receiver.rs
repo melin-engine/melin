@@ -12,7 +12,7 @@ use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use melin_app::Application;
 use melin_journal::BufferedWriter;
@@ -20,18 +20,21 @@ use melin_transport_core::WarmApp;
 use melin_transport_core::node_store::NodeStore;
 
 use super::auth::authenticate_with_primary;
+use super::halt_notice::HALT_REDIAL;
 use super::receiver_transport::{
     ControlFrameSource, ReceiverTransport, SessionExit, streaming_loop,
 };
 use super::{
-    CONNECT_TIMEOUT, ReplicaEngine, ReplicaState, ResumePoint, ResyncDecision, StreamStartVerdict,
-    build_replica_pipeline_with_threads, handle_resync_verdict, handle_session_exit,
-    journal_failed_while_disconnected, recover_replica_state, sleep_then_double_backoff,
+    CONNECT_TIMEOUT, MAX_BACKOFF, ReplicaEngine, ReplicaState, ResumePoint, ResyncDecision,
+    StreamStartVerdict, build_replica_pipeline_with_threads, handle_resync_verdict,
+    handle_session_exit, journal_failed_while_disconnected, recover_replica_state,
+    sleep_then_double_backoff,
 };
 use crate::uring_teardown::{DrainBackoff, wake_pending_ops};
 use melin_transport_core::replication::protocol::{
-    Ack, MAX_CONTROL_FRAME, MAX_DATA_FRAME, PrimaryMessage, decode_primary_message, encode_ack,
-    encode_handshake, read_frame,
+    Ack, Handshake, MAX_CONTROL_FRAME, MAX_DATA_FRAME, MSG_HALT, PrimaryMessage,
+    decode_primary_message, encode_ack, encode_handshake, encode_stopped_ack,
+    encode_stopped_handshake, read_frame,
 };
 
 /// How a [`dial_checking_flags`] ended. Exhaustive, so the reconnect loop
@@ -74,11 +77,24 @@ fn dial_checking_flags(
     shutdown: &AtomicBool,
     promote: &crate::promotion::PromotionRequest,
 ) -> Dial {
+    dial_until(addr, timeout, || {
+        shutdown.load(Ordering::Relaxed) || promote.is_requested()
+    })
+}
+
+/// [`dial_checking_flags`], abandoned when `interrupted` says so rather
+/// than on the flags: the stopped redial dials with the node's shutdown
+/// flag already set.
+fn dial_until(
+    addr: SocketAddr,
+    timeout: std::time::Duration,
+    interrupted: impl Fn() -> bool,
+) -> Dial {
     let deadline = std::time::Instant::now() + timeout;
     loop {
         // Before the deadline check, so a flag raised during the last
         // attempt abandons the dial rather than failing it.
-        if shutdown.load(Ordering::Relaxed) || promote.is_requested() {
+        if interrupted() {
             return Dial::Interrupted;
         }
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -95,6 +111,73 @@ fn dial_checking_flags(
             Err(e) => return Dial::Failed(e),
         }
     }
+}
+
+/// The redial a replica that stopped on its own detection owes a primary
+/// that did not answer its stopped ack: dial, authenticate, and handshake
+/// as stopped, with the reconnect loop's backoff, until a `Halt` answers
+/// or [`HALT_REDIAL`] runs out. Every wait is bounded by the time left.
+fn redial_stopped(primary: SocketAddr, key: &ed25519_dalek::SigningKey, handshake: &Handshake) {
+    let deadline = std::time::Instant::now() + HALT_REDIAL;
+    let mut backoff = std::time::Duration::from_secs(1);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            warn!(
+                primary = %primary,
+                "the primary did not answer this stopped replica's redial: it may not have been \
+                 told that the cluster's output diverged"
+            );
+            return;
+        }
+        match stopped_session(primary, key, handshake, deadline) {
+            Ok(true) => {
+                info!("the primary answered this replica's stop with its halt");
+                return;
+            }
+            Ok(false) => debug!("the primary's answer to the stopped handshake was not a halt"),
+            Err(e) => debug!(error = %e, "stopped redial attempt failed"),
+        }
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        std::thread::sleep(backoff.min(left));
+        backoff = (backoff * 2).min(MAX_BACKOFF);
+    }
+}
+
+/// One stopped redial attempt before `deadline`: `true` once the
+/// primary's answer is its `Halt`.
+fn stopped_session(
+    primary: SocketAddr,
+    key: &ed25519_dalek::SigningKey,
+    handshake: &Handshake,
+    deadline: std::time::Instant,
+) -> io::Result<bool> {
+    let left = || deadline.saturating_duration_since(std::time::Instant::now());
+    let mut stream = match dial_until(primary, left(), || false) {
+        Dial::Connected(stream) => stream,
+        Dial::Failed(e) => return Err(e),
+        // `interrupted` never says so.
+        Dial::Interrupted => return Ok(false),
+    };
+    // Armed from the time left at each step, not before the dial, so a
+    // dial that took most of it leaves the steps after it only the rest.
+    let arm = |stream: &TcpStream| -> io::Result<()> {
+        // Never zero: the socket refuses a zero timeout. At most the
+        // reconnect loop's read timeout, and never past the redial's end.
+        let io_timeout = left()
+            .min(std::time::Duration::from_secs(5))
+            .max(std::time::Duration::from_millis(1));
+        stream.set_read_timeout(Some(io_timeout))?;
+        stream.set_write_timeout(Some(io_timeout))
+    };
+    arm(&stream)?;
+    authenticate_with_primary(&mut stream, key)?;
+    let mut out = Vec::new();
+    encode_stopped_handshake(handshake, &mut out);
+    arm(&stream)?;
+    stream.write_all(&out)?;
+    arm(&stream)?;
+    Ok(read_frame(&mut stream, MAX_CONTROL_FRAME)? == [MSG_HALT])
 }
 
 /// Force the kernel to send a TCP ACK immediately rather than holding
@@ -273,11 +356,17 @@ impl UringTransport {
     /// after a chained send). Must only be called with no SEND in
     /// flight: the buffer is pinned by `ack_in_flight` until the CQE.
     fn push_ack_send(&mut self, ack: &Ack) {
+        self.push_ack_frame(ack, encode_ack);
+    }
+
+    /// [`Self::push_ack_send`], the frame written by `encode`: the
+    /// ordinary ack's encoder or the stopped one's.
+    fn push_ack_frame(&mut self, ack: &Ack, encode: fn(&Ack, &mut Vec<u8>)) {
         use io_uring::{opcode, types};
 
         debug_assert!(!self.ack_in_flight);
         self.ack_buf.clear();
-        encode_ack(ack, &mut self.ack_buf);
+        encode(ack, &mut self.ack_buf);
         let sqe = opcode::Send::new(
             types::Fixed(0),
             self.ack_buf.as_ptr(),
@@ -571,6 +660,14 @@ impl ReceiverTransport for UringTransport {
         Ok(true)
     }
 
+    fn send_stopped_ack(&mut self, ack: &Ack) -> io::Result<bool> {
+        if self.ack_in_flight() {
+            return Ok(false);
+        }
+        self.push_ack_frame(ack, encode_stopped_ack);
+        Ok(true)
+    }
+
     fn ack_in_flight(&self) -> bool {
         // Pending counts as in flight: the drain paths use this to mean
         // "everything offered has reached the wire", and the flush gate
@@ -688,6 +785,16 @@ where
     ));
     tip_ready.store(true, Ordering::Release);
 
+    // The stopped redial, for a session that ends with this replica's own
+    // stop unanswered: from the position the replica holds.
+    let redial = |state: &ReplicaState<A, BufferedWriter<A::Event>>| {
+        redial_stopped(
+            primary_addr,
+            signing_key,
+            &state.position.handshake(fence_state.epoch()),
+        );
+    };
+
     let mut backoff = std::time::Duration::from_secs(1);
 
     // Consecutive mid-stream divergence resyncs this process has
@@ -738,7 +845,7 @@ where
                     );
                     // A fatal exit never keeps the pipeline, so going
                     // round again dials only after a resync or not at all.
-                    if let Some(r) = after.adopt(&mut state) {
+                    if let Some(r) = after.adopt(&mut state, redial) {
                         return r;
                     }
                     continue;
@@ -1043,7 +1150,7 @@ where
             sizing,
             prealloc,
         );
-        if let Some(r) = after.adopt(&mut state) {
+        if let Some(r) = after.adopt(&mut state, redial) {
             return r;
         }
     }
@@ -2965,7 +3072,7 @@ mod tests {
         /// backlog of 0 some kernels count the SYN queue as full from the
         /// start, so the filler itself would go through SYN cookies, and
         /// hang where they are off.
-        fn silent_primary() -> (Socket, [TcpStream; 2], SocketAddr) {
+        pub(super) fn silent_primary() -> (Socket, [TcpStream; 2], SocketAddr) {
             let listener =
                 Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).expect("socket");
             listener
@@ -3400,6 +3507,104 @@ mod tests {
                 );
             }
             stop_receiver(replica, &shutdown);
+        }
+    }
+
+    /// The redial of a replica that stopped on its own detection. Gated as
+    /// `scripted`, whose replica key and auth table it uses.
+    #[cfg(not(feature = "no-persist"))]
+    mod stopped_redial {
+        use super::super::super::auth::authenticate_replica;
+        use super::scripted::*;
+        use super::*;
+        use melin_transport_core::replication::protocol::{
+            Handshake, MAX_CONTROL_FRAME, encode_halt, read_frame,
+        };
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        fn handshake() -> Handshake {
+            Handshake {
+                last_sequence: 7,
+                chain_hash: [3; 32],
+                epoch: 2,
+            }
+        }
+
+        /// The redial authenticates, handshakes as stopped from the
+        /// position it holds, and ends as soon as the primary's `Halt`
+        /// answers.
+        #[test]
+        fn the_redial_handshakes_as_stopped_and_ends_on_the_halt() {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let primary = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .expect("timeout");
+                authenticate_replica(&mut stream, &replica_auth()).expect("auth");
+                let frame = read_frame(&mut stream, MAX_CONTROL_FRAME).expect("handshake");
+                let message = decode_replica_message(&frame).expect("decodes");
+                stream.write_all(&encode_halt()).expect("halt");
+                message
+            });
+
+            let started = Instant::now();
+            redial_stopped(
+                addr,
+                &ed25519_dalek::SigningKey::from_bytes(&REPLICA_KEY),
+                &handshake(),
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "ended on the halt"
+            );
+            match primary.join().expect("the primary") {
+                ReplicaMessage::StoppedHandshake(h) => {
+                    assert_eq!((h.last_sequence, h.epoch), (7, 2));
+                }
+                other => panic!("expected a stopped handshake, got {other:?}"),
+            }
+        }
+
+        /// An attempt against a primary that drops its SYNs ends at the
+        /// time left, not after the kernel's retries.
+        #[test]
+        fn an_attempt_ends_at_the_time_left() {
+            let (_listener, _fillers, addr) = super::dial::silent_primary();
+            let left = Duration::from_millis(300);
+            let started = Instant::now();
+            let attempt = stopped_session(
+                addr,
+                &ed25519_dalek::SigningKey::from_bytes(&REPLICA_KEY),
+                &handshake(),
+                started + left,
+            );
+            assert!(attempt.is_err(), "{attempt:?}");
+            assert!(started.elapsed() < left + Duration::from_secs(1));
+        }
+
+        /// An attempt against a primary that accepts and then says
+        /// nothing ends at the time left too: the reads after the dial
+        /// wait no longer than it, not the reconnect loop's read timeout.
+        #[test]
+        fn a_silent_session_ends_at_the_time_left() {
+            // Never accepted: the kernel completes the connection from
+            // the backlog, and nothing is ever written to it.
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let left = Duration::from_millis(300);
+            let started = Instant::now();
+            let attempt = stopped_session(
+                addr,
+                &ed25519_dalek::SigningKey::from_bytes(&REPLICA_KEY),
+                &handshake(),
+                started + left,
+            );
+            assert!(attempt.is_err(), "{attempt:?}");
+            assert!(started.elapsed() < left + Duration::from_secs(1));
         }
     }
 

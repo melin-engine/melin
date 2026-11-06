@@ -103,7 +103,9 @@ mod validation_worker;
 #[cfg(any(feature = "dpdk", test))]
 mod join_worker;
 
-use receiver_transport::{ControlFrameSource, SessionExit, StreamingResult, receive_chunked_body};
+use receiver_transport::{
+    ControlFrameSource, SessionExit, StopNotice, StreamingResult, receive_chunked_body,
+};
 
 /// Log a replica's join ending, on either sender: from here its slot
 /// streams live and the replica's acks count. Without it, a join that
@@ -1264,6 +1266,10 @@ pub(in crate::replication) enum AfterSession<A, W> {
     /// already been applied (and the flags checked); the caller
     /// reconnects, reusing the still-live pipeline.
     Reconnect,
+    /// The replica stopped on its own detection and its primary did not
+    /// answer its stopped ack: the pipeline is down, and the receiver
+    /// redials the primary with a stopped handshake before it returns.
+    RedialStopped,
 }
 
 impl<A: Application, W: Send + 'static> AfterSession<A, W> {
@@ -1273,11 +1279,16 @@ impl<A: Application, W: Send + 'static> AfterSession<A, W> {
     /// whole of `state`). One copy for every dispatch site in both
     /// receivers, so they cannot drift apart.
     ///
+    /// `redial_stopped` is the receiver's stopped redial, run before it
+    /// returns on `RedialStopped` (see `halt_notice::HALT_REDIAL`): a parameter, so no
+    /// receiver can fold that outcome without one.
+    ///
     /// The state a resync replaces holds no pipeline: [`handle_session_exit`]
     /// took it out and tore it down before recovering.
     pub(in crate::replication) fn adopt(
         self,
         state: &mut ReplicaState<A, W>,
+        redial_stopped: impl FnOnce(&ReplicaState<A, W>),
     ) -> Option<ReceiverResult<A, W>> {
         match self {
             AfterSession::Return(r) => Some(r),
@@ -1286,6 +1297,10 @@ impl<A: Application, W: Send + 'static> AfterSession<A, W> {
                 None
             }
             AfterSession::Reconnect => None,
+            AfterSession::RedialStopped => {
+                redial_stopped(state);
+                Some(Ok(None))
+            }
         }
     }
 }
@@ -1350,9 +1365,16 @@ where
     match exit {
         // Stopped for divergence: as a shutdown, the pipeline stops and
         // the receiver returns; the node's exit reports the stop.
-        SessionExit::Shutdown | SessionExit::Stopped => {
+        SessionExit::Shutdown
+        | SessionExit::Stopped(StopNotice::NotOwed | StopNotice::Answered) => {
             state.engine.take().stop();
             AfterSession::Return(Ok(None))
+        }
+        // Stopped on its own detection, and the primary did not answer:
+        // the receiver redials it with a stopped handshake, then returns.
+        SessionExit::Stopped(StopNotice::Unanswered) => {
+            state.engine.take().stop();
+            AfterSession::RedialStopped
         }
 
         SessionExit::Promote => AfterSession::Return(match state.engine.take() {
@@ -2462,13 +2484,21 @@ mod tests {
             engine: recovered_engine,
             position: recovered_position,
         });
-        assert!(after.adopt(&mut state).is_none());
+        assert!(
+            after
+                .adopt(&mut state, |_| panic!("no stopped redial"))
+                .is_none()
+        );
         assert_eq!(state.position, recovered_position);
         assert_eq!(idle_in(&state.engine).warm.tick_watermark, replayed);
 
         // A plain reconnect, with an engine held, leaves both alone.
         let after = AfterSession::<counter_server::Counter, CounterWriter>::Reconnect;
-        assert!(after.adopt(&mut state).is_none());
+        assert!(
+            after
+                .adopt(&mut state, |_| panic!("no stopped redial"))
+                .is_none()
+        );
         assert_eq!(
             state.position, recovered_position,
             "a reconnect keeps the position"
@@ -2481,7 +2511,11 @@ mod tests {
 
         // A fresh recovery (nothing on disk) replaces them too.
         let after = AfterSession::Resync(RecoveredReplica::FRESH);
-        assert!(after.adopt(&mut state).is_none());
+        assert!(
+            after
+                .adopt(&mut state, |_| panic!("no stopped redial"))
+                .is_none()
+        );
         assert!(matches!(state.engine, ReplicaEngine::Fresh));
         assert_eq!(state.position, ChainPosition::GENESIS);
     }

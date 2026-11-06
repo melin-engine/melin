@@ -199,6 +199,17 @@ fn relay(mut from: TcpStream, mut to: TcpStream, link: &Link, born: u64, source:
             // delivers. Dropped, and the pair closed at the top.
             Ok(_) if link.generation.load(Ordering::Acquire) != born => {}
             Ok(n) => {
+                // Stalled since the check above (the read was already
+                // waiting when the link froze): the chunk is held, as one
+                // read while frozen would be, until the link relays again
+                // or is cut, when it is dropped and the pair closed at the
+                // top.
+                while link.stalls(source) && link.generation.load(Ordering::Acquire) == born {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                if link.generation.load(Ordering::Acquire) != born {
+                    continue;
+                }
                 if to.write_all(&buf[..n]).is_err() {
                     return;
                 }
