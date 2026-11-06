@@ -245,6 +245,21 @@ impl FileLogStore {
         // `panic = "abort"`, so no thread can unwind while holding the lock.
         self.inner.lock().expect("raft log store mutex poisoned")
     }
+
+    /// The newest membership entry the log holds, applied or not. Read
+    /// synchronously, before the raft core starts (see [`stored_membership`]).
+    fn last_membership(&self) -> Option<StoredMembership<NodeId, Node>> {
+        self.lock()
+            .entries
+            .values()
+            .rev()
+            .find_map(|entry| match &entry.payload {
+                openraft::EntryPayload::Membership(m) => {
+                    Some(StoredMembership::new(Some(entry.log_id), m.clone()))
+                }
+                _ => None,
+            })
+    }
 }
 
 impl LogInner {
@@ -321,6 +336,31 @@ impl FileStateMachine {
         self.inner
             .lock()
             .expect("raft state machine mutex poisoned")
+    }
+
+    /// The membership last applied (or installed from a snapshot). Read
+    /// synchronously, before the raft core starts (see [`stored_membership`]).
+    fn applied_membership(&self) -> StoredMembership<NodeId, Node> {
+        self.lock().data.membership.clone()
+    }
+}
+
+/// The membership an opened store puts in force when the raft core starts:
+/// the newer, by log id, of the state machine's and the log's latest
+/// membership entry (one appended but not yet applied included), as
+/// openraft itself chooses. Empty on a store never initialised.
+///
+/// Synchronous, through the stores' own mutexes, because `spawn` checks it
+/// before the driver thread and its runtime exist; openraft's readers of
+/// the same state are async trait methods.
+pub(crate) fn stored_membership(
+    log: &FileLogStore,
+    state_machine: &FileStateMachine,
+) -> StoredMembership<NodeId, Node> {
+    let applied = state_machine.applied_membership();
+    match log.last_membership() {
+        Some(logged) if logged.log_id() > applied.log_id() => logged,
+        _ => applied,
     }
 }
 

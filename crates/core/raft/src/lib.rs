@@ -12,8 +12,10 @@
 //! configuration, the node's journal tip it votes on, and the
 //! supersession policy that steps a superseded primary down, plus
 //! [`QUORUM_ACK_MAX_AGE`], the threshold the promotion policy applies to
-//! the quorum-ack age the driver publishes, and [`LeaderConfirm`], the
-//! blocking quorum round trip that confirms this node still leads. The
+//! the quorum-ack age the driver publishes, [`LeaderConfirm`], the
+//! blocking quorum round trip that confirms this node still leads, and
+//! [`MAX_VOTERS`] with [`check_voter_count`], the voter cap the server
+//! checks its flags against before it reaches [`spawn`]. The
 //! RPC server, wire format, authentication and file store stay private.
 
 mod auth;
@@ -29,7 +31,8 @@ mod wire;
 mod tests;
 
 pub use driver::{
-    LeaderConfirm, LeaderConfirmError, QUORUM_ACK_MAX_AGE, RaftConfig, RaftHandles, RaftPeer, spawn,
+    LeaderConfirm, LeaderConfirmError, MAX_VOTERS, QUORUM_ACK_MAX_AGE, RaftConfig, RaftHandles,
+    RaftPeer, check_voter_count, spawn,
 };
 pub use recency::{JournalTip, PeerTips, TipSource};
 pub use rpc_server::SupersessionPolicy;

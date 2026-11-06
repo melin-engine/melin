@@ -2082,35 +2082,21 @@ the new-cluster procedure, where it is the incident's record (step 6).
 Raft carries no message for the stop (finding 6). Two things change, and
 one is a prerequisite:
 
-- **The voter cap.** A cluster refuses more raft voters than one plus the
-  primary's replica slots, three today, derived from
-  `ReplicaSlotCursors::SLOTS` so the bound moves with it. `melin-raft`
-  already depends on `melin-transport-core` (`crates/core/raft/Cargo.toml:63`,
-  used at `driver.rs:23` and `recency.rs:43`), where the constant is public
-  (`cursors.rs:143`, re-exported at `lib.rs:83`), so both checks read
-  `ReplicaSlotCursors::SLOTS + 1` directly, through one `pub const
-  MAX_VOTERS` in `melin-raft` that `build_raft_config` uses too, and
-  `RaftConfig` is unchanged. It is checked twice: on the
-  `--raft-peer` flags in `build_raft_config` (`raft.rs:93`, beside the
-  minimum), and on the *stored* membership, which overrides edited flags
-  after the raft directory's first boot (`docs/replication.md`,
-  "Membership is static"). The second check runs in `melin_raft::spawn`,
-  right after `storage::open` (`driver.rs:524`), over the membership the
-  opened store holds (the state machine's, or the log's `initialize` entry
-  if it was never applied), so it fails the node's start before the
-  driver thread exists. The store's only membership readers today are
-  openraft's async trait methods (`applied_state`, `storage.rs:594`),
-  and `spawn` is synchronous, so the step adds a small synchronous
-  accessor on `FileStateMachine` and on `FileLogStore`, each reading
-  through the store's existing `std::sync::Mutex` (`storage.rs:239`,
-  `:315`), rather than a `block_on` in `spawn`. Not in `driver_main`
-  beside the existing stored-membership comparison (`driver.rs:738-768`): a
-  refusal there can only
-  `mark_stopped`, leaving a node that serves on without raft. A directory
-  initialised with five otherwise keeps five. It applies whatever the
-  digest setting: a voter that can never be a connected replica adds
-  nothing to failover. It breaks a deployment that lists more, so it
-  goes under `CHANGELOG.md` **Changed**. With
+- **The voter cap (on `main`).** A cluster refuses more raft voters than
+  one plus the primary's replica slots, three today:
+  `melin_raft::MAX_VOTERS`, derived from `ReplicaSlotCursors::SLOTS` so
+  the bound moves with it. It is checked on the `--raft-peer` flags
+  (`check_voter_count`, in `build_raft_config` at config validation and
+  in `spawn`'s peer-list validation), and on the *stored* membership,
+  which overrides edited flags after the raft directory's first boot: in
+  `spawn`, right after `storage::open`, over the newer by log id of the
+  state machine's membership and the log's latest membership entry, read
+  synchronously through the stores' mutexes (`storage::stored_membership`),
+  so it fails the node's start before the driver thread exists. Not in
+  `driver_main` beside the stored-membership comparison: a refusal there
+  can only `mark_stopped`, leaving a node that serves on without raft.
+  It applies whatever the digest setting: a voter that can never be a
+  connected replica adds nothing to failover. With
   one configured replica there are two voters, and auto-promotion is
   already refused (`raft.rs`). Without
   raft, or with raft observational, nothing auto-promotes: only the
@@ -2801,11 +2787,8 @@ one-byte `AuthOk` without a handshake and redialling. What remains:
 
   The notice is driven by the shadow's trip in this step. Step 5 adds the
   replica's comparison as a second detector, through the same notice.
-- Raft: the voter cap (`melin_raft::MAX_VOTERS`, from
-  `ReplicaSlotCursors::SLOTS`) on the flags and on the stored membership
-  in `melin_raft::spawn`, read through the new synchronous store
-  accessors (decision 14), and the
-  stop cause in the stand-down and refusal lines.
+- Raft: the stop cause in the stand-down and refusal lines (the voter
+  cap of decision 14 is on `main`).
 - Tests: round trips; wire byte patterns beside `ack_wire_byte_pattern`,
   `rotate_wire_byte_pattern` and `chain_check_wire_byte_pattern`
   (`server-runtime/src/replication/mod.rs`); the grown handshake still refused at another version (the
@@ -2883,11 +2866,7 @@ one-byte `AuthOk` without a handshake and redialling. What remains:
     already passed returns the timeout outcome
     without a call, not an `InvalidInput` from a zero `Duration`; the
     DPDK dial's deadline is the linger loop's, covered by the
-    pure-function case above and the netns linger case below;
-  - `raft.rs` and the driver: four voters refused from the flags, and a
-    raft directory initialised with four refused by `melin_raft::spawn`,
-    returning an error before any driver thread exists, under flags that
-    list three.
+    pure-function case above and the netns linger case below.
 - Tests of the stop, integration (`output_divergence.rs`, on both
   transports, the DPDK cases under the netns runner; raft on kernel TCP),
   faults through `Sizing`:

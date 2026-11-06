@@ -614,35 +614,24 @@ fn single_voter_elects_itself() {
 
 /// Recency steering over real sockets: while a quorum of caught-up nodes
 /// exists, a node whose advertised journal tip is behind cannot assemble
-/// a quorum, so leadership lands on a most-caught-up node — including
-/// across a re-election after the leader dies. This is the property
-/// auto-promotion relies on to prefer a most-caught-up replica.
+/// a quorum, so leadership lands on a most-caught-up node. This is the
+/// property auto-promotion relies on to prefer a most-caught-up replica.
 ///
-/// Five nodes (not three) so a caught-up quorum survives the leader kill
-/// without the behind node's cooperation. With only two survivors the
-/// filter's *liveness escape* is load-dependent by design: quorum would
-/// need the behind node's grant, the behind node's filtered campaigns
-/// still inflate its term (openraft has no pre-vote), and sustained
-/// leadership churn legitimately opens the escape — best-effort steering,
-/// with promotion-time checks staying authoritative (see
-/// `crate::recency`).
+/// Three nodes, the most a cluster may have (`MAX_VOTERS`), so only the
+/// first election is asserted. Once the leader dies, the two survivors'
+/// quorum needs the behind node's grant: its filtered campaigns still
+/// inflate its term (openraft has no pre-vote), and sustained leadership
+/// churn legitimately opens the filter's *liveness escape*. Steering there
+/// is best-effort by design, with the promotion-time check staying
+/// authoritative (see `crate::recency`).
 #[test]
 fn behind_node_never_wins_an_election() {
-    // Nodes 1–4 hold seq 100; node 5 is behind at seq 10. Node 5 can only
-    // win with a caught-up grant, and every caught-up node drops its vote
-    // requests (candidate tip 10 < local tip 100).
-    let mut cluster = start_cluster_with_tips(&[100, 100, 100, 100, 10]);
+    // Nodes 1 and 2 hold seq 100; node 3 is behind at seq 10. Node 3 can
+    // only win with a caught-up grant, and both caught-up nodes drop its
+    // vote requests (candidate tip 10 < local tip 100).
+    let mut cluster = start_cluster_with_tips(&[100, 100, 10]);
     let refs: Vec<&Node> = cluster.nodes.iter().collect();
     let first = await_single_leader(&refs);
-    assert_ne!(first, 5, "the behind node must not win the first election");
-
-    // Kill the leader: three caught-up nodes remain — a quorum (3 of 5)
-    // that elects among itself long before the behind node's dropped
-    // campaigns could open the liveness escape.
-    cluster.stop_node(first);
-    let survivors: Vec<&Node> = cluster.nodes.iter().filter(|n| n.id != first).collect();
-    let second = await_single_leader(&survivors);
-    assert_ne!(second, 5, "the behind node must not win the re-election");
-
+    assert_ne!(first, 3, "the behind node must not win the election");
     cluster.stop_all();
 }

@@ -9,6 +9,7 @@ mod election;
 mod pre_version_wire;
 mod rpc_loopback;
 mod storage_suite;
+mod voter_cap;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
