@@ -35,19 +35,25 @@
 ///
 /// An encoder must be a pure function of the value it encodes: the same
 /// value gives the same result (the same length and bytes, or the same
-/// error) every time, whatever the encoder encoded before, and nothing
-/// else (state of its own, the clock) changes it. It must write every
-/// byte below the length it returns, a reserved or padding field
-/// included; the bytes past that length are its to use as scratch, and
-/// are never sent.
+/// error) every time, on every node, whatever the encoder encoded before,
+/// and nothing else (state of its own, the clock, the node's identity)
+/// changes it. It must write every byte below the length it returns, a
+/// reserved or padding field included; the bytes past that length are its
+/// to use as scratch, and are never sent.
+///
+/// Every node digests the bytes of every report it encodes, sent to a
+/// client or not, so that a replica can check its output against its
+/// primary's. An encoder that breaks this contract makes two copies of
+/// one report differ, which stops the cluster as a divergence.
 ///
 /// The runtime zeroes the body region before every encode, so in a
 /// release build a byte the encoder skips goes out as zero, never as a
 /// byte of an earlier response. A debug build of the runtime checks both
-/// rules on every response a node encodes: each body is encoded twice
-/// more first, over two different fill patterns, and a difference below
-/// the returned length, or in the result, panics. A call to the encoder
-/// outside a node, as in a unit test of the encoder alone, is not checked.
+/// rules on every report a node encodes, sent or digested, and every
+/// query response: each body is encoded twice more first, over two
+/// different fill patterns, and a difference below the returned length,
+/// or in the result, panics. A call to the encoder outside a node, as in
+/// a unit test of the encoder alone, is not checked.
 pub trait ResponseEncoder: Send + Sync {
     /// Per-event fan-out report type. Must match
     /// [`crate::Application::Report`] at the call site.
@@ -58,9 +64,14 @@ pub trait ResponseEncoder: Send + Sync {
 
     /// Encode an application report's body into `buf` and return how
     /// many bytes it took. `buf` holds the runtime's bound on one
-    /// response body (`MAX_RESPONSE_BODY`). Returns `Err` with a static
-    /// reason on encode failure (the runtime logs at error level and
-    /// drops the response; the connection stays open).
+    /// response body (`MAX_RESPONSE_BODY`). Called for every report the
+    /// application produces, including those no client receives (a
+    /// tick's, a disconnected client's, every report on a replica), since
+    /// every report is digested. Returns `Err` with a static reason on
+    /// encode failure: for a reply to a connection the node holds, the
+    /// runtime logs it at error level and drops the response (the
+    /// connection stays open); a failure for a report nobody receives is
+    /// digested as a failure, and not logged.
     fn encode_report(&self, report: &Self::Report, buf: &mut [u8]) -> Result<usize, &'static str>;
 
     /// Encode an application query response's body into `buf`. Same

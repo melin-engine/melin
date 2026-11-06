@@ -1564,6 +1564,8 @@ pub fn run_receiver_dpdk<A>(
     // Applied to every instance this loop builds a pipeline around; see
     // `build_replica_pipeline_with_threads`.
     sizing: &A::Sizing,
+    // As the kernel-TCP `run_receiver`'s.
+    digest_encoder: Option<crate::response::ResponseEncoderArc<A>>,
 ) -> ReceiverResult<A, BufferedWriter<A::Event>>
 where
     A: Application + Send + 'static,
@@ -2034,6 +2036,7 @@ where
                         lineage_ack_policy,
                         Arc::clone(pipeline_healthy),
                         sizing,
+                        digest_encoder.clone(),
                     )?;
                     // Pipeline children are spawned and self-pinned. Now safe
                     // to pin the receive thread — mirrors the primary's reader

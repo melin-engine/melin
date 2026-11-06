@@ -638,6 +638,9 @@ pub fn run_receiver<A>(
     // Applied to every instance this loop builds a pipeline around; see
     // `build_replica_pipeline_with_threads`.
     sizing: &A::Sizing,
+    // The encoder each pipeline's drain digests reports with; `None` with
+    // output digests off. See `build_replica_pipeline_with_threads`.
+    digest_encoder: Option<crate::response::ResponseEncoderArc<A>>,
 ) -> ReceiverResult<A, BufferedWriter<A::Event>>
 where
     A: Application + Send + 'static,
@@ -959,6 +962,7 @@ where
                     lineage_ack_policy,
                     Arc::clone(pipeline_healthy),
                     sizing,
+                    digest_encoder.clone(),
                 )
             };
             let p =
@@ -1525,6 +1529,7 @@ mod tests {
                         64,
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
                         &(),
+                        None,
                     )
                     // ReceiverResult's error is !Send — stringify for join().
                     .map(|state| state.is_none())
@@ -1782,6 +1787,7 @@ mod tests {
                         64,
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
                         &(),
+                        None,
                     )
                     .map(|state| state.is_none())
                     .map_err(|e| e.to_string())
@@ -1991,6 +1997,7 @@ mod tests {
                         64,
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
                         &(),
+                        None,
                     )
                     .map(|state| state.is_none())
                     .map_err(|e| e.to_string())
@@ -2261,6 +2268,7 @@ mod tests {
                         64,
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
                         &(),
+                        None,
                     )
                     // ReceiverResult's error is !Send — stringify for join().
                     .map(|state| state.is_none())
@@ -2399,6 +2407,7 @@ mod tests {
                     64,
                     Arc::new(melin_transport_core::fence::FenceState::new(0)),
                     &(),
+                    None,
                 )
                 // ReceiverResult's error is !Send: stringify for join().
                 .map(|state| state.is_none())
@@ -2894,6 +2903,7 @@ mod tests {
                         64,
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
                         &(),
+                        None,
                     )
                     // The promotion path's check, on the writer the
                     // receiver hands over.
@@ -3165,6 +3175,7 @@ mod tests {
                             64,
                             Arc::new(melin_transport_core::fence::FenceState::new(0)),
                             &(),
+                            None,
                         )
                         // The error is !Send: stringify for join().
                         .map(|promoted| promoted.is_some())
@@ -3253,6 +3264,7 @@ mod tests {
                         64,
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
                         &(),
+                        None,
                     )
                     // ReceiverResult's error is !Send — stringify for join().
                     .map(|state| state.is_none())
@@ -3483,6 +3495,7 @@ mod tests {
                         64,
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
                         &(),
+                        None,
                     )
                     // ReceiverResult's error is !Send — stringify for join().
                     .map(|state| state.is_none())

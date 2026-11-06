@@ -75,7 +75,7 @@ use melin_journal::{BufferedWriter, JournalWrite};
 use melin_app::Application;
 use melin_transport_core::lineage::SharedLineagePolicy;
 use melin_transport_core::node_store::NodeStore;
-use melin_transport_core::pipeline::{InputSlot, OutputSlot};
+use melin_transport_core::pipeline::InputSlot;
 use melin_transport_core::replication::archive::{ArchiveReason, archive_local_lineage};
 use melin_transport_core::replication::protocol::{MAX_CONTROL_FRAME, decode_primary_message};
 use melin_transport_core::{TickWatermark, WarmApp};
@@ -83,6 +83,9 @@ use melin_transport_core::{TickWatermark, WarmApp};
 mod auth;
 #[cfg(feature = "dpdk")]
 mod dpdk;
+/// The replica's drain: `pub(crate)` for the response loop's agreement
+/// test, which runs it beside a primary's stage.
+pub(crate) mod drain;
 mod receiver_transport;
 mod tcp_receiver;
 mod tcp_sender;
@@ -723,6 +726,9 @@ pub(super) fn build_replica_pipeline_with_threads<A>(
     // The node's sizing, applied to every instance a pipeline is built
     // around — see `Application::prefault`.
     sizing: &A::Sizing,
+    // The encoder the drain digests reports with, the node's own; `None`
+    // with output digests off (`--no-output-digests`).
+    digest_encoder: Option<crate::response::ResponseEncoderArc<A>>,
 ) -> Result<ReplicaHandles<A>, Box<dyn std::error::Error>>
 where
     A: Application + Send + 'static,
@@ -823,24 +829,17 @@ where
 
     // Drain thread uses the response core — replicas have no response stage,
     // but the consumer needs to be drained so the output ring doesn't fill.
+    // With output digests on, it digests every report, as a primary's
+    // response stage does (see `drain`).
     let ps = Arc::clone(&pipeline_shutdown);
     let drain = cores.response;
     let drain_consumer = pipeline.drain_consumer;
+    let drain_digest = digest_encoder.and_then(|encoder| {
+        crate::server::output_digester(true, pipeline.first_live, &pipeline.cursors, ring_capacity)
+            .map(|digester| drain::DrainDigest { digester, encoder })
+    });
     let drain_handle = melin_app::affinity::spawn_placed("drain", drain.core, move || {
-        let mut consumer = drain_consumer;
-        let mut batch = vec![OutputSlot::<A::Report, A::QueryResponse>::default(); 256];
-        let mut waiter = drain.wait.waiter();
-        loop {
-            if ps.load(Ordering::Relaxed) {
-                return;
-            }
-            let count = consumer.consume_batch(&mut batch, 256);
-            if count == 0 {
-                waiter.idle();
-            } else {
-                waiter.reset();
-            }
-        }
+        drain::run(drain_consumer, drain_digest, drain.wait, &ps);
     })
     .map_err(|e| abandon(format!("start the replica's drain thread: {e}")))?;
 
@@ -2507,6 +2506,7 @@ mod tests {
             &SharedLineagePolicy::new(None),
             Arc::new(AtomicBool::new(true)),
             &(),
+            Some(Arc::new(counter_server::ResponseEncoder)),
         )
     }
 
@@ -4733,6 +4733,7 @@ mod tests {
                 &SharedLineagePolicy::new(None),
                 Arc::new(AtomicBool::new(true)),
                 &(),
+                Some(Arc::new(counter_server::ResponseEncoder)),
             )
             .expect("build the replica pipeline");
 

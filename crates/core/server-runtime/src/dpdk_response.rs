@@ -37,8 +37,9 @@ use melin_wire_protocol::control_codec::BATCH_END_FRAME_LEN;
 use crate::response_frame::{EarlyReplyBuf, MAX_APP_FRAME, MAX_EARLY_REPLY, encode_early_reply};
 
 use crate::response_loop::{
-    self, Egress, EgressRecorders, LoopInputs, SlotOutcome, SlotReply, StageNames,
+    self, Egress, EgressRecorders, LoopInputs, SlotFrames, SlotOutcome, StageNames,
 };
+use melin_transport_core::output_digest::OutputDigester;
 
 #[cfg(feature = "latency-trace")]
 use melin_transport_core::trace;
@@ -162,6 +163,9 @@ pub fn run<A: Application>(
     // Release of held replies on this node's own fsync while halted;
     // `None` when off. See `crate::halt::DegradedRelease`.
     degraded_release: Option<crate::halt::DegradedRelease>,
+    // Digests every report the stage reads, as on the kernel stage
+    // (`response::Response::digester`); `None` with output digests off.
+    digester: Option<OutputDigester>,
     // Test seam, the kernel stage's `Response::pause_after_control_drain`:
     // called once per iteration right after the control channel has been
     // drained, so a test can hold the stage there, and with it every early
@@ -189,6 +193,7 @@ pub fn run<A: Application>(
             heartbeat_interval,
             encoder,
             early_replies,
+            digester,
             #[cfg(test)]
             pause_after_control_drain,
         },
@@ -320,10 +325,10 @@ impl Egress for DpdkEgress {
     /// is not stamped, and no lane is kept, since the loop leaves without
     /// this slot's `after_slot`.
     #[inline]
-    fn send_slot<R: Copy, Q: Copy>(
+    fn send_slot(
         &mut self,
         connection_id: u64,
-        reply: SlotReply<'_, R, Q>,
+        frames: SlotFrames<'_>,
         now: Instant,
         shutdown: &AtomicBool,
     ) -> SlotOutcome {
@@ -338,7 +343,6 @@ impl Egress for DpdkEgress {
             return SlotOutcome::Unknown;
         };
         let lane = tx_lane(connection_id, self.tx_producers.len());
-        let frames = reply.into_frames();
 
         #[cfg(feature = "tick-to-trade")]
         let encode_start = trace::mono_trace_ns();
@@ -1333,6 +1337,7 @@ mod tests {
                             grace: Duration::ZERO,
                         }),
                         None,
+                        None,
                     )
                 });
 
@@ -1505,6 +1510,7 @@ mod tests {
                     WaitStrategy::SpinThenYield,
                     Arc::new(ResponseEncoder),
                     early_replies,
+                    None,
                     None,
                     pause_after_control_drain,
                 )
@@ -1866,7 +1872,7 @@ mod tests {
             let mut batch_ends = BatchEnds::new();
             egress.send_slot(
                 connection_id,
-                SlotReply::new(
+                SlotFrames::encode(
                     &slot,
                     Backing::Policy,
                     &ResponseEncoder,
@@ -1969,8 +1975,9 @@ mod tests {
         }
 
         /// A slot for a connection the egress does not hold is `Unknown`:
-        /// nothing is encoded or pushed, and the `after_slot` after it
-        /// leaves untouched what an earlier slot left (here, nothing).
+        /// nothing is pushed (the loop encoded it before offering it, for
+        /// the output digest), and the `after_slot` after it leaves
+        /// untouched what an earlier slot left (here, nothing).
         #[test]
         fn a_slot_for_an_unknown_connection_is_unknown_and_pushes_nothing() {
             let (mut egress, mut rings) = egress_holding(1, &[1]);
@@ -1981,7 +1988,6 @@ mod tests {
 
             assert_eq!(outcome, SlotOutcome::Unknown);
             assert!(egress.pushed.is_none());
-            assert!(encode_buf.iter().all(|&b| b == 0), "the reply was encoded");
             egress.after_slot();
             assert!(visible(&mut rings[0]).is_empty());
             assert_eq!(egress.connections[&1].last_send, before);

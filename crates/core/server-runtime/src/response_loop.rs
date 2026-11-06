@@ -44,7 +44,8 @@ use tracing::debug;
 
 use melin_app::encoder::ResponseEncoder;
 use melin_pipeline::ring;
-use melin_transport_core::pipeline::{OutputPayload, OutputSlot, RequestId};
+use melin_transport_core::output_digest::OutputDigester;
+use melin_transport_core::pipeline::{OutputSlot, RequestId};
 #[cfg(feature = "latency-trace")]
 use melin_transport_core::trace;
 use melin_transport_core::trace::MonoTraceInstant;
@@ -62,7 +63,7 @@ use crate::response::GateCrossTracker;
 #[cfg(feature = "pipeline-stats")]
 use crate::response::print_utilization;
 use crate::response_frame::{
-    EarlyReplyBuf, EncodeBuf, MAX_APP_FRAME, MAX_EARLY_REPLY, encode_slot_payload,
+    EarlyReplyBuf, EncodeBuf, MAX_APP_FRAME, MAX_EARLY_REPLY, encode_slot_payload, report_body,
 };
 
 /// Maximum number of output slots consumed per batch. `usize` because it
@@ -102,14 +103,12 @@ pub(crate) trait Egress {
     fn drain_control(&mut self, rx: &mpsc::Receiver<Self::Control>);
 
     /// One slot's reply to its connection, if this egress holds it: look
-    /// it up, turn the reply into frames ([`SlotReply::into_frames`],
-    /// which encodes the payload and builds the trailer), append or push
-    /// them under the encode sample, stamp its own `last_send`.
+    /// it up, append or push its frames (encoded by the loop, see
+    /// [`SlotFrames`]) under the encode sample, stamp its own `last_send`.
     /// [`SlotOutcome::Unknown`] makes the loop log the miss; nothing is
-    /// encoded for it and no trailer built. Called only for
-    /// `Admission::Reply`: a change slot (`Admission::GateOnly`) has no
-    /// destination and is not offered to the egress, so it is never
-    /// logged as a miss.
+    /// sent for it. Called only for `Admission::Reply`: a change slot
+    /// (`Admission::GateOnly`) has no destination and is not offered to
+    /// the egress, so it is never logged as a miss.
     ///
     /// An egress whose send can wait for room reads `shutdown` while it
     /// waits, and only then, and returns `SlotOutcome::Stopped` (compiled
@@ -117,10 +116,10 @@ pub(crate) trait Egress {
     /// flag ended the wait; one whose send never waits ignores it. A send
     /// with room goes through whatever the flag says: the loop finishes
     /// the batch in hand unless something has to wait.
-    fn send_slot<R: Copy, Q: Copy>(
+    fn send_slot(
         &mut self,
         connection_id: u64,
-        reply: SlotReply<'_, R, Q>,
+        frames: SlotFrames<'_>,
         now: Instant,
         shutdown: &AtomicBool,
     ) -> SlotOutcome;
@@ -188,14 +187,13 @@ pub(crate) trait Egress {
 #[must_use]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SlotOutcome {
-    /// The egress holds the connection, and the reply was turned into
-    /// frames. The bytes may still have been dropped: an append that
+    /// The egress holds the connection, and the reply's frames were
+    /// handed on. The bytes may still have been dropped: an append that
     /// overflows the kernel's send buffer cap queues the connection for
     /// removal and is still `Known`, since the reply was answered as far
     /// as this node is concerned.
     Known,
-    /// No such connection: nothing was encoded or built, and the loop
-    /// logs the miss.
+    /// No such connection: nothing was sent, and the loop logs the miss.
     Unknown,
     /// The send had to wait for room and was stopped by shutdown while it
     /// waited: nothing of the reply was handed on. The loop leaves to its
@@ -209,78 +207,11 @@ pub(crate) enum SlotOutcome {
     Stopped,
 }
 
-/// What [`Egress::send_slot`] hands over: what encoding the payload needs
-/// (the payload, the encoder, `&mut` the encode buffer), what building the
-/// trailer needs (`&mut` the [`BatchEnds`], the slot's backing and request
-/// ID, `is_last_in_request`), and what the end-to-end sample needs
-/// (`recv_ts`). No reference to the gate, and fields private to this
-/// module: an egress gets frames out of it only through
-/// [`Self::into_frames`].
-pub(crate) struct SlotReply<'a, R: Copy, Q: Copy> {
-    payload: &'a OutputPayload<R, Q>,
-    encoder: &'a dyn ResponseEncoder<Report = R, Query = Q>,
-    encode_buf: &'a mut EncodeBuf,
-    batch_ends: &'a mut BatchEnds,
-    backing: Backing,
-    request_id: RequestId,
-    is_last_in_request: bool,
-    recv_ts: MonoTraceInstant,
-}
-
-impl<'a, R: Copy, Q: Copy> SlotReply<'a, R, Q> {
-    /// `slot`'s reply, backed as the gate released it.
-    pub(crate) fn new(
-        slot: &'a OutputSlot<R, Q>,
-        backing: Backing,
-        encoder: &'a dyn ResponseEncoder<Report = R, Query = Q>,
-        encode_buf: &'a mut EncodeBuf,
-        batch_ends: &'a mut BatchEnds,
-    ) -> Self {
-        Self {
-            payload: &slot.payload,
-            encoder,
-            encode_buf,
-            batch_ends,
-            backing,
-            request_id: slot.request_id,
-            is_last_in_request: slot.is_last_in_request,
-            recv_ts: slot.recv_ts,
-        }
-    }
-
-    /// Encode the payload into the buffer and build the trailer from
-    /// [`BatchEnds`], once: consuming, so a reply becomes frames at most
-    /// once, and only where an egress calls it, after its lookup. The
-    /// buffer and `BatchEnds` are disjoint borrows, so both leave with
-    /// lifetime `'a` side by side.
-    #[inline]
-    pub(crate) fn into_frames(self) -> SlotFrames<'a> {
-        // Frame 1: the application payload, if any. A `BatchEnd` payload
-        // carries no body: the terminator below handles it, via
-        // `is_last_in_request`.
-        let encode_buf: &'a mut EncodeBuf = self.encode_buf;
-        let payload = encode_slot_payload(self.payload, self.encoder, encode_buf);
-        let encode_buf: &'a EncodeBuf = encode_buf;
-        // Frame 2: the pre-encoded terminator, `BatchEnd` or
-        // `BatchEndDegraded` as the slot is backed, with the request's ID
-        // written in. Only a request's last slot carries one.
-        let trailer: &'a [u8] = if self.is_last_in_request {
-            self.batch_ends.terminator(self.backing, self.request_id)
-        } else {
-            &[]
-        };
-        SlotFrames {
-            payload,
-            encode_buf,
-            trailer,
-            is_last_in_request: self.is_last_in_request,
-            recv_ts: self.recv_ts,
-        }
-    }
-}
-
-/// A slot's reply as frames: the encode result and the buffer it wrote,
-/// the trailer, and the end-to-end sample's inputs.
+/// A slot's reply as frames, what [`Egress::send_slot`] is handed: the
+/// encode result and the buffer it wrote, the trailer, and the end-to-end
+/// sample's inputs. The loop encodes every reply before offering it, so a
+/// report is encoded, and digested, whether or not its connection is still
+/// here; the egress never sees the encoder.
 pub(crate) struct SlotFrames<'a> {
     /// What encoding the payload gave: `None` for a payload with no body,
     /// the frame's length in [`Self::encode_buf`], or the encoder's error,
@@ -298,6 +229,43 @@ pub(crate) struct SlotFrames<'a> {
     /// When the reader received the request (a unit in untraced builds).
     #[cfg_attr(not(feature = "latency-trace"), allow(dead_code))]
     pub(crate) recv_ts: MonoTraceInstant,
+    /// The request the slot answers, for the loop's tests' recording
+    /// egress; the trailer carries it on the wire.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) request_id: RequestId,
+}
+
+impl<'a> SlotFrames<'a> {
+    /// `slot`'s reply, backed as the gate released it, as frames: its
+    /// payload encoded into `encode_buf` (a `BatchEnd` payload carries no
+    /// body; the terminator stands for it), and, on a request's last slot,
+    /// the pre-encoded terminator, `BatchEnd` or `BatchEndDegraded` as the
+    /// slot is backed, with the request's ID written in. The buffer and
+    /// `BatchEnds` are disjoint borrows, so both leave with lifetime `'a`
+    /// side by side.
+    #[inline]
+    pub(crate) fn encode<R: Copy, Q: Copy>(
+        slot: &OutputSlot<R, Q>,
+        backing: Backing,
+        encoder: &dyn ResponseEncoder<Report = R, Query = Q>,
+        encode_buf: &'a mut EncodeBuf,
+        batch_ends: &'a mut BatchEnds,
+    ) -> Self {
+        let payload = encode_slot_payload(&slot.payload, encoder, encode_buf);
+        let trailer: &'a [u8] = if slot.is_last_in_request {
+            batch_ends.terminator(backing, slot.request_id)
+        } else {
+            &[]
+        };
+        SlotFrames {
+            payload,
+            encode_buf,
+            trailer,
+            is_last_in_request: slot.is_last_in_request,
+            recv_ts: slot.recv_ts,
+            request_id: slot.request_id,
+        }
+    }
 }
 
 /// The stage's [`GateWait`] hook, built for one slot's admit: hand the
@@ -442,6 +410,9 @@ pub(crate) struct LoopInputs<R: Copy, Q: Copy, C> {
     pub(crate) heartbeat_interval: Option<Duration>,
     pub(crate) encoder: Arc<dyn ResponseEncoder<Report = R, Query = Q>>,
     pub(crate) early_replies: EarlyReplyQueue<R>,
+    /// Digests every report the stage reads, sent or not; `None` with
+    /// output digests off.
+    pub(crate) digester: Option<OutputDigester>,
     /// Test seam: see `response::Response::pause_after_control_drain`.
     #[cfg(test)]
     pub(crate) pause_after_control_drain: Option<Box<dyn FnMut() + Send>>,
@@ -467,6 +438,7 @@ pub(crate) fn run<E: Egress, R: Copy, Q: Copy>(
         heartbeat_interval,
         encoder,
         mut early_replies,
+        mut digester,
         #[cfg(test)]
         mut pause_after_control_drain,
     } = inputs;
@@ -552,6 +524,11 @@ pub(crate) fn run<E: Egress, R: Copy, Q: Copy>(
         // durability gate waits included — is done with them. That is
         // at most `MAX_BATCH` of a 1 M-slot ring, and the ring fills at
         // the same rate either way.
+        //
+        // How far the matching stage has applied is loaded first: if the
+        // read then finds the ring empty, every slot of every entry
+        // through it has been read (see `OutputDigester`).
+        let applied = digester.as_ref().map(OutputDigester::load_applied);
         let slots = consumer.read_contiguous(MAX_BATCH);
 
         // Take a snapshot of the early replies, then poll the control
@@ -578,6 +555,13 @@ pub(crate) fn run<E: Egress, R: Copy, Q: Copy>(
         }
 
         if slots.is_empty() {
+            // Windows whose entries published no slot close here.
+            if let Some(digester) = digester.as_mut()
+                && let Some(applied) = applied
+            {
+                digester.ring_empty(applied);
+            }
+
             // Between two events, the snapshot's early replies go now. An
             // empty read is not a boundary in itself: the matching stage
             // may have published only part of an event.
@@ -798,13 +782,16 @@ pub(crate) fn run<E: Egress, R: Copy, Q: Copy>(
             // Each slot expands to at most two wire frames: the
             // application payload (Report / Query) and an optional
             // trailing `BatchEnd`, naming the slot's request, when
-            // `is_last_in_request` is set. The egress encodes them after
-            // its own lookup, so a reply to a connection it does not hold
-            // is never encoded.
+            // `is_last_in_request` is set. Encoded here, before the egress
+            // looks the connection up, so a report whose connection is gone
+            // (a tick's, a disconnected client's) is encoded too: every
+            // copy digests every report, whoever receives it.
+            let mut encoded = None;
             if let Some((connection_id, backing)) = reply {
-                let reply =
-                    SlotReply::new(slot, backing, &*encoder, &mut encode_buf, &mut batch_ends);
-                match egress.send_slot(connection_id, reply, batch_now, shutdown) {
+                let frames =
+                    SlotFrames::encode(slot, backing, &*encoder, &mut encode_buf, &mut batch_ends);
+                encoded = frames.payload;
+                match egress.send_slot(connection_id, frames, batch_now, shutdown) {
                     SlotOutcome::Known => {
                         // A degraded terminator counts for
                         // `melin_degraded_acks_total`: once per request,
@@ -846,6 +833,17 @@ pub(crate) fn run<E: Egress, R: Copy, Q: Copy>(
                     #[cfg(any(feature = "dpdk", test))]
                     SlotOutcome::Stopped => break 'run,
                 }
+            }
+
+            // Digest the slot after it was offered, so the hash is off the
+            // reply's own latency: what it closes behind it, and a report's
+            // body, as encoded above whether it was sent or not. A report
+            // is always offered (only a change slot is the gate's alone),
+            // so a report's `encoded` is always there.
+            if let Some(digester) = digester.as_mut()
+                && let Some(at) = digester.slot(slot)
+            {
+                digester.fold(at, report_body(&encode_buf, encoded));
             }
 
             // The egress's turn between slots (the kernel's consumed-path
@@ -908,9 +906,13 @@ mod tests {
     use melin_pipeline::ring::DisruptorBuilder;
     use melin_pipeline::wait::WaitStrategy;
     use melin_transport_core::lineage::forced_policy_cell;
-    use melin_transport_core::pipeline::StageUtilization;
+    use melin_transport_core::output_digest::{
+        BoardLookup, BoardSize, ClosedWindow, DigestBoardReader, MAX_RESPONSE_BODY,
+        OUTPUT_DIGEST_WINDOW, ReportBody, WindowFolder, digest_board, encode_app_body,
+    };
+    use melin_transport_core::pipeline::{OutputPayload, StageUtilization};
     use melin_transport_core::replica_presence::ReplicaPresence;
-    use melin_transport_core::{DurableWireSeqCursor, WireSeq};
+    use melin_transport_core::{AppliedWireSeqCursor, DurableWireSeqCursor, WireSeq};
 
     use super::*;
     use crate::ack_policy::AckPolicy;
@@ -1004,17 +1006,17 @@ mod tests {
 
         /// A send to [`FULL`] waits for room that never comes, until
         /// `shutdown` stops it, as a push on a ring nobody drains does.
-        fn send_slot<R: Copy, Q: Copy>(
+        fn send_slot(
             &mut self,
             connection_id: u64,
-            reply: SlotReply<'_, R, Q>,
+            frames: SlotFrames<'_>,
             _now: Instant,
             shutdown: &AtomicBool,
         ) -> SlotOutcome {
             let known = self.known.contains(&connection_id);
             self.log(Call::SendSlot {
                 connection_id,
-                request: reply.request_id.0,
+                request: frames.request_id.0,
                 known,
                 committed: self.committed(),
             });
@@ -1025,7 +1027,6 @@ mod tests {
                 return SlotOutcome::Stopped;
             }
             if known {
-                let _frames = reply.into_frames();
                 SlotOutcome::Known
             } else {
                 SlotOutcome::Unknown
@@ -1132,6 +1133,21 @@ mod tests {
     /// Start the loop behind `gate`, the journal at `journal_at`, and
     /// wait for it to park at the seam of its first iteration.
     fn start(gate: GateKind, journal_at: u64) -> Stage {
+        start_with(gate, journal_at, None)
+    }
+
+    /// [`start`], digesting with `digester`.
+    fn start_with(gate: GateKind, journal_at: u64, digester: Option<OutputDigester>) -> Stage {
+        start_encoding(gate, journal_at, digester, Arc::new(CounterEncoder))
+    }
+
+    /// [`start_with`], encoding with `encoder`.
+    fn start_encoding(
+        gate: GateKind,
+        journal_at: u64,
+        digester: Option<OutputDigester>,
+        encoder: Arc<dyn ResponseEncoder<Report = CounterReport, Query = CounterQuery>>,
+    ) -> Stage {
         let (pause, seam) = seam(usize::MAX);
         let (producer, mut consumers) = DisruptorBuilder::<Slot>::new(64)
             .add_consumer()
@@ -1173,8 +1189,9 @@ mod tests {
                 forced: forced_policy_cell().1,
             },
             heartbeat_interval: None,
-            encoder: Arc::new(CounterEncoder),
+            encoder,
             early_replies,
+            digester,
             pause_after_control_drain: Some(pause),
         };
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -1304,6 +1321,337 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A stage under `disk`, the journal far ahead so nothing waits,
+    /// digesting from position 1; the applied cursor it closes windows
+    /// by, and its board.
+    fn start_digesting() -> (Stage, AppliedWireSeqCursor, DigestBoardReader) {
+        let applied = AppliedWireSeqCursor::detached(WireSeq::new(0));
+        let (writer, board) = digest_board(BoardSize::new(8).expect("above the minimum"));
+        let digester = OutputDigester::new(WireSeq::new(1), applied.clone(), writer);
+        (
+            start_with(GateKind::Disk, u64::MAX / 2, Some(digester)),
+            applied,
+            board,
+        )
+    }
+
+    /// The window ending at `end` as a reference folder digests
+    /// `reports`, each the counter's ack of its value at its position,
+    /// encoded through the one body encode: what any copy must publish.
+    fn reference_window(end: u64, reports: &[(u64, u64)]) -> ClosedWindow {
+        let (writer, board) = digest_board(BoardSize::new(8).expect("above the minimum"));
+        let mut folder = WindowFolder::new(WireSeq::new(1), writer);
+        let mut body = [0u8; MAX_RESPONSE_BODY];
+        for &(position, new_value) in reports {
+            let report = CounterReport::Ack { new_value };
+            let encoded = encode_app_body(&mut body, |b| CounterEncoder.encode_report(&report, b));
+            folder.fold(WireSeq::new(position), ReportBody::of(&body, encoded));
+        }
+        folder.close_through(WireSeq::new(end));
+        window(&board, end).expect("the reference closed it")
+    }
+
+    /// The window ending at `end` on `board`, if closed.
+    fn window(board: &DigestBoardReader, end: u64) -> Option<ClosedWindow> {
+        match board.get(WireSeq::new(end)) {
+            BoardLookup::Closed(window) => Some(window),
+            BoardLookup::NotYet => None,
+            BoardLookup::Overwritten => panic!("window {end} overwritten"),
+        }
+    }
+
+    const K: u64 = OUTPUT_DIGEST_WINDOW;
+
+    /// A report to a connection the egress does not hold is offered,
+    /// found unknown, and digested all the same: every copy digests every
+    /// report, whoever receives it. A slot past the window closes it,
+    /// with the ring never empty.
+    #[test]
+    fn a_report_to_an_unknown_connection_is_digested() {
+        let (mut stage, _applied, board) = start_digesting();
+        stage.publish(5, 1, 3, true);
+        stage.publish(5, 2, K + 1, true);
+        stage.step();
+        let calls = stage.step();
+        assert!(
+            calls.contains(&Call::SendSlot {
+                connection_id: 5,
+                request: 1,
+                known: false,
+                committed: stage.committed() - 2,
+            }),
+            "{calls:?}"
+        );
+        assert_eq!(window(&board, K), Some(reference_window(K, &[(3, 3)])));
+        assert_eq!(window(&board, 2 * K), None, "window 2 is still open");
+    }
+
+    /// A window of entries that published no slot (ticks with no report)
+    /// closes on the idle path once the applied cursor passes its end,
+    /// and not before.
+    #[test]
+    fn a_window_with_no_slot_closes_once_applied_past_it() {
+        let (stage, applied, board) = start_digesting();
+        applied.store(WireSeq::new(K - 1));
+        // The parked iteration finishes on what it loaded before; the
+        // next loads `K - 1` and finds the ring empty.
+        stage.step();
+        stage.step();
+        assert_eq!(window(&board, K), None, "applied short of its end");
+        applied.store(WireSeq::new(K));
+        stage.step();
+        stage.step();
+        assert_eq!(window(&board, K), Some(reference_window(K, &[])));
+    }
+
+    /// A query response is stamped with the last position applied before
+    /// it, so it closes the window ending there by itself: no later slot
+    /// follows, and the applied cursor stays short of it.
+    #[test]
+    fn a_query_response_at_a_window_end_closes_it() {
+        let (mut stage, _applied, board) = start_digesting();
+        stage.producer.publish(Slot {
+            connection_id: 5,
+            wire_seq: K,
+            payload: OutputPayload::QueryResponse(CounterQuery { value: 1 }),
+            is_last_in_request: true,
+            ..Default::default()
+        });
+        // The parked iteration finishes on its empty read; the next reads
+        // the query and parks; resumed, it handles it.
+        stage.step();
+        stage.step();
+        assert_eq!(window(&board, K), Some(reference_window(K, &[])));
+    }
+
+    /// The counter's encoder, refusing every ack whose value is a
+    /// multiple of 11: a report every copy fails to encode alike.
+    struct Refusing;
+
+    impl ResponseEncoder for Refusing {
+        type Report = CounterReport;
+        type Query = CounterQuery;
+        fn encode_report(
+            &self,
+            report: &CounterReport,
+            buf: &mut [u8],
+        ) -> Result<usize, &'static str> {
+            match report {
+                CounterReport::Ack { new_value } if new_value % 11 == 0 => Err("refused"),
+                _ => CounterEncoder.encode_report(report, buf),
+            }
+        }
+        fn encode_query(
+            &self,
+            query: &CounterQuery,
+            buf: &mut [u8],
+        ) -> Result<usize, &'static str> {
+            CounterEncoder.encode_query(query, buf)
+        }
+    }
+
+    type CounterInput = melin_transport_core::pipeline::InputSlot<counter_server::CounterEvent>;
+
+    fn input(
+        connection_id: u64,
+        event: melin_journal::JournalEvent<counter_server::CounterEvent>,
+    ) -> CounterInput {
+        CounterInput {
+            connection_id,
+            request_id: RequestId(0),
+            key_hash: 0,
+            sequence: 0,
+            timestamp_ns: 0,
+            event,
+            publish_ts: melin_transport_core::trace::mono_trace_ns(),
+            recv_ts: melin_transport_core::trace::mono_trace_ns(),
+        }
+    }
+
+    /// What one matching stage over a fresh counter publishes for
+    /// `inputs`, and how far it applied: a real stage, so each copy's slot
+    /// stream is the one a node of its role produces.
+    fn matching_outputs(inputs: &[CounterInput]) -> (Vec<Slot>, WireSeq) {
+        const RING: usize = 1024;
+        let (mut input_producer, mut inputs_rx) = DisruptorBuilder::<CounterInput>::new(RING)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
+        let (output, mut outputs) = DisruptorBuilder::<Slot>::new(RING)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
+        let applied = AppliedWireSeqCursor::detached(WireSeq::new(0));
+        let stage = melin_transport_core::pipeline::MatchingStage::new(
+            counter_server::Counter::default(),
+            melin_transport_core::TickWatermark::GENESIS,
+            inputs_rx.pop().expect("one consumer"),
+            output,
+            Arc::new(AtomicU64::new(0)),
+            DurableWireSeqCursor::detached(WireSeq::new(0)),
+            applied.clone(),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(melin_transport_core::fence::FenceState::new(0)),
+            WaitStrategy::SpinThenYield,
+            1,
+        );
+        assert!(
+            inputs.len() < RING,
+            "every input and its slots fit the rings"
+        );
+        for slot in inputs {
+            input_producer.publish(*slot);
+        }
+        input_producer.publish(input(0, melin_journal::JournalEvent::Shutdown));
+        let never = AtomicBool::new(false);
+        let _app = stage.run(&never);
+        let mut consumer = outputs.pop().expect("one consumer");
+        let mut slots = Vec::new();
+        while let Some((_, slot)) = consumer.try_consume() {
+            slots.push(slot);
+        }
+        (slots, applied.load())
+    }
+
+    /// Wait until `board` has closed the window ending at `end`.
+    fn closes(board: &DigestBoardReader, end: u64) -> ClosedWindow {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            if let Some(window) = window(board, end) {
+                return window;
+            }
+            assert!(Instant::now() < deadline, "window {end} never closed");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// One input sequence through a primary's response stage and a
+    /// replica's drain publishes identical window digests and chains for
+    /// every window, though the two copies' output rings differ on
+    /// purpose: the primary's carries query responses and reports to a
+    /// connection it does not hold, and answers its client; the replica's
+    /// has every slot on connection 0. Ticks publish nothing on either,
+    /// and the entries past the last whole window are all ticks, so that
+    /// window closes on the applied cursor with the ring empty, the
+    /// others through a later slot. Reports the encoder
+    /// refuses fail alike on both. (The counter answers every request with
+    /// a report, so no `BatchEnd` slot occurs here; the digester's own
+    /// tests pin what one closes.)
+    #[test]
+    fn a_primary_and_a_replica_publish_the_same_window_digests() {
+        use counter_server::CounterEvent::{GetValue, Increment};
+        use melin_journal::JournalEvent;
+
+        // (connection on the primary, event): ticks and the policy change
+        // from the node (0), increments from a client (1) and from one
+        // that is gone (7), queries from the client; past the fourth
+        // window, ticks only.
+        let mut entries: Vec<(u64, JournalEvent<counter_server::CounterEvent>)> = Vec::new();
+        for n in 1..=(4 * K + 20) {
+            let entry = match n {
+                n if n % 5 == 0 || n > 4 * K => (0, JournalEvent::Tick { now_ns: n }),
+                n if n == 2 * K => (
+                    0,
+                    JournalEvent::AckPolicyChange(AckPolicyChange {
+                        policy: AckPolicy::Disk.to_byte(),
+                        unwitnessed: false,
+                    }),
+                ),
+                n if n % 7 == 0 => (7, JournalEvent::App(Increment { amount: n })),
+                n => (1, JournalEvent::App(Increment { amount: n })),
+            };
+            entries.push(entry);
+            if n % 9 == 0 && n <= 4 * K {
+                entries.push((1, JournalEvent::App(GetValue)));
+            }
+        }
+        let primary_inputs: Vec<CounterInput> = entries
+            .iter()
+            .map(|&(connection, event)| input(connection, event))
+            .collect();
+        // A replica receives every journaled entry on connection 0, and
+        // never a query.
+        let replica_inputs: Vec<CounterInput> = entries
+            .iter()
+            .filter(|(_, event)| !event.is_query())
+            .map(|&(_, event)| input(0, event))
+            .collect();
+        let (primary_slots, primary_applied) = matching_outputs(&primary_inputs);
+        let (replica_slots, replica_applied) = matching_outputs(&replica_inputs);
+        assert_eq!(primary_applied, replica_applied);
+        assert!(
+            primary_slots
+                .iter()
+                .any(|s| matches!(s.payload, OutputPayload::QueryResponse(_)))
+                && primary_slots.len() > replica_slots.len(),
+            "the primary's ring carries what the replica's does not"
+        );
+        assert!(
+            primary_slots
+                .iter()
+                .chain(&replica_slots)
+                .all(|s| s.wire_seq <= 4 * K),
+            "no slot past the last whole window, which only the cursor closes"
+        );
+
+        // The primary: its response stage, digesting, its client connected.
+        let primary_cursor = AppliedWireSeqCursor::detached(WireSeq::new(0));
+        let (writer, primary_board) = digest_board(BoardSize::new(8).expect("above the minimum"));
+        let mut stage = start_encoding(
+            GateKind::Disk,
+            u64::MAX / 2,
+            Some(OutputDigester::new(
+                WireSeq::new(1),
+                primary_cursor.clone(),
+                writer,
+            )),
+            Arc::new(Refusing),
+        );
+        stage.connect(1);
+        stage.seam = None;
+        for slot in primary_slots {
+            stage.producer.publish(slot);
+        }
+        primary_cursor.store(primary_applied);
+
+        // The replica: its drain, digesting.
+        let replica_cursor = AppliedWireSeqCursor::detached(WireSeq::new(0));
+        let (writer, replica_board) = digest_board(BoardSize::new(8).expect("above the minimum"));
+        let (mut producer, mut consumers) = DisruptorBuilder::<Slot>::new(1024)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
+        let drain_digest = crate::replication::drain::DrainDigest {
+            digester: OutputDigester::new(WireSeq::new(1), replica_cursor.clone(), writer),
+            encoder: Arc::new(Refusing),
+        };
+        let consumer = consumers.pop().expect("one consumer");
+        let drain_stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&drain_stop);
+        let drain = thread::spawn(move || {
+            crate::replication::drain::run(
+                consumer,
+                Some(drain_digest),
+                WaitStrategy::SpinThenYield,
+                &flag,
+            );
+        });
+        for slot in replica_slots {
+            producer.publish(slot);
+        }
+        replica_cursor.store(replica_applied);
+
+        let last_end = primary_applied.get() / K * K;
+        assert_eq!(last_end, 4 * K, "four whole windows");
+        for end in (K..=last_end).step_by(K as usize) {
+            assert_eq!(
+                closes(&primary_board, end),
+                closes(&replica_board, end),
+                "window {end}"
+            );
+        }
+        drain_stop.store(true, Ordering::Relaxed);
+        drain.join().expect("the drain");
+        stage.stop();
     }
 
     /// The idle path at a boundary, with nothing to release.

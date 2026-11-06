@@ -1112,6 +1112,7 @@ requiring the full journal history.
 | `--ack-policy <policy>` | Primary | `disk+ram` | The ack policy the node requests when it starts as primary or is promoted: which copies of an event must exist before its response is released. `disk`, `ram`, `disk+ram`, or `two-disks`. Not in force at once over a history that records another policy (see "Runtime policy swap"). Can be swapped at runtime via admin `ACK-POLICY`. |
 | `--degraded-ack-grace-ms <ms>` | Primary | `2000` | How long a primary must have had no replica before it answers the replies it holds once its own journal has them, marked as degraded acks. See "Degraded acks". |
 | `--no-degraded-acks` | Primary | off | Never send degraded acks: a halted primary holds its replies, and the rejections and queries behind them, until a replica returns or the policy is swapped. |
+| `--no-output-digests` | Any | off | Do not digest this node's reports. Every node digests the output of its copy of the application so that copies can be compared (see [Pipeline Architecture](pipeline-architecture.md#output-digests)); with this flag the node's output is not checked. Logged as a warning at startup. |
 | `--dpdk-peer-mac <mac>` | Replica on DPDK | derived | Ethernet address of the primary named by `--replica-of`. Only consulted when replicating over DPDK. See below. |
 
 ### Addressing the primary over DPDK
