@@ -742,9 +742,9 @@ where
     // the matching thread. A replica's apply sits on the primary's ack
     // path under `disk+ram`, so its page faults are the primary's tail.
     <A as Application>::prefault(&mut app, sizing);
-    let shadow_app = <A as Application>::clone_via_snapshot(&app)?;
-
     let enable_shadow = snapshot_interval_ms > 0;
+    let shadow_app = crate::shadow_clone::shadow_clone(&app, sizing, enable_shadow)?;
+
     // Shadow snapshot seeds its lineage from the fence state's epoch and
     // the lineage policy cell (both set from the replica's recovered
     // journal, or the snapshot a resync installed, before this builder
@@ -845,6 +845,11 @@ where
     .map_err(|e| abandon(format!("start the replica's drain thread: {e}")))?;
 
     let shadow_handle = if let Some(shadow_feed) = pipeline.shadow_feed {
+        // The pipeline has a shadow feed exactly when `enable_shadow`,
+        // which took the clone above. A mismatch fails the build as on a
+        // primary (`spawn_shadow_stage`), stopping the stages started.
+        let shadow_app =
+            shadow_app.ok_or_else(|| abandon(crate::shadow_clone::NO_SHADOW_CLONE.into()))?;
         let snap_path = store.snapshot().to_path_buf();
         let chain_lock = pipeline.chain_hash_lock.clone();
         let ps = Arc::clone(&pipeline_shutdown);

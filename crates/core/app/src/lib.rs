@@ -503,7 +503,9 @@ pub trait Application: Sized + Default {
     /// on a primary at boot, on a replica before its pipeline starts
     /// (including one rebuilt after a resync), and once more when a
     /// replica is promoted. A snapshot has no genesis instance, so a
-    /// restored one is sized only after. The instance may therefore hold
+    /// restored one is sized only after; that includes the copy a node
+    /// with snapshots enabled takes of a sized instance for its snapshot
+    /// stage, sized right after the copy. The instance may therefore hold
     /// state already, and the contract is that the call changes capacity
     /// only: every entry survives, every decision `apply` would make
     /// afterwards is the same, and a second call with the same sizing is
