@@ -39,6 +39,12 @@ That decision makes these items moot:
 
 Their sections are kept as the record of why the plan moved.
 
+**The plan trimmed, 2026-11-06.** The plan was cut to the essentials of
+detection and renumbered, deferring among others the in-process check,
+build ids and runs kept across reconnects. Every `plan:N`, step and
+decision number cited here refers to the full plan, in git history (the
+plan file at b403d38b), not to the trimmed one.
+
 The plan is careful and mostly sound. Its chain, its anchor and pipeline-id
 rules and its stop ordering hold up under the cases checked here. Its
 weaknesses are elsewhere: one cost it does not see (replication ring slots),
