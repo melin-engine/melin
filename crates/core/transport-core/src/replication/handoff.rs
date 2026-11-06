@@ -344,6 +344,12 @@ mod tests {
     }
 
     fn decode(frame: &[u8]) -> Wire {
+        // One frame per send: these rings carry no digests.
+        assert_eq!(
+            crate::replication_wire::chunk_frames(frame).count(),
+            1,
+            "one frame"
+        );
         if peek_frame_tag(frame).expect("tag") == MSG_INPUT_BATCH {
             let slots = try_decode_input_batch::<TestEvent>(&frame[4..]).expect("an InputBatch");
             Wire::Batch(slots.iter().map(|s| s.sequence).collect())
