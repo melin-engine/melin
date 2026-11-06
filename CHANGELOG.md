@@ -89,6 +89,13 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Changed
 
+- **A cluster has at most three raft voters** (breaking for deployments
+  listing more): the primary and one per replica slot, as
+  `melin_raft::MAX_VOTERS`. A node refuses to start with more
+  `--raft-peer` entries, or with a `--raft-dir` whose stored membership
+  holds more voters, before its control plane starts; re-provision such
+  a directory with at most three entries. `melin_raft::check_voter_count`
+  is new.
 - **Replication protocol 9: the version is checked at authentication**
   (breaking for the wire). A replica states the version it speaks in its
   challenge response; a primary admits one at or above its own, answering

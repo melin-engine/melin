@@ -109,6 +109,37 @@ const QUORUM_ACK_MAX_AGE_MS: u64 = LEADER_LEASE_MS / 2;
 /// filter, not a safety guarantee.
 pub const QUORUM_ACK_MAX_AGE: Duration = Duration::from_millis(QUORUM_ACK_MAX_AGE_MS);
 
+/// The most raft voters a cluster may have: the primary and one per
+/// replica slot it streams to. A voter that can never be a connected
+/// replica adds nothing to failover, and the bound keeps a majority out of
+/// reach once any two voters are gone. Derived from the slot count, so it
+/// moves with it; `usize` because both count list entries.
+pub const MAX_VOTERS: usize = melin_transport_core::ReplicaSlotCursors::SLOTS + 1;
+
+/// The refusal for `voters` over [`MAX_VOTERS`], naming the count; the
+/// caller says where the voters were listed. One wording for the flags and
+/// the stored membership.
+fn voter_cap_refusal(voters: usize) -> Option<String> {
+    (voters > MAX_VOTERS).then(|| {
+        format!(
+            "{voters} raft voters, more than the {MAX_VOTERS} a cluster can use (the primary and \
+             one per replica slot): a voter that can never be a connected replica adds nothing \
+             to failover"
+        )
+    })
+}
+
+/// Refuse a `--raft-peer` list of more than [`MAX_VOTERS`] entries, with
+/// the error the operator sees. [`spawn`] applies it to its configured
+/// list; the server applies it at config validation too, to refuse before
+/// it opens the journal.
+pub fn check_voter_count(peers: &[RaftPeer]) -> Result<(), String> {
+    match voter_cap_refusal(peers.len()) {
+        Some(refusal) => Err(format!("--raft-peer lists {refusal}")),
+        None => Ok(()),
+    }
+}
+
 /// The largest heartbeat interval [`heartbeat_interval_ms`] gives any
 /// node: the base plus the largest offset.
 const MAX_HEARTBEAT_INTERVAL_MS: u64 = HEARTBEAT_INTERVAL_MS + HEARTBEAT_JITTER_MS - 1;
@@ -450,6 +481,7 @@ fn validate_peer_list(peers: &[RaftPeer]) -> io::Result<()> {
             "raft node ids must be non-zero (0 is the no-leader sentinel)",
         ));
     }
+    check_voter_count(peers).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     // Sorted by key, then id, so a shared key's entries sit side by side
     // and the first such pair is named lowest id first.
     let mut by_key: Vec<(&[u8; 32], NodeId)> = peers.iter().map(|p| (&p.pubkey, p.id)).collect();
@@ -523,6 +555,24 @@ pub fn spawn(
     listener.set_nonblocking(true)?;
     let (log_store, state_machine) = crate::storage::open(&config.dir)
         .map_err(|e| io::Error::other(format!("raft storage open failed: {e}")))?;
+    // The stored membership overrides the flags after first boot, so the
+    // cap is checked on it too, here, where a refusal still fails the
+    // start: once the driver runs, a refusal could only stop raft and
+    // leave the node serving without it.
+    let voters = crate::storage::stored_membership(&log_store, &state_machine)
+        .membership()
+        .voter_ids()
+        .count();
+    if let Some(refusal) = voter_cap_refusal(voters) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "the membership stored in {} holds {refusal}; re-provision --raft-dir with at \
+                 most {MAX_VOTERS} --raft-peer entries",
+                config.dir.display()
+            ),
+        ));
+    }
 
     let status = Arc::new(RaftStatus::new(config.node_id));
     let peer_tips = Arc::new(crate::recency::PeerTips::new());
@@ -933,6 +983,36 @@ mod tests {
             e.to_string(),
             "--raft-peer ids 2 and 3 name the same public key: each member needs its own \
              replication key"
+        );
+    }
+
+    #[test]
+    fn the_voter_cap_is_the_primary_and_one_per_replica_slot() {
+        assert_eq!(
+            MAX_VOTERS,
+            melin_transport_core::ReplicaSlotCursors::SLOTS + 1
+        );
+    }
+
+    #[test]
+    fn peer_list_at_the_voter_cap_is_accepted_and_one_more_refused() {
+        let mut peers: Vec<RaftPeer> = (1..=MAX_VOTERS as u64)
+            .map(|id| peer(id, id as u8))
+            .collect();
+        validate_peer_list(&peers).unwrap();
+
+        let over = MAX_VOTERS as u64 + 1;
+        peers.push(peer(over, over as u8));
+        let e = peer_list_refusal(&peers);
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            e.to_string(),
+            format!(
+                "--raft-peer lists {} raft voters, more than the {MAX_VOTERS} a cluster can use \
+                 (the primary and one per replica slot): a voter that can never be a connected \
+                 replica adds nothing to failover",
+                MAX_VOTERS + 1
+            )
         );
     }
 

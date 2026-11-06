@@ -669,7 +669,7 @@ Enable it per node with:
 |---|---|
 | `--raft-bind <addr>` | Control-plane listener (kernel TCP, also on DPDK nodes). Enables the control plane. |
 | `--raft-node-id <id>` | This node's id (non-zero, unique per cluster). |
-| `--raft-peer <id@host:port#base64-pubkey>` | One cluster member (repeatable). Give **every node the same list, including an entry for the node itself**. The pubkey pins the peer's identity in both directions: a connection authenticated with a different key cannot speak for that id, and when this node connects to that id, whatever answers at its address must prove that key or is refused. Each entry needs its own key: a list in which two entries share one is refused at startup. |
+| `--raft-peer <id@host:port#base64-pubkey>` | One cluster member (repeatable, at most three: see "Three voters at most"). Give **every node the same list, including an entry for the node itself**. The pubkey pins the peer's identity in both directions: a connection authenticated with a different key cannot speak for that id, and when this node connects to that id, whatever answers at its address must prove that key or is refused. Each entry needs its own key: a list in which two entries share one is refused at startup. |
 | `--raft-dir <path>` | Durable election state. Defaults to the journal path with a `.raft` extension. |
 | `--raft-auto-promote` | Act on election wins (below). Off by default. |
 
@@ -879,6 +879,12 @@ nothing of its own.
   `--raft-auto-promote` and fewer than three configured voters.
   Two-node deployments keep today's manual `PROMOTE` playbook (the
   observational election still works).
+- **Three voters at most.** A primary streams to at most two replicas,
+  so a fourth voter could never be a connected replica, and would add
+  nothing to failover. The server refuses to start with more than three
+  `--raft-peer` entries, and with a `--raft-dir` whose stored membership
+  holds more than three voters (one initialised by an earlier release):
+  re-provision that directory with at most three entries.
 - **`--raft-dir` is durable state.** Keep it on the same durability
   class as the journal. Never restart a node with a wiped raft dir
   while its peers are live — a forgotten vote can be granted twice in

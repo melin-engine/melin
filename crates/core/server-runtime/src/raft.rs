@@ -88,6 +88,10 @@ pub(crate) fn build_raft_config(config: &ServerConfig) -> Result<Option<RaftConf
             "--raft-peer list must include this node (id {node_id}) with its dialable address"
         ));
     }
+    // Refused here, at config validation, before the journal is opened;
+    // `spawn` refuses the same list again for a caller that skips this,
+    // and checks the stored membership, which overrides the flags.
+    melin_raft::check_voter_count(&peers)?;
     if config.raft_auto_promote && peers.len() < 3 {
         return Err(format!(
             "--raft-auto-promote requires at least 3 configured voters, got {} — a two-node \
@@ -441,6 +445,29 @@ mod tests {
         let mut c = base_config();
         c.raft_auto_promote = true;
         assert!(build_raft_config(&c).unwrap_err().contains("--raft-bind"));
+    }
+
+    /// Refused at config validation, before the journal is opened, with
+    /// the control plane's own wording; at the cap the same flags pass.
+    #[test]
+    fn more_voters_than_the_cap_are_refused() {
+        let mut c = base_config();
+        c.raft_bind = Some("127.0.0.1:7001".parse().unwrap());
+        c.raft_node_id = Some(1);
+        c.replication_key = Some("key".into());
+        c.raft_peer = (1..=melin_raft::MAX_VOTERS as u8)
+            .map(|id| format!("{id}@10.0.0.{id}:7001#{}", b64_key(id)))
+            .collect();
+        assert!(build_raft_config(&c).unwrap().is_some());
+
+        let over = melin_raft::MAX_VOTERS as u8 + 1;
+        c.raft_peer
+            .push(format!("{over}@10.0.0.{over}:7001#{}", b64_key(over)));
+        let err = build_raft_config(&c).unwrap_err();
+        assert!(
+            err.starts_with(&format!("--raft-peer lists {over} raft voters")),
+            "{err}"
+        );
     }
 
     #[test]
