@@ -373,6 +373,20 @@ impl Node {
         dpdk::release(self.slot);
         result
     }
+
+    /// [`Node::join`], for a node that must return on its own within
+    /// `limit`: panics if it has not by then, rather than hang the test.
+    pub fn join_within(self, limit: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + limit;
+        while !self.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "the node did not return within {limit:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.join()
+    }
 }
 
 /// How long a node may take to stop once asked: its clean shutdown on the
