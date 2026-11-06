@@ -33,6 +33,9 @@ pub const MSG_SNAPSHOT_END: u8 = 0x15;
 pub const MSG_ROTATE: u8 = 0x16;
 pub const MSG_CHAIN_CHECK: u8 = 0x17;
 pub const MSG_SEGMENT_SEED_BEGIN: u8 = 0x18;
+/// The primary's output digest at a window end: its chain value there,
+/// which a replica compares with its own.
+pub const MSG_DIGEST: u8 = 0x19;
 /// The primary has stopped because the cluster's output diverged: a
 /// replica that reads it stops too.
 pub const MSG_HALT: u8 = 0x1A;
@@ -212,6 +215,13 @@ pub enum PrimaryMessage {
     },
     /// The primary has stopped because the cluster's output diverged.
     Halt,
+    /// The primary's output digest chain at `window_end`, of digest kind
+    /// `kind` (the byte as sent: a replica skips a kind it does not know).
+    Digest {
+        kind: u8,
+        window_end: u64,
+        chain: [u8; 16],
+    },
 }
 
 /// A decoded `ChallengeResponse`.
@@ -319,6 +329,30 @@ struct PrefixedHaltFrame {
 /// Wire length, length prefix included, of the `Halt` frame
 /// [`encode_halt`] returns.
 pub const HALT_FRAME_LEN: usize = core::mem::size_of::<PrefixedHaltFrame>();
+
+/// The `Digest` frame: a digest kind, a window end, and the chain value
+/// there. Values are 16 bytes for every kind.
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct DigestFrame {
+    tag: u8,
+    kind: u8,
+    window_end: U64,
+    chain: [u8; 16],
+}
+
+/// A [`DigestFrame`] behind its length prefix.
+#[derive(IntoBytes, Immutable, Unaligned)]
+#[repr(C)]
+struct PrefixedDigestFrame {
+    len: U32,
+    frame: DigestFrame,
+}
+
+/// Wire length, length prefix included, of the `Digest` frame
+/// [`encode_digest`] returns: what the journal stage appends to a batch's
+/// replication slot, and reserves room for.
+pub const DIGEST_FRAME_LEN: usize = core::mem::size_of::<PrefixedDigestFrame>();
 
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 #[repr(C)]
@@ -436,6 +470,8 @@ pub const SEQ_HASH_FRAME_LEN: usize = core::mem::size_of::<PrefixedSeqHashFrame>
 const _: () = assert!(core::mem::size_of::<HandshakeFrame>() == 52);
 const _: () = assert!(core::mem::size_of::<AckFrame>() == 18);
 const _: () = assert!(HALT_FRAME_LEN == 5);
+const _: () = assert!(core::mem::size_of::<DigestFrame>() == 26);
+const _: () = assert!(DIGEST_FRAME_LEN == 30);
 const _: () = assert!(core::mem::size_of::<ChallengeFrame>() == 33);
 const _: () = assert!(core::mem::size_of::<ChallengeResponseFrame>() == 97);
 const _: () = assert!(core::mem::size_of::<VersionedChallengeResponseFrame>() == 99);
@@ -503,6 +539,25 @@ fn encode_ack_flagged(ack: &Ack, flags: u8, buf: &mut Vec<u8>) {
     let payload = frame.as_bytes();
     write_length_prefix(buf, payload.len() as u32);
     buf.extend_from_slice(payload);
+}
+
+/// Encode a `Digest` frame, length prefix included: the primary's chain
+/// value of digest `kind` at `window_end`. Fixed size and on the stack,
+/// so the journal stage's emit cannot allocate.
+pub fn encode_digest(
+    kind: crate::output_digest::DigestKind,
+    window_end: crate::WireSeq,
+    chain: crate::output_digest::ChainValue,
+) -> [u8; DIGEST_FRAME_LEN] {
+    zerocopy::transmute!(PrefixedDigestFrame {
+        len: U32::new(core::mem::size_of::<DigestFrame>() as u32),
+        frame: DigestFrame {
+            tag: MSG_DIGEST,
+            kind: kind.byte(),
+            window_end: U64::new(window_end.get()),
+            chain: *chain.as_bytes(),
+        },
+    })
 }
 
 /// Encode the `Halt` frame, length prefix included: this primary has
@@ -966,6 +1021,15 @@ pub fn decode_primary_message(payload: &[u8]) -> io::Result<PrimaryMessage> {
             })
         }
         MSG_HALT => Ok(PrimaryMessage::Halt),
+        MSG_DIGEST => {
+            let (frame, _) = DigestFrame::ref_from_prefix(payload)
+                .map_err(|_| io::Error::other("Digest too short"))?;
+            Ok(PrimaryMessage::Digest {
+                kind: frame.kind,
+                window_end: frame.window_end.get(),
+                chain: frame.chain,
+            })
+        }
         other => Err(io::Error::other(format!(
             "unknown primary message type: 0x{other:02x}"
         ))),
@@ -1244,6 +1308,36 @@ mod tests {
         let hs = payload(|buf| encode_handshake(&handshake(), buf));
         let err = decode_replica_message(&hs[..51]).expect_err("too short");
         assert!(err.to_string().contains("too short"), "{err}");
+    }
+
+    /// The `Digest` frame: length 26, tag, kind, the window end and the
+    /// chain value, byte for byte, and back.
+    #[test]
+    fn digest_wire_byte_pattern() {
+        let chain = crate::output_digest::ChainValue::from_bytes(std::array::from_fn(|i| i as u8));
+        let frame = encode_digest(
+            crate::output_digest::DigestKind::Output,
+            crate::WireSeq::new(0x0102_0304_0506_0708),
+            chain,
+        );
+        let mut expected = vec![26, 0, 0, 0, MSG_DIGEST, 1];
+        expected.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+        expected.extend(0u8..16);
+        assert_eq!(frame.as_slice(), expected.as_slice());
+        assert_eq!(MSG_DIGEST, 0x19);
+        match decode_primary_message(&frame[4..]).unwrap() {
+            PrimaryMessage::Digest {
+                kind,
+                window_end,
+                chain: bytes,
+            } => {
+                assert_eq!(kind, 1);
+                assert_eq!(window_end, 0x0102_0304_0506_0708);
+                assert_eq!(&bytes, chain.as_bytes());
+            }
+            other => panic!("expected a Digest, got {other:?}"),
+        }
+        assert!(decode_primary_message(&frame[4..frame.len() - 1]).is_err());
     }
 
     /// The `Halt` frame: its length prefix and tag, nothing else.

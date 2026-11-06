@@ -28,7 +28,7 @@ use melin_transport_core::divergence::{
 use melin_transport_core::journaled_app::JournaledApp;
 use melin_transport_core::lineage::{Lineage, LineagePolicy};
 use melin_transport_core::node_store::{NodeStore, NodeStoreError};
-use melin_transport_core::output_digest::OutputDigester;
+use melin_transport_core::output_digest::{DigestBoardReader, OutputDigester};
 /// The type of [`ServerConfig::ring_capacity`], re-exported beside it so
 /// a caller configuring a node needs no dependency of its own on the
 /// transport crate.
@@ -1158,18 +1158,17 @@ fn warn_if_output_digests_off(config: &ServerConfig) {
 }
 
 /// The output digester for a pipeline that applies its first live entry
-/// at `first_live`, `None` unless `enabled` (`--no-output-digests` unset).
-/// The one place a node builds one, for the primary's response stage on
-/// either transport and for a replica's drain.
+/// at `first_live`, with the reader of the board it publishes to; `None`
+/// unless `enabled` (`--no-output-digests` unset). The one place a node
+/// builds one, for the primary's response stage on either transport and
+/// for a replica's drain.
 pub(crate) fn output_digester(
     enabled: bool,
     first_live: WireSeq,
     cursors: &PipelineCursors,
     ring_capacity: RingCapacity,
-) -> Option<OutputDigester> {
-    // The board's reader is dropped: nothing in this node compares
-    // digests yet.
-    enabled.then(|| OutputDigester::for_pipeline(first_live, cursors, ring_capacity).0)
+) -> Option<(OutputDigester, DigestBoardReader)> {
+    enabled.then(|| OutputDigester::for_pipeline(first_live, cursors, ring_capacity))
 }
 
 /// Log the layout the node runs, and warn when it leaves a mandatory
@@ -2140,6 +2139,18 @@ where
     // tip (durable cursor after each fsync batch). On the promotion path
     // this takes over the handle the receiver was advancing.
     journal_stage.set_advertised_tip_publisher(journal_tip.clone());
+    // The response stage's output digester; its board goes to the journal
+    // stage, which forwards the primary's digests to its replicas.
+    let digester = output_digester(
+        !config.no_output_digests,
+        first_live,
+        &cursors,
+        config.ring_capacity,
+    )
+    .map(|(digester, board)| {
+        journal_stage.set_output_digests(board);
+        digester
+    });
     if config.max_journal_mib > 0 {
         info!(
             max_journal_mib = config.max_journal_mib,
@@ -2235,12 +2246,6 @@ where
     // the report never blocks the stage on this thread reaching `recv`.
     let (response_ready_tx, response_ready_rx) = std::sync::mpsc::sync_channel(1);
     let degraded_release = config.degraded_release(replicas_connected.as_ref());
-    let digester = output_digester(
-        !config.no_output_digests,
-        first_live,
-        &cursors,
-        config.ring_capacity,
-    );
     let response_latch = stop.latch.clone();
     stages.response = Some(
         melin_app::affinity::spawn_placed("response", cores.response.core, move || {
@@ -3386,6 +3391,18 @@ where
     // tip (durable cursor after each fsync batch). On the promotion path
     // this takes over the handle the receiver was advancing.
     journal_stage.set_advertised_tip_publisher(journal_tip.clone());
+    // The response stage's output digester; its board goes to the journal
+    // stage, which forwards the primary's digests to its replicas.
+    let digester = output_digester(
+        !config.no_output_digests,
+        first_live,
+        &cursors,
+        config.ring_capacity,
+    )
+    .map(|(digester, board)| {
+        journal_stage.set_output_digests(board);
+        digester
+    });
     if config.max_journal_mib > 0 {
         info!(
             max_journal_mib = config.max_journal_mib,
@@ -3452,12 +3469,6 @@ where
     let s3 = Arc::clone(&shutdown);
     let response_utilization_thread = Arc::clone(&response_utilization);
     let degraded_release = config.degraded_release(replicas_connected.as_ref());
-    let digester = output_digester(
-        !config.no_output_digests,
-        first_live,
-        &cursors,
-        config.ring_capacity,
-    );
     let response_latch = stop.latch.clone();
     stages.response = Some(
         melin_app::affinity::spawn_placed("response", cores.response.core, move || {

@@ -840,8 +840,10 @@ where
     let drain = cores.response;
     let drain_consumer = pipeline.drain_consumer;
     let drain_digest = digest_encoder.and_then(|encoder| {
+        // The board's reader is dropped until the receiver compares
+        // against it.
         crate::server::output_digester(true, pipeline.first_live, &pipeline.cursors, ring_capacity)
-            .map(|digester| drain::DrainDigest { digester, encoder })
+            .map(|(digester, _board)| drain::DrainDigest { digester, encoder })
     });
     let drain_handle = melin_app::affinity::spawn_placed("drain", drain.core, move || {
         drain::run(drain_consumer, drain_digest, drain.wait, &ps);

@@ -27,7 +27,12 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   board publishes each closed window to readers on other threads;
   `encode_app_body` is the one application body encode, which the response
   stages' framing goes through. `MAX_RESPONSE_BODY` moves here and is still
-  re-exported at the root of `melin-server-runtime`.
+  re-exported at the root of `melin-server-runtime`. `DigestComparator`
+  checks one copy's windows against the primary's chain values, run by
+  run, and trips a `Trip` once on a mismatch, reported as a `Divergence`;
+  `first_window_end` is the first window a copy digests whole.
+  `JournalStage::set_output_digests` hands the journal stage the board it
+  forwards the primary's digests from (see **Changed**).
 - **The divergence stop, on one node**: `melin_transport_core::divergence`
   holds `DivergenceLatch`, tripped once by its first `HaltCause`. It
   fences the node, stops its threads, sends nothing more to clients,
@@ -170,7 +175,16 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   `UnknownFlags` (an unknown flag bit is refused, never read as a stop or
   as no stop), `PrimaryMessage` gains `Halt`, each breaking for a `match`
   on it; `encode_stopped_ack`, `encode_stopped_handshake` and
-  `encode_halt` are new.
+  `encode_halt` are new. And the primary's new `Digest` frame
+  (`MSG_DIGEST`, 0x19; 26 bytes: the tag, a digest-kind byte, the window
+  end as a `u64` LE and the 16-byte chain value) carries its output
+  digest chain at a window end, in a batch's replication slot right after
+  the batch, naming no window past the batch's end and each window at
+  most once; a replica skips a kind it does not know, and as yet compares
+  nothing. `PrimaryMessage` gains `Digest` (breaking for a `match` on
+  it); `encode_digest` and `DIGEST_FRAME_LEN` (30, the frame with its
+  length prefix, which the journal stage reserves out of each batch's
+  slot) are new.
 - **`encode_rotate` and `encode_chain_check` return the frame**
   (breaking, in `melin_transport_core::replication::protocol`): each
   returns `[u8; SEQ_HASH_FRAME_LEN]`, length prefix included, instead of
