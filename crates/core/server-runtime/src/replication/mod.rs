@@ -3228,8 +3228,7 @@ mod tests {
 
     #[test]
     fn rotate_encode_decode_round_trip() {
-        let mut buf = Vec::new();
-        encode_rotate(7_000_000, &[0xBB; 32], &mut buf);
+        let buf = encode_rotate(7_000_000, &[0xBB; 32]);
 
         let payload = &buf[4..];
         let msg = decode_primary_message(payload).unwrap();
@@ -3247,8 +3246,7 @@ mod tests {
 
     #[test]
     fn chain_check_encode_decode_round_trip() {
-        let mut buf = Vec::new();
-        encode_chain_check(555, &[0xCC; 32], &mut buf);
+        let buf = encode_chain_check(555, &[0xCC; 32]);
 
         let payload = &buf[4..];
         let msg = decode_primary_message(payload).unwrap();
@@ -3273,8 +3271,7 @@ mod tests {
         for (i, b) in hash.iter_mut().enumerate() {
             *b = i as u8;
         }
-        let mut buf = Vec::new();
-        encode_rotate(0xDEAD_BEEF_CAFE_F00D, &hash, &mut buf);
+        let buf = encode_rotate(0xDEAD_BEEF_CAFE_F00D, &hash);
         // [length:u32 LE = 41][tag:u8 = MSG_ROTATE = 0x16]
         // [boundary_seq:u64 LE][tail_hash:32 bytes verbatim]
         let mut expected = vec![
@@ -3298,8 +3295,7 @@ mod tests {
         for (i, b) in hash.iter_mut().enumerate() {
             *b = 0x80 | i as u8;
         }
-        let mut buf = Vec::new();
-        encode_chain_check(0x0102_0304_0506_0708, &hash, &mut buf);
+        let buf = encode_chain_check(0x0102_0304_0506_0708, &hash);
         // [length:u32 LE = 41][tag:u8 = MSG_CHAIN_CHECK = 0x17]
         // [sequence:u64 LE][chain_hash:32 bytes verbatim]
         let mut expected = vec![

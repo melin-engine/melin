@@ -1279,13 +1279,17 @@ uncompared and without `Halt` (see the flag-day bullet below).
   `[u8; DIGEST_FRAME_LEN]`, and `encode_halt` returns
   `[u8; HALT_FRAME_LEN]`, with the length prefix included. The length is
   then part of the type: a test cannot pass with a frame one byte short,
-  and the journal stage's emit cannot allocate. `maybe_publish_chain_check`
-  builds a `Vec` per frame (`pipeline.rs`,
-  "Local buffer: the frame is 45 bytes"). `encode_chain_check` and
-  `encode_rotate` move to the same shape in the same step, so there is one
-  pattern for the fixed-size control frames, not two. This is not a copy
-  of a `Vec` pattern left for the next frame to imitate. Their wire bytes
-  are unchanged, pinned by byte-pattern tests (step 4).
+  and the journal stage's emit cannot allocate. `encode_chain_check` and
+  `encode_rotate` already have this shape (landed: they return
+  `[u8; SEQ_HASH_FRAME_LEN]`, built by `zerocopy::transmute!` from a
+  prefixed frame struct, their wire bytes pinned by
+  `chain_check_wire_byte_pattern` and `rotate_wire_byte_pattern`), so the
+  new frames follow the one pattern for fixed-size control frames. The
+  other fixed-size encoders (heartbeat, ack, segment seed, snapshot
+  begin and end, hash mismatch, the handshake frames) still append to a
+  `Vec`; that is legacy, not the pattern to imitate. Moving them is a
+  follow-up outside this plan, each a public API break with its own
+  `CHANGELOG.md` entry and a wire-byte pin written first.
 - **The kind byte from the start.** Only `1 = output` is defined; 0 is
   refused as malformed. Each kind fixes its own window length and
   definition, so frames carry no length. A replica skips a frame of a kind
@@ -2705,12 +2709,7 @@ one-byte `AuthOk` without a handshake and redialling. What remains:
   encoders returning fixed-size arrays (decision 8), decoders and size
   assertions; `AckFrame` and `HandshakeFrame` gain `flags` and
   `window_end`, with unknown bits refused, and `HandshakeFrame` the
-  replica's `build_id`; `encode_chain_check` and
-  `encode_rotate` move to the same
-  shape. The journal stage then publishes them from the stack. The
-  catch-up's `send_buf` (`catchup.rs`), which batches a rotate with data,
-  extends from the array, and the receiver tests take the array where
-  they built a `Vec`; `StreamStart`'s
+  replica's `build_id`; `StreamStart`'s
   `digest_kinds`, build id and pipeline id (`StreamStartFrame` to 115
   bytes); the version's history line gains these frames (9 if still
   unreleased, else a bump to 10, decision 8).
@@ -2809,13 +2808,9 @@ one-byte `AuthOk` without a handshake and redialling. What remains:
   in `melin_raft::spawn`, read through the new synchronous store
   accessors (decision 14), and the
   stop cause in the stand-down and refusal lines.
-- Tests: round trips; wire byte patterns beside `ack_wire_byte_pattern` and
-  `rotate_wire_byte_pattern` (`server-runtime/src/replication/mod.rs`),
-  and a new `chain_check_wire_byte_pattern` beside them. Today the chain
-  check has only a round trip, which a change on both sides would pass, so
-  this test is written and passing against the `Vec` encoder before the
-  move. The two pattern tests then pin the moved encoders to the same
-  bytes; the grown handshake still refused at another version (the
+- Tests: round trips; wire byte patterns beside `ack_wire_byte_pattern`,
+  `rotate_wire_byte_pattern` and `chain_check_wire_byte_pattern`
+  (`server-runtime/src/replication/mod.rs`); the grown handshake still refused at another version (the
   existing `a_handshake_from_another_protocol_version_is_refused`, with
   the new fields after the version; the authentication cases are on
   `main`); kind 0 refused, an unknown kind skipped and counted, not

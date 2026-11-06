@@ -2325,7 +2325,10 @@ mod tests {
 
         let mut buf = Vec::new();
         append_input_batch_frame(&mut buf, &[slot(6, 0xE0)]);
-        melin_transport_core::replication::protocol::encode_rotate(6, &[0x66; 32], &mut buf);
+        buf.extend_from_slice(&melin_transport_core::replication::protocol::encode_rotate(
+            6,
+            &[0x66; 32],
+        ));
         append_input_batch_frame(&mut buf, &[slot(7, 0xE1)]);
 
         let (outcome, _acks) = stream_frames(
@@ -2362,7 +2365,9 @@ mod tests {
 
         let mut buf = Vec::new();
         append_input_batch_frame(&mut buf, &[slot(6, 0xE0)]);
-        melin_transport_core::replication::protocol::encode_chain_check(6, &[0x77; 32], &mut buf);
+        buf.extend_from_slice(
+            &melin_transport_core::replication::protocol::encode_chain_check(6, &[0x77; 32]),
+        );
 
         let (outcome, _acks) = stream_frames(
             &buf,
@@ -2400,8 +2405,8 @@ mod tests {
         let mut slot_buf = Vec::new();
         let rotations = no_marks();
 
-        let mut buf = Vec::new();
-        melin_transport_core::replication::protocol::encode_rotate(3, &[0x33; 32], &mut buf);
+        let mut buf =
+            melin_transport_core::replication::protocol::encode_rotate(3, &[0x33; 32]).to_vec();
         append_input_batch_frame(&mut buf, &[slot(6, 0xE0)]);
 
         let (outcome, _acks) = stream_frames(
@@ -2430,7 +2435,10 @@ mod tests {
 
         let mut buf = Vec::new();
         append_input_batch_frame(&mut buf, &[slot(6, 0xE0)]);
-        melin_transport_core::replication::protocol::encode_rotate(9, &[0x99; 32], &mut buf);
+        buf.extend_from_slice(&melin_transport_core::replication::protocol::encode_rotate(
+            9,
+            &[0x99; 32],
+        ));
 
         let (outcome, _acks) = stream_frames(
             &buf,

@@ -372,6 +372,23 @@ struct SeqHashFrame {
     hash: [u8; 32],
 }
 
+/// A [`SeqHashFrame`] behind its length prefix: the whole frame as it goes
+/// on the wire, so its encoders return a fixed-size array (see
+/// [`SEQ_HASH_FRAME_LEN`]) rather than extend a `Vec`.
+#[derive(IntoBytes, Immutable, Unaligned)]
+#[repr(C)]
+struct PrefixedSeqHashFrame {
+    len: U32,
+    frame: SeqHashFrame,
+}
+
+/// Wire length, length prefix included, of a `Rotate` or `ChainCheck`
+/// frame, the two `(sequence, hash)` frames: what [`encode_rotate`] and
+/// [`encode_chain_check`] return. In the type rather than a `Vec`, so a
+/// frame of any other length does not compile, and the journal stage
+/// publishes one from the stack.
+pub const SEQ_HASH_FRAME_LEN: usize = core::mem::size_of::<PrefixedSeqHashFrame>();
+
 const _: () = assert!(core::mem::size_of::<HandshakeFrame>() == 51);
 const _: () = assert!(core::mem::size_of::<AckFrame>() == 17);
 const _: () = assert!(core::mem::size_of::<ChallengeFrame>() == 33);
@@ -383,6 +400,7 @@ const _: () = assert!(core::mem::size_of::<SnapshotEndFrame>() == 5);
 const _: () = assert!(core::mem::size_of::<HeartbeatFrame>() == 9);
 const _: () = assert!(core::mem::size_of::<StreamStartFrame>() == 66);
 const _: () = assert!(core::mem::size_of::<SeqHashFrame>() == 41);
+const _: () = assert!(SEQ_HASH_FRAME_LEN == 45);
 const _: () = assert!(core::mem::size_of::<SegmentSeedBeginFrame>() == 9);
 
 /// Helper: `length_prefix(buf, payload_len)` writes the 4-byte LE
@@ -599,19 +617,27 @@ pub fn encode_heartbeat(sequence: u64, buf: &mut Vec<u8>) {
     buf.extend_from_slice(payload);
 }
 
-/// Encode a Rotate message. `boundary_seq` is the last sequence of the
-/// outgoing segment; `tail_hash` its tail chain value (= the new
-/// segment's header anchor). Must be placed in the stream after the
-/// frame carrying `boundary_seq` and before any later entry.
-pub fn encode_rotate(boundary_seq: u64, tail_hash: &[u8; 32], buf: &mut Vec<u8>) {
-    let frame = SeqHashFrame {
-        tag: MSG_ROTATE,
-        sequence: U64::new(boundary_seq),
-        hash: *tail_hash,
+/// One `(sequence, hash)` frame, `tag` naming which, length prefix
+/// included.
+fn encode_seq_hash(tag: u8, sequence: u64, hash: &[u8; 32]) -> [u8; SEQ_HASH_FRAME_LEN] {
+    let prefixed = PrefixedSeqHashFrame {
+        len: U32::new(core::mem::size_of::<SeqHashFrame>() as u32),
+        frame: SeqHashFrame {
+            tag,
+            sequence: U64::new(sequence),
+            hash: *hash,
+        },
     };
-    let payload = frame.as_bytes();
-    write_length_prefix(buf, payload.len() as u32);
-    buf.extend_from_slice(payload);
+    // Sizes checked at compile time: the array is exactly the frame.
+    zerocopy::transmute!(prefixed)
+}
+
+/// Encode a Rotate message, length prefix included. `boundary_seq` is the
+/// last sequence of the outgoing segment; `tail_hash` its tail chain value
+/// (= the new segment's header anchor). Must be placed in the stream after
+/// the frame carrying `boundary_seq` and before any later entry.
+pub fn encode_rotate(boundary_seq: u64, tail_hash: &[u8; 32]) -> [u8; SEQ_HASH_FRAME_LEN] {
+    encode_seq_hash(MSG_ROTATE, boundary_seq, tail_hash)
 }
 
 /// Encode a SegmentSeedBegin message. The seed body follows as
@@ -627,16 +653,10 @@ pub fn encode_segment_seed_begin(seed_len: u64, buf: &mut Vec<u8>) {
     buf.extend_from_slice(payload);
 }
 
-/// Encode a ChainCheck message: the primary's chain value at `sequence`.
-pub fn encode_chain_check(sequence: u64, chain_hash: &[u8; 32], buf: &mut Vec<u8>) {
-    let frame = SeqHashFrame {
-        tag: MSG_CHAIN_CHECK,
-        sequence: U64::new(sequence),
-        hash: *chain_hash,
-    };
-    let payload = frame.as_bytes();
-    write_length_prefix(buf, payload.len() as u32);
-    buf.extend_from_slice(payload);
+/// Encode a ChainCheck message, length prefix included: the primary's
+/// chain value at `sequence`.
+pub fn encode_chain_check(sequence: u64, chain_hash: &[u8; 32]) -> [u8; SEQ_HASH_FRAME_LEN] {
+    encode_seq_hash(MSG_CHAIN_CHECK, sequence, chain_hash)
 }
 
 // --- Decoders / framing ---

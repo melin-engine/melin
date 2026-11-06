@@ -322,9 +322,7 @@ mod tests {
     }
 
     fn rotate(boundary: u64) -> Vec<u8> {
-        let mut buf = Vec::new();
-        encode_rotate(boundary, &[0x52; 32], &mut buf);
-        buf
+        encode_rotate(boundary, &[0x52; 32]).to_vec()
     }
 
     /// Capacity 16: a power of two above what any test here publishes.
