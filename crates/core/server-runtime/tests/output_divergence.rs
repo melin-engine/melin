@@ -158,7 +158,7 @@ fn a_stopped_primary_halts_its_replicas() {
         .request_one(&increment_request(1))
         .expect("served by the whole cluster");
 
-    let _halted = test_seam::trip(&primary_marker, detected()).expect("the primary runs");
+    test_seam::trip(&primary_marker, detected()).expect("the primary runs");
 
     stopped(primary);
     for (name, slot, marker, node) in replicas {
@@ -272,7 +272,7 @@ fn a_detecting_replica_stops_the_whole_cluster() {
         .request_one(&increment_request(1))
         .expect("served by the whole cluster");
 
-    let _halted = test_seam::trip(&detector_marker, detected()).expect("the replica runs");
+    test_seam::trip(&detector_marker, detected()).expect("the replica runs");
 
     let error = stopped(detector);
     assert!(
@@ -313,7 +313,7 @@ fn a_lost_stopped_ack_is_made_good_by_the_redial() {
     wait_for_gauge(health, "melin_replicas_connected", 1);
 
     proxy.freeze();
-    let _halted = test_seam::trip(&marker, detected()).expect("the replica runs");
+    test_seam::trip(&marker, detected()).expect("the replica runs");
     // Past the replica's in-session wait for the `Halt`: the primary has
     // heard nothing.
     std::thread::sleep(HALT_NOTICE_BOUND + Duration::from_secs(1));

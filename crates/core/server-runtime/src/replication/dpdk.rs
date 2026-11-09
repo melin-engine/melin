@@ -1297,7 +1297,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                 // replica stops this node, and is answered
                                 // with `Halt` as the poll loop closes.
                                 Ok(ReplicaMessage::StoppedHandshake(_)) => {
-                                    let _halted = self.latch.trip_with(HaltCause::ClusterHalted {
+                                    self.latch.trip_with(HaltCause::ClusterHalted {
                                         by: HaltedBy::Replica { slot: slot_idx },
                                         via: NoticePath::Handshake,
                                     });
@@ -1383,7 +1383,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                         // The replica stopped: this node stops too, and the
                         // poll loop's close sends the `Halt`.
                         JoinFrames::Stopped => {
-                            let _halted = self.latch.trip_with(HaltCause::ClusterHalted {
+                            self.latch.trip_with(HaltCause::ClusterHalted {
                                 by: HaltedBy::Replica { slot: slot_idx },
                                 via: NoticePath::Ack,
                             });
@@ -1548,7 +1548,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                             // poll loop's close sends every live session's
                             // `Halt`. Its positions are not recorded.
                             ReceivedAck::Stopped => {
-                                let _halted = latch.trip_with(HaltCause::ClusterHalted {
+                                latch.trip_with(HaltCause::ClusterHalted {
                                     by: HaltedBy::Replica { slot: slot_idx },
                                     via: NoticePath::Ack,
                                 });

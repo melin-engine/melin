@@ -140,15 +140,6 @@ pub enum MarkerOutcome {
     Unconfirmed,
 }
 
-/// Proof that this caller tripped the latch: returned once, to the first
-/// tripper only. Neither `Clone` nor `Copy`, and only the latch makes one,
-/// so whatever must happen once per stop (the notice) can demand it.
-#[must_use = "the first tripper owes the other nodes a notice"]
-#[derive(Debug)]
-pub struct Halted {
-    _private: (),
-}
-
 /// The node's divergence stop: tripped once, by the first cause. Cheap to
 /// clone; every clone is the same latch.
 #[derive(Clone)]
@@ -230,11 +221,12 @@ impl DivergenceLatch {
     /// Stop the node for `cause`, unless it has stopped already. The first
     /// trip, in order: marks the latch, fences the node and sets its
     /// shutdown flag, logs the cause at `error!`, starts the marker write
-    /// on a thread of its own, and returns the [`Halted`] token. Later
-    /// trips change nothing and return `None`.
-    pub fn trip_with(&self, cause: HaltCause) -> Option<Halted> {
+    /// on a thread of its own, and returns `true`. Later trips change
+    /// nothing and return `false`. Nothing depends on which caller was
+    /// first: each link sends its notice by the latch's state and cause.
+    pub fn trip_with(&self, cause: HaltCause) -> bool {
         if self.inner.cause.set(cause).is_err() {
-            return None;
+            return false;
         }
         let cause = self
             .inner
@@ -249,7 +241,7 @@ impl DivergenceLatch {
         self.inner.shutdown.store(true, Ordering::Release);
         log_cause(cause);
         self.start_marker_write();
-        Some(Halted { _private: () })
+        true
     }
 
     /// Write the marker on a short-lived thread, so the tripping thread,
@@ -334,10 +326,9 @@ fn settled_outcome(state: &MarkerSlot) -> Option<MarkerOutcome> {
 }
 
 impl Trip for DivergenceLatch {
-    type Token = Halted;
-
-    fn trip(&self, divergence: Divergence) -> Option<Halted> {
-        self.trip_with(HaltCause::Detected(divergence))
+    fn trip(&self, divergence: Divergence) {
+        // First or not, the node has stopped.
+        self.trip_with(HaltCause::Detected(divergence));
     }
 }
 
@@ -466,16 +457,17 @@ fn write_marker_file(marker: &Path, cause: &HaltCause, sync: &dyn MarkerSync) ->
     sync.sync_dir(parent_dir(marker))
 }
 
-/// Test-only: trip a running node's latch from outside it, as
-/// `melin-test-node` does until something in production detects. Latches
-/// register themselves by marker path when this feature is on.
+/// Test-only: trip a running node's latch from outside it, for the tests
+/// of the stop itself, which need one on a node and at a moment of their
+/// choosing. Latches register themselves by marker path when this feature
+/// is on.
 #[cfg(feature = "test-utils")]
 pub mod test_seam {
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock, Weak};
 
-    use super::{DivergenceLatch, HaltCause, Halted, Inner};
+    use super::{DivergenceLatch, HaltCause, Inner};
 
     /// `BTreeMap` by marker path: a handful of nodes per test process,
     /// looked up by path. `Weak`, so a stopped node's latch is not kept.
@@ -507,9 +499,10 @@ pub mod test_seam {
     }
 
     /// Trip the running node whose marker is `marker` with `cause`.
-    /// `None` if no such node runs, or it had stopped already.
-    pub fn trip(marker: &Path, cause: HaltCause) -> Option<Halted> {
-        latch(marker)?.trip_with(cause)
+    /// `None` if no such node runs; otherwise whether this trip was its
+    /// first.
+    pub fn trip(marker: &Path, cause: HaltCause) -> Option<bool> {
+        Some(latch(marker)?.trip_with(cause))
     }
 }
 
@@ -598,14 +591,13 @@ mod tests {
     }
 
     /// The first trip wins: it fences the node and sets its shutdown flag
-    /// before returning the token, and a second trip, whatever its cause,
-    /// changes nothing.
+    /// before returning, and a second trip, whatever its cause, changes
+    /// nothing and says so.
     #[test]
     fn the_first_trip_wins_and_stops_the_node() {
         let n = node(Arc::new(FsSync));
         assert!(!n.latch.is_tripped());
-        let halted = n.latch.trip(divergence());
-        assert!(halted.is_some());
+        assert!(n.latch.trip_with(HaltCause::Detected(divergence())));
         assert!(n.latch.is_tripped());
         assert!(n.fence.is_fenced());
         assert!(n.shutdown.load(Ordering::Relaxed));
@@ -613,7 +605,7 @@ mod tests {
             by: HaltedBy::Primary,
             via: NoticePath::HaltFrame,
         });
-        assert!(second.is_none());
+        assert!(!second);
         assert_eq!(n.latch.cause(), Some(&HaltCause::Detected(divergence())));
     }
 
@@ -621,7 +613,7 @@ mod tests {
     #[test]
     fn the_marker_is_written_and_parses_back() {
         let n = node(Arc::new(FsSync));
-        let _halted = n.latch.trip(divergence());
+        n.latch.trip(divergence());
         assert!(matches!(
             n.latch.wait_marker(HALT_NOTICE_BOUND),
             MarkerOutcome::Written
@@ -642,7 +634,7 @@ mod tests {
     #[test]
     fn a_told_marker_parses_back() {
         let n = node(Arc::new(FsSync));
-        let _halted = n.latch.trip_with(HaltCause::ClusterHalted {
+        n.latch.trip_with(HaltCause::ClusterHalted {
             by: HaltedBy::Replica { slot: 1 },
             via: NoticePath::Ack,
         });
@@ -674,7 +666,7 @@ mod tests {
     #[test]
     fn a_failed_write_is_reported_to_the_waiter() {
         let n = node(Arc::new(Failing));
-        let _halted = n.latch.trip(divergence());
+        n.latch.trip(divergence());
         assert!(matches!(
             n.latch.wait_marker(HALT_NOTICE_BOUND),
             MarkerOutcome::Failed(_)
@@ -688,7 +680,7 @@ mod tests {
     fn a_hung_write_holds_no_one_past_the_bound() {
         let barrier = Arc::new(Barrier::new(2));
         let n = node(Arc::new(Hanging(Arc::clone(&barrier))));
-        let _halted = n.latch.trip(divergence());
+        n.latch.trip(divergence());
         assert!(n.latch.marker_settled().is_none());
         let started = Instant::now();
         let bound = Duration::from_millis(50);

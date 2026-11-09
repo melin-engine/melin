@@ -639,13 +639,9 @@ impl Divergence {
 /// `dyn`: one implementation per build, monomorphized; tests use a
 /// recording one.
 pub trait Trip {
-    /// What the first trip returns: proof that this caller stopped the
-    /// node, for whatever it must then do once (the notice to the others).
-    type Token;
-
-    /// Stop the node for `divergence`. `None` when it was already stopped,
-    /// by this cause or another.
-    fn trip(&self, divergence: Divergence) -> Option<Self::Token>;
+    /// Stop the node for `divergence`. Nothing happens if it had already
+    /// stopped, by this cause or another.
+    fn trip(&self, divergence: Divergence);
 }
 
 // ---------------------------------------------------------------------------
@@ -653,8 +649,8 @@ pub trait Trip {
 // ---------------------------------------------------------------------------
 
 /// What one step of a [`DigestComparator`] found.
-#[derive(Debug)]
-pub struct Comparison<Token> {
+#[derive(Debug, Default)]
+pub struct Comparison {
     /// Comparisons that found the two chains equal.
     pub matched: u32,
     /// A run was anchored at this window end.
@@ -663,22 +659,8 @@ pub struct Comparison<Token> {
     /// was lost before it was read.
     pub broke_after: Option<WireSeq>,
     /// The chains differed. The comparator has tripped its stop, and is
-    /// spent; `halted` is what the trip returned (`None` when the node had
-    /// already stopped).
-    pub mismatch: Option<(Divergence, Option<Token>)>,
-}
-
-/// Nothing found: by hand, so the token needs no `Default` (a trip's
-/// token, `Halted`, has none on purpose).
-impl<Token> Default for Comparison<Token> {
-    fn default() -> Self {
-        Self {
-            matched: 0,
-            anchored: None,
-            broke_after: None,
-            mismatch: None,
-        }
-    }
+    /// spent.
+    pub mismatch: Option<Divergence>,
 }
 
 /// One of this copy's closed windows, as the comparator holds it.
@@ -806,7 +788,7 @@ impl<T: Trip> DigestComparator<T> {
 
     /// Copy every window this copy's board has closed since the last call,
     /// in order. A window overwritten before it was read is a gap.
-    pub fn absorb(&mut self, board: &DigestBoardReader) -> Comparison<T::Token> {
+    pub fn absorb(&mut self, board: &DigestBoardReader) -> Comparison {
         match board.latest() {
             Some(latest) => self.absorb_through(board, latest),
             None => Comparison::default(),
@@ -816,11 +798,7 @@ impl<T: Trip> DigestComparator<T> {
     /// [`absorb`](Self::absorb) up to `latest`, the board's newest end as
     /// loaded before the reads: the board may have moved on, even lapped
     /// `latest`, by the time a window is read.
-    fn absorb_through(
-        &mut self,
-        board: &DigestBoardReader,
-        latest: WireSeq,
-    ) -> Comparison<T::Token> {
+    fn absorb_through(&mut self, board: &DigestBoardReader, latest: WireSeq) -> Comparison {
         let mut found = Comparison::default();
         let mut next = match self.last_local {
             Some(last) => last + OUTPUT_DIGEST_WINDOW,
@@ -848,7 +826,7 @@ impl<T: Trip> DigestComparator<T> {
         found
     }
 
-    fn merge(into: &mut Comparison<T::Token>, from: Comparison<T::Token>) {
+    fn merge(into: &mut Comparison, from: Comparison) {
         into.matched += from.matched;
         into.anchored = from.anchored.or(into.anchored);
         into.broke_after = from.broke_after.or(into.broke_after);
@@ -858,7 +836,7 @@ impl<T: Trip> DigestComparator<T> {
     }
 
     /// This copy closed `window`; windows come in order.
-    pub fn push_local(&mut self, window: ClosedWindow) -> Comparison<T::Token> {
+    pub fn push_local(&mut self, window: ClosedWindow) -> Comparison {
         let mut found = Comparison::default();
         if self.spent {
             return found;
@@ -904,7 +882,7 @@ impl<T: Trip> DigestComparator<T> {
 
     /// Compare the primary's value waiting at `end`, if any, now that the
     /// run has reached it.
-    fn compare_waiting(&mut self, end: u64, found: &mut Comparison<T::Token>) {
+    fn compare_waiting(&mut self, end: u64, found: &mut Comparison) {
         let slot = self.slot(end);
         let waiting = self.expected[slot];
         if waiting.end == end {
@@ -914,7 +892,7 @@ impl<T: Trip> DigestComparator<T> {
     }
 
     /// The primary's chain value at `end` arrived.
-    pub fn push_expected(&mut self, end: WireSeq, chain: ChainValue) -> Comparison<T::Token> {
+    pub fn push_expected(&mut self, end: WireSeq, chain: ChainValue) -> Comparison {
         let mut found = Comparison::default();
         if self.spent {
             return found;
@@ -941,7 +919,7 @@ impl<T: Trip> DigestComparator<T> {
 
     /// Anchor a run at the primary's value `chain` at `end`, if every
     /// window of this copy after it is held or still to come, unbroken.
-    fn try_anchor(&mut self, end: u64, chain: ChainValue, found: &mut Comparison<T::Token>) {
+    fn try_anchor(&mut self, end: u64, chain: ChainValue, found: &mut Comparison) {
         if end < self.floor {
             return;
         }
@@ -972,7 +950,7 @@ impl<T: Trip> DigestComparator<T> {
 
     /// Compare the primary's `expected` value at `end` with this copy's
     /// chain there.
-    fn compare(&mut self, end: u64, expected: ChainValue, found: &mut Comparison<T::Token>) {
+    fn compare(&mut self, end: u64, expected: ChainValue, found: &mut Comparison) {
         let Some(actual) = self.held(end).and_then(|window| window.chain) else {
             // This copy's chain there was evicted: a skipped sample.
             return;
@@ -993,8 +971,8 @@ impl<T: Trip> DigestComparator<T> {
             actual,
         };
         self.spent = true;
-        let halted = self.trip.trip(divergence);
-        found.mismatch = Some((divergence, halted));
+        self.trip.trip(divergence);
+        found.mismatch = Some(divergence);
     }
 }
 
@@ -1515,19 +1493,15 @@ mod folder_tests {
 
     // ---- the comparator ---------------------------------------------------
 
-    /// A stop that records every trip; its token is a number, `None` once
-    /// `answer` is off (a node already stopped).
+    /// A stop that records every trip.
     #[derive(Default)]
     struct Recorder {
         trips: std::cell::RefCell<Vec<Divergence>>,
-        already_stopped: bool,
     }
 
     impl Trip for &Recorder {
-        type Token = u32;
-        fn trip(&self, divergence: Divergence) -> Option<u32> {
+        fn trip(&self, divergence: Divergence) {
             self.trips.borrow_mut().push(divergence);
-            (!self.already_stopped).then_some(7)
         }
     }
 
@@ -1612,8 +1586,7 @@ mod folder_tests {
         // (5 and 6 are never sent).
         assert_eq!(c.push_expected(primary[2].end, primary[2].chain).matched, 1);
         let found = c.push_expected(primary[6].end, primary[6].chain);
-        let (divergence, halted) = found.mismatch.expect("a mismatch");
-        assert_eq!(halted, Some(7));
+        let divergence = found.mismatch.expect("a mismatch");
         assert_eq!(divergence.end, primary[6].end);
         let (from, through) = divergence.positions();
         assert!(from.get() <= fault && fault <= through.get());
@@ -1626,24 +1599,6 @@ mod folder_tests {
                 .is_none()
         );
         assert_eq!(recorder.trips.borrow().len(), 1);
-    }
-
-    /// A stop that had already tripped answers `None`: the mismatch says so.
-    #[test]
-    fn a_mismatch_on_a_stopped_node_carries_no_token() {
-        let primary = windows(1, 3 * K, None);
-        let replica = windows(1, 3 * K, Some(K + 1));
-        let recorder = Recorder {
-            already_stopped: true,
-            ..Recorder::default()
-        };
-        let mut c = comparator(&recorder, 1);
-        let _ = c.push_expected(primary[0].end, primary[0].chain);
-        for w in &replica {
-            let _ = c.push_local(*w);
-        }
-        let found = c.push_expected(primary[2].end, primary[2].chain);
-        assert!(matches!(found.mismatch, Some((_, None))));
     }
 
     /// A replica that joined mid-window anchors on nothing before its own

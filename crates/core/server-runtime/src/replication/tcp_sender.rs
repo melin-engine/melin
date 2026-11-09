@@ -515,7 +515,7 @@ fn handle_replica_connection<A: Application>(
         // never sent a stream or a snapshot: it has stopped the cluster,
         // and this node stops with it, answering with `Halt`.
         ReplicaMessage::StoppedHandshake(_) => {
-            let _halted = latch.trip_with(HaltCause::ClusterHalted {
+            latch.trip_with(HaltCause::ClusterHalted {
                 by: HaltedBy::Replica { slot: slot_idx },
                 via: NoticePath::Handshake,
             });
@@ -1142,7 +1142,7 @@ fn live_stream_uring(
                             // the replica waits for. Its positions are
                             // not recorded.
                             ReceivedAck::Stopped => {
-                                let _halted = latch.trip_with(HaltCause::ClusterHalted {
+                                latch.trip_with(HaltCause::ClusterHalted {
                                     by: HaltedBy::Replica { slot: slot_idx },
                                     via: NoticePath::Ack,
                                 });

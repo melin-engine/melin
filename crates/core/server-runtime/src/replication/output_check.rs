@@ -148,7 +148,7 @@ impl OutputCheck {
         }
     }
 
-    fn record(&mut self, found: Comparison<melin_transport_core::divergence::Halted>) -> Checked {
+    fn record(&mut self, found: Comparison) -> Checked {
         if found.matched > 0 {
             self.checks
                 .fetch_add(u64::from(found.matched), Ordering::Relaxed);
@@ -167,10 +167,10 @@ impl OutputCheck {
             );
         }
         match found.mismatch {
-            // The latch logged the stop and owns its notice: the
-            // receiver's loop sends it, by the latch's cause, whether this
-            // call or another tripped it, so the token is not needed here.
-            Some((_divergence, _halted)) => Checked::Diverged,
+            // The latch logged the stop, divergence included; the
+            // receiver's loop sends the notice by the latch's cause,
+            // whether this call or another tripped it.
+            Some(_divergence) => Checked::Diverged,
             None => Checked::Continue,
         }
     }

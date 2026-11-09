@@ -1507,7 +1507,7 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
                 // A first trip, or one after another cause: either way the
                 // replica has stopped. It owes nobody a notice: the primary
                 // that halted it knows.
-                let _halted = latch.trip_with(HaltCause::ClusterHalted {
+                latch.trip_with(HaltCause::ClusterHalted {
                     by: HaltedBy::Primary,
                     via: NoticePath::HaltFrame,
                 });
@@ -2350,7 +2350,7 @@ mod tests {
         let shutdown = AtomicBool::new(true);
         let dir = tempfile::tempdir().expect("tempdir");
         let control = control_tripping_in(dir.path());
-        let _halted = control.latch.trip_with(HaltCause::ClusterHalted {
+        control.latch.trip_with(HaltCause::ClusterHalted {
             by: HaltedBy::Primary,
             via: NoticePath::HaltFrame,
         });
@@ -2449,7 +2449,7 @@ mod tests {
             dir.join("replica.journal.diverged"),
             sync,
         );
-        let _halted = latch.trip_with(HaltCause::Detected(
+        latch.trip_with(HaltCause::Detected(
             melin_transport_core::output_digest::Divergence {
                 end: melin_transport_core::WireSeq::new(64),
                 run_from: melin_transport_core::WireSeq::new(1),

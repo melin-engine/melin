@@ -178,7 +178,7 @@ mod tests {
     fn the_halt_goes_once_at_a_frame_boundary_after_the_marker() {
         let dir = tempfile::tempdir().expect("tempdir");
         let latch = latch(dir.path(), Arc::new(FsSync));
-        let _halted = latch.trip_with(cause());
+        latch.trip_with(cause());
         assert!(matches!(
             latch.wait_marker(HALT_NOTICE_BOUND),
             MarkerOutcome::Written
@@ -200,7 +200,7 @@ mod tests {
     fn a_hung_marker_delays_the_halt_by_the_bound_only() {
         let dir = tempfile::tempdir().expect("tempdir");
         let latch = latch(dir.path(), Arc::new(HungMarkerSync));
-        let _halted = latch.trip_with(cause());
+        latch.trip_with(cause());
         let bound = Duration::from_millis(30);
 
         let mut notice = HaltNotice::with_bound(bound);
