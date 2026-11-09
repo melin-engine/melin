@@ -1,6 +1,9 @@
 # Divergence detection (plan)
 
-Status: **proposal, trimmed to the essentials** (2026-11-06). Implements
+Status: **implemented** on `feat/output-divergence-detection`, steps 1 to
+3, from the proposal trimmed to the essentials (2026-11-06). The design
+decisions describe the code as built; where a step's text differs from
+what was built, the step says so. Implements
 item S8 of the [application API review](application-api-review-2026-09.md),
 "No divergence detection for a nondeterministic `apply`". The full plan,
 with the in-process check, the lingering endpoint, the build ids, runs
@@ -473,15 +476,17 @@ below it.
 - **`begin_session()`** ends the run and clears the expected side; the local
   side is kept.
 
-Verdicts: `Match { end }`; `Mismatch { divergence, halted }`, where
-`divergence` is `{ end, run_from, last_match: Option<WireSeq>, expected:
-ChainValue, actual: ChainValue }` and the differing window lies in
-`(last_match or run_from - 1, end]`; `Anchored { end }`; `Break { after }`.
-After a `Mismatch` the comparator is spent.
+Each call returns a `Comparison`: how many values matched, an anchor if
+one was taken, a break if the run ended on a lost window, and a mismatch's
+`Divergence`, `{ end, run_from, last_match: Option<WireSeq>, expected:
+ChainValue, actual: ChainValue }`, whose differing window lies in
+`(last_match or run_from - 1, end]`. After a mismatch the comparator is
+spent.
 
-**The comparator trips before it returns a `Mismatch`.** `Trip` is a trait
-(`fn trip(&self, Divergence) -> Option<Self::Token>`), and `halted` is what
-it returned, `None` when another site tripped first. If the comparator only
+**The comparator trips before it returns a mismatch.** `Trip` is a trait
+(`fn trip(&self, Divergence)`). It returns nothing: no caller acts on
+which site tripped first, since every link sends its notice by the latch's
+state and cause. If the comparator only
 returned the verdict, a call site that ignored it would compile: Rust has no
 linear types, and `#[must_use]` is a lint. Holding the stop means no caller
 can forget it. Generic rather than `dyn`: one implementation per build,
@@ -593,14 +598,14 @@ protocol 10, a stop of every node.
 A node stops for one of two causes, `HaltCause` (exhaustive):
 `Detected(Divergence)`, by its own comparator (a replica's receiver), and
 `ClusterHalted { by, via }`, when another node tells it (`by` the primary,
-or a replica's slot and key fingerprint; `via` the ack, the handshake or
+or a replica's replication slot; `via` the ack, the handshake or
 the halt frame).
 
 **The latch.** `DivergenceLatch`, one `Arc` per node in `transport-core`
 beside `FenceState`, built by the entry from the node's `FenceState` and
-shutdown flag and handed to every pipeline builder, `ReplicaCursors` and
-the receivers. `trip(cause)` keeps the first cause only (a second trip
-returns `None`) and, in order:
+shutdown flag and handed to every pipeline builder, the senders and the
+receivers. `trip_with(cause)` keeps the first cause only (a second trip
+changes nothing and returns `false`) and, in order:
 
 1. **Latches the fence and sets the node's shutdown flag**, as
    `fence_if_superseded` owns "fenced ⇒ shutting down". From then: the
@@ -623,8 +628,10 @@ returns `None`) and, in order:
    wall-clock time. The writer deposits `Written` or `Failed(io::Error)`
    in the latch's marker state, a `Mutex` with a `Condvar`, touched only
    on this cold path.
-4. **Returns the `Halted` token** (private constructor, neither `Clone` nor
-   `Copy`) to the first tripper.
+4. **Returns `true`** to the first tripper. Nothing is owed by being
+   first: each link sends its notice by the latch's state and cause (a
+   `Detected` cause can only be the replica's own), so there is no token
+   to carry.
 
 **The notice waits for the marker, within a bound.** Telling another node
 before the marker is down would let a crash leave a node that restarts
@@ -669,12 +676,12 @@ are handled on one thread in order: nothing promotes a stopped replica.
 **A primary told by a replica** trips with `ClusterHalted` at the first
 place each transport sees the flag:
 
-- `ReplicaCursors::record_ack`, which holds the latch, checks `STOPPED`
-  before its sent high-water check and before it stores, so a flagged ack
-  is neither lost to an eviction nor moves a cursor. It returns
-  `Result<AckRecorded, AckViolation>`, `AckRecorded::Stored` or
-  `AckRecorded::Stopped(Option<Halted>)`, so no caller treats a stop as an
-  ordinary ack.
+- The ack read. A flagged ack decodes to a variant of its own
+  (`ReplicaMessage::StoppedAck`), which `drain_ack_frames` hands over as
+  `ReceivedAck::Stopped`, so no caller treats a stop as an ordinary ack:
+  the sender trips, and the ack's positions are never recorded, so it is
+  neither lost to an eviction nor moves a cursor. `ReplicaCursors` is
+  unchanged.
 - `keep_last_ack` returns `JoinFrames::Stopped` when any ack it reads
   carries the flag, and the DPDK `Joining` arm trips at once: a stopped
   replica stops acking, so a flag held for after the join might never be
@@ -903,7 +910,9 @@ The third part, the replica's own notice, departs from the text below in
 these places:
 
 - The streaming loop owes the notice by the latch's cause, not by holding
-  the `Halted` token: a `Detected` cause can only be the replica's own
+  a token from the trip (the `Halted` token the text below names was
+  removed once nothing consumed it; a trip returns whether it was the
+  first): a `Detected` cause can only be the replica's own
   (its comparator in step 3, the seam until then), so the receiver that
   sees it at its loop top sends the stopped ack. The seam trips the latch
   directly, from the test's thread.
@@ -1128,8 +1137,7 @@ level, each covered as noted:
     capacity, and a recording `Trip`:
     - every `Mismatch` follows exactly one `trip` with the same
       `Divergence`, made before the verdict returns; no trip without one;
-      after one, nothing more; a `Trip` returning `None` yields
-      `halted: None`;
+      after one, nothing more;
     - never a `Mismatch` when the reports agree, across any session
       starts, the reference restarted from the seed at any of them;
     - a divergence in one window inside a run, sent or not, is a
@@ -1276,6 +1284,12 @@ Beyond each step's list:
 - **A non-default `--ring-capacity` end to end**: the sizing is one
   function, unit-tested at the minimum, the default and above.
 - **The idle delay in seconds**: the idle test counts checks, not time.
+- **A lossy `snapshot`/`restore` end to end**: a copy restored without a
+  field differs at the first report the field changes, which is the path
+  the sizing-fault application drives.
+- **A report the gate does not offer to the egress**: the response loop
+  encodes it for the digest itself, but the gate withholds only
+  policy-change slots, so no test can reach that branch today.
 
 ## Open questions
 

@@ -274,6 +274,12 @@ largest item here and the one with the best long-term return.
 
 ### S8. No divergence detection for a nondeterministic `apply`
 
+**Status.** Addressed by output digests, a different fix from the one
+below: replicas compare the bytes of their reports with their primary's,
+with no trait to implement, and a mismatch stops the cluster (see the
+[plan](divergence-detection-2026-10.md)). A state digest, which would
+also catch divergence no report has shown yet, is deferred there.
+
 **Problem.** Determinism is a documented obligation with no check.
 `apply` iterating a `HashMap` with a random seed, reading the wall
 clock, or depending on allocation addresses diverges replicas silently
