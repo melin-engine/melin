@@ -1071,7 +1071,7 @@ cluster.**
   snapshot taken before format 5 recovered with the warning about its
   tick watermark. Rarely, a hardware fault.
 - **Upgrading the application.** An upgrade that changes the output for
-  the same input (a new report field, a reworded rejection) now means
+  the same input (a new report field, a reworded rejection) means
   stopping every node and starting them all on the new build: rolled node
   by node, the first replica on the new build sees its output differ from
   its primary's and stops the cluster. An upgrade that leaves the output
@@ -1122,6 +1122,18 @@ has it.
 
 ### Limits
 
+- **Only a replica checks.** A standalone node, or a primary with no
+  replica streaming from it, compares its output with nothing and detects
+  nothing.
+- **Only output is compared, not state.** Two copies whose state differs
+  go on agreeing until a report shows the difference, which can be long
+  after the state diverged, and after a failover has made the drifted
+  copy the primary. An application that reports little of its state is
+  checked on little of it.
+- **The last windows before a failover are not compared.** A divergence
+  in the entries a primary journaled just before it failed, whose digest
+  it had not yet sent, is not found: the next primary starts a new
+  comparison.
 - **A replica not streaming when its primary stops is not told**: one
   between sessions, one receiving a snapshot, or one that does not read
   the primary's notice before its connection ends. (A replica catching up
