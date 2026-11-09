@@ -64,7 +64,8 @@ use crate::response::GateCrossTracker;
 #[cfg(feature = "pipeline-stats")]
 use crate::response::print_utilization;
 use crate::response_frame::{
-    EarlyReplyBuf, EncodeBuf, MAX_APP_FRAME, MAX_EARLY_REPLY, encode_slot_payload, report_body,
+    EarlyReplyBuf, EncodeBuf, MAX_APP_FRAME, MAX_EARLY_REPLY, encode_slot_payload,
+    frame_app_response, report_body,
 };
 
 /// Maximum number of output slots consumed per batch. `usize` because it
@@ -870,13 +871,19 @@ pub(crate) fn run<E: Egress, R: Copy, Q: Copy>(
 
             // Digest the slot after it was offered, so the hash is off the
             // reply's own latency: what it closes behind it, and a report's
-            // body, as encoded above whether it was sent or not. A report
-            // is always offered (only a change slot is the gate's alone),
-            // so a report's `encoded` is always there.
+            // body, as encoded above whether it was sent or not. Today
+            // every report is offered (only a change slot is the gate's
+            // alone); one that was not is encoded here, so it is digested
+            // as every other copy digests it, whatever the gate decides.
             if let Some(digester) = digester.as_mut()
                 && let Some(at) = digester.slot(slot)
             {
-                digester.fold(at, report_body(&encode_buf, encoded));
+                let framed = encoded.unwrap_or_else(|| {
+                    frame_app_response(&mut encode_buf, |body| {
+                        encoder.encode_report(at.report(), body)
+                    })
+                });
+                digester.fold(at, report_body(&encode_buf, framed));
             }
 
             // The egress's turn between slots (the kernel's consumed-path
@@ -1066,7 +1073,7 @@ mod tests {
                 return SlotOutcome::Stopped;
             }
             if connection_id == TRIP {
-                let _halted = self.latch.trip_with(test_cause());
+                self.latch.trip_with(test_cause());
             }
             if known {
                 SlotOutcome::Known
@@ -1734,7 +1741,7 @@ mod tests {
         stage.seam().resume();
         stage.wait_for(&Call::BeforeWait);
 
-        let _halted = stage.latch.trip_with(test_cause());
+        stage.latch.trip_with(test_cause());
         stage.answer_early(1, 0);
         // The journal reaches the slot: the gate would release it now.
         stage.journal.store(WireSeq::new(1));

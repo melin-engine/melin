@@ -861,19 +861,24 @@ where
     let drain_consumer = pipeline.drain_consumer;
     // The drain's digester publishes to the board the receiver's check
     // reads.
-    let (drain_digest, output_check) = match digest_encoder.and_then(|encoder| {
-        crate::server::output_digester(true, pipeline.first_live, &pipeline.cursors, ring_capacity)
-            .map(|digester| (digester, encoder))
-    }) {
-        Some(((digester, board), encoder)) => (
-            Some(drain::DrainDigest { digester, encoder }),
-            Some(Box::new(output_check::OutputCheck::new(
-                latch.clone(),
-                board,
-                pipeline.first_live,
-                Arc::clone(output_checks),
-            ))),
-        ),
+    let (drain_digest, output_check) = match digest_encoder {
+        Some(encoder) => {
+            let (digester, board) =
+                melin_transport_core::output_digest::OutputDigester::for_pipeline(
+                    pipeline.first_live,
+                    &pipeline.cursors,
+                    ring_capacity,
+                );
+            (
+                Some(drain::DrainDigest { digester, encoder }),
+                Some(Box::new(output_check::OutputCheck::new(
+                    latch.clone(),
+                    board,
+                    pipeline.first_live,
+                    Arc::clone(output_checks),
+                ))),
+            )
+        }
         None => (None, None),
     };
     let drain_handle = melin_app::affinity::spawn_placed("drain", drain.core, move || {

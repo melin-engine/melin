@@ -1159,10 +1159,10 @@ fn warn_if_output_digests_off(config: &ServerConfig) {
 
 /// The output digester for a pipeline that applies its first live entry
 /// at `first_live`, with the reader of the board it publishes to; `None`
-/// unless `enabled` (`--no-output-digests` unset). The one place a node
-/// builds one, for the primary's response stage on either transport and
-/// for a replica's drain.
-pub(crate) fn output_digester(
+/// unless `enabled` (`--no-output-digests` unset): the primary's response
+/// stage's, on either transport. A replica's drain builds its own beside
+/// its encoder, from the same constructor.
+fn output_digester(
     enabled: bool,
     first_live: WireSeq,
     cursors: &PipelineCursors,
@@ -4871,7 +4871,7 @@ mod tests {
             "never resolved a store"
         );
 
-        let _halted = stop.latch.trip_with(HaltCause::ClusterHalted {
+        stop.latch.trip_with(HaltCause::ClusterHalted {
             by: HaltedBy::Primary,
             via: NoticePath::HaltFrame,
         });

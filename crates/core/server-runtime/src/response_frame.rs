@@ -94,23 +94,16 @@ pub(crate) fn encode_slot_payload<R: Copy, Q: Copy>(
 }
 
 /// A report's body as the output digest folds it, from what
-/// [`encode_slot_payload`] gave for it in `buf`: the body behind the
+/// [`frame_app_response`] gave for it in `buf`: the body behind the
 /// header, or `Failed` for an encode error.
-///
-/// # Panics
-///
-/// If `encoded` is `None`: a report always has a payload frame, so a
-/// `None` here is a slot that was not a report, the caller's bug.
 #[inline]
 pub(crate) fn report_body<'a>(
     buf: &'a EncodeBuf,
-    encoded: Option<Result<usize, &'static str>>,
+    framed: Result<usize, &'static str>,
 ) -> ReportBody<'a> {
-    // `encoded` is the frame's length, header included; the body is what
+    // `framed` is the frame's length, header included; the body is what
     // follows the header.
-    let body_len = encoded
-        .expect("a report always has a payload frame")
-        .map(|frame_len| frame_len - HEADER_LEN);
+    let body_len = framed.map(|frame_len| frame_len - HEADER_LEN);
     ReportBody::of(&buf[HEADER_LEN..], body_len)
 }
 
