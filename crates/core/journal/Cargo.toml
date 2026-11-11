@@ -43,8 +43,10 @@ getrandom = "0.4"
 libc = { workspace = true }
 # Safe wrappers for `pwrite`, `pwritev2`, `fallocate` so the journal hot
 # path can drop the corresponding `unsafe { libc::… }` blocks. Already
-# transitively in the workspace dep tree.
-rustix = { version = "1", features = ["fs"] }
+# transitively in the workspace dep tree. At least 1.1.6, which fixes
+# RUSTSEC-2026-0486 (the xattr functions, which the journal does not call),
+# so a consumer of the published crate cannot resolve an unsound version.
+rustix = { version = "1.1.6", features = ["fs"] }
 tracing = { workspace = true }
 # Typed views over raw byte buffers for the on-disk frame layout —
 # replaces field-by-field le::put / le::get chains with single struct
