@@ -72,17 +72,17 @@ struct Cli {
     size: usize,
 
     /// How long the measured phase runs.
-    #[arg(long, default_value = "10s", value_parser = humantime::parse_duration)]
+    #[arg(long, default_value = "10s", value_parser = parse_duration)]
     duration: Duration,
 
     /// Load before the measured phase, its replies not timed.
-    #[arg(long, default_value = "5s", value_parser = humantime::parse_duration)]
+    #[arg(long, default_value = "5s", value_parser = parse_duration)]
     warmup_duration: Duration,
 
     /// Load after the measured phase, its replies not timed: the
     /// measured phase's last replies arrive under the same load as its
     /// first.
-    #[arg(long, default_value = "1s", value_parser = humantime::parse_duration)]
+    #[arg(long, default_value = "1s", value_parser = parse_duration)]
     cooldown_duration: Duration,
 
     /// Write the results as JSON to this file.
@@ -335,4 +335,52 @@ impl Results {
 /// `12.3 µs`.
 fn micros(ns: u64) -> String {
     format!("{:.1} µs", ns as f64 / 1_000.0)
+}
+
+/// Clap value parser for the phase durations: `10s`, `500ms`, `1m30s`,
+/// `2 minutes`, or ISO 8601 (`PT10S`). A negative duration is refused
+/// rather than clamped, since it can only be a typo.
+fn parse_duration(s: &str) -> Result<Duration, String> {
+    let signed: jiff::SignedDuration = s.parse().map_err(|e: jiff::Error| e.to_string())?;
+    Duration::try_from(signed)
+        .map_err(|_| format!("`{s}` is negative; a phase cannot run backwards"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_the_spellings_the_suite_passes() {
+        assert_eq!(parse_duration("60s").unwrap(), Duration::from_secs(60));
+        assert_eq!(parse_duration("5s").unwrap(), Duration::from_secs(5));
+        assert_eq!(parse_duration("0s").unwrap(), Duration::ZERO);
+    }
+
+    #[test]
+    fn parses_sub_second_and_compound_durations() {
+        assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
+        assert_eq!(parse_duration("1m30s").unwrap(), Duration::from_secs(90));
+        assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
+        assert_eq!(
+            parse_duration("2 minutes").unwrap(),
+            Duration::from_secs(120)
+        );
+    }
+
+    #[test]
+    fn refuses_negative_and_malformed_durations() {
+        assert!(parse_duration("-5s").unwrap_err().contains("negative"));
+        assert!(parse_duration("").is_err());
+        assert!(parse_duration("10").is_err());
+        assert!(parse_duration("ten seconds").is_err());
+    }
+
+    #[test]
+    fn defaults_parse() {
+        let cli = Cli::try_parse_from(["melin-bench", "--app", "echo", "--key", "k"]).unwrap();
+        assert_eq!(cli.duration, Duration::from_secs(10));
+        assert_eq!(cli.warmup_duration, Duration::from_secs(5));
+        assert_eq!(cli.cooldown_duration, Duration::from_secs(1));
+    }
 }
