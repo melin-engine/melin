@@ -1669,8 +1669,8 @@ mod tests {
     #[test]
     fn a_pending_change_already_durable_is_applied_at_the_start() {
         let metrics = ReplicationMetrics::default();
-        for slot in 0..2 {
-            metrics.in_memory_sequence[slot].store(6, Ordering::Relaxed);
+        for seq in &metrics.in_memory_sequence[..2] {
+            seq.store(6, Ordering::Relaxed);
         }
         let (g, _) = build_from(
             pending_start(AckPolicy::Ram, 3, AckPolicy::Disk, false),

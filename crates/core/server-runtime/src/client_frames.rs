@@ -550,15 +550,15 @@ fn publish<A: Application>(
 
     // The whole slot is rebuilt in place, through the one constructor
     // for a client slot, so no field keeps the previous occupant's
-    // value.
-    if batch
-        .try_push_with(|slot| {
-            *slot = InputSlot::client(origin, event, ts, recv_ts);
-        })
-        .is_err()
-    {
+    // value. A `let`-`else` rather than `if .is_err() { return false }`:
+    // with the trace features off nothing follows but `true`, which
+    // clippy's `needless_bool` would fold into one expression that no
+    // longer compiles once a feature adds its recording after the push.
+    let Ok(_seq) = batch.try_push_with(|slot| {
+        *slot = InputSlot::client(origin, event, ts, recv_ts);
+    }) else {
         return false;
-    }
+    };
 
     #[cfg(feature = "latency-trace")]
     {
