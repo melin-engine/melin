@@ -7,6 +7,11 @@
 //! the buffer, then publishes the metadata slot. Consumers read the
 //! metadata and reference the buffer directly (zero-copy read).
 //!
+//! A slot's bytes are opaque here and may hold more than one wire frame:
+//! the primary's journal stage writes a batch's `InputBatch` frame and,
+//! after it, an optional `Digest` frame, so a reader of a slot classifies
+//! it by its leading frame and must not reject bytes after it.
+//!
 //! This design avoids heap allocation on the journal thread. The only cost
 //! is one copy of each batch into its slot's buffer.
 

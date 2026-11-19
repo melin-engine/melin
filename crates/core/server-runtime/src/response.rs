@@ -39,8 +39,10 @@ use crate::response_frame::{EarlyReplyBuf, encode_early_reply};
 #[cfg(feature = "latency-trace")]
 use crate::response_loop::MAX_BATCH;
 use crate::response_loop::{
-    self, Egress, EgressRecorders, LoopInputs, SlotOutcome, SlotReply, StageNames,
+    self, Egress, EgressRecorders, LoopInputs, SlotFrames, SlotOutcome, StageNames,
 };
+use melin_transport_core::divergence::DivergenceLatch;
+use melin_transport_core::output_digest::OutputDigester;
 
 /// Maximum accumulated send buffer per connection (64 KiB). If a client
 /// falls behind and the buffer exceeds this, the connection is dropped.
@@ -215,6 +217,12 @@ pub struct Response<A: Application> {
     /// halted for want of a replica; `None` when off. See
     /// [`crate::halt::DegradedRelease`].
     pub degraded_release: Option<crate::halt::DegradedRelease>,
+    /// Digests every report the stage reads, sent or not, for the output
+    /// digest; `None` with output digests off.
+    pub digester: Option<OutputDigester>,
+    /// The node's divergence stop: once tripped, the stage sends nothing
+    /// more.
+    pub latch: DivergenceLatch,
     /// Test seam: called once per iteration right after the control
     /// channel has been drained, so a test can hold the stage there and
     /// choose what lands while it waits. The drain runs after the
@@ -623,17 +631,16 @@ impl Egress for UringEgress {
     /// `SlotOutcome::Stopped`: this stage notices a shutdown at a gate
     /// wait or at the top of the loop.
     #[inline]
-    fn send_slot<R: Copy, Q: Copy>(
+    fn send_slot(
         &mut self,
         connection_id: u64,
-        reply: SlotReply<'_, R, Q>,
+        frames: SlotFrames<'_>,
         now: Instant,
         _shutdown: &AtomicBool,
     ) -> SlotOutcome {
         let Some(entry) = self.connections.get_mut(&connection_id) else {
             return SlotOutcome::Unknown;
         };
-        let frames = reply.into_frames();
 
         #[cfg(feature = "tick-to-trade")]
         let encode_start = trace::mono_trace_ns();
@@ -836,6 +843,8 @@ pub fn run<A: Application>(
         ring_sizing,
         ready,
         degraded_release,
+        digester,
+        latch,
         #[cfg(test)]
         pause_after_control_drain,
     } = config;
@@ -901,6 +910,8 @@ pub fn run<A: Application>(
             heartbeat_interval,
             encoder,
             early_replies,
+            digester,
+            latch,
             #[cfg(test)]
             pause_after_control_drain,
         },
@@ -3599,7 +3610,7 @@ pub(crate) mod tests {
         use crate::durability_gate::{Backing, BatchEnds};
         use crate::response::{MAX_SEND_BUF, UringEgress};
         use crate::response_frame::{EncodeBuf, MAX_APP_FRAME};
-        use crate::response_loop::{Egress as _, SlotOutcome, SlotReply};
+        use crate::response_loop::{Egress as _, SlotFrames, SlotOutcome};
 
         /// The request every slot here ends.
         const REQUEST: RequestId = RequestId(7);
@@ -3624,7 +3635,7 @@ pub(crate) mod tests {
             let mut batch_ends = BatchEnds::new();
             egress.send_slot(
                 connection_id,
-                SlotReply::new(
+                SlotFrames::encode(
                     &slot,
                     backing,
                     &ResponseEncoder,
@@ -3664,9 +3675,10 @@ pub(crate) mod tests {
         }
 
         /// A slot for a connection the egress does not hold is `Unknown`,
-        /// and nothing is encoded for it.
+        /// and nothing of it is buffered or sent. (The loop encodes it
+        /// before offering it, for the output digest.)
         #[test]
-        fn a_slot_for_an_unknown_connection_is_unknown_and_encodes_nothing() {
+        fn a_slot_for_an_unknown_connection_is_unknown_and_sends_nothing() {
             let (server, _client) = UnixStream::pair().expect("socketpair");
             let (mut egress, _active) = egress_over(server);
 
@@ -3674,9 +3686,15 @@ pub(crate) mod tests {
             let outcome = send_last_slot(&mut egress, 9, Backing::Policy, &mut encode_buf);
 
             assert_eq!(outcome, SlotOutcome::Unknown);
-            assert!(encode_buf.iter().all(|&b| b == 0), "the reply was encoded");
             assert!(egress.to_remove.is_empty());
-            assert!(egress.dirty.is_empty());
+            assert!(egress.dirty.is_empty(), "nothing buffered");
+            assert!(
+                egress
+                    .connections
+                    .values()
+                    .all(|entry| entry.send_buf.is_empty()),
+                "nothing appended to any connection"
+            );
         }
 
         /// An egress holding a reply buffered for connection 1, fenced or
@@ -3790,6 +3808,7 @@ pub(crate) mod tests {
                 encoder: &ResponseEncoder,
                 early_buf: &mut early_buf,
                 shutdown: &AtomicBool::new(false),
+                latch: &crate::tests::idle_latch(),
             }
             .while_waiting();
             (egress, client)
@@ -3982,6 +4001,8 @@ pub(crate) mod tests {
                     .expect("a supported cap"),
                 ready: None,
                 degraded_release: None,
+                digester: None,
+                latch: crate::tests::idle_latch(),
                 pause_after_control_drain,
             }
         }

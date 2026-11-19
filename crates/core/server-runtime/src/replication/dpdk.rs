@@ -25,8 +25,8 @@ use super::join_worker::{
     JoinContext, JoinRequest, JoinStallWatch, JoinStream, JoinWorker, Pump, stream_join,
 };
 use super::receiver_transport::{
-    ControlFrameSource, FrameResult, ReceiverTransport, compact_recv_buf, drain_ack_frames,
-    run_serviced, streaming_loop, try_extract_frame,
+    ControlFrameSource, FrameResult, JoinFrames, ReceivedAck, ReceiverTransport, compact_recv_buf,
+    drain_ack_frames, keep_last_ack, run_serviced, streaming_loop, try_extract_frame,
 };
 use super::validation_worker::ValidationWorker;
 use super::{
@@ -36,6 +36,9 @@ use super::{
     journal_failed_while_disconnected, recover_replica_state, sleep_then_double_backoff,
 };
 use melin_app::auth::AuthorizedKeys;
+use melin_transport_core::divergence::{
+    DivergenceLatch, HALT_NOTICE_BOUND, HaltCause, HaltedBy, NoticePath,
+};
 use melin_transport_core::node_store::NodeStore;
 use melin_transport_core::replica_presence::{FirstAck, ReplicaPresence};
 use melin_transport_core::replication::PersistWatch;
@@ -45,7 +48,8 @@ use melin_transport_core::replication::handoff::{
 };
 use melin_transport_core::replication::protocol::{
     Ack, Handshake, MAX_CONTROL_FRAME, PrimaryMessage, ReplicaMessage, decode_primary_message,
-    decode_replica_message, encode_ack, encode_challenge, encode_handshake, encode_heartbeat,
+    decode_replica_message, encode_ack, encode_challenge, encode_halt, encode_handshake,
+    encode_heartbeat, encode_stopped_ack, encode_stopped_handshake,
 };
 use melin_transport_core::replication::validate::{
     HandshakeValidation, validate_replica_handshake_settled,
@@ -97,26 +101,14 @@ impl ReceiverTransport for DpdkReceiverTransport<'_> {
     }
 
     fn send_ack(&mut self, ack: &Ack) -> io::Result<bool> {
-        self.send_buf.clear();
-        encode_ack(ack, &mut self.send_buf);
-        let mut attempts: u32 = 0;
-        loop {
-            if self.transport.queue_send(self.handle, &self.send_buf) {
-                // Flush immediately so the ACK reaches the primary
-                // without waiting for the next poll_recv iteration.
-                self.transport.poll();
-                return Ok(true);
-            }
-            attempts += 1;
-            if attempts >= ACK_RETRY_CAP {
-                tracing::warn!("DPDK ack send failed after {ACK_RETRY_CAP} retries");
-                return Ok(false);
-            }
-            self.transport.poll();
-            if !self.transport.is_connected(self.handle) {
-                return Err(io::Error::other("replica disconnected during ack send"));
-            }
-        }
+        self.send_ack_frame(ack, encode_ack)
+    }
+
+    /// Nothing is ever in flight here (the frame is queued whole on the
+    /// socket, or not at all), so the stopped ack follows whatever was
+    /// queued before it and nothing after it.
+    fn send_stopped_ack(&mut self, ack: &Ack) -> io::Result<bool> {
+        self.send_ack_frame(ack, encode_stopped_ack)
     }
 
     fn ack_in_flight(&self) -> bool {
@@ -137,6 +129,243 @@ impl ReceiverTransport for DpdkReceiverTransport<'_> {
     fn keep_link_serviced(&mut self) {
         self.transport.poll();
     }
+}
+
+impl DpdkReceiverTransport<'_> {
+    /// Queue `ack`, written by `encode`, on the socket, retrying a full
+    /// queue a bounded number of times.
+    fn send_ack_frame(&mut self, ack: &Ack, encode: fn(&Ack, &mut Vec<u8>)) -> io::Result<bool> {
+        self.send_buf.clear();
+        encode(ack, &mut self.send_buf);
+        let mut attempts: u32 = 0;
+        loop {
+            if self.transport.queue_send(self.handle, &self.send_buf) {
+                // Flush immediately so the ACK reaches the primary
+                // without waiting for the next poll_recv iteration.
+                self.transport.poll();
+                return Ok(true);
+            }
+            attempts += 1;
+            if attempts >= ACK_RETRY_CAP {
+                tracing::warn!("DPDK ack send failed after {ACK_RETRY_CAP} retries");
+                return Ok(false);
+            }
+            self.transport.poll();
+            if !self.transport.is_connected(self.handle) {
+                return Err(io::Error::other("replica disconnected during ack send"));
+            }
+        }
+    }
+}
+
+/// How a DPDK dial to the primary ended. Exhaustive, so each caller
+/// decides for every outcome.
+enum DpdkDial {
+    /// Connected, the link's liveness deadline armed.
+    Connected(melin_dpdk::SocketHandle),
+    /// The stack would not open the socket (an endpoint it cannot
+    /// address): no SYN went out, and no socket was added.
+    Refused { local_port: u16, error: String },
+    /// No answer within the timeout, the socket went away, or
+    /// `interrupted` said so: the socket is reset.
+    Failed,
+}
+
+/// Dial the primary at `primary_ip:primary_port` from the next local port
+/// (`local_port` moves on), waiting at most `timeout` for the handshake,
+/// or until `interrupted` says so. One dial for the reconnect loop and the
+/// stopped redial.
+fn dial_primary_dpdk(
+    transport: &mut melin_dpdk::DpdkTransport,
+    primary_ip: std::net::Ipv4Addr,
+    primary_port: u16,
+    local_port: &mut u16,
+    timeout: std::time::Duration,
+    interrupted: impl Fn() -> bool,
+) -> DpdkDial {
+    // Seed the primary's MAC into smoltcp's neighbor cache. Without this
+    // the replica has no way to address its first frame: an acceptor
+    // learns the peer MAC from the inbound packet, but an initiator has to
+    // know it before anything goes out. ARP cannot supply it — an SR-IOV
+    // VF does not receive broadcast, and in bifurcated mode the `rte_flow`
+    // rule matches on IPv4 source address so ARP is never steered into
+    // DPDK at all. Either way the SYN never ships and the replica spins on
+    // "failed to connect (DPDK)" with no error to show for it.
+    //
+    // `--dpdk-peer-mac` wins when supplied; otherwise this falls back to
+    // the SR-IOV `02:00:<ip>` convention, which holds only on ports whose
+    // MAC dpdk-setup.sh assigned. Re-seeded on every dial so an expired
+    // neighbour entry cannot strand a reconnecting replica.
+    let mac_source = transport.seed_peer_neighbor(primary_ip);
+    info!(
+        primary_ip = %primary_ip,
+        mac_source = mac_source.as_str(),
+        "seeded primary MAC into the neighbour cache"
+    );
+    // Drain the injected ARP reply through smoltcp so the neighbor cache
+    // is populated BEFORE connect_to() runs. Without this poll smoltcp's
+    // connect tries to resolve ARP from an empty cache, queues a broadcast
+    // request that the PF drops, and the SYN never ships.
+    transport.poll();
+
+    // Replication streams large journal batches; use bigger RX buffer so
+    // smoltcp can advertise a window large enough to sustain throughput.
+    const REPL_RX_BUF: usize = 512 * 1024;
+    const REPL_TX_BUF: usize = 64 * 1024;
+    const REPL_TX_QUEUE: usize = 64 * 1024;
+    let dial_port = *local_port;
+    *local_port = local_port.wrapping_add(1).max(40000);
+    let handle = match transport.connect_to_with_buffers(
+        primary_ip,
+        primary_port,
+        dial_port,
+        REPL_RX_BUF,
+        REPL_TX_BUF,
+        REPL_TX_QUEUE,
+        REPL_DISPATCH_BURST,
+    ) {
+        Ok(handle) => handle,
+        Err(e) => {
+            return DpdkDial::Refused {
+                local_port: dial_port,
+                error: format!("{e:?}"),
+            };
+        }
+    };
+    let connect_start = std::time::Instant::now();
+    loop {
+        if interrupted() {
+            break;
+        }
+        transport.poll();
+        if transport.is_connected(handle) {
+            // From here the link watches the primary: one that stops
+            // answering is reset by the stack, which every wait after the
+            // dial reads as the session's end. Armed now rather than at
+            // connect, so the connect keeps its own timeout.
+            transport.set_peer_liveness(handle, &REPLICATION_LIVENESS);
+            return DpdkDial::Connected(handle);
+        }
+        if !transport.is_active(handle) || connect_start.elapsed() >= timeout {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    // Reset rather than drop: a primary that accepted after our timeout
+    // frees the connection at once.
+    transport.reset(handle);
+    DpdkDial::Failed
+}
+
+/// The redial a replica that stopped on its own detection owes a primary
+/// that did not answer its stopped ack, as the kernel-TCP receiver's: dial,
+/// authenticate, and handshake as stopped, with the reconnect backoff,
+/// until a `Halt` answers or `HALT_REDIAL` runs out, servicing the stack
+/// throughout. Every wait is bounded by the time left.
+fn redial_stopped_dpdk(
+    transport: &mut melin_dpdk::DpdkTransport,
+    primary_ip: std::net::Ipv4Addr,
+    primary_port: u16,
+    local_port: &mut u16,
+    key: &ed25519_dalek::SigningKey,
+    handshake: &Handshake,
+) {
+    let deadline = std::time::Instant::now() + super::halt_notice::HALT_REDIAL;
+    let mut backoff = std::time::Duration::from_secs(1);
+    // Never set: the redial runs with the node's shutdown flag already up.
+    let never = AtomicBool::new(false);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            warn!(
+                primary_ip = %primary_ip,
+                "the primary did not answer this stopped replica's redial: it may not have been \
+                 told that the cluster's output diverged"
+            );
+            return;
+        }
+        // Logged per attempt as the kernel-TCP redial's are.
+        match dial_primary_dpdk(
+            transport,
+            primary_ip,
+            primary_port,
+            local_port,
+            remaining,
+            || false,
+        ) {
+            DpdkDial::Connected(handle) => {
+                let attempt =
+                    stopped_session_dpdk(transport, handle, key, handshake, deadline, &never);
+                transport.reset(handle);
+                match attempt {
+                    Ok(true) => {
+                        info!("the primary answered this replica's stop with its halt");
+                        return;
+                    }
+                    Ok(false) => {
+                        debug!("the primary's answer to the stopped handshake was not a halt")
+                    }
+                    Err(e) => debug!(error = %e, "stopped redial attempt failed"),
+                }
+            }
+            DpdkDial::Refused { local_port, error } => debug!(
+                local_port,
+                error = %error,
+                "stopped redial attempt failed: the stack refused to open a connection"
+            ),
+            DpdkDial::Failed => debug!("stopped redial attempt failed: no connection"),
+        }
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let pause_until = std::time::Instant::now() + backoff.min(left);
+        while std::time::Instant::now() < pause_until {
+            transport.poll();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        backoff = (backoff * 2).min(super::MAX_BACKOFF);
+    }
+}
+
+/// One stopped redial attempt on the connected `handle`, before
+/// `deadline`: authenticate, handshake as stopped, and wait up to the
+/// notice bound for the primary's `Halt`. `true` once it answers, `false`
+/// when it did not in time; an error when the session failed before.
+fn stopped_session_dpdk(
+    transport: &mut melin_dpdk::DpdkTransport,
+    handle: melin_dpdk::SocketHandle,
+    key: &ed25519_dalek::SigningKey,
+    handshake: &Handshake,
+    deadline: std::time::Instant,
+    never: &AtomicBool,
+) -> std::io::Result<bool> {
+    let left = || deadline.saturating_duration_since(std::time::Instant::now());
+    let mut recv_buf = Vec::new();
+    {
+        let mut stream = PolledAuthStream {
+            transport: &mut *transport,
+            handle,
+            recv_buf: &mut recv_buf,
+            shutdown: never,
+            deadline: std::time::Instant::now() + AUTH_TIMEOUT.min(left()),
+        };
+        authenticate_with_primary(&mut stream, key)?;
+    }
+    let mut out = Vec::new();
+    encode_stopped_handshake(handshake, &mut out);
+    if !transport.queue_send(handle, &out) {
+        return Err(std::io::Error::other(
+            "the stopped handshake could not be queued",
+        ));
+    }
+    let wait_until = std::time::Instant::now() + HALT_NOTICE_BOUND.min(left());
+    while std::time::Instant::now() < wait_until && transport.is_connected(handle) {
+        transport.poll();
+        transport.recv_into_vec(handle, &mut recv_buf);
+        if super::halt_notice::take_halt(&mut recv_buf) {
+            return Ok(true);
+        }
+        std::thread::yield_now();
+    }
+    Ok(false)
 }
 
 /// When a replication peer counts as gone, at both ends of a DPDK link.
@@ -216,75 +445,6 @@ fn linger_then_reset(
     }
 }
 
-/// What reading a joining replica's control frames found.
-#[derive(Debug, PartialEq, Eq)]
-enum JoinFrames {
-    /// A frame's length prefix is zero or over [`MAX_CONTROL_FRAME`]: a
-    /// replica the caller disconnects, as the streaming arm does.
-    Malformed,
-    /// Well formed. `acked`: an ack is kept: the replica is in its
-    /// streaming loop, which arms the join's [`JoinStallWatch`].
-    Read { acked: bool },
-}
-
-/// Keep only the newest complete ack at the front of `buf`, and a trailing
-/// partial frame for the next read. `acked` whenever an ack is kept,
-/// which, as one is kept across reads, is true again on every read after
-/// the first (arming the stall watch is idempotent).
-///
-/// Serves a `Joining` slot, in both phases. The replica acks what it
-/// journals of the join, and its acks must be read off the socket (left
-/// unread they fill the listener's receive buffer, and the replica's acks
-/// then back up in its own TX queue), but not recorded yet: the slot's
-/// cursors are seeded only once the catch-up ends, and the sent high-water
-/// an ack is checked against only once the handoff is over (a journal
-/// pass's entries are counted when the pass ends, and the replica may ack
-/// them before). The streaming arm records what is kept here, on its first
-/// tick. Acks are cumulative, so the newest carries everything the older
-/// ones did, and the rest are dropped.
-///
-/// Kept, not dropped, through the catch-up too: a replica acks only when
-/// it holds something new, so its last ack of the join is never repeated.
-/// On a quiet primary nothing more is journaled, and an ack dropped here
-/// would leave the slot at its handshake position, with a write held for
-/// the replica's ack never answered.
-///
-/// Walks the frames itself rather than through [`drain_ack_frames`]: that
-/// helper hands out each decoded ack and compacts everything it consumed,
-/// where this one keeps the newest ack's own bytes in the buffer, for the
-/// streaming arm's drain to decode on its first tick.
-fn keep_last_ack(buf: &mut Vec<u8>) -> JoinFrames {
-    let mut consumed = 0;
-    // The newest ack's byte range in `buf`.
-    let mut newest: Option<(usize, usize)> = None;
-    loop {
-        match try_extract_frame(&buf[consumed..], MAX_CONTROL_FRAME) {
-            FrameResult::Complete(payload_start, frame_end) => {
-                let payload = &buf[consumed + payload_start..consumed + frame_end];
-                if matches!(decode_replica_message(payload), Ok(ReplicaMessage::Ack(_))) {
-                    newest = Some((consumed, consumed + frame_end));
-                }
-                consumed += frame_end;
-            }
-            FrameResult::Incomplete => break,
-            FrameResult::Oversized => return JoinFrames::Malformed,
-        }
-    }
-    let acked = newest.is_some();
-    match newest {
-        Some((start, end)) => {
-            let len = buf.len();
-            let ack_len = end - start;
-            buf.copy_within(start..end, 0);
-            // `ack_len <= end <= consumed`: the partial frame moves down.
-            buf.copy_within(consumed..len, ack_len);
-            buf.truncate(ack_len + (len - consumed));
-        }
-        None => compact_recv_buf(buf, consumed),
-    }
-    JoinFrames::Read { acked }
-}
-
 /// End a replica's session with its primary (see [`linger_then_reset`]):
 /// the primary's slot frees at once.
 fn end_session(transport: &mut melin_dpdk::DpdkTransport, handle: melin_dpdk::SocketHandle) {
@@ -313,6 +473,11 @@ enum SlotState {
     /// [`ReplicaPresence::lift`]), so the slot cannot stream uncounted, and
     /// its first ack ends any halt override.
     Streaming(melin_dpdk::SocketHandle, FirstAck),
+    /// The replica handshook as stopped for divergence, which stopped this
+    /// node: nothing more is read or sent on the link but the `Halt` that
+    /// answers it, which the poll loop's close sends
+    /// ([`DpdkReplicationDriver::close_all_links`]).
+    Halting(melin_dpdk::SocketHandle),
 }
 
 /// Deadline for one side of the DPDK auth exchange to make progress. On the
@@ -571,7 +736,8 @@ impl DpdkReplicaSlot {
         if let SlotState::Authenticating(h)
         | SlotState::Handshaking(h)
         | SlotState::Joining(h)
-        | SlotState::Streaming(h, _) = self.state
+        | SlotState::Streaming(h, _)
+        | SlotState::Halting(h) = self.state
         {
             // The gate is lifted only once the join begins (see the
             // handshake verdict in the `Handshaking` arm); a connection
@@ -634,6 +800,10 @@ pub struct DpdkReplicationDriver<A: Application> {
     /// (not threaded per-call) so the `Authenticating` tick arm can verify
     /// without the caller re-supplying it each poll.
     authorized_keys: Arc<AuthorizedKeys>,
+    /// The node's divergence stop: tripped by a replica that reports it
+    /// stopped; once tripped, every live session is sent a `Halt` as the
+    /// poll loop closes the links ([`Self::close_all_links`]).
+    latch: DivergenceLatch,
     // Anchors the `A` type parameter — the struct holds no app-typed
     // state, but `tick`'s journal-catchup and snapshot-transfer paths
     // do, and we want the type system to enforce that the same `A`
@@ -659,6 +829,9 @@ impl<A: Application> DpdkReplicationDriver<A> {
         heartbeat_secs: u64,
         fence_state: Arc<melin_transport_core::fence::FenceState>,
         authorized_keys: Arc<AuthorizedKeys>,
+        // The node's divergence stop, as the kernel-TCP sender's
+        // (`Sender::latch`).
+        latch: DivergenceLatch,
     ) -> Result<Self, String> {
         let [consumer_0, consumer_1] = repl_consumers;
         let now = std::time::Instant::now();
@@ -744,6 +917,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
             heartbeat_interval: std::time::Duration::from_secs(heartbeat_secs),
             fence_state,
             authorized_keys,
+            latch,
             _app: PhantomData,
         })
     }
@@ -857,6 +1031,9 @@ impl<A: Application> DpdkReplicationDriver<A> {
 
         for (slot_idx, slot) in slots.iter_mut().enumerate() {
             match slot.state {
+                // Owes its replica a `Halt`, which the poll loop's close
+                // sends: the node is stopping, so nothing else is done.
+                SlotState::Halting(_) => {}
                 SlotState::Idle => {
                     // Drain ring to keep it flowing. The journal stage
                     // skips inactive rings (active_flag=false), but there
@@ -1115,7 +1292,30 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                         }
                                     }
                                 }
-                                Ok(ReplicaMessage::Ack(_)) => {
+                                // Read before the fence and chain checks, as
+                                // on the kernel-TCP sender: a stopped
+                                // replica stops this node, and is answered
+                                // with `Halt` as the poll loop closes.
+                                Ok(ReplicaMessage::StoppedHandshake(_)) => {
+                                    self.latch.trip_with(HaltCause::ClusterHalted {
+                                        by: HaltedBy::Replica { slot: slot_idx },
+                                        via: NoticePath::Handshake,
+                                    });
+                                    slot.recv_buf.clear();
+                                    slot.state = SlotState::Halting(handle);
+                                }
+                                Ok(ReplicaMessage::UnknownFlags { tag, flags }) => {
+                                    let e = super::receiver_transport::unknown_flags(tag, flags);
+                                    warn!(slot = slot_idx, error = %e, "replica connection error");
+                                    slot.go_idle(
+                                        slot_idx,
+                                        transport,
+                                        cursors,
+                                        metrics,
+                                        replicas_connected,
+                                    );
+                                }
+                                Ok(ReplicaMessage::Ack(_) | ReplicaMessage::StoppedAck(_)) => {
                                     warn!(
                                         slot = slot_idx,
                                         "expected Handshake, got Ack — disconnecting"
@@ -1180,6 +1380,14 @@ impl<A: Application> DpdkReplicationDriver<A> {
                         // reads, and refusing for the limit is a stall.
                         JoinFrames::Read { acked: true } => join.stall.arm(),
                         JoinFrames::Read { acked: false } => {}
+                        // The replica stopped: this node stops too, and the
+                        // poll loop's close sends the `Halt`.
+                        JoinFrames::Stopped => {
+                            self.latch.trip_with(HaltCause::ClusterHalted {
+                                by: HaltedBy::Replica { slot: slot_idx },
+                                via: NoticePath::Ack,
+                            });
+                        }
                     }
 
                     // One tick of the join: as much as fits in the socket,
@@ -1332,7 +1540,21 @@ impl<A: Application> DpdkReplicationDriver<A> {
                     let mut acked = false;
                     // When this tick's acks arrived, read once, on the first.
                     let mut ack_received: Option<std::time::Instant> = None;
-                    let drained = drain_ack_frames(&mut slot.recv_buf, |ack| {
+                    let latch = &self.latch;
+                    let drained = drain_ack_frames(&mut slot.recv_buf, |frame| {
+                        let ack = match frame {
+                            ReceivedAck::Ack(ack) => ack,
+                            // The replica stopped: this node stops too; the
+                            // poll loop's close sends every live session's
+                            // `Halt`. Its positions are not recorded.
+                            ReceivedAck::Stopped => {
+                                latch.trip_with(HaltCause::ClusterHalted {
+                                    by: HaltedBy::Replica { slot: slot_idx },
+                                    via: NoticePath::Ack,
+                                });
+                                return Ok(());
+                            }
+                        };
                         // Eviction on violation: the store has logged it
                         // at error level, and the error tears the slot
                         // down below.
@@ -1506,6 +1728,13 @@ impl<A: Application> DpdkReplicationDriver<A> {
     /// Only the sockets: the halt gate, cursors and gauges are left as they
     /// are, since lowering the gate here would log the last replica leaving
     /// a node that is itself leaving.
+    ///
+    /// A node stopped for divergence first sends every live session (one
+    /// joining, streaming, or owed an answer to its stopped handshake) a
+    /// `Halt`, once its marker is durable or the notice bound has passed,
+    /// polling the transport meanwhile. The transmit queue holds whole
+    /// frames, so the `Halt` lands at a frame boundary, after what the
+    /// session had queued. Sessions not yet live just close.
     pub fn close_all_links(self, transport: &mut melin_dpdk::DpdkTransport) {
         // A `Vec`: built once, on the way out, so its allocation is
         // immaterial.
@@ -1516,11 +1745,71 @@ impl<A: Application> DpdkReplicationDriver<A> {
                 SlotState::Authenticating(h)
                 | SlotState::Handshaking(h)
                 | SlotState::Joining(h)
-                | SlotState::Streaming(h, _) => Some(h),
-                _ => None,
+                | SlotState::Streaming(h, _)
+                | SlotState::Halting(h) => Some(h),
+                SlotState::Idle => None,
             })
             .collect();
+        if self.latch.is_tripped() {
+            let live: Vec<_> = self
+                .slots
+                .iter()
+                .filter_map(|slot| match slot.state {
+                    SlotState::Joining(h) | SlotState::Streaming(h, _) | SlotState::Halting(h) => {
+                        Some(h)
+                    }
+                    SlotState::Idle | SlotState::Authenticating(_) | SlotState::Handshaking(_) => {
+                        None
+                    }
+                })
+                .collect();
+            send_halts(transport, &self.latch, &live);
+        }
         linger_then_reset(transport, &handles);
+    }
+}
+
+/// Queue a `Halt` on each of `handles`, once the node's marker is durable
+/// or the notice bound has passed (see `HaltNotice`), servicing the
+/// transport while it waits: the poll thread must not block. A link whose
+/// queue refuses the frame is left to its reset.
+fn send_halts(
+    transport: &mut melin_dpdk::DpdkTransport,
+    latch: &DivergenceLatch,
+    handles: &[melin_dpdk::SocketHandle],
+) {
+    // No one to tell: waiting for the marker would only hold the poll
+    // thread's exit, up to the bound on a hung disk, and log a notice
+    // leaving early that never leaves.
+    if handles.is_empty() {
+        return;
+    }
+    let mut notice = super::halt_notice::HaltNotice::new();
+    loop {
+        match notice.step(true, latch) {
+            super::halt_notice::HaltStep::Wait => {
+                transport.poll();
+                std::thread::yield_now();
+            }
+            super::halt_notice::HaltStep::Send => {
+                for &handle in handles {
+                    if !transport.queue_send(handle, &encode_halt()) {
+                        warn!("a replica's transmit queue refused the halt frame");
+                    }
+                }
+            }
+            super::halt_notice::HaltStep::Close => break,
+        }
+    }
+    // Then wait, servicing the links, for each replica to close its end,
+    // which it does once it has read the `Halt`: resetting first could
+    // discard the frame before the replica reads it. Bounded, as every
+    // wait of the stop is.
+    let deadline = std::time::Instant::now() + HALT_NOTICE_BOUND;
+    while std::time::Instant::now() < deadline && handles.iter().any(|&h| transport.is_connected(h))
+    {
+        transport.poll();
+        std::thread::yield_now();
     }
 }
 
@@ -1564,6 +1853,8 @@ pub fn run_receiver_dpdk<A>(
     // Applied to every instance this loop builds a pipeline around; see
     // `build_replica_pipeline_with_threads`.
     sizing: &A::Sizing,
+    // As the kernel-TCP `run_receiver`'s.
+    digest_encoder: Option<crate::response::ResponseEncoderArc<A>>,
 ) -> ReceiverResult<A, BufferedWriter<A::Event>>
 where
     A: Application + Send + 'static,
@@ -1594,6 +1885,10 @@ where
         primary_observed: _,
         lineage_ack_policy,
         pipeline_healthy,
+        // Read and tripped by the streaming loop, which takes `control`
+        // whole, and by each pipeline's output check, built with it.
+        latch,
+        output_checks,
     } = control;
     journal_tip.advance(melin_transport_core::WireSeq::new(
         state.position.last_sequence,
@@ -1670,7 +1965,16 @@ where
                     );
                     // A fatal exit never keeps the pipeline, so going
                     // round again dials only after a resync or not at all.
-                    if let Some(r) = after.adopt(&mut state) {
+                    if let Some(r) = after.adopt(&mut state, |state| {
+                        redial_stopped_dpdk(
+                            transport,
+                            primary_ip,
+                            primary_port,
+                            &mut local_port,
+                            signing_key,
+                            &state.position.handshake(fence_state.epoch()),
+                        )
+                    }) {
                         return r;
                     }
                     continue;
@@ -1697,119 +2001,52 @@ where
             "connecting to primary as replica (DPDK)"
         );
 
-        // Seed the primary's MAC into smoltcp's neighbor cache. Without
-        // this the replica has no way to address its first frame: an
-        // acceptor learns the peer MAC from the inbound packet, but an
-        // initiator has to know it before anything goes out. ARP cannot
-        // supply it — an SR-IOV VF does not receive broadcast, and in
-        // bifurcated mode the `rte_flow` rule matches on IPv4 source
-        // address so ARP is never steered into DPDK at all. Either way
-        // the SYN never ships and the replica spins on "failed to
-        // connect (DPDK)" with no error to show for it.
-        //
-        // `--dpdk-peer-mac` wins when supplied; otherwise this falls back
-        // to the SR-IOV `02:00:<ip>` convention, which holds only on
-        // ports whose MAC dpdk-setup.sh assigned. Re-seeded on every
-        // reconnect so an expired neighbour entry cannot strand a
-        // reconnecting replica.
-        let mac_source = transport.seed_peer_neighbor(primary_ip);
-        info!(
-            primary_ip = %primary_ip,
-            mac_source = mac_source.as_str(),
-            "seeded primary MAC into the neighbour cache"
-        );
-        // Drain the injected ARP reply through smoltcp so the neighbor
-        // cache is populated BEFORE connect_to() runs. Without this poll
-        // smoltcp's connect tries to resolve ARP from an empty cache,
-        // queues a broadcast request that the PF drops, and the SYN
-        // never ships.
-        transport.poll();
-
-        // Connect to primary via smoltcp.
-        // Replication streams large journal batches; use bigger RX buffer
-        // so smoltcp can advertise a window large enough to sustain throughput.
-        const REPL_RX_BUF: usize = 512 * 1024;
-        const REPL_TX_BUF: usize = 64 * 1024;
-        const REPL_TX_QUEUE: usize = 64 * 1024;
-        let dial_port = local_port;
-        local_port = local_port.wrapping_add(1).max(40000);
-        let handle = match transport.connect_to_with_buffers(
+        // Route shutdown and promotion through the failure arm and the
+        // loop top — returning from here would leak the pipeline threads
+        // and the smoltcp socket. Promotion is checked during the dial
+        // because a dial to a primary that has gone is answered by nothing
+        // (a stopped DPDK node has no stack to refuse it), so waiting out
+        // the connect timeout would delay the failover by as much.
+        let dialed = dial_primary_dpdk(
+            transport,
             primary_ip,
             primary_port,
-            dial_port,
-            REPL_RX_BUF,
-            REPL_TX_BUF,
-            REPL_TX_QUEUE,
-            REPL_DISPATCH_BURST,
-        ) {
-            Ok(handle) => handle,
-            // The stack would not open the socket (an endpoint it cannot
-            // address): a dial that failed before its SYN, on the same
-            // retry path as one that got no answer. No socket was added,
-            // so there is nothing to reset.
-            Err(e) => {
+            &mut local_port,
+            CONNECT_TIMEOUT,
+            || shutdown.load(Ordering::Relaxed) || promote.is_requested(),
+        );
+        let handle = match dialed {
+            DpdkDial::Connected(handle) => handle,
+            DpdkDial::Refused { local_port, error } => {
                 warn!(
                     primary_ip = %primary_ip,
                     primary_port,
-                    local_port = dial_port,
-                    error = ?e,
+                    local_port,
+                    error = %error,
                     backoff_secs = backoff.as_secs(),
                     "the stack refused to open a connection to the primary (DPDK) — retrying"
                 );
                 sleep_then_double_backoff(&mut backoff, shutdown, promote);
                 continue;
             }
+            DpdkDial::Failed => {
+                // A shutdown racing the connect window is a clean exit,
+                // not degraded operation — don't warn.
+                if shutdown.load(Ordering::Relaxed) {
+                    debug!("connect aborted — shutting down (DPDK)");
+                } else if promote.is_requested() {
+                    debug!("connect aborted — promoting (DPDK)");
+                } else {
+                    warn!(
+                        backoff_secs = backoff.as_secs(),
+                        "failed to connect to primary (DPDK) — retrying"
+                    );
+                }
+                sleep_then_double_backoff(&mut backoff, shutdown, promote);
+                continue;
+            }
         };
-
-        // Poll until TCP handshake completes (with timeout).
-        let connect_start = std::time::Instant::now();
-        let connected = loop {
-            // Route shutdown and promotion through the `!connected` arm
-            // and the loop top — returning from here would leak the
-            // pipeline threads and the smoltcp socket. Promotion is
-            // checked here because a dial to a primary that has gone is
-            // answered by nothing (a stopped DPDK node has no stack to
-            // refuse it), so waiting out the connect timeout would delay
-            // the failover by as much.
-            if shutdown.load(Ordering::Relaxed) || promote.is_requested() {
-                break false;
-            }
-            transport.poll();
-            if transport.is_connected(handle) {
-                break true;
-            }
-            if !transport.is_active(handle) || connect_start.elapsed() >= CONNECT_TIMEOUT {
-                break false;
-            }
-            std::thread::yield_now();
-        };
-
-        if !connected {
-            // A shutdown racing the connect window is a clean exit, not
-            // degraded operation — don't warn.
-            if shutdown.load(Ordering::Relaxed) {
-                debug!("connect aborted — shutting down (DPDK)");
-            } else if promote.is_requested() {
-                debug!("connect aborted — promoting (DPDK)");
-            } else {
-                warn!(
-                    backoff_secs = backoff.as_secs(),
-                    "failed to connect to primary (DPDK) — retrying"
-                );
-            }
-            // Reset rather than drop: a primary that accepted after our
-            // timeout frees the connection at once.
-            transport.reset(handle);
-            sleep_then_double_backoff(&mut backoff, shutdown, promote);
-            continue;
-        }
         info!("connected to primary (DPDK)");
-        // From here the link watches the primary: one that stops
-        // answering is reset by the stack, which every wait below (auth,
-        // handshake, transfer, streaming) reads as the session's end.
-        // Armed now rather than at connect, so the connect keeps its own
-        // timeout.
-        transport.set_peer_liveness(handle, &REPLICATION_LIVENESS);
 
         // Authenticate BEFORE the handshake — mirrors the kernel-TCP receiver.
         // The primary issues a Challenge first and will not accept our
@@ -2034,6 +2271,9 @@ where
                         lineage_ack_policy,
                         Arc::clone(pipeline_healthy),
                         sizing,
+                        digest_encoder.clone(),
+                        latch,
+                        output_checks,
                     )?;
                     // Pipeline children are spawned and self-pinned. Now safe
                     // to pin the receive thread — mirrors the primary's reader
@@ -2056,6 +2296,7 @@ where
             let journal_cursor = p.journal_cursor.as_ref();
             let stream_marks = &p.stream_marks;
             let journal_failed = &p.journal_failed;
+            let output_check = p.output_check.as_deref_mut();
             let mut dpdk_transport = DpdkReceiverTransport {
                 transport: &mut *transport,
                 handle,
@@ -2077,6 +2318,7 @@ where
                 None,
                 stream_marks,
                 journal_failed,
+                output_check,
             );
             send_buf = dpdk_transport.send_buf;
             r
@@ -2106,7 +2348,16 @@ where
             sizing,
             prealloc,
         );
-        if let Some(r) = after.adopt(&mut state) {
+        if let Some(r) = after.adopt(&mut state, |state| {
+            redial_stopped_dpdk(
+                transport,
+                primary_ip,
+                primary_port,
+                &mut local_port,
+                signing_key,
+                &state.position.handshake(fence_state.epoch()),
+            )
+        }) {
             return r;
         }
     }
@@ -2171,109 +2422,6 @@ impl ControlFrameSource for DpdkFrameSource<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A length-prefixed frame with a `len`-byte payload.
-    fn frame(len: usize) -> Vec<u8> {
-        let mut f = (len as u32).to_le_bytes().to_vec();
-        f.resize(4 + len, 0xAB);
-        f
-    }
-
-    fn ack(acked_sequence: u64, in_memory_sequence: u64) -> Vec<u8> {
-        let mut buf = Vec::new();
-        encode_ack(
-            &Ack {
-                acked_sequence,
-                in_memory_sequence,
-            },
-            &mut buf,
-        );
-        buf
-    }
-
-    /// The newest ack survives, ahead of a partial frame; older acks and
-    /// frames that are not acks go. Kept across reads, so the newest of
-    /// all of them is what the streaming arm records.
-    #[test]
-    fn keep_last_ack_keeps_the_newest_ack_and_a_partial_frame() {
-        let mut buf = ack(1, 2);
-        buf.extend(frame(8));
-        buf.extend(ack(3, 4));
-        buf.extend(frame(8));
-        let partial = ack(5, 6);
-        buf.extend_from_slice(&partial[..5]);
-
-        let acked = JoinFrames::Read { acked: true };
-        assert_eq!(keep_last_ack(&mut buf), acked);
-        let mut expected = ack(3, 4);
-        expected.extend_from_slice(&partial[..5]);
-        assert_eq!(buf, expected);
-
-        // The partial ack completes, and is the newest from then on.
-        buf.extend_from_slice(&partial[5..]);
-        assert_eq!(keep_last_ack(&mut buf), acked);
-        assert_eq!(buf, ack(5, 6));
-        assert_eq!(keep_last_ack(&mut buf), acked, "idempotent");
-        assert_eq!(buf, ack(5, 6));
-    }
-
-    #[test]
-    fn keep_last_ack_with_no_ack_keeps_only_a_partial_frame() {
-        let none = JoinFrames::Read { acked: false };
-        let mut buf = frame(8);
-        buf.extend_from_slice(&frame(8)[..3]);
-        assert_eq!(keep_last_ack(&mut buf), none);
-        assert_eq!(buf, frame(8)[..3]);
-
-        let mut buf = Vec::new();
-        assert_eq!(keep_last_ack(&mut buf), none);
-        assert!(buf.is_empty());
-
-        // Too short for a length prefix: left as it is.
-        let mut buf = vec![5, 0];
-        assert_eq!(keep_last_ack(&mut buf), none);
-        assert_eq!(buf, [5, 0]);
-
-        // A partial frame that completes as something other than an ack
-        // goes on the next read.
-        let partial = frame(12);
-        let mut buf = partial[..7].to_vec();
-        assert_eq!(keep_last_ack(&mut buf), none);
-        buf.extend_from_slice(&partial[7..]);
-        assert_eq!(keep_last_ack(&mut buf), none);
-        assert!(buf.is_empty());
-    }
-
-    /// The replica's only ack of a join, arriving in pieces, is reported
-    /// once complete and then kept, read after read, with nothing newer
-    /// behind it: a replica on a quiet primary acks the end of its catch-up
-    /// once, and the streaming arm must still find that ack when the join
-    /// is over, however many reads the rest of the join took.
-    #[test]
-    fn keep_last_ack_keeps_the_only_ack_until_the_join_is_over() {
-        let only = ack(1_560, 1_560);
-        let mut buf = only[..5].to_vec();
-        assert_eq!(keep_last_ack(&mut buf), JoinFrames::Read { acked: false });
-        buf.extend_from_slice(&only[5..]);
-        for read in 0..3 {
-            assert_eq!(
-                keep_last_ack(&mut buf),
-                JoinFrames::Read { acked: true },
-                "read {read}"
-            );
-            assert_eq!(buf, only, "read {read}");
-        }
-    }
-
-    #[test]
-    fn keep_last_ack_rejects_an_oversized_or_empty_frame() {
-        let mut buf = ack(1, 1);
-        buf.extend(((MAX_CONTROL_FRAME + 1) as u32).to_le_bytes());
-        assert_eq!(keep_last_ack(&mut buf), JoinFrames::Malformed);
-
-        let mut buf = 0u32.to_le_bytes().to_vec();
-        assert_eq!(keep_last_ack(&mut buf), JoinFrames::Malformed);
-    }
 
     /// The deadline on a joiner that stops reading is the liveness
     /// timeout, and long enough that a refusal or two is not a stall.

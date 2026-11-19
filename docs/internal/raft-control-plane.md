@@ -82,6 +82,43 @@ coexist — first request wins the one-shot, and a manual promotion that
 outruns raft terms simply makes the policy refuse (`term <= fence_epoch`)
 until terms catch up.
 
+### The term floor
+
+Terms catch up at the latest when the node next starts: before the raft
+core reads its store, `driver_main` raises the stored vote to the node's
+fencing epoch when the vote's term is below it (`apply_term_floor`). The
+raise is a vote for itself in the newer term, what a candidate persists
+when it starts an election, so raft's safety argument covers it; the
+node's next election is at `epoch + 1`, and every node it asks for a vote
+takes that term from it. Without it, a raft directory created on a
+journal that has failed over (a re-provisioned cluster, a replaced voter)
+starts at term zero, and the policy refuses until enough elections pass.
+
+A raised vote is uncommitted, so the node restarts as a follower even
+if it was the committed leader (openraft's `Engine::startup` restores
+leadership only from a committed vote for itself), and on rejoining a
+live cluster its higher term makes the current leader step down on the
+`HigherVote` reply. The first rolling restart of a cluster whose terms
+trail its epoch thus costs up to one election per node raised: the
+intended effect, and safe.
+
+openraft's `initialize` refuses a store that holds a vote
+(`RaftState::is_initialized`), so on a store never initialised the
+floor also writes the first entry itself: the membership entry at
+`LogId::default()` with every configured member a voter, which is what
+`initialize` writes (`RaftCore::handle_initialize`), and the driver then
+skips `initialize`. A floor of 0 changes nothing, so a history that
+never failed over takes the `initialize` path exactly as before.
+
+The epoch is known once the node's journal is recovered: at once on a
+primary, which recovers before it starts the driver, and later on a
+replica, which starts it first. So `driver_main` waits for the tip to be
+ready (`TipSource::ready`) before the raft core starts, and a recovering
+replica neither campaigns nor answers peers until then. The RPC server's
+refusal to deliver votes before the tip is ready (`rpc_server.rs`) stays
+as a second guard, for a server driven without `driver_main`, as the
+loopback tests do.
+
 ## Journal-tip vote recency filter (`recency.rs`)
 
 Melin replicates order data out-of-band from raft, so raft's own

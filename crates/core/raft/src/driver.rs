@@ -29,6 +29,8 @@ use openraft::ServerState;
 use openraft::error::CheckIsLeaderError;
 use openraft::error::InitializeError;
 use openraft::error::RaftError;
+use openraft::storage::RaftLogStorage;
+use openraft::storage::RaftLogStorageExt;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
@@ -672,11 +674,74 @@ fn publish_metrics(status: &RaftStatus, m: &RaftMetrics<NodeId, Node>) {
     status.set_millis_since_quorum_ack(m.millis_since_quorum_ack);
 }
 
+/// What [`apply_term_floor`] did to the store.
+#[derive(Debug, PartialEq, Eq)]
+enum TermFloor {
+    /// The stored term was at or above the floor: nothing written.
+    Unchanged,
+    /// A store never initialised: the first membership entry written as
+    /// openraft's `initialize` writes it, under a vote at the floor, so
+    /// the driver must not call `initialize` (which refuses a store
+    /// holding a vote).
+    Initialized,
+    /// An initialised store's vote raised from the term `from`.
+    Raised { from: u64 },
+}
+
+/// Raise the store's term to `floor`, the node's fencing epoch, before
+/// the raft core reads it.
+///
+/// A promotion journals its election term as the new epoch, so it is
+/// refused unless the term is above the epoch in force. Terms start at
+/// zero in a fresh raft directory, and lag the epoch after manual
+/// promotions, so without the floor a cluster on a journal that has failed
+/// over would promote only manually until enough elections had passed.
+/// Raised, the node's next election is at `floor + 1`, and every node it
+/// asks for a vote takes that term from it, as raft carries terms.
+///
+/// The raise is the vote a candidate persists when it starts an election,
+/// a vote for itself in a newer term, so it is as safe as an election
+/// timeout firing. A store never initialised also gets the first
+/// membership entry, because openraft's `initialize` refuses a store that
+/// holds a vote: the same entry, at the same position, with every
+/// configured member a voter. A floor of 0 (a history that never failed
+/// over) leaves every store as it is.
+// StorageError is openraft's error type and its size is theirs to choose;
+// this runs once per driver start, so no value in boxing it.
+#[allow(clippy::result_large_err)]
+async fn apply_term_floor(
+    log: &mut crate::storage::FileLogStore,
+    node_id: NodeId,
+    members: &BTreeMap<NodeId, Node>,
+    floor: u64,
+) -> Result<TermFloor, crate::types::StorageError> {
+    let vote = log.read_vote().await?;
+    let from = vote.as_ref().map_or(0, |v| v.leader_id().get_term());
+    if from >= floor {
+        return Ok(TermFloor::Unchanged);
+    }
+    let fresh = vote.is_none() && log.get_log_state().await?.last_log_id.is_none();
+    if fresh {
+        let first = <crate::types::Entry as openraft::entry::RaftEntry<_, _>>::new_membership(
+            LogId::default(),
+            openraft::Membership::from(members.clone()),
+        );
+        log.blocking_append([first]).await?;
+    }
+    log.save_vote(&crate::types::Vote::new(floor, node_id))
+        .await?;
+    Ok(if fresh {
+        TermFloor::Initialized
+    } else {
+        TermFloor::Raised { from }
+    })
+}
+
 #[allow(clippy::too_many_arguments)] // driver assembly point; a config struct would just restate it
 async fn driver_main(
     config: RaftConfig,
     listener: std::net::TcpListener,
-    log_store: crate::storage::FileLogStore,
+    mut log_store: crate::storage::FileLogStore,
     state_machine: crate::storage::FileStateMachine,
     signing_key: Arc<SigningKey>,
     authorized_keys: Arc<AuthorizedKeys>,
@@ -723,6 +788,59 @@ async fn driver_main(
         config.bind,
         supersession.clone(),
     );
+
+    // The static membership, as `initialize` (or the term floor, on a
+    // store never initialised) writes it on first boot.
+    let members: BTreeMap<NodeId, Node> = config
+        .peers
+        .iter()
+        .map(|p| {
+            (
+                p.id,
+                Node {
+                    addr: p.addr.clone(),
+                },
+            )
+        })
+        .collect();
+
+    // The term floor is the node's fencing epoch, which is known once its
+    // journal is recovered: at once on a primary, after recovery on a
+    // replica, which starts the driver first. Until then the raft core is
+    // not started, so the node neither campaigns nor answers peers, where
+    // before the floor it would only have refused their vote requests
+    // (`rpc_server`), and its first election is already above the floor.
+    while !tip.is_ready() {
+        if shutdown.load(Ordering::Relaxed) {
+            status.mark_stopped();
+            return;
+        }
+        tokio::time::sleep(SHUTDOWN_POLL).await;
+    }
+    let floor = tip.fence.epoch();
+    let term_floor = match apply_term_floor(&mut log_store, config.node_id, &members, floor).await {
+        Ok(applied) => applied,
+        Err(e) => {
+            error!(error = %e, "raft-driver: raising the term to the fencing epoch failed");
+            status.mark_stopped();
+            return;
+        }
+    };
+    match term_floor {
+        TermFloor::Unchanged => {}
+        TermFloor::Initialized => info!(
+            node_id = config.node_id,
+            term = floor,
+            "control plane initialized at the journal's fencing epoch"
+        ),
+        TermFloor::Raised { from } => info!(
+            node_id = config.node_id,
+            from,
+            term = floor,
+            "control-plane term raised to the journal's fencing epoch"
+        ),
+    }
+
     let raft: Raft<TypeConfig> = match Raft::new(
         config.node_id,
         raft_config,
@@ -769,22 +887,16 @@ async fn driver_main(
     // First-boot initialization with the static membership. A cluster that
     // is already initialized (any restart) refuses with `NotAllowed`, which
     // simply means the stored membership is in force — the CLI peer list is
-    // then advisory only.
-    let members: BTreeMap<NodeId, Node> = config
-        .peers
-        .iter()
-        .map(|p| {
-            (
-                p.id,
-                Node {
-                    addr: p.addr.clone(),
-                },
-            )
-        })
-        .collect();
-    match raft.initialize(members).await {
-        Ok(()) => info!(node_id = config.node_id, "control plane initialized"),
-        Err(RaftError::APIError(InitializeError::NotAllowed(_))) => {
+    // then advisory only. A store the term floor initialised holds the
+    // first entry already, and was logged as initialised above.
+    let initialized = match term_floor {
+        TermFloor::Initialized => None,
+        TermFloor::Unchanged | TermFloor::Raised { .. } => Some(raft.initialize(members).await),
+    };
+    match initialized {
+        None => {}
+        Some(Ok(())) => info!(node_id = config.node_id, "control plane initialized"),
+        Some(Err(RaftError::APIError(InitializeError::NotAllowed(_)))) => {
             // Already initialized (any restart): the stored membership is
             // authoritative and the CLI `--raft-peer` list is advisory.
             // Runtime membership changes are out of scope, so if the
@@ -846,7 +958,7 @@ async fn driver_main(
                 }
             }
         }
-        Err(e) => {
+        Some(Err(e)) => {
             error!(error = %e, "raft-driver: initialize failed");
             status.mark_stopped();
             let _ = raft.shutdown().await;
@@ -941,6 +1053,7 @@ async fn driver_main(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::reopened;
 
     fn peer(id: NodeId, key: u8) -> RaftPeer {
         RaftPeer {
@@ -1014,6 +1127,109 @@ mod tests {
                 MAX_VOTERS + 1
             )
         );
+    }
+
+    // --- apply_term_floor ---
+
+    /// Three members, as the static membership names them.
+    fn members() -> BTreeMap<NodeId, Node> {
+        (1..=3)
+            .map(|id| {
+                (
+                    id,
+                    Node {
+                        addr: format!("127.0.0.1:{}", 7000 + id),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// A store raised with `floor` at `dir`.
+    async fn floored(dir: &std::path::Path, floor: u64) -> TermFloor {
+        let (mut log, _sm) = crate::storage::open(dir).expect("open");
+        apply_term_floor(&mut log, 1, &members(), floor)
+            .await
+            .expect("apply the floor")
+    }
+
+    /// A history that never failed over leaves a fresh store to
+    /// `initialize`, exactly as before the floor.
+    #[tokio::test]
+    async fn a_zero_floor_writes_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert_eq!(floored(dir.path(), 0).await, TermFloor::Unchanged);
+        assert_eq!(reopened(dir.path()).await, (None, vec![]));
+    }
+
+    /// A store never initialised gets the entry `initialize` would write,
+    /// at the same position, under a vote for itself at the floor.
+    #[tokio::test]
+    async fn a_fresh_store_is_initialised_at_the_floor() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert_eq!(floored(dir.path(), 5).await, TermFloor::Initialized);
+
+        let (vote, entries) = reopened(dir.path()).await;
+        let vote = vote.expect("a vote at the floor");
+        assert_eq!(vote, crate::types::Vote::new(5, 1));
+        assert!(!vote.is_committed(), "a candidate's vote, not a leader's");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].log_id, LogId::default());
+        let openraft::EntryPayload::Membership(membership) = &entries[0].payload else {
+            panic!(
+                "the first entry is the membership: {:?}",
+                entries[0].payload
+            );
+        };
+        assert_eq!(membership, &openraft::Membership::from(members()));
+
+        // Applied once: a restart at the same epoch writes nothing more.
+        assert_eq!(floored(dir.path(), 5).await, TermFloor::Unchanged);
+        assert_eq!(reopened(dir.path()).await.1.len(), 1);
+    }
+
+    /// An initialised store behind the epoch keeps its log and has its
+    /// vote raised.
+    #[tokio::test]
+    async fn an_initialised_store_behind_the_epoch_is_raised() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let entry = <crate::types::Entry as openraft::entry::RaftEntry<_, _>>::new_membership(
+            LogId::default(),
+            openraft::Membership::from(members()),
+        );
+        {
+            let (mut log, _sm) = crate::storage::open(dir.path()).expect("open");
+            log.blocking_append([entry.clone()]).await.expect("append");
+            log.save_vote(&crate::types::Vote::new_committed(2, 3))
+                .await
+                .expect("save vote");
+        }
+
+        assert_eq!(floored(dir.path(), 5).await, TermFloor::Raised { from: 2 });
+        assert_eq!(
+            reopened(dir.path()).await,
+            (Some(crate::types::Vote::new(5, 1)), vec![entry])
+        );
+    }
+
+    /// A term already at or above the epoch is the raft cluster's own, and
+    /// is kept.
+    #[tokio::test]
+    async fn a_term_at_or_above_the_floor_is_kept() {
+        for term in [5, 7] {
+            let dir = tempfile::TempDir::new().unwrap();
+            {
+                let (mut log, _sm) = crate::storage::open(dir.path()).expect("open");
+                log.save_vote(&crate::types::Vote::new_committed(term, 3))
+                    .await
+                    .expect("save vote");
+            }
+            assert_eq!(floored(dir.path(), 5).await, TermFloor::Unchanged);
+            assert_eq!(
+                reopened(dir.path()).await.0,
+                Some(crate::types::Vote::new_committed(term, 3))
+            );
+        }
     }
 
     #[test]

@@ -14,17 +14,21 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use tracing::{debug, error, info, warn};
 
 use melin_journal::BufferedWriter;
 use melin_journal::JournalError;
 use melin_journal::JournalWrite;
+use melin_transport_core::divergence::{
+    DivergenceLatch, FsSync, HALT_NOTICE_BOUND, HaltCause, MarkerOutcome,
+};
 use melin_transport_core::journaled_app::JournaledApp;
 use melin_transport_core::lineage::{Lineage, LineagePolicy};
 use melin_transport_core::node_store::{NodeStore, NodeStoreError};
+use melin_transport_core::output_digest::{DigestBoardReader, OutputDigester};
 /// The type of [`ServerConfig::ring_capacity`], re-exported beside it so
 /// a caller configuring a node needs no dependency of its own on the
 /// transport crate.
@@ -35,6 +39,7 @@ use melin_transport_core::pipeline::{
 };
 use melin_transport_core::replica_presence::ReplicaPresence;
 use melin_transport_core::shadow::ShadowFeed;
+use melin_transport_core::{PipelineCursors, WireSeq};
 use melin_transport_core::{TickWatermark, WarmApp};
 /// Internal alias for the disruptor-built pipeline, used only by
 /// destructuring `let Pipeline { … }` patterns inside the boot path.
@@ -517,6 +522,17 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = false)]
     pub no_mlock: bool,
 
+    /// Turn off output digests on this node.
+    ///
+    /// By default every node digests every report its copy of the
+    /// application produces, so that a replica can check its output
+    /// against its primary's. With this flag the node digests nothing. It
+    /// takes nothing a client sees and saves the digest's cost on the
+    /// response path; the node's output is then not checked. Logged as a
+    /// warning at startup.
+    #[arg(long, default_value_t = false)]
+    pub no_output_digests: bool,
+
     /// Bind address for the control-plane raft RPC listener. Setting this
     /// enables the control plane on this node: leader election runs and is
     /// observable via the `melin_raft_*` gauges. Requires `--raft-node-id`
@@ -625,6 +641,7 @@ impl Default for ServerConfig {
             snapshot_path: None,
             tick_interval_ms: 250,
             no_mlock: false,
+            no_output_digests: false,
             raft_bind: None,
             raft_node_id: None,
             raft_peer: Vec::new(),
@@ -677,6 +694,17 @@ impl ServerConfig {
     /// archives the snapshot.
     pub fn store(&self) -> Result<NodeStore, NodeStoreError> {
         NodeStore::resolve(self.journal.clone(), self.snapshot_path.clone())
+    }
+
+    /// [`store`](Self::store), refused if the node stopped for divergence
+    /// ([`NodeStore::refuse_if_diverged`]): what a node starts on, the one
+    /// place the refusal is made, before the journal is opened and the
+    /// control plane started. [`store`](Self::store) stays as it is, so a
+    /// test or tool can still resolve a stopped node's paths.
+    pub fn startup_store(&self) -> Result<NodeStore, NodeStoreError> {
+        let store = self.store()?;
+        store.refuse_if_diverged()?;
+        Ok(store)
     }
 
     /// `--max-journal-mib` in bytes: the live segment's size-rotation
@@ -967,7 +995,8 @@ where
     L: BlockingTransportListener,
 {
     check_keys_match_decoder(&*decoder, &authorized_keys)?;
-    run_impl::<A, L>(
+    let stop = OnceLock::new();
+    let result = run_impl::<A, L>(
         listener,
         config,
         startup,
@@ -977,7 +1006,118 @@ where
         event_publisher,
         authorized_keys,
         shutdown,
-    )
+        &stop,
+    );
+    node_exit(stop.get(), result, HALT_NOTICE_BOUND)
+}
+
+/// A node's fence and its divergence stop, made once its store is
+/// resolved, before its role is chosen: one of each per node, carried
+/// through a replica → primary transition.
+pub(crate) struct NodeStop {
+    pub(crate) fence: Arc<melin_transport_core::fence::FenceState>,
+    pub(crate) latch: DivergenceLatch,
+}
+
+impl NodeStop {
+    /// The fence at epoch 0 (a primary raises it to what its journal
+    /// recovered; a replica's receiver to what it recovers and streams),
+    /// and the latch writing its marker beside `store`'s journal.
+    fn new(store: &NodeStore, shutdown: &Arc<AtomicBool>) -> Self {
+        let fence = Arc::new(melin_transport_core::fence::FenceState::new(0));
+        let latch = DivergenceLatch::new(
+            Arc::clone(&fence),
+            Arc::clone(shutdown),
+            store.divergence_marker(),
+            Arc::new(FsSync),
+        );
+        Self { fence, latch }
+    }
+}
+
+/// A node stopped because the cluster's output diverged: what every node
+/// entry returns once its threads have stopped, whatever else ended the
+/// run. Its marker, if written, refuses every later start of the node.
+#[derive(Debug)]
+pub struct NodeDiverged {
+    /// Why the node stopped.
+    pub cause: HaltCause,
+    /// What became of the marker.
+    pub marker: MarkerOutcome,
+}
+
+impl std::fmt::Display for NodeDiverged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.cause {
+            HaltCause::Detected(d) => {
+                let (from, through) = d.positions();
+                write!(
+                    f,
+                    "this node stopped: its output diverged from its primary's between \
+                     positions {} and {}",
+                    from.get(),
+                    through.get()
+                )?;
+            }
+            HaltCause::ClusterHalted { by, via } => write!(
+                f,
+                "this node stopped: told by {by} via {via} that the cluster's output diverged"
+            )?,
+        }
+        match &self.marker {
+            MarkerOutcome::Written => write!(f, "; its marker refuses every restart"),
+            MarkerOutcome::Failed(e) => write!(
+                f,
+                "; its marker could not be written ({e}), so a restart may not be refused"
+            ),
+            MarkerOutcome::Unconfirmed => write!(
+                f,
+                "; its marker was not confirmed written, so a restart may not be refused"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NodeDiverged {}
+
+/// Every node entry's way out, once its threads have stopped. A node whose
+/// divergence stop tripped returns [`NodeDiverged`], after waiting up to
+/// `marker_bound` for its marker (the entries pass [`HALT_NOTICE_BOUND`]);
+/// anything else returns as it ran. A return rather than `process::exit`:
+/// a test or a host may run several nodes in one process.
+fn node_exit(
+    stop: Option<&NodeStop>,
+    result: Result<(), Box<dyn std::error::Error>>,
+    marker_bound: std::time::Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(stop) = stop.filter(|stop| stop.latch.is_tripped()) else {
+        return result;
+    };
+    let cause = stop
+        .latch
+        .cause()
+        .expect("a tripped latch holds its cause")
+        .clone();
+    if let Err(e) = result {
+        // Secondary to the stop: the run may have ended on an error
+        // because the stop shut it down.
+        info!(error = %e, "the node's run ended with an error after the divergence stop");
+    }
+    let marker = stop.latch.wait_marker(marker_bound);
+    match &marker {
+        MarkerOutcome::Written => {}
+        MarkerOutcome::Failed(e) => error!(
+            marker = %stop.latch.marker().display(),
+            error = %e,
+            "the divergence marker was not written: a restart of this node may not be refused"
+        ),
+        MarkerOutcome::Unconfirmed => error!(
+            marker = %stop.latch.marker().display(),
+            "the divergence marker was not confirmed written: a restart of this node may not \
+             be refused"
+        ),
+    }
+    Err(Box::new(NodeDiverged { cause, marker }))
 }
 
 /// Announce at boot that this binary was built without the
@@ -1002,6 +1142,33 @@ fn warn_if_chain_disabled() {
          segment-continuity and snapshot cross-checks at recovery, and \
          cross-node divergence detection are all disabled"
     );
+}
+
+/// Warn at startup when output digests are off: the node's output is then
+/// never checked against another copy's, which an operator should know
+/// rather than discover. `warn!` rather than `error!`: a configuration the
+/// operator chose, not a malfunction.
+fn warn_if_output_digests_off(config: &ServerConfig) {
+    if config.no_output_digests {
+        warn!(
+            "output digests are off (--no-output-digests): this node digests none of its \
+             reports, so its output is not checked against any other copy's"
+        );
+    }
+}
+
+/// The output digester for a pipeline that applies its first live entry
+/// at `first_live`, with the reader of the board it publishes to; `None`
+/// unless `enabled` (`--no-output-digests` unset): the primary's response
+/// stage's, on either transport. A replica's drain builds its own beside
+/// its encoder, from the same constructor.
+fn output_digester(
+    enabled: bool,
+    first_live: WireSeq,
+    cursors: &PipelineCursors,
+    ring_capacity: RingCapacity,
+) -> Option<(OutputDigester, DigestBoardReader)> {
+    enabled.then(|| OutputDigester::for_pipeline(first_live, cursors, ring_capacity))
 }
 
 /// Log the layout the node runs, and warn when it leaves a mandatory
@@ -1048,6 +1215,9 @@ fn run_impl<A, L>(
     event_publisher: Option<EventPublisherFn<A>>,
     authorized_keys: Arc<AuthorizedKeys>,
     shutdown: Arc<AtomicBool>,
+    // Filled with the node's stop once its store is resolved, for the
+    // entry's exit (`node_exit`) to read whichever way this returns.
+    stop_slot: &OnceLock<NodeStop>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     A: Application + Send + 'static,
@@ -1057,6 +1227,7 @@ where
     L: BlockingTransportListener,
 {
     warn_if_chain_disabled();
+    warn_if_output_digests_off(&config);
 
     // The layout every spawn site below reads, refused outright if two
     // threads would starve each other.
@@ -1085,8 +1256,13 @@ where
     validate_primary_config(&config)?;
     // Where this node's journal and snapshot are, for every role below.
     // Resolved here, with the configuration's other checks: it refuses a
-    // layout the node must not start on, and writes nothing.
-    let store = config.store()?;
+    // layout the node must not start on, and a node stopped for
+    // divergence, and writes nothing.
+    let store = config.startup_store()?;
+    // The node's fence and divergence stop, before any role is chosen:
+    // both outlive a replica → primary transition, and the entry's exit
+    // reads the stop.
+    let stop = stop_slot.get_or_init(|| NodeStop::new(&store, &shutdown));
 
     // Bind the replication listener up front, before any pipeline thread
     // exists and regardless of role: a bad or stolen --replication-bind
@@ -1146,7 +1322,7 @@ where
         // mode-detection so it survives a replica → primary transition.
         // The rotate flag is re-wired into the new primary's journal
         // stage by `run_as_primary`.
-        let control = crate::replication::ReplicaControlPlane::new();
+        let control = crate::replication::ReplicaControlPlane::new(stop.latch.clone());
         let promotion_request = control.promote.clone();
         let rotate_flag = config.admin_bind.map(|_| Arc::new(AtomicBool::new(false)));
         let _admin_handle = config
@@ -1168,7 +1344,7 @@ where
         // receiver raises it from the replica's recovered journal and the
         // replication stream, and a promotion bumps it by injecting an
         // `EpochBump`. Carried into `run_as_primary` post-promotion.
-        let fence_state = Arc::new(melin_transport_core::fence::FenceState::new(0));
+        let fence_state = Arc::clone(&stop.fence);
 
         // Control-plane raft (observational election). Spawned before the
         // receive loop so the driver — like the fence state and admin
@@ -1229,6 +1405,7 @@ where
             &fence_state,
             raft_status.as_ref(),
             Arc::clone(&control.pipeline_healthy),
+            Arc::clone(&control.output_checks),
         )?;
 
         // No local rotation triggers on the replica side: segment
@@ -1252,6 +1429,7 @@ where
             config.replication_pipeline_depth,
             Arc::clone(&fence_state),
             &sizing,
+            (!config.no_output_digests).then(|| Arc::clone(&encoder)),
         )? {
             // Clean shutdown — the raft and health guards tear down on drop.
             None => return Ok(()),
@@ -1305,7 +1483,7 @@ where
                     authorized_keys,
                     rotate_flag,
                     ack_policy,
-                    fence_state,
+                    stop,
                     control.lineage_ack_policy.load(),
                     // promoted — EpochBump with the origin's epoch floor
                     promotion_request.pending().map(|origin| PromotedTenure {
@@ -1364,10 +1542,10 @@ where
     <A as Application>::prefault(&mut app, &sizing);
 
     // A primary booting directly (not via promotion) keeps whatever epoch
-    // its journal recovered; no bump.
-    let fence_state = Arc::new(melin_transport_core::fence::FenceState::new(
-        recovered_lineage.epoch,
-    ));
+    // its journal recovered; no bump. The node's one fence, at epoch 0
+    // until here, takes it.
+    stop.fence.observe_epoch(recovered_lineage.epoch);
+    let fence_state = Arc::clone(&stop.fence);
 
     // Control-plane raft (observational election). The primary needs the
     // replication signing key only when raft is on — peer links
@@ -1417,7 +1595,7 @@ where
         authorized_keys,
         rotate_flag,
         ack_policy,
-        fence_state,
+        stop,
         recovered_lineage.ack_policy,
         None, // not promoted — no EpochBump injection
         began_history,
@@ -1801,7 +1979,8 @@ fn run_as_primary<A, L>(
     // The ack-policy mailbox: the policy this primary requests as it
     // starts, and the `ACK-POLICY` requests its reader journals.
     ack_policy: Arc<crate::policy_control::AckPolicyControl>,
-    fence_state: Arc<melin_transport_core::fence::FenceState>,
+    // The node's fence and divergence stop.
+    stop: &NodeStop,
     // The ack policy the lineage has in force (`Lineage::ack_policy`): the
     // recovered one at boot, the replica's record of it at promotion.
     // Seeds the shadow stage's lineage next to the fence epoch, and the
@@ -1827,6 +2006,7 @@ where
     A::QueryResponse: Send + 'static,
     L: BlockingTransportListener,
 {
+    let fence_state = Arc::clone(&stop.fence);
     // Active connection counter shared between accept loop, response
     // stage, and matching stage (for stats queries).
     // Incremented on successful auth, decremented on disconnect.
@@ -1874,6 +2054,7 @@ where
         chain_hash_lock,
         replication_ring_progress,
         cursors,
+        first_live,
     } = build_pipeline_with_replication(
         app,
         tick_watermark,
@@ -1959,6 +2140,18 @@ where
     // tip (durable cursor after each fsync batch). On the promotion path
     // this takes over the handle the receiver was advancing.
     journal_stage.set_advertised_tip_publisher(journal_tip.clone());
+    // The response stage's output digester; its board goes to the journal
+    // stage, which forwards the primary's digests to its replicas.
+    let digester = output_digester(
+        !config.no_output_digests,
+        first_live,
+        &cursors,
+        config.ring_capacity,
+    )
+    .map(|(digester, board)| {
+        journal_stage.set_output_digests(board);
+        digester
+    });
     if config.max_journal_mib > 0 {
         info!(
             max_journal_mib = config.max_journal_mib,
@@ -2054,6 +2247,7 @@ where
     // the report never blocks the stage on this thread reaching `recv`.
     let (response_ready_tx, response_ready_rx) = std::sync::mpsc::sync_channel(1);
     let degraded_release = config.degraded_release(replicas_connected.as_ref());
+    let response_latch = stop.latch.clone();
     stages.response = Some(
         melin_app::affinity::spawn_placed("response", cores.response.core, move || {
             let started = crate::response::run::<A>(
@@ -2074,6 +2268,8 @@ where
                     ring_sizing,
                     ready: Some(response_ready_tx),
                     degraded_release,
+                    digester,
+                    latch: response_latch,
                     #[cfg(test)]
                     pause_after_control_drain: None,
                 },
@@ -2154,6 +2350,7 @@ where
             .ok_or("replication_metrics must be Some when replication is enabled")?;
         let handlers = [cores.repl_handler_0, cores.repl_handler_1];
         let sender_fence = Arc::clone(&fence_state);
+        let sender_latch = stop.latch.clone();
         // Bound in `run_impl` before any pipeline thread was spawned —
         // see the `repl_listener` parameter doc.
         let repl_listener = repl_listener
@@ -2188,6 +2385,7 @@ where
                         batch_size,
                         heartbeat_secs,
                         fence_state: sender_fence,
+                        latch: sender_latch,
                     },
                     &s_repl,
                     &ready_flag,
@@ -2540,7 +2738,8 @@ where
     check_keys_match_decoder(&*decoder, &authorized_keys)?;
     let dpdk_config = dpdk_config_from(&config)?;
 
-    run_dpdk_impl::<A>(
+    let stop = OnceLock::new();
+    let result = run_dpdk_impl::<A>(
         config,
         startup,
         sizing,
@@ -2550,7 +2749,9 @@ where
         authorized_keys,
         dpdk_config,
         shutdown,
-    )
+        &stop,
+    );
+    node_exit(stop.get(), result, HALT_NOTICE_BOUND)
 }
 
 /// Translate the CLI surface into a [`melin_dpdk::DpdkConfig`]: the NIC
@@ -2593,6 +2794,8 @@ fn run_dpdk_impl<A>(
     authorized_keys: Arc<AuthorizedKeys>,
     dpdk_config: melin_dpdk::DpdkConfig,
     shutdown: Arc<AtomicBool>,
+    // As `run_impl`'s.
+    stop_slot: &OnceLock<NodeStop>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     A: Application + Send + 'static,
@@ -2601,6 +2804,7 @@ where
     A::QueryResponse: Send + 'static,
 {
     warn_if_chain_disabled();
+    warn_if_output_digests_off(&config);
 
     // As on the kernel-TCP path: resolve the layout once, up front. The
     // reader entry pins the NIC poll thread here, which never yields.
@@ -2632,8 +2836,10 @@ where
     // once promoted.
     validate_primary_config(&config)?;
     // As on the kernel-TCP path: the node's journal and snapshot, for
-    // every role below, refused before anything touches the disk.
-    let store = config.store()?;
+    // every role below, refused before anything touches the disk, and the
+    // node's fence and divergence stop.
+    let store = config.startup_store()?;
+    let stop = stop_slot.get_or_init(|| NodeStop::new(&store, &shutdown));
     // Initialize shared DPDK resources (EAL, mempool, ports with N queues).
     let shared = melin_dpdk::DpdkShared::init(&dpdk_config)?;
     // Actual queue count may be less than requested (TAP only supports 1).
@@ -2677,7 +2883,7 @@ where
 
         // The replica's control-plane bundle, same shape as the kernel
         // TCP replica path — see `run` for the rationale on lifetime.
-        let control = crate::replication::ReplicaControlPlane::new();
+        let control = crate::replication::ReplicaControlPlane::new(stop.latch.clone());
         let promotion_request = control.promote.clone();
         let rotate_flag = config.admin_bind.map(|_| Arc::new(AtomicBool::new(false)));
         let _admin_handle = config
@@ -2699,7 +2905,7 @@ where
         // receiver raises it from the replica's recovered journal and the
         // replication stream, and a promotion bumps it by injecting an
         // `EpochBump`. Carried into `run_as_primary_dpdk` post-promotion.
-        let fence_state = Arc::new(melin_transport_core::fence::FenceState::new(0));
+        let fence_state = Arc::clone(&stop.fence);
 
         // Control-plane raft runs on kernel TCP even on DPDK nodes — the
         // control plane is off the hot path and must not consume a DPDK
@@ -2752,6 +2958,7 @@ where
             &fence_state,
             raft_status.as_ref(),
             Arc::clone(&control.pipeline_healthy),
+            Arc::clone(&control.output_checks),
         )?;
 
         // No local rotation triggers on the replica side — rotation is
@@ -2792,6 +2999,7 @@ where
             config.replication_pipeline_depth,
             Arc::clone(&fence_state),
             &sizing,
+            (!config.no_output_digests).then(|| Arc::clone(&encoder)),
         )? {
             // Clean shutdown — the raft and health guards tear down on drop.
             None => return Ok(()),
@@ -2866,7 +3074,7 @@ where
                     authorized_keys,
                     rotate_flag,
                     ack_policy,
-                    fence_state,
+                    stop,
                     control.lineage_ack_policy.load(),
                     // promoted — EpochBump with the origin's epoch floor
                     promotion_request.pending().map(|origin| PromotedTenure {
@@ -2933,10 +3141,10 @@ where
     )?;
     <A as Application>::prefault(&mut app, &sizing);
 
-    // Fencing state for this DPDK primary, seeded with the recovered epoch.
-    let fence_state = Arc::new(melin_transport_core::fence::FenceState::new(
-        recovered_lineage.epoch,
-    ));
+    // Fencing state for this DPDK primary: the node's one fence, raised
+    // to the recovered epoch.
+    stop.fence.observe_epoch(recovered_lineage.epoch);
+    let fence_state = Arc::clone(&stop.fence);
 
     // Control-plane raft (kernel TCP even on DPDK — off the hot path, no
     // DPDK queue consumed). Signing key loaded only when raft is on.
@@ -3003,7 +3211,7 @@ where
         authorized_keys,
         rotate_flag,
         ack_policy,
-        fence_state,
+        stop,
         recovered_lineage.ack_policy,
         None, // not promoted — no EpochBump injection
         raft_status,
@@ -3049,7 +3257,8 @@ fn run_as_primary_dpdk<A>(
     authorized_keys: Arc<AuthorizedKeys>,
     rotate_flag: Option<Arc<AtomicBool>>,
     ack_policy: Arc<crate::policy_control::AckPolicyControl>,
-    fence_state: Arc<melin_transport_core::fence::FenceState>,
+    // As `run_as_primary`'s.
+    stop: &NodeStop,
     // As `run_as_primary`'s.
     lineage_ack_policy: Option<LineagePolicy>,
     promotion: Option<PromotedTenure>,
@@ -3062,6 +3271,7 @@ where
     A::Report: Send + 'static,
     A::QueryResponse: Send + 'static,
 {
+    let fence_state = Arc::clone(&stop.fence);
     // Re-checked, as in `run_as_primary`: a promotion reaches here without
     // the boot-time check.
     validate_primary_config(config)?;
@@ -3102,6 +3312,7 @@ where
         chain_hash_lock,
         replication_ring_progress,
         cursors,
+        first_live,
     } = build_pipeline_with_replication(
         app,
         tick_watermark,
@@ -3182,6 +3393,18 @@ where
     // tip (durable cursor after each fsync batch). On the promotion path
     // this takes over the handle the receiver was advancing.
     journal_stage.set_advertised_tip_publisher(journal_tip.clone());
+    // The response stage's output digester; its board goes to the journal
+    // stage, which forwards the primary's digests to its replicas.
+    let digester = output_digester(
+        !config.no_output_digests,
+        first_live,
+        &cursors,
+        config.ring_capacity,
+    )
+    .map(|(digester, board)| {
+        journal_stage.set_output_digests(board);
+        digester
+    });
     if config.max_journal_mib > 0 {
         info!(
             max_journal_mib = config.max_journal_mib,
@@ -3248,6 +3471,7 @@ where
     let s3 = Arc::clone(&shutdown);
     let response_utilization_thread = Arc::clone(&response_utilization);
     let degraded_release = config.degraded_release(replicas_connected.as_ref());
+    let response_latch = stop.latch.clone();
     stages.response = Some(
         melin_app::affinity::spawn_placed("response", cores.response.core, move || {
             crate::dpdk_response::run::<A>(
@@ -3266,6 +3490,8 @@ where
                 encoder,
                 early_rx,
                 degraded_release,
+                digester,
+                response_latch,
                 #[cfg(test)]
                 None,
             );
@@ -3374,6 +3600,7 @@ where
             heartbeat_secs,
             Arc::clone(&fence_state),
             Arc::clone(&authorized_keys),
+            stop.latch.clone(),
         )?;
         // Legacy text match — `lan-bench-suite.sh` `wait_for_log` keys
         // off "DPDK replication sender started" to know the primary
@@ -4250,6 +4477,8 @@ fn spawn_health_endpoint(
             matching_utilization: Arc::clone(matching_utilization),
             response_utilization: Arc::clone(response_utilization),
             raft: raft_status.clone(),
+            // A primary compares nothing: its replicas check against it.
+            output_checks: None,
         },
         Arc::clone(shutdown),
     )?))
@@ -4602,6 +4831,111 @@ mod tests {
             forgotten_value.is_err(),
             "a forgotten value must error, not swallow the next flag"
         );
+    }
+
+    /// The entries' exit: a run whose stop never tripped returns as it
+    /// ran; a tripped one returns `NodeDiverged`, and with its marker
+    /// write hung, `Unconfirmed` once the bound has passed rather than
+    /// waiting for the disk.
+    #[test]
+    fn the_exit_reports_a_stop_and_never_waits_past_the_bound() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Barrier};
+        use std::time::{Duration, Instant};
+
+        use melin_transport_core::divergence::test_sync::Hanging;
+        use melin_transport_core::divergence::{
+            DivergenceLatch, HaltCause, HaltedBy, MarkerOutcome, NoticePath,
+        };
+        use melin_transport_core::fence::FenceState;
+
+        use super::{NodeDiverged, NodeStop, node_exit};
+
+        let bound = Duration::from_millis(50);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let barrier = Arc::new(Barrier::new(2));
+        let fence = Arc::new(FenceState::new(0));
+        let stop = NodeStop {
+            fence: Arc::clone(&fence),
+            latch: DivergenceLatch::new(
+                fence,
+                Arc::new(AtomicBool::new(false)),
+                dir.path().join("node.journal.diverged"),
+                Arc::new(Hanging(Arc::clone(&barrier))),
+            ),
+        };
+
+        assert!(node_exit(Some(&stop), Ok(()), bound).is_ok(), "not tripped");
+        assert!(
+            node_exit(None, Ok(()), bound).is_ok(),
+            "never resolved a store"
+        );
+
+        stop.latch.trip_with(HaltCause::ClusterHalted {
+            by: HaltedBy::Primary,
+            via: NoticePath::HaltFrame,
+        });
+        let started = Instant::now();
+        let error = node_exit(Some(&stop), Ok(()), bound).expect_err("a stopped node");
+        let elapsed = started.elapsed();
+        assert!(elapsed >= bound, "{elapsed:?}");
+        // Well short of the marker, which never lands while the barrier
+        // holds: the exit returned at its bound, not at the disk's pace.
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+        let diverged = error
+            .downcast_ref::<NodeDiverged>()
+            .expect("a NodeDiverged");
+        assert!(matches!(diverged.marker, MarkerOutcome::Unconfirmed));
+        assert!(
+            error.to_string().contains("not confirmed written"),
+            "{error}"
+        );
+        // Let the marker thread finish.
+        barrier.wait();
+    }
+
+    /// Output digests are on by default and off with the flag: a node with
+    /// them off builds no digester and says so once at startup, at `warn`;
+    /// one with them on builds one and says nothing.
+    #[test]
+    fn output_digests_are_on_unless_turned_off_and_off_is_warned() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+
+        use clap::Parser;
+        use melin_transport_core::test_logs::{Logs, level};
+        use melin_transport_core::{PipelineCursors, WireSeq};
+
+        use super::{ServerConfig, output_digester, warn_if_output_digests_off};
+
+        let parsed = ServerConfig::try_parse_from(["melin"]).expect("defaults parse");
+        assert!(!parsed.no_output_digests, "on by default");
+        let off = ServerConfig::try_parse_from(["melin", "--no-output-digests"]).expect("parses");
+        assert!(off.no_output_digests);
+
+        let cursors = PipelineCursors::new(
+            WireSeq::new(0),
+            Arc::new(melin_pipeline::padding::Sequence::new(AtomicU64::new(0))),
+            Arc::new(melin_pipeline::padding::Sequence::new(AtomicU64::new(0))),
+        );
+        let build = |enabled| {
+            output_digester(enabled, WireSeq::new(1), &cursors, super::RingCapacity::MIN).is_some()
+        };
+        assert!(build(true));
+        assert!(!build(false));
+
+        const WARNING: &str = "output digests are off";
+        let warned = |config: &ServerConfig| {
+            let logs = Logs::default();
+            tracing::subscriber::with_default(logs.subscriber(tracing::Level::DEBUG), || {
+                warn_if_output_digests_off(config);
+            });
+            logs.lines(WARNING)
+        };
+        let lines = warned(&off);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(level(&lines[0]), tracing::Level::WARN);
+        assert!(warned(&parsed).is_empty());
     }
 
     /// `--ring-capacity` defaults to the pipeline's default, on a bare
@@ -5950,6 +6284,7 @@ mod primary_gate_policy_tests {
             output,
             Arc::new(AtomicU64::new(0)),
             DurableWireSeqCursor::detached(WireSeq::new(0)),
+            melin_transport_core::AppliedWireSeqCursor::detached(WireSeq::new(0)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(FenceState::new(0)),
             WaitStrategy::SpinThenYield,

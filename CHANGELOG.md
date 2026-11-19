@@ -14,6 +14,45 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Added
 
+- **Output digests**: every node digests the bytes of every report its
+  copy of the application produces, in windows of 64 journal positions,
+  chained (XXH3-128): the primary in its response stage, sent or not, a
+  replica in its drain. The primary streams its digests to its replicas,
+  and each replica compares them with its own: a replica whose output
+  differs from its primary's stops the whole cluster (see **Changed**).
+  `--no-output-digests` (`ServerConfig::no_output_digests`) turns it off
+  on a node, with a warning at startup.
+- **`melin_output_checks_total`**: on a replica's health endpoint, the
+  windows of its output found equal to its primary's. Flat under traffic
+  means the replica is not checking. `health::HealthState` gains
+  `output_checks`, and `HealthState::for_replica` takes the counter
+  (breaking for code that builds either).
+- **`melin_transport_core::output_digest`**: the building blocks.
+  `WindowFolder` digests one copy's reports in fixed windows of
+  `OUTPUT_DIGEST_WINDOW` positions and chains the window digests;
+  `OutputDigester` drives one from an output ring's consumer; the digest
+  board publishes each closed window to readers on other threads;
+  `encode_app_body` is the one application body encode, which the response
+  stages' framing goes through. `MAX_RESPONSE_BODY` moves here and is still
+  re-exported at the root of `melin-server-runtime`. `DigestComparator`
+  checks one copy's windows against the primary's chain values, run by
+  run, and trips a `Trip` once on a mismatch, reported as a `Divergence`;
+  `first_window_end` is the first window a copy digests whole.
+  `JournalStage::set_output_digests` hands the journal stage the board it
+  forwards the primary's digests from (see **Changed**).
+- **The divergence stop, on one node**: `melin_transport_core::divergence`
+  holds `DivergenceLatch`, tripped once by its first `HaltCause`. It
+  fences the node, stops its threads, sends nothing more to clients,
+  logs the cause at `error!`, and writes a marker beside the journal
+  (`NodeStore::divergence_marker`, `<journal>.diverged`). A node whose
+  marker exists refuses to start (`NodeStore::refuse_if_diverged`,
+  through the new `ServerConfig::startup_store`), and a stopped node's run
+  returns `server::NodeDiverged`. A replica's output check trips it on a
+  mismatch, as does a stop the node is told of; tests can trip it through
+  a seam (`divergence::test_seam`, behind `test-utils`).
+- **`melin_transport_core::AppliedWireSeqCursor`**, reached through
+  `PipelineCursors::applied_wire_seq`: how far the matching stage has
+  applied, published once per batch after its output slots.
 - **`melin_pipeline::spsc::Producer::push_with_unless`**: the blocking
   push, given up with `Stopped`, having written nothing, if a stop flag is
   set while it waits for room. A push with room never reads the flag.
@@ -89,6 +128,30 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Changed
 
+- **A replica whose output differs from its primary's stops the whole
+  cluster**, whatever build each node runs: it stops, tells its primary,
+  which stops and tells its other replicas, and every node leaves a
+  marker that refuses its restart; the way back is a new cluster (see
+  "Output verification" in `docs/replication.md`). So an application
+  upgrade that changes the output for the same input can no longer roll
+  node by node with output digests on: stop every node and start them
+  all on the new build.
+- **`ResponseEncoder::encode_report` is called for every report**,
+  including those no client receives (a tick's, a disconnected client's,
+  every report on a replica), since every report is digested; and it must
+  be deterministic across nodes, not only within one: no node identity in
+  a body. An encode error is logged only for a reply to a connection the
+  node holds. Applications whose encoder already follows its purity
+  contract need no change.
+- **`NodeStoreError::Diverged`** is a new variant of an exhaustive enum
+  (breaking for a `match` on it).
+- **Breaking for code that builds these by hand**: `ServerConfig` gains
+  `no_output_digests`; `response::Response` gains `digester` and `latch`;
+  `pipeline::Pipeline` and `pipeline::ReplicaPipeline` gain `first_live`;
+  `MatchingStage::new` takes an `AppliedWireSeqCursor` after the durable
+  cursor; `replication::Sender` gains `latch`; `ReplicaControlPlane::new`
+  takes the node's `DivergenceLatch`, and `ReplicaControlPlane` no longer
+  implements `Default`.
 - **A cluster has at most three raft voters** (breaking for deployments
   listing more): the primary and one per replica slot, as
   `melin_raft::MAX_VOTERS`. A node refuses to start with more
@@ -119,7 +182,26 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   frames; `encode_unversioned_challenge_response`,
   `encode_unversioned_auth_ok`, `encode_version_refused`,
   `admits_replica_version` and `MSG_VERSION_REFUSED` are new. Control-plane
-  links keep the unversioned frames, and their wire is unchanged.
+  links keep the unversioned frames, and their wire is unchanged. Also in
+  protocol 9: a replica's `Ack` and `Handshake` gain a flag byte, whose one
+  bit (`FLAG_STOPPED`) says the replica stopped for divergence, and the
+  primary's new `Halt` frame (`MSG_HALT`) says it has. A stopped replica
+  stops its primary, which stops every replica streaming from it.
+  `ReplicaMessage` gains `StoppedAck`, `StoppedHandshake` and
+  `UnknownFlags` (an unknown flag bit is refused, never read as a stop or
+  as no stop), `PrimaryMessage` gains `Halt`, each breaking for a `match`
+  on it; `encode_stopped_ack`, `encode_stopped_handshake` and
+  `encode_halt` are new. And the primary's new `Digest` frame
+  (`MSG_DIGEST`, 0x19; 26 bytes: the tag, a digest-kind byte, the window
+  end as a `u64` LE and the 16-byte chain value) carries its output
+  digest chain at a window end, in a batch's replication slot right after
+  the batch, naming no window past the batch's end and each window at
+  most once; a replica compares it with its own output, refuses kind 0 or
+  a window end off the 64-position grid as a protocol error, and skips a
+  kind it does not know. `PrimaryMessage` gains `Digest` (breaking for a `match` on
+  it); `encode_digest` and `DIGEST_FRAME_LEN` (30, the frame with its
+  length prefix, which the journal stage reserves out of each batch's
+  slot) are new.
 - **`encode_rotate` and `encode_chain_check` return the frame**
   (breaking, in `melin_transport_core::replication::protocol`): each
   returns `[u8; SEQ_HASH_FRAME_LEN]`, length prefix included, instead of
@@ -300,6 +382,16 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Fixed
 
+- **A raft directory created on a journal that has failed over no longer
+  holds auto-promotion back.** A promotion's election term becomes its
+  fencing epoch, so it is refused unless the term is above the epoch in
+  force; a fresh raft directory started its terms at zero, and a cluster
+  re-provisioned (or a voter replaced) on such a journal could promote
+  only manually until enough elections had passed. A node now raises its
+  control-plane term to its journal's epoch as it starts, which also
+  clears terms left behind by manual promotions once the node restarts.
+  The control plane now starts once the node's journal is recovered, so
+  a recovering replica takes no part in elections until then.
 - **`melin_transport_core::test_ports::free_addr` (behind `test-utils`)
   no longer hands a test process a port another test process still
   uses.** Each port it hands out is now claimed, with a lock file in

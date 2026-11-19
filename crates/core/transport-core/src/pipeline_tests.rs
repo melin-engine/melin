@@ -26,7 +26,7 @@ use melin_pipeline::wait::WaitStrategy;
 
 #[cfg(not(feature = "no-persist"))]
 use crate::cursors::SlotAcked;
-use crate::cursors::{DurableWireSeqCursor, WireSeq};
+use crate::cursors::{AppliedWireSeqCursor, DurableWireSeqCursor, WireSeq};
 use crate::dispatch::TickWatermark;
 // Only the tests that recover or promote over a journal name it, and
 // no-persist gates those off.
@@ -239,6 +239,7 @@ fn matching_stage_processes_events() {
         output_producer,
         events_counter,
         dummy_cursor,
+        AppliedWireSeqCursor::detached(WireSeq::new(0)),
         active_conns,
         Arc::new(crate::fence::FenceState::new(0)),
         WaitStrategy::SpinThenYield,
@@ -314,6 +315,8 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
     // observed epoch (it is sequenced like any non-query event but never
     // reaches the application).
     let fence = Arc::new(crate::fence::FenceState::new(0));
+    // Where the stage publishes how far it has applied, checked below.
+    let applied = AppliedWireSeqCursor::detached(WireSeq::new(STARTING_WIRE_SEQ - 1));
     let stage = MatchingStage::new(
         app,
         TickWatermark::GENESIS,
@@ -321,6 +324,7 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
         output_producer,
         events_counter,
         dummy_cursor,
+        applied.clone(),
         active_conns,
         Arc::clone(&fence),
         WaitStrategy::SpinThenYield,
@@ -396,6 +400,20 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
         vec![10, 10, 11, 12, 13, 14, 15],
         "wire_seq stamping diverged from the journal allocator's per-event rule"
     );
+
+    // The applied cursor reaches the last allocated position, the query's
+    // allocating none, once the batch's slots are published. Stored right
+    // after the commit that made them visible, so it may trail the drain
+    // above by a moment.
+    let applied_start = std::time::Instant::now();
+    while applied.load() != WireSeq::new(15) {
+        assert!(
+            applied.load() <= WireSeq::new(15),
+            "applied past the last allocated position: {:?}",
+            applied.load()
+        );
+        drain_backoff(&mut spins, applied_start, "waiting for the applied cursor");
+    }
 
     // The EpochBump must have advanced the observed epoch without ever
     // touching application state, and the policy change after it must
@@ -538,6 +556,7 @@ where
         output_producer,
         Arc::new(AtomicU64::new(0)),
         dummy_durable_cursor(),
+        AppliedWireSeqCursor::detached(WireSeq::new(0)),
         Arc::new(AtomicU64::new(0)),
         Arc::new(crate::fence::FenceState::new(0)),
         WaitStrategy::SpinThenYield,
@@ -2052,10 +2071,14 @@ fn spawn_replication_relay(
             let mut got_something = false;
             if let Some(batch) = repl_c0.peek() {
                 let data = batch.data();
-                let payload_len =
-                    u32::from_le_bytes(data[..4].try_into().expect("4-byte length prefix"))
-                        as usize;
-                let payload = &data[4..4 + payload_len];
+                // One frame per slot: this relay's primary forwards no
+                // output digests.
+                assert_eq!(
+                    crate::replication_wire::chunk_frames(data).count(),
+                    1,
+                    "one frame per slot"
+                );
+                let payload = &data[4..];
                 if peek_frame_tag(data).expect("relay frame tag") == MSG_INPUT_BATCH {
                     let slots: Vec<TestInput> =
                         try_decode_input_batch(payload).expect("relay InputBatch decode");
@@ -3448,6 +3471,145 @@ fn primary_emits_chain_check_every_interval() {
         melin_journal::segment::ChainValueAt::Value(v) => assert_eq!(chain_hash, v),
         other => panic!("chain at {interval} must exist: {other:?}"),
     }
+}
+
+/// Through the real journal stage, handed the response stage's board with
+/// `set_output_digests`: a batch's slot is its `InputBatch` frame, then
+/// the primary's output digest when one is due, naming a window at or
+/// below the batch's end, each window once, with the board's chain value.
+/// A window the response stage closes only after the journal stage passed
+/// it goes out with the next batch; one closed ahead of the journal stage
+/// (by the applied cursor) waits for the batch that reaches it. One slot
+/// per batch, by waiting for each fsync before the next entry.
+#[cfg(not(feature = "no-persist"))]
+#[test]
+fn primary_emits_output_digest_after_its_position() {
+    use crate::output_digest::{
+        BoardLookup, BoardSize, OUTPUT_DIGEST_WINDOW as K, ReportBody, WindowFolder, digest_board,
+    };
+    use crate::replication::protocol::{PrimaryMessage, decode_primary_message};
+    use crate::replication_wire::{MSG_INPUT_BATCH, chunk_frames, peek_frame_tag};
+    use melin_pipeline::seqlock;
+
+    let dir = tempfile::tempdir().unwrap();
+    let writer = Writer::create(&dir.path().join("digests.journal"), PREALLOC).unwrap();
+    let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(256)
+        .add_consumer()
+        .build(WaitStrategy::SpinThenYield);
+    let mut stage = JournalStage::new(
+        writer,
+        consumers.pop().unwrap(),
+        Duration::ZERO,
+        MAX_JOURNAL_BATCH,
+        WaitStrategy::SpinThenYield,
+    );
+    let (repl_producer, mut repl_consumers) = melin_journal::replication::build_replication_ring(
+        1,
+        REPLICATION_RING_CAPACITY,
+        WaitStrategy::SpinThenYield,
+    );
+    // The second replica slot stays inactive.
+    let (idle_producer, _idle_consumers) = melin_journal::replication::build_replication_ring(
+        1,
+        REPLICATION_RING_CAPACITY,
+        WaitStrategy::SpinThenYield,
+    );
+    stage.set_replication_producers(
+        [repl_producer, idle_producer],
+        [
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        ],
+        [
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+        ],
+    );
+    let (board_writer, board) = digest_board(BoardSize::new(8).unwrap());
+    // The response stage's folder, driven from this thread.
+    let mut folder = WindowFolder::new(WireSeq::new(1), board_writer);
+    stage.set_output_digests(board.clone());
+    let (fsync_writer, fsync_state) = seqlock::split(crate::pipeline::FsyncState::default());
+    stage.set_chain_hash_lock(fsync_writer);
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let s = Arc::clone(&shutdown);
+    let handle = std::thread::spawn(move || stage.run(&s));
+    let mut publish_through = |from: u64, through: u64| {
+        for seq in from..=through {
+            producer.publish(add_slot(seq, 1_000_000_000 + seq));
+            assert!(
+                wait_until(|| fsync_state.load().journal_seq.get() >= seq),
+                "fsync of seq {seq} never landed"
+            );
+        }
+    };
+    let close_through = |folder: &mut WindowFolder, through: u64| {
+        folder.fold(
+            WireSeq::new(through),
+            ReportBody::Encoded(&through.to_le_bytes()),
+        );
+        folder.close_through(WireSeq::new(through));
+    };
+
+    // The response stage lags: window K closes only after the journal
+    // stage passed it, and goes out with the next batch.
+    publish_through(1, K + 3);
+    close_through(&mut folder, K);
+    publish_through(K + 4, K + 4);
+    // The response stage runs ahead: windows 2K and 3K close before the
+    // journal stage reaches them, and each goes out with the batch that
+    // does.
+    close_through(&mut folder, 3 * K);
+    publish_through(K + 5, 3 * K + 2);
+    shutdown.store(true, Ordering::Relaxed);
+    handle.join().unwrap().unwrap();
+
+    let chain_at = |end: u64| match board.get(WireSeq::new(end)) {
+        BoardLookup::Closed(window) => *window.chain.as_bytes(),
+        other => panic!("window {end} not on the board: {other:?}"),
+    };
+    let mut batches = 0u64;
+    let mut digests = Vec::new();
+    while let Some(slot) = repl_consumers[0].peek() {
+        let end_seq = slot.meta().end_sequence;
+        let frames: Vec<&[u8]> = chunk_frames(slot.data())
+            .map(|f| f.expect("whole frames"))
+            .collect();
+        let data = frames[0];
+        if peek_frame_tag(data).unwrap() == MSG_INPUT_BATCH {
+            batches += 1;
+            assert!(frames.len() <= 2, "a batch and at most one digest");
+            if let Some(rest) = frames.get(1) {
+                assert_eq!(rest.len(), crate::replication::protocol::DIGEST_FRAME_LEN);
+                match decode_primary_message(&rest[4..]).unwrap() {
+                    PrimaryMessage::Digest {
+                        window_end, chain, ..
+                    } => {
+                        assert!(window_end <= end_seq, "{window_end} past {end_seq}");
+                        assert_eq!(chain, chain_at(window_end));
+                        digests.push((end_seq, window_end));
+                    }
+                    other => panic!("not a digest after a batch: {other:?}"),
+                }
+            }
+        } else {
+            // A live-stream `ChainCheck`, with the hash chain on: its own
+            // slot, never a digest.
+            assert_eq!(frames.len(), 1);
+            assert!(matches!(
+                decode_primary_message(&data[4..]).unwrap(),
+                PrimaryMessage::ChainCheck { .. }
+            ));
+        }
+        slot.commit();
+    }
+    assert_eq!(batches, 3 * K + 2, "one slot per batch");
+    assert_eq!(
+        digests,
+        [(K + 4, K), (2 * K, 2 * K), (3 * K, 3 * K)],
+        "each window once, with the first batch that reaches it"
+    );
 }
 
 /// End-to-end primary → replica with primary-driven rotation: the
@@ -4919,12 +5081,14 @@ fn a_full_batch_always_fits_both_rings() {
         );
 
         // Each entry reaches replication with its magic stripped
-        // (`last_user_entry_replication_slice`), under one frame header.
-        let repl_bytes =
-            crate::replication_wire::FRAME_HEADER_LEN + batch * (entry - REPLICATION_SLICE_TRIM);
+        // (`last_user_entry_replication_slice`), under one frame header,
+        // and the slot carries the primary's output digest after it.
+        let repl_bytes = crate::replication_wire::FRAME_HEADER_LEN
+            + batch * (entry - REPLICATION_SLICE_TRIM)
+            + crate::replication::protocol::DIGEST_FRAME_LEN;
         assert!(
             repl_bytes <= melin_journal::replication::CHUNK_SIZE,
-            "{label}: a full batch is {repl_bytes} bytes against a {}-byte replication chunk",
+            "{label}: a full batch and its digest are {repl_bytes} bytes against a {}-byte replication chunk",
             melin_journal::replication::CHUNK_SIZE
         );
     }

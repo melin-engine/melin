@@ -29,6 +29,7 @@ pub mod cursors;
 /// three cannot rebuild different state from one stream, and the clock's
 /// watermark ([`TickWatermark`]) each of them carries.
 mod dispatch;
+pub mod divergence;
 /// Replication fencing: the node's observed epoch and the one-way fenced
 /// latch that closes the split-brain window after a promotion.
 pub mod fence;
@@ -44,6 +45,7 @@ pub mod lineage;
 /// both paths, shared by every role that reads, writes, serves or
 /// archives the snapshot.
 pub mod node_store;
+pub mod output_digest;
 pub mod pipeline;
 pub mod replica_presence;
 /// Replication wire protocol, journal-file catch-up, ack queueing,
@@ -85,8 +87,8 @@ pub mod test_support;
 mod pipeline_tests;
 
 pub use cursors::{
-    AdvertisedJournalTip, DurableWireSeqCursor, PipelineCursors, ReplicaSlotCursors, RingPos,
-    WireSeq,
+    AdvertisedJournalTip, AppliedWireSeqCursor, DurableWireSeqCursor, PipelineCursors,
+    ReplicaSlotCursors, RingPos, WireSeq,
 };
 // The items of the dispatch module other crates name: every stage they
 // build starts from a watermark, which only this crate mints (from

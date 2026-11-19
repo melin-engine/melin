@@ -280,10 +280,11 @@ struct AutoPromotionInputs {
 /// - `term > fence_epoch` — the promotion journals `epoch = term`, so
 ///   the term must be strictly newer than every epoch already in
 ///   force; two auto-promotions from different elections then always
-///   allocate distinct epochs and the newer fences the older. Epochs
-///   outrunning terms (a history of manual promotions) breaks the
-///   alignment until enough elections pass — refuse rather than risk
-///   an epoch collision.
+///   allocate distinct epochs and the newer fences the older. The raft
+///   driver raises a node's term to its epoch when it starts
+///   (`melin_raft`'s term floor), so this refuses only once manual
+///   promotions have run the epoch past the term since then — refuse
+///   rather than risk an epoch collision.
 /// - `ElectionTerm` — the term must be one a promotion request can carry
 ///   (above, it is never 0; `u64::MAX` is not reached in practice). `Ok`
 ///   hands it over, so the request filed is the term judged here.
@@ -347,7 +348,7 @@ fn auto_promotion_decision(inputs: &AutoPromotionInputs) -> Result<ElectionTerm,
     if inputs.term <= inputs.fence_epoch {
         return Err(
             "election term is not above the fencing epoch (manual promotions outran raft \
-             terms) — promote manually; the alignment heals as terms advance",
+             terms) — promote manually; a node raises its term to the epoch when it restarts",
         );
     }
     ElectionTerm::new(inputs.term)
@@ -1299,7 +1300,7 @@ mod tests {
         // first and swallow the second, leaving the stalled failover
         // explained by a condition that stopped holding at the crash.
         let status = leader_status(7, Some(0));
-        let control = crate::replication::ReplicaControlPlane::new();
+        let control = crate::replication::ReplicaControlPlane::new(crate::tests::idle_latch());
         control.tip_ready.store(true, Ordering::Release);
         control
             .journal_tip
@@ -1357,7 +1358,7 @@ mod tests {
     #[test]
     fn auto_promotion_judges_by_the_lineage_policy_not_the_nodes_own() {
         let status = leader_status(7, Some(0));
-        let control = crate::replication::ReplicaControlPlane::new();
+        let control = crate::replication::ReplicaControlPlane::new(crate::tests::idle_latch());
         control.tip_ready.store(true, Ordering::Release);
         control.primary_observed.store(true, Ordering::Release);
         control
@@ -1416,7 +1417,7 @@ mod tests {
     #[test]
     fn consider_auto_promotion_files_nothing_without_a_lease() {
         let status = leader_status(7, None);
-        let control = crate::replication::ReplicaControlPlane::new();
+        let control = crate::replication::ReplicaControlPlane::new(crate::tests::idle_latch());
         control.tip_ready.store(true, Ordering::Release);
         control.primary_observed.store(true, Ordering::Release);
         control

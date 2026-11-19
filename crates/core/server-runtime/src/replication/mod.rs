@@ -73,9 +73,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use melin_journal::{BufferedWriter, JournalWrite};
 
 use melin_app::Application;
+use melin_transport_core::divergence::DivergenceLatch;
 use melin_transport_core::lineage::SharedLineagePolicy;
 use melin_transport_core::node_store::NodeStore;
-use melin_transport_core::pipeline::{InputSlot, OutputSlot};
+use melin_transport_core::pipeline::InputSlot;
 use melin_transport_core::replication::archive::{ArchiveReason, archive_local_lineage};
 use melin_transport_core::replication::protocol::{MAX_CONTROL_FRAME, decode_primary_message};
 use melin_transport_core::{TickWatermark, WarmApp};
@@ -83,6 +84,11 @@ use melin_transport_core::{TickWatermark, WarmApp};
 mod auth;
 #[cfg(feature = "dpdk")]
 mod dpdk;
+/// The replica's drain: `pub(crate)` for the response loop's agreement
+/// test, which runs it beside a primary's stage.
+pub(crate) mod drain;
+mod halt_notice;
+mod output_check;
 mod receiver_transport;
 mod tcp_receiver;
 mod tcp_sender;
@@ -98,7 +104,9 @@ mod validation_worker;
 #[cfg(any(feature = "dpdk", test))]
 mod join_worker;
 
-use receiver_transport::{ControlFrameSource, SessionExit, StreamingResult, receive_chunked_body};
+use receiver_transport::{
+    ControlFrameSource, SessionExit, StopNotice, StreamingResult, receive_chunked_body,
+};
 
 /// Log a replica's join ending, on either sender: from here its slot
 /// streams live and the replica's acks count. Without it, a join that
@@ -186,14 +194,27 @@ pub struct ReplicaControlPlane {
     /// `true` from boot, latched `false` by the journal stage's failure
     /// wrapper, reset `true` when a fresh pipeline is built.
     pub(crate) pipeline_healthy: std::sync::Arc<AtomicBool>,
+    /// The node's divergence stop: tripped by the primary's `Halt`, and
+    /// read by the streaming loop before its shutdown arm, so a stopped
+    /// replica sends no ordinary ack after the stop.
+    pub(crate) latch: DivergenceLatch,
+    /// `melin_output_checks_total`: windows of this replica's output its
+    /// comparison found equal to the primary's. Process-lifetime for the
+    /// same reason as `pipeline_healthy`: every pipeline a resync builds
+    /// counts into it, and the health endpoint outlives them all. One
+    /// writer, the receive thread.
+    pub(crate) output_checks: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ReplicaControlPlane {
     /// Fresh handles for a replica boot: nothing requested, tip not
     /// trustworthy yet, tip sequence 0, primary link down and never seen,
     /// no lineage policy held, pipeline healthy (nothing has failed yet).
-    pub fn new() -> Self {
+    /// `latch` is the node's divergence stop, required: a replica whose
+    /// stop is not the node's would stop nothing.
+    pub fn new(latch: DivergenceLatch) -> Self {
         Self {
+            latch,
             promote: crate::promotion::PromotionRequest::new(),
             tip_ready: std::sync::Arc::new(AtomicBool::new(false)),
             journal_tip: melin_transport_core::AdvertisedJournalTip::new(
@@ -203,13 +224,8 @@ impl ReplicaControlPlane {
             primary_observed: std::sync::Arc::new(AtomicBool::new(false)),
             lineage_ack_policy: std::sync::Arc::new(SharedLineagePolicy::new(None)),
             pipeline_healthy: std::sync::Arc::new(AtomicBool::new(true)),
+            output_checks: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
-    }
-}
-
-impl Default for ReplicaControlPlane {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -494,6 +510,12 @@ pub(super) struct ReplicaPipelineHandles<A: Application, W: Send + 'static> {
     pub(super) matching_handle: std::thread::JoinHandle<WarmApp<A>>,
     pub(super) drain_handle: std::thread::JoinHandle<()>,
     pub(super) shadow_handle: Option<std::thread::JoinHandle<()>>,
+    /// The check of this pipeline's output against the primary's, read
+    /// from the drain's board; `None` with output digests off. Lent to
+    /// every streaming session over this pipeline, so its windows outlive
+    /// a reconnect. Boxed: inline, the comparator's state would make
+    /// every `ReplicaEngine` the running pipeline's size, idle or not.
+    pub(super) output_check: Option<Box<output_check::OutputCheck>>,
 }
 
 /// A replica's handshake position: the last sequence its journal holds
@@ -723,6 +745,15 @@ pub(super) fn build_replica_pipeline_with_threads<A>(
     // The node's sizing, applied to every instance a pipeline is built
     // around — see `Application::prefault`.
     sizing: &A::Sizing,
+    // The encoder the drain digests reports with, the node's own; `None`
+    // with output digests off (`--no-output-digests`).
+    digest_encoder: Option<crate::response::ResponseEncoderArc<A>>,
+    // The node's divergence stop, which the pipeline's output check trips
+    // on a mismatch (`ReplicaControlPlane::latch`).
+    latch: &DivergenceLatch,
+    // Where the check counts the windows it found equal
+    // (`ReplicaControlPlane::output_checks`).
+    output_checks: &Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<ReplicaHandles<A>, Box<dyn std::error::Error>>
 where
     A: Application + Send + 'static,
@@ -823,24 +854,35 @@ where
 
     // Drain thread uses the response core — replicas have no response stage,
     // but the consumer needs to be drained so the output ring doesn't fill.
+    // With output digests on, it digests every report, as a primary's
+    // response stage does (see `drain`).
     let ps = Arc::clone(&pipeline_shutdown);
     let drain = cores.response;
     let drain_consumer = pipeline.drain_consumer;
-    let drain_handle = melin_app::affinity::spawn_placed("drain", drain.core, move || {
-        let mut consumer = drain_consumer;
-        let mut batch = vec![OutputSlot::<A::Report, A::QueryResponse>::default(); 256];
-        let mut waiter = drain.wait.waiter();
-        loop {
-            if ps.load(Ordering::Relaxed) {
-                return;
-            }
-            let count = consumer.consume_batch(&mut batch, 256);
-            if count == 0 {
-                waiter.idle();
-            } else {
-                waiter.reset();
-            }
+    // The drain's digester publishes to the board the receiver's check
+    // reads.
+    let (drain_digest, output_check) = match digest_encoder {
+        Some(encoder) => {
+            let (digester, board) =
+                melin_transport_core::output_digest::OutputDigester::for_pipeline(
+                    pipeline.first_live,
+                    &pipeline.cursors,
+                    ring_capacity,
+                );
+            (
+                Some(drain::DrainDigest { digester, encoder }),
+                Some(Box::new(output_check::OutputCheck::new(
+                    latch.clone(),
+                    board,
+                    pipeline.first_live,
+                    Arc::clone(output_checks),
+                ))),
+            )
         }
+        None => (None, None),
+    };
+    let drain_handle = melin_app::affinity::spawn_placed("drain", drain.core, move || {
+        drain::run(drain_consumer, drain_digest, drain.wait, &ps);
     })
     .map_err(|e| abandon(format!("start the replica's drain thread: {e}")))?;
 
@@ -886,6 +928,7 @@ where
         matching_handle,
         drain_handle,
         shadow_handle,
+        output_check,
     })
 }
 
@@ -1262,6 +1305,10 @@ pub(in crate::replication) enum AfterSession<A, W> {
     /// already been applied (and the flags checked); the caller
     /// reconnects, reusing the still-live pipeline.
     Reconnect,
+    /// The replica stopped on its own detection and its primary did not
+    /// answer its stopped ack: the pipeline is down, and the receiver
+    /// redials the primary with a stopped handshake before it returns.
+    RedialStopped,
 }
 
 impl<A: Application, W: Send + 'static> AfterSession<A, W> {
@@ -1271,11 +1318,16 @@ impl<A: Application, W: Send + 'static> AfterSession<A, W> {
     /// whole of `state`). One copy for every dispatch site in both
     /// receivers, so they cannot drift apart.
     ///
+    /// `redial_stopped` is the receiver's stopped redial, run before it
+    /// returns on `RedialStopped` (see `halt_notice::HALT_REDIAL`): a parameter, so no
+    /// receiver can fold that outcome without one.
+    ///
     /// The state a resync replaces holds no pipeline: [`handle_session_exit`]
     /// took it out and tore it down before recovering.
     pub(in crate::replication) fn adopt(
         self,
         state: &mut ReplicaState<A, W>,
+        redial_stopped: impl FnOnce(&ReplicaState<A, W>),
     ) -> Option<ReceiverResult<A, W>> {
         match self {
             AfterSession::Return(r) => Some(r),
@@ -1284,6 +1336,10 @@ impl<A: Application, W: Send + 'static> AfterSession<A, W> {
                 None
             }
             AfterSession::Reconnect => None,
+            AfterSession::RedialStopped => {
+                redial_stopped(state);
+                Some(Ok(None))
+            }
         }
     }
 }
@@ -1346,9 +1402,18 @@ where
     close();
 
     match exit {
-        SessionExit::Shutdown => {
+        // Stopped for divergence: as a shutdown, the pipeline stops and
+        // the receiver returns; the node's exit reports the stop.
+        SessionExit::Shutdown
+        | SessionExit::Stopped(StopNotice::NotOwed | StopNotice::Answered) => {
             state.engine.take().stop();
             AfterSession::Return(Ok(None))
+        }
+        // Stopped on its own detection, and the primary did not answer:
+        // the receiver redials it with a stopped handshake, then returns.
+        SessionExit::Stopped(StopNotice::Unanswered) => {
+            state.engine.take().stop();
+            AfterSession::RedialStopped
         }
 
         SessionExit::Promote => AfterSession::Return(match state.engine.take() {
@@ -2169,15 +2234,22 @@ mod tests {
         };
         let mut buf = Vec::new();
         encode_ack(&ack, &mut buf);
-        // [length:u32 LE = 17][tag:u8 = MSG_ACK = 0x02]
-        // [acked_sequence:u64 LE][in_memory_sequence:u64 LE]
-        let expected: &[u8] = &[
-            0x11, 0x00, 0x00, 0x00, // length = 17 LE
+        // [length:u32 LE = 18][tag:u8 = MSG_ACK = 0x02]
+        // [acked_sequence:u64 LE][in_memory_sequence:u64 LE][flags:u8]
+        let mut expected: Vec<u8> = vec![
+            0x12, 0x00, 0x00, 0x00, // length = 18 LE
             0x02, // MSG_ACK
             0x0D, 0xF0, 0xFE, 0xCA, 0xEF, 0xBE, 0xAD, 0xDE, // acked_sequence LE
             0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // in_memory_sequence LE
+            0x00, // flags: none
         ];
-        assert_eq!(buf.as_slice(), expected, "Ack wire layout drifted");
+        assert_eq!(buf, expected, "Ack wire layout drifted");
+
+        // A stopped replica's ack: the same frame, the flag set.
+        buf.clear();
+        melin_transport_core::replication::protocol::encode_stopped_ack(&ack, &mut buf);
+        *expected.last_mut().expect("the flag byte") = 0x01;
+        assert_eq!(buf, expected, "stopped Ack wire layout drifted");
     }
 
     /// Two known genesis lengths must agree; an unknown one on either
@@ -2451,13 +2523,21 @@ mod tests {
             engine: recovered_engine,
             position: recovered_position,
         });
-        assert!(after.adopt(&mut state).is_none());
+        assert!(
+            after
+                .adopt(&mut state, |_| panic!("no stopped redial"))
+                .is_none()
+        );
         assert_eq!(state.position, recovered_position);
         assert_eq!(idle_in(&state.engine).warm.tick_watermark, replayed);
 
         // A plain reconnect, with an engine held, leaves both alone.
         let after = AfterSession::<counter_server::Counter, CounterWriter>::Reconnect;
-        assert!(after.adopt(&mut state).is_none());
+        assert!(
+            after
+                .adopt(&mut state, |_| panic!("no stopped redial"))
+                .is_none()
+        );
         assert_eq!(
             state.position, recovered_position,
             "a reconnect keeps the position"
@@ -2470,7 +2550,11 @@ mod tests {
 
         // A fresh recovery (nothing on disk) replaces them too.
         let after = AfterSession::Resync(RecoveredReplica::FRESH);
-        assert!(after.adopt(&mut state).is_none());
+        assert!(
+            after
+                .adopt(&mut state, |_| panic!("no stopped redial"))
+                .is_none()
+        );
         assert!(matches!(state.engine, ReplicaEngine::Fresh));
         assert_eq!(state.position, ChainPosition::GENESIS);
     }
@@ -2507,6 +2591,9 @@ mod tests {
             &SharedLineagePolicy::new(None),
             Arc::new(AtomicBool::new(true)),
             &(),
+            Some(Arc::new(counter_server::ResponseEncoder)),
+            &crate::tests::idle_latch(),
+            &Arc::new(std::sync::atomic::AtomicU64::new(0)),
         )
     }
 
@@ -2631,7 +2718,7 @@ mod tests {
             &mut state,
             &store,
             &melin_transport_core::fence::FenceState::new(0),
-            &ReplicaControlPlane::new(),
+            &ReplicaControlPlane::new(crate::tests::idle_latch()),
             PREALLOC,
         )
         .expect("resync");
@@ -2699,7 +2786,7 @@ mod tests {
             &mut state,
             &store,
             &melin_transport_core::fence::FenceState::new(0),
-            &ReplicaControlPlane::new(),
+            &ReplicaControlPlane::new(crate::tests::idle_latch()),
             PREALLOC,
         )
         .expect("a network-shaped failure is retried, not fatal");
@@ -2861,7 +2948,7 @@ mod tests {
             Writer::create_continuing(&path, 1, anchor, None, PREALLOC).expect("create"),
         );
         let fence = melin_transport_core::fence::FenceState::new(5);
-        let control = ReplicaControlPlane::new();
+        let control = ReplicaControlPlane::new(crate::tests::idle_latch());
 
         let verdict = accept_stream_start::<counter_server::Counter, Writer>(
             StreamStart {
@@ -2889,7 +2976,7 @@ mod tests {
     #[test]
     fn a_fresh_replica_follows_a_primary_without_an_engine() {
         let fence = melin_transport_core::fence::FenceState::new(0);
-        let control = ReplicaControlPlane::new();
+        let control = ReplicaControlPlane::new(crate::tests::idle_latch());
         let mut engine = ReplicaEngine::<counter_server::Counter, CounterWriter>::Fresh;
 
         let verdict = accept_stream_start(
@@ -3041,7 +3128,7 @@ mod tests {
             Writer::create_continuing(&path, 1, anchor, None, PREALLOC).expect("create"),
         );
         let fence = melin_transport_core::fence::FenceState::new(5);
-        let control = ReplicaControlPlane::new();
+        let control = ReplicaControlPlane::new(crate::tests::idle_latch());
         let held = Some(melin_transport_core::lineage::LineagePolicy::after(
             None,
             melin_transport_core::WireSeq::new(1),
@@ -3091,7 +3178,7 @@ mod tests {
             Writer::create_continuing(&path, 1, anchor, Some(2), PREALLOC).expect("create"),
         );
         let fence = melin_transport_core::fence::FenceState::new(5);
-        let control = ReplicaControlPlane::new();
+        let control = ReplicaControlPlane::new(crate::tests::idle_latch());
 
         let err = accept_stream_start::<counter_server::Counter, Writer>(
             StreamStart {
@@ -3157,6 +3244,7 @@ mod tests {
             matching_handle: std::thread::spawn(move || warm),
             drain_handle: std::thread::spawn(|| {}),
             shadow_handle: None,
+            output_check: None,
         });
         std::fs::remove_file(&path).expect("simulate the rotation gap");
         assert_eq!(
@@ -4628,6 +4716,7 @@ mod tests {
             }),
             drain_handle: std::thread::spawn(|| {}),
             shadow_handle: None,
+            output_check: None,
         };
         (handles, consumer)
     }
@@ -4733,6 +4822,9 @@ mod tests {
                 &SharedLineagePolicy::new(None),
                 Arc::new(AtomicBool::new(true)),
                 &(),
+                Some(Arc::new(counter_server::ResponseEncoder)),
+                &crate::tests::idle_latch(),
+                &Arc::new(std::sync::atomic::AtomicU64::new(0)),
             )
             .expect("build the replica pipeline");
 
@@ -4995,6 +5087,7 @@ mod tests {
             }),
             drain_handle: std::thread::spawn(|| {}),
             shadow_handle: None,
+            output_check: None,
         }
     }
 
@@ -5213,6 +5306,7 @@ mod tests {
             }),
             drain_handle: std::thread::spawn(|| {}),
             shadow_handle: None,
+            output_check: None,
         };
         let mut state = ReplicaState::<counter_server::Counter, Writer> {
             engine: ReplicaEngine::Running(handles),

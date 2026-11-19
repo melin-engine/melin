@@ -1473,6 +1473,8 @@ mod tests {
                         Arc::new(ResponseEncoder),
                         early_rx,
                         None,
+                        None,
+                        crate::tests::idle_latch(),
                         Some(Box::new(move || stage_hold.pause())),
                     );
                 }));

@@ -79,6 +79,12 @@ libc = "0.2"
 rand = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+# XXH3-128 for the output digest. Only the 128-bit hash: the default
+# features add `rand` (seeded hashers) and the 32/64-bit variants, none of
+# which the digest uses. `std` turns on the runtime SIMD dispatch for
+# inputs past 240 bytes, which every busy window is; it costs nothing in a
+# crate that links `std` anyway.
+twox-hash = { version = "2", default-features = false, features = ["xxhash3_128", "std"] }
 
 # Lints every member inherits via `[lints] workspace = true`.
 #

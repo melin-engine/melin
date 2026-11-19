@@ -793,8 +793,12 @@ Auto-promotion is deliberately conservative. The elected replica
   position was ahead (its journal is then the reconciliation source
   when it returns);
 - manual promotions have outrun election terms (the term must be
-  strictly above the epoch in force; the alignment heals as terms
-  advance — promote manually in the interim).
+  strictly above the epoch in force). A node raises its control-plane
+  term to its journal's epoch each time it starts, so restarting the
+  nodes clears this; promote manually in the interim. Each restarted
+  node whose term was raised returns as a follower and, on rejoining,
+  makes the current leader step down: expect up to one election per
+  such node during that rolling restart.
 
 Passing these checks starts the promotion; it does not finish it. Just
 before taking over, after its pipeline is ready and before it journals
@@ -891,6 +895,16 @@ nothing of its own.
   the same term, undermining the epoch guarantee. If the dir is lost,
   restart that node last, after a leader is established, or with the
   raft flags off.
+- **A new `--raft-dir` on an existing journal is ready for failover.** A
+  promotion's election term becomes its fencing epoch, so it must be
+  above the epoch the journal already holds. Each node raises its
+  control-plane term to its journal's epoch as it starts, so a raft
+  directory created for a history that has already failed over (a
+  cluster re-provisioned, or a voter replaced) elects above it at once,
+  instead of promoting only manually until enough elections have passed.
+  A node's control plane starts once its journal is recovered: until
+  then a recovering replica takes no part in elections, as it already
+  refused to vote.
 - **Membership is static on this release.** The `--raft-peer` list is
   fixed at first boot (later flag changes are ignored in favor of the
   stored membership, with a warning). The public keys are the exception:
@@ -1002,6 +1016,150 @@ with the same reason and index as the journal's archive (for example
 resync carry the same `<n>`, and the snapshot never leaves its own
 filesystem.
 
+## Output verification
+
+The journal checks prove that every node holds the same input. Output
+verification checks what each node's copy of the application *answered*
+for it. Every node digests the bytes of every report its copy produces,
+whether or not a client receives it, so that copies can be compared (see
+[Pipeline Architecture](pipeline-architecture.md#output-digests)). When
+two copies are seen to answer the same input differently, the
+application broke its determinism contract, or the builds the cluster
+runs do not agree. Either way a failover could show clients another
+history, so **the whole cluster stops, for good: the way back is a new
+cluster.**
+
+### How output is checked
+
+- **Every replica checks its primary.** The primary sends its digest of
+  each window of 64 journal positions down the replication stream, after
+  the entries the window covers; a replica compares it with its own
+  digest of the same window. The digests are chained, so one value found
+  equal vouches for every window since the session's first value,
+  including windows whose value the primary never sent.
+- **What is caught.** Any difference in the bytes of any report, in its
+  order among the others, or in how many there are, for a journaled
+  entry (client request or tick) in a window the session compares (see
+  below). Queries are not journaled, and are not checked. A difference is
+  found at the first value the primary sends after it: under traffic,
+  within a window or two.
+- **When it starts.** Each session with a primary starts the comparison
+  afresh: a replica that joins, reconnects, restarts (from its journal or
+  its own snapshot), or follows a restarted or newly promoted primary
+  takes the primary's first digest of the session as its starting point,
+  and compares every window that closes after it. What the replica
+  applied before that value reached it, its catch-up from the primary's
+  journal included, and the window that value covers are not compared. A
+  replica that restarts counts from zero again.
+- **When idle.** Windows close as positions are journaled, so a cluster
+  with ticks on keeps checking while no client writes; with ticks off
+  (`--tick-interval-ms 0`) an idle cluster checks nothing until writes
+  resume.
+- **What you see.** `melin_output_checks_total` on a replica's health
+  endpoint counts the windows found equal. Under traffic it keeps
+  growing; one flat under traffic means the replica is not checking (it
+  or its primary runs with `--no-output-digests`, or it is not
+  streaming), and is worth a look. The check logs nothing while it agrees
+  (its `debug` lines say where each session's comparison started, and
+  where one restarted after a window was missed).
+- **Likely causes of a divergence.** The application's determinism:
+  something in `apply` or `tick` that is not a function of its inputs and
+  state (an unseeded hash map's iteration order, a report order that
+  follows a collection's capacity, which a node's sizing can change, the
+  wall clock, a thread). Builds that differ between nodes (another
+  release of the application, another compiler, another target). A
+  snapshot taken before format 5 recovered with the warning about its
+  tick watermark. Rarely, a hardware fault.
+- **Upgrading the application.** An upgrade that changes the output for
+  the same input (a new report field, a reworded rejection) means
+  stopping every node and starting them all on the new build: rolled node
+  by node, the first replica on the new build sees its output differ from
+  its primary's and stops the cluster. An upgrade that leaves the output
+  alone rolls as before.
+
+### What a stop does
+
+- **The node that sees the divergence stops at once.** It closes every
+  client and sends nothing more, its control plane leaves and will not
+  promote it, and its process returns an error naming the cause.
+- **It tells the others.** A replica tells its primary, on its live
+  session or, if that goes unanswered, by redialling it for up to a
+  minute. The primary stops the same way and tells every replica
+  streaming from it, each of which stops too.
+- **Every stopped node logs the cause at `error`** (the positions the
+  divergence lies between, on the node that saw it; who told it, and how,
+  on the others) and **writes a marker beside its journal**,
+  `<journal>.diverged`, recording the same.
+- **A node whose marker exists refuses to start**, with a message
+  summarising the marker and naming it. Do not delete the marker to bring a node back: it
+  belonged to a cluster that broke its guarantee.
+- **Nothing is promoted automatically.** With at most three control-plane
+  voters, two stopped nodes leave no majority, and a promotion needs a
+  majority to confirm it before it takes effect.
+
+### Starting a new cluster
+
+1. Stop every node.
+2. Move each node's marker aside, kept as the record of the incident, and
+   set every node's snapshots aside: the build that diverged wrote them.
+3. Pick the node whose journal reaches the highest position and goes back
+   to sequence 1 (recovery without snapshots needs the whole history); if
+   none does, copy the missing early segments from any node or archive
+   (the segment chain check verifies the splice). Only if no copy
+   survives is a suspect snapshot the starting point, knowingly.
+4. Start it once, standalone, on one fixed build, to replay the journal
+   (or with `--no-output-digests`, which is not a fix: the replay is
+   another draw of whatever made the copies differ).
+5. Give every node a fresh `--raft-dir` and the others clean data
+   directories, and start as on a first deployment; the replicas reseed
+   from the new primary. The fresh control-plane directories start at
+   the journal's fencing epoch, so the new cluster can fail over at once.
+
+**Rolling back past this release** is the one other way around the
+marker: an older release does not read it. Check for `<journal>.diverged`
+before starting any node on an older release, and never start one that
+has it.
+
+### Limits
+
+- **Only a replica checks.** A standalone node, or a primary with no
+  replica streaming from it, compares its output with nothing and detects
+  nothing.
+- **Only output is compared, not state.** Two copies whose state differs
+  go on agreeing until a report shows the difference, which can be long
+  after the state diverged, and after a failover has made the drifted
+  copy the primary. An application that reports little of its state is
+  checked on little of it.
+- **The last windows before a failover are not compared.** A divergence
+  in the entries a primary journaled just before it failed, whose digest
+  it had not yet sent, is not found: the next primary starts a new
+  comparison.
+- **A replica not streaming when its primary stops is not told**: one
+  between sessions, one receiving a snapshot, or one that does not read
+  the primary's notice before its connection ends. (A replica catching up
+  from the primary's journal is normally told, as a streaming one is; one
+  just finishing its catch-up as the primary stops can miss the notice.)
+  It stays up, serves no
+  client (it is a replica), and cannot be promoted automatically, since
+  the two stopped nodes leave no majority. Stop it by hand.
+- **A detector cut off from its primary stops alone.** If a replica's
+  notice and a minute of redials all go unanswered, the replica stops by
+  itself and logs at `warn` that the primary may not have been told; the
+  primary and the other replica may go on serving.
+- **A manual promotion overrides the stop**, as does a cluster without
+  the control plane, or with it in observational mode, where only the
+  operator promotes. Never promote a node of a cluster in which any node
+  holds a marker.
+- **Output digests off.** A node started with `--no-output-digests`
+  digests nothing, so its output is never checked: as a primary it sends
+  no digests and its replicas check nothing, as a replica it drops the
+  ones it is sent. It still honours a stop it is told of.
+- **Each session's start is not compared.** Every session, a reconnect to
+  the same primary included, starts from the primary's first digest of
+  that session: the windows the replica applied before it, a long
+  catch-up included, and the window that digest covers are taken on
+  trust. A divergence confined to them is not found by that session.
+
 ## Entry integrity in transit
 
 Every replicated entry carries the CRC32C its primary journaled it
@@ -1098,6 +1256,7 @@ requiring the full journal history.
 | `--ack-policy <policy>` | Primary | `disk+ram` | The ack policy the node requests when it starts as primary or is promoted: which copies of an event must exist before its response is released. `disk`, `ram`, `disk+ram`, or `two-disks`. Not in force at once over a history that records another policy (see "Runtime policy swap"). Can be swapped at runtime via admin `ACK-POLICY`. |
 | `--degraded-ack-grace-ms <ms>` | Primary | `2000` | How long a primary must have had no replica before it answers the replies it holds once its own journal has them, marked as degraded acks. See "Degraded acks". |
 | `--no-degraded-acks` | Primary | off | Never send degraded acks: a halted primary holds its replies, and the rejections and queries behind them, until a replica returns or the policy is swapped. |
+| `--no-output-digests` | Any | off | Do not digest this node's reports. Every node digests the output of its copy of the application so that copies can be compared (see [Pipeline Architecture](pipeline-architecture.md#output-digests)); with this flag the node's output is not checked. Logged as a warning at startup. |
 | `--dpdk-peer-mac <mac>` | Replica on DPDK | derived | Ethernet address of the primary named by `--replica-of`. Only consulted when replicating over DPDK. See below. |
 
 ### Addressing the primary over DPDK
@@ -1150,8 +1309,8 @@ Exchanged first on every connection, before the handshake.
 
 | Message | Layout | Purpose |
 |---|---|---|
-| Handshake | `[len:u32][type=0x01][last_sequence:u64][chain_hash:[u8;32]][epoch:u64][protocol_version:u16]` | Initial connection — replica reports its last durable sequence, the chain hash at that point, its fencing epoch, and the replication protocol version it speaks. A version mismatch is rejected with an explicit log line naming both versions. |
-| Ack | `[len:u32][type=0x02][acked_sequence:u64][in_memory_sequence:u64]` | Replica confirms persisted writes up to `acked_sequence` and pre-journal receipt up to `in_memory_sequence`. Both fields are populated on every ack so the primary's gate can evaluate any policy without separate ack streams. |
+| Handshake | `[len:u32][type=0x01][last_sequence:u64][chain_hash:[u8;32]][epoch:u64][protocol_version:u16][flags:u8]` | Initial connection — replica reports its last durable sequence, the chain hash at that point, its fencing epoch, and the replication protocol version it speaks. A version mismatch is rejected with an explicit log line naming both versions. `flags` bit 0 set: the replica has stopped for divergence and redials to say so (see "Output verification"); the primary stops and answers with `Halt`. Any other bit is refused. |
+| Ack | `[len:u32][type=0x02][acked_sequence:u64][in_memory_sequence:u64][flags:u8]` | Replica confirms persisted writes up to `acked_sequence` and pre-journal receipt up to `in_memory_sequence`. Both fields are populated on every ack so the primary's gate can evaluate any policy without separate ack streams. `flags` bit 0 set: the replica has stopped for divergence, its positions the last it sent; the primary stops. Any other bit is refused, and the replica evicted. |
 
 ### Primary → Replica
 
@@ -1167,6 +1326,8 @@ Exchanged first on every connection, before the handshake.
 | ChainCheck | `[len:u32][type=0x17][sequence:u64][chain_hash:[u8;32]]` | Periodic live-stream validation: the primary's chain value at `sequence`; the replica compares its own and treats a mismatch as divergence. |
 | SegmentSeedBegin | `[len:u32][type=0x18][seed_len:u64]` | Start of the post-snapshot segment seed (see "Snapshot transfer"); the body rides SnapshotChunk frames and ends with a SnapshotEnd. |
 | InputBatch | `[len:u32][type=0x21][count:u16][slot...]` | Batch of input events. Each slot is the primary's journal entry without its leading magic: sequence, timestamp, key hash, the event itself, and the entry's CRC32C, which the replica verifies before accepting the entry (see "Entry integrity in transit"). The entries include the runtime's own (ticks, fencing epochs, ack-policy swaps): the ack policy reaches a replica only this way, in order with the events it governs. |
+| Digest | `[len:u32][type=0x19][kind:u8][window_end:u64][chain:[u8;16]]` | The primary's output digest chain at `window_end`, a multiple of 64 (see "Output verification"). It follows the batch that reaches its window, in the same send, so it never names a position the stream has not delivered. `kind` 1 is the output digest; 0 is refused, and a kind the replica does not know is skipped. |
+| Halt | `[len:u32][type=0x1A]` | The primary has stopped because the cluster's output diverged: the replica stops too (see "Output verification"). Sent at a frame boundary on every live session, and as the answer to a stopped replica's handshake. |
 | Heartbeat | `[len:u32][type=0x30][sequence:u64]` | Periodic idle keepalive (5 s interval) advertising the primary's last published sequence. |
 
 ## Cluster recovery
@@ -1335,6 +1496,10 @@ normal-case post-recovery state.
 
 ## Observability
 
+- `melin_output_checks_total` (Prometheus counter, replicas only) —
+  windows of the replica's output found equal to its primary's (see
+  "Output verification"). Alert on it staying flat while the primary's
+  `melin_journal_sequence` grows: the replica is not checking.
 - The health endpoint's `trading`/`halted` flag (and the
   `melin_trading_active` gauge) reports `halted` on a fenced node even
   while replicas remain connected — point load-balancer probes and
