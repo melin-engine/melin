@@ -30,8 +30,9 @@ clap = { workspace = true }
 # Latency percentiles over millions of samples without keeping them.
 hdrhistogram = "7"
 # `--duration 60s`, the spelling the Exchange Core's bench takes, so the
-# suite passes the same durations to every application's client.
-humantime = "2"
+# suite passes the same durations to every application's client. Only the
+# duration parser is used: no default features, so no time zone database.
+jiff = { version = "1", default-features = false, features = ["std"] }
 # The `--dpdk-*` flags, the node's own declaration.
 melin-dpdk = { workspace = true, optional = true, features = ["clap"] }
 

@@ -19,12 +19,22 @@ targets = ["x86_64-unknown-linux-gnu"]
 all-features = true
 
 [advisories]
-# Empty, and worth keeping that way. An entry here is a decision to ship a
-# known-vulnerable or unmaintained dependency; both advisories found on the
-# first run were fixed instead — one by a patch bump, one by dropping a
-# default feature that pulled an archived crate. Any addition should carry
-# a comment saying why the risk is accepted and what would remove it.
-ignore = []
+# Kept as short as possible. An entry here is a decision to ship a
+# known-vulnerable or unmaintained dependency, so the first move is always
+# a fix — a version bump, dropping a feature, or replacing the crate — and
+# an entry is the fallback when none exists. Each one carries a comment
+# saying why the risk is accepted and what would remove it.
+ignore = [
+    # chrono is unmaintained, not vulnerable. It reaches the tree only
+    # through openraft, which uses it to print `Instant`s in its display
+    # helpers and, in openraft-macros, to parse `#[since]` dates at compile
+    # time; it runs on the raft control-plane thread, never the data plane.
+    # No openraft release (0.9 or 0.10) makes it optional, and the
+    # alternatives — a vendored fork of our consensus library, or replacing
+    # it — cost far more than the risk. Remove this entry when openraft
+    # drops chrono or puts it behind a feature.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained, reached only through openraft, which has no release without it" },
+]
 # A yank is the registry's strongest signal short of an advisory.
 yanked = "deny"
 
