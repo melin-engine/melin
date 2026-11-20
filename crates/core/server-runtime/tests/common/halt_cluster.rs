@@ -1,16 +1,20 @@
 //! A primary and its replicas for the cluster tests (`halt_refusal.rs`,
-//! `degraded_acks.rs`, `tick_watermark.rs`): the application a test
-//! serves ([`Served`]), started through `melin-test-node` (kernel TCP by
-//! default, DPDK under its feature and the netns runner). The tests read
-//! the nodes through `melin_test_node::probe`.
+//! `degraded_acks.rs`, `tick_watermark.rs`, `output_checks.rs`,
+//! `output_divergence.rs`): the application a test serves ([`Served`]),
+//! started through `melin-test-node` (kernel TCP by default, DPDK under
+//! its feature and the netns runner), on ports a test takes through its
+//! lease ([`Ports`]). The tests read the nodes through
+//! `melin_test_node::probe`.
 //!
 //! Each test binary that uses it includes this file as a module (`#[path]`),
 //! and compiles its own copy. It carries no dead-code allowance: an item
 //! one includer leaves unused warns there, and is moved or dropped rather
 //! than hidden.
 
+use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -24,8 +28,10 @@ use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::server::ServerConfig;
 use melin_test_node::{Addrs, Node};
-use melin_transport_core::test_ports::free_addr;
 use melin_transport_core::test_support::{TickCountingApp, TickCountingCodec};
+
+#[path = "port_pool.rs"]
+mod port_pool;
 
 /// Port range for `free_addr`, shared with the other cluster tests: every
 /// other range below the ephemeral floor is taken. Their tests may run at
@@ -33,16 +39,67 @@ use melin_transport_core::test_support::{TickCountingApp, TickCountingCodec};
 /// within a range.
 const PORT_BASE: u16 = 10_000;
 
-/// Node `slot`'s addresses (`melin_test_node::addrs`), from this file's
-/// port range on kernel TCP.
-pub fn addrs(slot: usize) -> Addrs {
-    melin_test_node::addrs(slot, endpoint)
+/// A test's turn to run, and the ports it takes.
+///
+/// Plain `cargo test` runs a binary's tests in one process, which
+/// `free_addr` gives one block of ports and never reissues one in: a
+/// binary whose tests took a fresh set each would outgrow its block as
+/// tests are added (`output_checks.rs` did). So each test takes its turn,
+/// and hands its ports back for the next as its turn ends (`port_pool`).
+/// A port is taken only through a lease, so no test takes one outside
+/// its turn or keeps one past it. A test takes its lease first, so that
+/// its nodes, dropped in reverse order, are gone before their ports are
+/// handed back.
+pub struct Ports {
+    /// Held from the test's start to its end.
+    _turn: MutexGuard<'static, ()>,
+    /// The addresses of every node, to hand back. `Vec`s: a few entries
+    /// each, only pushed and drained; `RefCell`s: taken through `&self`,
+    /// so a test can hold several addresses and endpoints at once.
+    nodes: RefCell<Vec<Addrs>>,
+    /// Every endpoint, as its listener bound it, to hand back.
+    endpoints: RefCell<Vec<SocketAddr>>,
 }
 
-/// A free loopback address from this file's port range, for an endpoint
-/// that is kernel TCP on either transport (health, admin).
-pub fn endpoint() -> SocketAddr {
-    free_addr(PORT_BASE)
+impl Ports {
+    /// Wait for this test's turn.
+    pub fn lease() -> Self {
+        // `Mutex<()>`: nothing to guard but the order of the tests. A
+        // test that failed holding it leaves nothing to repair.
+        static TURN: Mutex<()> = Mutex::new(());
+        Self {
+            _turn: TURN.lock().unwrap_or_else(PoisonError::into_inner),
+            nodes: RefCell::default(),
+            endpoints: RefCell::default(),
+        }
+    }
+
+    /// Node `slot`'s addresses (`melin_test_node::addrs`), from this
+    /// file's port range on kernel TCP.
+    pub fn addrs(&self, slot: usize) -> Addrs {
+        let addrs = melin_test_node::addrs(slot, || port_pool::port(PORT_BASE));
+        self.nodes.borrow_mut().push(addrs);
+        addrs
+    }
+
+    /// A free loopback address from this file's port range, for an
+    /// endpoint that is kernel TCP on either transport (health, admin).
+    pub fn endpoint(&self) -> SocketAddr {
+        let addr = port_pool::port(PORT_BASE);
+        self.endpoints.borrow_mut().push(addr);
+        addr
+    }
+}
+
+impl Drop for Ports {
+    /// Hand the ports back, unless the test failed (`port_pool`), before
+    /// the turn passes on.
+    fn drop(&mut self) {
+        for node in self.nodes.take() {
+            port_pool::give_back(&node, []);
+        }
+        port_pool::give_back_ports(self.endpoints.take());
+    }
 }
 
 /// An application the cluster tests serve, with the codec its clients
@@ -153,19 +210,24 @@ impl Fixture {
     }
 
     /// A primary at `addrs`, taking replicas on its replication address,
-    /// with the health endpoint the tests read it through.
-    pub fn primary_config(&self, addrs: &Addrs, policy: AckPolicy) -> ServerConfig {
+    /// with the health endpoint the tests read it through at `health`.
+    pub fn primary_config(
+        &self,
+        addrs: &Addrs,
+        policy: AckPolicy,
+        health: SocketAddr,
+    ) -> ServerConfig {
         let mut config = self.node_config("primary", &self.primary_key, policy);
         config.replication_bind = Some(addrs.replication());
-        config.health_bind = Some(endpoint());
+        config.health_bind = Some(health);
         config
     }
 
     /// A replica of the primary whose replication endpoint is `primary`
     /// (a node's `Addrs::replication`, or a scripted primary's address),
     /// journaling to `name`. No health endpoint: the tests read the
-    /// primary's, and a port saved per replica keeps a binary run in one
-    /// process (plain `cargo test`) inside its port block.
+    /// primary's, and a test that needs a replica's sets one from its
+    /// `Ports` lease.
     pub fn replica_config(
         &self,
         name: &str,

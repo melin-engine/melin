@@ -29,7 +29,7 @@ use standalone::standalone_config;
 
 #[path = "common/halt_cluster.rs"]
 mod halt_cluster;
-use halt_cluster::{Fixture, addrs, spawn_node};
+use halt_cluster::{Fixture, Ports, spawn_node};
 
 #[path = "common/proxy.rs"]
 mod proxy;
@@ -127,9 +127,10 @@ fn stopped(node: melin_test_node::Node) -> String {
 /// refuses to restart.
 #[test]
 fn a_stopped_primary_halts_its_replicas() {
+    let ports = Ports::lease();
     let fx = Fixture::new(0xD3);
-    let primary_addrs = addrs(0);
-    let primary_config = fx.primary_config(&primary_addrs, AckPolicy::DiskAndRam);
+    let primary_addrs = ports.addrs(0);
+    let primary_config = fx.primary_config(&primary_addrs, AckPolicy::DiskAndRam, ports.endpoint());
     let health = primary_config.health_bind.expect("set by the fixture");
     let primary_marker = primary_config.store().expect("store").divergence_marker();
     let primary = spawn_node::<Counter>(&primary_addrs, primary_config);
@@ -148,7 +149,7 @@ fn a_stopped_primary_halts_its_replicas() {
                 name,
                 slot,
                 marker,
-                spawn_node::<Counter>(&addrs(slot), config),
+                spawn_node::<Counter>(&ports.addrs(slot), config),
             )
         })
         .collect();
@@ -169,7 +170,7 @@ fn a_stopped_primary_halts_its_replicas() {
         );
         assert!(marker.exists(), "{name}'s marker");
         // On the replica's own slot, free again now that it has returned.
-        let restarted = spawn_node::<Counter>(&addrs(slot), replica_config(name))
+        let restarted = spawn_node::<Counter>(&ports.addrs(slot), replica_config(name))
             .join()
             .expect_err("a restart is refused");
         assert!(
@@ -184,9 +185,10 @@ fn a_stopped_primary_halts_its_replicas() {
 /// and no node leaves a marker.
 #[test]
 fn a_healthy_cluster_checks_its_output() {
+    let ports = Ports::lease();
     let fx = Fixture::new(0xD7);
-    let primary_addrs = addrs(0);
-    let primary_config = fx.primary_config(&primary_addrs, AckPolicy::DiskAndRam);
+    let primary_addrs = ports.addrs(0);
+    let primary_config = fx.primary_config(&primary_addrs, AckPolicy::DiskAndRam, ports.endpoint());
     let health = primary_config.health_bind.expect("set by the fixture");
     let primary_marker = primary_config.store().expect("store").divergence_marker();
     let primary = spawn_node::<Counter>(&primary_addrs, primary_config);
@@ -197,10 +199,10 @@ fn a_healthy_cluster_checks_its_output() {
         .map(|(slot, name)| {
             let mut config =
                 fx.replica_config(name, primary_addrs.replication(), AckPolicy::DiskAndRam);
-            let replica_health = halt_cluster::endpoint();
+            let replica_health = ports.endpoint();
             config.health_bind = Some(replica_health);
             let marker = config.store().expect("store").divergence_marker();
-            let node = spawn_node::<Counter>(&addrs(slot), config);
+            let node = spawn_node::<Counter>(&ports.addrs(slot), config);
             (replica_health, marker, node)
         })
         .collect();
@@ -251,9 +253,10 @@ fn a_healthy_cluster_checks_its_output() {
 /// serves after.
 #[test]
 fn a_detecting_replica_stops_the_whole_cluster() {
+    let ports = Ports::lease();
     let fx = Fixture::new(0xDB);
-    let primary_addrs = addrs(0);
-    let primary_config = fx.primary_config(&primary_addrs, AckPolicy::DiskAndRam);
+    let primary_addrs = ports.addrs(0);
+    let primary_config = fx.primary_config(&primary_addrs, AckPolicy::DiskAndRam, ports.endpoint());
     let health = primary_config.health_bind.expect("set by the fixture");
     let primary_marker = primary_config.store().expect("store").divergence_marker();
     let primary = spawn_node::<Counter>(&primary_addrs, primary_config);
@@ -262,7 +265,7 @@ fn a_detecting_replica_stops_the_whole_cluster() {
     let replica = |slot: usize, name: &str| {
         let config = fx.replica_config(name, primary_addrs.replication(), AckPolicy::DiskAndRam);
         let marker = config.store().expect("store").divergence_marker();
-        (marker, spawn_node::<Counter>(&addrs(slot), config))
+        (marker, spawn_node::<Counter>(&ports.addrs(slot), config))
     };
     let (detector_marker, detector) = replica(1, "detector");
     let (other_marker, other) = replica(2, "other");
@@ -299,9 +302,10 @@ fn a_detecting_replica_stops_the_whole_cluster() {
 /// stopped handshake, once the link is back, stops the primary.
 #[test]
 fn a_lost_stopped_ack_is_made_good_by_the_redial() {
+    let ports = Ports::lease();
     let fx = Fixture::new(0xDF);
-    let primary_addrs = addrs(0);
-    let primary_config = fx.primary_config(&primary_addrs, AckPolicy::DiskAndRam);
+    let primary_addrs = ports.addrs(0);
+    let primary_config = fx.primary_config(&primary_addrs, AckPolicy::DiskAndRam, ports.endpoint());
     let health = primary_config.health_bind.expect("set by the fixture");
     let primary = spawn_node::<Counter>(&primary_addrs, primary_config);
     wait_for_gauge(health, "melin_replicas_connected", 0);
@@ -309,7 +313,7 @@ fn a_lost_stopped_ack_is_made_good_by_the_redial() {
     let proxy = Proxy::start(primary_addrs.replication());
     let config = fx.replica_config("detector", proxy.addr(), AckPolicy::DiskAndRam);
     let marker = config.store().expect("store").divergence_marker();
-    let detector = spawn_node::<Counter>(&addrs(1), config);
+    let detector = spawn_node::<Counter>(&ports.addrs(1), config);
     wait_for_gauge(health, "melin_replicas_connected", 1);
 
     proxy.freeze();
@@ -340,9 +344,10 @@ fn a_lost_stopped_ack_is_made_good_by_the_redial() {
 /// it nothing else: no stream, no snapshot.
 #[test]
 fn a_stopped_handshake_stops_the_primary_and_is_answered_with_halt() {
+    let ports = Ports::lease();
     let fx = Fixture::new(0xD7);
-    let primary_addrs = addrs(0);
-    let primary_config = fx.primary_config(&primary_addrs, AckPolicy::DiskAndRam);
+    let primary_addrs = ports.addrs(0);
+    let primary_config = fx.primary_config(&primary_addrs, AckPolicy::DiskAndRam, ports.endpoint());
     let health = primary_config.health_bind.expect("set by the fixture");
     let primary = spawn_node::<Counter>(&primary_addrs, primary_config);
     wait_for_gauge(health, "melin_replicas_connected", 0);
@@ -368,9 +373,10 @@ fn a_stopped_ack_stops_the_primary_and_is_answered_with_halt() {
         Ack, MSG_STREAM_START, encode_handshake, encode_stopped_ack,
     };
 
+    let ports = Ports::lease();
     let fx = Fixture::new(0xD9);
-    let primary_addrs = addrs(0);
-    let primary_config = fx.primary_config(&primary_addrs, AckPolicy::DiskAndRam);
+    let primary_addrs = ports.addrs(0);
+    let primary_config = fx.primary_config(&primary_addrs, AckPolicy::DiskAndRam, ports.endpoint());
     let health = primary_config.health_bind.expect("set by the fixture");
     let primary = spawn_node::<Counter>(&primary_addrs, primary_config);
     wait_for_gauge(health, "melin_replicas_connected", 0);

@@ -41,7 +41,7 @@ use melin_test_node::probe::{
     PROBE_LIMIT, gauge, journal_head, wait_for_gauge, wait_for_gauge_where, wait_until,
 };
 
-use halt_cluster::{Fixture, addrs, spawn_node};
+use halt_cluster::{Fixture, Ports, spawn_node};
 use raw_replica::RawReplica;
 
 /// Send one request and return the single frame of its reply.
@@ -58,15 +58,16 @@ fn value_of(conn: &mut Connection) -> u64 {
 
 #[test]
 fn a_write_refused_while_halted_is_not_replayed() {
+    let ports = Ports::lease();
     let fx = Fixture::new(0x71);
-    let primary_addrs = addrs(0);
-    let primary_config = fx.primary_config(&primary_addrs, AckPolicy::Disk);
+    let primary_addrs = ports.addrs(0);
+    let primary_config = fx.primary_config(&primary_addrs, AckPolicy::Disk, ports.endpoint());
     let primary_health = primary_config.health_bind.expect("set by the fixture");
     let primary_journal = primary_config.journal.clone();
 
     let primary = spawn_node::<Counter>(&primary_addrs, primary_config);
     let replica = spawn_node::<Counter>(
-        &addrs(1),
+        &ports.addrs(1),
         fx.replica_config("replica", primary_addrs.replication(), AckPolicy::Disk),
     );
 
@@ -114,7 +115,7 @@ fn a_write_refused_while_halted_is_not_replayed() {
 
     // --- Taking writes again: a replica attaches, the refused write is resent. ---
     let replica = spawn_node::<Counter>(
-        &addrs(2),
+        &ports.addrs(2),
         fx.replica_config("replica2", primary_addrs.replication(), AckPolicy::Disk),
     );
     wait_for_gauge(primary_health, "melin_replicas_connected", 1);
@@ -136,7 +137,7 @@ fn a_write_refused_while_halted_is_not_replayed() {
         health_bind: None,
         ..melin_test_node::config()
     };
-    let restarted = spawn_node::<Counter>(&addrs(0), restart_config);
+    let restarted = spawn_node::<Counter>(&ports.addrs(0), restart_config);
     let mut conn = fx.client(&restarted);
     let replayed = value_of(&mut conn);
     drop(conn);
@@ -165,9 +166,11 @@ fn a_refusal_overtakes_a_held_write() {
     /// gate wrongly opened would have released it.
     const HELD: Duration = Duration::from_millis(500);
 
+    let ports = Ports::lease();
     let fx = Fixture::new(0xA1);
-    let primary_addrs = addrs(0);
-    let mut primary_config = fx.primary_config(&primary_addrs, AckPolicy::DiskAndRam);
+    let primary_addrs = ports.addrs(0);
+    let mut primary_config =
+        fx.primary_config(&primary_addrs, AckPolicy::DiskAndRam, ports.endpoint());
     // A halted primary would otherwise release W1 on its own disk once
     // the grace period passed.
     primary_config.no_degraded_acks = true;
@@ -292,16 +295,17 @@ fn pipelined_writer(
 /// hypothesis for a hang reported under this policy).
 #[test]
 fn a_disk_primary_keeps_answering_once_its_replica_is_gone() {
+    let ports = Ports::lease();
     let fx = Fixture::new(0x91);
-    let primary_addrs = addrs(0);
-    let mut primary_config = fx.primary_config(&primary_addrs, AckPolicy::Disk);
+    let primary_addrs = ports.addrs(0);
+    let mut primary_config = fx.primary_config(&primary_addrs, AckPolicy::Disk, ports.endpoint());
     // Ticks on, and frequent: a halted node keeps journaling them.
     primary_config.tick_interval_ms = 5;
     let health = primary_config.health_bind.expect("set by the fixture");
 
     let primary = spawn_node::<Counter>(&primary_addrs, primary_config);
     let replica = spawn_node::<Counter>(
-        &addrs(1),
+        &ports.addrs(1),
         fx.replica_config("replica", primary_addrs.replication(), AckPolicy::Disk),
     );
     wait_for_gauge(health, "melin_replicas_connected", 1);

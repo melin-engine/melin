@@ -48,7 +48,7 @@ use melin_test_node::probe::{
     wait_for_replica_acks, wait_until,
 };
 
-use halt_cluster::{Fixture, addrs, spawn_node};
+use halt_cluster::{Fixture, Ports, spawn_node};
 use proxy::Proxy;
 
 /// The grace period of the degraded-ack scenario: short, so the test is.
@@ -185,9 +185,10 @@ enum Scenario {
 
 fn run(policy: AckPolicy, scenario: Scenario) {
     melin_test_node::logs::capture_if_requested();
+    let ports = Ports::lease();
     let fx = Fixture::new(0xA1);
-    let primary_addrs = addrs(0);
-    let mut primary_config = fx.primary_config(&primary_addrs, policy);
+    let primary_addrs = ports.addrs(0);
+    let mut primary_config = fx.primary_config(&primary_addrs, policy, ports.endpoint());
     match scenario {
         Scenario::Degraded => primary_config.degraded_ack_grace_ms = GRACE.as_millis() as u64,
         Scenario::ReturnsWithinGrace => {
@@ -201,7 +202,7 @@ fn run(policy: AckPolicy, scenario: Scenario) {
     // The replica reaches its primary through the relay.
     let proxy = Proxy::start(primary_addrs.replication());
     let replica_config = fx.replica_config("replica", proxy.addr(), policy);
-    let replica = spawn_node::<Counter>(&addrs(1), replica_config);
+    let replica = spawn_node::<Counter>(&ports.addrs(1), replica_config);
     wait_for_gauge(health, "melin_replicas_connected", 1);
     let (seen_connected, degraded_probes) = confirmed_in_full(&fx, &primary);
 
