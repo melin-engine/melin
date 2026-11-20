@@ -14,8 +14,11 @@ use std::time::SystemTime;
 /// binary shares one process, and so one block, and this allocator never
 /// reissues a port within a process: a binary whose tests together take
 /// more than a block must hand ports back and run its tests one at a time
-/// (as `melin-server-runtime`'s `ack_policy_changes.rs` and
-/// `raft_failover.rs` do, through `tests/common/port_pool.rs`).
+/// (as `melin-server-runtime`'s `ack_policy_changes.rs`,
+/// `raft_failover.rs` and the tests on `tests/common/halt_cluster.rs` do,
+/// through `tests/common/port_pool.rs`). nextest gives every test a
+/// process of its own, so a binary that outgrows its block passes there
+/// and fails only under plain `cargo test`.
 const BLOCK: u16 = 50;
 /// Blocks per range: each `base` owns `base..base + BLOCK * NBLOCKS`
 /// (5000 ports). Callers must space their bases accordingly.
@@ -60,16 +63,6 @@ const NBLOCKS: u16 = 100;
 /// processes sharing the block. The message tells claimed ports from
 /// bound ones.
 pub fn free_addr(base: u16) -> SocketAddr {
-    // Every port this process has handed out, with the claim that keeps
-    // other processes off it: dropping the file would release the claim,
-    // so it lives here until the process exits. HashMap over a bitmap or
-    // sorted Vec: a handful of scattered u16s where membership is the
-    // only query — no ordering or density to exploit. Mutex over an
-    // atomic scheme: allocation runs a few times per test, so contention
-    // is irrelevant, and holding the lock across the whole probe loop
-    // serializes concurrent callers so they cannot race each other to
-    // the same free port or observe a partially-updated map.
-    static ISSUED: OnceLock<Mutex<HashMap<u16, File>>> = OnceLock::new();
     // Per-process random probe rotation — see the doc comment. Derived
     // from `RandomState`, std's per-process randomly-seeded hasher:
     // cheap decorrelation without a rand dependency.
@@ -92,10 +85,7 @@ pub fn free_addr(base: u16) -> SocketAddr {
         let hasher = std::collections::hash_map::RandomState::new().build_hasher();
         (hasher.finish() % u64::from(BLOCK)) as u16
     });
-    let mut issued = ISSUED
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .expect("free_addr lock poisoned");
+    let mut issued = issued();
     // Why each port was passed over, for the exhaustion message. u16: a
     // count of ports within one block.
     let (mut held_here, mut held_elsewhere, mut bound) = (0u16, 0u16, 0u16);
@@ -126,6 +116,28 @@ pub fn free_addr(base: u16) -> SocketAddr {
         block_base + BLOCK,
         claims_dir().display(),
     );
+}
+
+/// Every port this process has handed out, with the claim that keeps
+/// other processes off it: dropping the file would release the claim, so
+/// it lives here until the process exits. HashMap over a bitmap or sorted
+/// Vec: a handful of scattered u16s where membership is the only query —
+/// no ordering or density to exploit. Mutex over an atomic scheme:
+/// allocation runs a few times per test, so contention is irrelevant, and
+/// holding the lock across the whole probe loop serializes concurrent
+/// callers so they cannot race each other to the same free port.
+///
+/// A test that panicked holding the lock (an exhausted block panics in
+/// the probe loop) left the map whole, since one `insert` is its only
+/// change: the lock is taken past the poison. Refusing it would fail
+/// every later allocation of the process with a poisoned lock, burying
+/// the panic that said why.
+fn issued() -> std::sync::MutexGuard<'static, HashMap<u16, File>> {
+    static ISSUED: OnceLock<Mutex<HashMap<u16, File>>> = OnceLock::new();
+    ISSUED
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// The directory holding the claim files of this user's test processes,
@@ -285,6 +297,22 @@ mod tests {
             !held.iter().any(|(port, _)| *port == second),
             "issued port {second}, which another process claims"
         );
+    }
+
+    /// A test that panics while allocating (an exhausted block) does not
+    /// fail the allocations of the tests after it.
+    #[test]
+    fn a_panic_while_allocating_leaves_the_allocator_usable() {
+        // Shares base 10_000 with `never_reissues_and_stays_in_block`:
+        // one port more leaves the block far from exhausted.
+        const BASE: u16 = 10_000;
+        let panicked = std::panic::catch_unwind(|| {
+            let _held = issued();
+            panic!("a test panicking mid-allocation");
+        });
+        assert!(panicked.is_err());
+        let port = free_addr(BASE).port();
+        assert!(issued().contains_key(&port), "port {port} was not recorded");
     }
 
     /// A claim excludes every other holder until it is dropped, and the
