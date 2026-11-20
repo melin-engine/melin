@@ -58,7 +58,7 @@ use melin_transport_core::test_support::{
     TestEvent, TestQuery, TickCountingApp, TickCountingCodec,
 };
 
-use halt_cluster::{Fixture, addrs, endpoint, spawn_node};
+use halt_cluster::{Fixture, Ports, spawn_node};
 use scripted_primary::ScriptedPrimary;
 
 /// Requests a load connection sends before reading their replies: enough
@@ -327,14 +327,15 @@ fn a_replica_restarted_under_load_ticks_as_an_uninterrupted_copy() {
     const RUNS: usize = 12;
 
     melin_test_node::logs::capture_if_requested();
+    let ports = Ports::lease();
     // Every run's nodes at the same addresses, and the primary's health
     // and the replica's admin endpoints at the same ports: a test process
     // has only so many ports.
     let cluster = Cluster {
-        primary: addrs(0),
-        replica: addrs(1),
-        health: endpoint(),
-        admin: endpoint(),
+        primary: ports.addrs(0),
+        replica: ports.addrs(1),
+        health: ports.endpoint(),
+        admin: ports.endpoint(),
     };
     // The journal end of each run's restart.
     let mut cuts = Vec::new();
@@ -382,8 +383,7 @@ fn restart_a_replica_under_load(cluster: &Cluster) -> (u64, bool) {
     } = cluster;
     let (health, admin) = (*health, *admin);
     let fx = Fixture::new(0xB1);
-    let mut primary_config = fx.primary_config(primary_addrs, POLICY);
-    primary_config.health_bind = Some(health);
+    let primary_config = fx.primary_config(primary_addrs, POLICY, health);
     // The last run's nodes may hold these ports a moment past their stop.
     wait_released(&[health, admin]);
     let primary = spawn_node::<TickCountingApp>(primary_addrs, primary_config);
@@ -459,14 +459,15 @@ fn restart_a_replica_under_load(cluster: &Cluster) -> (u64, bool) {
 #[test]
 fn a_promoted_replica_continues_the_watermark_it_streamed() {
     melin_test_node::logs::capture_if_requested();
+    let ports = Ports::lease();
     let fx = Fixture::new(0xB5);
     let primary = ScriptedPrimary::bind();
     let ahead = ahead_of_this_host();
     let mut config = fx.replica_config("replica", primary.addr(), AckPolicy::Disk);
-    config.admin_bind = Some(endpoint());
+    config.admin_bind = Some(ports.endpoint());
     let admin = config.admin_bind.expect("set above");
     let journal = config.journal.clone();
-    let replica = spawn_node::<TickCountingApp>(&addrs(0), config);
+    let replica = spawn_node::<TickCountingApp>(&ports.addrs(0), config);
 
     let mut stream = primary.accept(Some(0));
     assert_eq!(stream.resumes_after(), 0, "a fresh replica");
@@ -496,10 +497,11 @@ fn a_promoted_replica_continues_the_watermark_it_streamed() {
 #[test]
 fn a_replica_restarted_inside_a_run_of_one_timestamp_goes_on_from_its_watermark() {
     melin_test_node::logs::capture_if_requested();
+    let ports = Ports::lease();
     let fx = Fixture::new(0xBD);
     let primary = ScriptedPrimary::bind();
     let ahead = ahead_of_this_host();
-    let replica_addrs = addrs(0);
+    let replica_addrs = ports.addrs(0);
     let config = |admin| {
         let mut config = fx.replica_config("replica", primary.addr(), AckPolicy::Disk);
         config.admin_bind = admin;
@@ -515,7 +517,7 @@ fn a_replica_restarted_inside_a_run_of_one_timestamp_goes_on_from_its_watermark(
     replica.stop();
     drop(stream);
 
-    let admin = endpoint();
+    let admin = ports.endpoint();
     let replica = spawn_node::<TickCountingApp>(&replica_addrs, config(Some(admin)));
     let mut stream = primary.accept(Some(0));
     assert_eq!(
@@ -640,9 +642,10 @@ fn a_node_restored_from_a_shadow_snapshot_ticks_as_an_uninterrupted_copy() {
     const PAST_SNAPSHOT: u64 = 1_000;
 
     melin_test_node::logs::capture_if_requested();
+    let ports = Ports::lease();
     let fx = Fixture::new(0xB9);
-    let node_addrs = addrs(0);
-    let health = endpoint();
+    let node_addrs = ports.addrs(0);
+    let health = ports.endpoint();
     let config = || {
         let mut config = fx.node_config("node", &fx.primary_key, AckPolicy::Disk);
         config.standalone = true;

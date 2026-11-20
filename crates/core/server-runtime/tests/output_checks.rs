@@ -35,7 +35,7 @@ use melin_transport_core::test_support::{TestEvent, TickCountingApp, TickCountin
 
 #[path = "common/halt_cluster.rs"]
 mod halt_cluster;
-use halt_cluster::{Fixture, addrs, endpoint, spawn_node};
+use halt_cluster::{Fixture, Ports, spawn_node};
 
 #[path = "common/proxy.rs"]
 mod proxy;
@@ -183,20 +183,20 @@ fn add(client: &mut Connection, count: u64) {
 /// read on; returns it with that endpoint and the marker its stop leaves.
 fn replica_config(
     fx: &Fixture,
+    ports: &Ports,
     name: &str,
     primary: SocketAddr,
 ) -> (ServerConfig, SocketAddr, PathBuf) {
     let mut config = fx.replica_config(name, primary, POLICY);
-    let health = endpoint();
+    let health = ports.endpoint();
     config.health_bind = Some(health);
     let marker = config.store().expect("store").divergence_marker();
     (config, health, marker)
 }
 
-/// A primary of `TickCountingApp` journaling a tick every few
-/// milliseconds, so ticks interleave the writes throughout.
-fn ticking_primary_config(fx: &Fixture, addrs: &Addrs) -> ServerConfig {
-    let mut config = fx.primary_config(addrs, POLICY);
+/// `config`, journaling a tick every few milliseconds, so that on a
+/// primary of `TickCountingApp` ticks interleave the writes throughout.
+fn ticking(mut config: ServerConfig) -> ServerConfig {
     config.tick_interval_ms = 5;
     config
 }
@@ -241,9 +241,9 @@ struct Stopped {
 
 /// A primary and two replicas, those `faulted` changing the report at
 /// [`FAULT_AT`]; written to until the cluster stops.
-fn run_until_stopped(fx: &Fixture, faulted: [bool; 2]) -> Stopped {
-    let primary_addrs = addrs(0);
-    let primary_config = fx.primary_config(&primary_addrs, POLICY);
+fn run_until_stopped(fx: &Fixture, ports: &Ports, faulted: [bool; 2]) -> Stopped {
+    let primary_addrs = ports.addrs(0);
+    let primary_config = fx.primary_config(&primary_addrs, POLICY, ports.endpoint());
     let health = primary_config.health_bind.expect("set by the fixture");
     let primary_marker = primary_config.store().expect("store").divergence_marker();
     let primary = spawn_faulty(&primary_addrs, primary_config, None);
@@ -253,9 +253,10 @@ fn run_until_stopped(fx: &Fixture, faulted: [bool; 2]) -> Stopped {
         .zip(faulted)
         .enumerate()
         .map(|(i, (name, faulted))| {
-            let (config, _health, marker) = replica_config(fx, name, primary_addrs.replication());
+            let (config, _health, marker) =
+                replica_config(fx, ports, name, primary_addrs.replication());
             let fault = faulted.then_some(FAULT_AT);
-            (spawn_faulty(&addrs(i + 1), config, fault), marker)
+            (spawn_faulty(&ports.addrs(i + 1), config, fault), marker)
         })
         .collect();
     wait_for_gauge(health, "melin_replicas_connected", 2);
@@ -305,8 +306,9 @@ fn run_until_stopped(fx: &Fixture, faulted: [bool; 2]) -> Stopped {
 /// leaves its marker, and the faulted one refuses to start again.
 #[test]
 fn a_replica_whose_output_differs_stops_the_whole_cluster() {
+    let ports = Ports::lease();
     let fx = Fixture::new(0xE1);
-    let stopped = run_until_stopped(&fx, [true, false]);
+    let stopped = run_until_stopped(&fx, &ports, [true, false]);
 
     let detector = &stopped.replica_errors[0];
     assert!(
@@ -335,8 +337,8 @@ fn a_replica_whose_output_differs_stops_the_whole_cluster() {
         assert!(marker.exists(), "{}", marker.display());
     }
 
-    let (config, _, _) = replica_config(&fx, "replica-a", addrs(0).replication());
-    let restarted = spawn_faulty(&addrs(1), config, None)
+    let (config, _, _) = replica_config(&fx, &ports, "replica-a", ports.addrs(0).replication());
+    let restarted = spawn_faulty(&ports.addrs(1), config, None)
         .join()
         .expect_err("a restart is refused");
     assert!(
@@ -350,8 +352,9 @@ fn a_replica_whose_output_differs_stops_the_whole_cluster() {
 /// serves after.
 #[test]
 fn replicas_that_both_differ_stop_the_cluster_once() {
+    let ports = Ports::lease();
     let fx = Fixture::new(0xE5);
-    let stopped = run_until_stopped(&fx, [true, true]);
+    let stopped = run_until_stopped(&fx, &ports, [true, true]);
 
     assert!(
         stopped
@@ -388,16 +391,17 @@ fn replicas_that_both_differ_stop_the_cluster_once() {
 /// data and reseed from it; the cluster serves, and its replicas check.
 #[test]
 fn a_stopped_cluster_is_replaced_by_a_new_one() {
+    let ports = Ports::lease();
     let fx = Fixture::new(0xE9);
-    let stopped = run_until_stopped(&fx, [true, false]);
+    let stopped = run_until_stopped(&fx, &ports, [true, false]);
     for marker in &stopped.markers {
         let mut kept = marker.clone().into_os_string();
         kept.push(".kept");
         std::fs::rename(marker, &kept).expect("move the marker aside");
     }
 
-    let primary_addrs = addrs(0);
-    let primary_config = fx.primary_config(&primary_addrs, POLICY);
+    let primary_addrs = ports.addrs(0);
+    let primary_config = fx.primary_config(&primary_addrs, POLICY, ports.endpoint());
     let health = primary_config.health_bind.expect("set by the fixture");
     let primary = spawn_faulty(&primary_addrs, primary_config, None);
     wait_for_gauge(health, "melin_replicas_connected", 0);
@@ -405,8 +409,9 @@ fn a_stopped_cluster_is_replaced_by_a_new_one() {
         .into_iter()
         .enumerate()
         .map(|(i, name)| {
-            let (config, health, _) = replica_config(&fx, name, primary_addrs.replication());
-            (spawn_faulty(&addrs(i + 1), config, None), health)
+            let (config, health, _) =
+                replica_config(&fx, &ports, name, primary_addrs.replication());
+            (spawn_faulty(&ports.addrs(i + 1), config, None), health)
         })
         .unzip();
     wait_for_gauge(health, "melin_replicas_connected", 2);
@@ -442,23 +447,24 @@ fn a_stopped_cluster_is_replaced_by_a_new_one() {
 /// primary's first digest of the session reaches it.
 #[test]
 fn a_replica_joining_mid_run_checks_without_stopping() {
+    let ports = Ports::lease();
     let fx = Fixture::new(0xF1);
-    let primary_addrs = addrs(0);
-    let primary_config = ticking_primary_config(&fx, &primary_addrs);
+    let primary_addrs = ports.addrs(0);
+    let primary_config = ticking(fx.primary_config(&primary_addrs, POLICY, ports.endpoint()));
     let health = primary_config.health_bind.expect("set by the fixture");
     let primary_marker = primary_config.store().expect("store").divergence_marker();
     let primary = spawn_node::<TickCountingApp>(&primary_addrs, primary_config);
     wait_for_gauge(health, "melin_replicas_connected", 0);
     let (config, health_a, marker_a) =
-        replica_config(&fx, "replica-a", primary_addrs.replication());
-    let a = spawn_node::<TickCountingApp>(&addrs(1), config);
+        replica_config(&fx, &ports, "replica-a", primary_addrs.replication());
+    let a = spawn_node::<TickCountingApp>(&ports.addrs(1), config);
     wait_for_gauge(health, "melin_replicas_connected", 1);
     let mut client = fx.client(&primary);
     add(&mut client, 5 * K + 7);
 
     let (config, health_b, marker_b) =
-        replica_config(&fx, "replica-b", primary_addrs.replication());
-    let b = spawn_node::<TickCountingApp>(&addrs(2), config);
+        replica_config(&fx, &ports, "replica-b", primary_addrs.replication());
+    let b = spawn_node::<TickCountingApp>(&ports.addrs(2), config);
     wait_for_gauge(health, "melin_replicas_connected", 2);
     checks_go_on(
         &mut client,
@@ -473,21 +479,22 @@ fn a_replica_joining_mid_run_checks_without_stopping() {
 /// over it, goes on checking.
 #[test]
 fn a_replica_restarted_from_its_snapshot_checks_without_stopping() {
+    let ports = Ports::lease();
     let fx = Fixture::new(0xF5);
-    let primary_addrs = addrs(0);
-    let primary_config = ticking_primary_config(&fx, &primary_addrs);
+    let primary_addrs = ports.addrs(0);
+    let primary_config = ticking(fx.primary_config(&primary_addrs, POLICY, ports.endpoint()));
     let health = primary_config.health_bind.expect("set by the fixture");
     let primary = spawn_node::<TickCountingApp>(&primary_addrs, primary_config);
     wait_for_gauge(health, "melin_replicas_connected", 0);
     let snapshotting = || {
         let (mut config, health, marker) =
-            replica_config(&fx, "replica", primary_addrs.replication());
+            replica_config(&fx, &ports, "replica", primary_addrs.replication());
         config.snapshot_interval_ms = 20;
         (config, health, marker)
     };
     let (config, _, marker) = snapshotting();
     let snapshot = config.store().expect("store").snapshot().to_path_buf();
-    let replica = spawn_node::<TickCountingApp>(&addrs(1), config);
+    let replica = spawn_node::<TickCountingApp>(&ports.addrs(1), config);
     wait_for_gauge(health, "melin_replicas_connected", 1);
     let mut client = fx.client(&primary);
     add(&mut client, 3 * K);
@@ -497,7 +504,7 @@ fn a_replica_restarted_from_its_snapshot_checks_without_stopping() {
     replica.stop();
 
     let (config, replica_health, _) = snapshotting();
-    let replica = spawn_node::<TickCountingApp>(&addrs(1), config);
+    let replica = spawn_node::<TickCountingApp>(&ports.addrs(1), config);
     wait_for_gauge(health, "melin_replicas_connected", 1);
     checks_go_on(&mut client, 4 * K, &[replica_health], &[&primary, &replica]);
     assert_no_marker(&[&marker]);
@@ -508,18 +515,19 @@ fn a_replica_restarted_from_its_snapshot_checks_without_stopping() {
 /// it kept.
 #[test]
 fn a_replica_reconnecting_after_a_long_catch_up_checks_without_stopping() {
+    let ports = Ports::lease();
     let fx = Fixture::new(0xF9);
-    let primary_addrs = addrs(0);
-    let primary_config = ticking_primary_config(&fx, &primary_addrs);
+    let primary_addrs = ports.addrs(0);
+    let primary_config = ticking(fx.primary_config(&primary_addrs, POLICY, ports.endpoint()));
     let health = primary_config.health_bind.expect("set by the fixture");
     let primary = spawn_node::<TickCountingApp>(&primary_addrs, primary_config);
     wait_for_gauge(health, "melin_replicas_connected", 0);
     let (config, health_a, marker_a) =
-        replica_config(&fx, "replica-a", primary_addrs.replication());
-    let a = spawn_node::<TickCountingApp>(&addrs(1), config);
+        replica_config(&fx, &ports, "replica-a", primary_addrs.replication());
+    let a = spawn_node::<TickCountingApp>(&ports.addrs(1), config);
     let proxy = Proxy::start(primary_addrs.replication());
-    let (config, health_b, marker_b) = replica_config(&fx, "replica-b", proxy.addr());
-    let b = spawn_node::<TickCountingApp>(&addrs(2), config);
+    let (config, health_b, marker_b) = replica_config(&fx, &ports, "replica-b", proxy.addr());
+    let b = spawn_node::<TickCountingApp>(&ports.addrs(2), config);
     wait_for_gauge(health, "melin_replicas_connected", 2);
     let mut client = fx.client(&primary);
     add(&mut client, 2 * K);
@@ -544,23 +552,20 @@ fn a_replica_reconnecting_after_a_long_catch_up_checks_without_stopping() {
 /// go on checking.
 #[test]
 fn a_restarted_primary_is_checked_without_stopping_its_replicas() {
+    let ports = Ports::lease();
     let fx = Fixture::new(0xFD);
-    let primary_addrs = addrs(0);
+    let primary_addrs = ports.addrs(0);
     // Both starts on the same health endpoint.
-    let health = endpoint();
-    let primary_config = || {
-        let mut config = ticking_primary_config(&fx, &primary_addrs);
-        config.health_bind = Some(health);
-        config
-    };
+    let health = ports.endpoint();
+    let primary_config = || ticking(fx.primary_config(&primary_addrs, POLICY, health));
     let primary = spawn_node::<TickCountingApp>(&primary_addrs, primary_config());
     wait_for_gauge(health, "melin_replicas_connected", 0);
     let (config, health_a, marker_a) =
-        replica_config(&fx, "replica-a", primary_addrs.replication());
-    let a = spawn_node::<TickCountingApp>(&addrs(1), config);
+        replica_config(&fx, &ports, "replica-a", primary_addrs.replication());
+    let a = spawn_node::<TickCountingApp>(&ports.addrs(1), config);
     let (config, health_b, marker_b) =
-        replica_config(&fx, "replica-b", primary_addrs.replication());
-    let b = spawn_node::<TickCountingApp>(&addrs(2), config);
+        replica_config(&fx, &ports, "replica-b", primary_addrs.replication());
+    let b = spawn_node::<TickCountingApp>(&ports.addrs(2), config);
     wait_for_gauge(health, "melin_replicas_connected", 2);
     let mut client = fx.client(&primary);
     add(&mut client, 3 * K + 11);
@@ -585,16 +590,17 @@ fn a_restarted_primary_is_checked_without_stopping_its_replicas() {
 /// of it checks its output against it.
 #[test]
 fn a_promoted_replica_is_checked_by_its_own_replica() {
+    let ports = Ports::lease();
     let fx = Fixture::new(0xC1);
-    let primary_addrs = addrs(0);
-    let primary_config = ticking_primary_config(&fx, &primary_addrs);
+    let primary_addrs = ports.addrs(0);
+    let primary_config = ticking(fx.primary_config(&primary_addrs, POLICY, ports.endpoint()));
     let health = primary_config.health_bind.expect("set by the fixture");
     let primary = spawn_node::<TickCountingApp>(&primary_addrs, primary_config);
     wait_for_gauge(health, "melin_replicas_connected", 0);
-    let promoted_addrs = addrs(1);
+    let promoted_addrs = ports.addrs(1);
     let (mut config, promoted_health, marker_a) =
-        replica_config(&fx, "replica-a", primary_addrs.replication());
-    let admin = endpoint();
+        replica_config(&fx, &ports, "replica-a", primary_addrs.replication());
+    let admin = ports.endpoint();
     config.admin_bind = Some(admin);
     config.replication_bind = Some(promoted_addrs.replication());
     config.tick_interval_ms = 5;
@@ -616,8 +622,8 @@ fn a_promoted_replica_is_checked_by_its_own_replica() {
     admin_reply_when_up(admin, &fx.client_key, "PROMOTE");
     // The new primary's own replica, on the old primary's slot.
     let (config, health_c, marker_c) =
-        replica_config(&fx, "replica-c", promoted_addrs.replication());
-    let c = spawn_node::<TickCountingApp>(&addrs(0), config);
+        replica_config(&fx, &ports, "replica-c", promoted_addrs.replication());
+    let c = spawn_node::<TickCountingApp>(&ports.addrs(0), config);
     wait_for_gauge(promoted_health, "melin_replicas_connected", 1);
     let mut client = fx.client(&a);
     checks_go_on(&mut client, 4 * K, &[health_c], &[&a, &c]);
@@ -629,15 +635,16 @@ fn a_promoted_replica_is_checked_by_its_own_replica() {
 /// writes resume.
 #[test]
 fn idle_checks_follow_the_ticks() {
+    let ports = Ports::lease();
     let fx = Fixture::new(0xC5);
-    let primary_addrs = addrs(0);
-    let primary_config = ticking_primary_config(&fx, &primary_addrs);
+    let primary_addrs = ports.addrs(0);
+    let primary_config = ticking(fx.primary_config(&primary_addrs, POLICY, ports.endpoint()));
     let health = primary_config.health_bind.expect("set by the fixture");
     let primary = spawn_node::<TickCountingApp>(&primary_addrs, primary_config);
     wait_for_gauge(health, "melin_replicas_connected", 0);
     let (config, replica_health, marker) =
-        replica_config(&fx, "replica", primary_addrs.replication());
-    let replica = spawn_node::<TickCountingApp>(&addrs(1), config);
+        replica_config(&fx, &ports, "replica", primary_addrs.replication());
+    let replica = spawn_node::<TickCountingApp>(&ports.addrs(1), config);
     wait_for_gauge(health, "melin_replicas_connected", 1);
     let from = checks(replica_health);
     wait_for_checks(replica_health, from, 3, "on ticks alone");
@@ -647,13 +654,14 @@ fn idle_checks_follow_the_ticks() {
     drop(primary);
 
     let fx = Fixture::new(0xC9);
-    let primary_config = fx.primary_config(&primary_addrs, POLICY);
+    let primary_config = fx.primary_config(&primary_addrs, POLICY, ports.endpoint());
     wait_released(&[replica_health]);
     let health = primary_config.health_bind.expect("set by the fixture");
     let primary = spawn_node::<TickCountingApp>(&primary_addrs, primary_config);
     wait_for_gauge(health, "melin_replicas_connected", 0);
-    let (config, replica_health, _) = replica_config(&fx, "replica", primary_addrs.replication());
-    let replica = spawn_node::<TickCountingApp>(&addrs(1), config);
+    let (config, replica_health, _) =
+        replica_config(&fx, &ports, "replica", primary_addrs.replication());
+    let replica = spawn_node::<TickCountingApp>(&ports.addrs(1), config);
     wait_for_gauge(health, "melin_replicas_connected", 1);
     let mut client = fx.client(&primary);
     checks_go_on(&mut client, 4 * K, &[replica_health], &[&primary, &replica]);
