@@ -167,6 +167,14 @@ jobs:
       - name: Journal doctests
         run: cargo test -q --doc -p melin-journal --locked
 
+      # nextest gives each test a process of its own, so a binary's tests
+      # never share its port block there: the cluster tests' port lease
+      # (turn-taking, and ports handed back for the next test) only runs
+      # when they do. Plain `cargo test` on the binary that needs it most
+      # runs it here rather than first in the nightly sanitizer job.
+      - name: Cluster tests sharing one process
+        run: cargo test -q -p melin-server-runtime --test output_checks --locked
+
       # `--no-fail-fast` so one flaky cluster test cannot hide the verdict on
       # the rest of the suite. Costs nothing when the suite is green.
       - name: Tests

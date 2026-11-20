@@ -226,8 +226,8 @@ impl Fixture {
     /// A replica of the primary whose replication endpoint is `primary`
     /// (a node's `Addrs::replication`, or a scripted primary's address),
     /// journaling to `name`. No health endpoint: the tests read the
-    /// primary's, and a port saved per replica keeps a binary run in one
-    /// process (plain `cargo test`) inside its port block.
+    /// primary's, and a test that needs a replica's sets one from its
+    /// `Ports` lease.
     pub fn replica_config(
         &self,
         name: &str,
